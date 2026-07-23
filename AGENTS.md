@@ -638,8 +638,7 @@ They exist for this. Use them and there is nothing to decide per-test:
 | Email | `alice@example.com`, `bob@example.org` (RFC 2606) | any real or plausible address |
 | People | `alice`, `bob`, `carol`, `dave` | colleagues, customers, anyone real |
 | Hostnames | `*.test` (RFC 6761), `*.example.com` | internal hostnames, real clusters |
-| IPv4 | `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` (RFC 5737) | anything routable, anything internal |
-| IPv6 | `2001:db8::/32` (RFC 3849) | as above |
+| IP literals | any address that is not globally routable — loopback, unspecified, link-local, private, documentation | anything globally routable |
 | Roles | `engineer`, `analyst`, `admin` | real internal role names |
 | Teams / orgs | `team-a`, `acme`, `example-org` | real teams, real customers |
 | Issue keys | `PROJ-123` | real Jira keys |
