@@ -7,7 +7,10 @@ use std::process::{Command, ExitCode};
 
 use steward_adapter_fake::IMPLEMENTED_PORTS as FAKE_PORTS;
 use steward_ports::{Maturity, PORTS};
-use xtask::{local_test_context_is_safe, neutrality_violations, secret_violations};
+use xtask::{
+    local_test_context_is_safe, migration_history_violations, neutrality_violations,
+    secret_violations, validate_register_content,
+};
 
 type TaskResult = Result<(), String>;
 
@@ -108,18 +111,42 @@ fn policy_test() -> TaskResult {
 fn migrate_check() -> TaskResult {
     let directory = root().join("migrations");
     ensure_directory(&directory)?;
-    let mut names = files_with_extension(&directory, "sql")?
+    let names = files_with_extension(&directory, "sql")?
         .into_iter()
         .filter_map(|path| path.file_name().and_then(OsStr::to_str).map(str::to_owned))
         .collect::<Vec<_>>();
-    let original = names.clone();
-    names.sort();
-    if names != original {
-        return Err("migration filenames are not in lexical application order".to_owned());
+    let base = env::var("STEWARD_MIGRATION_BASE").unwrap_or_else(|_| "origin/main".to_owned());
+    let range = format!("{base}...HEAD");
+    let output = Command::new("git")
+        .args([
+            "diff",
+            "--name-status",
+            "--find-renames",
+            &range,
+            "--",
+            ":(glob)migrations/*.sql",
+        ])
+        .current_dir(root())
+        .output()
+        .map_err(|error| format!("failed to inspect migration history: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git could not compare migration history against {base}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let changes = String::from_utf8(output.stdout)
+        .map_err(|_| "git returned non-UTF-8 migration paths".to_owned())?;
+    let violations = migration_history_violations(&changes);
+    if !violations.is_empty() {
+        return Err(format!(
+            "existing migrations are immutable; only additions are allowed:\n{}",
+            violations.join("\n")
+        ));
     }
     println!(
-        "migrate-check: {} append-only migrations verified",
-        names.len()
+        "migrate-check: {} migration files; append-only history verified against {base}",
+        names.len(),
     );
     Ok(())
 }
@@ -225,41 +252,7 @@ fn validate_register() -> TaskResult {
     let path = root().join("conformance/register.toml");
     let content = fs::read_to_string(&path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    if !content.lines().any(|line| line.trim() == "schema = 1") {
-        return Err("conformance register must declare schema = 1".to_owned());
-    }
-    if !content
-        .lines()
-        .any(|line| line.trim_start().starts_with("pinned_openshell = "))
-    {
-        return Err("conformance register must pin OpenShell in one place".to_owned());
-    }
-    if content
-        .lines()
-        .any(|line| line.trim_start().starts_with("status = "))
-    {
-        return Err("conformance register must not contain a hand-authored status".to_owned());
-    }
-
-    let ids = content
-        .lines()
-        .filter_map(|line| {
-            line.trim()
-                .strip_prefix("id = \"")
-                .and_then(|value| value.strip_suffix('"'))
-        })
-        .collect::<Vec<_>>();
-    let unique = ids.iter().copied().collect::<BTreeSet<_>>();
-    if ids.len() != 6 || unique.len() != ids.len() {
-        return Err("conformance register must contain unique entries G-1 through G-6".to_owned());
-    }
-    for expected in 1..=6 {
-        let id = format!("G-{expected}");
-        if !unique.contains(id.as_str()) {
-            return Err(format!("conformance register is missing {id}"));
-        }
-    }
-    Ok(())
+    validate_register_content(&content)
 }
 
 fn ports_check() -> TaskResult {

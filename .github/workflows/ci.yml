@@ -63,6 +63,8 @@ jobs:
           echo "${tools_dir}" >> "${GITHUB_PATH}"
 
       - name: Run pinned gate
+        env:
+          STEWARD_MIGRATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
         run: cargo xtask ci
 
   latest-nightly:
@@ -75,8 +77,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install pinned Rust toolchain
+      # "latest" means latest upstream conformance target, not a different Rust release.
+      - name: Install Steward Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal
 
-      - name: Run informational latest lane
+      - name: Run informational latest-upstream lane
         run: cargo xtask conformance --latest
