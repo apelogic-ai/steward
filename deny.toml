@@ -1,0 +1,68 @@
+# cargo-deny — SKETCH. Crate names are placeholders until the workspace exists.
+# Verify `wrappers` semantics against the installed cargo-deny before relying on
+# this to gate anything.
+#
+# This file implements AGENTS.md §8 invariant 2 ("vendor semantics stay in their
+# adapter") and §8 invariant 9 (no panicking paths outside tests, via clippy —
+# not here). It is part of the enforcement surface, so AGENTS.md §13.3 applies:
+# weakening a rule here is a rule change wearing a config file.
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+# ---------------------------------------------------------------------------
+# The layering rule. Each vendor SDK may be depended on by exactly one adapter
+# crate. Anything else — steward-types, steward-ports, steward-admission,
+# steward-store, steward-controller, steward-apiserver, steward-mint — that
+# reaches for one of these fails the build.
+#
+# `wrappers` is the allow-list of crates permitted to depend on the named crate.
+# ---------------------------------------------------------------------------
+
+[[bans.deny]]
+name = "openshell-client"
+wrappers = ["steward-adapter-openshell"]
+
+[[bans.deny]]
+name = "litellm-client"
+wrappers = ["steward-adapter-litellm"]
+
+[[bans.deny]]
+name = "mcp-gw-client"
+wrappers = ["steward-adapter-mcp-gw"]
+
+[[bans.deny]]
+name = "gouqi"                      # Jira client
+wrappers = ["steward-adapter-jira"]
+
+[[bans.deny]]
+name = "spiffe"
+wrappers = ["steward-adapter-spire", "steward-mint"]
+
+# OPA is reached over HTTP by the adapter only; no core crate builds bundles.
+[[bans.deny]]
+name = "opa-client"
+wrappers = ["steward-adapter-opa"]
+
+# Steward builds no chat egress — AGENTS.md §8 invariant 8. Slack is reached
+# through a connector (Burble), never from a core crate, so there is no wrapper
+# that makes this acceptable.
+[[bans.deny]]
+name = "slack-morphism"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,96 @@
+# The guarantee register — declarative half.
+#
+# This file holds only what cannot be derived from a test run: what we sell, the
+# mechanism providing it, and what to watch. The STATUS COLUMN IS NOT HERE and
+# must never be added — it is derived from test outcomes by
+# `cargo xtask register`.
+#
+# `claim` is the strongest status this entry is ALLOWED to reach. Evidence can
+# fall short of it (that is a finding); evidence can never exceed it without a
+# deliberate edit here. Raising a claim is a decision, not a side effect.
+#
+#   holds  — we assert the guarantee is provided
+#   partial— provided for some sub-properties, not all; `gaps` says which
+#   not-yet— known absent; only `gap_*` tests may exist
+#   planned— no mechanism yet; must have zero tests
+#
+# Test discovery is by convention (see AGENTS.md in this directory):
+#   conformance/tests/g<N>_<slug>.rs   one module per guarantee
+#   holds_*  green ⇒ the guarantee holds
+#   gap_*    green ⇒ the documented gap is unchanged
+
+schema = 1
+
+[meta]
+# Rendered into the generated table so a reader knows what it was true against.
+pinned_openshell = "v0.0.82"
+
+# ---------------------------------------------------------------------------
+
+[[guarantee]]
+id = "G-1"
+module = "g1_egress"
+claim = "holds"
+sells = "Agent egress reaches only authorized destinations"
+mechanism = "OpenShell supervisor, default-deny L7"
+watch = """
+RFC 0005 (#2155) restructures the mechanism. The property should survive the \
+restructure; verify the property, not the mechanism."""
+
+[[guarantee]]
+id = "G-2"
+module = "g2_credential_isolation"
+claim = "holds"
+sells = "An agent cannot obtain another user's credentials"
+mechanism = "HOP-1 claims + mcp-gw email resolution"
+watch = """
+#1970 may replace the SVID→HOP-1 leg entirely. Also: the verifier passes no \
+`algorithms` allowlist to `jwtVerify`, so algorithm restriction is implicit in JWKS key \
+resolution — a holds_ test must cover an out-of-profile algorithm being rejected."""
+
+[[guarantee]]
+id = "G-3"
+module = "g3_authority_reverification"
+claim = "holds"
+sells = "An agent's authority is re-verified at most every T seconds"
+mechanism = "Short HOP-1 TTL; re-mint re-evaluates authority against current policy"
+watch = """
+T is configuration (`STEWARD_AUTHORITY_TTL`, default 60s), not a measured latency (D8). \
+In-flight operations complete under the old authority — the holds_ test must assert that \
+explicitly so the claim is not read as immediate interruption."""
+
+[[guarantee]]
+id = "G-4"
+module = "g4_revocation"
+claim = "holds"
+sells = "A terminated agent holds nothing live"
+mechanism = "Steward mint revocation + LiteLLM key delete"
+watch = "Mostly ours. The S5 exit criterion is this module."
+
+[[guarantee]]
+id = "G-5"
+module = "g5_model_allowlist"
+claim = "partial"
+gaps = [
+  "Not expressible at Tier 0; enforcement is the LiteLLM per-agent key only.",
+  "A route pins one model, not a set (upstream B1), and routes are workspace-scoped — so Tier 0 cannot express a model list at any granularity.",
+]
+sells = "An agent reaches only its allowed models"
+mechanism = "LiteLLM per-agent virtual key — NOT Tier 0"
+watch = """
+We inferred this wrongly once. It is the register's reason to exist. Re-verify \
+whenever the inference router changes."""
+
+[[guarantee]]
+id = "G-6"
+module = "g6_cross_agent_isolation"
+claim = "not-yet"
+gaps = [
+  "Isolation is name-based. Any authenticated user who knows a workspace name can operate in it.",
+]
+sells = "Agents are isolated from each other"
+mechanism = "None today — name-based only"
+watch = """
+Phase 2 (RFC 0011). The gap_* tests document current behaviour and will go RED \
+when upstream closes this, which is the signal to raise `claim` to holds and \
+convert them to holds_* tests."""

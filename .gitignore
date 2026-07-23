@@ -1,0 +1,32 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Secrets — AGENTS.md §11.1. A net, not the rule.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+kubeconfig
+kubeconfig.*
+*.jwks.json
+!*.pub.jwks.json
+
+# Test infrastructure — AGENTS.md §5. Run artifacts carry credentials
+# (a kind kubeconfig embeds client certs) and are recreated every run.
+.steward-run/
+
+# Worktrees — AGENTS.md §1.4. Inside the repo so they stay inside the
+# approved workspace; ignored so they never appear as untracked.
+.worktrees/
+
+# Generated — regenerate, never hand-edit (AGENTS.md §9)
+/web/src/api-client/
+
+# Local tooling
+.DS_Store
+*.swp
+.idea/
+.vscode/

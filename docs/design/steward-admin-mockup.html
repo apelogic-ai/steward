@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en" data-mode="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Steward — admin UI mockup</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tabler-icons/3.2.0/tabler-icons.min.css">
+<style>
+:root{
+  --surface-0:#f5f4ef; --surface-1:#faf9f5; --surface-2:#ffffff;
+  --text-primary:#1a1a18; --text-secondary:#5f5e5a; --text-muted:#888780;
+  --border:rgba(0,0,0,.10); --border-strong:rgba(0,0,0,.18);
+  --text-accent:#185fa5; --bg-accent:#e6f1fb; --border-accent:#378add;
+  --text-danger:#a32d2d; --bg-danger:#fcebeb;
+  --text-success:#3b6d11; --bg-success:#eaf3de;
+  --text-warning:#854f0b; --bg-warning:#faeeda;
+  --radius:8px;
+  --font-sans:"Inter","Helvetica Neue",Helvetica,Arial,sans-serif;
+  --font-mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+[data-mode="dark"]{
+  --surface-0:#191917; --surface-1:#232320; --surface-2:#2c2c2a;
+  --text-primary:#f0efea; --text-secondary:#b4b2a9; --text-muted:#888780;
+  --border:rgba(255,255,255,.12); --border-strong:rgba(255,255,255,.22);
+  --text-accent:#85b7eb; --bg-accent:#0c447c;
+  --text-danger:#f09595; --bg-danger:#791f1f;
+  --text-success:#97c459; --bg-success:#27500a;
+  --text-warning:#ef9f27; --bg-warning:#633806;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--surface-0);color:var(--text-primary);
+  font-family:var(--font-sans);font-size:14px;line-height:1.5;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:860px;margin:0 auto;padding:24px 16px 64px}
+.topbar{display:flex;align-items:center;gap:12px;margin-bottom:20px;flex-wrap:wrap}
+.brand{font-size:18px;font-weight:500;letter-spacing:-.01em}
+.brand small{font-size:12px;color:var(--text-muted);font-weight:400;margin-left:6px}
+.nav{display:flex;gap:4px;margin-left:auto}
+.nav button{font-size:13px;padding:6px 12px}
+.nav button[aria-selected="true"]{background:var(--surface-2);border-color:var(--border-strong);font-weight:500}
+button{font-family:inherit;font-size:13px;background:transparent;color:var(--text-primary);
+  border:.5px solid var(--border-strong);border-radius:var(--radius);
+  padding:8px 14px;cursor:pointer;transition:background .12s}
+button:hover{background:var(--surface-1)}
+button:active{transform:scale(.98)}
+button:disabled{opacity:.45;cursor:not-allowed}
+input,select{font-family:inherit;font-size:13px;height:36px;padding:0 10px;
+  background:var(--surface-2);color:var(--text-primary);
+  border:.5px solid var(--border);border-radius:var(--radius)}
+input:focus,select:focus{outline:none;border-color:var(--border-accent);
+  box-shadow:0 0 0 1px var(--border-accent)}
+.panel{background:var(--surface-1);border-radius:12px;padding:16px}
+.card{background:var(--surface-2);border:.5px solid var(--border);border-radius:var(--radius);padding:14px}
+.pill{font-size:11px;padding:2px 8px;border-radius:var(--radius);display:inline-block}
+.screen{display:none}
+.screen.on{display:block}
+table{border-collapse:collapse;width:100%}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+  background:var(--surface-2);border:.5px solid var(--border-strong);border-radius:var(--radius);
+  padding:10px 16px;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.12);
+  opacity:0;pointer-events:none;transition:opacity .2s;max-width:600px}
+.toast.on{opacity:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="topbar">
+  <span class="brand">Steward <small>working name · admin UI mockup</small></span>
+  <div class="nav">
+    <button data-s="approvals" aria-selected="true">Approvals</button>
+    <button data-s="envelope" aria-selected="false">Envelope</button>
+    <button data-s="fleet" aria-selected="false">Fleet</button>
+    <button id="mode" title="Toggle dark mode" aria-label="Toggle dark mode"><i class="ti ti-moon"></i></button>
+  </div>
+</div>
+
+<!-- ================= APPROVALS ================= -->
+<section class="screen on" id="s-approvals">
+<div class="panel">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+    <i class="ti ti-inbox" style="font-size:20px;color:var(--text-secondary)"></i>
+    <span style="font-size:16px;font-weight:500">Approvals</span>
+    <span class="pill" style="background:var(--bg-danger);color:var(--text-danger)">3 pending</span>
+  </div>
+
+  <div style="display:grid;grid-template-columns:minmax(0,260px) minmax(0,1fr);gap:12px">
+
+    <div style="border:.5px solid var(--border);border-radius:var(--radius);overflow:hidden;background:var(--surface-2)">
+      <div style="padding:10px 12px;border-bottom:.5px solid var(--border);border-left:3px solid var(--text-accent);background:var(--bg-accent)">
+        <span class="pill" style="background:var(--surface-2);color:var(--text-accent)">admission</span>
+        <div style="font-size:13px;font-weight:500;color:var(--text-accent);margin-top:4px">leo-openclaw-a1b2</div>
+        <div style="font-size:12px;color:var(--text-accent)">budget over by $50/mo</div>
+      </div>
+      <div style="padding:10px 12px;border-bottom:.5px solid var(--border)">
+        <span class="pill" style="background:var(--bg-warning);color:var(--text-warning)">tool-time</span>
+        <div style="font-size:13px;font-weight:500;margin-top:4px">maya-openclaw-c3d4</div>
+        <div style="font-size:12px;color:var(--text-secondary)">destructive: drive.files.delete</div>
+      </div>
+      <div style="padding:10px 12px">
+        <span class="pill" style="background:var(--bg-accent);color:var(--text-accent)">modify</span>
+        <div style="font-size:13px;font-weight:500;margin-top:4px">sam-hermes-e5f6</div>
+        <div style="font-size:12px;color:var(--text-secondary)">adds model not in envelope</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap">
+        <span style="font-size:15px;font-weight:500">leo-openclaw-a1b2</span>
+        <span style="font-size:12px;color:var(--text-muted);font-family:var(--font-mono)">rev 3</span>
+      </div>
+      <div style="font-size:13px;color:var(--text-secondary);margin-top:2px">leo@apelogic.ai · role engineer · openclaw</div>
+
+      <div style="margin-top:14px;padding:10px 12px;background:var(--bg-danger);border-radius:var(--radius)">
+        <div style="font-size:12px;font-weight:500;color:var(--text-danger);margin-bottom:8px">Exceeds engineer envelope</div>
+        <table style="font-size:13px;table-layout:fixed">
+          <tr><td style="color:var(--text-danger);padding:3px 0">budget.amount</td>
+          <td style="text-align:right;color:var(--text-danger);font-family:var(--font-mono)">300 → ceiling 250</td></tr>
+        </table>
+        <div style="font-size:12px;color:var(--text-danger);margin-top:6px;opacity:.85">Everything else is within ceiling.</div>
+      </div>
+
+      <div style="margin-top:14px">
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">Requested (absolute, not a delta from current)</div>
+        <table style="font-size:13px;table-layout:fixed">
+          <tr style="border-bottom:.5px solid var(--border)"><td style="padding:6px 0;color:var(--text-secondary)">llms</td>
+            <td style="padding:6px 0;text-align:right">claude-sonnet-5, qwen2.5-coder <i class="ti ti-check" style="color:var(--text-success);vertical-align:-2px"></i></td></tr>
+          <tr style="border-bottom:.5px solid var(--border)"><td style="padding:6px 0;color:var(--text-secondary)">tools</td>
+            <td style="padding:6px 0;text-align:right">github:issues:write, google:drive:read <i class="ti ti-check" style="color:var(--text-success);vertical-align:-2px"></i></td></tr>
+          <tr style="border-bottom:.5px solid var(--border)"><td style="padding:6px 0;color:var(--text-secondary)">budget</td>
+            <td style="padding:6px 0;text-align:right;color:var(--text-danger)">$300 / mo <i class="ti ti-alert-triangle" style="vertical-align:-2px"></i></td></tr>
+          <tr><td style="padding:6px 0;color:var(--text-secondary)">ttl</td>
+            <td style="padding:6px 0;text-align:right">720h <i class="ti ti-check" style="color:var(--text-success);vertical-align:-2px"></i></td></tr>
+        </table>
+      </div>
+
+      <div style="margin-top:16px;padding-top:12px;border-top:.5px solid var(--border)">
+        <label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:6px">Grant ceiling for this instance</label>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:13px;color:var(--text-secondary)">$</span>
+          <input type="number" id="grant" value="300" min="0" max="300" step="10" style="width:90px">
+          <span style="font-size:13px;color:var(--text-secondary)">/ mo</span>
+          <span id="grantnote" style="font-size:12px;color:var(--text-muted)">grants exactly what was requested</span>
+        </div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:8px">
+          <i class="ti ti-lock" style="vertical-align:-2px"></i>
+          Applies to this agent only. The engineer role ceiling stays $250.
+        </div>
+      </div>
+
+      <div style="margin-top:14px">
+        <label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:6px">Jira evidence <span style="color:var(--text-danger)">required</span></label>
+        <input type="text" id="jira" placeholder="https://apelogic.atlassian.net/browse/AGENT-142" style="width:100%">
+        <div id="jiranote" style="font-size:12px;color:var(--text-muted);margin-top:6px">
+          <i class="ti ti-info-circle" style="vertical-align:-2px"></i>
+          Jira records the decision. Steward makes it. Approval is not possible without a link.
+        </div>
+      </div>
+
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <button id="approve" disabled>Approve and provision</button>
+        <button id="reject">Reject</button>
+      </div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ================= ENVELOPE ================= -->
+<section class="screen" id="s-envelope">
+<div class="panel">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+    <i class="ti ti-shield-lock" style="font-size:20px;color:var(--text-secondary)"></i>
+    <span style="font-size:16px;font-weight:500">Envelope</span>
+    <select id="role" style="width:160px">
+      <option>engineer</option><option>data-scientist</option><option>support</option>
+    </select>
+    <span style="margin-left:auto;font-size:12px;color:var(--text-muted);font-family:var(--font-mono)">data.steward.admission</span>
+  </div>
+  <div style="font-size:12px;color:var(--text-muted);margin-bottom:14px">Authored once. Enforced at admission, at provisioning, and at every tool call.</div>
+
+  <div style="display:grid;grid-template-columns:minmax(0,1fr) minmax(0,280px);gap:12px">
+    <div class="card">
+      <div style="margin-bottom:14px">
+        <label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:6px">Max budget</label>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="font-size:13px;color:var(--text-secondary)">$</span>
+          <input type="number" id="budget" value="250" min="0" max="1000" step="10" style="width:90px">
+          <span style="font-size:13px;color:var(--text-secondary)">/ mo</span>
+          <span id="bdelta" style="font-size:12px;color:var(--text-muted);margin-left:auto">unchanged</span>
+        </div>
+      </div>
+
+      <div style="margin-bottom:14px">
+        <label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:6px">Allowed models</label>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">
+          <span class="pill" style="background:var(--bg-success);color:var(--text-success)">claude-sonnet-5 <i class="ti ti-x"></i></span>
+          <span class="pill" style="background:var(--bg-success);color:var(--text-success)">qwen2.5-coder-14b <i class="ti ti-x"></i></span>
+          <span class="pill" style="background:var(--bg-success);color:var(--text-success)">gpt-4o-mini <i class="ti ti-x"></i></span>
+          <span class="pill" style="border:.5px dashed var(--border-strong);color:var(--text-muted)"><i class="ti ti-plus"></i> add</span>
+        </div>
+      </div>
+
+      <div style="margin-bottom:14px">
+        <label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:6px">Allowed tools — by action class</label>
+        <table style="font-size:13px;table-layout:fixed">
+          <tr style="border-bottom:.5px solid var(--border)">
+            <td style="padding:5px 0;color:var(--text-secondary)">github</td>
+            <td style="padding:5px 0;text-align:right">
+              <span class="pill" style="background:var(--bg-success);color:var(--text-success)">read</span>
+              <span class="pill" style="background:var(--bg-warning);color:var(--text-warning)">write</span>
+              <span class="pill" style="border:.5px solid var(--border);color:var(--text-muted)">destructive</span>
+            </td></tr>
+          <tr>
+            <td style="padding:5px 0;color:var(--text-secondary)">google</td>
+            <td style="padding:5px 0;text-align:right">
+              <span class="pill" style="background:var(--bg-success);color:var(--text-success)">read</span>
+              <span class="pill" style="border:.5px solid var(--border);color:var(--text-muted)">write</span>
+              <span class="pill" style="border:.5px solid var(--border);color:var(--text-muted)">destructive</span>
+            </td></tr>
+        </table>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:6px">Destructive is off by default. Turning it on removes the per-call approval prompt.</div>
+      </div>
+
+      <div>
+        <label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:6px">Max TTL</label>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input type="number" id="ttl" value="720" min="1" max="2160" step="24" style="width:90px">
+          <span style="font-size:13px;color:var(--text-secondary)">hours — standing delegation cap</span>
+        </div>
+      </div>
+    </div>
+
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <div class="card">
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">Blast radius</div>
+        <div style="display:flex;align-items:baseline;gap:6px">
+          <span style="font-size:24px;font-weight:500">14</span>
+          <span style="font-size:13px;color:var(--text-secondary)">agents inherit this</span>
+        </div>
+        <div id="stranded" style="font-size:13px;color:var(--text-secondary);margin-top:8px">No running agent is affected.</div>
+      </div>
+
+      <div id="prover" style="background:var(--bg-success);border-radius:var(--radius);padding:12px">
+        <div id="plabel" style="font-size:12px;color:var(--text-success);margin-bottom:6px">Prover</div>
+        <div id="pverdict" style="font-size:13px;color:var(--text-success)">
+          <i class="ti ti-check" style="vertical-align:-2px"></i> No conflicting rules. Safe to apply.
+        </div>
+      </div>
+
+      <div class="card">
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">On apply</div>
+        <div style="font-size:12px;color:var(--text-secondary);line-height:1.7">
+          <div><i class="ti ti-arrow-right" style="vertical-align:-2px"></i> OpenShell bundle — hot</div>
+          <div><i class="ti ti-arrow-right" style="vertical-align:-2px"></i> mcp-gw OPA — hot</div>
+          <div><i class="ti ti-arrow-right" style="vertical-align:-2px"></i> LiteLLM keys — hot</div>
+        </div>
+      </div>
+
+      <button id="apply" style="width:100%">Stage and apply</button>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ================= FLEET ================= -->
+<section class="screen" id="s-fleet">
+<div class="panel">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap">
+    <i class="ti ti-stack-2" style="font-size:20px;color:var(--text-secondary)"></i>
+    <span style="font-size:16px;font-weight:500">Fleet</span>
+    <span style="font-size:12px;color:var(--text-muted)">14 agents</span>
+    <div style="margin-left:auto;display:flex;gap:6px">
+      <button id="f-all" style="font-size:12px;padding:5px 10px">All</button>
+      <button id="f-alarm" style="font-size:12px;padding:5px 10px">Needs attention · 4</button>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:12px">
+    <div style="background:var(--surface-2);border-radius:var(--radius);padding:10px 12px">
+      <div style="font-size:12px;color:var(--text-muted)">Running</div><div style="font-size:20px;font-weight:500">10</div></div>
+    <div style="background:var(--surface-2);border-radius:var(--radius);padding:10px 12px">
+      <div style="font-size:12px;color:var(--text-muted)">Suspended</div><div style="font-size:20px;font-weight:500;color:var(--text-danger)">2</div></div>
+    <div style="background:var(--surface-2);border-radius:var(--radius);padding:10px 12px">
+      <div style="font-size:12px;color:var(--text-muted)">Spend / mo</div><div style="font-size:20px;font-weight:500">$2,140</div></div>
+    <div style="background:var(--surface-2);border-radius:var(--radius);padding:10px 12px">
+      <div style="font-size:12px;color:var(--text-muted)">Upgrade due</div><div style="font-size:20px;font-weight:500;color:var(--text-warning)">3</div></div>
+  </div>
+
+  <div id="rows" style="border:.5px solid var(--border);border-radius:var(--radius);overflow:hidden;background:var(--surface-2)"></div>
+
+  <div style="font-size:12px;color:var(--text-muted);margin-top:10px">
+    <i class="ti ti-alert-triangle" style="vertical-align:-2px;color:var(--text-warning)"></i>
+    Drift and orphaned refs are reconciler findings, not user actions — actual state diverged from the manifest.
+  </div>
+</div>
+</section>
+
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+function sendPrompt(t){
+  var el=document.getElementById('toast');
+  el.textContent='→ '+t;
+  el.classList.add('on');
+  clearTimeout(window._tt);
+  window._tt=setTimeout(function(){el.classList.remove('on');},4200);
+}
+
+document.querySelectorAll('.nav button[data-s]').forEach(function(b){
+  b.addEventListener('click',function(){
+    document.querySelectorAll('.nav button[data-s]').forEach(function(x){x.setAttribute('aria-selected','false');});
+    b.setAttribute('aria-selected','true');
+    document.querySelectorAll('.screen').forEach(function(s){s.classList.remove('on');});
+    document.getElementById('s-'+b.dataset.s).classList.add('on');
+  });
+});
+
+document.getElementById('mode').addEventListener('click',function(){
+  var r=document.documentElement;
+  r.dataset.mode = r.dataset.mode==='dark' ? 'light' : 'dark';
+  this.innerHTML = r.dataset.mode==='dark' ? '<i class="ti ti-sun"></i>' : '<i class="ti ti-moon"></i>';
+});
+
+var jira=document.getElementById('jira'),approve=document.getElementById('approve'),
+    grant=document.getElementById('grant'),grantnote=document.getElementById('grantnote'),
+    jiranote=document.getElementById('jiranote');
+function syncJira(){
+  var ok=/^https?:\/\/.+\/browse\/[A-Z]+-\d+/.test(jira.value.trim());
+  approve.disabled=!ok;
+  jiranote.innerHTML = ok
+    ? '<i class="ti ti-check" style="vertical-align:-2px;color:var(--text-success)"></i> Linked as evidence on the approved revision.'
+    : '<i class="ti ti-info-circle" style="vertical-align:-2px"></i> Jira records the decision. Steward makes it. Approval is not possible without a link.';
+}
+function syncGrant(){
+  var v=Math.round(Number(grant.value)||0);
+  grantnote.textContent = v>=300 ? 'grants exactly what was requested'
+    : v>250 ? 'partial grant — less than requested'
+    : 'at or below role ceiling — no exception needed';
+}
+jira.addEventListener('input',syncJira);
+grant.addEventListener('input',syncGrant);
+approve.addEventListener('click',function(){
+  sendPrompt('Approved leo-openclaw-a1b2 with granted ceiling $'+Math.round(Number(grant.value))+'/mo, evidence linked.');
+});
+document.getElementById('reject').addEventListener('click',function(){sendPrompt('Rejected leo-openclaw-a1b2.');});
+syncJira();syncGrant();
+
+var budget=document.getElementById('budget'),bdelta=document.getElementById('bdelta'),
+    stranded=document.getElementById('stranded'),prover=document.getElementById('prover'),
+    pverdict=document.getElementById('pverdict'),plabel=document.getElementById('plabel'),
+    BASE=250,AGENTS=[180,200,240,250,120,90,300,210,160,250,75,230,195,140];
+function syncEnv(){
+  var v=Math.round(Number(budget.value)||0),d=v-BASE,
+      over=AGENTS.filter(function(a){return a>v;}).length;
+  bdelta.textContent = d===0?'unchanged':(d>0?'widening +$'+d:'narrowing −$'+Math.abs(d));
+  bdelta.style.color = d===0?'var(--text-muted)':(d>0?'var(--text-secondary)':'var(--text-danger)');
+  if(d>=0){
+    stranded.innerHTML='No running agent is stranded. Widening never breaks an existing agent.';
+    prover.style.background='var(--bg-success)';
+    plabel.style.color='var(--text-success)';
+    pverdict.style.color='var(--text-success)';
+    pverdict.innerHTML='<i class="ti ti-check" style="vertical-align:-2px"></i> No conflicting rules. Safe to apply.';
+  }else{
+    stranded.innerHTML='<span style="color:var(--text-danger)"><i class="ti ti-alert-triangle" style="vertical-align:-2px"></i> '+over+' running agents are now above ceiling.</span><br><span style="color:var(--text-muted);font-size:12px">They were admitted under the old ceiling. Steward will not retroactively suspend them — choose a disposition.</span>';
+    prover.style.background='var(--bg-warning)';
+    plabel.style.color='var(--text-warning)';
+    pverdict.style.color='var(--text-warning)';
+    pverdict.innerHTML='<i class="ti ti-alert-triangle" style="vertical-align:-2px"></i> Narrowing strands '+over+' agents. Choose a disposition before apply.';
+  }
+}
+budget.addEventListener('input',syncEnv);
+document.getElementById('apply').addEventListener('click',function(){
+  sendPrompt('Staged engineer envelope: budget ceiling $'+Math.round(Number(budget.value))+'/mo.');
+});
+syncEnv();
+
+var DATA=[
+ {n:'leo-openclaw-a1b2',u:'leo@apelogic.ai',p:'Running',spend:118,budget:300,ttl:'18d',alarms:[]},
+ {n:'maya-openclaw-c3d4',u:'maya@apelogic.ai',p:'Suspended',spend:250,budget:250,ttl:'9d',alarms:['budget exhausted']},
+ {n:'sam-hermes-e5f6',u:'sam@apelogic.ai',p:'Running',spend:61,budget:150,ttl:'2d',alarms:['delegation expires soon']},
+ {n:'raj-openclaw-g7h8',u:'raj@apelogic.ai',p:'Running',spend:204,budget:250,ttl:'27d',alarms:['image 2 versions behind']},
+ {n:'ana-openclaw-i9j0',u:'ana@apelogic.ai',p:'Running',spend:33,budget:250,ttl:'30d',alarms:['drift: LiteLLM key missing']},
+ {n:'kim-hermes-k1l2',u:'kim@apelogic.ai',p:'Modifying',spend:88,budget:200,ttl:'21d',alarms:[]}
+];
+var PHASE={Running:['var(--bg-success)','var(--text-success)'],
+           Suspended:['var(--bg-danger)','var(--text-danger)'],
+           Modifying:['var(--bg-accent)','var(--text-accent)']};
+function bar(s,b){
+  var pct=Math.min(100,Math.round(s/b*100)),
+      c=pct>=100?'var(--text-danger)':pct>=80?'var(--text-warning)':'var(--text-secondary)';
+  return '<div style="display:flex;align-items:center;gap:6px">'+
+    '<div style="flex:1;height:4px;border-radius:2px;background:var(--border);overflow:hidden">'+
+    '<div style="width:'+pct+'%;height:100%;background:'+c+'"></div></div>'+
+    '<span style="font-size:11px;color:'+c+';min-width:70px;text-align:right">$'+s+' / '+b+'</span></div>';
+}
+function render(list){
+  document.getElementById('rows').innerHTML=list.map(function(d,i){
+    var ph=PHASE[d.p]||['var(--surface-1)','var(--text-secondary)'];
+    var al=d.alarms.map(function(a){
+      var dr=a.indexOf('drift')===0;
+      return '<span class="pill" style="background:'+(dr?'var(--bg-danger)':'var(--bg-warning)')+';color:'+(dr?'var(--text-danger)':'var(--text-warning)')+'">'+a+'</span>';
+    }).join(' ');
+    return '<div style="display:grid;grid-template-columns:minmax(0,1.4fr) 92px minmax(0,1.2fr) 60px;gap:10px;align-items:center;padding:10px 12px;'+(i?'border-top:.5px solid var(--border);':'')+'">'+
+      '<div style="min-width:0"><div style="font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+d.n+'</div>'+
+      '<div style="font-size:12px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+d.u+'</div>'+
+      (al?'<div style="margin-top:4px;display:flex;gap:4px;flex-wrap:wrap">'+al+'</div>':'')+'</div>'+
+      '<div><span class="pill" style="background:'+ph[0]+';color:'+ph[1]+'">'+d.p+'</span></div>'+
+      '<div>'+bar(d.spend,d.budget)+'<div style="font-size:11px;color:var(--text-muted);margin-top:3px">expires '+d.ttl+'</div></div>'+
+      '<div style="text-align:right"><button data-n="'+d.n+'" style="font-size:11px;padding:4px 8px">Open</button></div></div>';
+  }).join('');
+  document.querySelectorAll('#rows button').forEach(function(b){
+    b.addEventListener('click',function(){sendPrompt('Open fleet detail for '+b.dataset.n+'.');});
+  });
+}
+document.getElementById('f-all').addEventListener('click',function(){render(DATA);});
+document.getElementById('f-alarm').addEventListener('click',function(){render(DATA.filter(function(d){return d.alarms.length;}));});
+render(DATA);
+</script>
+</body>
+</html>
