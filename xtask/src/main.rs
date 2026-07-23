@@ -8,8 +8,8 @@ use std::process::{Command, ExitCode};
 use steward_adapter_fake::IMPLEMENTED_PORTS as FAKE_PORTS;
 use steward_ports::{Maturity, PORTS};
 use xtask::{
-    local_test_context_is_safe, migration_history_violations, neutrality_violations,
-    secret_violations, validate_register_content,
+    local_test_context_is_safe, migration_base_candidates, migration_history_violations,
+    neutrality_violations, secret_violations, select_migration_base, validate_register_content,
 };
 
 type TaskResult = Result<(), String>;
@@ -115,7 +115,7 @@ fn migrate_check() -> TaskResult {
         .into_iter()
         .filter_map(|path| path.file_name().and_then(OsStr::to_str).map(str::to_owned))
         .collect::<Vec<_>>();
-    let base = env::var("STEWARD_MIGRATION_BASE").unwrap_or_else(|_| "origin/main".to_owned());
+    let base = resolve_migration_base()?;
     let range = format!("{base}...HEAD");
     let output = Command::new("git")
         .args([
@@ -149,6 +149,60 @@ fn migrate_check() -> TaskResult {
         names.len(),
     );
     Ok(())
+}
+
+fn resolve_migration_base() -> Result<String, String> {
+    let configured = env::var("STEWARD_MIGRATION_BASE").ok();
+    let candidates = migration_base_candidates(configured.as_deref());
+    let mut resolved = Vec::new();
+
+    for candidate in &candidates {
+        if let Some(commit) = resolve_git_commit(candidate)? {
+            resolved.push((candidate.clone(), commit));
+        }
+    }
+
+    let base = select_migration_base(&candidates, &resolved)?;
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", &base, "HEAD"])
+        .current_dir(root())
+        .status()
+        .map_err(|error| format!("failed to compare migration base {base} with HEAD: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "migration comparison base {base} is not an ancestor of HEAD"
+        ));
+    }
+
+    Ok(base)
+}
+
+fn resolve_git_commit(reference: &str) -> Result<Option<String>, String> {
+    let commitish = format!("{reference}^{{commit}}");
+    let output = Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &commitish,
+        ])
+        .current_dir(root())
+        .output()
+        .map_err(|error| format!("failed to resolve migration base {reference}: {error}"))?;
+    if output.status.success() {
+        return String::from_utf8(output.stdout)
+            .map(|commit| Some(commit.trim().to_owned()))
+            .map_err(|_| format!("git returned a non-UTF-8 commit for {reference}"));
+    }
+    if output.stderr.is_empty() {
+        return Ok(None);
+    }
+
+    Err(format!(
+        "git could not resolve migration base {reference}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
 }
 
 fn verify_manifests() -> TaskResult {
