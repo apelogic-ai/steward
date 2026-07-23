@@ -404,9 +404,24 @@ Refs: <issue>
 
 Non-slice work squashes to one commit per PR with a conventional-commit subject.
 
-**Never commit and never switch branches unless explicitly told to.** Stay on
-the current branch for the whole session. If a task appears to need a different
-branch, ask first.
+### 6.1 Committing is protection; the branch is the boundary
+
+The rule is about **blast radius**, not about the act of committing. A commit on
+your own branch is recoverable and is the only thing standing between hours of
+work and a stray `checkout`. Withholding it does not make anything safer.
+
+- **Commit freely on your own branch**, as often as is useful. Uncommitted work
+  is unprotected work; a long unattended run that ends with a full slice in the
+  working tree has produced nothing durable.
+- **Never commit to `main`.** §1.
+- **Never switch branches unless explicitly told to.** Stay on the current
+  branch for the whole session. If a task appears to need a different branch,
+  ask first — and see §1.4 before reaching for a worktree to get around it.
+- **Never push without announcing it first.** §1.3.
+- **Never merge or close.** §1.2.
+The distinction matters most in exactly the case where the old wording failed:
+an unattended run. Attended, a withheld commit costs a moment. Unattended, it
+risks the whole session.
 
 ## 7. Gates
 
