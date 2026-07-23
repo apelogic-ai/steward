@@ -1,0 +1,16 @@
+[package]
+name = "steward-apiserver"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+steward-admission = { path = "../steward-admission", version = "=0.0.0" }
+steward-ports = { path = "../steward-ports", version = "=0.0.0" }
+steward-store = { path = "../steward-store", version = "=0.0.0" }
+steward-types = { path = "../steward-types", version = "=0.0.0" }
+
+[lints]
+workspace = true

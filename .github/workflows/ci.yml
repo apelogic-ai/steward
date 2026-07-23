@@ -1,0 +1,85 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_DENY_VERSION: "0.20.2"
+  OPA_VERSION: "1.18.2"
+
+jobs:
+  pinned:
+    name: pinned
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt
+
+      - name: Install pinned gate tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools_dir="${RUNNER_TEMP}/steward-tools"
+          mkdir -p "${tools_dir}"
+
+          deny_asset="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          deny_url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}"
+          curl --fail --location --silent --show-error \
+            --output "${tools_dir}/${deny_asset}" "${deny_url}/${deny_asset}"
+          curl --fail --location --silent --show-error \
+            --output "${tools_dir}/${deny_asset}.sha256" "${deny_url}/${deny_asset}.sha256"
+          deny_hash="$(cut -d ' ' -f 1 "${tools_dir}/${deny_asset}.sha256")"
+          echo "${deny_hash}  ${tools_dir}/${deny_asset}" | sha256sum --check -
+          tar --extract --gzip --strip-components=1 \
+            --file "${tools_dir}/${deny_asset}" --directory "${tools_dir}"
+
+          opa_asset="opa_linux_amd64_static"
+          opa_url="https://www.openpolicyagent.org/downloads/v${OPA_VERSION}"
+          curl --fail --location --silent --show-error \
+            --output "${tools_dir}/${opa_asset}" "${opa_url}/${opa_asset}"
+          curl --fail --location --silent --show-error \
+            --output "${tools_dir}/${opa_asset}.sha256" "${opa_url}/${opa_asset}.sha256"
+          opa_hash="$(cut -d ' ' -f 1 "${tools_dir}/${opa_asset}.sha256")"
+          echo "${opa_hash}  ${tools_dir}/${opa_asset}" | sha256sum --check -
+          mv "${tools_dir}/${opa_asset}" "${tools_dir}/opa"
+          chmod +x "${tools_dir}/opa"
+
+          echo "${tools_dir}" >> "${GITHUB_PATH}"
+
+      - name: Run pinned gate
+        env:
+          STEWARD_MIGRATION_BASE: ${{ github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || github.sha }}
+        run: cargo xtask ci
+
+  latest-nightly:
+    name: latest-nightly
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # "latest" means latest upstream conformance target, not a different Rust release.
+      - name: Install Steward Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Run informational latest-upstream lane
+        run: cargo xtask conformance --latest
