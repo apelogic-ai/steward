@@ -1,0 +1,13 @@
+[package]
+name = "steward-adapter-mcp-gw"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+steward-ports = { path = "../../crates/steward-ports", version = "=0.0.0" }
+
+[lints]
+workspace = true

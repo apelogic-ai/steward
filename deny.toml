@@ -1,6 +1,6 @@
-# cargo-deny — SKETCH. Crate names are placeholders until the workspace exists.
-# Verify `wrappers` semantics against the installed cargo-deny before relying on
-# this to gate anything.
+# cargo-deny configuration. `cargo xtask layering-test` verifies the `wrappers`
+# semantics against the installed cargo-deny by accepting the adapter path and
+# rejecting an ephemeral core-crate violation.
 #
 # This file implements AGENTS.md §8 invariant 2 ("vendor semantics stay in their
 # adapter") and §8 invariant 9 (no panicking paths outside tests, via clippy —
@@ -14,6 +14,9 @@ all-features = true
 version = 2
 allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0"]
 confidence-threshold = 0.9
+# Bootstrap has no third-party graph yet. Keep the complete policy without
+# emitting a warning merely because an allowed license has not appeared.
+unused-allowed-license = "allow"
 
 [advisories]
 version = 2
