@@ -1,0 +1,20 @@
+[package]
+name = "xtask"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+steward-adapter-fake = { path = "../adapters/fake", version = "=0.0.0" }
+steward-adapter-jira = { path = "../adapters/jira", version = "=0.0.0" }
+steward-adapter-litellm = { path = "../adapters/litellm", version = "=0.0.0" }
+steward-adapter-mcp-gw = { path = "../adapters/mcp-gw", version = "=0.0.0" }
+steward-adapter-opa = { path = "../adapters/opa", version = "=0.0.0" }
+steward-adapter-openshell = { path = "../adapters/openshell", version = "=0.0.0" }
+steward-adapter-spire = { path = "../adapters/spire", version = "=0.0.0" }
+steward-ports = { path = "../crates/steward-ports", version = "=0.0.0" }
+
+[lints]
+workspace = true

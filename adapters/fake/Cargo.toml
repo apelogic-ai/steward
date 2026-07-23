@@ -1,0 +1,14 @@
+[package]
+name = "steward-adapter-fake"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+steward-ports = { path = "../../crates/steward-ports", version = "=0.0.0" }
+steward-types = { path = "../../crates/steward-types", version = "=0.0.0" }
+
+[lints]
+workspace = true

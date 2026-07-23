@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "adapters/fake",
+    "adapters/jira",
+    "adapters/litellm",
+    "adapters/mcp-gw",
+    "adapters/opa",
+    "adapters/openshell",
+    "adapters/spire",
+    "crates/steward-admission",
+    "crates/steward-apiserver",
+    "crates/steward-controller",
+    "crates/steward-ports",
+    "crates/steward-store",
+    "crates/steward-types",
+    "xtask",
+]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+rust-version = "1.95"
+version = "0.0.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+expect_used = "deny"
+panic = "deny"
+unwrap_used = "deny"
