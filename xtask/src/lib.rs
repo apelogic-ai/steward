@@ -18,6 +18,7 @@ pub fn neutrality_violations(content: &str) -> Vec<String> {
     let mut violations = Vec::new();
 
     for region in text_regions(content) {
+        let path_basenames = filename_path_basenames(&region);
         for token in region.split(|character: char| {
             !character.is_ascii_alphanumeric() && !matches!(character, '@' | '.' | ':' | '-' | '_')
         }) {
@@ -45,7 +46,11 @@ pub fn neutrality_violations(content: &str) -> Vec<String> {
                 continue;
             }
 
-            if looks_like_hostname(token) && !is_reserved_hostname(token) {
+            if looks_like_hostname(token)
+                && !path_basenames.contains(token)
+                && !looks_like_unambiguous_filename(token)
+                && !is_reserved_hostname(token)
+            {
                 violations.push(format!("non-reserved hostname: {token}"));
             }
         }
@@ -163,6 +168,47 @@ pub fn migration_history_violations(changes: &str) -> Vec<String> {
         .collect()
 }
 
+pub fn migration_base_candidates(configured: Option<&str>) -> Vec<String> {
+    let configured = configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| !value.bytes().all(|byte| byte == b'0'));
+
+    configured.map_or_else(
+        || vec!["main".to_owned(), "origin/main".to_owned()],
+        |value| vec![value.to_owned()],
+    )
+}
+
+pub fn select_migration_base(
+    candidates: &[String],
+    resolved: &[(String, String)],
+) -> Result<String, String> {
+    if resolved.is_empty() {
+        return Err(if candidates.len() == 1 {
+            format!(
+                "migration comparison base {} does not resolve to a commit",
+                candidates[0]
+            )
+        } else {
+            "no migration comparison base is available; set STEWARD_MIGRATION_BASE or sync local main"
+                .to_owned()
+        });
+    }
+
+    if resolved.len() > 1 && resolved.windows(2).any(|pair| pair[0].1 != pair[1].1) {
+        return Err(
+            "local main and origin/main differ; complete the mandatory sync before migrate-check"
+                .to_owned(),
+        );
+    }
+
+    resolved
+        .first()
+        .map(|(reference, _commit)| reference.clone())
+        .ok_or_else(|| "no migration comparison base is available".to_owned())
+}
+
 fn contains_toml_key(value: &toml::Value, key: &str) -> bool {
     match value {
         toml::Value::Table(table) => {
@@ -179,7 +225,13 @@ fn text_regions(content: &str) -> Vec<String> {
     let mut index = 0;
 
     while index < characters.len() {
+        if characters[index] == '\'' && is_rust_lifetime(&characters, index) {
+            index += 1;
+            continue;
+        }
+
         if matches!(characters[index], '"' | '\'') {
+            let opening = index;
             let delimiter = characters[index];
             index += 1;
             let mut region = String::new();
@@ -202,6 +254,8 @@ fn text_regions(content: &str) -> Vec<String> {
             }
             if closed {
                 regions.push(region);
+            } else {
+                index = opening + 1;
             }
             continue;
         }
@@ -243,6 +297,38 @@ fn text_regions(content: &str) -> Vec<String> {
     regions
 }
 
+fn is_rust_lifetime(characters: &[char], quote: usize) -> bool {
+    let Some(first) = characters.get(quote + 1) else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() && *first != '_' {
+        return false;
+    }
+
+    let mut after = quote + 2;
+    while characters
+        .get(after)
+        .is_some_and(|character| character.is_ascii_alphanumeric() || *character == '_')
+    {
+        after += 1;
+    }
+    if characters.get(after) == Some(&'\'') {
+        return false;
+    }
+
+    matches!(
+        characters.get(after),
+        Some('>' | ',' | ':' | '+' | ')' | ']')
+    ) || characters
+        .get(after)
+        .is_some_and(|character| character.is_whitespace())
+        && characters[..quote]
+            .iter()
+            .rev()
+            .find(|character| !character.is_whitespace())
+            .is_some_and(|character| matches!(character, '<' | '&' | ':' | '+' | ','))
+}
+
 fn is_reserved_email(token: &str) -> bool {
     let Some((local, domain)) = token.rsplit_once('@') else {
         return false;
@@ -280,8 +366,91 @@ fn looks_like_hostname(token: &str) -> bool {
         })
 }
 
+fn filename_path_basenames(region: &str) -> BTreeSet<String> {
+    region
+        .split_ascii_whitespace()
+        .filter_map(|raw| {
+            let path = raw.trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+                )
+            });
+            if path.contains("://") || !path.contains(['/', '\\']) {
+                return None;
+            }
+            let basename = path.rsplit(['/', '\\']).next()?;
+            looks_like_file_basename(basename).then(|| basename.to_owned())
+        })
+        .collect()
+}
+
+fn looks_like_unambiguous_filename(token: &str) -> bool {
+    let lowercase = token.to_ascii_lowercase();
+    if matches!(
+        lowercase.as_str(),
+        "changelog.md" | "contributing.md" | "license.md" | "readme.md"
+    ) {
+        return true;
+    }
+
+    let Some((_stem, extension)) = lowercase.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        extension,
+        "css"
+            | "go"
+            | "html"
+            | "js"
+            | "json"
+            | "jsx"
+            | "lock"
+            | "proto"
+            | "sql"
+            | "toml"
+            | "ts"
+            | "tsx"
+            | "txt"
+            | "yaml"
+            | "yml"
+    )
+}
+
+fn looks_like_file_basename(token: &str) -> bool {
+    let Some((_stem, extension)) = token.rsplit_once('.') else {
+        return false;
+    };
+
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "css"
+            | "go"
+            | "html"
+            | "js"
+            | "json"
+            | "jsx"
+            | "lock"
+            | "md"
+            | "proto"
+            | "py"
+            | "rs"
+            | "sh"
+            | "sql"
+            | "toml"
+            | "ts"
+            | "tsx"
+            | "txt"
+            | "yaml"
+            | "yml"
+    )
+}
+
 fn is_reserved_hostname(token: &str) -> bool {
-    token == "test" || token.ends_with(".test") || is_example_domain(token)
+    token == "test"
+        || token.ends_with(".test")
+        || is_example_domain(token)
+        || is_recognized_upstream_hostname(token)
 }
 
 fn is_example_domain(token: &str) -> bool {
@@ -289,6 +458,12 @@ fn is_example_domain(token: &str) -> bool {
         || token.ends_with(".example.com")
         || token == "example.org"
         || token.ends_with(".example.org")
+}
+
+fn is_recognized_upstream_hostname(token: &str) -> bool {
+    ["crates.io", "docs.rs", "github.com", "openpolicyagent.org"]
+        .into_iter()
+        .any(|domain| token == domain || token.ends_with(&format!(".{domain}")))
 }
 
 fn is_sensitive_path(path: &Path) -> bool {
@@ -371,8 +546,8 @@ fn is_literal_secret(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        local_test_context_is_safe, migration_history_violations, neutrality_violations,
-        secret_violations, validate_register_content,
+        local_test_context_is_safe, migration_base_candidates, migration_history_violations,
+        neutrality_violations, secret_violations, select_migration_base, validate_register_content,
     };
     use std::path::Path;
 
@@ -480,6 +655,54 @@ mod tests {
             violations.len(),
             1,
             "neutrality gate must inspect identifiers in single-quoted fixture text"
+        );
+    }
+
+    #[test]
+    fn neutrality_scans_after_rust_lifetimes() {
+        let host = ["secret", "corp.invalid"].join(".");
+        let content = format!("fn borrow<'a>() {{}} let host = \"{host}\";");
+
+        let violations = neutrality_violations(&content);
+
+        assert_eq!(
+            violations.len(),
+            1,
+            "a Rust lifetime must not blind the neutrality gate to later identifiers"
+        );
+    }
+
+    #[test]
+    fn neutrality_ignores_common_filenames() {
+        let violations = neutrality_violations("\"src/main.rs\" \"config.yaml\" \"README.md\"");
+
+        assert!(
+            violations.is_empty(),
+            "routine filename literals are not hostnames: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn neutrality_still_rejects_hostname_shaped_like_a_filename() {
+        let hostname = ["service", "rs"].join(".");
+        let violations = neutrality_violations(&format!("\"{hostname}\""));
+
+        assert_eq!(
+            violations.len(),
+            1,
+            "an ambiguous bare name under a real top-level domain must remain a hostname"
+        );
+    }
+
+    #[test]
+    fn neutrality_allows_recognized_upstream_hosts() {
+        let violations = neutrality_violations(
+            "// see github.com/org/repo, crates.io, docs.rs, and openpolicyagent.org",
+        );
+
+        assert!(
+            violations.is_empty(),
+            "recognized public upstream references must remain allowed in comments: {violations:?}"
         );
     }
 
@@ -604,6 +827,57 @@ id = "G-6"
         assert!(
             violations.is_empty(),
             "new migration files must remain allowed: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn migration_base_falls_back_to_local_then_remote_main() {
+        assert_eq!(
+            migration_base_candidates(None),
+            vec!["main", "origin/main"],
+            "local checks must work without an origin remote while detecting stale refs"
+        );
+    }
+
+    #[test]
+    fn migration_base_ignores_an_all_zero_event_sha() {
+        let zero_sha = "0000000000000000000000000000000000000000";
+
+        assert_eq!(
+            migration_base_candidates(Some(zero_sha)),
+            vec!["main", "origin/main"],
+            "an all-zero push event SHA must fall back to real repository refs"
+        );
+    }
+
+    #[test]
+    fn migration_base_honors_an_explicit_commit() {
+        let commit = "1234567890abcdef1234567890abcdef12345678";
+
+        assert_eq!(
+            migration_base_candidates(Some(commit)),
+            vec![commit],
+            "CI must compare against its explicit event commit"
+        );
+    }
+
+    #[test]
+    fn migration_base_rejects_divergent_local_and_remote_main() {
+        let candidates = vec!["main".to_owned(), "origin/main".to_owned()];
+        let resolved = vec![
+            ("main".to_owned(), "1111111".to_owned()),
+            ("origin/main".to_owned(), "2222222".to_owned()),
+        ];
+
+        let selection = select_migration_base(&candidates, &resolved);
+
+        assert_eq!(
+            selection,
+            Err(
+                "local main and origin/main differ; complete the mandatory sync before migrate-check"
+                    .to_owned()
+            ),
+            "a stale local or remote main ref must fail closed"
         );
     }
 

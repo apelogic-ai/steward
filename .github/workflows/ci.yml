@@ -64,7 +64,7 @@ jobs:
 
       - name: Run pinned gate
         env:
-          STEWARD_MIGRATION_BASE: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+          STEWARD_MIGRATION_BASE: ${{ github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || github.sha }}
         run: cargo xtask ci
 
   latest-nightly:
