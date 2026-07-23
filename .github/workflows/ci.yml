@@ -46,7 +46,8 @@ jobs:
             --output "${tools_dir}/${deny_asset}.sha256" "${deny_url}/${deny_asset}.sha256"
           deny_hash="$(cut -d ' ' -f 1 "${tools_dir}/${deny_asset}.sha256")"
           echo "${deny_hash}  ${tools_dir}/${deny_asset}" | sha256sum --check -
-          tar --extract --gzip --file "${tools_dir}/${deny_asset}" --directory "${tools_dir}"
+          tar --extract --gzip --strip-components=1 \
+            --file "${tools_dir}/${deny_asset}" --directory "${tools_dir}"
 
           opa_asset="opa_linux_amd64_static"
           opa_url="https://www.openpolicyagent.org/downloads/v${OPA_VERSION}"
