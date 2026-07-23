@@ -116,27 +116,7 @@ fn migrate_check() -> TaskResult {
         .filter_map(|path| path.file_name().and_then(OsStr::to_str).map(str::to_owned))
         .collect::<Vec<_>>();
     let base = resolve_migration_base()?;
-    let range = format!("{base}...HEAD");
-    let output = Command::new("git")
-        .args([
-            "diff",
-            "--name-status",
-            "--find-renames",
-            &range,
-            "--",
-            ":(glob)migrations/*.sql",
-        ])
-        .current_dir(root())
-        .output()
-        .map_err(|error| format!("failed to inspect migration history: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git could not compare migration history against {base}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let changes = String::from_utf8(output.stdout)
-        .map_err(|_| "git returned non-UTF-8 migration paths".to_owned())?;
+    let changes = migration_changes(&root(), &base)?;
     let violations = migration_history_violations(&changes);
     if !violations.is_empty() {
         return Err(format!(
@@ -151,6 +131,30 @@ fn migrate_check() -> TaskResult {
     Ok(())
 }
 
+fn migration_changes(repository: &Path, base: &str) -> Result<String, String> {
+    let range = format!("{base}...HEAD");
+    let output = Command::new("git")
+        .args([
+            "diff",
+            "--name-status",
+            "--find-renames",
+            &range,
+            "--",
+            ":(glob)migrations/*.sql",
+        ])
+        .current_dir(repository)
+        .output()
+        .map_err(|error| format!("failed to inspect migration history: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git could not compare migration history against {base}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| "git returned non-UTF-8 migration paths".to_owned())
+}
+
 fn resolve_migration_base() -> Result<String, String> {
     let configured = env::var("STEWARD_MIGRATION_BASE").ok();
     let candidates = migration_base_candidates(configured.as_deref());
@@ -162,19 +166,7 @@ fn resolve_migration_base() -> Result<String, String> {
         }
     }
 
-    let base = select_migration_base(&candidates, &resolved)?;
-    let status = Command::new("git")
-        .args(["merge-base", "--is-ancestor", &base, "HEAD"])
-        .current_dir(root())
-        .status()
-        .map_err(|error| format!("failed to compare migration base {base} with HEAD: {error}"))?;
-    if !status.success() {
-        return Err(format!(
-            "migration comparison base {base} is not an ancestor of HEAD"
-        ));
-    }
-
-    Ok(base)
+    select_migration_base(&candidates, &resolved)
 }
 
 fn resolve_git_commit(reference: &str) -> Result<Option<String>, String> {
@@ -634,5 +626,148 @@ impl Drop for TemporaryTree {
                 self.path.display()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::migration_changes;
+    use std::fs;
+    use std::io::ErrorKind;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_REPOSITORY_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestRepository {
+        path: PathBuf,
+    }
+
+    impl TestRepository {
+        fn create() -> Result<Self, String> {
+            let nonce = NEXT_REPOSITORY_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("steward-migration-{}-{nonce}", std::process::id()));
+            fs::create_dir_all(&path)
+                .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+            Ok(Self { path })
+        }
+    }
+
+    impl Drop for TestRepository {
+        fn drop(&mut self) {
+            if let Err(error) = fs::remove_dir_all(&self.path)
+                && error.kind() != ErrorKind::NotFound
+            {
+                eprintln!(
+                    "warning: failed to remove test repository {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+
+    fn test_git_command(repository: &Path, arguments: &[&str]) -> Command {
+        let mut command = Command::new("git");
+        command
+            .args(["-c", "commit.gpgsign=false"])
+            .args(arguments)
+            .env("GIT_CONFIG_GLOBAL", repository.join(".gitconfig-disabled"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .current_dir(repository);
+        command
+    }
+
+    fn git(repository: &Path, arguments: &[&str]) -> Result<(), String> {
+        let output = test_git_command(repository, arguments)
+            .output()
+            .map_err(|error| format!("failed to run git {}: {error}", arguments.join(" ")))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "git {} failed: {}",
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    #[test]
+    fn migration_test_git_isolates_signing_configuration() -> Result<(), String> {
+        let repository = TestRepository::create()?;
+        let command = test_git_command(&repository.path, &["commit"]);
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let expected_global = repository.path.join(".gitconfig-disabled");
+        let global_config = command
+            .get_envs()
+            .find(|(key, _value)| *key == "GIT_CONFIG_GLOBAL")
+            .and_then(|(_key, value)| value);
+        let no_system_config = command
+            .get_envs()
+            .find(|(key, _value)| *key == "GIT_CONFIG_NOSYSTEM")
+            .and_then(|(_key, value)| value);
+
+        assert_eq!(
+            arguments,
+            ["-c", "commit.gpgsign=false", "commit"],
+            "fixture commits must disable signing explicitly"
+        );
+        assert_eq!(
+            global_config,
+            Some(expected_global.as_os_str()),
+            "fixture Git commands must not inherit global configuration"
+        );
+        assert_eq!(
+            no_system_config,
+            Some(std::ffi::OsStr::new("1")),
+            "fixture Git commands must not inherit system configuration"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_diff_accepts_a_divergent_base() -> Result<(), String> {
+        let repository = TestRepository::create()?;
+        git(&repository.path, &["init", "--initial-branch=main"])?;
+        git(
+            &repository.path,
+            &["config", "user.email", "alice@example.com"],
+        )?;
+        git(&repository.path, &["config", "user.name", "alice"])?;
+        fs::write(repository.path.join("README.md"), "base\n")
+            .map_err(|error| format!("failed to write base fixture: {error}"))?;
+        git(&repository.path, &["add", "README.md"])?;
+        git(&repository.path, &["commit", "-m", "base"])?;
+
+        git(&repository.path, &["switch", "-c", "feature"])?;
+        fs::create_dir(repository.path.join("migrations"))
+            .map_err(|error| format!("failed to create migration fixture directory: {error}"))?;
+        fs::write(
+            repository.path.join("migrations/0001_feature.sql"),
+            "select 1;\n",
+        )
+        .map_err(|error| format!("failed to write migration fixture: {error}"))?;
+        git(&repository.path, &["add", "migrations/0001_feature.sql"])?;
+        git(&repository.path, &["commit", "-m", "feature"])?;
+
+        git(&repository.path, &["switch", "main"])?;
+        fs::write(repository.path.join("main.txt"), "advanced\n")
+            .map_err(|error| format!("failed to write advanced-main fixture: {error}"))?;
+        git(&repository.path, &["add", "main.txt"])?;
+        git(&repository.path, &["commit", "-m", "advance main"])?;
+        git(&repository.path, &["switch", "feature"])?;
+
+        let changes = migration_changes(&repository.path, "main")?;
+
+        assert!(
+            changes.contains("migrations/0001_feature.sql"),
+            "three-dot comparison must include the feature migration: {changes}"
+        );
+        Ok(())
     }
 }

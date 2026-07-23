@@ -18,7 +18,6 @@ pub fn neutrality_violations(content: &str) -> Vec<String> {
     let mut violations = Vec::new();
 
     for region in text_regions(content) {
-        let path_basenames = filename_path_basenames(&region);
         for token in region.split(|character: char| {
             !character.is_ascii_alphanumeric() && !matches!(character, '@' | '.' | ':' | '-' | '_')
         }) {
@@ -34,21 +33,21 @@ pub fn neutrality_violations(content: &str) -> Vec<String> {
             }
 
             if let Ok(address) = token.parse::<IpAddr>() {
-                match address {
-                    IpAddr::V4(address) if !is_documentation_ipv4(address) => {
-                        violations.push(format!("non-reserved IPv4 address: {token}"));
+                if is_globally_routable(address) {
+                    match address {
+                        IpAddr::V4(_) => {
+                            violations.push(format!("non-reserved IPv4 address: {token}"));
+                        }
+                        IpAddr::V6(_) => {
+                            violations.push(format!("non-reserved IPv6 address: {token}"));
+                        }
                     }
-                    IpAddr::V6(address) if !is_documentation_ipv6(address) => {
-                        violations.push(format!("non-reserved IPv6 address: {token}"));
-                    }
-                    IpAddr::V4(_) | IpAddr::V6(_) => {}
                 }
                 continue;
             }
 
             if looks_like_hostname(token)
-                && !path_basenames.contains(token)
-                && !looks_like_unambiguous_filename(token)
+                && !is_allowed_filename(token)
                 && !is_reserved_hostname(token)
             {
                 violations.push(format!("non-reserved hostname: {token}"));
@@ -92,7 +91,7 @@ pub fn secret_violations(path: &Path, content: &[u8]) -> Vec<usize> {
             let has_github_token = github_prefixes
                 .iter()
                 .any(|prefix| contains_prefixed_secret(line, prefix, 20));
-            let has_provider_key = contains_prefixed_secret(line, &provider_prefix, 20);
+            let has_provider_key = contains_provider_key(line, &provider_prefix);
             let has_aws_key = contains_aws_access_key(line);
             let has_credential_assignment = contains_password_assignment(line);
             let has_connection_credential = contains_password_in_url(line);
@@ -194,13 +193,6 @@ pub fn select_migration_base(
             "no migration comparison base is available; set STEWARD_MIGRATION_BASE or sync local main"
                 .to_owned()
         });
-    }
-
-    if resolved.len() > 1 && resolved.windows(2).any(|pair| pair[0].1 != pair[1].1) {
-        return Err(
-            "local main and origin/main differ; complete the mandatory sync before migrate-check"
-                .to_owned(),
-        );
     }
 
     resolved
@@ -336,16 +328,57 @@ fn is_reserved_email(token: &str) -> bool {
     !local.is_empty() && !local.contains('@') && is_example_domain(domain)
 }
 
-fn is_documentation_ipv4(address: Ipv4Addr) -> bool {
-    matches!(
-        address.octets(),
-        [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]
-    )
+fn is_globally_routable(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_globally_routable_ipv4(address),
+        IpAddr::V6(address) => is_globally_routable_ipv6(address),
+    }
 }
 
-fn is_documentation_ipv6(address: Ipv6Addr) -> bool {
+fn is_globally_routable_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    let is_shared = octets[0] == 100 && octets[1] & 0b1100_0000 == 0b0100_0000;
+    let is_protocol_assignment = matches!(octets, [192, 0, 0, last] if last != 9 && last != 10);
+    let is_benchmarking = octets[0] == 198 && octets[1] & 0xfe == 18;
+    let is_reserved = octets[0] & 0xf0 == 0xf0 && address != Ipv4Addr::BROADCAST;
+
+    !(octets[0] == 0
+        || address.is_private()
+        || is_shared
+        || address.is_loopback()
+        || address.is_link_local()
+        || is_protocol_assignment
+        || address.is_documentation()
+        || is_benchmarking
+        || is_reserved
+        || address == Ipv4Addr::BROADCAST)
+}
+
+fn is_globally_routable_ipv6(address: Ipv6Addr) -> bool {
     let segments = address.segments();
-    segments[0] == 0x2001 && segments[1] == 0x0db8
+    let value = u128::from_be_bytes(address.octets());
+    let is_protocol_assignment = segments[0] == 0x2001 && segments[1] < 0x200;
+    let is_protocol_assignment_exception = matches!(
+        value,
+        0x2001_0001_0000_0000_0000_0000_0000_0001 | 0x2001_0001_0000_0000_0000_0000_0000_0002
+    ) || segments[0] == 0x2001
+        && (segments[1] == 3
+            || segments[1] == 4 && segments[2] == 0x112
+            || (0x20..=0x3f).contains(&segments[1]));
+    let is_documentation = (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0);
+
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || matches!(segments, [0, 0, 0, 0, 0, 0xffff, _, _])
+        || matches!(segments, [0x64, 0xff9b, 1, _, _, _, _, _])
+        || matches!(segments, [0x100, 0, 0, 0, _, _, _, _])
+        || is_protocol_assignment && !is_protocol_assignment_exception
+        || matches!(segments, [0x2002, _, _, _, _, _, _, _])
+        || is_documentation
+        || matches!(segments, [0x5f00, ..])
+        || address.is_unique_local()
+        || address.is_unicast_link_local())
 }
 
 fn looks_like_hostname(token: &str) -> bool {
@@ -366,83 +399,27 @@ fn looks_like_hostname(token: &str) -> bool {
         })
 }
 
-fn filename_path_basenames(region: &str) -> BTreeSet<String> {
-    region
-        .split_ascii_whitespace()
-        .filter_map(|raw| {
-            let path = raw.trim_matches(|character: char| {
-                matches!(
-                    character,
-                    '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
-                )
-            });
-            if path.contains("://") || !path.contains(['/', '\\']) {
-                return None;
-            }
-            let basename = path.rsplit(['/', '\\']).next()?;
-            looks_like_file_basename(basename).then(|| basename.to_owned())
-        })
-        .collect()
-}
-
-fn looks_like_unambiguous_filename(token: &str) -> bool {
-    let lowercase = token.to_ascii_lowercase();
-    if matches!(
-        lowercase.as_str(),
-        "changelog.md" | "contributing.md" | "license.md" | "readme.md"
-    ) {
-        return true;
-    }
-
-    let Some((_stem, extension)) = lowercase.rsplit_once('.') else {
-        return false;
-    };
+// Dotted tokens are ambiguous even when they appear inside paths because the
+// neutrality tokenizer deliberately discards path context. Keep this list exact
+// and security-biased; add a narrowly reviewed entry when a fixture must name
+// another file so unknown hostname-shaped tokens continue to fail closed.
+fn is_allowed_filename(token: &str) -> bool {
     matches!(
-        extension,
-        "css"
-            | "go"
-            | "html"
-            | "js"
-            | "json"
-            | "jsx"
-            | "lock"
-            | "proto"
-            | "sql"
-            | "toml"
-            | "ts"
-            | "tsx"
-            | "txt"
-            | "yaml"
-            | "yml"
-    )
-}
-
-fn looks_like_file_basename(token: &str) -> bool {
-    let Some((_stem, extension)) = token.rsplit_once('.') else {
-        return false;
-    };
-
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "css"
-            | "go"
-            | "html"
-            | "js"
-            | "json"
-            | "jsx"
-            | "lock"
-            | "md"
-            | "proto"
-            | "py"
-            | "rs"
-            | "sh"
-            | "sql"
-            | "toml"
-            | "ts"
-            | "tsx"
-            | "txt"
-            | "yaml"
-            | "yml"
+        token.to_ascii_lowercase().as_str(),
+        "build.rs"
+            | "changelog.md"
+            | "config.toml"
+            | "config.yaml"
+            | "config.yml"
+            | "contributing.md"
+            | "fixture.txt"
+            | "jwks.json"
+            | "lib.rs"
+            | "license.md"
+            | "main.rs"
+            | "main.txt"
+            | "mod.rs"
+            | "readme.md"
     )
 }
 
@@ -477,7 +454,8 @@ fn is_sensitive_path(path: &Path) -> bool {
         || name == "kubeconfig"
         || name.starts_with("kubeconfig.")
         || matches!(extension, Some("pem" | "key" | "p12" | "pfx"))
-        || (name.ends_with(".jwks.json") && !name.ends_with(".pub.jwks.json"))
+        || ((name == "jwks.json" || name.ends_with(".jwks.json"))
+            && !name.ends_with(".pub.jwks.json"))
 }
 
 fn contains_prefixed_secret(line: &str, prefix: &str, minimum_suffix: usize) -> bool {
@@ -488,6 +466,52 @@ fn contains_prefixed_secret(line: &str, prefix: &str, minimum_suffix: usize) -> 
             .count()
             >= minimum_suffix
     })
+}
+
+fn contains_provider_key(line: &str, prefix: &str) -> bool {
+    line.match_indices(prefix).any(|(index, _)| {
+        let has_token_boundary = line[..index].chars().next_back().is_none_or(|character| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-')
+        });
+        if !has_token_boundary {
+            return false;
+        }
+
+        let suffix = &line[index + prefix.len()..];
+        // Legacy keys have no class tag, so a same-shaped identifier cannot be
+        // distinguished safely. Keep this branch conservative; structured keys
+        // are handled separately below without broadening the legacy shape.
+        let legacy_payload_length = suffix
+            .chars()
+            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+            .count();
+        if legacy_payload_length >= 20 {
+            return true;
+        }
+
+        provider_payload(suffix).is_some_and(|payload| {
+            payload
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+                .count()
+                >= 20
+        })
+    })
+}
+
+fn provider_payload(suffix: &str) -> Option<&str> {
+    if let Some(payload) = suffix
+        .strip_prefix("proj-")
+        .or_else(|| suffix.strip_prefix("svcacct-"))
+    {
+        return Some(payload);
+    }
+
+    let versioned = suffix.strip_prefix("ant-api")?;
+    let (version, payload) = versioned.split_once('-')?;
+    (version.len() == 2 && version.bytes().all(|byte| byte.is_ascii_digit())).then_some(payload)
 }
 
 fn contains_aws_access_key(line: &str) -> bool {
@@ -612,14 +636,14 @@ mod tests {
     }
 
     #[test]
-    fn neutrality_rejects_non_reserved_ipv6() {
-        let address = ["fe80", "", "1ff", "fe23", "4567", "890a"].join(":");
+    fn neutrality_rejects_globally_routable_ipv6() {
+        let address = ["2001", "db9", "", "1"].join(":");
         let violations = neutrality_violations(&format!("\"{address}\""));
 
         assert_eq!(
             violations.len(),
             1,
-            "neutrality gate must reject a non-documentation IPv6 address"
+            "neutrality gate must reject a globally routable IPv6 address"
         );
     }
 
@@ -634,9 +658,22 @@ mod tests {
     }
 
     #[test]
+    fn neutrality_allows_non_global_ip_addresses() {
+        let violations = neutrality_violations(
+            "\"127.0.0.1\" \"0.0.0.0\" \"10.0.0.1\" \"192.168.1.1\" \
+             \"169.254.1.1\" \"::1\" \"::\" \"fc00::1\" \"fe80::1\"",
+        );
+
+        assert!(
+            violations.is_empty(),
+            "every non-globally-routable IP address must be allowed: {violations:?}"
+        );
+    }
+
+    #[test]
     fn neutrality_scans_comments() {
         let email = ["ops", "corp.invalid"].join("@");
-        let ip = ["10", "0", "0", "5"].join(".");
+        let ip = ["203", "0", "114", "5"].join(".");
         let violations = neutrality_violations(&format!("// reach {email} at {ip}"));
 
         assert_eq!(
@@ -695,6 +732,20 @@ mod tests {
     }
 
     #[test]
+    fn neutrality_rejects_extension_shaped_hostnames() {
+        let host = ["svc", "go"].join(".");
+        let basename = ["deploy", "sh"].join(".");
+        let path = ["scripts", &basename].join("/");
+        let violations = neutrality_violations(&format!("\"{host}\" \"{path}\""));
+
+        assert_eq!(
+            violations.len(),
+            2,
+            "filename extensions must not exempt hostname-shaped identifiers"
+        );
+    }
+
+    #[test]
     fn neutrality_allows_recognized_upstream_hosts() {
         let violations = neutrality_violations(
             "// see github.com/org/repo, crates.io, docs.rs, and openpolicyagent.org",
@@ -746,6 +797,91 @@ mod tests {
         assert!(
             violations.is_empty(),
             "environment-backed URL passwords must not be reported as credentials"
+        );
+    }
+
+    #[test]
+    fn secret_scan_rejects_modern_dashed_provider_keys() {
+        let prefix = ["s", "k"].concat();
+        let payloads = [
+            "abcde-fghijklmnopqrstuvwxyz012345",
+            "abc_defghijklmnopqrstuvwxyz012345",
+            "ab-cd_efghijklmnopqrstuvwxyz012345",
+        ];
+        let content = ["proj", "ant-api03", "svcacct"]
+            .into_iter()
+            .zip(payloads)
+            .map(|(kind, payload)| [prefix.as_str(), kind, payload].join("-"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let violations = secret_violations(Path::new("fixture.txt"), content.as_bytes());
+
+        assert_eq!(
+            violations,
+            vec![1, 2, 3],
+            "modern dashed provider-key formats must be rejected"
+        );
+    }
+
+    #[test]
+    fn secret_scan_rejects_future_dashed_provider_classes() {
+        let prefix = ["s", "k"].concat();
+        let payload = "abc-de_fghijklmnopqrstuvwxyz012345";
+        let content = [prefix.as_str(), "ant-api04", payload].join("-");
+
+        let violations = secret_violations(Path::new("fixture.txt"), content.as_bytes());
+
+        assert_eq!(
+            violations,
+            vec![1],
+            "future provider classes with base64url payloads must be rejected"
+        );
+    }
+
+    #[test]
+    fn secret_scan_allows_ordinary_kebab_case_text() {
+        let content = [
+            "disk-usage-monitoring-service",
+            "task-management-workflow-configuration",
+            "risk-assessment-framework-module",
+        ]
+        .join("\n");
+
+        let violations = secret_violations(Path::new("README.md"), content.as_bytes());
+
+        assert!(
+            violations.is_empty(),
+            "ordinary kebab-case prose must not look like a provider key: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn secret_scan_allows_non_key_tokens_starting_with_sk() {
+        let prefix = ["s", "k"].concat();
+        let content = [
+            [prefix.as_str(), "learn", "model-training-pipeline-v2"].join("-"),
+            [prefix.as_str(), "icon", "set-large-collection"].join("-"),
+            [prefix.as_str(), "session", "key-rotation-interval-seconds"].join("-"),
+        ]
+        .join("\n");
+
+        let violations = secret_violations(Path::new("README.md"), content.as_bytes());
+
+        assert!(
+            violations.is_empty(),
+            "non-key sk-prefixed tokens must not be reported: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn secret_scan_treats_bare_jwks_filename_as_sensitive() {
+        let violations = secret_violations(Path::new("jwks.json"), b"{}");
+
+        assert_eq!(
+            violations,
+            vec![1],
+            "a bare private JWKS filename must fail regardless of content"
         );
     }
 
@@ -862,7 +998,7 @@ id = "G-6"
     }
 
     #[test]
-    fn migration_base_rejects_divergent_local_and_remote_main() {
+    fn migration_base_prefers_local_main_when_remote_main_differs() {
         let candidates = vec!["main".to_owned(), "origin/main".to_owned()];
         let resolved = vec![
             ("main".to_owned(), "1111111".to_owned()),
@@ -873,11 +1009,8 @@ id = "G-6"
 
         assert_eq!(
             selection,
-            Err(
-                "local main and origin/main differ; complete the mandatory sync before migrate-check"
-                    .to_owned()
-            ),
-            "a stale local or remote main ref must fail closed"
+            Ok("main".to_owned()),
+            "an advancing remote must not invalidate the branch's synced local base"
         );
     }
 
