@@ -416,19 +416,19 @@ fn write_layering_fixture(directory: &Path, include_violation: bool) -> TaskResu
         &directory.join("Cargo.toml"),
         &format!("[workspace]\nresolver = \"2\"\nmembers = [{members}]\n"),
     )?;
-    write_crate(directory, "vendor", "openshell-client", "")?;
+    write_crate(directory, "vendor", "openshell-sdk", "")?;
     write_crate(
         directory,
         "adapter",
         "steward-adapter-openshell",
-        "openshell-client = { path = \"../vendor\", version = \"=0.0.0\" }",
+        "openshell-sdk = { path = \"../vendor\", version = \"=0.0.0\" }",
     )?;
     if include_violation {
         write_crate(
             directory,
             "core",
             "steward-controller",
-            "openshell-client = { path = \"../vendor\", version = \"=0.0.0\" }",
+            "openshell-sdk = { path = \"../vendor\", version = \"=0.0.0\" }",
         )?;
     }
     Ok(())

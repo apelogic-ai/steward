@@ -36,7 +36,7 @@ wildcards = "deny"
 # ---------------------------------------------------------------------------
 
 [[bans.deny]]
-name = "openshell-client"
+name = "openshell-sdk"
 wrappers = ["steward-adapter-openshell"]
 
 [[bans.deny]]
@@ -69,3 +69,4 @@ name = "slack-morphism"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-git = ["https://github.com/NVIDIA/OpenShell"]

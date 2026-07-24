@@ -7,6 +7,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
 steward-adapter-fake = { path = "../adapters/fake", version = "=0.0.0" }
 steward-adapter-jira = { path = "../adapters/jira", version = "=0.0.0" }
 steward-adapter-litellm = { path = "../adapters/litellm", version = "=0.0.0" }

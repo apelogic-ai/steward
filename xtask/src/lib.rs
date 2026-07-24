@@ -2,6 +2,45 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TestOutcome {
+    Passed,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DerivedStatus {
+    Provided,
+    Partial,
+    NotYetProvided,
+    Regressed,
+    GapMayHaveClosed,
+    Unevidenced,
+}
+
+pub fn derive_status(
+    has_declared_gaps: bool,
+    holds: &[TestOutcome],
+    gaps: &[TestOutcome],
+) -> DerivedStatus {
+    if holds.contains(&TestOutcome::Failed) {
+        return DerivedStatus::Regressed;
+    }
+    if gaps.contains(&TestOutcome::Failed) {
+        return DerivedStatus::GapMayHaveClosed;
+    }
+    if holds.is_empty() && gaps.is_empty() {
+        return DerivedStatus::Unevidenced;
+    }
+    if holds.is_empty() {
+        return DerivedStatus::NotYetProvided;
+    }
+    if has_declared_gaps {
+        return DerivedStatus::Partial;
+    }
+    DerivedStatus::Provided
+}
+
 pub fn local_test_context_is_safe(context: &str) -> bool {
     ["kind-steward-", "k3d-steward-"]
         .into_iter()
@@ -114,14 +153,26 @@ pub fn validate_register_content(content: &str) -> Result<(), String> {
     if root.get("schema").and_then(toml::Value::as_integer) != Some(1) {
         return Err("conformance register must declare schema = 1".to_owned());
     }
-    if root
+    let meta = root
         .get("meta")
         .and_then(toml::Value::as_table)
-        .and_then(|meta| meta.get("pinned_openshell"))
-        .and_then(toml::Value::as_str)
-        .is_none_or(str::is_empty)
-    {
-        return Err("conformance register must pin OpenShell in one place".to_owned());
+        .ok_or_else(|| "conformance register must declare environment provenance".to_owned())?;
+    for (field, dependency) in [
+        ("pinned_openshell", "OpenShell"),
+        ("pinned_spire", "SPIRE"),
+        ("pinned_litellm", "LiteLLM"),
+        ("pinned_agent_sandbox", "Agent Sandbox"),
+        ("pinned_mcp_gw", "mcp-gw"),
+    ] {
+        if meta
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(format!(
+                "conformance register must pin {dependency} in one place"
+            ));
+        }
     }
     if root.contains_key("status")
         || root
@@ -570,8 +621,9 @@ fn is_literal_secret(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        local_test_context_is_safe, migration_base_candidates, migration_history_violations,
-        neutrality_violations, secret_violations, select_migration_base, validate_register_content,
+        DerivedStatus, TestOutcome, derive_status, local_test_context_is_safe,
+        migration_base_candidates, migration_history_violations, neutrality_violations,
+        secret_violations, select_migration_base, validate_register_content,
     };
     use std::path::Path;
 
@@ -892,6 +944,10 @@ schema = 1
 
 [meta]
 pinned_openshell = "v0.0.82"
+pinned_spire = "1.15.2"
+pinned_litellm = "1.93.0"
+pinned_agent_sandbox = "v0.5.0"
+pinned_mcp_gw = "v0.2.0"
 
 [[guarantee]]
 id = "G-1"
@@ -930,7 +986,9 @@ id = "G-6"
             .map(|id| format!("[[guarantee]]\nid = \"G-{id}\"\n"))
             .collect::<String>();
         guarantees.push_str("status = \"holds\"\n");
-        let content = format!("schema = 1\n[meta]\npinned_openshell = \"v0.0.82\"\n{guarantees}");
+        let content = format!(
+            "schema = 1\n[meta]\npinned_openshell = \"v0.0.82\"\npinned_spire = \"1.15.2\"\npinned_litellm = \"1.93.0\"\npinned_agent_sandbox = \"v0.5.0\"\npinned_mcp_gw = \"v0.2.0\"\n{guarantees}"
+        );
 
         let validation = validate_register_content(&content);
 
@@ -938,6 +996,56 @@ id = "G-6"
             validation,
             Err("conformance register must not contain a hand-authored status".to_owned()),
             "a structural status key must remain forbidden"
+        );
+    }
+
+    #[test]
+    fn register_requires_complete_conformance_environment_provenance() {
+        let guarantees = (1..=6)
+            .map(|id| format!("[[guarantee]]\nid = \"G-{id}\"\n"))
+            .collect::<String>();
+        let content = format!("schema = 1\n[meta]\npinned_openshell = \"v0.0.90\"\n{guarantees}");
+
+        let validation = validate_register_content(&content);
+
+        assert_eq!(
+            validation,
+            Err("conformance register must pin SPIRE in one place".to_owned()),
+            "a foundation claim without its SPIRE version has ambiguous provenance"
+        );
+    }
+
+    #[test]
+    fn register_status_is_derived_from_negative_test_outcomes() {
+        assert_eq!(
+            derive_status(false, &[TestOutcome::Passed], &[]),
+            DerivedStatus::Provided,
+            "green holds evidence must derive provided"
+        );
+        assert_eq!(
+            derive_status(true, &[TestOutcome::Passed], &[TestOutcome::Passed]),
+            DerivedStatus::Partial,
+            "declared green gap evidence must cap the derived status at partial"
+        );
+        assert_eq!(
+            derive_status(true, &[], &[TestOutcome::Passed]),
+            DerivedStatus::NotYetProvided,
+            "green gap-only evidence must derive not-yet-provided"
+        );
+        assert_eq!(
+            derive_status(false, &[TestOutcome::Failed], &[]),
+            DerivedStatus::Regressed,
+            "a failed holds test must be a regression finding"
+        );
+        assert_eq!(
+            derive_status(true, &[], &[TestOutcome::Failed]),
+            DerivedStatus::GapMayHaveClosed,
+            "a failed gap test must report possible upstream improvement"
+        );
+        assert_eq!(
+            derive_status(false, &[], &[]),
+            DerivedStatus::Unevidenced,
+            "an entry with no tests must stay visibly unevidenced"
         );
     }
 
