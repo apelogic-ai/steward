@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 pub const IMPLEMENTED_PORTS: [&str; 0] = [];
 const NAME_LENGTH: usize = 19;
 const HASH_CHARACTERS: usize = NAME_LENGTH - 2;
-const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+const LOWER_BASE36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NameKind {
@@ -21,14 +21,19 @@ pub fn stable_name(kind: NameKind, identity: &[u8]) -> String {
     let digest = Sha256::digest(identity);
     let mut name = String::with_capacity(NAME_LENGTH);
     name.push_str(prefix);
-    for nibble_index in 0..HASH_CHARACTERS {
-        let byte = digest[nibble_index / 2];
-        let nibble = if nibble_index % 2 == 0 {
-            byte >> 4
-        } else {
-            byte & 0x0f
-        };
-        name.push(char::from(LOWER_HEX[usize::from(nibble)]));
+    let mut quotient = digest;
+    let mut encoded = [b'0'; HASH_CHARACTERS];
+    for digit in encoded.iter_mut().rev() {
+        let mut remainder = 0_u16;
+        for byte in &mut quotient {
+            let value = (remainder << 8) | u16::from(*byte);
+            *byte = (value / 36) as u8;
+            remainder = value % 36;
+        }
+        *digit = LOWER_BASE36[usize::from(remainder)];
+    }
+    for byte in encoded {
+        name.push(char::from(byte));
     }
     name
 }
@@ -43,12 +48,12 @@ mod tests {
         let sandbox = stable_name(NameKind::Sandbox, b"runtime-uid-1");
 
         assert_eq!(
-            workspace, "w-96c2886c51d1dfb49",
-            "workspace names must use the stable SHA-256 derivation"
+            workspace, "w-9086ou4eujpgku8z0",
+            "workspace names must encode the full 17-character base36 budget"
         );
         assert_eq!(
-            sandbox, "s-20d730b3c5fe542e0",
-            "sandbox names must use a distinct stable SHA-256 domain"
+            sandbox, "s-78i56shpq2adzg64z",
+            "sandbox names must encode the full 17-character base36 budget"
         );
         for name in [&workspace, &sandbox] {
             assert_eq!(name.len(), 19, "OpenShell names must fit its 19-char cap");

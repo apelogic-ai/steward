@@ -2,9 +2,18 @@ diff --git a/crates/openshell-supervisor-process/src/run.rs b/crates/openshell-s
 index 5a06d97a..e72ab952 100644
 --- a/crates/openshell-supervisor-process/src/run.rs
 +++ b/crates/openshell-supervisor-process/src/run.rs
-@@ -97,0 +98,5 @@ pub async fn run_process(
+@@ -98,5 +98,10 @@ pub async fn run_process(
+-    // Eagerly fetch initial settings and install the agent skill if the
+-    // proposals flag is on at startup, rather than waiting for the policy
+-    // poll loop's first tick. In offline/file-mode there is no gateway, so
+-    // the flag stays at its default (false) and no skill is installed.
 +    // Pin the child mount namespace while privileged startup operations are
 +    // still available and before seccomp hardens the supervisor.
 +    #[cfg(target_os = "linux")]
 +    crate::process::prepare_supervisor_identity_mount_namespace_from_env()?;
 +
++    // Eagerly fetch initial settings and install the agent skill if the
++    // proposals flag is on at startup, rather than waiting for the policy
++    // poll loop's first tick. In offline/file-mode there is no gateway, so
++    // the flag stays at its default (false) and no skill is installed.
+     install_initial_agent_skill(sandbox_id, openshell_endpoint).await;

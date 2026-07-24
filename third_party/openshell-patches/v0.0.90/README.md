@@ -38,9 +38,9 @@ the existing fail-closed behavior if identity isolation cannot be established.
 Remove this patch when a NVIDIA/OpenShell PR containing the equivalent
 fail-closed startup call merges and Steward pins a release that contains it.
 Apply it only to the recorded base with
-`git apply --unidiff-zero 0001-prepare-supervisor-identity-mount-namespace.patch`;
-the zero-context form keeps the patch artifact free of whitespace-only context
-lines while the exact base commit supplies the safety boundary.
+`git apply 0001-prepare-supervisor-identity-mount-namespace.patch`.
+The patch carries surrounding startup context so it refuses to apply if the
+privileged-setup and hardening boundary moves.
 
 ## Verification
 

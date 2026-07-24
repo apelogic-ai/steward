@@ -35,12 +35,42 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for command in kind kubectl helm cargo curl openssl sed shasum tar; do
+case "$(uname -s):$(uname -m)" in
+  Darwin:arm64)
+    openshell_cli_target="aarch64-apple-darwin"
+    ;;
+  Linux:arm64 | Linux:aarch64)
+    openshell_cli_target="aarch64-unknown-linux-musl"
+    ;;
+  Linux:x86_64 | Linux:amd64)
+    openshell_cli_target="x86_64-unknown-linux-musl"
+    ;;
+  *)
+    echo "unsupported OpenShell CLI platform: $(uname -s) $(uname -m)" >&2
+    exit 2
+    ;;
+esac
+openshell_cli_archive="openshell-${openshell_cli_target}.tar.gz"
+if [[ "$#" -eq 1 && "$1" == "--print-openshell-cli-asset" ]]; then
+  echo "${openshell_cli_archive}"
+  exit 0
+fi
+
+for command in kind kubectl helm cargo curl openssl sed tar; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is missing: ${command}" >&2
     exit 2
   fi
 done
+
+if command -v sha256sum >/dev/null 2>&1; then
+  checksum_command=(sha256sum -c -)
+elif command -v shasum >/dev/null 2>&1; then
+  checksum_command=(shasum -a 256 -c -)
+else
+  echo "required command is missing: sha256sum or shasum" >&2
+  exit 2
+fi
 
 mkdir -p "${RUN_DIR}"
 kind create cluster \
@@ -169,18 +199,21 @@ export STEWARD_TEST_KUBECONFIG="${KUBECONFIG_PATH}"
 export KUBECONFIG="${KUBECONFIG_PATH}"
 
 if [[ "$#" -eq 0 ]]; then
-  cargo run -p steward-adapter-openshell --example workspace_contract
-  cli_archive="${RUN_DIR}/openshell-aarch64-apple-darwin.tar.gz"
+  cargo run \
+    -p steward-adapter-openshell \
+    --features s0-spike \
+    --example workspace_contract
+  cli_archive="${RUN_DIR}/${openshell_cli_archive}"
   cli_checksums="${RUN_DIR}/openshell-checksums-sha256.txt"
   curl -fsSL \
-    "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.90/openshell-aarch64-apple-darwin.tar.gz" \
+    "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.90/${openshell_cli_archive}" \
     -o "${cli_archive}"
   curl -fsSL \
     "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.90/openshell-checksums-sha256.txt" \
     -o "${cli_checksums}"
   (
     cd "${RUN_DIR}"
-    grep " openshell-aarch64-apple-darwin.tar.gz$" "${cli_checksums}" | shasum -a 256 -c -
+    grep " ${openshell_cli_archive}$" "${cli_checksums}" | "${checksum_command[@]}"
     tar -xzf "${cli_archive}"
   )
   source_archive="${RUN_DIR}/openshell-v0.0.90.tar.gz"

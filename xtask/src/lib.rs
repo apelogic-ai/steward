@@ -2,45 +2,6 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TestOutcome {
-    Passed,
-    Failed,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DerivedStatus {
-    Provided,
-    Partial,
-    NotYetProvided,
-    Regressed,
-    GapMayHaveClosed,
-    Unevidenced,
-}
-
-pub fn derive_status(
-    has_declared_gaps: bool,
-    holds: &[TestOutcome],
-    gaps: &[TestOutcome],
-) -> DerivedStatus {
-    if holds.contains(&TestOutcome::Failed) {
-        return DerivedStatus::Regressed;
-    }
-    if gaps.contains(&TestOutcome::Failed) {
-        return DerivedStatus::GapMayHaveClosed;
-    }
-    if holds.is_empty() && gaps.is_empty() {
-        return DerivedStatus::Unevidenced;
-    }
-    if holds.is_empty() {
-        return DerivedStatus::NotYetProvided;
-    }
-    if has_declared_gaps {
-        return DerivedStatus::Partial;
-    }
-    DerivedStatus::Provided
-}
-
 pub fn local_test_context_is_safe(context: &str) -> bool {
     ["kind-steward-", "k3d-steward-"]
         .into_iter()
@@ -621,9 +582,8 @@ fn is_literal_secret(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DerivedStatus, TestOutcome, derive_status, local_test_context_is_safe,
-        migration_base_candidates, migration_history_violations, neutrality_violations,
-        secret_violations, select_migration_base, validate_register_content,
+        local_test_context_is_safe, migration_base_candidates, migration_history_violations,
+        neutrality_violations, secret_violations, select_migration_base, validate_register_content,
     };
     use std::path::Path;
 
@@ -1012,40 +972,6 @@ id = "G-6"
             validation,
             Err("conformance register must pin SPIRE in one place".to_owned()),
             "a foundation claim without its SPIRE version has ambiguous provenance"
-        );
-    }
-
-    #[test]
-    fn register_status_is_derived_from_negative_test_outcomes() {
-        assert_eq!(
-            derive_status(false, &[TestOutcome::Passed], &[]),
-            DerivedStatus::Provided,
-            "green holds evidence must derive provided"
-        );
-        assert_eq!(
-            derive_status(true, &[TestOutcome::Passed], &[TestOutcome::Passed]),
-            DerivedStatus::Partial,
-            "declared green gap evidence must cap the derived status at partial"
-        );
-        assert_eq!(
-            derive_status(true, &[], &[TestOutcome::Passed]),
-            DerivedStatus::NotYetProvided,
-            "green gap-only evidence must derive not-yet-provided"
-        );
-        assert_eq!(
-            derive_status(false, &[TestOutcome::Failed], &[]),
-            DerivedStatus::Regressed,
-            "a failed holds test must be a regression finding"
-        );
-        assert_eq!(
-            derive_status(true, &[], &[TestOutcome::Failed]),
-            DerivedStatus::GapMayHaveClosed,
-            "a failed gap test must report possible upstream improvement"
-        );
-        assert_eq!(
-            derive_status(false, &[], &[]),
-            DerivedStatus::Unevidenced,
-            "an entry with no tests must stay visibly unevidenced"
         );
     }
 
