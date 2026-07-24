@@ -23,7 +23,12 @@ schema = 1
 
 [meta]
 # Rendered into the generated table so a reader knows what it was true against.
-pinned_openshell = "v0.0.82"
+pinned_openshell = "v0.0.90"
+pinned_openshell_commit = "1d4ac708f1d2a9ab94204cdce6ca0eee7e792839"
+pinned_agent_sandbox = "v0.5.0"
+pinned_mcp_gw = "v0.2.0"
+pinned_spire = "1.15.2"
+pinned_litellm = "1.93.0"
 
 # ---------------------------------------------------------------------------
 
@@ -40,10 +45,17 @@ restructure; verify the property, not the mechanism."""
 [[guarantee]]
 id = "G-2"
 module = "g2_credential_isolation"
-claim = "holds"
+claim = "not-yet"
+gaps = [
+  "Stock OpenShell v0.0.90 fails before readiness because the supervisor identity mount namespace is not prepared; the carried patch restores per-sandbox JWT-SVID acquisition.",
+  "Steward's SVID → HOP-1 exchange and mcp-gw credential boundary are not implemented.",
+  "The upstream token-grant demo reaches its configured token endpoint with the patched supervisor, then its Node issuer rejects the SPIRE OIDC discovery TLS chain.",
+]
 sells = "An agent cannot obtain another user's credentials"
-mechanism = "HOP-1 claims + mcp-gw email resolution"
+mechanism = "Patched per-sandbox SPIFFE identity is live; the SVID → HOP-1 exchange remains unimplemented"
 watch = """
+The downstream patch exits when a fail-closed supervisor-identity fix merges; \
+track focused closed attempt #2012 and broader open attempt #2184. \
 #1970 may replace the SVID→HOP-1 leg entirely. Also: the verifier passes no \
 `algorithms` allowlist to `jwtVerify`, so algorithm restriction is implicit in JWKS key \
 resolution — a holds_ test must cover an out-of-profile algorithm being rejected."""

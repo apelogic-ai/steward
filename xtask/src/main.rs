@@ -416,19 +416,19 @@ fn write_layering_fixture(directory: &Path, include_violation: bool) -> TaskResu
         &directory.join("Cargo.toml"),
         &format!("[workspace]\nresolver = \"2\"\nmembers = [{members}]\n"),
     )?;
-    write_crate(directory, "vendor", "openshell-client", "")?;
+    write_crate(directory, "vendor", "openshell-sdk", "")?;
     write_crate(
         directory,
         "adapter",
         "steward-adapter-openshell",
-        "openshell-client = { path = \"../vendor\", version = \"=0.0.0\" }",
+        "openshell-sdk = { path = \"../vendor\", version = \"=0.0.0\" }",
     )?;
     if include_violation {
         write_crate(
             directory,
             "core",
             "steward-controller",
-            "openshell-client = { path = \"../vendor\", version = \"=0.0.0\" }",
+            "openshell-sdk = { path = \"../vendor\", version = \"=0.0.0\" }",
         )?;
     }
     Ok(())
@@ -631,7 +631,7 @@ impl Drop for TemporaryTree {
 
 #[cfg(test)]
 mod tests {
-    use super::migration_changes;
+    use super::{migration_changes, root};
     use std::fs;
     use std::io::ErrorKind;
     use std::path::{Path, PathBuf};
@@ -726,6 +726,101 @@ mod tests {
             no_system_config,
             Some(std::ffi::OsStr::new("1")),
             "fixture Git commands must not inherit system configuration"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_spike_dependencies_are_feature_isolated() -> Result<(), String> {
+        let manifest_path = root().join("adapters/openshell/Cargo.toml");
+        let content = fs::read_to_string(&manifest_path)
+            .map_err(|error| format!("failed to read {}: {error}", manifest_path.display()))?;
+        let manifest = toml::from_str::<toml::Table>(&content)
+            .map_err(|error| format!("failed to parse {}: {error}", manifest_path.display()))?;
+        let dependencies = manifest
+            .get("dependencies")
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| "OpenShell adapter must declare dependencies".to_owned())?;
+        for dependency in ["openshell-sdk", "tokio"] {
+            let optional = dependencies
+                .get(dependency)
+                .and_then(toml::Value::as_table)
+                .and_then(|specification| specification.get("optional"))
+                .and_then(toml::Value::as_bool);
+            assert_eq!(
+                optional,
+                Some(true),
+                "{dependency} must be optional so normal xtask and workspace builds exclude the OpenShell SDK graph"
+            );
+        }
+        let spike_features = manifest
+            .get("features")
+            .and_then(toml::Value::as_table)
+            .and_then(|features| features.get("s0-spike"))
+            .and_then(toml::Value::as_array)
+            .map(|features| {
+                features
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<Vec<_>>()
+            })
+            .ok_or_else(|| "OpenShell adapter must declare the s0-spike feature".to_owned())?;
+        for dependency in ["dep:openshell-sdk", "dep:tokio"] {
+            assert!(
+                spike_features.contains(&dependency),
+                "s0-spike must activate {dependency}"
+            );
+        }
+
+        let required_features = manifest
+            .get("example")
+            .and_then(toml::Value::as_array)
+            .and_then(|examples| {
+                examples.iter().find(|example| {
+                    example.get("name").and_then(toml::Value::as_str) == Some("workspace_contract")
+                })
+            })
+            .and_then(|example| example.get("required-features"))
+            .and_then(toml::Value::as_array)
+            .map(|features| {
+                features
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<Vec<_>>()
+            });
+        assert_eq!(
+            required_features,
+            Some(vec!["s0-spike"]),
+            "the live workspace example must require the feature that activates its SDK dependencies"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_spike_selects_the_host_cli_artifact_before_cluster_setup() -> Result<(), String> {
+        let operating_system = std::env::consts::OS;
+        let architecture = std::env::consts::ARCH;
+        let expected = match (operating_system, architecture) {
+            ("macos", "aarch64") => "openshell-aarch64-apple-darwin.tar.gz",
+            ("linux", "aarch64") => "openshell-aarch64-unknown-linux-musl.tar.gz",
+            ("linux", "x86_64") => "openshell-x86_64-unknown-linux-musl.tar.gz",
+            _ => return Ok(()),
+        };
+        let output = Command::new("bash")
+            .arg(root().join("scripts/s0-0-openshell-spike.sh"))
+            .arg("--print-openshell-cli-asset")
+            .output()
+            .map_err(|error| format!("failed to inspect OpenShell CLI selection: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "OpenShell CLI selection failed before cluster setup: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            expected,
+            "the spike must download the OpenShell CLI artifact for its host platform"
         );
         Ok(())
     }

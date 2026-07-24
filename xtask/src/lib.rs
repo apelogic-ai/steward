@@ -114,14 +114,26 @@ pub fn validate_register_content(content: &str) -> Result<(), String> {
     if root.get("schema").and_then(toml::Value::as_integer) != Some(1) {
         return Err("conformance register must declare schema = 1".to_owned());
     }
-    if root
+    let meta = root
         .get("meta")
         .and_then(toml::Value::as_table)
-        .and_then(|meta| meta.get("pinned_openshell"))
-        .and_then(toml::Value::as_str)
-        .is_none_or(str::is_empty)
-    {
-        return Err("conformance register must pin OpenShell in one place".to_owned());
+        .ok_or_else(|| "conformance register must declare environment provenance".to_owned())?;
+    for (field, dependency) in [
+        ("pinned_openshell", "OpenShell"),
+        ("pinned_spire", "SPIRE"),
+        ("pinned_litellm", "LiteLLM"),
+        ("pinned_agent_sandbox", "Agent Sandbox"),
+        ("pinned_mcp_gw", "mcp-gw"),
+    ] {
+        if meta
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(format!(
+                "conformance register must pin {dependency} in one place"
+            ));
+        }
     }
     if root.contains_key("status")
         || root
@@ -892,6 +904,10 @@ schema = 1
 
 [meta]
 pinned_openshell = "v0.0.82"
+pinned_spire = "1.15.2"
+pinned_litellm = "1.93.0"
+pinned_agent_sandbox = "v0.5.0"
+pinned_mcp_gw = "v0.2.0"
 
 [[guarantee]]
 id = "G-1"
@@ -930,7 +946,9 @@ id = "G-6"
             .map(|id| format!("[[guarantee]]\nid = \"G-{id}\"\n"))
             .collect::<String>();
         guarantees.push_str("status = \"holds\"\n");
-        let content = format!("schema = 1\n[meta]\npinned_openshell = \"v0.0.82\"\n{guarantees}");
+        let content = format!(
+            "schema = 1\n[meta]\npinned_openshell = \"v0.0.82\"\npinned_spire = \"1.15.2\"\npinned_litellm = \"1.93.0\"\npinned_agent_sandbox = \"v0.5.0\"\npinned_mcp_gw = \"v0.2.0\"\n{guarantees}"
+        );
 
         let validation = validate_register_content(&content);
 
@@ -938,6 +956,22 @@ id = "G-6"
             validation,
             Err("conformance register must not contain a hand-authored status".to_owned()),
             "a structural status key must remain forbidden"
+        );
+    }
+
+    #[test]
+    fn register_requires_complete_conformance_environment_provenance() {
+        let guarantees = (1..=6)
+            .map(|id| format!("[[guarantee]]\nid = \"G-{id}\"\n"))
+            .collect::<String>();
+        let content = format!("schema = 1\n[meta]\npinned_openshell = \"v0.0.90\"\n{guarantees}");
+
+        let validation = validate_register_content(&content);
+
+        assert_eq!(
+            validation,
+            Err("conformance register must pin SPIRE in one place".to_owned()),
+            "a foundation claim without its SPIRE version has ambiguous provenance"
         );
     }
 

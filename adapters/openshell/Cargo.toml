@@ -6,8 +6,18 @@ publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+s0-spike = ["dep:openshell-sdk", "dep:tokio"]
+
 [dependencies]
+openshell-sdk = { git = "https://github.com/NVIDIA/OpenShell", rev = "1d4ac708f1d2a9ab94204cdce6ca0eee7e792839", version = "=0.0.0", optional = true }
+sha2.workspace = true
 steward-types = { path = "../../crates/steward-types", version = "=0.0.0" }
+tokio = { workspace = true, optional = true }
+
+[[example]]
+name = "workspace_contract"
+required-features = ["s0-spike"]
 
 [lints]
 workspace = true

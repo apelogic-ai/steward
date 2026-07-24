@@ -698,6 +698,9 @@ because a walking skeleton built on a mis-inferred guarantee walks fine.
 This is also our Lane H opening upstream — nobody in #1613 or #1719 is speaking as an
 integrator with a shipping control plane, and after this spike we are.
 
+**Current execution order:** S0 → S3 → S4. S1 and S2 wait for the OpenShell
+supervisor-identity fix because both require a per-sandbox SVID; S0, S3, and S4 do not.
+
 ---
 
 ### S0 — Walking skeleton
@@ -826,7 +829,8 @@ it by default.
 
 ## 8. Foundation posture — the schedule
 
-OpenShell is at `v0.0.82`, releasing near-daily, with the isolation model still landing.
+OpenShell is pinned at `v0.0.90`, releasing near-daily, with the isolation model still
+landing.
 Steward's product claim is a *security* claim, so the risk that matters is not that the
 foundation moves — motion is loud and CI catches it. It is that a guarantee we sell
 quietly stops being provided by the mechanism we believe provides it.
