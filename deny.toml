@@ -18,6 +18,16 @@ confidence-threshold = 0.9
 # emitting a warning merely because an allowed license has not appeared.
 unused-allowed-license = "allow"
 
+[[licenses.exceptions]]
+name = "foldhash"
+version = "=0.1.5"
+allow = ["Zlib"]
+
+[[licenses.exceptions]]
+name = "webpki-roots"
+version = "=1.0.9"
+allow = ["CDLA-Permissive-2.0"]
+
 [advisories]
 version = 2
 yanked = "deny"
