@@ -1,0 +1,10 @@
+diff --git a/crates/openshell-supervisor-process/src/run.rs b/crates/openshell-supervisor-process/src/run.rs
+index 5a06d97a..e72ab952 100644
+--- a/crates/openshell-supervisor-process/src/run.rs
++++ b/crates/openshell-supervisor-process/src/run.rs
+@@ -97,0 +98,5 @@ pub async fn run_process(
++    // Pin the child mount namespace while privileged startup operations are
++    // still available and before seccomp hardens the supervisor.
++    #[cfg(target_os = "linux")]
++    crate::process::prepare_supervisor_identity_mount_namespace_from_env()?;
++

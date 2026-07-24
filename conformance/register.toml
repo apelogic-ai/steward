@@ -52,7 +52,8 @@ gaps = [
 sells = "An agent cannot obtain another user's credentials"
 mechanism = "Blocked upstream before the SVID → HOP-1 exchange"
 watch = """
-The downstream patch exits when the upstream supervisor-identity fix merges. \
+The downstream patch exits when a fail-closed supervisor-identity fix merges; \
+track focused closed attempt #2012 and broader open attempt #2184. \
 #1970 may replace the SVID→HOP-1 leg entirely. Also: the verifier passes no \
 `algorithms` allowlist to `jwtVerify`, so algorithm restriction is implicit in JWKS key \
 resolution — a holds_ test must cover an out-of-profile algorithm being rejected."""
