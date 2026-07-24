@@ -67,6 +67,25 @@ CREATE TRIGGER admission_decisions_are_append_only
 BEFORE UPDATE OR DELETE ON admission_decisions
 FOR EACH ROW EXECUTE FUNCTION steward_reject_history_mutation();
 
+CREATE FUNCTION steward_reject_approval_rebinding()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.runtime_uid IS DISTINCT FROM OLD.runtime_uid
+        OR NEW.admission_decision_id IS DISTINCT FROM OLD.admission_decision_id
+    THEN
+        RAISE EXCEPTION 'approval binding is immutable'
+            USING ERRCODE = '55000';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER approval_binding_is_immutable
+BEFORE UPDATE ON approvals
+FOR EACH ROW EXECUTE FUNCTION steward_reject_approval_rebinding();
+
 CREATE TRIGGER runtime_events_are_append_only
 BEFORE UPDATE OR DELETE ON runtime_events
 FOR EACH ROW EXECUTE FUNCTION steward_reject_history_mutation();

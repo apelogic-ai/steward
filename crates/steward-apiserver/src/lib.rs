@@ -5,8 +5,9 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-use axum::extract::{Path, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Extension, Json, Router};
@@ -15,7 +16,7 @@ use kube::core::Request as KubeRequest;
 use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, evaluate};
+use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, add_budget_amount, evaluate};
 use steward_store::{ParkRejection, ParkedAdmission, PendingApproval, PgStore, StoreError};
 use steward_types::{AgentRuntime, AgentRuntimeSpec, Principal};
 use uuid::Uuid;
@@ -31,6 +32,26 @@ pub struct AdmissionContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminContext {
     pub actor: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedCaller {
+    pub actor: String,
+    pub member_roles: Vec<String>,
+    pub is_admin: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthenticationError {
+    InvalidCredentials,
+    Unavailable,
+}
+
+pub trait RequestAuthenticator: Clone + Send + Sync + 'static {
+    fn authenticate<'a>(
+        &'a self,
+        bearer_token: &'a str,
+    ) -> BoxFuture<'a, Result<AuthenticatedCaller, AuthenticationError>>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -233,22 +254,127 @@ struct AppState<R, L> {
     ledger: L,
 }
 
-pub fn router<R, L>(runtimes: R, ledger: L) -> Router
+pub fn router<R, L, A>(runtimes: R, ledger: L, authenticator: A) -> Router
 where
     R: RuntimeRepository,
     L: AdmissionLedger,
+    A: RequestAuthenticator,
 {
-    Router::new()
+    let admission = Router::new()
         .route(
             "/v1/namespaces/{namespace}/runtimes/{name}/budget",
             patch(budget_increase_handler::<R, L>),
         )
+        .route_layer(middleware::from_fn_with_state(
+            authenticator.clone(),
+            authenticate_admission::<A>,
+        ));
+    let admin = Router::new()
         .route("/admin/approvals", get(approval_queue_handler::<R, L>))
         .route(
             "/admin/envelopes/{member_role}",
             post(author_envelope_handler::<R, L>),
         )
+        .route_layer(middleware::from_fn_with_state(
+            authenticator,
+            authenticate_admin::<A>,
+        ));
+    admission
+        .merge(admin)
         .with_state(AppState { runtimes, ledger })
+}
+
+async fn authenticate_admission<A: RequestAuthenticator>(
+    State(authenticator): State<A>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let caller = match authenticate_request(&authenticator, request.headers()).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    let roles = caller
+        .member_roles
+        .iter()
+        .filter(|role| !role.is_empty())
+        .collect::<Vec<_>>();
+    let Some(member_role) = roles.first().filter(|_| roles.len() == 1) else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "exactly one authenticated member role is required",
+            })),
+        )
+            .into_response();
+    };
+    request.extensions_mut().insert(AdmissionContext {
+        actor: caller.actor,
+        member_role: (*member_role).clone(),
+    });
+    next.run(request).await
+}
+
+async fn authenticate_admin<A: RequestAuthenticator>(
+    State(authenticator): State<A>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let caller = match authenticate_request(&authenticator, request.headers()).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    if !caller.is_admin {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "administrator authority is required",
+            })),
+        )
+            .into_response();
+    }
+    request.extensions_mut().insert(AdminContext {
+        actor: caller.actor,
+    });
+    next.run(request).await
+}
+
+async fn authenticate_request<A: RequestAuthenticator>(
+    authenticator: &A,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedCaller, Response> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|token| !token.is_empty())
+        .ok_or_else(unauthorized)?;
+    authenticator.authenticate(token).await.map_err(|error| {
+        let status = match error {
+            AuthenticationError::InvalidCredentials => StatusCode::UNAUTHORIZED,
+            AuthenticationError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        (
+            status,
+            Json(serde_json::json!({
+                "error": "caller authentication failed",
+            })),
+        )
+            .into_response()
+    })
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            axum::http::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer"),
+        )],
+        Json(serde_json::json!({
+            "error": "bearer authentication is required",
+        })),
+    )
+        .into_response()
 }
 
 async fn budget_increase_handler<R, L>(
@@ -410,11 +536,12 @@ where
         .map_err(|error| ApiError::Store(error.to_string()))?
         .ok_or(ApiError::MissingEnvelope)?;
     let mut proposed = runtime.clone();
-    proposed.spec.budget.monthly_limit = add_decimal(
-        &runtime.spec.budget.monthly_limit,
-        &edit.amount,
-        &edit.amount,
-    )?;
+    proposed.spec.budget.monthly_limit =
+        add_budget_amount(&runtime.spec.budget.monthly_limit, &edit.amount).map_err(|_| {
+            ApiError::InvalidBudgetIncrease {
+                value: edit.amount.clone(),
+            }
+        })?;
     let decision = evaluate(&proposed.spec, &envelope)
         .map_err(|error| ApiError::Admission(format!("{error:?}")))?;
     match decision {
@@ -465,68 +592,8 @@ where
     }
 }
 
-fn add_decimal(left: &str, right: &str, reported_value: &str) -> Result<String, ApiError> {
-    let (mut left_digits, left_scale) = decimal_digits(left, reported_value)?;
-    let (mut right_digits, right_scale) = decimal_digits(right, reported_value)?;
-    let scale = left_scale.max(right_scale);
-    left_digits.extend(std::iter::repeat_n(0, scale - left_scale));
-    right_digits.extend(std::iter::repeat_n(0, scale - right_scale));
-    let width = left_digits.len().max(right_digits.len());
-    left_digits.splice(0..0, std::iter::repeat_n(0, width - left_digits.len()));
-    right_digits.splice(0..0, std::iter::repeat_n(0, width - right_digits.len()));
-
-    let mut carry = 0;
-    let mut sum = Vec::with_capacity(width + 1);
-    for (left, right) in left_digits.into_iter().zip(right_digits).rev() {
-        let value = left + right + carry;
-        sum.push(value % 10);
-        carry = value / 10;
-    }
-    if carry > 0 {
-        sum.push(carry);
-    }
-    sum.reverse();
-    let first_nonzero = sum
-        .iter()
-        .position(|digit| *digit != 0)
-        .unwrap_or(sum.len().saturating_sub(scale + 1));
-    let mut text = sum[first_nonzero..]
-        .iter()
-        .map(|digit| char::from(b'0' + *digit))
-        .collect::<String>();
-    if scale > 0 {
-        if text.len() <= scale {
-            text.insert_str(0, &"0".repeat(scale + 1 - text.len()));
-        }
-        text.insert(text.len() - scale, '.');
-    }
-    Ok(text)
-}
-
-fn decimal_digits(value: &str, reported_value: &str) -> Result<(Vec<u8>, usize), ApiError> {
-    let mut parts = value.split('.');
-    let integer = parts.next().unwrap_or_default();
-    let fractional = parts.next().unwrap_or_default();
-    if integer.is_empty()
-        || parts.next().is_some()
-        || !integer.bytes().all(|byte| byte.is_ascii_digit())
-        || !fractional.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(ApiError::InvalidBudgetIncrease {
-            value: reported_value.to_owned(),
-        });
-    }
-    let digits = integer
-        .bytes()
-        .chain(fractional.bytes())
-        .map(|byte| byte - b'0')
-        .collect();
-    Ok((digits, fractional.len()))
-}
-
 #[cfg(test)]
 mod tests {
-    use axum::Extension;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use std::sync::{Arc, Mutex};
@@ -540,9 +607,36 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        AdminContext, AdmissionContext, AdmissionLedger, BoxFuture, BudgetIncrease,
-        RuntimeRepository, SubmissionOutcome, router, submit_budget_increase,
+        AdmissionContext, AdmissionLedger, AuthenticatedCaller, AuthenticationError, BoxFuture,
+        BudgetIncrease, RequestAuthenticator, RuntimeRepository, SubmissionOutcome, router,
+        submit_budget_increase,
     };
+
+    #[derive(Clone)]
+    struct FakeAuthenticator;
+
+    impl RequestAuthenticator for FakeAuthenticator {
+        fn authenticate<'a>(
+            &'a self,
+            bearer_token: &'a str,
+        ) -> BoxFuture<'a, Result<AuthenticatedCaller, AuthenticationError>> {
+            Box::pin(async move {
+                match bearer_token {
+                    "user-session" => Ok(AuthenticatedCaller {
+                        actor: "alice@example.com".to_owned(),
+                        member_roles: vec!["engineer".to_owned()],
+                        is_admin: false,
+                    }),
+                    "admin-session" => Ok(AuthenticatedCaller {
+                        actor: "admin@example.com".to_owned(),
+                        member_roles: Vec::new(),
+                        is_admin: true,
+                    }),
+                    _ => Err(AuthenticationError::InvalidCredentials),
+                }
+            })
+        }
+    }
 
     #[derive(Clone)]
     struct FakeRuntimeRepository {
@@ -754,28 +848,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn privileged_routes_reject_missing_authentication() -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let app = router(runtimes, ledger(), FakeAuthenticator);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/approvals")
+                    .body(Body::empty())
+                    .map_err(|error| format!("failed to build unauthenticated request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("unauthenticated request failed: {error}"))?;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a router with no authenticated caller must reject privileged routes explicitly"
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/approvals")
+                    .header("authorization", "Bearer user-session")
+                    .body(Body::empty())
+                    .map_err(|error| {
+                        format!("failed to build unauthorized-admin request: {error}")
+                    })?,
+            )
+            .await
+            .map_err(|error| format!("unauthorized-admin request failed: {error}"))?;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "an authenticated non-admin must not reach privileged admin routes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rest_route_returns_the_parked_shared_counterexample() -> Result<(), String> {
         let runtimes = FakeRuntimeRepository {
             runtime: Arc::new(Mutex::new(runtime())),
         };
         let ledger = ledger();
-        let context = AdmissionContext {
-            actor: "alice@example.com".to_owned(),
-            member_role: "engineer".to_owned(),
-        };
         let envelope_body = serde_json::to_vec(&ledger.envelope)
             .map_err(|error| format!("failed to serialize envelope: {error}"))?;
-        let app = router(runtimes, ledger)
-            .layer(Extension(context))
-            .layer(Extension(AdminContext {
-                actor: "admin@example.com".to_owned(),
-            }));
+        let app = router(runtimes, ledger, FakeAuthenticator);
         let authored = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/admin/envelopes/engineer")
+                    .header("authorization", "Bearer admin-session")
                     .header("content-type", "application/json")
                     .body(Body::from(envelope_body))
                     .map_err(|error| format!("failed to build envelope request: {error}"))?,
@@ -791,6 +921,7 @@ mod tests {
             Request::builder()
                 .method("PATCH")
                 .uri("/v1/namespaces/team-a/runtimes/runtime-a/budget")
+                .header("authorization", "Bearer user-session")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"amount":"60.00"}"#))
                 .map_err(|error| format!("failed to build API request: {error}"))
@@ -835,6 +966,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/approvals")
+                    .header("authorization", "Bearer admin-session")
                     .body(Body::empty())
                     .map_err(|error| format!("failed to build queue request: {error}"))?,
             )

@@ -182,6 +182,46 @@ pub fn evaluate(
     }
 }
 
+pub fn add_budget_amount(left: &str, right: &str) -> Result<String, AdmissionError> {
+    let (left_integer, left_fractional) = decimal_parts(left)?;
+    let (right_integer, right_fractional) = decimal_parts(right)?;
+    let mut left_digits = decimal_digits(left_integer, left_fractional);
+    let mut right_digits = decimal_digits(right_integer, right_fractional);
+    let scale = left_fractional.len().max(right_fractional.len());
+    left_digits.extend(std::iter::repeat_n(0, scale - left_fractional.len()));
+    right_digits.extend(std::iter::repeat_n(0, scale - right_fractional.len()));
+    let width = left_digits.len().max(right_digits.len());
+    left_digits.splice(0..0, std::iter::repeat_n(0, width - left_digits.len()));
+    right_digits.splice(0..0, std::iter::repeat_n(0, width - right_digits.len()));
+
+    let mut carry = 0;
+    let mut sum = Vec::with_capacity(width + 1);
+    for (left, right) in left_digits.into_iter().zip(right_digits).rev() {
+        let value = left + right + carry;
+        sum.push(value % 10);
+        carry = value / 10;
+    }
+    if carry > 0 {
+        sum.push(carry);
+    }
+    sum.reverse();
+    let first_nonzero = sum
+        .iter()
+        .position(|digit| *digit != 0)
+        .unwrap_or(sum.len().saturating_sub(scale + 1));
+    let mut text = sum[first_nonzero..]
+        .iter()
+        .map(|digit| char::from(b'0' + *digit))
+        .collect::<String>();
+    if scale > 0 {
+        if text.len() <= scale {
+            text.insert_str(0, &"0".repeat(scale + 1 - text.len()));
+        }
+        text.insert(text.len() - scale, '.');
+    }
+    Ok(text)
+}
+
 #[derive(Debug)]
 struct Decimal<'a> {
     integer: &'a str,
@@ -190,18 +230,7 @@ struct Decimal<'a> {
 
 impl<'a> Decimal<'a> {
     fn parse(value: &'a str) -> Result<Self, AdmissionError> {
-        let mut parts = value.split('.');
-        let integer = parts.next().unwrap_or_default();
-        let fractional = parts.next().unwrap_or_default();
-        if integer.is_empty()
-            || parts.next().is_some()
-            || !integer.bytes().all(|byte| byte.is_ascii_digit())
-            || !fractional.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err(AdmissionError::InvalidBudget {
-                value: value.to_owned(),
-            });
-        }
+        let (integer, fractional) = decimal_parts(value)?;
         Ok(Self {
             integer: integer.trim_start_matches('0'),
             fractional: fractional.trim_end_matches('0'),
@@ -215,6 +244,30 @@ impl<'a> Decimal<'a> {
             .then_with(|| self.integer.cmp(other.integer))
             .then_with(|| compare_fractional(self.fractional, other.fractional))
     }
+}
+
+fn decimal_parts(value: &str) -> Result<(&str, &str), AdmissionError> {
+    let mut parts = value.split('.');
+    let integer = parts.next().unwrap_or_default();
+    let fractional = parts.next().unwrap_or_default();
+    if integer.is_empty()
+        || parts.next().is_some()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fractional.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(AdmissionError::InvalidBudget {
+            value: value.to_owned(),
+        });
+    }
+    Ok((integer, fractional))
+}
+
+fn decimal_digits(integer: &str, fractional: &str) -> Vec<u8> {
+    integer
+        .bytes()
+        .chain(fractional.bytes())
+        .map(|byte| byte - b'0')
+        .collect()
 }
 
 fn compare_fractional(left: &str, right: &str) -> Ordering {
@@ -271,7 +324,8 @@ mod tests {
     };
 
     use super::{
-        AdmissionDecision, AdmissionDelta, AdmissionError, Envelope, EnvelopeSpec, evaluate,
+        AdmissionDecision, AdmissionDelta, AdmissionError, Envelope, EnvelopeSpec,
+        add_budget_amount, evaluate,
     };
 
     fn request_with_budget(monthly_limit: &str) -> AgentRuntimeSpec {
@@ -436,6 +490,17 @@ mod tests {
                 "envelope exceeded: budget.monthlyLimit requested 220.00 USD, ceiling 200.00 USD; ttl requested 25h, ceiling 24h"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn budget_addition_uses_the_admission_decimal_syntax() {
+        assert_eq!(add_budget_amount("099.90", "0.1"), Ok("100.00".to_owned()));
+        assert_eq!(
+            add_budget_amount("100.00", "+1"),
+            Err(AdmissionError::InvalidBudget {
+                value: "+1".to_owned(),
+            })
         );
     }
 }

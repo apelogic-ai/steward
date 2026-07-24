@@ -10,6 +10,21 @@ const RUNTIME_NAME: &str = "runtime-a";
 const COUNTEREXAMPLE: &str =
     "envelope exceeded: budget.monthlyLimit requested 220.00 USD, ceiling 200.00 USD";
 
+#[derive(Clone, Copy)]
+enum Caller {
+    User,
+    Admin,
+}
+
+impl Caller {
+    fn bearer_token(self) -> &'static str {
+        match self {
+            Self::User => "test-user-session",
+            Self::Admin => "test-admin-session",
+        }
+    }
+}
+
 struct Harness {
     api_url: String,
     ca_certificate: PathBuf,
@@ -66,13 +81,16 @@ impl Harness {
         path: &str,
         body: Option<&str>,
         output_name: &str,
+        caller: Caller,
     ) -> Result<(u16, String), Box<dyn Error>> {
         let output_path = self.run_directory.join(output_name);
         let mut command = Command::new("curl");
         command
             .args(["--silent", "--show-error", "--cacert"])
             .arg(&self.ca_certificate)
-            .args(["--resolve", &self.resolve, "--request", method, "--output"])
+            .args(["--resolve", &self.resolve, "--request", method, "--header"])
+            .arg(format!("authorization: Bearer {}", caller.bearer_token()))
+            .arg("--output")
             .arg(&output_path)
             .args(["--write-out", "%{http_code}"]);
         if let Some(body) = body {
@@ -168,6 +186,7 @@ fn e2e_s3_composed_edits_rejected() -> Result<(), Box<dyn Error>> {
         "/admin/envelopes/engineer",
         Some(&envelope.to_string()),
         "authored-envelope.json",
+        Caller::Admin,
     )?;
     assert_eq!(status, 201, "member-role envelope must be authored");
 
@@ -187,6 +206,7 @@ fn e2e_s3_composed_edits_rejected() -> Result<(), Box<dyn Error>> {
         "/v1/namespaces/team-a/runtimes/runtime-a/budget",
         Some(edit),
         "first-edit.json",
+        Caller::User,
     )?;
     assert_eq!(first_status, 200, "first +60 edit must compose to 160");
     let first = serde_json::from_str::<serde_json::Value>(&first_body)?;
@@ -227,6 +247,7 @@ fn e2e_s3_composed_edits_rejected() -> Result<(), Box<dyn Error>> {
         "/v1/namespaces/team-a/runtimes/runtime-a/budget",
         Some(edit),
         "second-edit.json",
+        Caller::User,
     )?;
     assert_eq!(second_status, 202, "second +60 edit must park");
     let second = serde_json::from_str::<serde_json::Value>(&second_body)?;
@@ -272,8 +293,13 @@ fn e2e_s3_composed_edits_rejected() -> Result<(), Box<dyn Error>> {
         "kubectl denial must contain the API's exact counterexample: {kubectl_message}"
     );
 
-    let (queue_status, queue) =
-        harness.curl("GET", "/admin/approvals", None, "approval-queue.html")?;
+    let (queue_status, queue) = harness.curl(
+        "GET",
+        "/admin/approvals",
+        None,
+        "approval-queue.html",
+        Caller::Admin,
+    )?;
     assert_eq!(queue_status, 200);
     for expected in [
         runtime_uid.as_str(),

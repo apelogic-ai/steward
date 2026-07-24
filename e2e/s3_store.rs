@@ -125,6 +125,35 @@ async fn s3_postgres_keeps_envelopes_immutable_and_parks_exact_rejections()
                 "a rejected manifest and its counterexample must park atomically: {error}"
             ))
         })?;
+    let rebound = sqlx::query("UPDATE approvals SET runtime_uid = 'runtime-other' WHERE id = $1")
+        .bind(parked.approval_id)
+        .execute(store.pool())
+        .await;
+    assert!(
+        rebound.is_err(),
+        "an approval must never be rebound to another runtime UID"
+    );
+    let other_runtime_uid = format!("runtime-other-{suffix}");
+    let other = store
+        .park_rejection(ParkRejection {
+            runtime_uid: &other_runtime_uid,
+            spec_digest: "digest-b",
+            envelope_revision: envelope.revision,
+            deltas: &deltas,
+            proposed_spec: &proposed_spec,
+            actor: "bob@example.org",
+            member_role: &member_role,
+        })
+        .await?;
+    let rebound = sqlx::query("UPDATE approvals SET admission_decision_id = $1 WHERE id = $2")
+        .bind(other.decision_id)
+        .bind(parked.approval_id)
+        .execute(store.pool())
+        .await;
+    assert!(
+        rebound.is_err(),
+        "an approval must never be rebound to another admission decision"
+    );
     let queue = store.pending_approvals().await?;
     let row = queue
         .iter()

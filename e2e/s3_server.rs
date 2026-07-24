@@ -5,10 +5,12 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Extension;
 use axum::serve::Listener;
 use sqlx::postgres::PgPoolOptions;
-use steward_apiserver::{AdminContext, AdmissionContext, KubeRuntimeRepository, router};
+use steward_apiserver::{
+    AuthenticatedCaller, AuthenticationError, BoxFuture, KubeRuntimeRepository,
+    RequestAuthenticator, router,
+};
 use steward_controller::webhook_router;
 use steward_store::PgStore;
 use tokio::net::{TcpListener, TcpStream};
@@ -35,10 +37,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let store = PgStore::new(pool);
     store.migrate().await?;
     let client = kube::Client::try_default().await?;
-    let app = router(KubeRuntimeRepository::new(client), store.clone())
-        .merge(webhook_router(store))
-        .layer(Extension(AdmissionContext { actor, member_role }))
-        .layer(Extension(AdminContext { actor: admin }));
+    let app = router(
+        KubeRuntimeRepository::new(client),
+        store.clone(),
+        S3Authenticator {
+            actor,
+            member_role,
+            admin,
+        },
+    )
+    .merge(webhook_router(store));
     let listener = TcpListener::bind(&bind).await?;
     let certificate = CertificateDer::from(fs::read(certificate_path)?);
     let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(fs::read(private_key_path)?));
@@ -54,6 +62,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
     Ok(())
+}
+
+#[derive(Clone)]
+struct S3Authenticator {
+    actor: String,
+    member_role: String,
+    admin: String,
+}
+
+impl RequestAuthenticator for S3Authenticator {
+    fn authenticate<'a>(
+        &'a self,
+        bearer_token: &'a str,
+    ) -> BoxFuture<'a, Result<AuthenticatedCaller, AuthenticationError>> {
+        Box::pin(async move {
+            match bearer_token {
+                "test-user-session" => Ok(AuthenticatedCaller {
+                    actor: self.actor.clone(),
+                    member_roles: vec![self.member_role.clone()],
+                    is_admin: false,
+                }),
+                "test-admin-session" => Ok(AuthenticatedCaller {
+                    actor: self.admin.clone(),
+                    member_roles: Vec::new(),
+                    is_admin: true,
+                }),
+                _ => Err(AuthenticationError::InvalidCredentials),
+            }
+        })
+    }
 }
 
 fn required(name: &str) -> Result<String, io::Error> {
