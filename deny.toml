@@ -23,8 +23,22 @@ name = "foldhash"
 version = "=0.1.5"
 allow = ["Zlib"]
 
+# kube-runtime 4.2.0 reaches foldhash 0.2.0 through hashbrown 0.16;
+# Zlib is OSI-permissive and MIT-equivalent in effect.
+[[licenses.exceptions]]
+name = "foldhash"
+version = "=0.2.0"
+allow = ["Zlib"]
+
 [[licenses.exceptions]]
 name = "webpki-roots"
+version = "=1.0.9"
+allow = ["CDLA-Permissive-2.0"]
+
+# rustls-platform-verifier 0.7.0 packages the same Mozilla CA data under
+# CDLA-Permissive-2.0, which imposes no attribution requirement.
+[[licenses.exceptions]]
+name = "webpki-root-certs"
 version = "=1.0.9"
 allow = ["CDLA-Permissive-2.0"]
 

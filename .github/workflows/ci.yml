@@ -15,6 +15,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_DENY_VERSION: "0.20.2"
+  HELM_VERSION: "3.17.1"
+  KIND_VERSION: "0.31.0"
+  KUBECTL_VERSION: "1.32.1"
   OPA_VERSION: "1.18.2"
 
 jobs:
@@ -60,12 +63,48 @@ jobs:
           mv "${tools_dir}/${opa_asset}" "${tools_dir}/opa"
           chmod +x "${tools_dir}/opa"
 
+          kind_asset="kind-linux-amd64"
+          kind_url="https://github.com/kubernetes-sigs/kind/releases/download/v${KIND_VERSION}"
+          curl --fail --location --silent --show-error \
+            --output "${tools_dir}/${kind_asset}" "${kind_url}/${kind_asset}"
+          curl --fail --location --silent --show-error \
+            --output "${tools_dir}/${kind_asset}.sha256sum" "${kind_url}/${kind_asset}.sha256sum"
+          kind_hash="$(cut -d ' ' -f 1 "${tools_dir}/${kind_asset}.sha256sum")"
+          echo "${kind_hash}  ${tools_dir}/${kind_asset}" | sha256sum --check -
+          mv "${tools_dir}/${kind_asset}" "${tools_dir}/kind"
+          chmod +x "${tools_dir}/kind"
+
+          kubectl_url="https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64"
+          curl --fail --location --silent --show-error \
+            --output "${tools_dir}/kubectl" "${kubectl_url}/kubectl"
+          curl --fail --location --silent --show-error \
+            --output "${tools_dir}/kubectl.sha256" "${kubectl_url}/kubectl.sha256"
+          kubectl_hash="$(cat "${tools_dir}/kubectl.sha256")"
+          echo "${kubectl_hash}  ${tools_dir}/kubectl" | sha256sum --check -
+          chmod +x "${tools_dir}/kubectl"
+
+          helm_asset="helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          helm_url="https://get.helm.sh"
+          curl --fail --location --silent --show-error \
+            --output "${tools_dir}/${helm_asset}" "${helm_url}/${helm_asset}"
+          curl --fail --location --silent --show-error \
+            --output "${tools_dir}/${helm_asset}.sha256sum" "${helm_url}/${helm_asset}.sha256sum"
+          helm_hash="$(cut -d ' ' -f 1 "${tools_dir}/${helm_asset}.sha256sum")"
+          echo "${helm_hash}  ${tools_dir}/${helm_asset}" | sha256sum --check -
+          tar --extract --gzip \
+            --file "${tools_dir}/${helm_asset}" --directory "${tools_dir}" linux-amd64/helm
+          mv "${tools_dir}/linux-amd64/helm" "${tools_dir}/helm"
+          chmod +x "${tools_dir}/helm"
+
           echo "${tools_dir}" >> "${GITHUB_PATH}"
 
       - name: Run pinned gate
         env:
           STEWARD_MIGRATION_BASE: ${{ github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || github.sha }}
         run: cargo xtask ci
+
+      - name: Run S0 exit criterion
+        run: cargo xtask e2e-s0
 
   latest-nightly:
     name: latest-nightly

@@ -26,6 +26,7 @@ schema = 1
 pinned_openshell = "v0.0.90"
 pinned_openshell_commit = "1d4ac708f1d2a9ab94204cdce6ca0eee7e792839"
 pinned_agent_sandbox = "v0.5.0"
+pinned_base_sandbox_image = "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e"
 pinned_mcp_gw = "v0.2.0"
 pinned_spire = "1.15.2"
 pinned_litellm = "1.93.0"
