@@ -47,10 +47,12 @@ id = "G-2"
 module = "g2_credential_isolation"
 claim = "not-yet"
 gaps = [
-  "OpenShell v0.0.90 SPIFFE-enabled sandboxes fail before readiness because the supervisor identity mount namespace is not prepared, so no per-sandbox JWT-SVID is obtainable.",
+  "Stock OpenShell v0.0.90 fails before readiness because the supervisor identity mount namespace is not prepared; the carried patch restores per-sandbox JWT-SVID acquisition.",
+  "Steward's SVID → HOP-1 exchange and mcp-gw credential boundary are not implemented.",
+  "The upstream token-grant demo reaches its configured token endpoint with the patched supervisor, then its Node issuer rejects the SPIRE OIDC discovery TLS chain.",
 ]
 sells = "An agent cannot obtain another user's credentials"
-mechanism = "Blocked upstream before the SVID → HOP-1 exchange"
+mechanism = "Patched per-sandbox SPIFFE identity is live; the SVID → HOP-1 exchange remains unimplemented"
 watch = """
 The downstream patch exits when a fail-closed supervisor-identity fix merges; \
 track focused closed attempt #2012 and broader open attempt #2184. \

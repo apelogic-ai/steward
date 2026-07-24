@@ -23,7 +23,7 @@ cleanup() {
     kill "${PORT_FORWARD_PID}" >/dev/null 2>&1 || true
     wait "${PORT_FORWARD_PID}" >/dev/null 2>&1 || true
   fi
-  if [[ "${CLUSTER_CREATED}" == "1" ]]; then
+  if [[ "${CLUSTER_CREATED}" == "1" && "${STEWARD_DEV_KEEP:-0}" != "1" ]]; then
     kind delete cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1 || true
   fi
   if [[ "${STEWARD_DEV_KEEP:-0}" == "1" ]]; then
@@ -35,7 +35,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for command in kind kubectl helm cargo curl openssl shasum tar; do
+for command in kind kubectl helm cargo curl openssl sed shasum tar; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is missing: ${command}" >&2
     exit 2
@@ -48,6 +48,24 @@ kind create cluster \
   --kubeconfig "${KUBECONFIG_PATH}" \
   --wait 120s
 CLUSTER_CREATED=1
+
+supervisor_image_args=()
+if [[ -n "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
+  if [[ "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE}" != *:* || "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE}" == *@* ]]; then
+    echo "STEWARD_OPENSHELL_SUPERVISOR_IMAGE must be an explicit repository:tag reference" >&2
+    exit 2
+  fi
+  supervisor_repository="${STEWARD_OPENSHELL_SUPERVISOR_IMAGE%:*}"
+  supervisor_tag="${STEWARD_OPENSHELL_SUPERVISOR_IMAGE##*:}"
+  kind load docker-image \
+    "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE}" \
+    --name "${CLUSTER_NAME}"
+  supervisor_image_args=(
+    --set-string "supervisor.image.repository=${supervisor_repository}"
+    --set-string "supervisor.image.tag=${supervisor_tag}"
+    --set-string "supervisor.image.pullPolicy=IfNotPresent"
+  )
+fi
 
 actual_context="$(
   kubectl --kubeconfig "${KUBECONFIG_PATH}" config current-context
@@ -114,6 +132,7 @@ env \
   --values "${ROOT}/config/openshell/provider-token-grants.yaml" \
   --set server.disableTls=true \
   --set server.auth.allowUnauthenticatedUsers=true \
+  "${supervisor_image_args[@]}" \
   --wait \
   --timeout 5m
 
@@ -171,6 +190,25 @@ if [[ "$#" -eq 0 ]]; then
     -o "${source_archive}"
   mkdir -p "${source_directory}"
   tar -xzf "${source_archive}" -C "${source_directory}" --strip-components=1
+  service_subnet="$(
+    kubectl \
+      --kubeconfig "${KUBECONFIG_PATH}" \
+      --context "${KUBE_CONTEXT}" \
+      -n kube-system \
+      get configmap kubeadm-config \
+      -o jsonpath='{.data.ClusterConfiguration}' |
+      sed -nE 's/^[[:space:]]*serviceSubnet:[[:space:]]*([^[:space:]]+).*$/\1/p'
+  )"
+  if [[ -z "${service_subnet}" ]]; then
+    echo "could not derive the kind service subnet for the OpenShell demo" >&2
+    exit 1
+  fi
+  demo_profile="${source_directory}/examples/spiffe-token-grant-demo/provider-profile.yaml"
+  if ! grep -q "10\\.43\\.0\\.0/16" "${demo_profile}"; then
+    echo "OpenShell demo no longer carries its expected k3s service subnet" >&2
+    exit 1
+  fi
+  sed -i.bak "s#10\\.43\\.0\\.0/16#${service_subnet}#g" "${demo_profile}"
   PATH="${RUN_DIR}:${PATH}" \
     XDG_CONFIG_HOME="${RUN_DIR}/openshell-config" \
     GATEWAY_ENDPOINT="${endpoint}" \

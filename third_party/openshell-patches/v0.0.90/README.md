@@ -29,10 +29,11 @@ the existing fail-closed behavior if identity isolation cannot be established.
 - [NVIDIA/OpenShell#2184](https://github.com/NVIDIA/OpenShell/pull/2184) remains
   open and also wires the call, but combines it with broader recovery behavior
   that continues without supervisor identity isolation.
-- A focused branch is prepared at
-  `lbelyaev/OpenShell:2184-prepare-supervisor-identity-namespace/lbelyaev`.
-  Upstream will auto-close its PR until the human contributor completes the
-  required vouch process.
+- The focused, signed-off fix is
+  [`lbelyaev/OpenShell@151f6ba6`](https://github.com/lbelyaev/OpenShell/commit/151f6ba6)
+  on branch `2184-prepare-supervisor-identity-namespace/lbelyaev`. Upstream
+  will auto-close its PR until the human contributor completes the required
+  vouch process.
 
 Remove this patch when a NVIDIA/OpenShell PR containing the equivalent
 fail-closed startup call merges and Steward pins a release that contains it.
@@ -49,5 +50,18 @@ lines while the exact base commit supplies the safety boundary.
   `cargo test -p openshell-supervisor-process` (80 passed; one privileged test
   ignored by upstream), and
   `cargo clippy -p openshell-supervisor-process --all-targets -- -D warnings`.
-- Full upstream pre-commit and the patched live demo remain required before the
-  upstream branch is pushed.
+- Full upstream `mise run pre-commit` passed on the focused current-main branch.
+- Live against the exact patched v0.0.90 base: the sandbox reached readiness,
+  the `ClusterSPIFFEID` selected it using `openshell.io/sandbox-id`, and the
+  supervisor obtained a JWT-SVID and sent it to the profile's configured token
+  endpoint. The upstream demo then stopped in its Node token issuer because
+  that process did not trust the SPIRE OIDC discovery provider's TLS chain
+  (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`); that is downstream of SVID acquisition.
+
+The live command loads the locally built image only into its ephemeral kind
+cluster:
+
+```bash
+STEWARD_OPENSHELL_SUPERVISOR_IMAGE=openshell/supervisor:steward-spiffe-v0090 \
+  scripts/s0-0-openshell-spike.sh
+```
