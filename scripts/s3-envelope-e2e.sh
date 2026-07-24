@@ -2,14 +2,20 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-run_id="s3-$(date -u +%Y%m%d%H%M%S)-$$"
-cluster="steward-s3-${run_id}"
+slice="${STEWARD_E2E_SLICE:-s3}"
+if [[ "${slice}" != "s3" && "${slice}" != "s4" ]]; then
+  echo "error: STEWARD_E2E_SLICE must be s3 or s4" >&2
+  exit 1
+fi
+run_id="${slice}-$(date -u +%Y%m%d%H%M%S)-$$"
+cluster="steward-${slice}-${run_id}"
 context="kind-${cluster}"
 run_dir="${root}/.steward-run/${run_id}"
 kubeconfig="${run_dir}/kubeconfig"
-image="steward-s3-e2e:${run_id}"
+image="steward-${slice}-e2e:${run_id}"
 port_forward_pid=""
 postgres_forward_pid=""
+jira_forward_pid=""
 
 cleanup() {
   status=$?
@@ -23,6 +29,10 @@ cleanup() {
     kill "${postgres_forward_pid}" >/dev/null 2>&1
     wait "${postgres_forward_pid}" >/dev/null 2>&1
   fi
+  if [[ -n "${jira_forward_pid}" ]]; then
+    kill "${jira_forward_pid}" >/dev/null 2>&1
+    wait "${jira_forward_pid}" >/dev/null 2>&1
+  fi
   kind delete cluster --name "${cluster}" >/dev/null 2>&1
   docker image rm "${image}" >/dev/null 2>&1
   rm -rf -- "${run_dir}"
@@ -32,7 +42,7 @@ trap cleanup EXIT INT TERM
 
 for tool in cargo curl docker kind kubectl openssl sed; do
   command -v "${tool}" >/dev/null 2>&1 || {
-    echo "error: ${tool} is required for the S3 E2E" >&2
+    echo "error: ${tool} is required for the ${slice^^} E2E" >&2
     exit 1
   }
 done
@@ -48,7 +58,7 @@ image=${image}
 EOF
 
 docker build \
-  --file e2e/Dockerfile.s3 \
+  --file "e2e/Dockerfile.${slice}" \
   --label "steward.test/run-id=${run_id}" \
   --tag "${image}" \
   .
@@ -131,10 +141,10 @@ metadata:
 rules:
   - apiGroups: ["agents.apelogic.ai"]
     resources: ["agentruntimes"]
-    verbs: ["get", "update"]
+    verbs: ["get", "list", "update"]
   - apiGroups: [""]
     resources: ["users"]
-    resourceNames: ["alice@example.com"]
+    resourceNames: ["alice@example.com", "bob@example.org"]
     verbs: ["impersonate"]
   - apiGroups: [""]
     resources: ["groups"]
@@ -253,6 +263,9 @@ spec:
         steward.test/run-id: "${run_id}"
     spec:
       serviceAccountName: steward-s3
+      hostAliases:
+        - ip: "127.0.0.1"
+          hostnames: ["jira.test"]
       initContainers:
         - name: wait-postgres
           image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
@@ -277,9 +290,13 @@ spec:
               value: /tls/tls-cert.der
             - name: STEWARD_TEST_TLS_KEY_DER
               value: /tls/tls-key.der
+            - name: STEWARD_TEST_JIRA_URL
+              value: http://jira.test:8081
           ports:
             - name: https
               containerPort: 8080
+            - name: jira
+              containerPort: 8081
           readinessProbe:
             tcpSocket:
               port: https
@@ -309,6 +326,9 @@ spec:
     - name: https
       port: 443
       targetPort: https
+    - name: jira
+      port: 8081
+      targetPort: jira
 EOF
 
 kubectl \
@@ -405,20 +425,69 @@ if [[ -z "${postgres_port}" ]]; then
   exit 1
 fi
 
-STEWARD_TEST_DATABASE_URL="postgres://steward@127.0.0.1:${postgres_port}/steward" \
-  cargo test \
-    --manifest-path e2e/Cargo.toml \
-    --test s3_store
+database_url="postgres://steward@127.0.0.1:${postgres_port}/steward"
+if [[ "${slice}" == "s3" ]]; then
+  STEWARD_TEST_DATABASE_URL="${database_url}" \
+    cargo test \
+      --manifest-path e2e/Cargo.toml \
+      --test s3_store
 
-STEWARD_TEST_KUBE_CONTEXT="${context}" \
-STEWARD_TEST_KUBECONFIG="${kubeconfig}" \
-STEWARD_RUN_DIR="${run_dir}" \
-STEWARD_TEST_TLS_CA="${run_dir}/tls-cert.pem" \
-STEWARD_S3_URL="https://steward-s3.test:${port}" \
-STEWARD_S3_RESOLVE="steward-s3.test:${port}:127.0.0.1" \
-  cargo test \
-    --manifest-path e2e/Cargo.toml \
-    --test s3 \
-    e2e_s3_composed_edits_rejected \
-    -- \
-    --exact
+  STEWARD_TEST_KUBE_CONTEXT="${context}" \
+  STEWARD_TEST_KUBECONFIG="${kubeconfig}" \
+  STEWARD_RUN_DIR="${run_dir}" \
+  STEWARD_TEST_TLS_CA="${run_dir}/tls-cert.pem" \
+  STEWARD_S3_URL="https://steward-s3.test:${port}" \
+  STEWARD_S3_RESOLVE="steward-s3.test:${port}:127.0.0.1" \
+    cargo test \
+      --manifest-path e2e/Cargo.toml \
+      --test s3 \
+      e2e_s3_composed_edits_rejected \
+      -- \
+      --exact
+else
+  jira_forward_log="${run_dir}/jira-port-forward.log"
+  kubectl \
+    --kubeconfig "${kubeconfig}" \
+    --context "${context}" \
+    -n steward-system \
+    port-forward service/steward-s3 :8081 \
+    >"${jira_forward_log}" 2>&1 &
+  jira_forward_pid=$!
+
+  jira_port=""
+  for _attempt in {1..30}; do
+    jira_port="$(sed -n 's/.*127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "${jira_forward_log}" | head -n 1)"
+    if [[ -n "${jira_port}" ]]; then
+      break
+    fi
+    if ! kill -0 "${jira_forward_pid}" >/dev/null 2>&1; then
+      cat "${jira_forward_log}" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+  if [[ -z "${jira_port}" ]]; then
+    echo "error: mock Jira port-forward did not publish a local port" >&2
+    exit 1
+  fi
+
+  STEWARD_TEST_DATABASE_URL="${database_url}" \
+    cargo test \
+      --manifest-path e2e/Cargo.toml \
+      --test s4_store
+
+  STEWARD_TEST_KUBE_CONTEXT="${context}" \
+  STEWARD_TEST_KUBECONFIG="${kubeconfig}" \
+  STEWARD_RUN_DIR="${run_dir}" \
+  STEWARD_TEST_TLS_CA="${run_dir}/tls-cert.pem" \
+  STEWARD_TEST_DATABASE_URL="${database_url}" \
+  STEWARD_TEST_JIRA_URL="http://127.0.0.1:${jira_port}" \
+  STEWARD_S4_URL="https://steward-s3.test:${port}" \
+  STEWARD_S4_RESOLVE="steward-s3.test:${port}:127.0.0.1" \
+    cargo test \
+      --manifest-path e2e/Cargo.toml \
+      --test s4 \
+      e2e_s4_grant_binds_to_instance \
+      -- \
+      --exact
+fi

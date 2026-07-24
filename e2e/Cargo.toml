@@ -20,9 +20,21 @@ path = "s3_store.rs"
 name = "s3"
 path = "s3.rs"
 
+[[test]]
+name = "s4_store"
+path = "s4_store.rs"
+
+[[test]]
+name = "s4"
+path = "s4.rs"
+
 [[bin]]
 name = "s3-server"
 path = "s3_server.rs"
+
+[[bin]]
+name = "s4-server"
+path = "s4_server.rs"
 
 [dependencies]
 axum = "0.8"
@@ -30,6 +42,7 @@ kube = { version = "4.2.0", default-features = false, features = ["client", "rin
 serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
 steward-admission = { path = "../crates/steward-admission", version = "=0.0.0" }
+steward-adapter-jira = { path = "../adapters/jira", version = "=0.0.0" } # Exercises the real Jira decision-channel adapter in the S4 full-stack test.
 steward-apiserver = { path = "../crates/steward-apiserver", version = "=0.0.0" }
 steward-controller = { path = "../crates/steward-controller", version = "=0.0.0" }
 steward-store = { path = "../crates/steward-store", version = "=0.0.0" }

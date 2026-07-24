@@ -7,7 +7,15 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+# Serialize and deserialize the narrow Jira REST payloads without leaking vendor types into core.
+serde.workspace = true
+# Send Jira issue and comment requests over the workspace's rustls-backed HTTP client.
+reqwest.workspace = true
 steward-ports = { path = "../../crates/steward-ports", version = "=0.0.0" }
+
+[dev-dependencies]
+# Drive async adapter tests against a local mock Jira server.
+tokio = { workspace = true, features = ["io-util"] }
 
 [lints]
 workspace = true

@@ -3143,7 +3143,10 @@ dependencies = [
 name = "steward-adapter-jira"
 version = "0.0.0"
 dependencies = [
+ "reqwest",
+ "serde",
  "steward-ports",
+ "tokio",
 ]
 
 [[package]]

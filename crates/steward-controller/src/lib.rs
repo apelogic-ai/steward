@@ -20,7 +20,7 @@ use kube::runtime::finalizer::{Event, finalizer};
 use kube::runtime::watcher;
 use kube::{Client, ResourceExt};
 use sha2::{Digest, Sha256};
-use steward_admission::{AdmissionDecision, Envelope, evaluate};
+use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, evaluate_with_grants};
 use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
 use steward_store::{PgStore, StoreError};
 use steward_types::{AgentRuntime, AgentRuntimeStatus, Phase, RuntimeId, RuntimeRefs};
@@ -250,6 +250,11 @@ pub trait WebhookEnvelopeReader: Clone + Send + Sync + 'static {
         &'a self,
         member_role: &'a str,
     ) -> WebhookFuture<'a, Result<Option<Envelope>, StoreError>>;
+
+    fn grants_for_runtime<'a>(
+        &'a self,
+        runtime_uid: &'a str,
+    ) -> WebhookFuture<'a, Result<Vec<AdmissionDelta>, StoreError>>;
 }
 
 impl WebhookEnvelopeReader for PgStore {
@@ -258,6 +263,13 @@ impl WebhookEnvelopeReader for PgStore {
         member_role: &'a str,
     ) -> WebhookFuture<'a, Result<Option<Envelope>, StoreError>> {
         Box::pin(async move { PgStore::latest_envelope(self, member_role).await })
+    }
+
+    fn grants_for_runtime<'a>(
+        &'a self,
+        runtime_uid: &'a str,
+    ) -> WebhookFuture<'a, Result<Vec<AdmissionDelta>, StoreError>> {
+        Box::pin(async move { PgStore::grants_for_runtime(self, runtime_uid).await })
     }
 }
 
@@ -305,7 +317,16 @@ pub async fn validate_admission<R: WebhookEnvelopeReader>(
             ));
         }
     };
-    match evaluate(&runtime.spec, &envelope) {
+    let grants = match runtime.metadata.uid.as_deref() {
+        Some(runtime_uid) => match envelopes.grants_for_runtime(runtime_uid).await {
+            Ok(grants) => grants,
+            Err(error) => {
+                return response.deny(format!("runtime grant lookup failed closed: {error}"));
+            }
+        },
+        None => Vec::new(),
+    };
+    match evaluate_with_grants(&runtime.spec, &envelope, &grants) {
         Ok(AdmissionDecision::Admit) => response,
         Ok(decision @ AdmissionDecision::Reject { .. }) => response.deny(
             decision
@@ -508,10 +529,12 @@ mod tests {
 
 #[cfg(test)]
 mod webhook_tests {
+    use std::collections::BTreeMap;
+
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use kube::core::admission::{AdmissionRequest, AdmissionReview};
-    use steward_admission::{Envelope, EnvelopeSpec};
+    use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
     use steward_store::StoreError;
     use steward_types::{AgentRuntime, Budget, Duration, ModelRef};
     use tower::ServiceExt;
@@ -521,6 +544,7 @@ mod webhook_tests {
     #[derive(Clone)]
     struct FakeEnvelopes {
         envelope: Envelope,
+        grants: BTreeMap<String, Vec<AdmissionDelta>>,
     }
 
     impl WebhookEnvelopeReader for FakeEnvelopes {
@@ -529,6 +553,13 @@ mod webhook_tests {
             _member_role: &'a str,
         ) -> WebhookFuture<'a, Result<Option<Envelope>, StoreError>> {
             Box::pin(async move { Ok(Some(self.envelope.clone())) })
+        }
+
+        fn grants_for_runtime<'a>(
+            &'a self,
+            runtime_uid: &'a str,
+        ) -> WebhookFuture<'a, Result<Vec<AdmissionDelta>, StoreError>> {
+            Box::pin(async move { Ok(self.grants.get(runtime_uid).cloned().unwrap_or_default()) })
         }
     }
 
@@ -600,6 +631,7 @@ mod webhook_tests {
                     ttl: Duration("24h".to_owned()),
                 },
             },
+            grants: BTreeMap::new(),
         }
     }
 
@@ -656,6 +688,49 @@ mod webhook_tests {
             Some(&serde_json::json!(
                 "envelope exceeded: budget.monthlyLimit requested 220.00 USD, ceiling 200.00 USD"
             ))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_applies_a_grant_only_to_its_bound_runtime_uid() -> Result<(), String> {
+        let mut envelopes = fake_envelopes();
+        envelopes.grants.insert(
+            "runtime-uid-a".to_owned(),
+            vec![AdmissionDelta::Budget {
+                requested: "220.00".to_owned(),
+                ceiling: "200.00".to_owned(),
+                currency: "USD".to_owned(),
+            }],
+        );
+        let review =
+            serde_json::from_value::<AdmissionReview<AgentRuntime>>(admission_review_value())
+                .map_err(|error| format!("failed to construct granted review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read granted request: {error}"))?;
+        let response = validate_admission(&request, &envelopes).await;
+        assert!(
+            response.allowed,
+            "the exact approved manifest must pass for runtime UID A: {}",
+            response.result.message
+        );
+
+        let mut other_value = admission_review_value();
+        other_value["request"]["object"]["metadata"]["uid"] = serde_json::json!("runtime-uid-b");
+        let other_review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(other_value)
+            .map_err(|error| format!("failed to construct second-runtime review: {error}"))?;
+        let other_request: AdmissionRequest<AgentRuntime> = other_review
+            .try_into()
+            .map_err(|error| format!("failed to read second-runtime request: {error}"))?;
+        let other_response = validate_admission(&other_request, &envelopes).await;
+        assert!(
+            !other_response.allowed,
+            "runtime UID B must not inherit runtime UID A's approved exception"
+        );
+        assert_eq!(
+            other_response.result.message,
+            "envelope exceeded: budget.monthlyLimit requested 220.00 USD, ceiling 200.00 USD"
         );
         Ok(())
     }

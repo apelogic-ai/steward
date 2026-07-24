@@ -2,8 +2,9 @@
 
 SQL migrations are append-only. Slice S3 introduces Postgres operational state
 for immutable envelope revisions, admission decisions, the approval queue, and
-runtime-event history.
+runtime-event history. Slice S4 adds immutable, runtime-UID-bound grants linked
+to the Steward approval that authorized each exception.
 
 `cargo xtask migrate-check` rejects edits or renames of migrations already
-present on the comparison base. The S3 store integration test applies the full
-set to an empty ephemeral Postgres database.
+present on the comparison base. The S3 and S4 store integration tests apply the
+full set to empty ephemeral Postgres databases.
