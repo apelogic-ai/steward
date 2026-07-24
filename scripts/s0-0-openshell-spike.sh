@@ -226,6 +226,7 @@ if [[ "${S0_E2E}" == "1" ]]; then
     --timeout=120s
   cargo build -p steward-controller-bin
   export STEWARD_CONTROLLER_BIN="${ROOT}/target/debug/steward-controller-bin"
+  export STEWARD_S0_BOOTSTRAP=1
   export STEWARD_AGENTRUNTIME_API_VERSION="agents.apelogic.ai/v1alpha1"
   cargo test \
     --manifest-path "${ROOT}/e2e/Cargo.toml" \

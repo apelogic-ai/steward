@@ -12,7 +12,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Extension, Json, Router};
-use kube::api::{Api, ListParams, PostParams};
+use kube::api::{Api, PostParams};
 use kube::core::Request as KubeRequest;
 use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
@@ -24,8 +24,8 @@ pub use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
 };
 use steward_store::{
-    ApprovalCandidate, ApproveAdmission, ApprovedAdmission, ParkRejection, ParkedAdmission,
-    PendingApproval, PgStore, StoreError,
+    ApprovalCandidate, ApproveAdmission, ApprovedAdmission, DecisionFiling, GrantReversion,
+    ParkRejection, ParkedAdmission, PendingApproval, PgStore, StoreError,
 };
 use steward_types::{AgentRuntime, AgentRuntimeSpec, Principal};
 use uuid::Uuid;
@@ -129,7 +129,7 @@ pub enum SubmissionOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApiError {
     Runtime(String),
-    Store(String),
+    Store(StoreError),
     MissingRuntimeUid,
     PrincipalMismatch,
     MissingEnvelope,
@@ -137,6 +137,7 @@ pub enum ApiError {
     Admission(String),
     DecisionChannel(String),
     Conflict(String),
+    NoActiveGrants,
 }
 
 impl fmt::Display for ApiError {
@@ -154,8 +155,10 @@ pub trait RuntimeRepository: Clone + Send + Sync + 'static {
         name: &'a str,
     ) -> BoxFuture<'a, Result<AgentRuntime, String>>;
 
-    fn get_by_uid<'a>(
+    fn get_bound<'a>(
         &'a self,
+        namespace: &'a str,
+        name: &'a str,
         runtime_uid: &'a str,
     ) -> BoxFuture<'a, Result<AgentRuntime, String>>;
 
@@ -191,18 +194,24 @@ impl RuntimeRepository for KubeRuntimeRepository {
         })
     }
 
-    fn get_by_uid<'a>(
+    fn get_bound<'a>(
         &'a self,
+        namespace: &'a str,
+        name: &'a str,
         runtime_uid: &'a str,
     ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
         Box::pin(async move {
-            Api::<AgentRuntime>::all(self.client.clone())
-                .list(&ListParams::default())
+            let runtime = Api::<AgentRuntime>::namespaced(self.client.clone(), namespace)
+                .get(name)
                 .await
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .find(|runtime| runtime.metadata.uid.as_deref() == Some(runtime_uid))
-                .ok_or_else(|| format!("AgentRuntime UID {runtime_uid} does not exist"))
+                .map_err(|error| error.to_string())?;
+            if runtime.metadata.uid.as_deref() == Some(runtime_uid) {
+                Ok(runtime)
+            } else {
+                Err(format!(
+                    "AgentRuntime {namespace}/{name} no longer has UID {runtime_uid}"
+                ))
+            }
         })
     }
 
@@ -278,6 +287,7 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
     fn grants_for_runtime<'a>(
         &'a self,
         runtime_uid: &'a str,
+        member_role: &'a str,
         envelope_revision: i64,
     ) -> BoxFuture<'a, Result<Vec<AdmissionDelta>, StoreError>>;
 
@@ -293,6 +303,16 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         revoked_by: &'a str,
         reason: &'a str,
     ) -> BoxFuture<'a, Result<u64, StoreError>>;
+
+    fn approval_for_filing(
+        &self,
+        approval_id: Uuid,
+    ) -> BoxFuture<'_, Result<DecisionFiling, StoreError>>;
+
+    fn grant_reversion<'a>(
+        &'a self,
+        runtime_uid: &'a str,
+    ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>>;
 }
 
 impl AdmissionLedger for PgStore {
@@ -346,11 +366,12 @@ impl AdmissionLedger for PgStore {
     fn grants_for_runtime<'a>(
         &'a self,
         runtime_uid: &'a str,
+        member_role: &'a str,
         envelope_revision: i64,
     ) -> BoxFuture<'a, Result<Vec<AdmissionDelta>, StoreError>> {
-        Box::pin(
-            async move { PgStore::grants_for_runtime(self, runtime_uid, envelope_revision).await },
-        )
+        Box::pin(async move {
+            PgStore::grants_for_runtime(self, runtime_uid, member_role, envelope_revision).await
+        })
     }
 
     fn approval_candidate<'a>(
@@ -370,6 +391,20 @@ impl AdmissionLedger for PgStore {
         Box::pin(async move {
             PgStore::revoke_runtime_grants(self, runtime_uid, revoked_by, reason).await
         })
+    }
+
+    fn approval_for_filing(
+        &self,
+        approval_id: Uuid,
+    ) -> BoxFuture<'_, Result<DecisionFiling, StoreError>> {
+        Box::pin(async move { PgStore::approval_for_filing(self, approval_id).await })
+    }
+
+    fn grant_reversion<'a>(
+        &'a self,
+        runtime_uid: &'a str,
+    ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>> {
+        Box::pin(async move { PgStore::grant_reversion(self, runtime_uid).await })
     }
 }
 
@@ -405,6 +440,10 @@ where
         .route(
             "/admin/approvals/{approval_id}/approve",
             post(approve_handler::<R, L, D>),
+        )
+        .route(
+            "/admin/approvals/{approval_id}/file",
+            post(file_decision_handler::<R, L, D>),
         )
         .route(
             "/admin/runtimes/{runtime_uid}/grants/revoke",
@@ -558,7 +597,7 @@ where
 {
     match state.ledger.pending_approvals().await {
         Ok(approvals) => Html(render_approval_queue(&approvals)).into_response(),
-        Err(error) => ApiError::Store(error.to_string()).into_response(),
+        Err(error) => ApiError::Store(error).into_response(),
     }
 }
 
@@ -588,7 +627,7 @@ where
         .await
     {
         Ok(()) => StatusCode::CREATED.into_response(),
-        Err(error) => ApiError::Store(error.to_string()).into_response(),
+        Err(error) => ApiError::Store(error).into_response(),
     }
 }
 
@@ -629,13 +668,43 @@ where
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
-    match state
+    let revoked = match state
         .ledger
         .revoke_runtime_grants(&runtime_uid, &admin.actor, &request.reason)
         .await
     {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => ApiError::Store(error.to_string()).into_response(),
+        Ok(revoked) => revoked,
+        Err(error) => return ApiError::Store(error).into_response(),
+    };
+    if revoked == 0 {
+        return ApiError::NoActiveGrants.into_response();
+    }
+    match reconcile_grant_reversion(&state.runtimes, &state.ledger, &runtime_uid).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn file_decision_handler<R, L, D>(
+    State(state): State<AppState<R, L, D>>,
+    Extension(_admin): Extension<AdminContext>,
+    Path(approval_id): Path<Uuid>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    match file_decision_reference(&state.ledger, &state.decisions, approval_id).await {
+        Ok(reference) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "decisionKey": reference.key,
+                "evidenceUrl": reference.evidence_url,
+            })),
+        )
+            .into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
@@ -686,7 +755,20 @@ impl IntoResponse for ApiError {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
             Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::Runtime(_) | Self::Store(_) | Self::DecisionChannel(_) => {
+            Self::NoActiveGrants => StatusCode::NOT_FOUND,
+            Self::Store(StoreError::ApprovalNotFound) => StatusCode::NOT_FOUND,
+            Self::Store(
+                StoreError::ApprovalNotPending
+                | StoreError::MissingDecisionReference
+                | StoreError::DecisionReferenceMismatch
+                | StoreError::EvidenceMismatch
+                | StoreError::StaleEnvelope
+                | StoreError::EnvelopeRevisionNotIncreasing,
+            ) => StatusCode::CONFLICT,
+            Self::Store(StoreError::InvalidGrantExpiry | StoreError::MissingRevocationReason) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+            Self::Runtime(_) | Self::Store(StoreError::Database(_)) | Self::DecisionChannel(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
         };
@@ -730,7 +812,7 @@ where
     let envelope = ledger
         .latest_envelope(&context.member_role)
         .await
-        .map_err(|error| ApiError::Store(error.to_string()))?
+        .map_err(ApiError::Store)?
         .ok_or(ApiError::MissingEnvelope)?;
     let mut proposed = runtime.clone();
     proposed.spec.budget.monthly_limit =
@@ -740,9 +822,9 @@ where
             }
         })?;
     let grants = ledger
-        .grants_for_runtime(runtime_uid, envelope.revision)
+        .grants_for_runtime(runtime_uid, &context.member_role, envelope.revision)
         .await
-        .map_err(|error| ApiError::Store(error.to_string()))?;
+        .map_err(ApiError::Store)?;
     let decision = evaluate_with_grants(&proposed.spec, &envelope, &grants)
         .map_err(|error| ApiError::Admission(format!("{error:?}")))?;
     match decision {
@@ -768,8 +850,11 @@ where
             let parked = ledger
                 .park_rejection(ParkRejection {
                     runtime_uid,
+                    runtime_namespace: namespace,
+                    runtime_name: name,
                     spec_digest: &spec_digest,
                     base_spec_digest: &base_spec_digest,
+                    base_spec: &runtime.spec,
                     envelope_revision: envelope.revision,
                     deltas: &deltas,
                     proposed_spec: &proposed.spec,
@@ -777,25 +862,18 @@ where
                     member_role: &context.member_role,
                 })
                 .await
-                .map_err(|error| ApiError::Store(error.to_string()))?;
-            let reference = decisions
-                .request(&DecisionRequest {
-                    request_id: parked.approval_id.to_string(),
-                    runtime_uid: runtime_uid.to_owned(),
-                    actor: context.actor.clone(),
-                    member_role: context.member_role.clone(),
-                    counterexample: counterexample.clone(),
-                })
-                .await
-                .map_err(|error| ApiError::DecisionChannel(format!("{error:?}")))?;
-            ledger
-                .link_decision_reference(
-                    parked.approval_id,
-                    &reference.key,
-                    &reference.evidence_url,
-                )
-                .await
-                .map_err(|error| ApiError::Store(error.to_string()))?;
+                .map_err(ApiError::Store)?;
+            let reference = match (parked.decision_key, parked.evidence_url) {
+                (Some(key), Some(evidence_url)) => DecisionReference { key, evidence_url },
+                (None, None) => {
+                    file_decision_reference(ledger, decisions, parked.approval_id).await?
+                }
+                _ => {
+                    return Err(ApiError::Conflict(
+                        "parked approval has an incomplete decision reference".to_owned(),
+                    ));
+                }
+            };
             Ok(SubmissionOutcome::Parked {
                 approval_id: parked.approval_id,
                 decision_id: parked.decision_id,
@@ -833,9 +911,23 @@ where
     let candidate = ledger
         .approval_candidate(approval_id, &request.evidence_url)
         .await
-        .map_err(|error| ApiError::Store(error.to_string()))?;
+        .map_err(ApiError::Store)?;
+    let latest_envelope = ledger
+        .latest_envelope(&candidate.member_role)
+        .await
+        .map_err(ApiError::Store)?
+        .ok_or(ApiError::MissingEnvelope)?;
+    if latest_envelope.revision != candidate.envelope_revision {
+        return Err(ApiError::Conflict(
+            "approval envelope is no longer current".to_owned(),
+        ));
+    }
     let mut runtime = runtimes
-        .get_by_uid(&candidate.runtime_uid)
+        .get_bound(
+            &candidate.runtime_namespace,
+            &candidate.runtime_name,
+            &candidate.runtime_uid,
+        )
         .await
         .map_err(ApiError::Runtime)?;
     if runtime.metadata.uid.as_deref() != Some(candidate.runtime_uid.as_str()) {
@@ -859,7 +951,7 @@ where
             expires_at: &request.expires_at,
         })
         .await
-        .map_err(|error| ApiError::Store(error.to_string()))?;
+        .map_err(ApiError::Store)?;
     if !already_applied {
         runtime.spec = approved.proposed_spec.clone();
         runtimes
@@ -888,6 +980,86 @@ where
     })
 }
 
+async fn file_decision_reference<L, D>(
+    ledger: &L,
+    decisions: &D,
+    approval_id: Uuid,
+) -> Result<DecisionReference, ApiError>
+where
+    L: AdmissionLedger,
+    D: DecisionChannel,
+{
+    let filing = ledger
+        .approval_for_filing(approval_id)
+        .await
+        .map_err(ApiError::Store)?;
+    if let (Some(key), Some(evidence_url)) = (filing.decision_key, filing.evidence_url) {
+        return Ok(DecisionReference { key, evidence_url });
+    }
+    let counterexample = AdmissionDecision::Reject {
+        deltas: filing.deltas,
+    }
+    .counterexample()
+    .ok_or_else(|| {
+        ApiError::Admission("parked decision did not carry a counterexample".to_owned())
+    })?;
+    let reference = decisions
+        .request(&DecisionRequest {
+            request_id: filing.approval_id.to_string(),
+            runtime_uid: filing.runtime_uid,
+            actor: filing.actor,
+            member_role: filing.member_role,
+            counterexample,
+        })
+        .await
+        .map_err(|error| ApiError::DecisionChannel(format!("{error:?}")))?;
+    ledger
+        .link_decision_reference(approval_id, &reference.key, &reference.evidence_url)
+        .await
+        .map_err(ApiError::Store)?;
+    Ok(reference)
+}
+
+async fn reconcile_grant_reversion<R, L>(
+    runtimes: &R,
+    ledger: &L,
+    runtime_uid: &str,
+) -> Result<(), ApiError>
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+{
+    let Some(reversion) = ledger
+        .grant_reversion(runtime_uid)
+        .await
+        .map_err(ApiError::Store)?
+    else {
+        return Ok(());
+    };
+    let mut runtime = runtimes
+        .get_bound(
+            &reversion.runtime_namespace,
+            &reversion.runtime_name,
+            &reversion.runtime_uid,
+        )
+        .await
+        .map_err(ApiError::Runtime)?;
+    if runtime.spec == reversion.proposed_spec {
+        runtime.spec = reversion.base_spec;
+        runtimes
+            .replace(
+                &runtime,
+                &AdmissionContext {
+                    actor: reversion.actor,
+                    member_role: reversion.member_role,
+                },
+            )
+            .await
+            .map_err(ApiError::Runtime)?;
+    }
+    Ok(())
+}
+
 fn spec_digest(spec: &AgentRuntimeSpec) -> Result<String, ApiError> {
     let serialized =
         serde_json::to_vec(spec).map_err(|error| ApiError::Admission(error.to_string()))?;
@@ -908,8 +1080,8 @@ mod tests {
         DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
     };
     use steward_store::{
-        ApprovalCandidate, ApproveAdmission, ApprovedAdmission, ParkRejection, ParkedAdmission,
-        PendingApproval, StoreError,
+        ApprovalCandidate, ApproveAdmission, ApprovedAdmission, DecisionFiling, GrantReversion,
+        ParkRejection, ParkedAdmission, PendingApproval, StoreError,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal,
@@ -1007,8 +1179,10 @@ mod tests {
             })
         }
 
-        fn get_by_uid<'a>(
+        fn get_bound<'a>(
             &'a self,
+            namespace: &'a str,
+            name: &'a str,
             runtime_uid: &'a str,
         ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
             Box::pin(async move {
@@ -1017,10 +1191,15 @@ mod tests {
                     .lock()
                     .map_err(|_| "fake runtime lock was poisoned".to_owned())?
                     .clone();
-                if runtime.metadata.uid.as_deref() == Some(runtime_uid) {
+                if runtime.metadata.namespace.as_deref() == Some(namespace)
+                    && runtime.metadata.name.as_deref() == Some(name)
+                    && runtime.metadata.uid.as_deref() == Some(runtime_uid)
+                {
                     Ok(runtime)
                 } else {
-                    Err(format!("AgentRuntime UID {runtime_uid} does not exist"))
+                    Err(format!(
+                        "AgentRuntime {namespace}/{name} is not bound to UID {runtime_uid}"
+                    ))
                 }
             })
         }
@@ -1043,13 +1222,28 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeLedger {
-        envelope: Envelope,
+        envelope: Arc<Mutex<Envelope>>,
         grants: Vec<AdmissionDelta>,
         parked: ParkedRows,
         decision_references: DecisionReferences,
+        revoke_rows: u64,
+        reversion: Option<GrantReversion>,
     }
 
-    type ParkedRows = Arc<Mutex<Vec<(String, Vec<AdmissionDelta>, AgentRuntimeSpec, String)>>>;
+    #[derive(Clone)]
+    struct FakeParked {
+        runtime_uid: String,
+        runtime_namespace: String,
+        runtime_name: String,
+        deltas: Vec<AdmissionDelta>,
+        proposed_spec: AgentRuntimeSpec,
+        base_spec_digest: String,
+        actor: String,
+        member_role: String,
+        envelope_revision: i64,
+    }
+
+    type ParkedRows = Arc<Mutex<Vec<FakeParked>>>;
     type DecisionReferences = Arc<Mutex<Vec<(Uuid, String, String)>>>;
 
     impl AdmissionLedger for FakeLedger {
@@ -1066,7 +1260,12 @@ mod tests {
             &'a self,
             _member_role: &'a str,
         ) -> BoxFuture<'a, Result<Option<Envelope>, StoreError>> {
-            Box::pin(async move { Ok(Some(self.envelope.clone())) })
+            Box::pin(async move {
+                self.envelope
+                    .lock()
+                    .map(|envelope| Some(envelope.clone()))
+                    .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))
+            })
         }
 
         fn park_rejection<'a>(
@@ -1078,16 +1277,30 @@ mod tests {
                     StoreError::Database("fake ledger lock was poisoned".to_owned())
                 })?;
                 if parked.is_empty() {
-                    parked.push((
-                        request.runtime_uid.to_owned(),
-                        request.deltas.to_vec(),
-                        request.proposed_spec.clone(),
-                        request.base_spec_digest.to_owned(),
-                    ));
+                    parked.push(FakeParked {
+                        runtime_uid: request.runtime_uid.to_owned(),
+                        runtime_namespace: request.runtime_namespace.to_owned(),
+                        runtime_name: request.runtime_name.to_owned(),
+                        deltas: request.deltas.to_vec(),
+                        proposed_spec: request.proposed_spec.clone(),
+                        base_spec_digest: request.base_spec_digest.to_owned(),
+                        actor: request.actor.to_owned(),
+                        member_role: request.member_role.to_owned(),
+                        envelope_revision: request.envelope_revision,
+                    });
                 }
+                let reference = self
+                    .decision_references
+                    .lock()
+                    .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))?
+                    .iter()
+                    .find(|(approval_id, _, _)| *approval_id == Uuid::nil())
+                    .cloned();
                 Ok(ParkedAdmission {
                     decision_id: Uuid::nil(),
                     approval_id: Uuid::nil(),
+                    decision_key: reference.as_ref().map(|(_, key, _)| key.clone()),
+                    evidence_url: reference.map(|(_, _, url)| url),
                 })
             })
         }
@@ -1105,21 +1318,19 @@ mod tests {
                     .find(|(approval_id, _, _)| *approval_id == Uuid::nil());
                 Ok(rows
                     .iter()
-                    .map(
-                        |(runtime_uid, deltas, proposed_spec, base_spec_digest)| PendingApproval {
-                            approval_id: Uuid::nil(),
-                            decision_id: Uuid::nil(),
-                            runtime_uid: runtime_uid.clone(),
-                            decision_key: reference.map(|(_, key, _)| key.clone()),
-                            evidence_url: reference.map(|(_, _, url)| url.clone()),
-                            deltas: deltas.clone(),
-                            proposed_spec: proposed_spec.clone(),
-                            base_spec_digest: base_spec_digest.clone(),
-                            envelope_revision: self.envelope.revision,
-                            actor: "alice@example.com".to_owned(),
-                            member_role: "engineer".to_owned(),
-                        },
-                    )
+                    .map(|parked| PendingApproval {
+                        approval_id: Uuid::nil(),
+                        decision_id: Uuid::nil(),
+                        runtime_uid: parked.runtime_uid.clone(),
+                        decision_key: reference.map(|(_, key, _)| key.clone()),
+                        evidence_url: reference.map(|(_, _, url)| url.clone()),
+                        deltas: parked.deltas.clone(),
+                        proposed_spec: parked.proposed_spec.clone(),
+                        base_spec_digest: parked.base_spec_digest.clone(),
+                        envelope_revision: parked.envelope_revision,
+                        actor: parked.actor.clone(),
+                        member_role: parked.member_role.clone(),
+                    })
                     .collect())
             })
         }
@@ -1151,8 +1362,7 @@ mod tests {
                 let rows = self.parked.lock().map_err(|_| {
                     StoreError::Database("fake ledger lock was poisoned".to_owned())
                 })?;
-                let (runtime_uid, grants, proposed_spec, base_spec_digest) =
-                    rows.first().ok_or(StoreError::ApprovalNotFound)?;
+                let parked = rows.first().ok_or(StoreError::ApprovalNotFound)?;
                 let references = self.decision_references.lock().map_err(|_| {
                     StoreError::Database("fake ledger lock was poisoned".to_owned())
                 })?;
@@ -1166,14 +1376,14 @@ mod tests {
                 Ok(ApprovedAdmission {
                     approval_id: request.approval_id,
                     decision_id: Uuid::nil(),
-                    runtime_uid: runtime_uid.clone(),
-                    proposed_spec: proposed_spec.clone(),
-                    base_spec_digest: base_spec_digest.clone(),
-                    actor: "alice@example.com".to_owned(),
-                    member_role: "engineer".to_owned(),
+                    runtime_uid: parked.runtime_uid.clone(),
+                    proposed_spec: parked.proposed_spec.clone(),
+                    base_spec_digest: parked.base_spec_digest.clone(),
+                    actor: parked.actor.clone(),
+                    member_role: parked.member_role.clone(),
                     decision_key: decision_key.clone(),
                     evidence_url: evidence_url.clone(),
-                    grants: grants.clone(),
+                    grants: parked.deltas.clone(),
                     decided_by: request.decided_by.to_owned(),
                     rationale: request.rationale.to_owned(),
                 })
@@ -1183,6 +1393,7 @@ mod tests {
         fn grants_for_runtime<'a>(
             &'a self,
             _runtime_uid: &'a str,
+            _member_role: &'a str,
             _envelope_revision: i64,
         ) -> BoxFuture<'a, Result<Vec<AdmissionDelta>, StoreError>> {
             Box::pin(async move { Ok(self.grants.clone()) })
@@ -1197,8 +1408,7 @@ mod tests {
                 let rows = self.parked.lock().map_err(|_| {
                     StoreError::Database("fake ledger lock was poisoned".to_owned())
                 })?;
-                let (runtime_uid, _, proposed_spec, base_spec_digest) =
-                    rows.first().ok_or(StoreError::ApprovalNotFound)?;
+                let parked = rows.first().ok_or(StoreError::ApprovalNotFound)?;
                 let references = self.decision_references.lock().map_err(|_| {
                     StoreError::Database("fake ledger lock was poisoned".to_owned())
                 })?;
@@ -1211,11 +1421,50 @@ mod tests {
                 }
                 Ok(ApprovalCandidate {
                     approval_id,
-                    runtime_uid: runtime_uid.clone(),
-                    proposed_spec: proposed_spec.clone(),
-                    base_spec_digest: base_spec_digest.clone(),
+                    runtime_uid: parked.runtime_uid.clone(),
+                    proposed_spec: parked.proposed_spec.clone(),
+                    base_spec_digest: parked.base_spec_digest.clone(),
+                    member_role: parked.member_role.clone(),
+                    envelope_revision: parked.envelope_revision,
+                    runtime_namespace: parked.runtime_namespace.clone(),
+                    runtime_name: parked.runtime_name.clone(),
                 })
             })
+        }
+
+        fn approval_for_filing(
+            &self,
+            approval_id: Uuid,
+        ) -> BoxFuture<'_, Result<DecisionFiling, StoreError>> {
+            Box::pin(async move {
+                let rows = self.parked.lock().map_err(|_| {
+                    StoreError::Database("fake ledger lock was poisoned".to_owned())
+                })?;
+                let parked = rows.first().ok_or(StoreError::ApprovalNotFound)?;
+                let reference = self
+                    .decision_references
+                    .lock()
+                    .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))?
+                    .iter()
+                    .find(|(id, _, _)| *id == approval_id)
+                    .cloned();
+                Ok(DecisionFiling {
+                    approval_id,
+                    runtime_uid: parked.runtime_uid.clone(),
+                    actor: parked.actor.clone(),
+                    member_role: parked.member_role.clone(),
+                    deltas: parked.deltas.clone(),
+                    decision_key: reference.as_ref().map(|(_, key, _)| key.clone()),
+                    evidence_url: reference.map(|(_, _, url)| url),
+                })
+            })
+        }
+
+        fn grant_reversion<'a>(
+            &'a self,
+            _runtime_uid: &'a str,
+        ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>> {
+            Box::pin(async move { Ok(self.reversion.clone()) })
         }
 
         fn revoke_runtime_grants<'a>(
@@ -1224,7 +1473,7 @@ mod tests {
             _revoked_by: &'a str,
             _reason: &'a str,
         ) -> BoxFuture<'a, Result<u64, StoreError>> {
-            Box::pin(async { Ok(0) })
+            Box::pin(async move { Ok(self.revoke_rows) })
         }
     }
 
@@ -1258,7 +1507,7 @@ mod tests {
 
     fn ledger() -> FakeLedger {
         FakeLedger {
-            envelope: Envelope {
+            envelope: Arc::new(Mutex::new(Envelope {
                 revision: 3,
                 spec: EnvelopeSpec {
                     llms: vec![ModelRef {
@@ -1272,10 +1521,12 @@ mod tests {
                     },
                     ttl: Duration("24h".to_owned()),
                 },
-            },
+            })),
             grants: Vec::new(),
             parked: Arc::new(Mutex::new(Vec::new())),
             decision_references: Arc::new(Mutex::new(Vec::new())),
+            revoke_rows: 0,
+            reversion: None,
         }
     }
 
@@ -1374,13 +1625,18 @@ mod tests {
             .lock()
             .map_err(|_| "fake ledger lock was poisoned")?;
         assert_eq!(parked.len(), 1);
-        assert_eq!(parked[0].0, "runtime-uid-a");
-        assert_eq!(parked[0].1, vec![expected_delta]);
-        assert_eq!(parked[0].2.budget.monthly_limit, "220.00");
+        assert_eq!(parked[0].runtime_uid, "runtime-uid-a");
+        assert_eq!(parked[0].deltas, vec![expected_delta]);
+        assert_eq!(parked[0].proposed_spec.budget.monthly_limit, "220.00");
+        let envelope = ledger
+            .envelope
+            .lock()
+            .map_err(|_| "fake envelope lock was poisoned")?
+            .clone();
         assert_eq!(
-            steward_admission::evaluate(&parked[0].2, &ledger.envelope),
+            steward_admission::evaluate(&parked[0].proposed_spec, &envelope),
             Ok(AdmissionDecision::Reject {
-                deltas: parked[0].1.clone()
+                deltas: parked[0].deltas.clone()
             })
         );
         drop(parked);
@@ -1525,6 +1781,20 @@ mod tests {
             matches!(second, Ok(SubmissionOutcome::Parked { .. })),
             "resubmitting the same rejected manifest must retry channel filing: {second:?}"
         );
+        let third = submit_budget_increase(
+            &runtimes,
+            &ledger,
+            &decisions,
+            &context,
+            "team-a",
+            "runtime-a",
+            &edit,
+        )
+        .await;
+        assert!(
+            matches!(third, Ok(SubmissionOutcome::Parked { .. })),
+            "a filed pending approval must remain an idempotent submission: {third:?}"
+        );
         assert_eq!(
             ledger
                 .parked
@@ -1533,6 +1803,231 @@ mod tests {
                 .len(),
             1,
             "channel recovery must reuse one durable approval"
+        );
+        assert_eq!(
+            *decisions
+                .attempts
+                .lock()
+                .map_err(|_| "flaky channel lock was poisoned")?,
+            2,
+            "a retry after the durable decision reference exists must not create another issue"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unfiled_approval_has_an_authenticated_recovery_route() -> Result<(), String> {
+        let ledger = ledger();
+        let decisions = FlakyDecisionChannel::default();
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger,
+            FakeAuthenticator,
+            decisions.clone(),
+        );
+        let budget_request = || {
+            Request::builder()
+                .method("PATCH")
+                .uri("/v1/namespaces/team-a/runtimes/runtime-a/budget")
+                .header("authorization", "Bearer user-session")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"amount":"120.00"}"#))
+                .map_err(|error| format!("failed to build budget request: {error}"))
+        };
+        let outage = app
+            .clone()
+            .oneshot(budget_request()?)
+            .await
+            .map_err(|error| format!("budget outage request failed: {error}"))?;
+        assert_eq!(outage.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let filed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/approvals/00000000-0000-0000-0000-000000000000/file")
+                    .header("authorization", "Bearer admin-session")
+                    .body(Body::empty())
+                    .map_err(|error| format!("failed to build filing request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("filing request failed: {error}"))?;
+        assert_eq!(
+            filed.status(),
+            StatusCode::OK,
+            "an administrator must be able to finish a decision-channel write after a crash window"
+        );
+        let retried = app
+            .oneshot(budget_request()?)
+            .await
+            .map_err(|error| format!("retried budget request failed: {error}"))?;
+        assert_eq!(retried.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            *decisions
+                .attempts
+                .lock()
+                .map_err(|_| "flaky channel lock was poisoned")?,
+            2,
+            "the recovered durable reference must prevent a second external decision request"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_envelope_blocks_approval_before_desired_state_changes() -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let parked = submit_budget_increase(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &AdmissionContext {
+                actor: "alice@example.com".to_owned(),
+                member_role: "engineer".to_owned(),
+            },
+            "team-a",
+            "runtime-a",
+            &BudgetIncrease {
+                amount: "120.00".to_owned(),
+            },
+        )
+        .await;
+        assert!(matches!(parked, Ok(SubmissionOutcome::Parked { .. })));
+        ledger
+            .envelope
+            .lock()
+            .map_err(|_| "fake envelope lock was poisoned")?
+            .revision = 4;
+        let result = super::approve_parked_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &super::AdminContext {
+                actor: "admin@example.com".to_owned(),
+            },
+            Uuid::nil(),
+            &super::ApprovalRequest {
+                rationale: "old authority must not cross revisions".to_owned(),
+                evidence_url: "https://jira.example.com/browse/PROJ-123".to_owned(),
+                expires_at: "2999-01-01T00:00:00Z".to_owned(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ApiError::Conflict(_))),
+            "an approval against a superseded envelope must fail closed: {result:?}"
+        );
+        assert_eq!(
+            runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?
+                .spec
+                .budget
+                .monthly_limit,
+            "100.00"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_faults_are_not_reported_as_retryable_outages() -> Result<(), String> {
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        let missing_approval = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/approvals/00000000-0000-0000-0000-000000000000/approve")
+                    .header("authorization", "Bearer admin-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"rationale":"bounded exception","evidenceUrl":"https://jira.example.com/browse/PROJ-123","expiresAt":"2999-01-01T00:00:00Z"}"#,
+                    ))
+                    .map_err(|error| format!("failed to build missing approval request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("missing approval request failed: {error}"))?;
+        assert_eq!(missing_approval.status(), StatusCode::NOT_FOUND);
+
+        let no_grants = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/runtimes/runtime-uid-a/grants/revoke")
+                    .header("authorization", "Bearer admin-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reason":"scope ended"}"#))
+                    .map_err(|error| format!("failed to build empty revoke request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("empty revoke request failed: {error}"))?;
+        assert_eq!(
+            no_grants.status(),
+            StatusCode::NOT_FOUND,
+            "revoking a runtime with no active grant must not claim success"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revocation_restores_an_unchanged_escalated_runtime() -> Result<(), String> {
+        let base = runtime();
+        let mut escalated = base.clone();
+        escalated.spec.budget.monthly_limit = "220.00".to_owned();
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(escalated.clone())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let mut ledger = ledger();
+        ledger.revoke_rows = 1;
+        ledger.reversion = Some(GrantReversion {
+            runtime_uid: "runtime-uid-a".to_owned(),
+            runtime_namespace: "team-a".to_owned(),
+            runtime_name: "runtime-a".to_owned(),
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+            base_spec: base.spec,
+            proposed_spec: escalated.spec,
+        });
+        let response = router(
+            runtimes,
+            ledger,
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/runtimes/runtime-uid-a/grants/revoke")
+                .header("authorization", "Bearer admin-session")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"reason":"scope ended"}"#))
+                .map_err(|error| format!("failed to build revoke request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("revoke request failed: {error}"))?;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?
+                .spec
+                .budget
+                .monthly_limit,
+            "100.00",
+            "revoking an active grant must remove its already-applied authority"
         );
         Ok(())
     }
@@ -1593,6 +2088,10 @@ mod tests {
                     r#"{"rationale":"not authorized","evidenceUrl":"https://jira.example.com/browse/PROJ-123"}"#,
                 ),
                 (
+                    "/admin/approvals/00000000-0000-0000-0000-000000000000/file",
+                    "{}",
+                ),
+                (
                     "/admin/runtimes/runtime-uid-a/grants/revoke",
                     r#"{"reason":"not authorized"}"#,
                 ),
@@ -1627,8 +2126,13 @@ mod tests {
             runtime: Arc::new(Mutex::new(runtime())),
         };
         let ledger = ledger();
-        let envelope_body = serde_json::to_vec(&ledger.envelope)
-            .map_err(|error| format!("failed to serialize envelope: {error}"))?;
+        let envelope_body = serde_json::to_vec(
+            &*ledger
+                .envelope
+                .lock()
+                .map_err(|_| "fake envelope lock was poisoned")?,
+        )
+        .map_err(|error| format!("failed to serialize envelope: {error}"))?;
         let app = router(
             runtimes,
             ledger,

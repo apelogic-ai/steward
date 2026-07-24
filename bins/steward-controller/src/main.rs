@@ -13,6 +13,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sandbox_runtime = OpenShellRuntime::connect(endpoint)
         .await
         .map_err(|error| io::Error::other(format!("OpenShell connection failed: {error:?}")))?;
-    steward_controller::run_controller(client, sandbox_runtime).await;
+    if env::var("STEWARD_S0_BOOTSTRAP").as_deref() == Ok("1") {
+        steward_controller::run_controller(client, sandbox_runtime).await;
+    } else {
+        let database_url = env::var("STEWARD_DATABASE_URL")
+            .map_err(|_| io::Error::other("STEWARD_DATABASE_URL is required"))?;
+        steward_controller::run_controller_with_database(client, sandbox_runtime, &database_url)
+            .await?;
+    }
     Ok(())
 }

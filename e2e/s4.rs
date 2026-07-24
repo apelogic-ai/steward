@@ -409,6 +409,43 @@ fn e2e_s4_grant_binds_to_instance() -> Result<(), Box<dyn Error>> {
     assert_eq!(bob_grants, 0, "runtime B must own no grant");
     assert_eq!(ceiling, CEILING, "approval must never edit the envelope");
 
+    let (revocation_status, revocation_body) = harness.steward(
+        "POST",
+        &format!("/admin/runtimes/{alice_uid}/grants/revoke"),
+        Some(r#"{"reason":"approved exception window ended"}"#),
+        "alice-revoked.json",
+        Caller::Admin,
+    )?;
+    assert_eq!(
+        revocation_status, 204,
+        "revoking runtime A's grant must succeed: {revocation_body}"
+    );
+    assert_eq!(
+        harness.runtime_field("runtime-a", "jsonpath={.spec.budget.monthlyLimit}")?,
+        "100.00",
+        "revocation must remove authority already applied to the live runtime"
+    );
+    let revocations = database_runtime.block_on(async {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&harness.database_url)
+            .await?;
+        sqlx::query(
+            "SELECT count(*)::bigint AS count \
+             FROM grant_revocations \
+             JOIN grants ON grants.id = grant_revocations.grant_id \
+             WHERE grants.runtime_uid = $1",
+        )
+        .bind(&alice_uid)
+        .fetch_one(&pool)
+        .await?
+        .try_get::<i64, _>("count")
+    })?;
+    assert_eq!(
+        revocations, 1,
+        "revocation must retain one immutable authority-removal event"
+    );
+
     let (_, final_jira_body) = harness.jira("GET", "/test/state", "jira-final.json")?;
     let final_jira = serde_json::from_str::<serde_json::Value>(&final_jira_body)?;
     let first_comments = final_jira

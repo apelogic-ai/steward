@@ -19,6 +19,13 @@ impl PgStore {
         Self { pool }
     }
 
+    pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
+        PgPool::connect(database_url)
+            .await
+            .map(Self::new)
+            .map_err(database_error)
+    }
+
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -36,6 +43,20 @@ impl PgStore {
         envelope: &Envelope,
         authored_by: &str,
     ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        lock_member_role(&mut transaction, member_role).await?;
+        let latest_revision = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT max(revision) \
+             FROM envelopes \
+             WHERE scope_kind = 'member_role' AND scope_ref = $1",
+        )
+        .bind(member_role)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if latest_revision.is_some_and(|revision| envelope.revision <= revision) {
+            return Err(StoreError::EnvelopeRevisionNotIncreasing);
+        }
         sqlx::query(
             "INSERT INTO envelopes \
              (scope_kind, scope_ref, revision, spec, authored_by) \
@@ -45,9 +66,29 @@ impl PgStore {
         .bind(envelope.revision)
         .bind(Json(&envelope.spec))
         .bind(authored_by)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
+        sqlx::query(
+            "INSERT INTO grant_revocations (grant_id, revoked_by, reason) \
+             SELECT grants.id, $2, 'member-role envelope superseded' \
+             FROM grants \
+             JOIN approvals ON approvals.id = grants.approval_id \
+             JOIN admission_decisions \
+               ON admission_decisions.id = approvals.admission_decision_id \
+             LEFT JOIN grant_revocations ON grant_revocations.grant_id = grants.id \
+             WHERE admission_decisions.member_role = $1 \
+               AND admission_decisions.envelope_rev <> $3 \
+               AND grant_revocations.grant_id IS NULL \
+             ON CONFLICT (grant_id) DO NOTHING",
+        )
+        .bind(member_role)
+        .bind(authored_by)
+        .bind(envelope.revision)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
         Ok(())
     }
 
@@ -77,17 +118,65 @@ impl PgStore {
         &self,
         request: ParkRejection<'_>,
     ) -> Result<ParkedAdmission, StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "{}:{}:{}:{}:{}:{}",
+                request.runtime_uid,
+                request.spec_digest,
+                request.envelope_revision,
+                request.base_spec_digest,
+                request.actor,
+                request.member_role,
+            ))
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let existing = sqlx::query(
+            "SELECT \
+                admission_decisions.id AS decision_id, \
+                approvals.id AS approval_id, \
+                approvals.decision_key, \
+                approvals.evidence_url \
+             FROM admission_decisions \
+             JOIN approvals ON approvals.admission_decision_id = admission_decisions.id \
+             WHERE admission_decisions.runtime_uid = $1 \
+               AND admission_decisions.spec_digest = $2 \
+               AND admission_decisions.envelope_rev = $3 \
+               AND admission_decisions.base_spec_digest = $4 \
+               AND admission_decisions.actor = $5 \
+               AND admission_decisions.member_role = $6 \
+               AND approvals.state = 'pending' \
+             ORDER BY admission_decisions.at DESC \
+             LIMIT 1",
+        )
+        .bind(request.runtime_uid)
+        .bind(request.spec_digest)
+        .bind(request.envelope_revision)
+        .bind(request.base_spec_digest)
+        .bind(request.actor)
+        .bind(request.member_role)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if let Some(row) = existing {
+            let parked = ParkedAdmission {
+                decision_id: row.try_get("decision_id").map_err(database_error)?,
+                approval_id: row.try_get("approval_id").map_err(database_error)?,
+                decision_key: row.try_get("decision_key").map_err(database_error)?,
+                evidence_url: row.try_get("evidence_url").map_err(database_error)?,
+            };
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(parked);
+        }
+
         let decision_id = Uuid::new_v4();
         let approval_id = Uuid::new_v4();
-        let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        let inserted = sqlx::query(
+        sqlx::query(
             "INSERT INTO admission_decisions \
              (id, runtime_uid, spec_digest, envelope_rev, verdict, deltas, proposed_spec, actor, \
-              member_role, base_spec_digest) \
-             VALUES ($1, $2, $3, $4, 'reject', $5, $6, $7, $8, $9) \
-             ON CONFLICT (runtime_uid, spec_digest, envelope_rev, base_spec_digest, actor, member_role) \
-             DO NOTHING \
-             RETURNING id",
+              member_role, base_spec_digest, base_spec, runtime_namespace, runtime_name) \
+             VALUES ($1, $2, $3, $4, 'reject', $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(decision_id)
         .bind(request.runtime_uid)
@@ -98,53 +187,30 @@ impl PgStore {
         .bind(request.actor)
         .bind(request.member_role)
         .bind(request.base_spec_digest)
-        .fetch_optional(&mut *transaction)
+        .bind(Json(request.base_spec))
+        .bind(request.runtime_namespace)
+        .bind(request.runtime_name)
+        .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
-        let parked = if inserted.is_some() {
-            sqlx::query(
-                "INSERT INTO approvals \
-                 (id, runtime_uid, admission_decision_id, state) \
-                 VALUES ($1, $2, $3, 'pending')",
-            )
-            .bind(approval_id)
-            .bind(request.runtime_uid)
-            .bind(decision_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-            ParkedAdmission {
-                decision_id,
-                approval_id,
-            }
-        } else {
-            let row = sqlx::query(
-                "SELECT admission_decisions.id AS decision_id, approvals.id AS approval_id \
-                 FROM admission_decisions \
-                 JOIN approvals ON approvals.admission_decision_id = admission_decisions.id \
-                 WHERE admission_decisions.runtime_uid = $1 \
-                   AND admission_decisions.spec_digest = $2 \
-                   AND admission_decisions.envelope_rev = $3 \
-                   AND admission_decisions.base_spec_digest = $4 \
-                   AND admission_decisions.actor = $5 \
-                   AND admission_decisions.member_role = $6",
-            )
-            .bind(request.runtime_uid)
-            .bind(request.spec_digest)
-            .bind(request.envelope_revision)
-            .bind(request.base_spec_digest)
-            .bind(request.actor)
-            .bind(request.member_role)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-            ParkedAdmission {
-                decision_id: row.try_get("decision_id").map_err(database_error)?,
-                approval_id: row.try_get("approval_id").map_err(database_error)?,
-            }
-        };
+        sqlx::query(
+            "INSERT INTO approvals \
+             (id, runtime_uid, admission_decision_id, state) \
+             VALUES ($1, $2, $3, 'pending')",
+        )
+        .bind(approval_id)
+        .bind(request.runtime_uid)
+        .bind(decision_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
         transaction.commit().await.map_err(database_error)?;
-        Ok(parked)
+        Ok(ParkedAdmission {
+            decision_id,
+            approval_id,
+            decision_key: None,
+            evidence_url: None,
+        })
     }
 
     pub async fn pending_approvals(&self) -> Result<Vec<PendingApproval>, StoreError> {
@@ -229,9 +295,6 @@ impl PgStore {
         .map_err(database_error)?
         .ok_or(StoreError::ApprovalNotFound)?;
         let state = row.try_get::<String, _>("state").map_err(database_error)?;
-        if state != "pending" {
-            return Err(StoreError::ApprovalNotPending);
-        }
         let existing_key = row
             .try_get::<Option<String>, _>("decision_key")
             .map_err(database_error)?;
@@ -242,6 +305,8 @@ impl PgStore {
             && existing_url.as_deref() == Some(evidence_url)
         {
             Ok(())
+        } else if state != "pending" {
+            Err(StoreError::ApprovalNotPending)
         } else {
             Err(StoreError::DecisionReferenceMismatch)
         }
@@ -250,14 +315,20 @@ impl PgStore {
     pub async fn grants_for_runtime(
         &self,
         runtime_uid: &str,
+        member_role: &str,
         envelope_revision: i64,
     ) -> Result<Vec<AdmissionDelta>, StoreError> {
         let rows = sqlx::query(
             "SELECT grants.granted_value \
              FROM grants \
+             JOIN approvals ON approvals.id = grants.approval_id \
+             JOIN admission_decisions \
+               ON admission_decisions.id = approvals.admission_decision_id \
              LEFT JOIN grant_revocations ON grant_revocations.grant_id = grants.id \
              WHERE grants.runtime_uid = $1 \
-               AND grants.envelope_revision = $2 \
+               AND admission_decisions.member_role = $2 \
+               AND admission_decisions.envelope_rev = $3 \
+               AND grants.envelope_revision = admission_decisions.envelope_rev \
                AND grants.expires_at > now() \
                AND grant_revocations.grant_id IS NULL \
              ORDER BY CASE grants.dimension \
@@ -269,6 +340,7 @@ impl PgStore {
              END, grants.at, grants.id",
         )
         .bind(runtime_uid)
+        .bind(member_role)
         .bind(envelope_revision)
         .fetch_all(&self.pool)
         .await
@@ -293,7 +365,11 @@ impl PgStore {
                 approvals.evidence_url, \
                 approvals.runtime_uid, \
                 admission_decisions.proposed_spec, \
-                admission_decisions.base_spec_digest \
+                admission_decisions.base_spec_digest, \
+                admission_decisions.member_role, \
+                admission_decisions.envelope_rev, \
+                admission_decisions.runtime_namespace, \
+                admission_decisions.runtime_name \
              FROM approvals \
              JOIN admission_decisions \
                ON admission_decisions.id = approvals.admission_decision_id \
@@ -323,7 +399,179 @@ impl PgStore {
             runtime_uid: row.try_get("runtime_uid").map_err(database_error)?,
             proposed_spec,
             base_spec_digest: row.try_get("base_spec_digest").map_err(database_error)?,
+            member_role: row.try_get("member_role").map_err(database_error)?,
+            envelope_revision: row.try_get("envelope_rev").map_err(database_error)?,
+            runtime_namespace: row.try_get("runtime_namespace").map_err(database_error)?,
+            runtime_name: row.try_get("runtime_name").map_err(database_error)?,
         })
+    }
+
+    pub async fn approval_for_filing(
+        &self,
+        approval_id: Uuid,
+    ) -> Result<DecisionFiling, StoreError> {
+        let row = sqlx::query(
+            "SELECT \
+                approvals.state, \
+                approvals.decision_key, \
+                approvals.evidence_url, \
+                approvals.runtime_uid, \
+                admission_decisions.actor, \
+                admission_decisions.member_role, \
+                admission_decisions.deltas \
+             FROM approvals \
+             JOIN admission_decisions \
+               ON admission_decisions.id = approvals.admission_decision_id \
+             WHERE approvals.id = $1",
+        )
+        .bind(approval_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::ApprovalNotFound)?;
+        if row.try_get::<String, _>("state").map_err(database_error)? != "pending" {
+            return Err(StoreError::ApprovalNotPending);
+        }
+        let Json(deltas) = row
+            .try_get::<Json<Vec<AdmissionDelta>>, _>("deltas")
+            .map_err(database_error)?;
+        Ok(DecisionFiling {
+            approval_id,
+            runtime_uid: row.try_get("runtime_uid").map_err(database_error)?,
+            actor: row.try_get("actor").map_err(database_error)?,
+            member_role: row.try_get("member_role").map_err(database_error)?,
+            deltas,
+            decision_key: row.try_get("decision_key").map_err(database_error)?,
+            evidence_url: row.try_get("evidence_url").map_err(database_error)?,
+        })
+    }
+
+    pub async fn grant_reversion(
+        &self,
+        runtime_uid: &str,
+    ) -> Result<Option<GrantReversion>, StoreError> {
+        let row = sqlx::query(
+            "SELECT \
+                admission_decisions.base_spec, \
+                admission_decisions.proposed_spec, \
+                admission_decisions.actor, \
+                admission_decisions.member_role, \
+                admission_decisions.runtime_namespace, \
+                admission_decisions.runtime_name, \
+                admission_decisions.envelope_rev, \
+                latest_envelope.revision AS latest_envelope_rev, \
+                bool_and( \
+                    grants.expires_at > now() \
+                    AND grant_revocations.grant_id IS NULL \
+                ) AS grants_active \
+             FROM approvals \
+             JOIN admission_decisions \
+               ON admission_decisions.id = approvals.admission_decision_id \
+             JOIN grants ON grants.approval_id = approvals.id \
+             LEFT JOIN grant_revocations ON grant_revocations.grant_id = grants.id \
+             LEFT JOIN LATERAL ( \
+                 SELECT revision \
+                 FROM envelopes \
+                 WHERE scope_kind = 'member_role' \
+                   AND scope_ref = admission_decisions.member_role \
+                 ORDER BY revision DESC \
+                 LIMIT 1 \
+             ) latest_envelope ON true \
+             WHERE approvals.runtime_uid = $1 \
+               AND approvals.state = 'approved' \
+             GROUP BY \
+                approvals.decided_at, approvals.id, admission_decisions.id, \
+                latest_envelope.revision \
+             ORDER BY approvals.decided_at DESC, approvals.id DESC \
+             LIMIT 1",
+        )
+        .bind(runtime_uid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let envelope_revision: i64 = row.try_get("envelope_rev").map_err(database_error)?;
+        let latest_envelope_revision: Option<i64> =
+            row.try_get("latest_envelope_rev").map_err(database_error)?;
+        let grants_active: bool = row.try_get("grants_active").map_err(database_error)?;
+        if grants_active && latest_envelope_revision == Some(envelope_revision) {
+            return Ok(None);
+        }
+        let Json(base_spec) = row
+            .try_get::<Json<AgentRuntimeSpec>, _>("base_spec")
+            .map_err(database_error)?;
+        let Json(proposed_spec) = row
+            .try_get::<Json<AgentRuntimeSpec>, _>("proposed_spec")
+            .map_err(database_error)?;
+        Ok(Some(GrantReversion {
+            runtime_uid: runtime_uid.to_owned(),
+            runtime_namespace: row.try_get("runtime_namespace").map_err(database_error)?,
+            runtime_name: row.try_get("runtime_name").map_err(database_error)?,
+            actor: row.try_get("actor").map_err(database_error)?,
+            member_role: row.try_get("member_role").map_err(database_error)?,
+            base_spec,
+            proposed_spec,
+        }))
+    }
+
+    pub async fn grant_application(
+        &self,
+        runtime_uid: &str,
+    ) -> Result<Option<GrantReversion>, StoreError> {
+        let row = sqlx::query(
+            "SELECT \
+                admission_decisions.base_spec, \
+                admission_decisions.proposed_spec, \
+                admission_decisions.actor, \
+                admission_decisions.member_role, \
+                admission_decisions.runtime_namespace, \
+                admission_decisions.runtime_name \
+             FROM approvals \
+             JOIN admission_decisions \
+               ON admission_decisions.id = approvals.admission_decision_id \
+             JOIN grants ON grants.approval_id = approvals.id \
+             LEFT JOIN grant_revocations ON grant_revocations.grant_id = grants.id \
+             JOIN LATERAL ( \
+                 SELECT revision \
+                 FROM envelopes \
+                 WHERE scope_kind = 'member_role' \
+                   AND scope_ref = admission_decisions.member_role \
+                 ORDER BY revision DESC \
+                 LIMIT 1 \
+             ) latest_envelope ON true \
+             WHERE approvals.runtime_uid = $1 \
+               AND approvals.state = 'approved' \
+               AND grants.expires_at > now() \
+               AND grant_revocations.grant_id IS NULL \
+               AND latest_envelope.revision = admission_decisions.envelope_rev \
+             GROUP BY approvals.decided_at, approvals.id, admission_decisions.id \
+             ORDER BY approvals.decided_at DESC, approvals.id DESC \
+             LIMIT 1",
+        )
+        .bind(runtime_uid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let Json(base_spec) = row
+            .try_get::<Json<AgentRuntimeSpec>, _>("base_spec")
+            .map_err(database_error)?;
+        let Json(proposed_spec) = row
+            .try_get::<Json<AgentRuntimeSpec>, _>("proposed_spec")
+            .map_err(database_error)?;
+        Ok(Some(GrantReversion {
+            runtime_uid: runtime_uid.to_owned(),
+            runtime_namespace: row.try_get("runtime_namespace").map_err(database_error)?,
+            runtime_name: row.try_get("runtime_name").map_err(database_error)?,
+            actor: row.try_get("actor").map_err(database_error)?,
+            member_role: row.try_get("member_role").map_err(database_error)?,
+            base_spec,
+            proposed_spec,
+        }))
     }
 
     pub async fn approve_admission(
@@ -383,7 +631,7 @@ impl PgStore {
         let base_spec_digest = row.try_get("base_spec_digest").map_err(database_error)?;
         let envelope_revision: i64 = row.try_get("envelope_rev").map_err(database_error)?;
         let actor = row.try_get("actor").map_err(database_error)?;
-        let member_role = row.try_get("member_role").map_err(database_error)?;
+        let member_role: String = row.try_get("member_role").map_err(database_error)?;
         if state == "approved" {
             let decided_by = row
                 .try_get::<Option<String>, _>("decided_by")
@@ -411,34 +659,46 @@ impl PgStore {
         if state != "pending" {
             return Err(StoreError::ApprovalNotPending);
         }
-        let valid_expiry =
-            sqlx::query_scalar::<_, bool>("SELECT (($1::text)::timestamptz > now())")
-                .bind(request.expires_at)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(|_| StoreError::InvalidGrantExpiry)?;
-        if !valid_expiry {
-            return Err(StoreError::InvalidGrantExpiry);
+        lock_member_role(&mut transaction, &member_role).await?;
+        let latest_revision = sqlx::query_scalar::<_, i64>(
+            "SELECT revision \
+             FROM envelopes \
+             WHERE scope_kind = 'member_role' AND scope_ref = $1 \
+             ORDER BY revision DESC \
+             LIMIT 1",
+        )
+        .bind(&member_role)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if latest_revision != Some(envelope_revision) {
+            return Err(StoreError::StaleEnvelope);
         }
 
-        sqlx::query(
+        let updated = sqlx::query(
             "UPDATE approvals \
              SET state = 'approved', \
                  decided_by = $1, \
                  decided_at = now(), \
                  rationale = $2 \
-             WHERE id = $3",
+             WHERE id = $3 \
+               AND ($4::text)::timestamptz > now()",
         )
         .bind(request.decided_by)
         .bind(request.rationale)
         .bind(request.approval_id)
+        .bind(request.expires_at)
         .execute(&mut *transaction)
         .await
-        .map_err(database_error)?;
+        .map_err(grant_expiry_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::InvalidGrantExpiry);
+        }
         for grant in &grants {
             sqlx::query(
                 "INSERT INTO grants \
-                 (id, runtime_uid, dimension, granted_value, approval_id, envelope_revision, expires_at) \
+                 (id, runtime_uid, dimension, granted_value, approval_id, \
+                  envelope_revision, expires_at) \
                  VALUES ($1, $2, $3, $4, $5, $6, ($7::text)::timestamptz)",
             )
             .bind(Uuid::new_v4())
@@ -500,8 +760,11 @@ impl PgStore {
 
 pub struct ParkRejection<'a> {
     pub runtime_uid: &'a str,
+    pub runtime_namespace: &'a str,
+    pub runtime_name: &'a str,
     pub spec_digest: &'a str,
     pub base_spec_digest: &'a str,
+    pub base_spec: &'a AgentRuntimeSpec,
     pub envelope_revision: i64,
     pub deltas: &'a [AdmissionDelta],
     pub proposed_spec: &'a AgentRuntimeSpec,
@@ -513,6 +776,8 @@ pub struct ParkRejection<'a> {
 pub struct ParkedAdmission {
     pub decision_id: Uuid,
     pub approval_id: Uuid,
+    pub decision_key: Option<String>,
+    pub evidence_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -536,6 +801,32 @@ pub struct ApprovalCandidate {
     pub runtime_uid: String,
     pub proposed_spec: AgentRuntimeSpec,
     pub base_spec_digest: String,
+    pub member_role: String,
+    pub envelope_revision: i64,
+    pub runtime_namespace: String,
+    pub runtime_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecisionFiling {
+    pub approval_id: Uuid,
+    pub runtime_uid: String,
+    pub actor: String,
+    pub member_role: String,
+    pub deltas: Vec<AdmissionDelta>,
+    pub decision_key: Option<String>,
+    pub evidence_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GrantReversion {
+    pub runtime_uid: String,
+    pub runtime_namespace: String,
+    pub runtime_name: String,
+    pub actor: String,
+    pub member_role: String,
+    pub base_spec: AgentRuntimeSpec,
+    pub proposed_spec: AgentRuntimeSpec,
 }
 
 pub struct ApproveAdmission<'a> {
@@ -572,6 +863,8 @@ pub enum StoreError {
     EvidenceMismatch,
     InvalidGrantExpiry,
     MissingRevocationReason,
+    StaleEnvelope,
+    EnvelopeRevisionNotIncreasing,
 }
 
 impl fmt::Display for StoreError {
@@ -601,6 +894,12 @@ impl fmt::Display for StoreError {
             Self::MissingRevocationReason => {
                 write!(formatter, "grant revocation reason is required")
             }
+            Self::StaleEnvelope => {
+                write!(formatter, "approval envelope is no longer current")
+            }
+            Self::EnvelopeRevisionNotIncreasing => {
+                write!(formatter, "envelope revision must increase monotonically")
+            }
         }
     }
 }
@@ -609,6 +908,31 @@ impl Error for StoreError {}
 
 fn database_error(error: sqlx::Error) -> StoreError {
     StoreError::Database(error.to_string())
+}
+
+fn grant_expiry_error(error: sqlx::Error) -> StoreError {
+    if error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .as_deref()
+        == Some("22007")
+    {
+        StoreError::InvalidGrantExpiry
+    } else {
+        database_error(error)
+    }
+}
+
+async fn lock_member_role(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    member_role: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(member_role)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    Ok(())
 }
 
 fn grant_dimension(delta: &AdmissionDelta) -> &'static str {
