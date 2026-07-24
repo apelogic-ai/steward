@@ -1,4 +1,9 @@
 # Generated manifests
 
-Generated CRD YAML begins with the `AgentRuntime` type in Slice S0. Until then,
-`cargo xtask verify-manifests` requires this directory to contain no YAML.
+Generated CRD YAML is committed and verified against `steward-types`.
+
+Regenerate it after an approved schema change:
+
+```bash
+cargo xtask generate-manifests
+```

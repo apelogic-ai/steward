@@ -1,0 +1,16 @@
+[package]
+name = "steward-controller-bin"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+kube = { workspace = true, features = ["client", "ring", "rustls-tls"] }
+steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.0.0", features = ["runtime"] }
+steward-controller = { path = "../../crates/steward-controller", version = "=0.0.0" }
+tokio.workspace = true
+
+[lints]
+workspace = true

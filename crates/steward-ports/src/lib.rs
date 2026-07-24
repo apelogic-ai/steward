@@ -1,6 +1,8 @@
 //! Vendor-neutral interfaces for every replaceable Steward plane.
 
-use steward_types::RuntimeId;
+use std::future::Future;
+
+use steward_types::{AgentType, RuntimeId, RuntimeRefs};
 
 /// Maturity derived from whether a non-fake adapter implements a port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +60,36 @@ pub const PORTS: [PortDescriptor; 8] = [
 pub enum PortError {
     Unsupported { operation: &'static str },
     Rejected { reason: String },
+    Failed { reason: String },
+}
+
+/// Desired identity for one sandbox runtime.
+///
+/// This is the class-B OpenShell seam, not a ninth replaceable-plane port.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SandboxRequest {
+    pub runtime: RuntimeId,
+    pub workspace_key: String,
+    pub agent_type: AgentType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SandboxObservation {
+    Absent,
+    Provisioning { refs: RuntimeRefs },
+    Running { refs: RuntimeRefs },
+}
+
+pub trait SandboxRuntime: Send + Sync + 'static {
+    fn ensure(
+        &self,
+        request: &SandboxRequest,
+    ) -> impl Future<Output = Result<SandboxObservation, PortError>> + Send;
+
+    fn delete(
+        &self,
+        request: &SandboxRequest,
+    ) -> impl Future<Output = Result<SandboxObservation, PortError>> + Send;
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

@@ -15,9 +15,13 @@ KUBECONFIG_PATH="${RUN_DIR}/kubeconfig"
 PORT_FORWARD_LOG="${RUN_DIR}/openshell-port-forward.log"
 PORT_FORWARD_PID=""
 CLUSTER_CREATED=0
+S0_E2E=0
+if [[ "$#" -eq 1 && "$1" == "--s0-e2e" ]]; then
+  S0_E2E=1
+fi
 
 cleanup() {
-  status=$?
+  status="$1"
   trap - EXIT INT TERM
   if [[ -n "${PORT_FORWARD_PID}" ]]; then
     kill "${PORT_FORWARD_PID}" >/dev/null 2>&1 || true
@@ -33,7 +37,9 @@ cleanup() {
   fi
   exit "${status}"
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup "$?"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 case "$(uname -s):$(uname -m)" in
   Darwin:arm64)
@@ -117,54 +123,61 @@ kubectl \
   rollout status deployment/agent-sandbox-controller \
   --timeout=300s
 
-env \
-  HELM_CACHE_HOME="${RUN_DIR}/helm/cache" \
-  HELM_CONFIG_HOME="${RUN_DIR}/helm/config" \
-  HELM_DATA_HOME="${RUN_DIR}/helm/data" \
-  helm \
-  --kubeconfig "${KUBECONFIG_PATH}" \
-  --kube-context "${KUBE_CONTEXT}" \
-  install spire-crds spire-crds \
-  --repo https://spiffe.github.io/helm-charts-hardened/ \
-  --version 0.5.0 \
-  --namespace spire \
-  --create-namespace \
-  --wait \
-  --timeout 5m
+openshell_helm_args=(
+  --kubeconfig "${KUBECONFIG_PATH}"
+  --kube-context "${KUBE_CONTEXT}"
+  install openshell oci://ghcr.io/nvidia/openshell/helm-chart
+  --version 0.0.90
+  --namespace openshell
+  --create-namespace
+)
+if [[ "${S0_E2E}" == "0" ]]; then
+  env \
+    HELM_CACHE_HOME="${RUN_DIR}/helm/cache" \
+    HELM_CONFIG_HOME="${RUN_DIR}/helm/config" \
+    HELM_DATA_HOME="${RUN_DIR}/helm/data" \
+    helm \
+    --kubeconfig "${KUBECONFIG_PATH}" \
+    --kube-context "${KUBE_CONTEXT}" \
+    install spire-crds spire-crds \
+    --repo https://spiffe.github.io/helm-charts-hardened/ \
+    --version 0.5.0 \
+    --namespace spire \
+    --create-namespace \
+    --wait \
+    --timeout 5m
+
+  env \
+    HELM_CACHE_HOME="${RUN_DIR}/helm/cache" \
+    HELM_CONFIG_HOME="${RUN_DIR}/helm/config" \
+    HELM_DATA_HOME="${RUN_DIR}/helm/data" \
+    helm \
+    --kubeconfig "${KUBECONFIG_PATH}" \
+    --kube-context "${KUBE_CONTEXT}" \
+    install spire spire \
+    --repo https://spiffe.github.io/helm-charts-hardened/ \
+    --version 0.29.0 \
+    --namespace spire \
+    --create-namespace \
+    --values "${ROOT}/config/openshell/spire-values.yaml" \
+    --wait \
+    --timeout 10m
+  openshell_helm_args+=(--values "${ROOT}/config/openshell/provider-token-grants.yaml")
+fi
+openshell_helm_args+=(
+  --set server.disableTls=true
+  --set server.auth.allowUnauthenticatedUsers=true
+)
+if [[ -n "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
+  openshell_helm_args+=("${supervisor_image_args[@]}")
+fi
+openshell_helm_args+=(--wait --timeout 5m)
 
 env \
   HELM_CACHE_HOME="${RUN_DIR}/helm/cache" \
   HELM_CONFIG_HOME="${RUN_DIR}/helm/config" \
   HELM_DATA_HOME="${RUN_DIR}/helm/data" \
-  helm \
-  --kubeconfig "${KUBECONFIG_PATH}" \
-  --kube-context "${KUBE_CONTEXT}" \
-  install spire spire \
-  --repo https://spiffe.github.io/helm-charts-hardened/ \
-  --version 0.29.0 \
-  --namespace spire \
-  --create-namespace \
-  --values "${ROOT}/config/openshell/spire-values.yaml" \
-  --wait \
-  --timeout 10m
-
-env \
-  HELM_CACHE_HOME="${RUN_DIR}/helm/cache" \
-  HELM_CONFIG_HOME="${RUN_DIR}/helm/config" \
-  HELM_DATA_HOME="${RUN_DIR}/helm/data" \
-  helm \
-  --kubeconfig "${KUBECONFIG_PATH}" \
-  --kube-context "${KUBE_CONTEXT}" \
-  install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
-  --version 0.0.90 \
-  --namespace openshell \
-  --create-namespace \
-  --values "${ROOT}/config/openshell/provider-token-grants.yaml" \
-  --set server.disableTls=true \
-  --set server.auth.allowUnauthenticatedUsers=true \
-  "${supervisor_image_args[@]}" \
-  --wait \
-  --timeout 5m
+  helm "${openshell_helm_args[@]}"
 
 kubectl \
   --kubeconfig "${KUBECONFIG_PATH}" \
@@ -196,9 +209,31 @@ fi
 export STEWARD_OPENSHELL_ENDPOINT="${endpoint}"
 export STEWARD_TEST_KUBE_CONTEXT="${KUBE_CONTEXT}"
 export STEWARD_TEST_KUBECONFIG="${KUBECONFIG_PATH}"
+export STEWARD_RUN_DIR="${RUN_DIR}"
 export KUBECONFIG="${KUBECONFIG_PATH}"
 
-if [[ "$#" -eq 0 ]]; then
+if [[ "${S0_E2E}" == "1" ]]; then
+  kubectl \
+    --kubeconfig "${KUBECONFIG_PATH}" \
+    --context "${KUBE_CONTEXT}" \
+    apply -f "${ROOT}/manifests/agents.apelogic.ai_agentruntimes.yaml"
+  kubectl \
+    --kubeconfig "${KUBECONFIG_PATH}" \
+    --context "${KUBE_CONTEXT}" \
+    wait \
+    --for=condition=Established \
+    crd/agentruntimes.agents.apelogic.ai \
+    --timeout=120s
+  cargo build -p steward-controller-bin
+  export STEWARD_CONTROLLER_BIN="${ROOT}/target/debug/steward-controller-bin"
+  export STEWARD_AGENTRUNTIME_API_VERSION="agents.apelogic.ai/v1alpha1"
+  cargo test \
+    --manifest-path "${ROOT}/e2e/Cargo.toml" \
+    --test s0 \
+    e2e_s0_provision_and_teardown \
+    -- \
+    --exact
+elif [[ "$#" -eq 0 ]]; then
   cargo run \
     -p steward-adapter-openshell \
     --features s0-spike \

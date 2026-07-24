@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["e2e"]
 members = [
     "adapters/fake",
     "adapters/jira",
@@ -8,6 +9,7 @@ members = [
     "adapters/opa",
     "adapters/openshell",
     "adapters/spire",
+    "bins/steward-controller",
     "crates/steward-admission",
     "crates/steward-apiserver",
     "crates/steward-controller",
@@ -25,7 +27,12 @@ rust-version = "1.95"
 version = "0.0.0"
 
 [workspace.dependencies]
+futures = "0.3.33"
+k8s-openapi = { version = "0.28.0", features = ["schemars", "v1_32"] }
+kube = { version = "4.2.0", default-features = false }
+schemars = "1.2.1"
 serde = { version = "1", features = ["derive"] }
+serde-saphyr = "0.0.29"
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1.43", features = ["macros", "rt-multi-thread"] }

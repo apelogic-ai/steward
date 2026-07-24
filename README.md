@@ -1,9 +1,9 @@
 # Steward — governance control plane
 
 Steward is a Rust workspace for a self-service agent governance control plane.
-The repository is in Slice S-1 (bootstrap): its vendor-neutral boundaries,
-in-memory adapter, and executable gate surface exist; runtime integration begins
-with the S0.0 OpenShell spike.
+The repository implements Slice S0 (walking skeleton): an `AgentRuntime` CRD,
+controller, and pinned OpenShell adapter provision and tear down a sandbox
+idempotently, including across a controller restart.
 
 ## Start here
 
@@ -22,6 +22,9 @@ CLAUDE.md                     → @AGENTS.md
 .gitignore                    matches §11.1, §5, §1.4
 Cargo.toml                    Rust workspace
 deny.toml                     the §8 layering rule, mechanically
+
+bins/
+  steward-controller/         Kubernetes controller composition root
 
 crates/
   steward-types/              vendor-neutral shared types
@@ -42,6 +45,7 @@ xtask/                        local and CI gate implementation
 policy/                       OPA policy and tests
 migrations/                   append-only SQL migrations
 manifests/                    generated CRD YAML
+e2e/                          external-stack slice exit tests
 
 conformance/
   AGENTS.md                   these tests assert upstream's behaviour, not ours
@@ -85,9 +89,8 @@ for the object model it commits to, not as a build plan.
 
 - **Mint code.** `crates/steward-mint/AGENTS.md` requires changes under that path
   to land in a separate, human-reviewed PR.
-- **The OpenShell client and conformance suite.** Those are S0.0 outputs. Until
-  then, the conformance/register commands validate the authored register shape
-  and state clearly that evidence is pending.
+- **The identity and budget planes.** S1 and S2 wait for the carried OpenShell
+  supervisor-identity fix; S3 and S4 are next in the recorded execution order.
 - **`dev-integration-spec.md`** — referenced as a companion by the roadmap but
   not present in this package. Add it if it is still current; the roadmap
   supersedes its sequencing but not its detail.
