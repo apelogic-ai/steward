@@ -1,9 +1,10 @@
 # Steward — governance control plane
 
 Steward is a Rust workspace for a self-service agent governance control plane.
-The repository implements Slice S0 (walking skeleton): an `AgentRuntime` CRD,
-controller, and pinned OpenShell adapter provision and tear down a sandbox
-idempotently, including across a controller restart.
+The repository implements Slice S0's walking skeleton and Slice S3's envelope
+admission path: immutable member-role envelopes, one shared admission evaluator,
+the Kubernetes webhook and REST front doors, a durable approval queue, and the
+anti-ratchet E2E exit criterion.
 
 ## Start here
 
@@ -90,7 +91,8 @@ for the object model it commits to, not as a build plan.
 - **Mint code.** `crates/steward-mint/AGENTS.md` requires changes under that path
   to land in a separate, human-reviewed PR.
 - **The identity and budget planes.** S1 and S2 wait for the carried OpenShell
-  supervisor-identity fix; S3 and S4 are next in the recorded execution order.
+  supervisor-identity fix. S3 can run independently; S4 follows it in the
+  recorded execution order.
 - **`dev-integration-spec.md`** — referenced as a companion by the roadmap but
   not present in this package. Add it if it is still current; the roadmap
   supersedes its sequencing but not its detail.

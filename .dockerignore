@@ -1,0 +1,10 @@
+.git
+.steward-run
+.worktrees
+target
+e2e/target
+.env*
+*.key
+*.pem
+*.p12
+kubeconfig*

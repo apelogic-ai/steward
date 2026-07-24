@@ -34,6 +34,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
     match command {
         "ci" if rest.is_empty() => ci(),
         "e2e-s0" if rest.is_empty() => e2e_s0(),
+        "e2e-s3" if rest.is_empty() => e2e_s3(),
         "policy-test" if rest.is_empty() => policy_test(),
         "migrate-check" if rest.is_empty() => migrate_check(),
         "generate-manifests" if rest.is_empty() => generate_manifests(),
@@ -59,6 +60,7 @@ fn usage() -> String {
         "commands:",
         "  ci",
         "  e2e-s0",
+        "  e2e-s3",
         "  policy-test",
         "  migrate-check",
         "  generate-manifests",
@@ -111,6 +113,10 @@ fn ci() -> TaskResult {
 
 fn e2e_s0() -> TaskResult {
     run("bash", &["scripts/s0-0-openshell-spike.sh", "--s0-e2e"])
+}
+
+fn e2e_s3() -> TaskResult {
+    run("bash", &["scripts/s3-envelope-e2e.sh"])
 }
 
 fn policy_test() -> TaskResult {

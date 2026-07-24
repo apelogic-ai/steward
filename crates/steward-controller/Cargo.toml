@@ -7,13 +7,19 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+axum.workspace = true
 futures.workspace = true
-kube = { workspace = true, features = ["client", "ring", "runtime", "rustls-tls"] }
+kube = { workspace = true, features = ["admission", "client", "ring", "runtime", "rustls-tls"] }
 serde_json.workspace = true
 sha2.workspace = true
+steward-admission = { path = "../steward-admission", version = "=0.0.0" }
 steward-ports = { path = "../steward-ports", version = "=0.0.0" }
+steward-store = { path = "../steward-store", version = "=0.0.0" }
 steward-types = { path = "../steward-types", version = "=0.0.0" }
 tokio.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
 
 [lints]
 workspace = true

@@ -11,3 +11,28 @@ version = "0.0.0"
 [[test]]
 name = "s0"
 path = "s0.rs"
+
+[[test]]
+name = "s3_store"
+path = "s3_store.rs"
+
+[[test]]
+name = "s3"
+path = "s3.rs"
+
+[[bin]]
+name = "s3-server"
+path = "s3_server.rs"
+
+[dependencies]
+axum = "0.8"
+kube = { version = "4.2.0", default-features = false, features = ["client", "ring", "rustls-tls"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
+steward-admission = { path = "../crates/steward-admission", version = "=0.0.0" }
+steward-apiserver = { path = "../crates/steward-apiserver", version = "=0.0.0" }
+steward-controller = { path = "../crates/steward-controller", version = "=0.0.0" }
+steward-store = { path = "../crates/steward-store", version = "=0.0.0" }
+steward-types = { path = "../crates/steward-types", version = "=0.0.0" }
+tokio = { version = "1.43", features = ["macros", "net", "rt-multi-thread"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
