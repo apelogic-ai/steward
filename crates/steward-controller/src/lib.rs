@@ -254,6 +254,7 @@ pub trait WebhookEnvelopeReader: Clone + Send + Sync + 'static {
     fn grants_for_runtime<'a>(
         &'a self,
         runtime_uid: &'a str,
+        envelope_revision: i64,
     ) -> WebhookFuture<'a, Result<Vec<AdmissionDelta>, StoreError>>;
 }
 
@@ -268,8 +269,11 @@ impl WebhookEnvelopeReader for PgStore {
     fn grants_for_runtime<'a>(
         &'a self,
         runtime_uid: &'a str,
+        envelope_revision: i64,
     ) -> WebhookFuture<'a, Result<Vec<AdmissionDelta>, StoreError>> {
-        Box::pin(async move { PgStore::grants_for_runtime(self, runtime_uid).await })
+        Box::pin(
+            async move { PgStore::grants_for_runtime(self, runtime_uid, envelope_revision).await },
+        )
     }
 }
 
@@ -318,7 +322,10 @@ pub async fn validate_admission<R: WebhookEnvelopeReader>(
         }
     };
     let grants = match runtime.metadata.uid.as_deref() {
-        Some(runtime_uid) => match envelopes.grants_for_runtime(runtime_uid).await {
+        Some(runtime_uid) => match envelopes
+            .grants_for_runtime(runtime_uid, envelope.revision)
+            .await
+        {
             Ok(grants) => grants,
             Err(error) => {
                 return response.deny(format!("runtime grant lookup failed closed: {error}"));
@@ -558,6 +565,7 @@ mod webhook_tests {
         fn grants_for_runtime<'a>(
             &'a self,
             runtime_uid: &'a str,
+            _envelope_revision: i64,
         ) -> WebhookFuture<'a, Result<Vec<AdmissionDelta>, StoreError>> {
             Box::pin(async move { Ok(self.grants.get(runtime_uid).cloned().unwrap_or_default()) })
         }

@@ -261,7 +261,7 @@ fn e2e_s4_grant_binds_to_instance() -> Result<(), Box<dyn Error>> {
     assert_eq!(parked_status, 202, "Alice's over-limit request must park");
     let parked = serde_json::from_str::<serde_json::Value>(&parked_body)?;
     let approval_id = required_json_string(&parked, "/approvalId")?;
-    let jira_key = required_json_string(&parked, "/jiraKey")?;
+    let decision_key = required_json_string(&parked, "/decisionKey")?;
     let evidence_url = required_json_string(&parked, "/evidenceUrl")?;
     assert_eq!(
         parked.pointer("/proposedSpec/budget/monthlyLimit"),
@@ -278,7 +278,7 @@ fn e2e_s4_grant_binds_to_instance() -> Result<(), Box<dyn Error>> {
     let jira = serde_json::from_str::<serde_json::Value>(&jira_body)?;
     assert_eq!(
         jira.pointer("/issues/0/key"),
-        Some(&serde_json::json!(jira_key))
+        Some(&serde_json::json!(decision_key))
     );
     let create_body = jira
         .pointer("/issues/0/createBody")
@@ -300,7 +300,7 @@ fn e2e_s4_grant_binds_to_instance() -> Result<(), Box<dyn Error>> {
 
     let (transition_status, _) = harness.jira(
         "POST",
-        &format!("/test/issues/{jira_key}/transition"),
+        &format!("/test/issues/{decision_key}/transition"),
         "jira-transition.json",
     )?;
     assert_eq!(transition_status, 204);
@@ -313,6 +313,7 @@ fn e2e_s4_grant_binds_to_instance() -> Result<(), Box<dyn Error>> {
     let approval = serde_json::json!({
         "rationale": "approved for this runtime instance",
         "evidenceUrl": evidence_url,
+        "expiresAt": "2999-01-01T00:00:00Z",
     });
     let (approval_status, approval_body) = harness.steward(
         "POST",
@@ -357,8 +358,8 @@ fn e2e_s4_grant_binds_to_instance() -> Result<(), Box<dyn Error>> {
     );
     let bob_parked = serde_json::from_str::<serde_json::Value>(&bob_body)?;
     assert_ne!(
-        bob_parked.pointer("/jiraKey"),
-        parked.pointer("/jiraKey"),
+        bob_parked.pointer("/decisionKey"),
+        parked.pointer("/decisionKey"),
         "runtime B must receive a distinct approval request"
     );
     assert_eq!(

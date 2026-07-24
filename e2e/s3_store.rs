@@ -113,6 +113,7 @@ async fn s3_postgres_keeps_envelopes_immutable_and_parks_exact_rejections()
         .park_rejection(ParkRejection {
             runtime_uid: &runtime_uid,
             spec_digest: "digest-a",
+            base_spec_digest: "base-digest-a",
             envelope_revision: envelope.revision,
             deltas: &deltas,
             proposed_spec: &proposed_spec,
@@ -138,6 +139,7 @@ async fn s3_postgres_keeps_envelopes_immutable_and_parks_exact_rejections()
         .park_rejection(ParkRejection {
             runtime_uid: &other_runtime_uid,
             spec_digest: "digest-b",
+            base_spec_digest: "base-digest-b",
             envelope_revision: envelope.revision,
             deltas: &deltas,
             proposed_spec: &proposed_spec,

@@ -9,6 +9,37 @@ use steward_admission::AdmissionDelta;
 use steward_store::{ApproveAdmission, ParkRejection, PgStore, StoreError};
 use steward_types::{AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal};
 
+fn proposed_spec() -> AgentRuntimeSpec {
+    AgentRuntimeSpec {
+        principal: Principal::User {
+            acting_user: Email("alice@example.com".to_owned()),
+        },
+        owner: Email("alice@example.com".to_owned()),
+        agent_type: AgentType {
+            name: "base".to_owned(),
+        },
+        llms: vec![ModelRef {
+            provider: "provider-a".to_owned(),
+            model: "model-a".to_owned(),
+        }],
+        tools: Vec::new(),
+        budget: Budget {
+            monthly_limit: "220.00".to_owned(),
+            currency: "USD".to_owned(),
+        },
+        ttl: Duration("24h".to_owned()),
+        bindings: None,
+    }
+}
+
+fn budget_deltas() -> Vec<AdmissionDelta> {
+    vec![AdmissionDelta::Budget {
+        requested: "220.00".to_owned(),
+        ceiling: "200.00".to_owned(),
+        currency: "USD".to_owned(),
+    }]
+}
+
 #[tokio::test]
 async fn s4_grants_are_append_only_and_bound_to_one_runtime() -> Result<(), Box<dyn Error>> {
     let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
@@ -42,9 +73,10 @@ async fn s4_grants_are_append_only_and_bound_to_one_runtime() -> Result<(), Box<
 
     sqlx::query(
         "INSERT INTO admission_decisions \
-         (id, runtime_uid, spec_digest, envelope_rev, verdict, deltas, proposed_spec, actor, member_role) \
+         (id, runtime_uid, spec_digest, envelope_rev, verdict, deltas, proposed_spec, actor, \
+          member_role, base_spec_digest) \
          VALUES ($1::uuid, $2, 'digest-a', 1, 'reject', '[]'::jsonb, '{}'::jsonb, \
-                 'alice@example.com', 'engineer')",
+                 'alice@example.com', 'engineer', 'base-digest-a')",
     )
     .bind(&decision_id)
     .bind(&runtime_a)
@@ -52,7 +84,7 @@ async fn s4_grants_are_append_only_and_bound_to_one_runtime() -> Result<(), Box<
     .await?;
     sqlx::query(
         "INSERT INTO approvals \
-         (id, runtime_uid, admission_decision_id, state, jira_key) \
+         (id, runtime_uid, admission_decision_id, state, decision_key) \
          VALUES ($1::uuid, $2, $3::uuid, 'pending', 'PROJ-123')",
     )
     .bind(&approval_id)
@@ -63,10 +95,11 @@ async fn s4_grants_are_append_only_and_bound_to_one_runtime() -> Result<(), Box<
 
     let inserted = sqlx::query(
         "INSERT INTO grants \
-         (id, runtime_uid, dimension, granted_value, approval_id, expires_at) \
+         (id, runtime_uid, dimension, granted_value, approval_id, envelope_revision, expires_at) \
          VALUES ($1::uuid, $2, 'budget', \
-                 '{\"requested\":\"220.00\",\"currency\":\"USD\"}'::jsonb, \
-                 $3::uuid, NULL)",
+                 '{\"dimension\":\"budget\",\"requested\":\"220.00\",\
+                   \"ceiling\":\"200.00\",\"currency\":\"USD\"}'::jsonb, \
+                 $3::uuid, 1, '2999-01-01T00:00:00Z')",
     )
     .bind(&grant_id)
     .bind(&runtime_a)
@@ -106,6 +139,148 @@ async fn s4_grants_are_append_only_and_bound_to_one_runtime() -> Result<(), Box<
         deleted.is_err(),
         "grant history must be append-only so approval evidence cannot disappear"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn s4_repeated_parking_reuses_one_approval_and_one_channel_marker()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the S4 Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let proposed_spec = proposed_spec();
+    let deltas = budget_deltas();
+    let request = || ParkRejection {
+        runtime_uid: "runtime-retry-a",
+        spec_digest: "digest-retry-a",
+        base_spec_digest: "base-digest-retry-a",
+        envelope_revision: 1,
+        deltas: &deltas,
+        proposed_spec: &proposed_spec,
+        actor: "alice@example.com",
+        member_role: "engineer",
+    };
+
+    let first = store.park_rejection(request()).await?;
+    let second = store.park_rejection(request()).await?;
+    assert_eq!(
+        first, second,
+        "retrying the same rejected manifest must reuse its approval so a failed channel request can be retried"
+    );
+    let decision_count = sqlx::query(
+        "SELECT count(*)::bigint AS count \
+         FROM admission_decisions \
+         WHERE runtime_uid = 'runtime-retry-a' AND spec_digest = 'digest-retry-a'",
+    )
+    .fetch_one(store.pool())
+    .await?
+    .try_get::<i64, _>("count")?;
+    assert_eq!(decision_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn s4_active_grants_expire_and_can_be_revoked_without_erasing_history()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the S4 Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let proposed_spec = proposed_spec();
+    let deltas = budget_deltas();
+    let parked = store
+        .park_rejection(ParkRejection {
+            runtime_uid: "runtime-revocation-a",
+            spec_digest: "digest-revocation-a",
+            base_spec_digest: "base-digest-revocation-a",
+            envelope_revision: 7,
+            deltas: &deltas,
+            proposed_spec: &proposed_spec,
+            actor: "alice@example.com",
+            member_role: "engineer",
+        })
+        .await?;
+    store
+        .link_decision_reference(
+            parked.approval_id,
+            "PROJ-123",
+            "https://jira.example.com/browse/PROJ-123",
+        )
+        .await?;
+    let expired = store
+        .approve_admission(ApproveAdmission {
+            approval_id: parked.approval_id,
+            decided_by: "admin@example.com",
+            rationale: "unbounded exception attempt",
+            evidence_url: "https://jira.example.com/browse/PROJ-123",
+            expires_at: "2000-01-01T00:00:00Z",
+        })
+        .await;
+    assert_eq!(
+        expired,
+        Err(StoreError::InvalidGrantExpiry),
+        "an approval must not create authority with an absent or elapsed lifetime",
+    );
+    store
+        .approve_admission(ApproveAdmission {
+            approval_id: parked.approval_id,
+            decided_by: "admin@example.com",
+            rationale: "bounded exception",
+            evidence_url: "https://jira.example.com/browse/PROJ-123",
+            expires_at: "2999-01-01T00:00:00Z",
+        })
+        .await?;
+
+    let context = sqlx::query(
+        "SELECT envelope_revision, expires_at IS NOT NULL AS expires \
+         FROM grants WHERE approval_id = $1",
+    )
+    .bind(parked.approval_id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(context.try_get::<i64, _>("envelope_revision")?, 7);
+    assert!(context.try_get::<bool, _>("expires")?);
+    assert!(
+        store
+            .grants_for_runtime("runtime-revocation-a", 8)
+            .await?
+            .is_empty(),
+        "a grant must not survive a change from the envelope revision it approved",
+    );
+    assert_eq!(
+        store
+            .revoke_runtime_grants(
+                "runtime-revocation-a",
+                "admin@example.com",
+                "scope narrowed",
+            )
+            .await?,
+        1,
+    );
+    assert!(
+        store
+            .grants_for_runtime("runtime-revocation-a", 7)
+            .await?
+            .is_empty(),
+        "an append-only revocation must remove the grant from active authority"
+    );
+    let retained = sqlx::query("SELECT count(*)::bigint AS count FROM grants WHERE approval_id = $1")
+        .bind(parked.approval_id)
+        .fetch_one(store.pool())
+        .await?
+        .try_get::<i64, _>("count")?;
+    assert_eq!(retained, 1, "revocation must retain immutable grant evidence");
     Ok(())
 }
 
@@ -151,6 +326,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
         .park_rejection(ParkRejection {
             runtime_uid: "runtime-evidence-a",
             spec_digest: "digest-evidence-a",
+            base_spec_digest: "base-digest-evidence-a",
             envelope_revision: 1,
             deltas: &deltas,
             proposed_spec: &proposed_spec,
@@ -177,6 +353,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
             decided_by: "admin@example.com",
             rationale: "approved for this runtime",
             evidence_url: "https://jira.example.com/browse/PROJ-999",
+            expires_at: "2999-01-01T00:00:00Z",
         })
         .await;
     assert_eq!(
@@ -191,6 +368,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
             decided_by: "admin@example.com",
             rationale: "approved for this runtime",
             evidence_url: "https://jira.example.com/browse/PROJ-123",
+            expires_at: "2999-01-01T00:00:00Z",
         })
         .await;
     let approved = approved.map_err(|error| {
@@ -204,7 +382,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
     assert_eq!(approved.proposed_spec, proposed_spec);
     assert_eq!(approved.actor, "alice@example.com");
     assert_eq!(approved.member_role, "engineer");
-    assert_eq!(approved.jira_key, "PROJ-123");
+    assert_eq!(approved.decision_key, "PROJ-123");
     assert_eq!(
         approved.evidence_url,
         "https://jira.example.com/browse/PROJ-123"
@@ -242,13 +420,13 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
         serde_json::to_value(&deltas[0])?
     );
     assert_eq!(
-        store.grants_for_runtime("runtime-evidence-a").await?,
+        store.grants_for_runtime("runtime-evidence-a", 1).await?,
         deltas,
         "the approved runtime must read back its structured grant"
     );
     assert!(
         store
-            .grants_for_runtime("runtime-evidence-b")
+            .grants_for_runtime("runtime-evidence-b", 1)
             .await?
             .is_empty(),
         "a second runtime must never inherit the first runtime's grant"
@@ -256,14 +434,15 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
     let retried = store
         .approve_admission(ApproveAdmission {
             approval_id: parked.approval_id,
-            decided_by: "admin@example.com",
-            rationale: "approved for this runtime",
+            decided_by: "backup-admin@example.org",
+            rationale: "recover the previously authorized apply",
             evidence_url: "https://jira.example.com/browse/PROJ-123",
+            expires_at: "2999-01-01T00:00:00Z",
         })
         .await
         .map_err(|error| {
             io::Error::other(format!(
-                "an identical approval retry must be idempotent: {error}"
+                "another admin must be able to retry an authorized apply after a transient failure: {error}"
             ))
         })?;
     assert_eq!(retried, approved);
