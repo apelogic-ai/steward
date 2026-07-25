@@ -939,11 +939,8 @@ esac
             std::env::var("PATH").map_err(|error| format!("PATH is unset: {error}"))?;
         let path = format!("{}:{system_path}", bin.display());
         let script = root().join("scripts/build-patched-openshell-supervisor.sh");
-        let current_metadata = concat!(
-            "1d4ac708f1d2a9ab94204cdce6ca0eee7e792839|",
-            "eac2ee8aa72ac358d3bedc23e0b8b4bbcd43d7e874a057f56462c8727dbdabec|",
-            "arm64"
-        );
+        let current_metadata =
+            "ff87dcd5e9d79fa8f19a9e3b2b3a5f00b251d389c9945276a8ce54ea91c8dcc5|arm64";
         let current = Command::new("bash")
             .arg(&script)
             .arg("--image-is-current")
@@ -959,21 +956,9 @@ esac
         );
 
         for stale_metadata in [
-            concat!(
-                "0000000000000000000000000000000000000000|",
-                "eac2ee8aa72ac358d3bedc23e0b8b4bbcd43d7e874a057f56462c8727dbdabec|",
-                "arm64"
-            ),
-            concat!(
-                "1d4ac708f1d2a9ab94204cdce6ca0eee7e792839|",
-                "0000000000000000000000000000000000000000000000000000000000000000|",
-                "arm64"
-            ),
-            concat!(
-                "1d4ac708f1d2a9ab94204cdce6ca0eee7e792839|",
-                "eac2ee8aa72ac358d3bedc23e0b8b4bbcd43d7e874a057f56462c8727dbdabec|",
-                "amd64"
-            ),
+            // The digest of the same contract with Zig 0.14.0 instead of 0.14.1.
+            "5596bf03048dd0e8c2a62f91a55a21c164deb355e61bef09e701d818852b2a2a|arm64",
+            "ff87dcd5e9d79fa8f19a9e3b2b3a5f00b251d389c9945276a8ce54ea91c8dcc5|amd64",
         ] {
             let stale = Command::new("bash")
                 .arg(&script)
@@ -985,7 +970,7 @@ esac
                 .map_err(|error| format!("failed to validate stale supervisor image: {error}"))?;
             assert!(
                 !stale.status.success(),
-                "an image with stale source, patch content, or architecture must be rebuilt"
+                "an image with a stale build contract or architecture must be rebuilt"
             );
         }
         Ok(())

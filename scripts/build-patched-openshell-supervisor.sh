@@ -94,6 +94,13 @@ patch_sha256() {
   openssl dgst -sha256 -r "${PATCH_PATH}" | awk '{print $1}'
 }
 
+build_contract_sha256() {
+  {
+    print_contract
+    printf 'patch-sha256=%s\n' "$(patch_sha256)"
+  } | openssl dgst -sha256 | awk '{print $NF}'
+}
+
 docker_architecture() {
   case "$(docker info --format '{{.Architecture}}')" in
     aarch64 | arm64)
@@ -120,18 +127,17 @@ image_is_current() {
     return 1
   fi
   expected_metadata="$(
-    printf '%s|%s|%s' \
-      "${SOURCE_COMMIT}" \
-      "$(patch_sha256)" \
+    printf '%s|%s' \
+      "$(build_contract_sha256)" \
       "$(docker_architecture)"
   )"
   actual_metadata="$(
     docker image inspect \
-      --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}|{{ index .Config.Labels "io.apelogic.steward.patch-sha256" }}|{{.Architecture}}' \
+      --format '{{ index .Config.Labels "io.apelogic.steward.build-contract-sha256" }}|{{.Architecture}}' \
       "${IMAGE}" 2>/dev/null
   )" || true
   if [[ "${actual_metadata}" != "${expected_metadata}" ]]; then
-    echo "${IMAGE} does not match the pinned source, patch content, and Docker architecture" >&2
+    echo "${IMAGE} does not match the pinned build contract and Docker architecture" >&2
     return 1
   fi
 }
@@ -255,6 +261,7 @@ docker buildx build \
   --label "org.opencontainers.image.revision=${SOURCE_COMMIT}" \
   --label "io.apelogic.steward.patch=${PATCH_RELATIVE}" \
   --label "io.apelogic.steward.patch-sha256=$(patch_sha256)" \
+  --label "io.apelogic.steward.build-contract-sha256=$(build_contract_sha256)" \
   --provenance=false \
   --load \
   "${SOURCE_DIR}"
