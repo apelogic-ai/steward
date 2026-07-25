@@ -10,6 +10,7 @@ use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{KubeRuntimeRepository, KubernetesTokenAuthenticator, router};
 use steward_store::PgStore;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::{JoinError, JoinSet};
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
@@ -20,6 +21,7 @@ use tokio_rustls::server::TlsStream;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(25);
+const MAX_PENDING_TLS_HANDSHAKES: usize = 64;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -72,13 +74,29 @@ async fn tls_listener(
         .with_single_cert(vec![certificate], private_key)?;
     Ok(TlsListener {
         acceptor: TlsAcceptor::from(Arc::new(config)),
+        handshakes: JoinSet::new(),
         listener: TcpListener::bind(bind).await?,
     })
 }
 
 struct TlsListener {
     acceptor: TlsAcceptor,
+    handshakes: JoinSet<Option<TlsConnection>>,
     listener: TcpListener,
+}
+
+type TlsConnection = (TlsStream<TcpStream>, std::net::SocketAddr);
+type JoinedHandshake = Option<Result<Option<TlsConnection>, JoinError>>;
+
+fn completed_handshake(result: JoinedHandshake) -> Option<TlsConnection> {
+    match result {
+        Some(Ok(connection)) => connection,
+        Some(Err(error)) => {
+            eprintln!("apiserver TLS handshake task failed: {error}");
+            None
+        }
+        None => None,
+    }
 }
 
 impl Listener for TlsListener {
@@ -87,17 +105,40 @@ impl Listener for TlsListener {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            match self.listener.accept().await {
-                Ok((stream, address)) => {
-                    match timeout(TLS_HANDSHAKE_TIMEOUT, self.acceptor.accept(stream)).await {
-                        Ok(Ok(stream)) => return (stream, address),
-                        Ok(Err(error)) => eprintln!("apiserver TLS handshake failed: {error}"),
-                        Err(_) => eprintln!("apiserver TLS handshake timed out"),
-                    }
+            if self.handshakes.len() >= MAX_PENDING_TLS_HANDSHAKES {
+                if let Some(connection) = completed_handshake(self.handshakes.join_next().await) {
+                    return connection;
                 }
-                Err(error) => {
-                    eprintln!("apiserver listener accept failed: {error}");
-                    sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            let has_pending_handshakes = !self.handshakes.is_empty();
+            tokio::select! {
+                accepted = self.listener.accept() => match accepted {
+                    Ok((stream, address)) => {
+                        let acceptor = self.acceptor.clone();
+                        self.handshakes.spawn(async move {
+                            match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                                Ok(Ok(stream)) => Some((stream, address)),
+                                Ok(Err(error)) => {
+                                    eprintln!("apiserver TLS handshake failed: {error}");
+                                    None
+                                }
+                                Err(_) => {
+                                    eprintln!("apiserver TLS handshake timed out");
+                                    None
+                                }
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        eprintln!("apiserver listener accept failed: {error}");
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                },
+                completed = self.handshakes.join_next(), if has_pending_handshakes => {
+                    if let Some(connection) = completed_handshake(completed) {
+                        return connection;
+                    }
                 }
             }
         }
@@ -124,7 +165,7 @@ mod tests {
     use super::TlsListener;
 
     #[tokio::test]
-    async fn incomplete_tls_handshake_is_bounded() -> Result<(), String> {
+    async fn stalled_tls_handshakes_do_not_serialize_acceptance() -> Result<(), String> {
         let tcp = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|error| format!("bind test listener: {error}"))?;
@@ -136,18 +177,36 @@ mod tests {
             .with_cert_resolver(Arc::new(ResolvesServerCertUsingSni::new()));
         let mut listener = TlsListener {
             acceptor: TlsAcceptor::from(Arc::new(config)),
+            handshakes: tokio::task::JoinSet::new(),
             listener: tcp,
         };
         let task = tokio::spawn(async move { listener.accept().await });
-        let mut stalled = TcpStream::connect(address)
-            .await
-            .map_err(|error| format!("connect stalled client: {error}"))?;
-        let mut byte = [0_u8; 1];
-        let closed = timeout(Duration::from_millis(100), stalled.read(&mut byte)).await;
+        let mut stalled = Vec::new();
+        for _ in 0..6 {
+            stalled.push(
+                TcpStream::connect(address)
+                    .await
+                    .map_err(|error| format!("connect stalled client: {error}"))?,
+            );
+        }
+        let closed = timeout(Duration::from_millis(100), async {
+            for stream in &mut stalled {
+                let mut byte = [0_u8; 1];
+                let read = stream
+                    .read(&mut byte)
+                    .await
+                    .map_err(|error| format!("read stalled client: {error}"))?;
+                if read != 0 {
+                    return Err("stalled TLS client received unexpected bytes".to_owned());
+                }
+            }
+            Ok::<(), String>(())
+        })
+        .await;
         task.abort();
         assert!(
-            matches!(closed, Ok(Ok(0))),
-            "an incomplete TLS handshake must be closed promptly"
+            matches!(closed, Ok(Ok(()))),
+            "stalled TLS handshakes must time out concurrently"
         );
         Ok(())
     }
