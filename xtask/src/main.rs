@@ -1080,6 +1080,27 @@ esac
     }
 
     #[test]
+    fn supervisor_build_requires_openssl_before_expensive_work() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        let requirement = script
+            .find("for command_name in cargo docker git openssl rustup;")
+            .ok_or_else(|| {
+                "the supervisor build must reject a missing OpenSSL before cloning or compiling"
+                    .to_owned()
+            })?;
+        let source_checkout = script
+            .find("git init --quiet")
+            .ok_or_else(|| "the supervisor build must check out its pinned source".to_owned())?;
+        assert!(
+            requirement < source_checkout,
+            "OpenSSL must be validated before the supervisor source checkout begins"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn openshell_identity_spike_defaults_to_the_carried_supervisor_image() -> Result<(), String> {
         let output = Command::new("bash")
             .arg(root().join("scripts/s0-0-openshell-spike.sh"))

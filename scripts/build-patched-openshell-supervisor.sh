@@ -35,7 +35,7 @@ check_prerequisites() {
   local actual_zig=""
   local actual_zigbuild=""
 
-  for command_name in cargo docker git rustup; do
+  for command_name in cargo docker git openssl rustup; do
     if ! require_command "${command_name}"; then
       failed=1
     fi
