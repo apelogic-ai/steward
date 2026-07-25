@@ -3143,7 +3143,10 @@ dependencies = [
 name = "steward-adapter-jira"
 version = "0.0.0"
 dependencies = [
+ "reqwest",
+ "serde",
  "steward-ports",
+ "tokio",
 ]
 
 [[package]]
@@ -3199,6 +3202,7 @@ name = "steward-apiserver"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "k8s-openapi",
  "kube",
  "serde",
  "serde_json",
@@ -3211,6 +3215,19 @@ dependencies = [
  "tower",
  "utoipa",
  "uuid",
+]
+
+[[package]]
+name = "steward-apiserver-bin"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "kube",
+ "steward-adapter-jira",
+ "steward-apiserver",
+ "steward-store",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -3234,10 +3251,13 @@ dependencies = [
 name = "steward-controller-bin"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "kube",
  "steward-adapter-openshell",
  "steward-controller",
+ "steward-store",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

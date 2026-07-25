@@ -109,6 +109,9 @@ jobs:
       - name: Run S3 exit criterion
         run: cargo xtask e2e-s3
 
+      - name: Run S4 exit criterion
+        run: cargo xtask e2e-s4
+
   latest-nightly:
     name: latest-nightly
     runs-on: ubuntu-latest

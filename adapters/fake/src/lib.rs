@@ -1,9 +1,11 @@
 //! Deterministic in-memory implementation of Steward's vendor-neutral ports.
 
+use std::sync::Mutex;
+
 use steward_ports::{
-    DecisionChannel, DecisionIntent, GitHostingPlane, InferenceCapabilities, InferencePlane,
-    Notification, NotificationSink, PolicySink, PortError, SessionEvent, SessionRelay,
-    StreamGranularity, ToolCapabilities, ToolPlane, WorkloadIdentity,
+    DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, GitHostingPlane,
+    InferenceCapabilities, InferencePlane, Notification, NotificationSink, PolicySink, PortError,
+    SessionEvent, SessionRelay, StreamGranularity, ToolCapabilities, ToolPlane, WorkloadIdentity,
 };
 use steward_types::RuntimeId;
 
@@ -20,7 +22,8 @@ pub const IMPLEMENTED_PORTS: [&str; 8] = [
 
 #[derive(Debug, Default)]
 pub struct FakeAdapter {
-    pub decisions: Vec<DecisionIntent>,
+    pub decision_requests: Mutex<Vec<DecisionRequest>>,
+    pub decision_resolutions: Mutex<Vec<DecisionResolution>>,
     pub notifications: Vec<Notification>,
     pub events: Vec<SessionEvent>,
     pub revoked_runtimes: Vec<RuntimeId>,
@@ -56,8 +59,26 @@ impl ToolPlane for FakeAdapter {
 }
 
 impl DecisionChannel for FakeAdapter {
-    fn publish(&mut self, intent: DecisionIntent) -> Result<(), PortError> {
-        self.decisions.push(intent);
+    async fn request(&self, request: &DecisionRequest) -> Result<DecisionReference, PortError> {
+        self.decision_requests
+            .lock()
+            .map_err(|_| PortError::Failed {
+                reason: "fake decision-request lock was poisoned".to_owned(),
+            })?
+            .push(request.clone());
+        Ok(DecisionReference {
+            key: "PROJ-123".to_owned(),
+            evidence_url: "https://jira.example.com/browse/PROJ-123".to_owned(),
+        })
+    }
+
+    async fn record_resolution(&self, resolution: &DecisionResolution) -> Result<(), PortError> {
+        self.decision_resolutions
+            .lock()
+            .map_err(|_| PortError::Failed {
+                reason: "fake decision-resolution lock was poisoned".to_owned(),
+            })?
+            .push(resolution.clone());
         Ok(())
     }
 }

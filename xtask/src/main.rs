@@ -35,6 +35,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "ci" if rest.is_empty() => ci(),
         "e2e-s0" if rest.is_empty() => e2e_s0(),
         "e2e-s3" if rest.is_empty() => e2e_s3(),
+        "e2e-s4" if rest.is_empty() => e2e_s4(),
         "policy-test" if rest.is_empty() => policy_test(),
         "migrate-check" if rest.is_empty() => migrate_check(),
         "generate-manifests" if rest.is_empty() => generate_manifests(),
@@ -61,6 +62,7 @@ fn usage() -> String {
         "  ci",
         "  e2e-s0",
         "  e2e-s3",
+        "  e2e-s4",
         "  policy-test",
         "  migrate-check",
         "  generate-manifests",
@@ -117,6 +119,10 @@ fn e2e_s0() -> TaskResult {
 
 fn e2e_s3() -> TaskResult {
     run("bash", &["scripts/s3-envelope-e2e.sh"])
+}
+
+fn e2e_s4() -> TaskResult {
+    run("bash", &["scripts/s4-escalation-e2e.sh"])
 }
 
 fn policy_test() -> TaskResult {

@@ -109,10 +109,16 @@ async fn s3_postgres_keeps_envelopes_immutable_and_parks_exact_rejections()
         ceiling: "200.00".to_owned(),
         currency: "USD".to_owned(),
     }];
+    let mut base_spec = proposed_spec.clone();
+    base_spec.budget.monthly_limit = "100.00".to_owned();
     let parked = store
         .park_rejection(ParkRejection {
             runtime_uid: &runtime_uid,
+            runtime_namespace: "team-a",
+            runtime_name: "runtime-a",
             spec_digest: "digest-a",
+            base_spec_digest: "base-digest-a",
+            base_spec: &base_spec,
             envelope_revision: envelope.revision,
             deltas: &deltas,
             proposed_spec: &proposed_spec,
@@ -137,7 +143,11 @@ async fn s3_postgres_keeps_envelopes_immutable_and_parks_exact_rejections()
     let other = store
         .park_rejection(ParkRejection {
             runtime_uid: &other_runtime_uid,
+            runtime_namespace: "team-a",
+            runtime_name: "runtime-b",
             spec_digest: "digest-b",
+            base_spec_digest: "base-digest-b",
+            base_spec: &base_spec,
             envelope_revision: envelope.revision,
             deltas: &deltas,
             proposed_spec: &proposed_spec,

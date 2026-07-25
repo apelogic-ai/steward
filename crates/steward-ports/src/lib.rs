@@ -30,7 +30,7 @@ pub const PORTS: [PortDescriptor; 8] = [
     },
     PortDescriptor {
         name: "DecisionChannel",
-        maturity: Maturity::Provisional,
+        maturity: Maturity::Proven,
     },
     PortDescriptor {
         name: "NotificationSink",
@@ -107,9 +107,26 @@ pub struct ToolCapabilities {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub struct DecisionIntent {
+pub struct DecisionRequest {
+    pub request_id: String,
+    pub runtime_uid: String,
     pub actor: String,
+    pub member_role: String,
+    pub counterexample: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecisionReference {
+    pub key: String,
+    pub evidence_url: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecisionResolution {
+    pub request_id: String,
+    pub key: String,
+    pub decided_by: String,
+    pub rationale: String,
     pub evidence_url: String,
 }
 
@@ -150,8 +167,16 @@ pub trait ToolPlane {
     fn revoke_runtime(&mut self, runtime: &RuntimeId) -> Result<(), PortError>;
 }
 
-pub trait DecisionChannel {
-    fn publish(&mut self, intent: DecisionIntent) -> Result<(), PortError>;
+pub trait DecisionChannel: Send + Sync + 'static {
+    fn request(
+        &self,
+        request: &DecisionRequest,
+    ) -> impl Future<Output = Result<DecisionReference, PortError>> + Send;
+
+    fn record_resolution(
+        &self,
+        resolution: &DecisionResolution,
+    ) -> impl Future<Output = Result<(), PortError>> + Send;
 }
 
 pub trait NotificationSink {

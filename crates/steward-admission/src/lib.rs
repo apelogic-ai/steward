@@ -111,16 +111,36 @@ impl AdmissionDelta {
 #[serde(rename_all = "camelCase", tag = "error")]
 pub enum AdmissionError {
     InvalidBudget { value: String },
+    InvalidCurrency { value: String },
     CurrencyMismatch { requested: String, ceiling: String },
     InvalidTtl { value: String },
     UnsupportedServicePrincipal,
     UnsupportedBindings,
 }
 
+pub fn validate_envelope(envelope: &Envelope) -> Result<(), AdmissionError> {
+    Decimal::parse(&envelope.spec.budget.monthly_limit)?;
+    if envelope.spec.budget.currency.len() != 3
+        || !envelope
+            .spec
+            .budget
+            .currency
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase())
+    {
+        return Err(AdmissionError::InvalidCurrency {
+            value: envelope.spec.budget.currency.clone(),
+        });
+    }
+    duration_seconds(&envelope.spec.ttl)?;
+    Ok(())
+}
+
 pub fn evaluate(
     request: &AgentRuntimeSpec,
     envelope: &Envelope,
 ) -> Result<AdmissionDecision, AdmissionError> {
+    validate_envelope(envelope)?;
     if matches!(request.principal, Principal::Service { .. }) {
         return Err(AdmissionError::UnsupportedServicePrincipal);
     }
@@ -179,6 +199,74 @@ pub fn evaluate(
         Ok(AdmissionDecision::Admit)
     } else {
         Ok(AdmissionDecision::Reject { deltas })
+    }
+}
+
+pub fn evaluate_with_grants(
+    request: &AgentRuntimeSpec,
+    envelope: &Envelope,
+    grants: &[AdmissionDelta],
+) -> Result<AdmissionDecision, AdmissionError> {
+    let decision = evaluate(request, envelope)?;
+    let AdmissionDecision::Reject { deltas } = decision else {
+        return Ok(AdmissionDecision::Admit);
+    };
+    let mut uncovered = Vec::new();
+    for delta in deltas {
+        if let Some(delta) = uncovered_delta(delta, grants)? {
+            uncovered.push(delta);
+        }
+    }
+    if uncovered.is_empty() {
+        Ok(AdmissionDecision::Admit)
+    } else {
+        Ok(AdmissionDecision::Reject { deltas: uncovered })
+    }
+}
+
+fn uncovered_delta(
+    delta: AdmissionDelta,
+    grants: &[AdmissionDelta],
+) -> Result<Option<AdmissionDelta>, AdmissionError> {
+    match delta {
+        AdmissionDelta::Models { requested, ceiling } => {
+            let requested = requested
+                .into_iter()
+                .filter(|model| {
+                    !grants.iter().any(|grant| {
+                        matches!(
+                            grant,
+                            AdmissionDelta::Models { requested, .. }
+                                if requested.contains(model)
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok((!requested.is_empty()).then_some(AdmissionDelta::Models { requested, ceiling }))
+        }
+        AdmissionDelta::Tools { requested, ceiling } => {
+            let requested = requested
+                .into_iter()
+                .filter(|tool| {
+                    !grants.iter().any(|grant| {
+                        matches!(
+                            grant,
+                            AdmissionDelta::Tools { requested, .. }
+                                if requested.contains(tool)
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok((!requested.is_empty()).then_some(AdmissionDelta::Tools { requested, ceiling }))
+        }
+        delta => {
+            for grant in grants {
+                if grant_covers(grant, &delta)? {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(delta))
+        }
     }
 }
 
@@ -316,6 +404,47 @@ fn duration_seconds(duration: &Duration) -> Result<u64, AdmissionError> {
         })
 }
 
+fn grant_covers(
+    grant: &AdmissionDelta,
+    requested: &AdmissionDelta,
+) -> Result<bool, AdmissionError> {
+    match (grant, requested) {
+        (
+            AdmissionDelta::Budget {
+                requested: granted,
+                currency: grant_currency,
+                ..
+            },
+            AdmissionDelta::Budget {
+                requested,
+                currency,
+                ..
+            },
+        ) => Ok(grant_currency == currency
+            && Decimal::parse(requested)?.cmp(&Decimal::parse(granted)?) != Ordering::Greater),
+        (
+            AdmissionDelta::Ttl {
+                requested: granted, ..
+            },
+            AdmissionDelta::Ttl { requested, .. },
+        ) => Ok(duration_seconds(&Duration(requested.clone()))?
+            <= duration_seconds(&Duration(granted.clone()))?),
+        (
+            AdmissionDelta::Models {
+                requested: granted, ..
+            },
+            AdmissionDelta::Models { requested, .. },
+        ) => Ok(requested.iter().all(|model| granted.contains(model))),
+        (
+            AdmissionDelta::Tools {
+                requested: granted, ..
+            },
+            AdmissionDelta::Tools { requested, .. },
+        ) => Ok(requested.iter().all(|tool| granted.contains(tool))),
+        _ => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use steward_types::{
@@ -325,8 +454,34 @@ mod tests {
 
     use super::{
         AdmissionDecision, AdmissionDelta, AdmissionError, Envelope, EnvelopeSpec,
-        add_budget_amount, evaluate,
+        add_budget_amount, evaluate, evaluate_with_grants, validate_envelope,
     };
+
+    #[test]
+    fn malformed_envelopes_are_rejected_before_they_become_authority() {
+        for (budget, currency, ttl) in [
+            ("not-a-decimal", "USD", "1h"),
+            ("100.00", "", "1h"),
+            ("100.00", "USD", "forever"),
+        ] {
+            let envelope = Envelope {
+                revision: 1,
+                spec: EnvelopeSpec {
+                    llms: Vec::new(),
+                    tools: Vec::new(),
+                    budget: Budget {
+                        monthly_limit: budget.to_owned(),
+                        currency: currency.to_owned(),
+                    },
+                    ttl: Duration(ttl.to_owned()),
+                },
+            };
+            assert!(
+                validate_envelope(&envelope).is_err(),
+                "malformed envelope must fail closed: {envelope:?}"
+            );
+        }
+    }
 
     fn request_with_budget(monthly_limit: &str) -> AgentRuntimeSpec {
         AgentRuntimeSpec {
@@ -501,6 +656,118 @@ mod tests {
             Err(AdmissionError::InvalidBudget {
                 value: "+1".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn grant_covers_only_the_approved_absolute_value() {
+        let envelope = envelope_with_budget("200.00");
+        let grant = AdmissionDelta::Budget {
+            requested: "220.00".to_owned(),
+            ceiling: "200.00".to_owned(),
+            currency: "USD".to_owned(),
+        };
+
+        assert_eq!(
+            evaluate_with_grants(
+                &request_with_budget("220.00"),
+                &envelope,
+                std::slice::from_ref(&grant),
+            ),
+            Ok(AdmissionDecision::Admit),
+            "the exact approved budget must pass admission for the bound runtime"
+        );
+        assert_eq!(
+            evaluate_with_grants(&request_with_budget("221.00"), &envelope, &[grant]),
+            Ok(AdmissionDecision::Reject {
+                deltas: vec![AdmissionDelta::Budget {
+                    requested: "221.00".to_owned(),
+                    ceiling: "200.00".to_owned(),
+                    currency: "USD".to_owned(),
+                }],
+            }),
+            "a grant must not authorize a value beyond the approved absolute ceiling"
+        );
+    }
+
+    #[test]
+    fn grants_cover_only_the_approved_values_in_each_dimension() {
+        let envelope = envelope_with_budget("200.00");
+        let extra_model = ModelRef {
+            provider: "provider-b".to_owned(),
+            model: "model-b".to_owned(),
+        };
+        let extra_tool = ToolGrant {
+            provider: "tool-a".to_owned(),
+            resource: "issues".to_owned(),
+            action: "write".to_owned(),
+        };
+        let mut approved = request_with_budget("220.00");
+        approved.ttl = Duration("25h".to_owned());
+        approved.llms.push(extra_model.clone());
+        approved.tools.push(extra_tool.clone());
+        let grants = vec![
+            AdmissionDelta::Budget {
+                requested: "220.00".to_owned(),
+                ceiling: "200.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            AdmissionDelta::Ttl {
+                requested: "25h".to_owned(),
+                ceiling: "24h".to_owned(),
+            },
+            AdmissionDelta::Models {
+                requested: vec![extra_model],
+                ceiling: envelope.spec.llms.clone(),
+            },
+            AdmissionDelta::Tools {
+                requested: vec![extra_tool],
+                ceiling: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            evaluate_with_grants(&approved, &envelope, &grants),
+            Ok(AdmissionDecision::Admit),
+            "every approved exception dimension must be recognized together"
+        );
+
+        let mut outside = approved;
+        outside.ttl = Duration("26h".to_owned());
+        outside.llms.push(ModelRef {
+            provider: "provider-c".to_owned(),
+            model: "model-c".to_owned(),
+        });
+        outside.tools.push(ToolGrant {
+            provider: "tool-b".to_owned(),
+            resource: "deployments".to_owned(),
+            action: "write".to_owned(),
+        });
+        assert_eq!(
+            evaluate_with_grants(&outside, &envelope, &grants),
+            Ok(AdmissionDecision::Reject {
+                deltas: vec![
+                    AdmissionDelta::Ttl {
+                        requested: "26h".to_owned(),
+                        ceiling: "24h".to_owned(),
+                    },
+                    AdmissionDelta::Models {
+                        requested: vec![ModelRef {
+                            provider: "provider-c".to_owned(),
+                            model: "model-c".to_owned(),
+                        }],
+                        ceiling: envelope.spec.llms.clone(),
+                    },
+                    AdmissionDelta::Tools {
+                        requested: vec![ToolGrant {
+                            provider: "tool-b".to_owned(),
+                            resource: "deployments".to_owned(),
+                            action: "write".to_owned(),
+                        }],
+                        ceiling: Vec::new(),
+                    },
+                ],
+            }),
+            "unapproved values must remain outside even when another value in each dimension was granted"
         );
     }
 }

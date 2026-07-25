@@ -8,8 +8,9 @@ use std::time::Duration;
 use axum::serve::Listener;
 use sqlx::postgres::PgPoolOptions;
 use steward_apiserver::{
-    AuthenticatedCaller, AuthenticationError, BoxFuture, KubeRuntimeRepository,
-    RequestAuthenticator, router,
+    AuthenticatedCaller, AuthenticationError, BoxFuture, DecisionChannel, DecisionReference,
+    DecisionRequest, DecisionResolution, KubeRuntimeRepository, PortError, RequestAuthenticator,
+    router,
 };
 use steward_controller::webhook_router;
 use steward_store::PgStore;
@@ -45,6 +46,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             member_role,
             admin,
         },
+        S3DecisionChannel,
     )
     .merge(webhook_router(store));
     let listener = TcpListener::bind(&bind).await?;
@@ -62,6 +64,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
     Ok(())
+}
+
+#[derive(Clone)]
+struct S3DecisionChannel;
+
+impl DecisionChannel for S3DecisionChannel {
+    async fn request(&self, _request: &DecisionRequest) -> Result<DecisionReference, PortError> {
+        Ok(DecisionReference {
+            key: "PROJ-123".to_owned(),
+            evidence_url: "https://jira.example.com/browse/PROJ-123".to_owned(),
+        })
+    }
+
+    async fn record_resolution(&self, _resolution: &DecisionResolution) -> Result<(), PortError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]

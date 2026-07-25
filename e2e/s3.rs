@@ -120,6 +120,9 @@ impl Harness {
             "metadata": {
                 "name": RUNTIME_NAME,
                 "namespace": NAMESPACE,
+                "annotations": {
+                    "agents.apelogic.ai/member-role": "engineer",
+                },
             },
             "spec": {
                 "principal": {

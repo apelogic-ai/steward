@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::serve::Listener;
-use kube::Client;
-use steward_adapter_openshell::OpenShellRuntime;
+use steward_adapter_jira::{JiraAdapter, JiraConfig};
+use steward_apiserver::{KubeRuntimeRepository, KubernetesTokenAuthenticator, router};
 use steward_store::PgStore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinError, JoinSet};
@@ -25,37 +25,36 @@ const MAX_PENDING_TLS_HANDSHAKES: usize = 64;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let endpoint = required("STEWARD_OPENSHELL_ENDPOINT")?;
-    let client = Client::try_default().await?;
-    let sandbox_runtime = OpenShellRuntime::connect(endpoint)
-        .await
-        .map_err(|error| io::Error::other(format!("OpenShell connection failed: {error:?}")))?;
-    if env::var("STEWARD_S0_BOOTSTRAP").as_deref() == Ok("1") {
-        steward_controller::run_controller(client, sandbox_runtime).await;
-        return Ok(());
-    }
-
-    let database_url = required("STEWARD_DATABASE_URL")?;
-    let store = PgStore::connect(&database_url).await?;
+    let client = kube::Client::try_default().await?;
+    let store = PgStore::connect(&required("STEWARD_DATABASE_URL")?).await?;
     store.migrate().await?;
+    let decisions = JiraAdapter::new(
+        JiraConfig {
+            base_url: required("STEWARD_JIRA_BASE_URL")?,
+            project_key: required("STEWARD_JIRA_PROJECT_KEY")?,
+            account_email: required("STEWARD_JIRA_ACCOUNT_EMAIL")?,
+        },
+        required("STEWARD_JIRA_TOKEN")?,
+    )
+    .map_err(|error| io::Error::other(format!("Jira configuration failed: {error:?}")))?;
+    let authenticator = KubernetesTokenAuthenticator::new(
+        client.clone(),
+        env::var("STEWARD_ADMIN_GROUP").unwrap_or_else(|_| "agents.apelogic.ai/admin".to_owned()),
+        env::var("STEWARD_TOKEN_AUDIENCE").ok(),
+    );
+    let app = router(
+        KubeRuntimeRepository::new(client),
+        store,
+        authenticator,
+        decisions,
+    );
     let listener = tls_listener(
-        &env::var("STEWARD_WEBHOOK_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_owned()),
+        &env::var("STEWARD_APISERVER_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_owned()),
         &required("STEWARD_TLS_CERT_DER")?,
         &required("STEWARD_TLS_KEY_DER")?,
     )
     .await?;
-    let webhook = axum::serve(
-        listener,
-        steward_controller::webhook_router_for_controller(
-            store.clone(),
-            required("STEWARD_CONTROLLER_USERNAME")?,
-        ),
-    );
-    let controller = steward_controller::run_controller_with_store(client, sandbox_runtime, store);
-    tokio::select! {
-        result = webhook => result?,
-        () = controller => return Err(io::Error::other("controller exited").into()),
-    }
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
@@ -93,7 +92,7 @@ fn completed_handshake(result: JoinedHandshake) -> Option<TlsConnection> {
     match result {
         Some(Ok(connection)) => connection,
         Some(Err(error)) => {
-            eprintln!("webhook TLS handshake task failed: {error}");
+            eprintln!("apiserver TLS handshake task failed: {error}");
             None
         }
         None => None,
@@ -121,18 +120,18 @@ impl Listener for TlsListener {
                             match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                                 Ok(Ok(stream)) => Some((stream, address)),
                                 Ok(Err(error)) => {
-                                    eprintln!("webhook TLS handshake failed: {error}");
+                                    eprintln!("apiserver TLS handshake failed: {error}");
                                     None
                                 }
                                 Err(_) => {
-                                    eprintln!("webhook TLS handshake timed out");
+                                    eprintln!("apiserver TLS handshake timed out");
                                     None
                                 }
                             }
                         });
                     }
                     Err(error) => {
-                        eprintln!("webhook listener accept failed: {error}");
+                        eprintln!("apiserver listener accept failed: {error}");
                         sleep(Duration::from_secs(1)).await;
                     }
                 },
