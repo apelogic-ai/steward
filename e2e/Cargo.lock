@@ -2679,6 +2679,7 @@ name = "steward-apiserver"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "k8s-openapi",
  "kube",
  "serde",
  "serde_json",

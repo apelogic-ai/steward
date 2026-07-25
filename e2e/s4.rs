@@ -160,6 +160,9 @@ impl Harness {
             "metadata": {
                 "name": name,
                 "namespace": NAMESPACE,
+                "annotations": {
+                    "agents.apelogic.ai/member-role": "engineer",
+                },
             },
             "spec": {
                 "principal": {

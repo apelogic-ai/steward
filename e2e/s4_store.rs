@@ -313,12 +313,16 @@ async fn s4_active_grants_expire_and_can_be_revoked_without_erasing_history()
             .is_empty(),
         "an append-only revocation must remove the grant from active authority"
     );
-    let retained = sqlx::query("SELECT count(*)::bigint AS count FROM grants WHERE approval_id = $1")
-        .bind(parked.approval_id)
-        .fetch_one(store.pool())
-        .await?
-        .try_get::<i64, _>("count")?;
-    assert_eq!(retained, 1, "revocation must retain immutable grant evidence");
+    let retained =
+        sqlx::query("SELECT count(*)::bigint AS count FROM grants WHERE approval_id = $1")
+            .bind(parked.approval_id)
+            .fetch_one(store.pool())
+            .await?
+            .try_get::<i64, _>("count")?;
+    assert_eq!(
+        retained, 1,
+        "revocation must retain immutable grant evidence"
+    );
     Ok(())
 }
 
@@ -569,11 +573,74 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
         "authoring a new role envelope must atomically retire older authority"
     );
     assert!(
-        store
-            .grant_reversion("runtime-evidence-a")
-            .await?
-            .is_some(),
+        store.grant_reversion("runtime-evidence-a").await?.is_some(),
         "superseding an unapplied grant must produce durable reconciliation work"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn s4_decision_filing_claim_serializes_concurrent_retries() -> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the S4 Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let runtime_uid = format!("runtime-filing-{suffix}");
+    let proposed = proposed_spec();
+    let base = base_spec();
+    let deltas = budget_deltas();
+    let parked = store
+        .park_rejection(ParkRejection {
+            runtime_uid: &runtime_uid,
+            runtime_namespace: "team-a",
+            runtime_name: "runtime-filing",
+            spec_digest: &format!("digest-{suffix}"),
+            base_spec_digest: &format!("base-digest-{suffix}"),
+            base_spec: &base,
+            envelope_revision: 1,
+            deltas: &deltas,
+            proposed_spec: &proposed,
+            actor: "alice@example.com",
+            member_role: "engineer-filing",
+        })
+        .await?;
+
+    let (left, right) = tokio::join!(
+        store.claim_decision_filing(parked.approval_id),
+        store.claim_decision_filing(parked.approval_id),
+    );
+    let (claim, blocked) = match (left, right) {
+        (Ok(claim), Err(error)) | (Err(error), Ok(claim)) => (claim, error),
+        result => {
+            return Err(io::Error::other(format!(
+                "exactly one concurrent filing claim must succeed: {result:?}"
+            ))
+            .into());
+        }
+    };
+    assert_eq!(blocked, StoreError::DecisionFilingInProgress);
+    let token = claim
+        .token
+        .ok_or_else(|| io::Error::other("new filing claim had no lease token"))?;
+    store
+        .complete_decision_filing(
+            parked.approval_id,
+            token,
+            "PROJ-123",
+            "https://jira.example.com/browse/PROJ-123",
+        )
+        .await?;
+    let replay = store.claim_decision_filing(parked.approval_id).await?;
+    assert_eq!(replay.token, None);
+    assert_eq!(replay.filing.decision_key.as_deref(), Some("PROJ-123"));
     Ok(())
 }

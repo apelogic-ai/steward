@@ -446,6 +446,93 @@ impl PgStore {
         })
     }
 
+    pub async fn claim_decision_filing(
+        &self,
+        approval_id: Uuid,
+    ) -> Result<DecisionFilingClaim, StoreError> {
+        let token = Uuid::new_v4();
+        let row = sqlx::query(
+            "UPDATE approvals \
+             SET decision_filing_token = $2, decision_filing_started_at = now() \
+             WHERE id = $1 \
+               AND state = 'pending' \
+               AND decision_key IS NULL \
+               AND evidence_url IS NULL \
+               AND (decision_filing_token IS NULL \
+                    OR decision_filing_started_at < now() - interval '5 minutes') \
+             RETURNING id",
+        )
+        .bind(approval_id)
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if row.is_some() {
+            return Ok(DecisionFilingClaim {
+                filing: self.approval_for_filing(approval_id).await?,
+                token: Some(token),
+            });
+        }
+        let filing = self.approval_for_filing(approval_id).await?;
+        if filing.decision_key.is_some() && filing.evidence_url.is_some() {
+            Ok(DecisionFilingClaim {
+                filing,
+                token: None,
+            })
+        } else {
+            Err(StoreError::DecisionFilingInProgress)
+        }
+    }
+
+    pub async fn complete_decision_filing(
+        &self,
+        approval_id: Uuid,
+        token: Uuid,
+        decision_key: &str,
+        evidence_url: &str,
+    ) -> Result<(), StoreError> {
+        let updated = sqlx::query(
+            "UPDATE approvals \
+             SET decision_key = $3, evidence_url = $4, \
+                 decision_filing_token = NULL, decision_filing_started_at = NULL \
+             WHERE id = $1 \
+               AND decision_filing_token = $2 \
+               AND state = 'pending' \
+               AND decision_key IS NULL \
+               AND evidence_url IS NULL",
+        )
+        .bind(approval_id)
+        .bind(token)
+        .bind(decision_key)
+        .bind(evidence_url)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if updated.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::DecisionFilingClaimLost)
+        }
+    }
+
+    pub async fn release_decision_filing(
+        &self,
+        approval_id: Uuid,
+        token: Uuid,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE approvals \
+             SET decision_filing_token = NULL, decision_filing_started_at = NULL \
+             WHERE id = $1 AND decision_filing_token = $2",
+        )
+        .bind(approval_id)
+        .bind(token)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(())
+    }
+
     pub async fn grant_reversion(
         &self,
         runtime_uid: &str,
@@ -819,6 +906,12 @@ pub struct DecisionFiling {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct DecisionFilingClaim {
+    pub filing: DecisionFiling,
+    pub token: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct GrantReversion {
     pub runtime_uid: String,
     pub runtime_namespace: String,
@@ -860,6 +953,8 @@ pub enum StoreError {
     ApprovalNotPending,
     MissingDecisionReference,
     DecisionReferenceMismatch,
+    DecisionFilingInProgress,
+    DecisionFilingClaimLost,
     EvidenceMismatch,
     InvalidGrantExpiry,
     MissingRevocationReason,
@@ -881,6 +976,12 @@ impl fmt::Display for StoreError {
                     formatter,
                     "approval already has a different decision-channel reference"
                 )
+            }
+            Self::DecisionFilingInProgress => {
+                write!(formatter, "decision-channel filing is already in progress")
+            }
+            Self::DecisionFilingClaimLost => {
+                write!(formatter, "decision-channel filing claim was lost")
             }
             Self::EvidenceMismatch => {
                 write!(

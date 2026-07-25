@@ -111,16 +111,36 @@ impl AdmissionDelta {
 #[serde(rename_all = "camelCase", tag = "error")]
 pub enum AdmissionError {
     InvalidBudget { value: String },
+    InvalidCurrency { value: String },
     CurrencyMismatch { requested: String, ceiling: String },
     InvalidTtl { value: String },
     UnsupportedServicePrincipal,
     UnsupportedBindings,
 }
 
+pub fn validate_envelope(envelope: &Envelope) -> Result<(), AdmissionError> {
+    Decimal::parse(&envelope.spec.budget.monthly_limit)?;
+    if envelope.spec.budget.currency.len() != 3
+        || !envelope
+            .spec
+            .budget
+            .currency
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase())
+    {
+        return Err(AdmissionError::InvalidCurrency {
+            value: envelope.spec.budget.currency.clone(),
+        });
+    }
+    duration_seconds(&envelope.spec.ttl)?;
+    Ok(())
+}
+
 pub fn evaluate(
     request: &AgentRuntimeSpec,
     envelope: &Envelope,
 ) -> Result<AdmissionDecision, AdmissionError> {
+    validate_envelope(envelope)?;
     if matches!(request.principal, Principal::Service { .. }) {
         return Err(AdmissionError::UnsupportedServicePrincipal);
     }
@@ -434,8 +454,34 @@ mod tests {
 
     use super::{
         AdmissionDecision, AdmissionDelta, AdmissionError, Envelope, EnvelopeSpec,
-        add_budget_amount, evaluate, evaluate_with_grants,
+        add_budget_amount, evaluate, evaluate_with_grants, validate_envelope,
     };
+
+    #[test]
+    fn malformed_envelopes_are_rejected_before_they_become_authority() {
+        for (budget, currency, ttl) in [
+            ("not-a-decimal", "USD", "1h"),
+            ("100.00", "", "1h"),
+            ("100.00", "USD", "forever"),
+        ] {
+            let envelope = Envelope {
+                revision: 1,
+                spec: EnvelopeSpec {
+                    llms: Vec::new(),
+                    tools: Vec::new(),
+                    budget: Budget {
+                        monthly_limit: budget.to_owned(),
+                        currency: currency.to_owned(),
+                    },
+                    ttl: Duration(ttl.to_owned()),
+                },
+            };
+            assert!(
+                validate_envelope(&envelope).is_err(),
+                "malformed envelope must fail closed: {envelope:?}"
+            );
+        }
+    }
 
     fn request_with_budget(monthly_limit: &str) -> AgentRuntimeSpec {
         AgentRuntimeSpec {

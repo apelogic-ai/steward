@@ -12,6 +12,9 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Extension, Json, Router};
+use k8s_openapi::api::authentication::v1::{
+    TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
+};
 use kube::api::{Api, PostParams};
 use kube::core::Request as KubeRequest;
 use kube::{Client, ResourceExt};
@@ -19,13 +22,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, add_budget_amount, evaluate_with_grants,
+    validate_envelope,
 };
 pub use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
 };
 use steward_store::{
-    ApprovalCandidate, ApproveAdmission, ApprovedAdmission, DecisionFiling, GrantReversion,
-    ParkRejection, ParkedAdmission, PendingApproval, PgStore, StoreError,
+    ApprovalCandidate, ApproveAdmission, ApprovedAdmission, DecisionFiling, DecisionFilingClaim,
+    GrantReversion, ParkRejection, ParkedAdmission, PendingApproval, PgStore, StoreError,
 };
 use steward_types::{AgentRuntime, AgentRuntimeSpec, Principal};
 use uuid::Uuid;
@@ -61,6 +65,92 @@ pub trait RequestAuthenticator: Clone + Send + Sync + 'static {
         &'a self,
         bearer_token: &'a str,
     ) -> BoxFuture<'a, Result<AuthenticatedCaller, AuthenticationError>>;
+}
+
+#[derive(Clone)]
+pub struct KubernetesTokenAuthenticator {
+    client: Client,
+    admin_group: String,
+    audience: Option<String>,
+}
+
+impl KubernetesTokenAuthenticator {
+    pub fn new(client: Client, admin_group: String, audience: Option<String>) -> Self {
+        Self {
+            client,
+            admin_group,
+            audience,
+        }
+    }
+}
+
+impl RequestAuthenticator for KubernetesTokenAuthenticator {
+    fn authenticate<'a>(
+        &'a self,
+        bearer_token: &'a str,
+    ) -> BoxFuture<'a, Result<AuthenticatedCaller, AuthenticationError>> {
+        Box::pin(async move {
+            let review = TokenReview {
+                spec: TokenReviewSpec {
+                    audiences: self.audience.clone().map(|audience| vec![audience]),
+                    token: Some(bearer_token.to_owned()),
+                },
+                ..TokenReview::default()
+            };
+            let reviewed = Api::<TokenReview>::all(self.client.clone())
+                .create(&PostParams::default(), &review)
+                .await
+                .map_err(|_| AuthenticationError::Unavailable)?;
+            caller_from_token_review(reviewed.status, &self.admin_group, self.audience.as_deref())
+        })
+    }
+}
+
+fn caller_from_token_review(
+    status: Option<TokenReviewStatus>,
+    admin_group: &str,
+    requested_audience: Option<&str>,
+) -> Result<AuthenticatedCaller, AuthenticationError> {
+    let status = status
+        .filter(|status| status.authenticated == Some(true))
+        .ok_or(AuthenticationError::InvalidCredentials)?;
+    if requested_audience.is_some_and(|requested| {
+        !status
+            .audiences
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|audience| audience == requested)
+    }) {
+        return Err(AuthenticationError::InvalidCredentials);
+    }
+    let user = status.user.ok_or(AuthenticationError::InvalidCredentials)?;
+    caller_from_kubernetes_user(&user, admin_group)
+}
+
+fn caller_from_kubernetes_user(
+    user: &UserInfo,
+    admin_group: &str,
+) -> Result<AuthenticatedCaller, AuthenticationError> {
+    let actor = user
+        .username
+        .clone()
+        .filter(|username| !username.is_empty())
+        .ok_or(AuthenticationError::InvalidCredentials)?;
+    let groups = user.groups.as_deref().unwrap_or_default();
+    let member_roles = groups
+        .iter()
+        .filter_map(|group| group.strip_prefix("agents.apelogic.ai/member-role:"))
+        .filter(|role| !role.is_empty())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(AuthenticatedCaller {
+        actor,
+        member_roles,
+        is_admin: groups.iter().any(|group| group == admin_group),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -309,6 +399,25 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         approval_id: Uuid,
     ) -> BoxFuture<'_, Result<DecisionFiling, StoreError>>;
 
+    fn claim_decision_filing(
+        &self,
+        approval_id: Uuid,
+    ) -> BoxFuture<'_, Result<DecisionFilingClaim, StoreError>>;
+
+    fn complete_decision_filing<'a>(
+        &'a self,
+        approval_id: Uuid,
+        token: Uuid,
+        decision_key: &'a str,
+        evidence_url: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    fn release_decision_filing(
+        &self,
+        approval_id: Uuid,
+        token: Uuid,
+    ) -> BoxFuture<'_, Result<(), StoreError>>;
+
     fn grant_reversion<'a>(
         &'a self,
         runtime_uid: &'a str,
@@ -398,6 +507,34 @@ impl AdmissionLedger for PgStore {
         approval_id: Uuid,
     ) -> BoxFuture<'_, Result<DecisionFiling, StoreError>> {
         Box::pin(async move { PgStore::approval_for_filing(self, approval_id).await })
+    }
+
+    fn claim_decision_filing(
+        &self,
+        approval_id: Uuid,
+    ) -> BoxFuture<'_, Result<DecisionFilingClaim, StoreError>> {
+        Box::pin(async move { PgStore::claim_decision_filing(self, approval_id).await })
+    }
+
+    fn complete_decision_filing<'a>(
+        &'a self,
+        approval_id: Uuid,
+        token: Uuid,
+        decision_key: &'a str,
+        evidence_url: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            PgStore::complete_decision_filing(self, approval_id, token, decision_key, evidence_url)
+                .await
+        })
+    }
+
+    fn release_decision_filing(
+        &self,
+        approval_id: Uuid,
+        token: Uuid,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        Box::pin(async move { PgStore::release_decision_filing(self, approval_id, token).await })
     }
 
     fn grant_reversion<'a>(
@@ -621,6 +758,15 @@ where
         )
             .into_response();
     }
+    if let Err(error) = validate_envelope(&envelope) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": format!("invalid envelope: {error:?}"),
+            })),
+        )
+            .into_response();
+    }
     match state
         .ledger
         .insert_envelope(&member_role, &envelope, &admin.actor)
@@ -761,6 +907,7 @@ impl IntoResponse for ApiError {
                 StoreError::ApprovalNotPending
                 | StoreError::MissingDecisionReference
                 | StoreError::DecisionReferenceMismatch
+                | StoreError::DecisionFilingInProgress
                 | StoreError::EvidenceMismatch
                 | StoreError::StaleEnvelope
                 | StoreError::EnvelopeRevisionNotIncreasing,
@@ -768,9 +915,9 @@ impl IntoResponse for ApiError {
             Self::Store(StoreError::InvalidGrantExpiry | StoreError::MissingRevocationReason) => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
-            Self::Runtime(_) | Self::Store(StoreError::Database(_)) | Self::DecisionChannel(_) => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Self::Runtime(_)
+            | Self::Store(StoreError::Database(_) | StoreError::DecisionFilingClaimLost)
+            | Self::DecisionChannel(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
         (
             status,
@@ -989,13 +1136,17 @@ where
     L: AdmissionLedger,
     D: DecisionChannel,
 {
-    let filing = ledger
-        .approval_for_filing(approval_id)
+    let claim = ledger
+        .claim_decision_filing(approval_id)
         .await
         .map_err(ApiError::Store)?;
+    let filing = claim.filing;
     if let (Some(key), Some(evidence_url)) = (filing.decision_key, filing.evidence_url) {
         return Ok(DecisionReference { key, evidence_url });
     }
+    let token = claim
+        .token
+        .ok_or(ApiError::Store(StoreError::DecisionFilingClaimLost))?;
     let counterexample = AdmissionDecision::Reject {
         deltas: filing.deltas,
     }
@@ -1003,7 +1154,7 @@ where
     .ok_or_else(|| {
         ApiError::Admission("parked decision did not carry a counterexample".to_owned())
     })?;
-    let reference = decisions
+    let reference = match decisions
         .request(&DecisionRequest {
             request_id: filing.approval_id.to_string(),
             runtime_uid: filing.runtime_uid,
@@ -1012,9 +1163,18 @@ where
             counterexample,
         })
         .await
-        .map_err(|error| ApiError::DecisionChannel(format!("{error:?}")))?;
+    {
+        Ok(reference) => reference,
+        Err(error) => {
+            ledger
+                .release_decision_filing(approval_id, token)
+                .await
+                .map_err(ApiError::Store)?;
+            return Err(ApiError::DecisionChannel(format!("{error:?}")));
+        }
+    };
     ledger
-        .link_decision_reference(approval_id, &reference.key, &reference.evidence_url)
+        .complete_decision_filing(approval_id, token, &reference.key, &reference.evidence_url)
         .await
         .map_err(ApiError::Store)?;
     Ok(reference)
@@ -1073,15 +1233,19 @@ fn spec_digest(spec: &AgentRuntimeSpec) -> Result<String, ApiError> {
 mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
+    use k8s_openapi::api::authentication::v1::{TokenReviewStatus, UserInfo};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration as StdDuration;
 
     use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec};
     use steward_ports::{
         DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
     };
     use steward_store::{
-        ApprovalCandidate, ApproveAdmission, ApprovedAdmission, DecisionFiling, GrantReversion,
-        ParkRejection, ParkedAdmission, PendingApproval, StoreError,
+        ApprovalCandidate, ApproveAdmission, ApprovedAdmission, DecisionFiling,
+        DecisionFilingClaim, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval,
+        StoreError,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal,
@@ -1092,11 +1256,70 @@ mod tests {
     use super::{
         AdmissionContext, AdmissionLedger, ApiError, AuthenticatedCaller, AuthenticationError,
         BoxFuture, BudgetIncrease, RequestAuthenticator, RuntimeRepository, SubmissionOutcome,
-        router, submit_budget_increase,
+        caller_from_kubernetes_user, caller_from_token_review, router, submit_budget_increase,
     };
 
     #[derive(Clone)]
     struct FakeAuthenticator;
+
+    #[test]
+    fn kubernetes_identity_is_the_only_source_of_roles_and_admin_authority() -> Result<(), String> {
+        let caller = caller_from_kubernetes_user(
+            &UserInfo {
+                username: Some("alice@example.com".to_owned()),
+                groups: Some(vec![
+                    "agents.apelogic.ai/member-role:engineer".to_owned(),
+                    "agents.apelogic.ai/member-role:engineer".to_owned(),
+                    "agents.apelogic.ai/admin".to_owned(),
+                ]),
+                ..UserInfo::default()
+            },
+            "agents.apelogic.ai/admin",
+        )
+        .map_err(|error| format!("authenticated Kubernetes user was rejected: {error:?}"))?;
+        assert_eq!(caller.actor, "alice@example.com");
+        assert_eq!(caller.member_roles, vec!["engineer"]);
+        assert!(caller.is_admin);
+        assert_eq!(
+            caller_from_kubernetes_user(
+                &UserInfo {
+                    groups: Some(vec!["agents.apelogic.ai/admin".to_owned()]),
+                    ..UserInfo::default()
+                },
+                "agents.apelogic.ai/admin",
+            ),
+            Err(AuthenticationError::InvalidCredentials),
+            "a group without an authenticated Kubernetes username is not a caller"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn kubernetes_token_audience_must_match_the_configured_api_audience() {
+        let status = TokenReviewStatus {
+            authenticated: Some(true),
+            audiences: Some(vec!["steward-api".to_owned()]),
+            user: Some(UserInfo {
+                username: Some("alice@example.com".to_owned()),
+                groups: Some(vec!["agents.apelogic.ai/member-role:engineer".to_owned()]),
+                ..UserInfo::default()
+            }),
+            ..TokenReviewStatus::default()
+        };
+        assert!(
+            caller_from_token_review(
+                Some(status.clone()),
+                "agents.apelogic.ai/admin",
+                Some("steward-api"),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            caller_from_token_review(Some(status), "agents.apelogic.ai/admin", Some("other-api"),),
+            Err(AuthenticationError::InvalidCredentials),
+            "a valid Kubernetes token for another audience must fail closed"
+        );
+    }
 
     impl RequestAuthenticator for FakeAuthenticator {
         fn authenticate<'a>(
@@ -1130,6 +1353,32 @@ mod tests {
     struct FakeDecisionChannel {
         requests: Arc<Mutex<Vec<DecisionRequest>>>,
         resolutions: Arc<Mutex<Vec<DecisionResolution>>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct SlowDecisionChannel {
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl DecisionChannel for SlowDecisionChannel {
+        async fn request(
+            &self,
+            _request: &DecisionRequest,
+        ) -> Result<DecisionReference, PortError> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(StdDuration::from_millis(25)).await;
+            Ok(DecisionReference {
+                key: "PROJ-123".to_owned(),
+                evidence_url: "https://jira.example.com/browse/PROJ-123".to_owned(),
+            })
+        }
+
+        async fn record_resolution(
+            &self,
+            _resolution: &DecisionResolution,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
     }
 
     impl DecisionChannel for FakeDecisionChannel {
@@ -1226,6 +1475,7 @@ mod tests {
         grants: Vec<AdmissionDelta>,
         parked: ParkedRows,
         decision_references: DecisionReferences,
+        decision_filing_claim: Arc<Mutex<Option<Uuid>>>,
         revoke_rows: u64,
         reversion: Option<GrantReversion>,
     }
@@ -1460,6 +1710,76 @@ mod tests {
             })
         }
 
+        fn claim_decision_filing(
+            &self,
+            approval_id: Uuid,
+        ) -> BoxFuture<'_, Result<DecisionFilingClaim, StoreError>> {
+            Box::pin(async move {
+                let filing = self.approval_for_filing(approval_id).await?;
+                if filing.decision_key.is_some() && filing.evidence_url.is_some() {
+                    return Ok(DecisionFilingClaim {
+                        filing,
+                        token: None,
+                    });
+                }
+                let mut claim = self.decision_filing_claim.lock().map_err(|_| {
+                    StoreError::Database("fake filing claim lock was poisoned".to_owned())
+                })?;
+                if claim.is_some() {
+                    return Err(StoreError::DecisionFilingInProgress);
+                }
+                let token = Uuid::new_v4();
+                *claim = Some(token);
+                Ok(DecisionFilingClaim {
+                    filing,
+                    token: Some(token),
+                })
+            })
+        }
+
+        fn complete_decision_filing<'a>(
+            &'a self,
+            approval_id: Uuid,
+            token: Uuid,
+            decision_key: &'a str,
+            evidence_url: &'a str,
+        ) -> BoxFuture<'a, Result<(), StoreError>> {
+            Box::pin(async move {
+                let mut claim = self.decision_filing_claim.lock().map_err(|_| {
+                    StoreError::Database("fake filing claim lock was poisoned".to_owned())
+                })?;
+                if *claim != Some(token) {
+                    return Err(StoreError::DecisionFilingClaimLost);
+                }
+                self.decision_references
+                    .lock()
+                    .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))?
+                    .push((
+                        approval_id,
+                        decision_key.to_owned(),
+                        evidence_url.to_owned(),
+                    ));
+                *claim = None;
+                Ok(())
+            })
+        }
+
+        fn release_decision_filing(
+            &self,
+            _approval_id: Uuid,
+            token: Uuid,
+        ) -> BoxFuture<'_, Result<(), StoreError>> {
+            Box::pin(async move {
+                let mut claim = self.decision_filing_claim.lock().map_err(|_| {
+                    StoreError::Database("fake filing claim lock was poisoned".to_owned())
+                })?;
+                if *claim == Some(token) {
+                    *claim = None;
+                }
+                Ok(())
+            })
+        }
+
         fn grant_reversion<'a>(
             &'a self,
             _runtime_uid: &'a str,
@@ -1501,6 +1821,10 @@ mod tests {
         let mut runtime = AgentRuntime::new("runtime-a", spec);
         runtime.metadata.namespace = Some("team-a".to_owned());
         runtime.metadata.uid = Some("runtime-uid-a".to_owned());
+        runtime.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            "agents.apelogic.ai/member-role".to_owned(),
+            "engineer".to_owned(),
+        )]));
         runtime.metadata.resource_version = Some("1".to_owned());
         runtime
     }
@@ -1525,6 +1849,7 @@ mod tests {
             grants: Vec::new(),
             parked: Arc::new(Mutex::new(Vec::new())),
             decision_references: Arc::new(Mutex::new(Vec::new())),
+            decision_filing_claim: Arc::new(Mutex::new(None)),
             revoke_rows: 0,
             reversion: None,
         }
@@ -1871,6 +2196,45 @@ mod tests {
                 .map_err(|_| "flaky channel lock was poisoned")?,
             2,
             "the recovered durable reference must prevent a second external decision request"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_retries_file_exactly_one_external_decision() -> Result<(), String> {
+        let ledger = ledger();
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let parked = submit_budget_increase(
+            &runtimes,
+            &ledger,
+            &FlakyDecisionChannel::default(),
+            &AdmissionContext {
+                actor: "alice@example.com".to_owned(),
+                member_role: "engineer".to_owned(),
+            },
+            "team-a",
+            "runtime-a",
+            &BudgetIncrease {
+                amount: "120.00".to_owned(),
+            },
+        )
+        .await;
+        assert!(matches!(parked, Err(ApiError::DecisionChannel(_))));
+        let decisions = SlowDecisionChannel::default();
+        let (left, right) = tokio::join!(
+            super::file_decision_reference(&ledger, &decisions, Uuid::nil()),
+            super::file_decision_reference(&ledger, &decisions, Uuid::nil()),
+        );
+        assert!(
+            left.is_ok() || right.is_ok(),
+            "one filing attempt must complete successfully"
+        );
+        assert_eq!(
+            decisions.requests.load(Ordering::SeqCst),
+            1,
+            "a durable filing claim must serialize the outbound decision-channel call"
         );
         Ok(())
     }
@@ -2240,6 +2604,46 @@ mod tests {
             assert!(
                 queue_html.contains(expected),
                 "approval queue must render {expected:?} from the parked row"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn envelope_authoring_rejects_malformed_authority_before_persistence()
+    -> Result<(), String> {
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        for body in [
+            r#"{"revision":4,"spec":{"llms":[],"tools":[],"budget":{"monthlyLimit":"invalid","currency":"USD"},"ttl":"24h"}}"#,
+            r#"{"revision":4,"spec":{"llms":[],"tools":[],"budget":{"monthlyLimit":"100.00","currency":"US dollars"},"ttl":"24h"}}"#,
+            r#"{"revision":4,"spec":{"llms":[],"tools":[],"budget":{"monthlyLimit":"100.00","currency":"USD"},"ttl":"forever"}}"#,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/admin/envelopes/engineer")
+                        .header("authorization", "Bearer admin-session")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .map_err(|error| {
+                            format!("failed to build invalid envelope request: {error}")
+                        })?,
+                )
+                .await
+                .map_err(|error| format!("invalid envelope request failed: {error}"))?;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "malformed envelope authority must not be persisted"
             );
         }
         Ok(())

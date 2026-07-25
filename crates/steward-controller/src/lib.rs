@@ -22,9 +22,7 @@ use kube::runtime::finalizer::{Event, finalizer};
 use kube::runtime::watcher;
 use kube::{Client, ResourceExt};
 use sha2::{Digest, Sha256};
-use steward_admission::{
-    AdmissionDecision, AdmissionDelta, Envelope, evaluate, evaluate_with_grants,
-};
+use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, evaluate_with_grants};
 use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
 use steward_store::{GrantReversion, PgStore, StoreError};
 use steward_types::{AgentRuntime, AgentRuntimeStatus, Phase, RuntimeId, RuntimeRefs};
@@ -148,6 +146,7 @@ pub async fn reconcile_once<R: SandboxRuntime>(
 }
 
 const FINALIZER: &str = "agents.apelogic.ai/runtime";
+pub const MEMBER_ROLE_ANNOTATION: &str = "agents.apelogic.ai/member-role";
 
 pub async fn run_controller<R: SandboxRuntime>(client: Client, sandbox_runtime: R) {
     run_controller_inner(client, sandbox_runtime, None).await;
@@ -160,8 +159,16 @@ pub async fn run_controller_with_database<R: SandboxRuntime>(
 ) -> Result<(), StoreError> {
     let authority = PgStore::connect(database_url).await?;
     authority.migrate().await?;
-    run_controller_inner(client, sandbox_runtime, Some(authority)).await;
+    run_controller_with_store(client, sandbox_runtime, authority).await;
     Ok(())
+}
+
+pub async fn run_controller_with_store<R: SandboxRuntime>(
+    client: Client,
+    sandbox_runtime: R,
+    authority: PgStore,
+) {
+    run_controller_inner(client, sandbox_runtime, Some(authority)).await;
 }
 
 async fn run_controller_inner<R: SandboxRuntime>(
@@ -221,8 +228,27 @@ async fn reconcile<R: SandboxRuntime>(
                                     "grant member role no longer has an envelope".to_owned(),
                                 ))
                             })?;
-                        match authority_action(&runtime, &reversion, &latest_envelope)
-                            .map_err(ControllerError::Reconcile)?
+                        let surviving_grants = authority
+                            .grants_for_runtime(
+                                runtime.metadata.uid.as_deref().ok_or(
+                                    ControllerError::Reconcile(ReconcileError::MissingRuntimeUid),
+                                )?,
+                                &reversion.member_role,
+                                latest_envelope.revision,
+                            )
+                            .await
+                            .map_err(|error| {
+                                ControllerError::Reconcile(ReconcileError::Authority(
+                                    error.to_string(),
+                                ))
+                            })?;
+                        match authority_action(
+                            &runtime,
+                            &reversion,
+                            &latest_envelope,
+                            &surviving_grants,
+                        )
+                        .map_err(ControllerError::Reconcile)?
                         {
                             AuthorityAction::Continue => {}
                             AuthorityAction::Restore(mut restored) => {
@@ -237,27 +263,8 @@ async fn reconcile<R: SandboxRuntime>(
                                 return Ok(Action::requeue(StdDuration::from_secs(2)));
                             }
                             AuthorityAction::Suspend => {
-                                let decision = reconcile_once(
-                                    &runtime,
-                                    ReconcileIntent::Delete,
-                                    &context.sandbox_runtime,
-                                )
-                                .await
-                                .map_err(ControllerError::Reconcile)?;
-                                let status = match decision {
-                                    ReconcileDecision::Deleted => suspended_status(&runtime)?,
-                                    ReconcileDecision::Status(status) => status,
-                                };
-                                if runtime.status.as_ref() != Some(&status) {
-                                    api.patch_status(
-                                        &runtime.name_any(),
-                                        &PatchParams::default(),
-                                        &Patch::Merge(&status_merge_patch(&status)),
-                                    )
-                                    .await
-                                    .map_err(ControllerError::Kubernetes)?;
-                                }
-                                return Ok(Action::requeue(StdDuration::from_secs(2)));
+                                return suspend_runtime(&runtime, &api, &context.sandbox_runtime)
+                                    .await;
                             }
                         }
                     }
@@ -286,6 +293,46 @@ async fn reconcile<R: SandboxRuntime>(
                             }
                             AuthorityAction::Continue | AuthorityAction::Suspend => {}
                         }
+                    }
+                    let Some(member_role) = runtime
+                        .annotations()
+                        .get(MEMBER_ROLE_ANNOTATION)
+                        .filter(|role| !role.is_empty())
+                    else {
+                        return suspend_runtime(&runtime, &api, &context.sandbox_runtime).await;
+                    };
+                    let latest_envelope = authority
+                        .latest_envelope(member_role)
+                        .await
+                        .map_err(|error| {
+                            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
+                        })?
+                        .ok_or_else(|| {
+                            ControllerError::Reconcile(ReconcileError::Authority(
+                                "runtime member role no longer has an envelope".to_owned(),
+                            ))
+                        })?;
+                    let grants =
+                        authority
+                            .grants_for_runtime(
+                                runtime.metadata.uid.as_deref().ok_or(
+                                    ControllerError::Reconcile(ReconcileError::MissingRuntimeUid),
+                                )?,
+                                member_role,
+                                latest_envelope.revision,
+                            )
+                            .await
+                            .map_err(|error| {
+                                ControllerError::Reconcile(ReconcileError::Authority(
+                                    error.to_string(),
+                                ))
+                            })?;
+                    if matches!(
+                        runtime_authority_action(&runtime, &latest_envelope, &grants)
+                            .map_err(ControllerError::Reconcile)?,
+                        AuthorityAction::Suspend
+                    ) {
+                        return suspend_runtime(&runtime, &api, &context.sandbox_runtime).await;
                     }
                 }
                 let decision =
@@ -332,6 +379,30 @@ async fn reconcile<R: SandboxRuntime>(
     .map_err(|error| ControllerError::Finalizer(error.to_string()))
 }
 
+async fn suspend_runtime<R: SandboxRuntime>(
+    runtime: &AgentRuntime,
+    api: &Api<AgentRuntime>,
+    sandbox_runtime: &R,
+) -> Result<Action, ControllerError> {
+    let decision = reconcile_once(runtime, ReconcileIntent::Delete, sandbox_runtime)
+        .await
+        .map_err(ControllerError::Reconcile)?;
+    let status = match decision {
+        ReconcileDecision::Deleted => suspended_status(runtime)?,
+        ReconcileDecision::Status(status) => status,
+    };
+    if runtime.status.as_ref() != Some(&status) {
+        api.patch_status(
+            &runtime.name_any(),
+            &PatchParams::default(),
+            &Patch::Merge(&status_merge_patch(&status)),
+        )
+        .await
+        .map_err(ControllerError::Kubernetes)?;
+    }
+    Ok(Action::requeue(StdDuration::from_secs(60)))
+}
+
 #[derive(Clone, Debug)]
 enum AuthorityAction {
     Continue,
@@ -343,13 +414,15 @@ fn authority_action(
     runtime: &AgentRuntime,
     reversion: &GrantReversion,
     latest_envelope: &Envelope,
+    surviving_grants: &[AdmissionDelta],
 ) -> Result<AuthorityAction, ReconcileError> {
     validate_authority_binding(runtime, reversion)?;
-    let base_is_admitted = evaluate(&reversion.base_spec, latest_envelope).map_err(|error| {
-        ReconcileError::InvalidSpec {
-            reason: format!("{error:?}"),
-        }
-    })? == AdmissionDecision::Admit;
+    let base_is_admitted =
+        evaluate_with_grants(&reversion.base_spec, latest_envelope, surviving_grants).map_err(
+            |error| ReconcileError::InvalidSpec {
+                reason: format!("{error:?}"),
+            },
+        )? == AdmissionDecision::Admit;
     if runtime.spec == reversion.base_spec && base_is_admitted {
         return Ok(AuthorityAction::Continue);
     }
@@ -373,6 +446,21 @@ fn authority_application_action(
         Ok(AuthorityAction::Restore(Box::new(proposed)))
     } else {
         Ok(AuthorityAction::Continue)
+    }
+}
+
+fn runtime_authority_action(
+    runtime: &AgentRuntime,
+    latest_envelope: &Envelope,
+    grants: &[AdmissionDelta],
+) -> Result<AuthorityAction, ReconcileError> {
+    match evaluate_with_grants(&runtime.spec, latest_envelope, grants).map_err(|error| {
+        ReconcileError::InvalidSpec {
+            reason: format!("{error:?}"),
+        }
+    })? {
+        AdmissionDecision::Admit => Ok(AuthorityAction::Continue),
+        AdmissionDecision::Reject { .. } => Ok(AuthorityAction::Suspend),
     }
 }
 
@@ -537,6 +625,23 @@ pub async fn validate_admission<R: WebhookEnvelopeReader>(
     let Some(username) = request.user_info.username.as_deref() else {
         return response.deny("authenticated Kubernetes username is required");
     };
+    if request.operation == Operation::Update {
+        let Some(old_runtime) = request.old_object.as_ref() else {
+            return response.deny("AgentRuntime UPDATE admission request has no old object");
+        };
+        if old_runtime.spec.principal != runtime.spec.principal {
+            return response
+                .deny("AgentRuntime principal is immutable through the validating admission path");
+        }
+        match &old_runtime.spec.principal {
+            steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
+            _ => {
+                return response.deny(
+                    "existing AgentRuntime acting user must match the authenticated Kubernetes username",
+                );
+            }
+        }
+    }
     match &runtime.spec.principal {
         steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
         _ => {
@@ -555,6 +660,25 @@ pub async fn validate_admission<R: WebhookEnvelopeReader>(
     let Some(member_role) = roles.iter().next().copied().filter(|_| roles.len() == 1) else {
         return response.deny("exactly one authenticated member-role group is required");
     };
+    let bound_role = runtime
+        .annotations()
+        .get(MEMBER_ROLE_ANNOTATION)
+        .map(String::as_str);
+    if bound_role != Some(member_role) {
+        return response.deny(
+            "AgentRuntime member-role annotation must match the authenticated member-role group",
+        );
+    }
+    if request.operation == Operation::Update
+        && request
+            .old_object
+            .as_ref()
+            .and_then(|old| old.annotations().get(MEMBER_ROLE_ANNOTATION))
+            .map(String::as_str)
+            != Some(member_role)
+    {
+        return response.deny("AgentRuntime member-role binding is immutable");
+    }
     let envelope = match envelopes.latest_envelope(member_role).await {
         Ok(Some(envelope)) => envelope,
         Ok(None) => return response.deny("no envelope exists for the authenticated member role"),
@@ -613,7 +737,7 @@ async fn webhook_handler<R: WebhookEnvelopeReader>(
 mod tests {
     use std::sync::Mutex;
 
-    use steward_admission::{Envelope, EnvelopeSpec};
+    use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
     use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
     use steward_store::GrantReversion;
     use steward_types::{
@@ -623,7 +747,7 @@ mod tests {
 
     use super::{
         AuthorityAction, ReconcileDecision, ReconcileIntent, authority_action,
-        authority_application_action, reconcile_once, status_merge_patch,
+        authority_application_action, reconcile_once, runtime_authority_action, status_merge_patch,
     };
 
     #[derive(Default)]
@@ -753,7 +877,7 @@ mod tests {
         let mut runtime = fixture();
         let reversion = grant_reversion(&runtime);
         runtime.spec = reversion.proposed_spec.clone();
-        let action = authority_action(&runtime, &reversion, &envelope("1.00"))
+        let action = authority_action(&runtime, &reversion, &envelope("1.00"), &[])
             .map_err(|error| format!("authority evaluation failed: {error:?}"))?;
         let AuthorityAction::Restore(restored) = action else {
             return Err("an unchanged escalated spec must be restored after expiry".to_owned());
@@ -783,7 +907,7 @@ mod tests {
         runtime.spec.ttl = Duration("30m".to_owned());
         assert!(
             matches!(
-                authority_action(&runtime, &reversion, &envelope("1.00"))
+                authority_action(&runtime, &reversion, &envelope("1.00"), &[])
                     .map_err(|error| format!("authority evaluation failed: {error:?}"))?,
                 AuthorityAction::Suspend
             ),
@@ -796,11 +920,52 @@ mod tests {
         runtime.spec = reversion.proposed_spec.clone();
         assert!(
             matches!(
-                authority_action(&runtime, &reversion, &envelope("0.50"))
+                authority_action(&runtime, &reversion, &envelope("0.50"), &[])
                     .map_err(|error| format!("authority evaluation failed: {error:?}"))?,
                 AuthorityAction::Suspend
             ),
             "a narrowed envelope must suspend rather than restore a now-invalid base spec",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expired_newest_grant_restores_to_a_base_authorized_by_an_older_grant() -> Result<(), String>
+    {
+        let mut runtime = fixture();
+        let mut reversion = grant_reversion(&runtime);
+        reversion.base_spec.budget.monthly_limit = "2.00".to_owned();
+        reversion.proposed_spec.budget.monthly_limit = "3.00".to_owned();
+        runtime.spec = reversion.proposed_spec.clone();
+        let action = authority_action(
+            &runtime,
+            &reversion,
+            &envelope("1.00"),
+            &[AdmissionDelta::Budget {
+                requested: "2.00".to_owned(),
+                ceiling: "1.00".to_owned(),
+                currency: "USD".to_owned(),
+            }],
+        )
+        .map_err(|error| format!("authority evaluation failed: {error:?}"))?;
+        let AuthorityAction::Restore(restored) = action else {
+            return Err("an older surviving grant must authorize the predecessor state".to_owned());
+        };
+        assert_eq!(restored.spec, reversion.base_spec);
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_runtime_outside_a_narrowed_envelope_suspends_without_approval_history()
+    -> Result<(), String> {
+        let runtime = fixture();
+        assert!(
+            matches!(
+                runtime_authority_action(&runtime, &envelope("0.50"), &[])
+                    .map_err(|error| format!("authority evaluation failed: {error:?}"))?,
+                AuthorityAction::Suspend
+            ),
+            "periodic reconciliation must suspend an ordinary runtime after envelope narrowing"
         );
         Ok(())
     }
@@ -910,7 +1075,7 @@ mod webhook_tests {
     }
 
     fn admission_review_value() -> serde_json::Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "apiVersion": "admission.k8s.io/v1",
             "kind": "AdmissionReview",
             "request": {
@@ -938,7 +1103,10 @@ mod webhook_tests {
                     "metadata": {
                         "name": "runtime-a",
                         "namespace": "team-a",
-                        "uid": "runtime-uid-a"
+                        "uid": "runtime-uid-a",
+                        "annotations": {
+                            "agents.apelogic.ai/member-role": "engineer"
+                        }
                     },
                     "spec": {
                         "principal": {
@@ -957,7 +1125,9 @@ mod webhook_tests {
                 "dryRun": false,
                 "options": null
             }
-        })
+        });
+        value["request"]["oldObject"] = value["request"]["object"].clone();
+        value
     }
 
     fn fake_envelopes() -> FakeEnvelopes {
@@ -1077,6 +1247,32 @@ mod webhook_tests {
         assert_eq!(
             other_response.result.message,
             "envelope exceeded: budget.monthlyLimit requested 220.00 USD, ceiling 200.00 USD"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_principal_takeover_on_update() -> Result<(), String> {
+        let mut value = admission_review_value();
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
+        let mut old_object = value["request"]["object"].clone();
+        old_object["spec"]["principal"]["actingUser"] = serde_json::json!("bob@example.org");
+        value["request"]["oldObject"] = old_object;
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct takeover review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read takeover request: {error}"))?;
+
+        let response = validate_admission(&request, &fake_envelopes()).await;
+
+        assert!(
+            !response.allowed,
+            "an update must not reassign its principal"
+        );
+        assert_eq!(
+            response.result.message,
+            "AgentRuntime principal is immutable through the validating admission path"
         );
         Ok(())
     }

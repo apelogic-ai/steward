@@ -1,5 +1,7 @@
 //! Jira implementation of Steward's outbound-only decision channel.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
@@ -34,8 +36,14 @@ impl JiraAdapter {
         }
         let mut config = config;
         config.base_url = config.base_url.trim_end_matches('/').to_owned();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|error| PortError::Failed {
+                reason: format!("build Jira HTTP client: {error}"),
+            })?;
         Ok(Self {
-            client: reqwest::Client::new(),
+            client,
             config,
             api_token,
         })
