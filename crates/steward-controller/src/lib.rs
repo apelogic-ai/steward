@@ -711,15 +711,72 @@ pub async fn validate_admission<R: WebhookEnvelopeReader>(
     }
 }
 
+async fn validate_admission_for_controller<R: WebhookEnvelopeReader>(
+    request: &AdmissionRequest<AgentRuntime>,
+    envelopes: &R,
+    controller_username: &str,
+) -> AdmissionResponse {
+    if is_controller_finalizer_update(request, controller_username) {
+        return AdmissionResponse::from(request);
+    }
+    validate_admission(request, envelopes).await
+}
+
+fn is_controller_finalizer_update(
+    request: &AdmissionRequest<AgentRuntime>,
+    controller_username: &str,
+) -> bool {
+    if request.operation != Operation::Update
+        || request.user_info.username.as_deref() != Some(controller_username)
+    {
+        return false;
+    }
+    let (Some(old_runtime), Some(runtime)) = (request.old_object.as_ref(), request.object.as_ref())
+    else {
+        return false;
+    };
+    if old_runtime.spec != runtime.spec || old_runtime.status != runtime.status {
+        return false;
+    }
+    let mut old_metadata = old_runtime.metadata.clone();
+    let mut metadata = runtime.metadata.clone();
+    let mut old_finalizers = std::mem::take(&mut old_metadata.finalizers).unwrap_or_default();
+    let mut finalizers = std::mem::take(&mut metadata.finalizers).unwrap_or_default();
+    if old_metadata != metadata {
+        return false;
+    }
+    old_finalizers.retain(|finalizer| finalizer != FINALIZER);
+    finalizers.retain(|finalizer| finalizer != FINALIZER);
+    old_finalizers == finalizers
+}
+
 #[derive(Clone)]
 struct WebhookState<R> {
     envelopes: R,
+    controller_username: Option<String>,
 }
 
 pub fn webhook_router<R: WebhookEnvelopeReader>(envelopes: R) -> Router {
+    webhook_router_with_controller(envelopes, None)
+}
+
+pub fn webhook_router_for_controller<R: WebhookEnvelopeReader>(
+    envelopes: R,
+    controller_username: String,
+) -> Router {
+    webhook_router_with_controller(envelopes, Some(controller_username))
+}
+
+fn webhook_router_with_controller<R: WebhookEnvelopeReader>(
+    envelopes: R,
+    controller_username: Option<String>,
+) -> Router {
     Router::new()
         .route("/validate-agent-runtime", post(webhook_handler::<R>))
-        .with_state(WebhookState { envelopes })
+        .with_state(WebhookState {
+            envelopes,
+            controller_username,
+        })
 }
 
 async fn webhook_handler<R: WebhookEnvelopeReader>(
@@ -727,7 +784,13 @@ async fn webhook_handler<R: WebhookEnvelopeReader>(
     Json(review): Json<kube::core::admission::AdmissionReview<AgentRuntime>>,
 ) -> Json<kube::core::admission::AdmissionReview<DynamicObject>> {
     let response = match review.try_into() {
-        Ok(request) => validate_admission(&request, &state.envelopes).await,
+        Ok(request) => match state.controller_username.as_deref() {
+            Some(controller_username) => {
+                validate_admission_for_controller(&request, &state.envelopes, controller_username)
+                    .await
+            }
+            None => validate_admission(&request, &state.envelopes).await,
+        },
         Err(error) => AdmissionResponse::invalid(error),
     };
     Json(response.into_review())
@@ -1048,7 +1111,9 @@ mod webhook_tests {
     use steward_types::{AgentRuntime, Budget, Duration, ModelRef};
     use tower::ServiceExt;
 
-    use super::{WebhookEnvelopeReader, WebhookFuture, validate_admission, webhook_router};
+    use super::{
+        FINALIZER, WebhookEnvelopeReader, WebhookFuture, validate_admission, webhook_router,
+    };
 
     #[derive(Clone)]
     struct FakeEnvelopes {
@@ -1273,6 +1338,71 @@ mod webhook_tests {
         assert_eq!(
             response.result.message,
             "AgentRuntime principal is immutable through the validating admission path"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_allows_only_its_controller_to_change_its_finalizer() -> Result<(), String> {
+        let mut value = admission_review_value();
+        value["request"]["userInfo"] = serde_json::json!({
+            "username": "system:serviceaccount:steward-system:steward-controller",
+            "groups": ["system:serviceaccounts"]
+        });
+        value["request"]["object"]["metadata"]["finalizers"] = serde_json::json!([FINALIZER]);
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value.clone())
+            .map_err(|error| format!("failed to construct finalizer review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read finalizer request: {error}"))?;
+
+        let response = super::validate_admission_for_controller(
+            &request,
+            &fake_envelopes(),
+            "system:serviceaccount:steward-system:steward-controller",
+        )
+        .await;
+        assert!(
+            response.allowed,
+            "the configured controller must be able to add Steward's finalizer: {}",
+            response.result.message
+        );
+
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value.clone())
+            .map_err(|error| format!("failed to construct controller spec edit: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read controller spec edit: {error}"))?;
+        let response = super::validate_admission_for_controller(
+            &request,
+            &fake_envelopes(),
+            "system:serviceaccount:steward-system:steward-controller",
+        )
+        .await;
+        assert!(
+            !response.allowed,
+            "controller identity must not exempt desired-state changes"
+        );
+
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] =
+            value["request"]["oldObject"]["spec"]["budget"]["monthlyLimit"].clone();
+        value["request"]["object"]["metadata"]["finalizers"] =
+            serde_json::json!([FINALIZER, "example.com/other"]);
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct foreign finalizer edit: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read foreign finalizer edit: {error}"))?;
+        let response = super::validate_admission_for_controller(
+            &request,
+            &fake_envelopes(),
+            "system:serviceaccount:steward-system:steward-controller",
+        )
+        .await;
+        assert!(
+            !response.allowed,
+            "controller identity must not exempt another controller's finalizer"
         );
         Ok(())
     }
