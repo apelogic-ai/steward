@@ -54,12 +54,26 @@ privileged-setup and hardening boundary moves.
 - Live against the exact patched v0.0.90 base: the sandbox reached readiness,
   the `ClusterSPIFFEID` selected it using `openshell.io/sandbox-id`, and the
   supervisor obtained a JWT-SVID and sent it to the profile's configured token
-  endpoint. The upstream demo then stopped in its Node token issuer because
-  that process did not trust the SPIRE OIDC discovery provider's TLS chain
-  (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`); that is downstream of SVID acquisition.
+  endpoint. With SPIRE's published X.509 bundle mounted as the Node issuer's
+  trust anchor, the upstream demo completed audience-specific exchanges for
+  both protected services and preserved the sandbox SPIFFE ID as `azp`.
 
-The live command loads the locally built image only into its ephemeral kind
-cluster:
+Build the image from the recorded commit and patch with the OpenShell-pinned
+Zig 0.14.1 and cargo-zigbuild 0.22.3 toolchain:
+
+```bash
+scripts/build-patched-openshell-supervisor.sh
+```
+
+The script clones the immutable commit into `.steward-run/`, refuses a patch
+context mismatch, cross-builds the Linux supervisor, labels the image with its
+source revision and patch path, and removes the source tree unconditionally.
+`STEWARD_DEV_KEEP=1` retains that source for debugging and prints its exact
+cleanup command.
+
+The identity spike selects and builds this image automatically when it is not
+already present, then loads it only into its ephemeral kind cluster. An
+explicit image override remains available for upstream-fix verification:
 
 ```bash
 STEWARD_OPENSHELL_SUPERVISOR_IMAGE=openshell/supervisor:steward-spiffe-v0090 \

@@ -91,9 +91,10 @@ for the object model it commits to, not as a build plan.
 
 - **Mint code.** `crates/steward-mint/AGENTS.md` requires changes under that path
   to land in a separate, human-reviewed PR.
-- **The identity and budget planes.** S1 and S2 wait for the carried OpenShell
-  supervisor-identity fix. S3 and S4 run independently of that upstream
-  blocker.
+- **The identity and budget planes.** S1 and S2 use the recorded OpenShell
+  supervisor-identity patch until its upstream exit condition lands. The
+  ephemeral identity spike builds that patched supervisor from its immutable
+  source revision; S3 and S4 run independently of it.
 - **`dev-integration-spec.md`** — referenced as a companion by the roadmap but
   not present in this package. Add it if it is still current; the roadmap
   supersedes its sequencing but not its detail.

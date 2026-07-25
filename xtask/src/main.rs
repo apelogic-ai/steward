@@ -871,6 +871,91 @@ mod tests {
     }
 
     #[test]
+    fn carried_openshell_patch_has_a_reproducible_image_build_contract() -> Result<(), String> {
+        let output = Command::new("bash")
+            .arg(root().join("scripts/build-patched-openshell-supervisor.sh"))
+            .arg("--print-contract")
+            .output()
+            .map_err(|error| format!("failed to inspect patched supervisor build: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "patched supervisor build contract failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            concat!(
+                "source=https://github.com/NVIDIA/OpenShell.git\n",
+                "commit=1d4ac708f1d2a9ab94204cdce6ca0eee7e792839\n",
+                "patch=third_party/openshell-patches/v0.0.90/",
+                "0001-prepare-supervisor-identity-mount-namespace.patch\n",
+                "image=openshell/supervisor:steward-spiffe-v0090\n",
+                "zig=0.14.1\n",
+                "cargo-zigbuild=0.22.3\n",
+            ),
+            "the carried patch must build from its recorded immutable source and image contract"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_identity_spike_defaults_to_the_carried_supervisor_image() -> Result<(), String> {
+        let output = Command::new("bash")
+            .arg(root().join("scripts/s0-0-openshell-spike.sh"))
+            .arg("--print-identity-supervisor-image")
+            .output()
+            .map_err(|error| format!("failed to inspect identity supervisor image: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "identity supervisor selection failed before cluster setup: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "openshell/supervisor:steward-spiffe-v0090",
+            "the identity spike must use the supervisor built from the carried patch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_identity_spike_declares_its_spire_issuer_trust_bundle() -> Result<(), String> {
+        let output = Command::new("bash")
+            .arg(root().join("scripts/s0-0-openshell-spike.sh"))
+            .arg("--print-spire-issuer-ca-configmap")
+            .output()
+            .map_err(|error| format!("failed to inspect SPIRE issuer trust bundle: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "SPIRE issuer trust selection failed before cluster setup: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "openshell-spire-oidc-ca",
+            "the token issuer must consume a named run-scoped SPIRE CA ConfigMap"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_spike_cleanup_never_updates_the_ambient_kubeconfig() -> Result<(), String> {
+        let script_path = root().join("scripts/s0-0-openshell-spike.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        assert!(
+            script.contains(
+                "KUBECONFIG=\"${KUBECONFIG_PATH}\" kind delete cluster --name \"${CLUSTER_NAME}\""
+            ),
+            "owned kind-cluster cleanup must use the run kubeconfig even on early interruption"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn migration_diff_accepts_a_divergent_base() -> Result<(), String> {
         let repository = TestRepository::create()?;
         git(&repository.path, &["init", "--initial-branch=main"])?;
