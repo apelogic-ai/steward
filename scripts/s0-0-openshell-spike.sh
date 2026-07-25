@@ -90,7 +90,7 @@ fi
 
 if [[ "${S0_E2E}" == "0" && -z "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
   STEWARD_OPENSHELL_SUPERVISOR_IMAGE="${DEFAULT_IDENTITY_SUPERVISOR_IMAGE}"
-  if ! docker image inspect "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE}" >/dev/null 2>&1; then
+  if ! "${ROOT}/scripts/build-patched-openshell-supervisor.sh" --image-is-current; then
     "${ROOT}/scripts/build-patched-openshell-supervisor.sh"
   fi
 fi

@@ -71,9 +71,11 @@ source revision and patch path, and removes the source tree unconditionally.
 `STEWARD_DEV_KEEP=1` retains that source for debugging and prints its exact
 cleanup command.
 
-The identity spike selects and builds this image automatically when it is not
-already present, then loads it only into its ephemeral kind cluster. An
-explicit image override remains available for upstream-fix verification:
+The identity spike reuses this image only when its source revision, patch
+content digest, and architecture match the pinned build contract; otherwise it
+rebuilds it automatically. It then loads the image only into its ephemeral kind
+cluster. An explicit image override remains available for upstream-fix
+verification:
 
 ```bash
 STEWARD_OPENSHELL_SUPERVISOR_IMAGE=openshell/supervisor:steward-spiffe-v0090 \

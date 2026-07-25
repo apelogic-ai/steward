@@ -679,6 +679,7 @@ mod tests {
     use super::{migration_changes, root};
     use std::fs;
     use std::io::ErrorKind;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -737,6 +738,17 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             ))
         }
+    }
+
+    fn write_executable(path: &Path, content: &str) -> Result<(), String> {
+        fs::write(path, content)
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+        let mut permissions = fs::metadata(path)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)
+            .map_err(|error| format!("failed to make {} executable: {error}", path.display()))
     }
 
     #[test]
@@ -895,6 +907,174 @@ mod tests {
                 "cargo-zigbuild=0.22.3\n",
             ),
             "the carried patch must build from its recorded immutable source and image contract"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cached_openshell_supervisor_must_match_the_build_contract() -> Result<(), String> {
+        let fixture = TestRepository::create()?;
+        let bin = fixture.path.join("bin");
+        fs::create_dir(&bin)
+            .map_err(|error| format!("failed to create fake tool directory: {error}"))?;
+        write_executable(
+            &bin.join("docker"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+case "$1:$2" in
+  info:--format)
+    printf '%s\n' "${FAKE_DOCKER_ENGINE_ARCHITECTURE}"
+    ;;
+  image:inspect)
+    printf '%s\n' "${FAKE_DOCKER_IMAGE_METADATA}"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"#,
+        )?;
+
+        let system_path =
+            std::env::var("PATH").map_err(|error| format!("PATH is unset: {error}"))?;
+        let path = format!("{}:{system_path}", bin.display());
+        let script = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let current_metadata = concat!(
+            "1d4ac708f1d2a9ab94204cdce6ca0eee7e792839|",
+            "eac2ee8aa72ac358d3bedc23e0b8b4bbcd43d7e874a057f56462c8727dbdabec|",
+            "arm64"
+        );
+        let current = Command::new("bash")
+            .arg(&script)
+            .arg("--image-is-current")
+            .env("PATH", &path)
+            .env("FAKE_DOCKER_ENGINE_ARCHITECTURE", "aarch64")
+            .env("FAKE_DOCKER_IMAGE_METADATA", current_metadata)
+            .output()
+            .map_err(|error| format!("failed to validate current supervisor image: {error}"))?;
+        assert!(
+            current.status.success(),
+            "an image matching the source, patch content, and Docker architecture must be reusable: {}",
+            String::from_utf8_lossy(&current.stderr)
+        );
+
+        for stale_metadata in [
+            concat!(
+                "0000000000000000000000000000000000000000|",
+                "eac2ee8aa72ac358d3bedc23e0b8b4bbcd43d7e874a057f56462c8727dbdabec|",
+                "arm64"
+            ),
+            concat!(
+                "1d4ac708f1d2a9ab94204cdce6ca0eee7e792839|",
+                "0000000000000000000000000000000000000000000000000000000000000000|",
+                "arm64"
+            ),
+            concat!(
+                "1d4ac708f1d2a9ab94204cdce6ca0eee7e792839|",
+                "eac2ee8aa72ac358d3bedc23e0b8b4bbcd43d7e874a057f56462c8727dbdabec|",
+                "amd64"
+            ),
+        ] {
+            let stale = Command::new("bash")
+                .arg(&script)
+                .arg("--image-is-current")
+                .env("PATH", &path)
+                .env("FAKE_DOCKER_ENGINE_ARCHITECTURE", "aarch64")
+                .env("FAKE_DOCKER_IMAGE_METADATA", stale_metadata)
+                .output()
+                .map_err(|error| format!("failed to validate stale supervisor image: {error}"))?;
+            assert!(
+                !stale.status.success(),
+                "an image with stale source, patch content, or architecture must be rebuilt"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_identity_spike_validates_a_cached_supervisor_before_reuse() -> Result<(), String> {
+        let script_path = root().join("scripts/s0-0-openshell-spike.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        assert!(
+            script.contains(
+                "\"${ROOT}/scripts/build-patched-openshell-supervisor.sh\" --image-is-current"
+            ),
+            "the identity spike must validate the cached image against the pinned build contract"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_mise_cross_tools_override_mismatched_path_tools() -> Result<(), String> {
+        let fixture = TestRepository::create()?;
+        let ambient_bin = fixture.path.join("ambient-bin");
+        let pinned_zig_bin = fixture.path.join("pinned-zig");
+        let pinned_zigbuild_bin = fixture.path.join("pinned-zigbuild");
+        for directory in [&ambient_bin, &pinned_zig_bin, &pinned_zigbuild_bin] {
+            fs::create_dir(directory)
+                .map_err(|error| format!("failed to create {}: {error}", directory.display()))?;
+        }
+        for command in ["cargo", "git", "rustup"] {
+            write_executable(&ambient_bin.join(command), "#!/bin/sh\nexit 0\n")?;
+        }
+        write_executable(
+            &ambient_bin.join("docker"),
+            r#"#!/bin/sh
+if [ "$1:$2" = "buildx:version" ]; then
+  exit 0
+fi
+if [ "$1:$2" = "info:--format" ]; then
+  printf 'linux\n'
+  exit 0
+fi
+exit 2
+"#,
+        )?;
+        write_executable(&ambient_bin.join("zig"), "#!/bin/sh\nprintf '0.99.0\\n'\n")?;
+        write_executable(
+            &ambient_bin.join("cargo-zigbuild"),
+            "#!/bin/sh\nprintf 'cargo-zigbuild 0.99.0\\n'\n",
+        )?;
+        write_executable(
+            &ambient_bin.join("mise"),
+            r#"#!/bin/sh
+case "$2" in
+  zig@0.14.1)
+    printf '%s\n' "${FAKE_PINNED_ZIG_BIN}"
+    ;;
+  github:rust-cross/cargo-zigbuild@0.22.3)
+    printf '%s\n' "${FAKE_PINNED_ZIGBUILD_BIN}"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+        )?;
+        write_executable(
+            &pinned_zig_bin.join("zig"),
+            "#!/bin/sh\nprintf '0.14.1\\n'\n",
+        )?;
+        write_executable(
+            &pinned_zigbuild_bin.join("cargo-zigbuild"),
+            "#!/bin/sh\nprintf 'cargo-zigbuild 0.22.3\\n'\n",
+        )?;
+
+        let system_path =
+            std::env::var("PATH").map_err(|error| format!("PATH is unset: {error}"))?;
+        let output = Command::new("bash")
+            .arg(root().join("scripts/build-patched-openshell-supervisor.sh"))
+            .arg("--check-prerequisites")
+            .env("PATH", format!("{}:{system_path}", ambient_bin.display()))
+            .env("FAKE_PINNED_ZIG_BIN", &pinned_zig_bin)
+            .env("FAKE_PINNED_ZIGBUILD_BIN", &pinned_zigbuild_bin)
+            .output()
+            .map_err(|error| format!("failed to inspect cross-tool selection: {error}"))?;
+        assert!(
+            output.status.success(),
+            "exact mise tools must be selected when ambient versions differ: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
         Ok(())
     }

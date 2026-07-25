@@ -40,9 +40,7 @@ check_prerequisites() {
       failed=1
     fi
   done
-  if command -v zig >/dev/null 2>&1 && command -v cargo-zigbuild >/dev/null 2>&1; then
-    CROSS_TOOL_PATH="${PATH}"
-  elif command -v mise >/dev/null 2>&1 \
+  if command -v mise >/dev/null 2>&1 \
     && mise where "zig@${ZIG_VERSION}" >/dev/null 2>&1 \
     && mise where "github:rust-cross/cargo-zigbuild@${CARGO_ZIGBUILD_VERSION}" >/dev/null 2>&1
   then
@@ -52,6 +50,8 @@ check_prerequisites() {
         "$(mise where "github:rust-cross/cargo-zigbuild@${CARGO_ZIGBUILD_VERSION}")" \
         "${PATH}"
     )"
+  elif command -v zig >/dev/null 2>&1 && command -v cargo-zigbuild >/dev/null 2>&1; then
+    CROSS_TOOL_PATH="${PATH}"
   else
     echo "zig ${ZIG_VERSION} and cargo-zigbuild ${CARGO_ZIGBUILD_VERSION} are required" >&2
     failed=1
@@ -90,6 +90,10 @@ check_prerequisites() {
   fi
 }
 
+patch_sha256() {
+  openssl dgst -sha256 -r "${PATCH_PATH}" | awk '{print $1}'
+}
+
 docker_architecture() {
   case "$(docker info --format '{{.Architecture}}')" in
     aarch64 | arm64)
@@ -103,6 +107,33 @@ docker_architecture() {
       return 1
       ;;
   esac
+}
+
+image_is_current() {
+  local actual_metadata=""
+  local expected_metadata=""
+
+  require_command docker
+  require_command openssl
+  if [[ ! -f "${PATCH_PATH}" ]]; then
+    echo "carried patch is missing: ${PATCH_RELATIVE}" >&2
+    return 1
+  fi
+  expected_metadata="$(
+    printf '%s|%s|%s' \
+      "${SOURCE_COMMIT}" \
+      "$(patch_sha256)" \
+      "$(docker_architecture)"
+  )"
+  actual_metadata="$(
+    docker image inspect \
+      --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}|{{ index .Config.Labels "io.apelogic.steward.patch-sha256" }}|{{.Architecture}}' \
+      "${IMAGE}" 2>/dev/null
+  )" || true
+  if [[ "${actual_metadata}" != "${expected_metadata}" ]]; then
+    echo "${IMAGE} does not match the pinned source, patch content, and Docker architecture" >&2
+    return 1
+  fi
 }
 
 rust_target_for_architecture() {
@@ -139,8 +170,17 @@ if [[ "${1:-}" == "--check-prerequisites" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "--image-is-current" ]]; then
+  if [[ "$#" != "1" ]]; then
+    echo "--image-is-current takes no additional arguments" >&2
+    exit 2
+  fi
+  image_is_current
+  exit 0
+fi
+
 if [[ "$#" != "0" ]]; then
-  echo "usage: $0 [--print-contract|--check-prerequisites]" >&2
+  echo "usage: $0 [--print-contract|--check-prerequisites|--image-is-current]" >&2
   exit 2
 fi
 
@@ -214,6 +254,7 @@ docker buildx build \
   --tag "${IMAGE}" \
   --label "org.opencontainers.image.revision=${SOURCE_COMMIT}" \
   --label "io.apelogic.steward.patch=${PATCH_RELATIVE}" \
+  --label "io.apelogic.steward.patch-sha256=$(patch_sha256)" \
   --provenance=false \
   --load \
   "${SOURCE_DIR}"
