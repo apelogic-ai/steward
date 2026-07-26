@@ -923,8 +923,37 @@ mod tests {
                 "musl-utils=1.2.5-r12 ncurses-terminfo-base=6.5_p20250503-r0 ",
                 "nftables=1.1.3-r0 readline=8.2.13-r1 scanelf=1.3.8-r1 ",
                 "ssl_client=1.37.0-r20 zlib=1.3.2-r0\n",
+                "apk-artifact-base=https://dl-cdn.alpinelinux.org/alpine/v3.22/main\n",
+                "apk-artifacts-aarch64=",
+                "gmp-6.3.0-r3.apk=0d2eb1079b1b5692e9e6652ff0e269caeb9c812f483e34c88d461c03bcf75460 ",
+                "iptables-1.8.11-r1.apk=0a10fe634e3525082a1219487cd044d987ac4a55ed5aa551bf758e81223e1cfb ",
+                "iptables-legacy-1.8.11-r1.apk=8beced6a354697e50014e2cebe0dcea3dc65d2dbbb708006a149999b3b029919 ",
+                "jansson-2.14.1-r0.apk=f57c3bceb823add72ee0ccbf17aa7fc98596ff9eb0c11d0e5a2c28260ea87dcd ",
+                "libip4tc-1.8.11-r1.apk=6418c50ff5287f6aca02ba7d8baab7cfe729a898793c9a8856cf8975b3f759c2 ",
+                "libip6tc-1.8.11-r1.apk=48ec17436d0e6fd754c8eb50862b5604e86e80ac7d19d7c7a48f9f622f305306 ",
+                "libmnl-1.0.5-r2.apk=213a7e87553bed3d9159b2e74d2627885c259883e61714b357949ca806eb1f8d ",
+                "libncursesw-6.5_p20250503-r0.apk=419b375e8a4345e7172b1f0f3a3c57db61374f5408cdb875d9e860bd4c243aca ",
+                "libnftnl-1.2.9-r0.apk=6912a5d56b31d3365b8dd0d6339bd70a2bfc9e25dab0c387f77174113c43e664 ",
+                "libxtables-1.8.11-r1.apk=e84f0d6b69d4318f297056d00ccbe433e6c7d163fe6767405e373248c42e3e88 ",
+                "ncurses-terminfo-base-6.5_p20250503-r0.apk=3d37403e0b5ab9eb0c1ce269444e4a385faec9fe6af452c1c6956806b13d2bd6 ",
+                "nftables-1.1.3-r0.apk=e48df72b87580444a6b3094e2292886994c3d9c600435d7a62949e3706ce2c07 ",
+                "readline-8.2.13-r1.apk=334af29dbf6b5a71a87af4d6a58e2967a8f711a51d00093de0e1498daf83ceb2\n",
+                "apk-artifacts-x86_64=",
+                "gmp-6.3.0-r3.apk=d3f987ae3836ac7774324bff443dd49d03b846209660729d0c30dfff5546e138 ",
+                "iptables-1.8.11-r1.apk=defe876173d08fe30b664b2d9f60d0237298a639e3a7d0e3f83ac637fd6519db ",
+                "iptables-legacy-1.8.11-r1.apk=aebfc932aa2e3b27e4895250aa4b73ead107116a3e8cd33ebf2d4036e46c043e ",
+                "jansson-2.14.1-r0.apk=7fde81421482507163410715a7ef7d7df6a091870edab855c24e8f6fc84e3e2d ",
+                "libip4tc-1.8.11-r1.apk=3ca5cd36732d59374d970d937f781469969bf668ff5eb65207892f7cfcd27f02 ",
+                "libip6tc-1.8.11-r1.apk=dc0e2aa34b2454bce4c8f6860484925fd6e5bea8eeb24e53d4b9526a24ed4c2c ",
+                "libmnl-1.0.5-r2.apk=e9dc63c95a0c8a263dc7f0705e6f7a2220d632a675ce85db798d33a40b1c1b0b ",
+                "libncursesw-6.5_p20250503-r0.apk=aeafdfca68147b014705b4e2564639ade6345198debb522f2c6c51d32e417651 ",
+                "libnftnl-1.2.9-r0.apk=bef674635aec00dca296b8206751245f7664ba10c416f31c01a563af596720ae ",
+                "libxtables-1.8.11-r1.apk=5367f1f5c309a0aeede0a08d73af717f582f7a135ff97080aa0e5b7c72fd97af ",
+                "ncurses-terminfo-base-6.5_p20250503-r0.apk=0815a5f0403974bb9c34d456e71dc9c0222cb5455d393bc63c44b573da3d7fe0 ",
+                "nftables-1.1.3-r0.apk=96bdef738b0ae22ad86500af3345622c7f5bdc6ade0a407d087d1ea3223c8bc7 ",
+                "readline-8.2.13-r1.apk=520fa586c689144928191bee13e2c85ff4e170ad87d1471ec48e3e97611673d8\n",
                 "build-script-sha256=",
-                "6b07e67b3a15955220f2c66431435fb50de0101dd7edb72ba83e983c82fe1f0e\n",
+                "1d2caafeff04d08627cfcaf436edbcdda8ea0b57223744056e2741bed321fac8\n",
             ),
             "the carried patch must build from its recorded immutable source and image contract"
         );
@@ -1068,8 +1097,36 @@ mod tests {
             );
         }
         assert!(
-            script.contains("apk add --no-cache ${APK_PACKAGE_CLOSURE[*]}"),
-            "the generated runtime image must install the single locked package closure"
+            script.contains(
+                "RUN --network=none apk --no-cache --no-network --repositories-file /dev/null add /tmp/steward-apks/*.apk"
+            ),
+            "the generated runtime image must install the locked package closure without repository resolution"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_runtime_installs_checksum_pinned_apks_without_repository_indexes()
+    -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for required in [
+            "APK_ARTIFACTS_AARCH64=(",
+            "APK_ARTIFACTS_X86_64=(",
+            "download_apk_artifacts()",
+            "openssl dgst -sha256 -r",
+            "RUN --network=none apk --no-cache --no-network ",
+            "--repositories-file /dev/null add /tmp/steward-apks/*.apk",
+        ] {
+            assert!(
+                script.contains(required),
+                "the supervisor runtime must install checksum-pinned APK artifacts without a mutable repository index: missing {required}"
+            );
+        }
+        assert!(
+            !script.contains("apk add --no-cache ${APK_PACKAGE_CLOSURE[*]}"),
+            "the supervisor runtime must not resolve its locked package closure through a mutable APKINDEX"
         );
         Ok(())
     }
@@ -1104,7 +1161,9 @@ mod tests {
         for required in [
             "# syntax=${DOCKERFILE_FRONTEND_IMAGE}",
             "FROM ${SUPERVISOR_BASE_IMAGE} AS supervisor",
-            "apk add --no-cache ${APK_PACKAGE_CLOSURE[*]}",
+            "COPY deploy/docker/.build/steward-apks/ /tmp/steward-apks/",
+            "RUN --network=none apk --no-cache --no-network ",
+            "--repositories-file /dev/null add /tmp/steward-apks/*.apk",
         ] {
             assert!(
                 script.contains(required),
@@ -1143,7 +1202,7 @@ esac
         let path = format!("{}:{system_path}", bin.display());
         let script = root().join("scripts/build-patched-openshell-supervisor.sh");
         let current_metadata =
-            "3e3bdd9208defcce1485d7a673c997975d4becbde82b5b1691ce0b1a8b35cc6a|arm64";
+            "d29214a0fd77894403531f86abfa7bc52db6c375c251d924be300552c1285c3d|arm64";
         let current = Command::new("bash")
             .arg(&script)
             .arg("--image-is-current")
@@ -1161,7 +1220,7 @@ esac
         for stale_metadata in [
             // The prior build logic and partial APK closure must not be reusable.
             "f445d04ba50e2d50690b58696fd67111ab36c74060e4229d5e0b7f33e4934d2d|arm64",
-            "3e3bdd9208defcce1485d7a673c997975d4becbde82b5b1691ce0b1a8b35cc6a|amd64",
+            "d29214a0fd77894403531f86abfa7bc52db6c375c251d924be300552c1285c3d|amd64",
         ] {
             let stale = Command::new("bash")
                 .arg(&script)
@@ -1282,7 +1341,7 @@ esac
         let script = fs::read_to_string(&script_path)
             .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
         let requirement = script
-            .find("for command_name in cargo docker git openssl rustup;")
+            .find("for command_name in cargo curl docker git openssl rustup;")
             .ok_or_else(|| {
                 "the supervisor build must reject a missing OpenSSL before cloning or compiling"
                     .to_owned()

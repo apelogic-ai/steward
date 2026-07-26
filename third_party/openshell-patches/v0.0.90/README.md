@@ -68,10 +68,13 @@ scripts/build-patched-openshell-supervisor.sh
 The script clones the immutable commit into `.steward-run/`, refuses a patch
 context mismatch, isolates Cargo and compiler configuration, cross-builds the
 Linux supervisor, and packages it with a digest-pinned Dockerfile frontend,
-base image, and a version-locked closure of every installed APK package. The
-cache contract includes the build script itself, so output-affecting build
-logic invalidates an older image. The script removes the source tree
-unconditionally.
+base image, and a version-locked closure of every installed APK package.
+Packages absent from the base image are downloaded by exact artifact name,
+verified against architecture-specific SHA-256 digests, and installed with
+APK networking disabled; the runtime build never resolves a mutable
+`APKINDEX`. The cache contract includes the build script itself, so
+output-affecting build logic invalidates an older image. The script removes the
+source tree unconditionally.
 `STEWARD_DEV_KEEP=1` retains that source for debugging and prints its exact
 cleanup command.
 
