@@ -941,6 +941,46 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_build_scrubs_target_specific_compiler_overrides() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for required in [
+            "scrub_cargo_target_compiler_overrides()",
+            "CARGO_TARGET_*)",
+            "unset \"${variable_name}\"",
+        ] {
+            assert!(
+                script.contains(required),
+                "the supervisor build must remove target-specific ambient compiler inputs: missing {required}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_build_signals_terminate_after_cleanup() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for required in [
+            "trap cleanup EXIT",
+            "trap 'exit 130' INT",
+            "trap 'exit 143' TERM",
+        ] {
+            assert!(
+                script.contains(required),
+                "the supervisor build must terminate after handling signals: missing {required}"
+            );
+        }
+        assert!(
+            !script.contains("trap cleanup EXIT INT TERM"),
+            "cleanup alone must not handle INT or TERM because Bash can resume execution afterwards"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn supervisor_build_pins_runtime_layer_inputs() -> Result<(), String> {
         let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
         let script = fs::read_to_string(&script_path)
@@ -1152,15 +1192,18 @@ esac
             script.contains("for command in kind kubectl helm cargo curl openssl sed tar;"),
             "the common S0 prerequisite set must not include identity-demo-only jq"
         );
-        let identity_branch = script
-            .find("elif [[ \"$#\" -eq 0 ]]; then")
-            .ok_or_else(|| "the spike must retain a dedicated identity-demo branch".to_owned())?;
         let jq_requirement = script
-            .find("required command is missing: jq")
-            .ok_or_else(|| "the identity-demo branch must still require jq".to_owned())?;
+            .find("if [[ \"$#\" -eq 0 ]] && ! command -v jq")
+            .ok_or_else(|| "the identity-demo mode must still require jq".to_owned())?;
+        let image_build = script
+            .find("build-patched-openshell-supervisor.sh\" --image-is-current")
+            .ok_or_else(|| "the identity demo must validate its patched image".to_owned())?;
+        let cluster_setup = script
+            .find("kind create cluster")
+            .ok_or_else(|| "the spike must retain its ephemeral cluster setup".to_owned())?;
         assert!(
-            jq_requirement > identity_branch,
-            "jq must be required only after selecting the identity-demo branch"
+            jq_requirement < image_build && jq_requirement < cluster_setup,
+            "identity-demo-only jq must be checked before image build or cluster setup"
         );
         Ok(())
     }

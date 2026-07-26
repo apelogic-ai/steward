@@ -29,6 +29,10 @@ if [[ "$#" -eq 1 && "$1" == "--print-spire-issuer-ca-configmap" ]]; then
   echo "${SPIRE_ISSUER_CA_CONFIGMAP}"
   exit 0
 fi
+if [[ "$#" -eq 0 ]] && ! command -v jq >/dev/null 2>&1; then
+  echo "required command is missing: jq" >&2
+  exit 2
+fi
 
 cleanup() {
   status="$1"
@@ -252,10 +256,6 @@ if [[ "${S0_E2E}" == "1" ]]; then
     -- \
     --exact
 elif [[ "$#" -eq 0 ]]; then
-  if ! command -v jq >/dev/null 2>&1; then
-    echo "required command is missing: jq" >&2
-    exit 2
-  fi
   cargo run \
     -p steward-adapter-openshell \
     --features s0-spike \

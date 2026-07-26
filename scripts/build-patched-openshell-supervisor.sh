@@ -42,6 +42,17 @@ require_command() {
   fi
 }
 
+scrub_cargo_target_compiler_overrides() {
+  local variable_name=""
+  while IFS= read -r variable_name; do
+    case "${variable_name}" in
+      CARGO_TARGET_*)
+        unset "${variable_name}"
+        ;;
+    esac
+  done < <(compgen -v)
+}
+
 check_prerequisites() {
   local failed=0
   local actual_rust=""
@@ -230,7 +241,9 @@ cleanup() {
     echo "refusing to remove unexpected build directory: ${RUN_DIR}" >&2
   fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 git init --quiet "${SOURCE_DIR}"
 git -C "${SOURCE_DIR}" remote add origin "${SOURCE_URL}"
@@ -264,6 +277,7 @@ pinned_dockerfile="${RUN_DIR}/Dockerfile.supervisor.pinned"
   unset CARGO_PROFILE_RELEASE_CODEGEN_UNITS CARGO_PROFILE_RELEASE_DEBUG
   unset CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_OPT_LEVEL
   unset CARGO_PROFILE_RELEASE_PANIC CARGO_PROFILE_RELEASE_STRIP
+  scrub_cargo_target_compiler_overrides
   source tasks/scripts/build-env.sh
   ensure_build_nofile_limit
   rustup target add --toolchain "${RUST_TOOLCHAIN}" "${rust_target}"
