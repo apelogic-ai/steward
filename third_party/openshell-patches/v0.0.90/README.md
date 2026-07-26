@@ -58,16 +58,18 @@ privileged-setup and hardening boundary moves.
   trust anchor, the upstream demo completed audience-specific exchanges for
   both protected services and preserved the sandbox SPIFFE ID as `azp`.
 
-Build the image from the recorded commit and patch with the OpenShell-pinned
-Zig 0.14.1 and cargo-zigbuild 0.22.3 toolchain:
+Build the image from the recorded commit and patch with Rust 1.95.0, Zig
+0.14.1, and cargo-zigbuild 0.22.3:
 
 ```bash
 scripts/build-patched-openshell-supervisor.sh
 ```
 
 The script clones the immutable commit into `.steward-run/`, refuses a patch
-context mismatch, cross-builds the Linux supervisor, labels the image with its
-source revision and patch path, and removes the source tree unconditionally.
+context mismatch, isolates Cargo and compiler configuration, cross-builds the
+Linux supervisor, and packages it with a digest-pinned Dockerfile frontend,
+base image, and version-pinned firewall packages. It labels the image with the
+complete build contract and removes the source tree unconditionally.
 `STEWARD_DEV_KEEP=1` retains that source for debugging and prints its exact
 cleanup command.
 

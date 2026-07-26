@@ -72,7 +72,7 @@ if [[ "$#" -eq 1 && "$1" == "--print-openshell-cli-asset" ]]; then
   exit 0
 fi
 
-for command in kind kubectl helm cargo curl jq openssl sed tar; do
+for command in kind kubectl helm cargo curl openssl sed tar; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is missing: ${command}" >&2
     exit 2
@@ -252,6 +252,10 @@ if [[ "${S0_E2E}" == "1" ]]; then
     -- \
     --exact
 elif [[ "$#" -eq 0 ]]; then
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "required command is missing: jq" >&2
+    exit 2
+  fi
   cargo run \
     -p steward-adapter-openshell \
     --features s0-spike \

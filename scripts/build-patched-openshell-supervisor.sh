@@ -8,8 +8,14 @@ SOURCE_COMMIT="1d4ac708f1d2a9ab94204cdce6ca0eee7e792839"
 PATCH_RELATIVE="third_party/openshell-patches/v0.0.90/0001-prepare-supervisor-identity-mount-namespace.patch"
 PATCH_PATH="${ROOT}/${PATCH_RELATIVE}"
 IMAGE="openshell/supervisor:steward-spiffe-v0090"
+RUST_TOOLCHAIN="1.95.0"
 ZIG_VERSION="0.14.1"
 CARGO_ZIGBUILD_VERSION="0.22.3"
+DOCKERFILE_FRONTEND_IMAGE="docker/dockerfile:1.4@sha256:9ba7531bd80fb0a858632727cf7a112fbfd19b17e94c4e84ced81e24ef1a0dbc"
+SUPERVISOR_BASE_IMAGE="alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce"
+NFTABLES_VERSION="1.1.3-r0"
+IPTABLES_VERSION="1.8.11-r1"
+IPTABLES_LEGACY_VERSION="1.8.11-r1"
 CROSS_TOOL_PATH=""
 
 print_contract() {
@@ -18,8 +24,14 @@ print_contract() {
     "commit=${SOURCE_COMMIT}" \
     "patch=${PATCH_RELATIVE}" \
     "image=${IMAGE}" \
+    "rust=${RUST_TOOLCHAIN}" \
     "zig=${ZIG_VERSION}" \
-    "cargo-zigbuild=${CARGO_ZIGBUILD_VERSION}"
+    "cargo-zigbuild=${CARGO_ZIGBUILD_VERSION}" \
+    "dockerfile-frontend=${DOCKERFILE_FRONTEND_IMAGE}" \
+    "supervisor-base=${SUPERVISOR_BASE_IMAGE}" \
+    "nftables=${NFTABLES_VERSION}" \
+    "iptables=${IPTABLES_VERSION}" \
+    "iptables-legacy=${IPTABLES_LEGACY_VERSION}"
 }
 
 require_command() {
@@ -32,6 +44,7 @@ require_command() {
 
 check_prerequisites() {
   local failed=0
+  local actual_rust=""
   local actual_zig=""
   local actual_zigbuild=""
 
@@ -58,6 +71,13 @@ check_prerequisites() {
   fi
 
   if [[ "${failed}" == "0" ]]; then
+    if ! actual_rust="$(rustup run "${RUST_TOOLCHAIN}" rustc --version 2>/dev/null)"; then
+      echo "Rust ${RUST_TOOLCHAIN} is required through rustup" >&2
+      failed=1
+    elif [[ "$(printf '%s\n' "${actual_rust}" | awk '{print $2}')" != "${RUST_TOOLCHAIN}" ]]; then
+      echo "Rust ${RUST_TOOLCHAIN} is required; found ${actual_rust}" >&2
+      failed=1
+    fi
     actual_zig="$(env PATH="${CROSS_TOOL_PATH}" zig version)"
     actual_zigbuild="$(
       env PATH="${CROSS_TOOL_PATH}" cargo-zigbuild --version | awk '{print $2}'
@@ -195,6 +215,8 @@ check_prerequisites
 mkdir -p "${ROOT}/.steward-run"
 RUN_DIR="$(mktemp -d "${ROOT}/.steward-run/openshell-supervisor-build.XXXXXX")"
 SOURCE_DIR="${RUN_DIR}/OpenShell"
+SUPERVISOR_CARGO_HOME="${RUN_DIR}/cargo-home"
+SUPERVISOR_TARGET_DIR="${RUN_DIR}/cargo-target"
 
 cleanup() {
   if [[ "${STEWARD_DEV_KEEP:-0}" == "1" ]]; then
@@ -229,20 +251,29 @@ git -C "${SOURCE_DIR}" apply --reverse --check "${PATCH_PATH}"
 architecture="$(docker_architecture)"
 rust_target="$(rust_target_for_architecture "${architecture}")"
 stage="${SOURCE_DIR}/deploy/docker/.build/prebuilt-binaries/${architecture}"
-binary="${SOURCE_DIR}/target/${rust_target}/release/openshell-sandbox"
+binary="${SUPERVISOR_TARGET_DIR}/${rust_target}/release/openshell-sandbox"
+upstream_dockerfile="${SOURCE_DIR}/deploy/docker/Dockerfile.supervisor"
+pinned_dockerfile="${RUN_DIR}/Dockerfile.supervisor.pinned"
 
 (
   cd "${SOURCE_DIR}"
   export PATH="${CROSS_TOOL_PATH}"
+  unset RUSTUP_TOOLCHAIN RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+  unset RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTDOCFLAGS RUSTC_BOOTSTRAP
+  unset CARGO_BUILD_RUSTC CARGO_BUILD_RUSTFLAGS CARGO_BUILD_TARGET_DIR
+  unset CARGO_PROFILE_RELEASE_CODEGEN_UNITS CARGO_PROFILE_RELEASE_DEBUG
+  unset CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_OPT_LEVEL
+  unset CARGO_PROFILE_RELEASE_PANIC CARGO_PROFILE_RELEASE_STRIP
   source tasks/scripts/build-env.sh
   ensure_build_nofile_limit
-  rustup target add "${rust_target}"
-  CARGO_INCREMENTAL=0 \
+  rustup target add --toolchain "${RUST_TOOLCHAIN}" "${rust_target}"
+  CARGO_HOME="${SUPERVISOR_CARGO_HOME}" \
+    CARGO_TARGET_DIR="${SUPERVISOR_TARGET_DIR}" \
+    CARGO_INCREMENTAL=0 \
     CARGO_ZIGBUILD_CACHE_DIR="${RUN_DIR}/cargo-zigbuild-cache" \
-    RUSTC_WRAPPER="" \
     ZIG_GLOBAL_CACHE_DIR="${RUN_DIR}/zig-global-cache" \
     ZIG_LOCAL_CACHE_DIR="${RUN_DIR}/zig-local-cache" \
-    cargo zigbuild \
+    cargo +"${RUST_TOOLCHAIN}" zigbuild \
       --locked \
       --release \
       --target "${rust_target}" \
@@ -253,9 +284,36 @@ binary="${SOURCE_DIR}/target/${rust_target}/release/openshell-sandbox"
 mkdir -p "${stage}"
 install -m 0755 "${binary}" "${stage}/openshell-sandbox"
 
+frontend_replacements=0
+base_replacements=0
+package_replacements=0
+while IFS= read -r line; do
+  case "${line}" in
+    "# syntax=docker/dockerfile:1.4")
+      echo "# syntax=${DOCKERFILE_FRONTEND_IMAGE}"
+      frontend_replacements=$((frontend_replacements + 1))
+      ;;
+    "FROM alpine:3.22 AS supervisor")
+      echo "FROM ${SUPERVISOR_BASE_IMAGE} AS supervisor"
+      base_replacements=$((base_replacements + 1))
+      ;;
+    "RUN apk add --no-cache nftables iptables iptables-legacy")
+      echo "RUN apk add --no-cache nftables=${NFTABLES_VERSION} iptables=${IPTABLES_VERSION} iptables-legacy=${IPTABLES_LEGACY_VERSION}"
+      package_replacements=$((package_replacements + 1))
+      ;;
+    *)
+      printf '%s\n' "${line}"
+      ;;
+  esac
+done <"${upstream_dockerfile}" >"${pinned_dockerfile}"
+if [[ "${frontend_replacements}" != "1" || "${base_replacements}" != "1" || "${package_replacements}" != "1" ]]; then
+  echo "OpenShell supervisor Dockerfile changed; rebase the pinned runtime inputs" >&2
+  exit 1
+fi
+
 docker buildx build \
   --platform "linux/${architecture}" \
-  --file "${SOURCE_DIR}/deploy/docker/Dockerfile.supervisor" \
+  --file "${pinned_dockerfile}" \
   --target supervisor \
   --tag "${IMAGE}" \
   --label "org.opencontainers.image.revision=${SOURCE_COMMIT}" \

@@ -903,11 +903,60 @@ mod tests {
                 "patch=third_party/openshell-patches/v0.0.90/",
                 "0001-prepare-supervisor-identity-mount-namespace.patch\n",
                 "image=openshell/supervisor:steward-spiffe-v0090\n",
+                "rust=1.95.0\n",
                 "zig=0.14.1\n",
                 "cargo-zigbuild=0.22.3\n",
+                "dockerfile-frontend=docker/dockerfile:1.4@sha256:",
+                "9ba7531bd80fb0a858632727cf7a112fbfd19b17e94c4e84ced81e24ef1a0dbc\n",
+                "supervisor-base=alpine:3.22@sha256:",
+                "14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce\n",
+                "nftables=1.1.3-r0\n",
+                "iptables=1.8.11-r1\n",
+                "iptables-legacy=1.8.11-r1\n",
             ),
             "the carried patch must build from its recorded immutable source and image contract"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_build_isolates_target_and_compiler_environment() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for required in [
+            "SUPERVISOR_TARGET_DIR=\"${RUN_DIR}/cargo-target\"",
+            "binary=\"${SUPERVISOR_TARGET_DIR}/${rust_target}/release/openshell-sandbox\"",
+            "CARGO_TARGET_DIR=\"${SUPERVISOR_TARGET_DIR}\"",
+            "rustup target add --toolchain \"${RUST_TOOLCHAIN}\" \"${rust_target}\"",
+            "cargo +\"${RUST_TOOLCHAIN}\" zigbuild",
+            "unset RUSTUP_TOOLCHAIN RUSTFLAGS CARGO_ENCODED_RUSTFLAGS",
+        ] {
+            assert!(
+                script.contains(required),
+                "the supervisor build must isolate its target directory and compiler environment: missing {required}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_build_pins_runtime_layer_inputs() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for required in [
+            "# syntax=${DOCKERFILE_FRONTEND_IMAGE}",
+            "FROM ${SUPERVISOR_BASE_IMAGE} AS supervisor",
+            "nftables=${NFTABLES_VERSION}",
+            "iptables=${IPTABLES_VERSION}",
+            "iptables-legacy=${IPTABLES_LEGACY_VERSION}",
+        ] {
+            assert!(
+                script.contains(required),
+                "the supervisor runtime layer must be generated from pinned inputs: missing {required}"
+            );
+        }
         Ok(())
     }
 
@@ -940,7 +989,7 @@ esac
         let path = format!("{}:{system_path}", bin.display());
         let script = root().join("scripts/build-patched-openshell-supervisor.sh");
         let current_metadata =
-            "ff87dcd5e9d79fa8f19a9e3b2b3a5f00b251d389c9945276a8ce54ea91c8dcc5|arm64";
+            "f445d04ba50e2d50690b58696fd67111ab36c74060e4229d5e0b7f33e4934d2d|arm64";
         let current = Command::new("bash")
             .arg(&script)
             .arg("--image-is-current")
@@ -958,7 +1007,7 @@ esac
         for stale_metadata in [
             // The digest of the same contract with Zig 0.14.0 instead of 0.14.1.
             "5596bf03048dd0e8c2a62f91a55a21c164deb355e61bef09e701d818852b2a2a|arm64",
-            "ff87dcd5e9d79fa8f19a9e3b2b3a5f00b251d389c9945276a8ce54ea91c8dcc5|amd64",
+            "f445d04ba50e2d50690b58696fd67111ab36c74060e4229d5e0b7f33e4934d2d|amd64",
         ] {
             let stale = Command::new("bash")
                 .arg(&script)
@@ -1000,9 +1049,18 @@ esac
             fs::create_dir(directory)
                 .map_err(|error| format!("failed to create {}: {error}", directory.display()))?;
         }
-        for command in ["cargo", "git", "rustup"] {
+        for command in ["cargo", "git"] {
             write_executable(&ambient_bin.join(command), "#!/bin/sh\nexit 0\n")?;
         }
+        write_executable(
+            &ambient_bin.join("rustup"),
+            r#"#!/bin/sh
+if [ "$1:$2:$3" = "run:1.95.0:rustc" ]; then
+  printf 'rustc 1.95.0 (59807616e 2026-04-14)\n'
+fi
+exit 0
+"#,
+        )?;
         write_executable(
             &ambient_bin.join("docker"),
             r#"#!/bin/sh
@@ -1081,6 +1139,28 @@ esac
         assert!(
             requirement < source_checkout,
             "OpenSSL must be validated before the supervisor source checkout begins"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn s0_e2e_does_not_require_identity_demo_jq() -> Result<(), String> {
+        let script_path = root().join("scripts/s0-0-openshell-spike.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        assert!(
+            script.contains("for command in kind kubectl helm cargo curl openssl sed tar;"),
+            "the common S0 prerequisite set must not include identity-demo-only jq"
+        );
+        let identity_branch = script
+            .find("elif [[ \"$#\" -eq 0 ]]; then")
+            .ok_or_else(|| "the spike must retain a dedicated identity-demo branch".to_owned())?;
+        let jq_requirement = script
+            .find("required command is missing: jq")
+            .ok_or_else(|| "the identity-demo branch must still require jq".to_owned())?;
+        assert!(
+            jq_requirement > identity_branch,
+            "jq must be required only after selecting the identity-demo branch"
         );
         Ok(())
     }
