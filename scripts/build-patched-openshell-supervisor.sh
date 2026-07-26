@@ -13,9 +13,37 @@ ZIG_VERSION="0.14.1"
 CARGO_ZIGBUILD_VERSION="0.22.3"
 DOCKERFILE_FRONTEND_IMAGE="docker/dockerfile:1.4@sha256:9ba7531bd80fb0a858632727cf7a112fbfd19b17e94c4e84ced81e24ef1a0dbc"
 SUPERVISOR_BASE_IMAGE="alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce"
-NFTABLES_VERSION="1.1.3-r0"
-IPTABLES_VERSION="1.8.11-r1"
-IPTABLES_LEGACY_VERSION="1.8.11-r1"
+APK_PACKAGE_CLOSURE=(
+  "alpine-baselayout=3.7.0-r0"
+  "alpine-baselayout-data=3.7.0-r0"
+  "alpine-keys=2.5-r0"
+  "alpine-release=3.22.5-r0"
+  "apk-tools=2.14.10-r0"
+  "busybox=1.37.0-r20"
+  "busybox-binsh=1.37.0-r20"
+  "ca-certificates-bundle=20260611-r0"
+  "gmp=6.3.0-r3"
+  "iptables=1.8.11-r1"
+  "iptables-legacy=1.8.11-r1"
+  "jansson=2.14.1-r0"
+  "libapk2=2.14.10-r0"
+  "libcrypto3=3.5.7-r0"
+  "libip4tc=1.8.11-r1"
+  "libip6tc=1.8.11-r1"
+  "libmnl=1.0.5-r2"
+  "libncursesw=6.5_p20250503-r0"
+  "libnftnl=1.2.9-r0"
+  "libssl3=3.5.7-r0"
+  "libxtables=1.8.11-r1"
+  "musl=1.2.5-r12"
+  "musl-utils=1.2.5-r12"
+  "ncurses-terminfo-base=6.5_p20250503-r0"
+  "nftables=1.1.3-r0"
+  "readline=8.2.13-r1"
+  "scanelf=1.3.8-r1"
+  "ssl_client=1.37.0-r20"
+  "zlib=1.3.2-r0"
+)
 CROSS_TOOL_PATH=""
 
 print_contract() {
@@ -29,9 +57,8 @@ print_contract() {
     "cargo-zigbuild=${CARGO_ZIGBUILD_VERSION}" \
     "dockerfile-frontend=${DOCKERFILE_FRONTEND_IMAGE}" \
     "supervisor-base=${SUPERVISOR_BASE_IMAGE}" \
-    "nftables=${NFTABLES_VERSION}" \
-    "iptables=${IPTABLES_VERSION}" \
-    "iptables-legacy=${IPTABLES_LEGACY_VERSION}"
+    "apk-packages=${APK_PACKAGE_CLOSURE[*]}" \
+    "build-script-sha256=$(build_script_sha256)"
 }
 
 require_command() {
@@ -42,11 +69,33 @@ require_command() {
   fi
 }
 
-scrub_cargo_target_compiler_overrides() {
+scrub_ambient_compiler_overrides() {
   local variable_name=""
   while IFS= read -r variable_name; do
     case "${variable_name}" in
-      CARGO_TARGET_*)
+      RUSTUP_TOOLCHAIN | \
+        RUSTFLAGS | \
+        RUSTDOCFLAGS | \
+        RUSTC | \
+        RUSTC_WRAPPER | \
+        RUSTC_WORKSPACE_WRAPPER | \
+        RUSTC_BOOTSTRAP | \
+        CARGO_ENCODED_RUSTFLAGS | \
+        CARGO_BUILD_* | CARGO_PROFILE_* | CARGO_TARGET_* | \
+        CC | CC_* | *_CC | \
+        CXX | CXX_* | *_CXX | \
+        CPP | CPP_* | *_CPP | \
+        AR | AR_* | *_AR | \
+        RANLIB | RANLIB_* | *_RANLIB | \
+        CFLAGS | CFLAGS_* | *_CFLAGS | \
+        CXXFLAGS | CXXFLAGS_* | *_CXXFLAGS | \
+        CPPFLAGS | CPPFLAGS_* | *_CPPFLAGS | \
+        LDFLAGS | LDFLAGS_* | *_LDFLAGS | \
+        BINDGEN_EXTRA_CLANG_ARGS | BINDGEN_EXTRA_CLANG_ARGS_* | \
+        CMAKE_* | PKG_CONFIG_* | \
+        SDKROOT | *_DEPLOYMENT_TARGET | \
+        CPATH | C_INCLUDE_PATH | CPLUS_INCLUDE_PATH | OBJC_INCLUDE_PATH | \
+        SOURCE_DATE_EPOCH)
         unset "${variable_name}"
         ;;
     esac
@@ -123,6 +172,10 @@ check_prerequisites() {
 
 patch_sha256() {
   openssl dgst -sha256 -r "${PATCH_PATH}" | awk '{print $1}'
+}
+
+build_script_sha256() {
+  openssl dgst -sha256 -r "${BASH_SOURCE[0]}" | awk '{print $1}'
 }
 
 build_contract_sha256() {
@@ -245,6 +298,12 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+scrub_ambient_compiler_overrides
+
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
+
 git init --quiet "${SOURCE_DIR}"
 git -C "${SOURCE_DIR}" remote add origin "${SOURCE_URL}"
 git -C "${SOURCE_DIR}" fetch --quiet --depth=1 origin "${SOURCE_COMMIT}"
@@ -268,19 +327,20 @@ binary="${SUPERVISOR_TARGET_DIR}/${rust_target}/release/openshell-sandbox"
 upstream_dockerfile="${SOURCE_DIR}/deploy/docker/Dockerfile.supervisor"
 pinned_dockerfile="${RUN_DIR}/Dockerfile.supervisor.pinned"
 
+install -d -m 0700 "${SUPERVISOR_CARGO_HOME}"
+install \
+  -m 0644 \
+  "${SOURCE_DIR}/.cargo/config.toml" \
+  "${SUPERVISOR_CARGO_HOME}/config.toml"
+
 (
   cd "${SOURCE_DIR}"
   export PATH="${CROSS_TOOL_PATH}"
-  unset RUSTUP_TOOLCHAIN RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
-  unset RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTDOCFLAGS RUSTC_BOOTSTRAP
-  unset CARGO_BUILD_RUSTC CARGO_BUILD_RUSTFLAGS CARGO_BUILD_TARGET_DIR
-  unset CARGO_PROFILE_RELEASE_CODEGEN_UNITS CARGO_PROFILE_RELEASE_DEBUG
-  unset CARGO_PROFILE_RELEASE_LTO CARGO_PROFILE_RELEASE_OPT_LEVEL
-  unset CARGO_PROFILE_RELEASE_PANIC CARGO_PROFILE_RELEASE_STRIP
-  scrub_cargo_target_compiler_overrides
+  scrub_ambient_compiler_overrides
   source tasks/scripts/build-env.sh
   ensure_build_nofile_limit
   rustup target add --toolchain "${RUST_TOOLCHAIN}" "${rust_target}"
+  cd /
   CARGO_HOME="${SUPERVISOR_CARGO_HOME}" \
     CARGO_TARGET_DIR="${SUPERVISOR_TARGET_DIR}" \
     CARGO_INCREMENTAL=0 \
@@ -291,6 +351,7 @@ pinned_dockerfile="${RUN_DIR}/Dockerfile.supervisor.pinned"
       --locked \
       --release \
       --target "${rust_target}" \
+      --manifest-path "${SOURCE_DIR}/Cargo.toml" \
       -p openshell-sandbox \
       --bin openshell-sandbox
 )
@@ -312,7 +373,7 @@ while IFS= read -r line; do
       base_replacements=$((base_replacements + 1))
       ;;
     "RUN apk add --no-cache nftables iptables iptables-legacy")
-      echo "RUN apk add --no-cache nftables=${NFTABLES_VERSION} iptables=${IPTABLES_VERSION} iptables-legacy=${IPTABLES_LEGACY_VERSION}"
+      echo "RUN apk add --no-cache ${APK_PACKAGE_CLOSURE[*]}"
       package_replacements=$((package_replacements + 1))
       ;;
     *)

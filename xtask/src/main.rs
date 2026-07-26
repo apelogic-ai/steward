@@ -910,9 +910,21 @@ mod tests {
                 "9ba7531bd80fb0a858632727cf7a112fbfd19b17e94c4e84ced81e24ef1a0dbc\n",
                 "supervisor-base=alpine:3.22@sha256:",
                 "14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce\n",
-                "nftables=1.1.3-r0\n",
-                "iptables=1.8.11-r1\n",
-                "iptables-legacy=1.8.11-r1\n",
+                "apk-packages=alpine-baselayout=3.7.0-r0 ",
+                "alpine-baselayout-data=3.7.0-r0 alpine-keys=2.5-r0 ",
+                "alpine-release=3.22.5-r0 apk-tools=2.14.10-r0 ",
+                "busybox=1.37.0-r20 busybox-binsh=1.37.0-r20 ",
+                "ca-certificates-bundle=20260611-r0 gmp=6.3.0-r3 ",
+                "iptables=1.8.11-r1 iptables-legacy=1.8.11-r1 ",
+                "jansson=2.14.1-r0 libapk2=2.14.10-r0 libcrypto3=3.5.7-r0 ",
+                "libip4tc=1.8.11-r1 libip6tc=1.8.11-r1 libmnl=1.0.5-r2 ",
+                "libncursesw=6.5_p20250503-r0 libnftnl=1.2.9-r0 ",
+                "libssl3=3.5.7-r0 libxtables=1.8.11-r1 musl=1.2.5-r12 ",
+                "musl-utils=1.2.5-r12 ncurses-terminfo-base=6.5_p20250503-r0 ",
+                "nftables=1.1.3-r0 readline=8.2.13-r1 scanelf=1.3.8-r1 ",
+                "ssl_client=1.37.0-r20 zlib=1.3.2-r0\n",
+                "build-script-sha256=",
+                "6b07e67b3a15955220f2c66431435fb50de0101dd7edb72ba83e983c82fe1f0e\n",
             ),
             "the carried patch must build from its recorded immutable source and image contract"
         );
@@ -930,7 +942,7 @@ mod tests {
             "CARGO_TARGET_DIR=\"${SUPERVISOR_TARGET_DIR}\"",
             "rustup target add --toolchain \"${RUST_TOOLCHAIN}\" \"${rust_target}\"",
             "cargo +\"${RUST_TOOLCHAIN}\" zigbuild",
-            "unset RUSTUP_TOOLCHAIN RUSTFLAGS CARGO_ENCODED_RUSTFLAGS",
+            "scrub_ambient_compiler_overrides",
         ] {
             assert!(
                 script.contains(required),
@@ -946,8 +958,12 @@ mod tests {
         let script = fs::read_to_string(&script_path)
             .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
         for required in [
-            "scrub_cargo_target_compiler_overrides()",
-            "CARGO_TARGET_*)",
+            "scrub_ambient_compiler_overrides()",
+            "CARGO_TARGET_*",
+            "CARGO_BUILD_* | CARGO_PROFILE_*",
+            "CC | CC_* | *_CC",
+            "CFLAGS | CFLAGS_* | *_CFLAGS",
+            "SOURCE_DATE_EPOCH",
             "unset \"${variable_name}\"",
         ] {
             assert!(
@@ -955,6 +971,106 @@ mod tests {
                 "the supervisor build must remove target-specific ambient compiler inputs: missing {required}"
             );
         }
+        let scrub = script
+            .find("\nscrub_ambient_compiler_overrides\n")
+            .ok_or_else(|| "the build must scrub its parent environment".to_owned())?;
+        let source_checkout = script
+            .find("git init --quiet")
+            .ok_or_else(|| "the build must retain its pinned source checkout".to_owned())?;
+        let image_build = script
+            .find("docker buildx build")
+            .ok_or_else(|| "the build must retain its pinned image packaging".to_owned())?;
+        assert!(
+            scrub < source_checkout && scrub < image_build,
+            "ambient compiler inputs must be scrubbed in the parent before both compilation and image packaging"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_cache_key_includes_its_build_implementation() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for required in [
+            "build_script_sha256()",
+            "\"build-script-sha256=$(build_script_sha256)\"",
+        ] {
+            assert!(
+                script.contains(required),
+                "the reusable supervisor image must be invalidated by build-logic changes: missing {required}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_build_isolates_git_and_cargo_config_discovery() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for required in [
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GIT_CONFIG_SYSTEM=/dev/null",
+            "GIT_CONFIG_NOSYSTEM=1",
+            "\"${SOURCE_DIR}/.cargo/config.toml\"",
+            "\"${SUPERVISOR_CARGO_HOME}/config.toml\"",
+            "cd /",
+            "--manifest-path \"${SOURCE_DIR}/Cargo.toml\"",
+        ] {
+            assert!(
+                script.contains(required),
+                "the supervisor build must isolate ambient Git and Cargo config while retaining the pinned upstream config: missing {required}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_runtime_locks_the_complete_apk_closure() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for package in [
+            "alpine-baselayout=3.7.0-r0",
+            "alpine-baselayout-data=3.7.0-r0",
+            "alpine-keys=2.5-r0",
+            "alpine-release=3.22.5-r0",
+            "apk-tools=2.14.10-r0",
+            "busybox=1.37.0-r20",
+            "busybox-binsh=1.37.0-r20",
+            "ca-certificates-bundle=20260611-r0",
+            "gmp=6.3.0-r3",
+            "iptables=1.8.11-r1",
+            "iptables-legacy=1.8.11-r1",
+            "jansson=2.14.1-r0",
+            "libapk2=2.14.10-r0",
+            "libcrypto3=3.5.7-r0",
+            "libip4tc=1.8.11-r1",
+            "libip6tc=1.8.11-r1",
+            "libmnl=1.0.5-r2",
+            "libncursesw=6.5_p20250503-r0",
+            "libnftnl=1.2.9-r0",
+            "libssl3=3.5.7-r0",
+            "libxtables=1.8.11-r1",
+            "musl=1.2.5-r12",
+            "musl-utils=1.2.5-r12",
+            "ncurses-terminfo-base=6.5_p20250503-r0",
+            "nftables=1.1.3-r0",
+            "readline=8.2.13-r1",
+            "scanelf=1.3.8-r1",
+            "ssl_client=1.37.0-r20",
+            "zlib=1.3.2-r0",
+        ] {
+            assert!(
+                script.contains(package),
+                "the pinned supervisor runtime package closure is incomplete: missing {package}"
+            );
+        }
+        assert!(
+            script.contains("apk add --no-cache ${APK_PACKAGE_CLOSURE[*]}"),
+            "the generated runtime image must install the single locked package closure"
+        );
         Ok(())
     }
 
@@ -988,9 +1104,7 @@ mod tests {
         for required in [
             "# syntax=${DOCKERFILE_FRONTEND_IMAGE}",
             "FROM ${SUPERVISOR_BASE_IMAGE} AS supervisor",
-            "nftables=${NFTABLES_VERSION}",
-            "iptables=${IPTABLES_VERSION}",
-            "iptables-legacy=${IPTABLES_LEGACY_VERSION}",
+            "apk add --no-cache ${APK_PACKAGE_CLOSURE[*]}",
         ] {
             assert!(
                 script.contains(required),
@@ -1029,7 +1143,7 @@ esac
         let path = format!("{}:{system_path}", bin.display());
         let script = root().join("scripts/build-patched-openshell-supervisor.sh");
         let current_metadata =
-            "f445d04ba50e2d50690b58696fd67111ab36c74060e4229d5e0b7f33e4934d2d|arm64";
+            "3e3bdd9208defcce1485d7a673c997975d4becbde82b5b1691ce0b1a8b35cc6a|arm64";
         let current = Command::new("bash")
             .arg(&script)
             .arg("--image-is-current")
@@ -1045,9 +1159,9 @@ esac
         );
 
         for stale_metadata in [
-            // The digest of the same contract with Zig 0.14.0 instead of 0.14.1.
-            "5596bf03048dd0e8c2a62f91a55a21c164deb355e61bef09e701d818852b2a2a|arm64",
-            "f445d04ba50e2d50690b58696fd67111ab36c74060e4229d5e0b7f33e4934d2d|amd64",
+            // The prior build logic and partial APK closure must not be reusable.
+            "f445d04ba50e2d50690b58696fd67111ab36c74060e4229d5e0b7f33e4934d2d|arm64",
+            "3e3bdd9208defcce1485d7a673c997975d4becbde82b5b1691ce0b1a8b35cc6a|amd64",
         ] {
             let stale = Command::new("bash")
                 .arg(&script)
