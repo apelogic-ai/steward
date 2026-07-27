@@ -77,7 +77,7 @@ wrappers = ["steward-adapter-jira"]
 
 [[bans.deny]]
 name = "spiffe"
-wrappers = ["steward-adapter-spire", "steward-mint"]
+wrappers = ["steward-adapter-spire"]
 
 # OPA is reached over HTTP by the adapter only; no core crate builds bundles.
 [[bans.deny]]

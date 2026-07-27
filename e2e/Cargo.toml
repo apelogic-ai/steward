@@ -13,6 +13,10 @@ name = "s0"
 path = "s0.rs"
 
 [[test]]
+name = "s1"
+path = "s1.rs"
+
+[[test]]
 name = "s3_store"
 path = "s3_store.rs"
 

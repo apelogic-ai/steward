@@ -5,13 +5,23 @@ use std::collections::HashMap;
 #[cfg(feature = "runtime")]
 use std::future::Future;
 
+#[cfg(feature = "identity")]
+use kube::Client;
+#[cfg(feature = "identity")]
+use kube::api::{Api, ListParams};
+#[cfg(feature = "identity")]
+use kube::core::DynamicObject;
+#[cfg(feature = "identity")]
+use kube::discovery::Discovery;
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
     ClientConfig, OpenShellClient, SandboxPhase, SandboxSpec, SdkError, WorkspaceScopedClient,
 };
 use sha2::{Digest, Sha256};
 #[cfg(feature = "runtime")]
-use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
+use steward_ports::PortError;
+#[cfg(feature = "runtime")]
+use steward_ports::{SandboxObservation, SandboxRequest, SandboxRuntime};
 #[cfg(feature = "runtime")]
 use steward_types::RuntimeRefs;
 
@@ -23,6 +33,151 @@ const LOWER_BASE36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 const BASE_SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e";
 #[cfg(feature = "runtime")]
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
+#[cfg(feature = "runtime")]
+const TOOL_PROVIDER: &str = "steward-mcp-gw";
+#[cfg(feature = "identity")]
+const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
+#[cfg(feature = "identity")]
+const SANDBOX_NAME_ANNOTATION: &str = "openshell.ai/sandbox-name";
+#[cfg(feature = "identity")]
+const SANDBOX_WORKSPACE_ANNOTATION: &str = "openshell.ai/sandbox-workspace";
+#[cfg(feature = "identity")]
+const MANAGED_BY_LABEL: &str = "openshell.ai/managed-by";
+#[cfg(feature = "identity")]
+const MANAGED_BY_VALUE: &str = "openshell";
+
+#[cfg(feature = "identity")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SandboxBinding {
+    pub sandbox: String,
+    pub workspace: String,
+}
+
+#[cfg(feature = "identity")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum IdentityResolutionError {
+    Rejected { reason: String },
+    Unavailable { reason: String },
+}
+
+#[cfg(feature = "identity")]
+fn binding_from_sandbox(
+    sandbox_id: &str,
+    object: &DynamicObject,
+) -> Result<SandboxBinding, IdentityResolutionError> {
+    let labels =
+        object
+            .metadata
+            .labels
+            .as_ref()
+            .ok_or_else(|| IdentityResolutionError::Rejected {
+                reason: "OpenShell sandbox identity has no labels".to_owned(),
+            })?;
+    if labels.get(SANDBOX_ID_LABEL).map(String::as_str) != Some(sandbox_id)
+        || labels.get(MANAGED_BY_LABEL).map(String::as_str) != Some(MANAGED_BY_VALUE)
+    {
+        return Err(IdentityResolutionError::Rejected {
+            reason: "OpenShell sandbox identity does not match the live managed object".to_owned(),
+        });
+    }
+    let annotations =
+        object
+            .metadata
+            .annotations
+            .as_ref()
+            .ok_or_else(|| IdentityResolutionError::Rejected {
+                reason: "OpenShell sandbox identity has no annotations".to_owned(),
+            })?;
+    let sandbox = annotations
+        .get(SANDBOX_NAME_ANNOTATION)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| IdentityResolutionError::Rejected {
+            reason: "OpenShell sandbox identity has no immutable sandbox name".to_owned(),
+        })?;
+    let workspace = annotations
+        .get(SANDBOX_WORKSPACE_ANNOTATION)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| IdentityResolutionError::Rejected {
+            reason: "OpenShell sandbox identity has no immutable workspace name".to_owned(),
+        })?;
+    Ok(SandboxBinding { sandbox, workspace })
+}
+
+#[cfg(feature = "identity")]
+#[derive(Clone)]
+pub struct OpenShellIdentityResolver {
+    sandboxes: Api<DynamicObject>,
+    workload_prefix: String,
+}
+
+#[cfg(feature = "identity")]
+impl OpenShellIdentityResolver {
+    pub async fn discover(
+        client: Client,
+        namespace: &str,
+        trust_domain: &str,
+    ) -> Result<Self, IdentityResolutionError> {
+        if namespace.is_empty() || trust_domain.is_empty() {
+            return Err(IdentityResolutionError::Rejected {
+                reason: "OpenShell identity namespace and trust domain are required".to_owned(),
+            });
+        }
+        let discovery = Discovery::new(client.clone())
+            .filter(&["agents.x-k8s.io"])
+            .run()
+            .await
+            .map_err(identity_failure)?;
+        let resource = discovery
+            .get("agents.x-k8s.io")
+            .and_then(|group| group.recommended_kind("Sandbox"))
+            .map(|(resource, _)| resource)
+            .ok_or_else(|| IdentityResolutionError::Unavailable {
+                reason: "Agent Sandbox API is not discoverable".to_owned(),
+            })?;
+        Ok(Self {
+            sandboxes: Api::namespaced_with(client, namespace, &resource),
+            workload_prefix: format!("spiffe://{trust_domain}/openshell/sandbox/"),
+        })
+    }
+
+    pub async fn resolve(
+        &self,
+        workload_id: &str,
+    ) -> Result<SandboxBinding, IdentityResolutionError> {
+        let sandbox_id = workload_id
+            .strip_prefix(&self.workload_prefix)
+            .filter(|value| {
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+            .ok_or_else(|| IdentityResolutionError::Rejected {
+                reason: "workload is outside the configured OpenShell trust domain".to_owned(),
+            })?;
+        let objects = self
+            .sandboxes
+            .list(&ListParams::default().labels(&format!("{SANDBOX_ID_LABEL}={sandbox_id}")))
+            .await
+            .map_err(identity_failure)?;
+        let [object] = objects.items.as_slice() else {
+            return Err(IdentityResolutionError::Rejected {
+                reason: "workload must resolve to exactly one live OpenShell sandbox".to_owned(),
+            });
+        };
+        binding_from_sandbox(sandbox_id, object)
+    }
+}
+
+#[cfg(feature = "identity")]
+fn identity_failure(error: kube::Error) -> IdentityResolutionError {
+    IdentityResolutionError::Unavailable {
+        reason: format!("OpenShell identity lookup failed: {error}"),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NameKind {
@@ -61,6 +216,7 @@ struct OpenShellProjection {
     workspace_key: String,
     sandbox: String,
     image: &'static str,
+    providers: Vec<String>,
     runtime_uid: String,
 }
 
@@ -88,6 +244,10 @@ fn project_request(request: &SandboxRequest) -> Result<OpenShellProjection, Port
         workspace_key: request.workspace_key.clone(),
         sandbox: stable_name(NameKind::Sandbox, request.runtime.0.as_bytes()),
         image,
+        providers: (!request.tools.is_empty())
+            .then(|| TOOL_PROVIDER.to_owned())
+            .into_iter()
+            .collect(),
         runtime_uid: request.runtime.0.clone(),
     })
 }
@@ -208,6 +368,7 @@ impl SandboxRuntime for OpenShellRuntime {
                         name: Some(projection.sandbox.clone()),
                         image: Some(projection.image.to_owned()),
                         labels,
+                        providers: projection.providers.clone(),
                         ..SandboxSpec::default()
                     })
                     .await
@@ -265,6 +426,8 @@ fn port_failure(error: SdkError) -> PortError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "identity")]
+    use std::collections::BTreeMap;
     #[cfg(feature = "runtime")]
     use std::collections::HashMap;
     #[cfg(feature = "runtime")]
@@ -276,9 +439,13 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     use steward_ports::PortError;
+    #[cfg(feature = "runtime")]
     use steward_ports::SandboxRequest;
-    use steward_types::{AgentType, RuntimeId};
+    #[cfg(feature = "runtime")]
+    use steward_types::{AgentType, RuntimeId, ToolGrant};
 
+    #[cfg(feature = "identity")]
+    use super::{IdentityResolutionError, SANDBOX_ID_LABEL, binding_from_sandbox};
     use super::{NameKind, stable_name};
     #[cfg(feature = "runtime")]
     use super::{SandboxDeleteClient, delete_owned_sandbox, project_request};
@@ -337,6 +504,57 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "identity")]
+    #[test]
+    fn identity_binding_rejects_a_reused_name_with_a_different_sandbox_id() {
+        let resource = kube::core::ApiResource::from_gvk(&kube::core::GroupVersionKind::gvk(
+            "agents.x-k8s.io",
+            "v1alpha1",
+            "Sandbox",
+        ));
+        let mut object = kube::core::DynamicObject::new("workspace--sandbox", &resource);
+        object.metadata.labels = Some(BTreeMap::from([(
+            SANDBOX_ID_LABEL.to_owned(),
+            "sandbox-id-b".to_owned(),
+        )]));
+
+        let result = binding_from_sandbox("sandbox-id-a", &object);
+
+        assert!(
+            matches!(result, Err(IdentityResolutionError::Rejected { .. })),
+            "the SVID sandbox UUID must match the live OpenShell object; got {result:?}"
+        );
+    }
+
+    #[cfg(feature = "identity")]
+    #[test]
+    fn identity_binding_resolves_the_exact_live_sandbox() -> Result<(), String> {
+        let resource = kube::core::ApiResource::from_gvk(&kube::core::GroupVersionKind::gvk(
+            "agents.x-k8s.io",
+            "v1alpha1",
+            "Sandbox",
+        ));
+        let mut object = kube::core::DynamicObject::new("workspace--sandbox", &resource);
+        object.metadata.labels = Some(BTreeMap::from([
+            (SANDBOX_ID_LABEL.to_owned(), "sandbox-id-a".to_owned()),
+            ("openshell.ai/managed-by".to_owned(), "openshell".to_owned()),
+        ]));
+        object.metadata.annotations = Some(BTreeMap::from([
+            ("openshell.ai/sandbox-name".to_owned(), "sandbox".to_owned()),
+            (
+                "openshell.ai/sandbox-workspace".to_owned(),
+                "workspace".to_owned(),
+            ),
+        ]));
+
+        let binding = binding_from_sandbox("sandbox-id-a", &object)
+            .map_err(|error| format!("exact sandbox binding was rejected: {error:?}"))?;
+
+        assert_eq!(binding.sandbox, "sandbox");
+        assert_eq!(binding.workspace, "workspace");
+        Ok(())
+    }
+
     #[cfg(feature = "runtime")]
     #[test]
     fn runtime_projection_is_stable_and_uid_bound() -> Result<(), String> {
@@ -346,6 +564,7 @@ mod tests {
             agent_type: AgentType {
                 name: "base".to_owned(),
             },
+            tools: Vec::new(),
         })
         .map_err(|error| format!("runtime projection failed: {error:?}"))?;
 
@@ -357,6 +576,31 @@ mod tests {
             "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e"
         );
         assert_eq!(projection.runtime_uid, "runtime-uid-a");
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn tool_authority_attaches_only_the_steward_gateway_provider() -> Result<(), String> {
+        let projection = project_request(&SandboxRequest {
+            runtime: RuntimeId("runtime-uid-a".to_owned()),
+            workspace_key: "team-a".to_owned(),
+            agent_type: AgentType {
+                name: "base".to_owned(),
+            },
+            tools: vec![ToolGrant {
+                provider: "github".to_owned(),
+                resource: "search_repositories".to_owned(),
+                action: "read".to_owned(),
+            }],
+        })
+        .map_err(|error| format!("runtime projection failed: {error:?}"))?;
+
+        assert_eq!(
+            projection.providers,
+            ["steward-mcp-gw"],
+            "a tool-bearing runtime must use the token-grant provider and no ambient provider"
+        );
         Ok(())
     }
 

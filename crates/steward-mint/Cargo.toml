@@ -14,7 +14,7 @@ jwt-compact.workspace = true # Produces type-safe EdDSA JWTs and public JWK mate
 serde.workspace = true # Defines the versioned claim and exchange wire contracts.
 serde_json.workspace = true # Renders the public JWKS response without exposing key material.
 sha2.workspace = true # Derives a stable RFC 7638 key identifier from the public JWK.
-spiffe.workspace = true # Delegates JWT-SVID verification to the local SPIRE Workload API.
+steward-ports = { path = "../steward-ports", version = "=0.0.0" } # Validates opaque workload assertions through the vendor-neutral identity port.
 steward-types = { path = "../steward-types", version = "=0.0.0" } # Reuses Principal, RuntimeId, and ToolGrant as the mint authority input.
 uuid.workspace = true # Gives every HOP-1 token a collision-resistant jti.
 

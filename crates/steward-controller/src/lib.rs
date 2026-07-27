@@ -102,6 +102,7 @@ pub async fn reconcile_once<R: SandboxRuntime>(
         runtime: runtime_id,
         workspace_key,
         agent_type: runtime.spec.agent_type.clone(),
+        tools: runtime.spec.tools.clone(),
     };
 
     let observation = match intent {

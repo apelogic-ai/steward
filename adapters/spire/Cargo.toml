@@ -7,7 +7,9 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+spiffe.workspace = true # Delegates JWT-SVID verification to the local SPIRE Workload API.
 steward-ports = { path = "../../crates/steward-ports", version = "=0.0.0" }
+tonic.workspace = true # Distinguishes invalid SPIRE gRPC assertions from validator outages.
 
 [lints]
 workspace = true

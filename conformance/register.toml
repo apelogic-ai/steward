@@ -27,7 +27,7 @@ pinned_openshell = "v0.0.90"
 pinned_openshell_commit = "1d4ac708f1d2a9ab94204cdce6ca0eee7e792839"
 pinned_agent_sandbox = "v0.5.0"
 pinned_base_sandbox_image = "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e"
-pinned_mcp_gw = "v0.2.0"
+pinned_mcp_gw = "c2af10d9c3dee898e368e6cf3d0f5a1ef6ad0dde + apelogic-ai/mcp-gw#16@34acece3eb59c69d9725d3aa16fadf6b7d072df0"
 pinned_spire = "1.15.2"
 pinned_litellm = "1.93.0"
 
@@ -46,19 +46,15 @@ restructure; verify the property, not the mechanism."""
 [[guarantee]]
 id = "G-2"
 module = "g2_credential_isolation"
-claim = "not-yet"
-gaps = [
-  "Stock OpenShell v0.0.90 fails before readiness because the supervisor identity mount namespace is not prepared; the carried patch restores per-sandbox JWT-SVID acquisition.",
-  "Steward's SVID → HOP-1 exchange and mcp-gw credential boundary are not implemented.",
-]
+claim = "holds"
 sells = "An agent cannot obtain another user's credentials"
-mechanism = "Patched per-sandbox SPIFFE identity and token-grant exchange are live; Steward's SVID → HOP-1 exchange remains unimplemented"
+mechanism = "Patched per-sandbox SPIFFE identity; Steward SVID → runtime-bound HOP-1 exchange; mcp-gw introspection and verified-claim OPA policy before credential resolution"
 watch = """
 The downstream patch exits when a fail-closed supervisor-identity fix merges; \
 track focused closed attempt #2012 and broader open attempt #2184. \
-#1970 may replace the SVID→HOP-1 leg entirely. Also: the verifier passes no \
-`algorithms` allowlist to `jwtVerify`, so algorithm restriction is implicit in JWKS key \
-resolution — a holds_ test must cover an out-of-profile algorithm being rejected."""
+#1970 may replace the SVID→HOP-1 leg entirely. The mcp-gw policy-input patch exits \
+when apelogic-ai/mcp-gw#16, or an equivalent verified-claims interface, lands in the \
+pinned release. The S1 negative path covers an out-of-profile JWT algorithm."""
 
 [[guarantee]]
 id = "G-3"

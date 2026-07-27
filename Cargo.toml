@@ -11,6 +11,7 @@ members = [
     "adapters/spire",
     "bins/steward-controller",
     "bins/steward-apiserver",
+    "bins/steward-mint",
     "crates/steward-admission",
     "crates/steward-apiserver",
     "crates/steward-controller",
@@ -49,6 +50,8 @@ sqlx = { version = "0.8", default-features = false, features = ["json", "macros"
 tokio = { version = "1.43", features = ["macros", "net", "rt-multi-thread"] }
 # Production admission endpoints terminate Kubernetes-compatible TLS.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# The SPIRE adapter classifies gRPC credential failures separately from service outages.
+tonic = "0.14.6"
 tower = { version = "0.5", features = ["util"] }
 utoipa = "5"
 uuid = { version = "1", features = ["serde", "v4"] }

@@ -5,7 +5,8 @@ use std::sync::Mutex;
 use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, GitHostingPlane,
     InferenceCapabilities, InferencePlane, Notification, NotificationSink, PolicySink, PortError,
-    SessionEvent, SessionRelay, StreamGranularity, ToolCapabilities, ToolPlane, WorkloadIdentity,
+    SessionEvent, SessionRelay, StreamGranularity, SvidAssertion, SvidValidationError,
+    ToolCapabilities, ToolPlane, ValidatedWorkload, WorkloadIdentity,
 };
 use steward_types::RuntimeId;
 
@@ -102,13 +103,14 @@ impl SessionRelay for FakeAdapter {
 }
 
 impl WorkloadIdentity for FakeAdapter {
-    fn attest(&mut self, runtime: &RuntimeId) -> Result<String, PortError> {
-        Ok(format!("spiffe://steward.test/runtime/{}", runtime.0))
-    }
-
-    fn revoke(&mut self, runtime: &RuntimeId) -> Result<(), PortError> {
-        self.revoked_runtimes.push(runtime.clone());
-        Ok(())
+    async fn validate(
+        &self,
+        _audience: &str,
+        _assertion: &SvidAssertion,
+    ) -> Result<ValidatedWorkload, SvidValidationError> {
+        Ok(ValidatedWorkload {
+            spiffe_id: "spiffe://steward.test/runtime/runtime-a".to_owned(),
+        })
     }
 }
 

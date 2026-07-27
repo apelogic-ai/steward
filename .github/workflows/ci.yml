@@ -19,6 +19,8 @@ env:
   KIND_VERSION: "0.31.0"
   KUBECTL_VERSION: "1.32.1"
   OPA_VERSION: "1.18.2"
+  ZIG_VERSION: "0.14.1"
+  CARGO_ZIGBUILD_VERSION: "0.22.3"
 
 jobs:
   pinned:
@@ -98,6 +100,29 @@ jobs:
 
           echo "${tools_dir}" >> "${GITHUB_PATH}"
 
+      - name: Install pinned S1 supervisor build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools_dir="${RUNNER_TEMP}/steward-tools"
+          zig_asset="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          zig_url="https://ziglang.org/download/${ZIG_VERSION}/${zig_asset}"
+          curl --fail --location --silent --show-error \
+            --output "${tools_dir}/${zig_asset}" "${zig_url}"
+          echo "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c  ${tools_dir}/${zig_asset}" \
+            | sha256sum --check -
+          tar --extract --xz \
+            --file "${tools_dir}/${zig_asset}" --directory "${tools_dir}"
+          zig_dir="${tools_dir}/zig-x86_64-linux-${ZIG_VERSION}"
+          chmod +x "${zig_dir}/zig"
+          echo "${zig_dir}" >> "${GITHUB_PATH}"
+
+          cargo install cargo-zigbuild \
+            --locked \
+            --version "${CARGO_ZIGBUILD_VERSION}" \
+            --root "${tools_dir}/cargo-zigbuild"
+          echo "${tools_dir}/cargo-zigbuild/bin" >> "${GITHUB_PATH}"
+
       - name: Run pinned gate
         env:
           STEWARD_MIGRATION_BASE: ${{ github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || github.sha }}
@@ -105,6 +130,9 @@ jobs:
 
       - name: Run S0 exit criterion
         run: cargo xtask e2e-s0
+
+      - name: Run S1 exit criterion
+        run: cargo xtask e2e-s1
 
       - name: Run S3 exit criterion
         run: cargo xtask e2e-s3

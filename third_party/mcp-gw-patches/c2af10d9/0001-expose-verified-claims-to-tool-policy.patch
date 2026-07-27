@@ -1,0 +1,136 @@
+diff --git a/servers/github-mcp/wrapper/src/proxy.test.ts b/servers/github-mcp/wrapper/src/proxy.test.ts
+index 493e22b..aa621dd 100644
+--- a/servers/github-mcp/wrapper/src/proxy.test.ts
++++ b/servers/github-mcp/wrapper/src/proxy.test.ts
+@@ -470,9 +470,26 @@ describe("GitHub MCP proxy wrapper", () => {
+   test("denies tool calls before resolving GitHub credentials when policy rejects them", async () => {
+     const policyInputs: ToolPolicyInput[] = [];
+     const audit = new InMemoryAuditSink();
++    const identityWithAuthority = {
++      ...identity,
++      claims: {
++        steward: {
++          acting_as: "user",
++          runtime_uid: "runtime-uid-a",
++          tools: [
++            {
++              provider: "github",
++              resource: "github_create_issue",
++              action: "write",
++            },
++          ],
++          version: 1,
++        },
++      },
++    };
+     const handler = createGithubMcpProxyHandler({
+       upstreamUrl: "http://github-mcp:8082/mcp",
+-      authenticate: () => Promise.resolve(identity),
++      authenticate: () => Promise.resolve(identityWithAuthority),
+       resolveGithubToken: () => Promise.reject(new Error("should not resolve token")),
+       githubScopes: ["repo"],
+       audit,
+@@ -515,6 +532,11 @@ describe("GitHub MCP proxy wrapper", () => {
+     expect(policyInputs).toEqual([
+       {
+         principal: "user@example.com",
++        tokenClaims: {
++          ...identityWithAuthority.claims,
++          email: "user@example.com",
++          sub: "user-123",
++        },
+         tool: "github_create_issue",
+         service: "github",
+         actionClass: "write",
+diff --git a/servers/github-mcp/wrapper/src/proxy.ts b/servers/github-mcp/wrapper/src/proxy.ts
+index f84e55d..d0f77eb 100644
+--- a/servers/github-mcp/wrapper/src/proxy.ts
++++ b/servers/github-mcp/wrapper/src/proxy.ts
+@@ -1,4 +1,4 @@
+-import type { Hop1Identity } from "../../../../shared/identity/hop1";
++import { normalizedHop1Claims, type Hop1Identity } from "../../../../shared/identity/hop1";
+ import { digestArgs, type AuditSink } from "../../../../shared/audit/audit";
+ import { GitHubOAuthError } from "../../../../shared/oauth/github";
+ import {
+@@ -132,6 +132,7 @@ export function createGithubMcpProxyHandler(
+     if (toolCall) {
+       const decision = await policy.decide({
+         principal: identity.email,
++        tokenClaims: normalizedHop1Claims(identity),
+         tool: toolCall.toolName,
+         service: "github",
+         actionClass: toolCall.actionClass,
+diff --git a/servers/google-workspace/wrapper/src/google-workspace/registry.ts b/servers/google-workspace/wrapper/src/google-workspace/registry.ts
+index a825b5f..cdfaf20 100644
+--- a/servers/google-workspace/wrapper/src/google-workspace/registry.ts
++++ b/servers/google-workspace/wrapper/src/google-workspace/registry.ts
+@@ -1,4 +1,4 @@
+-import type { Hop1Identity } from "../../../../../shared/identity/hop1";
++import { normalizedHop1Claims, type Hop1Identity } from "../../../../../shared/identity/hop1";
+ import { digestArgs, type AuditSink } from "../../../../../shared/audit/audit";
+ import {
+   AllowAllPolicy,
+@@ -79,5 +79,6 @@ export function createGoogleWorkspaceRegistry(
+       const decision = await policy.decide({
+         principal: options.identity.email,
++        tokenClaims: normalizedHop1Claims(options.identity),
+         tool: tool.name,
+         service: tool.service,
+         actionClass: tool.actionClass,
+diff --git a/shared/identity/hop1.ts b/shared/identity/hop1.ts
+index ef1f5a2..1a9e6f4 100644
+--- a/shared/identity/hop1.ts
++++ b/shared/identity/hop1.ts
+@@ -21,6 +21,14 @@ export interface TrustedIssuer {
+   jwks: JWK[];
+ }
+-
++
++export function normalizedHop1Claims(identity: Hop1Identity): JWTPayload {
++  return {
++    ...identity.claims,
++    email: identity.email,
++    sub: identity.subject,
++  };
++}
++
+ export class Hop1ValidationError extends Error {
+   constructor(message: string) {
+     super(message);
+diff --git a/shared/policy/policy.test.ts b/shared/policy/policy.test.ts
+index 874edaf..7fceb98 100644
+--- a/shared/policy/policy.test.ts
++++ b/shared/policy/policy.test.ts
+@@ -11,6 +11,13 @@ import {
+ describe("policy primitives", () => {
+   const input = {
+     principal: "user@example.com",
++    tokenClaims: {
++      steward: {
++        acting_as: "user",
++        runtime_uid: "runtime-uid-a",
++        version: 1,
++      },
++    },
+     tool: "google_drive_files_delete",
+     service: "drive",
+     actionClass: "destructive" as const,
+@@ -28,6 +35,7 @@ describe("policy primitives", () => {
+   test("maps OPA allow responses to policy decisions without exposing raw args", async () => {
+     const adapter = new OpaPolicyAdapter((request) => {
+       expect(request.input.tool).toBe("google_drive_files_delete");
++      expect(request.input.tokenClaims).toEqual(input.tokenClaims);
+       expect(request.input.args).toEqual({
+         fileId: "file-123",
+         accessToken: "[redacted]",
+diff --git a/shared/policy/policy.ts b/shared/policy/policy.ts
+index 4a15bb7..ddbaaea 100644
+--- a/shared/policy/policy.ts
++++ b/shared/policy/policy.ts
+@@ -6,5 +6,6 @@ export type PolicyActionClass = "read" | "write" | "destructive";
+ export interface ToolPolicyInput {
+   principal: string;
++  tokenClaims: Record<string, unknown>;
+   tool: string;
+   service: string;
+   actionClass: PolicyActionClass;

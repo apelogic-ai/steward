@@ -3350,6 +3350,7 @@ dependencies = [
 name = "steward-adapter-openshell"
 version = "0.0.0"
 dependencies = [
+ "kube",
  "openshell-sdk",
  "sha2",
  "steward-ports",
@@ -3361,7 +3362,9 @@ dependencies = [
 name = "steward-adapter-spire"
 version = "0.0.0"
 dependencies = [
+ "spiffe",
  "steward-ports",
+ "tonic",
 ]
 
 [[package]]
@@ -3448,7 +3451,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "spiffe",
+ "steward-ports",
  "steward-types",
  "tokio",
  "tower",
@@ -3456,9 +3459,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "steward-mint-bin"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "kube",
+ "steward-adapter-openshell",
+ "steward-adapter-spire",
+ "steward-mint",
+ "steward-types",
+ "tokio",
+]
+
+[[package]]
 name = "steward-ports"
 version = "0.0.0"
 dependencies = [
+ "serde",
  "steward-types",
 ]
 
