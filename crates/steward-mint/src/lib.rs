@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::rejection::FormRejection;
-use axum::extract::{Form, State};
-use axum::http::header::{CACHE_CONTROL, PRAGMA};
+use axum::extract::{Form, FromRequest, Request, State};
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, PRAGMA};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -18,7 +18,7 @@ use jwt_compact::jwk::JsonWebKey;
 use jwt_compact::prelude::UntrustedToken;
 use jwt_compact::{AlgorithmExt as _, Claims, Header, TimeOptions};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 use spiffe::WorkloadApiClient;
 use steward_types::{Principal, RuntimeId, ToolGrant};
 use uuid::Uuid;
@@ -184,6 +184,21 @@ pub struct MintConfig {
     pub allowed_scopes: Vec<String>,
     pub svid_audience: String,
     pub authority_ttl: Duration,
+    pub introspection_client_credential: IntrospectionClientCredential,
+}
+
+/// Gateway credential accepted only by the online introspection endpoint.
+/// Deliberately implements neither `Debug` nor `Display`.
+pub struct IntrospectionClientCredential(String);
+
+impl IntrospectionClientCredential {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    fn secret(&self) -> &str {
+        &self.0
+    }
 }
 
 impl MintConfig {
@@ -196,6 +211,14 @@ impl MintConfig {
         }
         if self.svid_audience.trim().is_empty() {
             return Err(MintConfigError::EmptySvidAudience);
+        }
+        if self
+            .introspection_client_credential
+            .secret()
+            .trim()
+            .is_empty()
+        {
+            return Err(MintConfigError::InvalidIntrospectionClientCredential);
         }
         let mut scopes = BTreeSet::new();
         if self.allowed_scopes.is_empty()
@@ -222,6 +245,7 @@ pub enum MintConfigError {
     EmptySvidAudience,
     InvalidAllowedScopes,
     InvalidAuthorityTtl,
+    InvalidIntrospectionClientCredential,
 }
 
 pub struct TokenGrantRequest {
@@ -308,10 +332,19 @@ struct StewardClaims {
 }
 
 pub struct Mint<V, R> {
-    config: MintConfig,
+    config: MintRuntimeConfig,
+    introspection_client_credential_hash: [u8; 32],
     _key: MintSigningKey,
     resolver: R,
     validator: V,
+}
+
+struct MintRuntimeConfig {
+    issuer: String,
+    audience: String,
+    allowed_scopes: Vec<String>,
+    svid_audience: String,
+    authority_ttl: Duration,
 }
 
 impl<V, R> Mint<V, R>
@@ -326,8 +359,25 @@ where
         resolver: R,
     ) -> Result<Self, MintConfigError> {
         config.validate()?;
+        let introspection_client_credential_hash =
+            Sha256::digest(config.introspection_client_credential.secret().as_bytes()).into();
+        let MintConfig {
+            issuer,
+            audience,
+            allowed_scopes,
+            svid_audience,
+            authority_ttl,
+            introspection_client_credential: _,
+        } = config;
         Ok(Self {
-            config,
+            config: MintRuntimeConfig {
+                issuer,
+                audience,
+                allowed_scopes,
+                svid_audience,
+                authority_ttl,
+            },
+            introspection_client_credential_hash,
             _key: key,
             resolver,
             validator,
@@ -475,6 +525,18 @@ where
             && principal_matches;
         Ok(TokenIntrospectionResponse { active })
     }
+
+    fn authenticates_introspection_client(&self, authorization: Option<&HeaderValue>) -> bool {
+        let Some(candidate) = authorization
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        let candidate_hash: [u8; 32] = Sha256::digest(candidate.as_bytes()).into();
+        constant_time_equal(&candidate_hash, &self.introspection_client_credential_hash)
+    }
 }
 
 #[derive(Deserialize)]
@@ -549,13 +611,18 @@ where
 
 async fn introspection_handler<V, R>(
     State(mint): State<Arc<Mint<V, R>>>,
-    form: Result<Form<TokenIntrospectionForm>, FormRejection>,
+    request: Request,
 ) -> TokenResult<TokenIntrospectionResponse>
 where
     V: SvidValidator,
     R: AuthorityResolver,
 {
-    let Form(form) = form.map_err(|_| oauth_error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    if !mint.authenticates_introspection_client(request.headers().get(AUTHORIZATION)) {
+        return Err(oauth_error(StatusCode::UNAUTHORIZED, "invalid_client"));
+    }
+    let Form(form) = Form::<TokenIntrospectionForm>::from_request(request, &())
+        .await
+        .map_err(|_| oauth_error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     mint.introspect(&form.token)
         .await
         .map(|response| (no_store_headers(), Json(response)))
@@ -596,6 +663,15 @@ fn no_store_headers() -> HeaderMap {
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
     headers
+}
+
+fn constant_time_equal(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 pub fn router<V, R>(mint: Arc<Mint<V, R>>) -> Router

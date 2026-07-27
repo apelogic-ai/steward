@@ -8,9 +8,9 @@ use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use serde_json::Value;
 use steward_mint::{
-    AuthorityBinding, AuthorityResolver, AuthorityState, DEFAULT_AUTHORITY_TTL, Mint, MintConfig,
-    MintError, MintSigningKey, SvidAssertion, SvidValidationError, SvidValidator,
-    ValidatedWorkload, router,
+    AuthorityBinding, AuthorityResolver, AuthorityState, DEFAULT_AUTHORITY_TTL,
+    IntrospectionClientCredential, Mint, MintConfig, MintError, MintSigningKey, SvidAssertion,
+    SvidValidationError, SvidValidator, ValidatedWorkload, router,
 };
 use steward_types::{Email, Principal, RuntimeId};
 use tower::ServiceExt;
@@ -69,6 +69,9 @@ fn app(
             allowed_scopes: vec!["tools".to_owned()],
             svid_audience: "https://mint.example.test".to_owned(),
             authority_ttl: DEFAULT_AUTHORITY_TTL,
+            introspection_client_credential: IntrospectionClientCredential::new(
+                "gateway-credential".to_owned(),
+            ),
         },
         MintSigningKey::from_bytes(&signing_key.to_bytes()),
         FixedValidator {
@@ -89,10 +92,33 @@ async fn call(
     uri: &str,
     body: &str,
 ) -> Result<(StatusCode, HeaderMap, Value), String> {
-    let request = Request::builder()
+    call_with_authorization(app, method, uri, body, None).await
+}
+
+async fn call_as_gateway(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    body: &str,
+) -> Result<(StatusCode, HeaderMap, Value), String> {
+    call_with_authorization(app, method, uri, body, Some("Bearer gateway-credential")).await
+}
+
+async fn call_with_authorization(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    body: &str,
+    authorization: Option<&str>,
+) -> Result<(StatusCode, HeaderMap, Value), String> {
+    let mut request = Request::builder()
         .method(method)
         .uri(uri)
-        .header("content-type", "application/x-www-form-urlencoded")
+        .header("content-type", "application/x-www-form-urlencoded");
+    if let Some(authorization) = authorization {
+        request = request.header("authorization", authorization);
+    }
+    let request = request
         .body(Body::from(body.to_owned()))
         .map_err(|error| format!("build request: {error}"))?;
     let response = app
@@ -263,6 +289,9 @@ async fn already_issued_hop1_is_inactive_immediately_after_revocation() -> Resul
             allowed_scopes: vec!["tools".to_owned()],
             svid_audience: "https://mint.example.test".to_owned(),
             authority_ttl: DEFAULT_AUTHORITY_TTL,
+            introspection_client_credential: IntrospectionClientCredential::new(
+                "gateway-credential".to_owned(),
+            ),
         },
         MintSigningKey::from_bytes(&signing_key.to_bytes()),
         FixedValidator {
@@ -285,7 +314,8 @@ async fn already_issued_hop1_is_inactive_immediately_after_revocation() -> Resul
         .as_str()
         .ok_or_else(|| "token exchange must return an access token".to_owned())?;
     let form = format!("token={token}");
-    let (status, headers, introspection) = call(app.clone(), "POST", "/introspect", &form).await?;
+    let (status, headers, introspection) =
+        call_as_gateway(app.clone(), "POST", "/introspect", &form).await?;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers["cache-control"], "no-store");
     assert_eq!(
@@ -294,12 +324,50 @@ async fn already_issued_hop1_is_inactive_immediately_after_revocation() -> Resul
     );
 
     authority_state.store(1, Ordering::SeqCst);
-    let (status, _, introspection) = call(app, "POST", "/introspect", &form).await?;
+    let (status, _, introspection) = call_as_gateway(app, "POST", "/introspect", &form).await?;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         introspection["active"], false,
         "a consumer check must reject an issued HOP-1 immediately after revocation"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn introspection_requires_gateway_authentication_before_authority_lookup()
+-> Result<(), String> {
+    let (app, _, resolver_calls) = app(Ok(ValidatedWorkload {
+        spiffe_id: WORKLOAD.to_owned(),
+    }))?;
+    let (status, _, token_response) = call(app.clone(), "POST", "/token", VALID_FORM).await?;
+    if status != StatusCode::OK {
+        return Err(format!("token exchange failed with {status}"));
+    }
+    let token = token_response["access_token"]
+        .as_str()
+        .ok_or_else(|| "token exchange must return an access token".to_owned())?;
+
+    let form = format!("token={token}");
+    let (status, _, body) = call(app.clone(), "POST", "/introspect", &form).await?;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "invalid_client");
+    let workload_authorization = format!("Bearer {token}");
+    let (status, _, body) = call_with_authorization(
+        app,
+        "POST",
+        "/introspect",
+        &form,
+        Some(&workload_authorization),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "invalid_client");
+    assert_eq!(
+        resolver_calls.load(Ordering::SeqCst),
+        1,
+        "only the configured gateway client may trigger authority resolution"
     );
     Ok(())
 }

@@ -10,7 +10,9 @@ every request. Introspection re-resolves the workload's current authority and
 returns only `{"active":true|false}`. Revocation, suspension, termination, or a
 binding change therefore invalidates an already-issued token immediately; its
 short TTL is a backstop, not the revocation boundary. Introspection failures
-must fail closed.
+must fail closed. The route requires the configured gateway credential as an
+`Authorization: Bearer` value before it parses the presented token or resolves
+authority. The mint retains only the credential's SHA-256 digest.
 
 ## HOP-1 claim contract v1
 

@@ -10,9 +10,10 @@ use jwt_compact::{AlgorithmExt, Token};
 use rand_core::OsRng;
 use serde::Deserialize;
 use steward_mint::{
-    AuthorityBinding, AuthorityResolver, AuthorityState, DEFAULT_AUTHORITY_TTL, Mint, MintConfig,
-    MintConfigError, MintError, MintSigningKey, SPIFFE_CLIENT_ASSERTION_TYPE, SvidAssertion,
-    SvidValidationError, SvidValidator, TokenGrantRequest, ValidatedWorkload,
+    AuthorityBinding, AuthorityResolver, AuthorityState, DEFAULT_AUTHORITY_TTL,
+    IntrospectionClientCredential, Mint, MintConfig, MintConfigError, MintError, MintSigningKey,
+    SPIFFE_CLIENT_ASSERTION_TYPE, SvidAssertion, SvidValidationError, SvidValidator,
+    TokenGrantRequest, ValidatedWorkload,
 };
 use steward_types::{Email, Principal, RuntimeId, ToolGrant};
 
@@ -96,6 +97,9 @@ fn mint(
             allowed_scopes: vec!["tools".to_owned()],
             svid_audience: "https://mint.example.test".to_owned(),
             authority_ttl: DEFAULT_AUTHORITY_TTL,
+            introspection_client_credential: IntrospectionClientCredential::new(
+                "gateway-credential".to_owned(),
+            ),
         },
         MintSigningKey::from_bytes(&signing_key.to_bytes()),
         FixedValidator {
@@ -123,6 +127,9 @@ fn valid_config() -> MintConfig {
         allowed_scopes: vec!["tools".to_owned()],
         svid_audience: "https://mint.example.test".to_owned(),
         authority_ttl: DEFAULT_AUTHORITY_TTL,
+        introspection_client_credential: IntrospectionClientCredential::new(
+            "gateway-credential".to_owned(),
+        ),
     }
 }
 
@@ -147,6 +154,13 @@ fn mint_config_rejects_empty_identity_fields_and_out_of_bounds_ttls() {
     assert_eq!(
         config.validate(),
         Err(MintConfigError::InvalidAllowedScopes)
+    );
+
+    let mut config = valid_config();
+    config.introspection_client_credential = IntrospectionClientCredential::new(String::new());
+    assert_eq!(
+        config.validate(),
+        Err(MintConfigError::InvalidIntrospectionClientCredential)
     );
 
     let mut config = valid_config();
