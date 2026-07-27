@@ -1,0 +1,27 @@
+[package]
+name = "steward-mint"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+axum.workspace = true # Exposes the OAuth client-assertion exchange and public JWKS endpoints.
+chrono.workspace = true # Sets and validates the bounded HOP-1 issuance and expiry timestamps.
+ed25519-dalek.workspace = true # Holds the Ed25519 signing key and derives its public half.
+jwt-compact.workspace = true # Produces type-safe EdDSA JWTs and public JWK material.
+serde.workspace = true # Defines the versioned claim and exchange wire contracts.
+serde_json.workspace = true # Renders the public JWKS response without exposing key material.
+sha2.workspace = true # Derives a stable RFC 7638 key identifier from the public JWK.
+spiffe.workspace = true # Delegates JWT-SVID verification to the local SPIRE Workload API.
+steward-types = { path = "../steward-types", version = "=0.0.0" } # Reuses Principal, RuntimeId, and ToolGrant as the mint authority input.
+uuid.workspace = true # Gives every HOP-1 token a collision-resistant jti.
+
+[dev-dependencies]
+rand_core.workspace = true # Generates ephemeral Ed25519 test keys at runtime.
+tokio.workspace = true # Runs async mint and router tests without external services.
+tower.workspace = true # Drives the mint router without opening a test socket.
+
+[lints]
+workspace = true
