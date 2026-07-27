@@ -5,6 +5,13 @@ The token endpoint accepts OpenShell's OAuth client-assertion request, validates
 the JWT-SVID through SPIRE's Workload API, resolves current Steward authority,
 and only then signs a token.
 
+Consumers validate the signature and claims, then call `POST /introspect` for
+every request. Introspection re-resolves the workload's current authority and
+returns only `{"active":true|false}`. Revocation, suspension, termination, or a
+binding change therefore invalidates an already-issued token immediately; its
+short TTL is a backstop, not the revocation boundary. Introspection failures
+must fail closed.
+
 ## HOP-1 claim contract v1
 
 The protected header is `alg=EdDSA`, `typ=JWT`, and a public-key `kid`.

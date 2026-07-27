@@ -1,9 +1,9 @@
 use std::future::{Future, ready};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use serde_json::Value;
@@ -88,7 +88,7 @@ async fn call(
     method: &str,
     uri: &str,
     body: &str,
-) -> Result<(StatusCode, Value), String> {
+) -> Result<(StatusCode, HeaderMap, Value), String> {
     let request = Request::builder()
         .method(method)
         .uri(uri)
@@ -100,12 +100,13 @@ async fn call(
         .await
         .map_err(|error| format!("route request: {error}"))?;
     let status = response.status();
+    let headers = response.headers().clone();
     let body = to_bytes(response.into_body(), 64 * 1024)
         .await
         .map_err(|error| format!("read response: {error}"))?;
     let json = serde_json::from_slice(&body)
         .map_err(|error| format!("OAuth responses must be JSON: {error}"))?;
-    Ok((status, json))
+    Ok((status, headers, json))
 }
 
 #[tokio::test]
@@ -114,9 +115,11 @@ async fn openshell_client_assertion_form_returns_an_oauth_token_response() -> Re
         spiffe_id: WORKLOAD.to_owned(),
     }))?;
 
-    let (status, body) = call(app, "POST", "/token", VALID_FORM).await?;
+    let (status, headers, body) = call(app, "POST", "/token", VALID_FORM).await?;
 
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(headers["pragma"], "no-cache");
     assert_eq!(body["token_type"], "Bearer");
     assert_eq!(body["expires_in"], 60);
     assert_eq!(body["scope"], "tools");
@@ -138,7 +141,7 @@ async fn unsupported_grant_fails_before_reading_the_svid() -> Result<(), String>
     }))?;
     let form = VALID_FORM.replace("grant_type=client_credentials", "grant_type=password");
 
-    let (status, body) = call(app, "POST", "/token", &form).await?;
+    let (status, _, body) = call(app, "POST", "/token", &form).await?;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "unsupported_grant_type");
@@ -154,7 +157,7 @@ async fn unconfigured_scope_fails_before_reading_the_svid() -> Result<(), String
     }))?;
     let form = VALID_FORM.replace("scope=tools", "scope=admin");
 
-    let (status, body) = call(app, "POST", "/token", &form).await?;
+    let (status, _, body) = call(app, "POST", "/token", &form).await?;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "invalid_scope");
@@ -167,7 +170,7 @@ async fn unconfigured_scope_fails_before_reading_the_svid() -> Result<(), String
 async fn rejected_svid_returns_a_sanitized_invalid_client_error() -> Result<(), String> {
     let (app, validator_calls, resolver_calls) = app(Err(SvidValidationError::Rejected))?;
 
-    let (status, body) = call(app, "POST", "/token", VALID_FORM).await?;
+    let (status, _, body) = call(app, "POST", "/token", VALID_FORM).await?;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"], "invalid_client");
@@ -187,7 +190,7 @@ async fn malformed_form_returns_a_json_invalid_request_without_validation() -> R
     }))?;
     let form = "grant_type=client_credentials&audience=mcp-gw.example.test";
 
-    let (status, body) = call(app, "POST", "/token", form).await?;
+    let (status, _, body) = call(app, "POST", "/token", form).await?;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "invalid_request");
@@ -200,7 +203,7 @@ async fn malformed_form_returns_a_json_invalid_request_without_validation() -> R
 async fn unavailable_spire_returns_a_retryable_sanitized_error() -> Result<(), String> {
     let (app, validator_calls, resolver_calls) = app(Err(SvidValidationError::Unavailable))?;
 
-    let (status, body) = call(app, "POST", "/token", VALID_FORM).await?;
+    let (status, _, body) = call(app, "POST", "/token", VALID_FORM).await?;
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["error"], "temporarily_unavailable");
@@ -215,10 +218,88 @@ async fn jwks_route_publishes_the_active_public_key() -> Result<(), String> {
         spiffe_id: WORKLOAD.to_owned(),
     }))?;
 
-    let (status, body) = call(app, "GET", "/.well-known/jwks.json", "").await?;
+    let (status, _, body) = call(app, "GET", "/.well-known/jwks.json", "").await?;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["keys"][0]["alg"], "EdDSA");
     assert!(body["keys"][0].get("d").is_none());
+    Ok(())
+}
+
+struct RevocableResolver {
+    state: Arc<AtomicU8>,
+}
+
+impl AuthorityResolver for RevocableResolver {
+    fn resolve(
+        &self,
+        _workload: &ValidatedWorkload,
+    ) -> impl Future<Output = Result<AuthorityBinding, MintError>> + Send {
+        let state = if self.state.load(Ordering::SeqCst) == 0 {
+            AuthorityState::Active
+        } else {
+            AuthorityState::Revoked
+        };
+        ready(Ok(AuthorityBinding {
+            workload_id: WORKLOAD.to_owned(),
+            runtime: RuntimeId("runtime-uid-a".to_owned()),
+            principal: Principal::User {
+                acting_user: Email("alice@example.com".to_owned()),
+            },
+            tools: Vec::new(),
+            state,
+        }))
+    }
+}
+
+#[tokio::test]
+async fn already_issued_hop1_is_inactive_immediately_after_revocation() -> Result<(), String> {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let authority_state = Arc::new(AtomicU8::new(0));
+    let mint = Mint::new(
+        MintConfig {
+            issuer: "https://mint.example.test".to_owned(),
+            audience: "mcp-gw.example.test".to_owned(),
+            allowed_scopes: vec!["tools".to_owned()],
+            svid_audience: "https://mint.example.test".to_owned(),
+            authority_ttl: DEFAULT_AUTHORITY_TTL,
+        },
+        MintSigningKey::from_bytes(&signing_key.to_bytes()),
+        FixedValidator {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Ok(ValidatedWorkload {
+                spiffe_id: WORKLOAD.to_owned(),
+            }),
+        },
+        RevocableResolver {
+            state: authority_state.clone(),
+        },
+    )
+    .map_err(|error| format!("test mint config must be valid: {error:?}"))?;
+    let app = router(Arc::new(mint));
+    let (status, _, token_response) = call(app.clone(), "POST", "/token", VALID_FORM).await?;
+    if status != StatusCode::OK {
+        return Err(format!("token exchange failed with {status}"));
+    }
+    let token = token_response["access_token"]
+        .as_str()
+        .ok_or_else(|| "token exchange must return an access token".to_owned())?;
+    let form = format!("token={token}");
+    let (status, headers, introspection) = call(app.clone(), "POST", "/introspect", &form).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(
+        introspection["active"], true,
+        "the online check must accept a current issued HOP-1 before revocation"
+    );
+
+    authority_state.store(1, Ordering::SeqCst);
+    let (status, _, introspection) = call(app, "POST", "/introspect", &form).await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        introspection["active"], false,
+        "a consumer check must reject an issued HOP-1 immediately after revocation"
+    );
     Ok(())
 }

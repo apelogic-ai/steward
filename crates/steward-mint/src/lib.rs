@@ -7,13 +7,15 @@ use std::time::Duration;
 
 use axum::extract::rejection::FormRejection;
 use axum::extract::{Form, State};
-use axum::http::StatusCode;
+use axum::http::header::{CACHE_CONTROL, PRAGMA};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Duration as ChronoDuration;
 use ed25519_dalek::SigningKey;
 use jwt_compact::alg::Ed25519;
 use jwt_compact::jwk::JsonWebKey;
+use jwt_compact::prelude::UntrustedToken;
 use jwt_compact::{AlgorithmExt as _, Claims, Header, TimeOptions};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -40,6 +42,25 @@ impl SvidAssertion {
 }
 
 impl<'de> Deserialize<'de> for SvidAssertion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self)
+    }
+}
+
+/// A signed HOP-1 presented for online authority verification.
+/// Deliberately implements neither `Debug` nor `Display`.
+pub struct Hop1Token(String);
+
+impl Hop1Token {
+    fn secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Hop1Token {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -267,7 +288,7 @@ pub enum MintError {
     SigningFailed,
 }
 
-#[derive(Clone, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 struct Hop1Claims {
     aud: Vec<String>,
     azp: String,
@@ -278,7 +299,7 @@ struct Hop1Claims {
     sub: String,
 }
 
-#[derive(Clone, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 struct StewardClaims {
     acting_as: String,
     runtime_uid: String,
@@ -408,6 +429,52 @@ where
             }],
         })
     }
+
+    pub async fn introspect(
+        &self,
+        token: &Hop1Token,
+    ) -> Result<TokenIntrospectionResponse, MintError> {
+        let untrusted = match UntrustedToken::new(token.secret()) {
+            Ok(token) => token,
+            Err(_) => return Ok(TokenIntrospectionResponse::inactive()),
+        };
+        let token: jwt_compact::Token<Hop1Claims> =
+            match Ed25519.validator(&self._key.verifying).validate(&untrusted) {
+                Ok(token) => token,
+                Err(_) => return Ok(TokenIntrospectionResponse::inactive()),
+            };
+        let claims = token.claims();
+        let time = TimeOptions::from_leeway(ChronoDuration::zero());
+        if claims.validate_expiration(&time).is_err()
+            || claims.custom.iss != self.config.issuer
+            || claims.custom.aud.as_slice() != [self.config.audience.as_str()]
+        {
+            return Ok(TokenIntrospectionResponse::inactive());
+        }
+
+        let workload = ValidatedWorkload {
+            spiffe_id: claims.custom.azp.clone(),
+        };
+        let authority = match self.resolver.resolve(&workload).await {
+            Ok(authority) => authority,
+            Err(MintError::AuthorityUnavailable) => return Err(MintError::AuthorityUnavailable),
+            Err(_) => return Ok(TokenIntrospectionResponse::inactive()),
+        };
+        let principal_matches = matches!(
+            &authority.principal,
+            Principal::User { acting_user }
+                if acting_user.0 == claims.custom.email
+                    && acting_user.0 == claims.custom.sub
+        );
+        let active = authority.state == AuthorityState::Active
+            && authority.workload_id == claims.custom.azp
+            && authority.runtime.0 == claims.custom.steward.runtime_uid
+            && authority.tools == claims.custom.steward.tools
+            && claims.custom.steward.version == HOP1_CLAIMS_VERSION
+            && claims.custom.steward.acting_as == "user"
+            && principal_matches;
+        Ok(TokenIntrospectionResponse { active })
+    }
 }
 
 #[derive(Deserialize)]
@@ -420,17 +487,34 @@ struct TokenGrantForm {
     scope: String,
 }
 
+#[derive(Deserialize)]
+struct TokenIntrospectionForm {
+    token: Hop1Token,
+}
+
+#[derive(Serialize)]
+pub struct TokenIntrospectionResponse {
+    active: bool,
+}
+
+impl TokenIntrospectionResponse {
+    const fn inactive() -> Self {
+        Self { active: false }
+    }
+}
+
 #[derive(Serialize)]
 struct OAuthError {
     error: &'static str,
 }
 
 type OAuthResult<T> = Result<Json<T>, (StatusCode, Json<OAuthError>)>;
+type TokenResult<T> = Result<(HeaderMap, Json<T>), (StatusCode, Json<OAuthError>)>;
 
 async fn token_handler<V, R>(
     State(mint): State<Arc<Mint<V, R>>>,
     form: Result<Form<TokenGrantForm>, FormRejection>,
-) -> OAuthResult<TokenGrantResponse>
+) -> TokenResult<TokenGrantResponse>
 where
     V: SvidValidator,
     R: AuthorityResolver,
@@ -459,7 +543,22 @@ where
     };
     mint.exchange(request)
         .await
-        .map(Json)
+        .map(|response| (no_store_headers(), Json(response)))
+        .map_err(map_mint_error)
+}
+
+async fn introspection_handler<V, R>(
+    State(mint): State<Arc<Mint<V, R>>>,
+    form: Result<Form<TokenIntrospectionForm>, FormRejection>,
+) -> TokenResult<TokenIntrospectionResponse>
+where
+    V: SvidValidator,
+    R: AuthorityResolver,
+{
+    let Form(form) = form.map_err(|_| oauth_error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    mint.introspect(&form.token)
+        .await
+        .map(|response| (no_store_headers(), Json(response)))
         .map_err(map_mint_error)
 }
 
@@ -492,6 +591,13 @@ fn oauth_error(status: StatusCode, error: &'static str) -> (StatusCode, Json<OAu
     (status, Json(OAuthError { error }))
 }
 
+fn no_store_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    headers
+}
+
 pub fn router<V, R>(mint: Arc<Mint<V, R>>) -> Router
 where
     V: SvidValidator,
@@ -499,6 +605,7 @@ where
 {
     Router::new()
         .route("/token", post(token_handler::<V, R>))
+        .route("/introspect", post(introspection_handler::<V, R>))
         .route("/.well-known/jwks.json", get(jwks_handler::<V, R>))
         .fallback(|| async {
             (
