@@ -679,6 +679,7 @@ mod tests {
     use super::{migration_changes, root};
     use std::fs;
     use std::io::ErrorKind;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -737,6 +738,17 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             ))
         }
+    }
+
+    fn write_executable(path: &Path, content: &str) -> Result<(), String> {
+        fs::write(path, content)
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+        let mut permissions = fs::metadata(path)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)
+            .map_err(|error| format!("failed to make {} executable: {error}", path.display()))
     }
 
     #[test]
@@ -866,6 +878,561 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             expected,
             "the spike must download the OpenShell CLI artifact for its host platform"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn carried_openshell_patch_has_a_reproducible_image_build_contract() -> Result<(), String> {
+        let output = Command::new("bash")
+            .arg(root().join("scripts/build-patched-openshell-supervisor.sh"))
+            .arg("--print-contract")
+            .output()
+            .map_err(|error| format!("failed to inspect patched supervisor build: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "patched supervisor build contract failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            concat!(
+                "source=https://github.com/NVIDIA/OpenShell.git\n",
+                "commit=1d4ac708f1d2a9ab94204cdce6ca0eee7e792839\n",
+                "patch=third_party/openshell-patches/v0.0.90/",
+                "0001-prepare-supervisor-identity-mount-namespace.patch\n",
+                "image=openshell/supervisor:steward-spiffe-v0090\n",
+                "rust=1.95.0\n",
+                "zig=0.14.1\n",
+                "cargo-zigbuild=0.22.3\n",
+                "dockerfile-frontend=docker/dockerfile:1.4@sha256:",
+                "9ba7531bd80fb0a858632727cf7a112fbfd19b17e94c4e84ced81e24ef1a0dbc\n",
+                "supervisor-base=alpine:3.22@sha256:",
+                "14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce\n",
+                "apk-packages=alpine-baselayout=3.7.0-r0 ",
+                "alpine-baselayout-data=3.7.0-r0 alpine-keys=2.5-r0 ",
+                "alpine-release=3.22.5-r0 apk-tools=2.14.10-r0 ",
+                "busybox=1.37.0-r20 busybox-binsh=1.37.0-r20 ",
+                "ca-certificates-bundle=20260611-r0 gmp=6.3.0-r3 ",
+                "iptables=1.8.11-r1 iptables-legacy=1.8.11-r1 ",
+                "jansson=2.14.1-r0 libapk2=2.14.10-r0 libcrypto3=3.5.7-r0 ",
+                "libip4tc=1.8.11-r1 libip6tc=1.8.11-r1 libmnl=1.0.5-r2 ",
+                "libncursesw=6.5_p20250503-r0 libnftnl=1.2.9-r0 ",
+                "libssl3=3.5.7-r0 libxtables=1.8.11-r1 musl=1.2.5-r12 ",
+                "musl-utils=1.2.5-r12 ncurses-terminfo-base=6.5_p20250503-r0 ",
+                "nftables=1.1.3-r0 readline=8.2.13-r1 scanelf=1.3.8-r1 ",
+                "ssl_client=1.37.0-r20 zlib=1.3.2-r0\n",
+                "apk-artifact-base=https://dl-cdn.alpinelinux.org/alpine/v3.22/main\n",
+                "apk-artifacts-aarch64=",
+                "gmp-6.3.0-r3.apk=0d2eb1079b1b5692e9e6652ff0e269caeb9c812f483e34c88d461c03bcf75460 ",
+                "iptables-1.8.11-r1.apk=0a10fe634e3525082a1219487cd044d987ac4a55ed5aa551bf758e81223e1cfb ",
+                "iptables-legacy-1.8.11-r1.apk=8beced6a354697e50014e2cebe0dcea3dc65d2dbbb708006a149999b3b029919 ",
+                "jansson-2.14.1-r0.apk=f57c3bceb823add72ee0ccbf17aa7fc98596ff9eb0c11d0e5a2c28260ea87dcd ",
+                "libip4tc-1.8.11-r1.apk=6418c50ff5287f6aca02ba7d8baab7cfe729a898793c9a8856cf8975b3f759c2 ",
+                "libip6tc-1.8.11-r1.apk=48ec17436d0e6fd754c8eb50862b5604e86e80ac7d19d7c7a48f9f622f305306 ",
+                "libmnl-1.0.5-r2.apk=213a7e87553bed3d9159b2e74d2627885c259883e61714b357949ca806eb1f8d ",
+                "libncursesw-6.5_p20250503-r0.apk=419b375e8a4345e7172b1f0f3a3c57db61374f5408cdb875d9e860bd4c243aca ",
+                "libnftnl-1.2.9-r0.apk=6912a5d56b31d3365b8dd0d6339bd70a2bfc9e25dab0c387f77174113c43e664 ",
+                "libxtables-1.8.11-r1.apk=e84f0d6b69d4318f297056d00ccbe433e6c7d163fe6767405e373248c42e3e88 ",
+                "ncurses-terminfo-base-6.5_p20250503-r0.apk=3d37403e0b5ab9eb0c1ce269444e4a385faec9fe6af452c1c6956806b13d2bd6 ",
+                "nftables-1.1.3-r0.apk=e48df72b87580444a6b3094e2292886994c3d9c600435d7a62949e3706ce2c07 ",
+                "readline-8.2.13-r1.apk=334af29dbf6b5a71a87af4d6a58e2967a8f711a51d00093de0e1498daf83ceb2\n",
+                "apk-artifacts-x86_64=",
+                "gmp-6.3.0-r3.apk=d3f987ae3836ac7774324bff443dd49d03b846209660729d0c30dfff5546e138 ",
+                "iptables-1.8.11-r1.apk=defe876173d08fe30b664b2d9f60d0237298a639e3a7d0e3f83ac637fd6519db ",
+                "iptables-legacy-1.8.11-r1.apk=aebfc932aa2e3b27e4895250aa4b73ead107116a3e8cd33ebf2d4036e46c043e ",
+                "jansson-2.14.1-r0.apk=7fde81421482507163410715a7ef7d7df6a091870edab855c24e8f6fc84e3e2d ",
+                "libip4tc-1.8.11-r1.apk=3ca5cd36732d59374d970d937f781469969bf668ff5eb65207892f7cfcd27f02 ",
+                "libip6tc-1.8.11-r1.apk=dc0e2aa34b2454bce4c8f6860484925fd6e5bea8eeb24e53d4b9526a24ed4c2c ",
+                "libmnl-1.0.5-r2.apk=e9dc63c95a0c8a263dc7f0705e6f7a2220d632a675ce85db798d33a40b1c1b0b ",
+                "libncursesw-6.5_p20250503-r0.apk=aeafdfca68147b014705b4e2564639ade6345198debb522f2c6c51d32e417651 ",
+                "libnftnl-1.2.9-r0.apk=bef674635aec00dca296b8206751245f7664ba10c416f31c01a563af596720ae ",
+                "libxtables-1.8.11-r1.apk=5367f1f5c309a0aeede0a08d73af717f582f7a135ff97080aa0e5b7c72fd97af ",
+                "ncurses-terminfo-base-6.5_p20250503-r0.apk=0815a5f0403974bb9c34d456e71dc9c0222cb5455d393bc63c44b573da3d7fe0 ",
+                "nftables-1.1.3-r0.apk=96bdef738b0ae22ad86500af3345622c7f5bdc6ade0a407d087d1ea3223c8bc7 ",
+                "readline-8.2.13-r1.apk=520fa586c689144928191bee13e2c85ff4e170ad87d1471ec48e3e97611673d8\n",
+                "build-script-sha256=",
+                "1d2caafeff04d08627cfcaf436edbcdda8ea0b57223744056e2741bed321fac8\n",
+            ),
+            "the carried patch must build from its recorded immutable source and image contract"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_build_isolates_target_and_compiler_environment() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for required in [
+            "SUPERVISOR_TARGET_DIR=\"${RUN_DIR}/cargo-target\"",
+            "binary=\"${SUPERVISOR_TARGET_DIR}/${rust_target}/release/openshell-sandbox\"",
+            "CARGO_TARGET_DIR=\"${SUPERVISOR_TARGET_DIR}\"",
+            "rustup target add --toolchain \"${RUST_TOOLCHAIN}\" \"${rust_target}\"",
+            "cargo +\"${RUST_TOOLCHAIN}\" zigbuild",
+            "scrub_ambient_compiler_overrides",
+        ] {
+            assert!(
+                script.contains(required),
+                "the supervisor build must isolate its target directory and compiler environment: missing {required}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_build_scrubs_target_specific_compiler_overrides() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for required in [
+            "scrub_ambient_compiler_overrides()",
+            "CARGO_TARGET_*",
+            "CARGO_BUILD_* | CARGO_PROFILE_*",
+            "CC | CC_* | *_CC",
+            "CFLAGS | CFLAGS_* | *_CFLAGS",
+            "SOURCE_DATE_EPOCH",
+            "unset \"${variable_name}\"",
+        ] {
+            assert!(
+                script.contains(required),
+                "the supervisor build must remove target-specific ambient compiler inputs: missing {required}"
+            );
+        }
+        let scrub = script
+            .find("\nscrub_ambient_compiler_overrides\n")
+            .ok_or_else(|| "the build must scrub its parent environment".to_owned())?;
+        let source_checkout = script
+            .find("git init --quiet")
+            .ok_or_else(|| "the build must retain its pinned source checkout".to_owned())?;
+        let image_build = script
+            .find("docker buildx build")
+            .ok_or_else(|| "the build must retain its pinned image packaging".to_owned())?;
+        assert!(
+            scrub < source_checkout && scrub < image_build,
+            "ambient compiler inputs must be scrubbed in the parent before both compilation and image packaging"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_cache_key_includes_its_build_implementation() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for required in [
+            "build_script_sha256()",
+            "\"build-script-sha256=$(build_script_sha256)\"",
+        ] {
+            assert!(
+                script.contains(required),
+                "the reusable supervisor image must be invalidated by build-logic changes: missing {required}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_build_isolates_git_and_cargo_config_discovery() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for required in [
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GIT_CONFIG_SYSTEM=/dev/null",
+            "GIT_CONFIG_NOSYSTEM=1",
+            "\"${SOURCE_DIR}/.cargo/config.toml\"",
+            "\"${SUPERVISOR_CARGO_HOME}/config.toml\"",
+            "cd /",
+            "--manifest-path \"${SOURCE_DIR}/Cargo.toml\"",
+        ] {
+            assert!(
+                script.contains(required),
+                "the supervisor build must isolate ambient Git and Cargo config while retaining the pinned upstream config: missing {required}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_runtime_locks_the_complete_apk_closure() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for package in [
+            "alpine-baselayout=3.7.0-r0",
+            "alpine-baselayout-data=3.7.0-r0",
+            "alpine-keys=2.5-r0",
+            "alpine-release=3.22.5-r0",
+            "apk-tools=2.14.10-r0",
+            "busybox=1.37.0-r20",
+            "busybox-binsh=1.37.0-r20",
+            "ca-certificates-bundle=20260611-r0",
+            "gmp=6.3.0-r3",
+            "iptables=1.8.11-r1",
+            "iptables-legacy=1.8.11-r1",
+            "jansson=2.14.1-r0",
+            "libapk2=2.14.10-r0",
+            "libcrypto3=3.5.7-r0",
+            "libip4tc=1.8.11-r1",
+            "libip6tc=1.8.11-r1",
+            "libmnl=1.0.5-r2",
+            "libncursesw=6.5_p20250503-r0",
+            "libnftnl=1.2.9-r0",
+            "libssl3=3.5.7-r0",
+            "libxtables=1.8.11-r1",
+            "musl=1.2.5-r12",
+            "musl-utils=1.2.5-r12",
+            "ncurses-terminfo-base=6.5_p20250503-r0",
+            "nftables=1.1.3-r0",
+            "readline=8.2.13-r1",
+            "scanelf=1.3.8-r1",
+            "ssl_client=1.37.0-r20",
+            "zlib=1.3.2-r0",
+        ] {
+            assert!(
+                script.contains(package),
+                "the pinned supervisor runtime package closure is incomplete: missing {package}"
+            );
+        }
+        assert!(
+            script.contains(
+                "RUN --network=none apk --no-cache --no-network --repositories-file /dev/null add /tmp/steward-apks/*.apk"
+            ),
+            "the generated runtime image must install the locked package closure without repository resolution"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_runtime_installs_checksum_pinned_apks_without_repository_indexes()
+    -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for required in [
+            "APK_ARTIFACTS_AARCH64=(",
+            "APK_ARTIFACTS_X86_64=(",
+            "download_apk_artifacts()",
+            "openssl dgst -sha256 -r",
+            "RUN --network=none apk --no-cache --no-network ",
+            "--repositories-file /dev/null add /tmp/steward-apks/*.apk",
+        ] {
+            assert!(
+                script.contains(required),
+                "the supervisor runtime must install checksum-pinned APK artifacts without a mutable repository index: missing {required}"
+            );
+        }
+        assert!(
+            !script.contains("apk add --no-cache ${APK_PACKAGE_CLOSURE[*]}"),
+            "the supervisor runtime must not resolve its locked package closure through a mutable APKINDEX"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_build_signals_terminate_after_cleanup() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for required in [
+            "trap cleanup EXIT",
+            "trap 'exit 130' INT",
+            "trap 'exit 143' TERM",
+        ] {
+            assert!(
+                script.contains(required),
+                "the supervisor build must terminate after handling signals: missing {required}"
+            );
+        }
+        assert!(
+            !script.contains("trap cleanup EXIT INT TERM"),
+            "cleanup alone must not handle INT or TERM because Bash can resume execution afterwards"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_build_pins_runtime_layer_inputs() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        for required in [
+            "# syntax=${DOCKERFILE_FRONTEND_IMAGE}",
+            "FROM ${SUPERVISOR_BASE_IMAGE} AS supervisor",
+            "COPY deploy/docker/.build/steward-apks/ /tmp/steward-apks/",
+            "RUN --network=none apk --no-cache --no-network ",
+            "--repositories-file /dev/null add /tmp/steward-apks/*.apk",
+        ] {
+            assert!(
+                script.contains(required),
+                "the supervisor runtime layer must be generated from pinned inputs: missing {required}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cached_openshell_supervisor_must_match_the_build_contract() -> Result<(), String> {
+        let fixture = TestRepository::create()?;
+        let bin = fixture.path.join("bin");
+        fs::create_dir(&bin)
+            .map_err(|error| format!("failed to create fake tool directory: {error}"))?;
+        write_executable(
+            &bin.join("docker"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+case "$1:$2" in
+  info:--format)
+    printf '%s\n' "${FAKE_DOCKER_ENGINE_ARCHITECTURE}"
+    ;;
+  image:inspect)
+    printf '%s\n' "${FAKE_DOCKER_IMAGE_METADATA}"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+"#,
+        )?;
+
+        let system_path =
+            std::env::var("PATH").map_err(|error| format!("PATH is unset: {error}"))?;
+        let path = format!("{}:{system_path}", bin.display());
+        let script = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let current_metadata =
+            "d29214a0fd77894403531f86abfa7bc52db6c375c251d924be300552c1285c3d|arm64";
+        let current = Command::new("bash")
+            .arg(&script)
+            .arg("--image-is-current")
+            .env("PATH", &path)
+            .env("FAKE_DOCKER_ENGINE_ARCHITECTURE", "aarch64")
+            .env("FAKE_DOCKER_IMAGE_METADATA", current_metadata)
+            .output()
+            .map_err(|error| format!("failed to validate current supervisor image: {error}"))?;
+        assert!(
+            current.status.success(),
+            "an image matching the source, patch content, and Docker architecture must be reusable: {}",
+            String::from_utf8_lossy(&current.stderr)
+        );
+
+        for stale_metadata in [
+            // The prior build logic and partial APK closure must not be reusable.
+            "f445d04ba50e2d50690b58696fd67111ab36c74060e4229d5e0b7f33e4934d2d|arm64",
+            "d29214a0fd77894403531f86abfa7bc52db6c375c251d924be300552c1285c3d|amd64",
+        ] {
+            let stale = Command::new("bash")
+                .arg(&script)
+                .arg("--image-is-current")
+                .env("PATH", &path)
+                .env("FAKE_DOCKER_ENGINE_ARCHITECTURE", "aarch64")
+                .env("FAKE_DOCKER_IMAGE_METADATA", stale_metadata)
+                .output()
+                .map_err(|error| format!("failed to validate stale supervisor image: {error}"))?;
+            assert!(
+                !stale.status.success(),
+                "an image with a stale build contract or architecture must be rebuilt"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_identity_spike_validates_a_cached_supervisor_before_reuse() -> Result<(), String> {
+        let script_path = root().join("scripts/s0-0-openshell-spike.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        assert!(
+            script.contains(
+                "\"${ROOT}/scripts/build-patched-openshell-supervisor.sh\" --image-is-current"
+            ),
+            "the identity spike must validate the cached image against the pinned build contract"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_mise_cross_tools_override_mismatched_path_tools() -> Result<(), String> {
+        let fixture = TestRepository::create()?;
+        let ambient_bin = fixture.path.join("ambient-bin");
+        let pinned_zig_bin = fixture.path.join("pinned-zig");
+        let pinned_zigbuild_bin = fixture.path.join("pinned-zigbuild");
+        for directory in [&ambient_bin, &pinned_zig_bin, &pinned_zigbuild_bin] {
+            fs::create_dir(directory)
+                .map_err(|error| format!("failed to create {}: {error}", directory.display()))?;
+        }
+        for command in ["cargo", "git"] {
+            write_executable(&ambient_bin.join(command), "#!/bin/sh\nexit 0\n")?;
+        }
+        write_executable(
+            &ambient_bin.join("rustup"),
+            r#"#!/bin/sh
+if [ "$1:$2:$3" = "run:1.95.0:rustc" ]; then
+  printf 'rustc 1.95.0 (59807616e 2026-04-14)\n'
+fi
+exit 0
+"#,
+        )?;
+        write_executable(
+            &ambient_bin.join("docker"),
+            r#"#!/bin/sh
+if [ "$1:$2" = "buildx:version" ]; then
+  exit 0
+fi
+if [ "$1:$2" = "info:--format" ]; then
+  printf 'linux\n'
+  exit 0
+fi
+exit 2
+"#,
+        )?;
+        write_executable(&ambient_bin.join("zig"), "#!/bin/sh\nprintf '0.99.0\\n'\n")?;
+        write_executable(
+            &ambient_bin.join("cargo-zigbuild"),
+            "#!/bin/sh\nprintf 'cargo-zigbuild 0.99.0\\n'\n",
+        )?;
+        write_executable(
+            &ambient_bin.join("mise"),
+            r#"#!/bin/sh
+case "$2" in
+  zig@0.14.1)
+    printf '%s\n' "${FAKE_PINNED_ZIG_BIN}"
+    ;;
+  github:rust-cross/cargo-zigbuild@0.22.3)
+    printf '%s\n' "${FAKE_PINNED_ZIGBUILD_BIN}"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+"#,
+        )?;
+        write_executable(
+            &pinned_zig_bin.join("zig"),
+            "#!/bin/sh\nprintf '0.14.1\\n'\n",
+        )?;
+        write_executable(
+            &pinned_zigbuild_bin.join("cargo-zigbuild"),
+            "#!/bin/sh\nprintf 'cargo-zigbuild 0.22.3\\n'\n",
+        )?;
+
+        let system_path =
+            std::env::var("PATH").map_err(|error| format!("PATH is unset: {error}"))?;
+        let output = Command::new("bash")
+            .arg(root().join("scripts/build-patched-openshell-supervisor.sh"))
+            .arg("--check-prerequisites")
+            .env("PATH", format!("{}:{system_path}", ambient_bin.display()))
+            .env("FAKE_PINNED_ZIG_BIN", &pinned_zig_bin)
+            .env("FAKE_PINNED_ZIGBUILD_BIN", &pinned_zigbuild_bin)
+            .output()
+            .map_err(|error| format!("failed to inspect cross-tool selection: {error}"))?;
+        assert!(
+            output.status.success(),
+            "exact mise tools must be selected when ambient versions differ: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn supervisor_build_requires_openssl_before_expensive_work() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        let requirement = script
+            .find("for command_name in cargo curl docker git openssl rustup;")
+            .ok_or_else(|| {
+                "the supervisor build must reject a missing OpenSSL before cloning or compiling"
+                    .to_owned()
+            })?;
+        let source_checkout = script
+            .find("git init --quiet")
+            .ok_or_else(|| "the supervisor build must check out its pinned source".to_owned())?;
+        assert!(
+            requirement < source_checkout,
+            "OpenSSL must be validated before the supervisor source checkout begins"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn s0_e2e_does_not_require_identity_demo_jq() -> Result<(), String> {
+        let script_path = root().join("scripts/s0-0-openshell-spike.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        assert!(
+            script.contains("for command in kind kubectl helm cargo curl openssl sed tar;"),
+            "the common S0 prerequisite set must not include identity-demo-only jq"
+        );
+        let jq_requirement = script
+            .find("if [[ \"$#\" -eq 0 ]] && ! command -v jq")
+            .ok_or_else(|| "the identity-demo mode must still require jq".to_owned())?;
+        let image_build = script
+            .find("build-patched-openshell-supervisor.sh\" --image-is-current")
+            .ok_or_else(|| "the identity demo must validate its patched image".to_owned())?;
+        let cluster_setup = script
+            .find("kind create cluster")
+            .ok_or_else(|| "the spike must retain its ephemeral cluster setup".to_owned())?;
+        assert!(
+            jq_requirement < image_build && jq_requirement < cluster_setup,
+            "identity-demo-only jq must be checked before image build or cluster setup"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_identity_spike_defaults_to_the_carried_supervisor_image() -> Result<(), String> {
+        let output = Command::new("bash")
+            .arg(root().join("scripts/s0-0-openshell-spike.sh"))
+            .arg("--print-identity-supervisor-image")
+            .output()
+            .map_err(|error| format!("failed to inspect identity supervisor image: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "identity supervisor selection failed before cluster setup: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "openshell/supervisor:steward-spiffe-v0090",
+            "the identity spike must use the supervisor built from the carried patch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_identity_spike_declares_its_spire_issuer_trust_bundle() -> Result<(), String> {
+        let output = Command::new("bash")
+            .arg(root().join("scripts/s0-0-openshell-spike.sh"))
+            .arg("--print-spire-issuer-ca-configmap")
+            .output()
+            .map_err(|error| format!("failed to inspect SPIRE issuer trust bundle: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "SPIRE issuer trust selection failed before cluster setup: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "openshell-spire-oidc-ca",
+            "the token issuer must consume a named run-scoped SPIRE CA ConfigMap"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_spike_cleanup_never_updates_the_ambient_kubeconfig() -> Result<(), String> {
+        let script_path = root().join("scripts/s0-0-openshell-spike.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        assert!(
+            script.contains(
+                "KUBECONFIG=\"${KUBECONFIG_PATH}\" kind delete cluster --name \"${CLUSTER_NAME}\""
+            ),
+            "owned kind-cluster cleanup must use the run kubeconfig even on early interruption"
         );
         Ok(())
     }

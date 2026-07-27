@@ -19,6 +19,20 @@ S0_E2E=0
 if [[ "$#" -eq 1 && "$1" == "--s0-e2e" ]]; then
   S0_E2E=1
 fi
+DEFAULT_IDENTITY_SUPERVISOR_IMAGE="openshell/supervisor:steward-spiffe-v0090"
+SPIRE_ISSUER_CA_CONFIGMAP="openshell-spire-oidc-ca"
+if [[ "$#" -eq 1 && "$1" == "--print-identity-supervisor-image" ]]; then
+  echo "${DEFAULT_IDENTITY_SUPERVISOR_IMAGE}"
+  exit 0
+fi
+if [[ "$#" -eq 1 && "$1" == "--print-spire-issuer-ca-configmap" ]]; then
+  echo "${SPIRE_ISSUER_CA_CONFIGMAP}"
+  exit 0
+fi
+if [[ "$#" -eq 0 ]] && ! command -v jq >/dev/null 2>&1; then
+  echo "required command is missing: jq" >&2
+  exit 2
+fi
 
 cleanup() {
   status="$1"
@@ -28,7 +42,7 @@ cleanup() {
     wait "${PORT_FORWARD_PID}" >/dev/null 2>&1 || true
   fi
   if [[ "${CLUSTER_CREATED}" == "1" && "${STEWARD_DEV_KEEP:-0}" != "1" ]]; then
-    kind delete cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1 || true
+    KUBECONFIG="${KUBECONFIG_PATH}" kind delete cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1 || true
   fi
   if [[ "${STEWARD_DEV_KEEP:-0}" == "1" ]]; then
     echo "kept run ${RUN_ID}; clean it with: kind delete cluster --name ${CLUSTER_NAME}" >&2
@@ -76,6 +90,13 @@ elif command -v shasum >/dev/null 2>&1; then
 else
   echo "required command is missing: sha256sum or shasum" >&2
   exit 2
+fi
+
+if [[ "${S0_E2E}" == "0" && -z "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
+  STEWARD_OPENSHELL_SUPERVISOR_IMAGE="${DEFAULT_IDENTITY_SUPERVISOR_IMAGE}"
+  if ! "${ROOT}/scripts/build-patched-openshell-supervisor.sh" --image-is-current; then
+    "${ROOT}/scripts/build-patched-openshell-supervisor.sh"
+  fi
 fi
 
 mkdir -p "${RUN_DIR}"
@@ -259,6 +280,51 @@ elif [[ "$#" -eq 0 ]]; then
     -o "${source_archive}"
   mkdir -p "${source_directory}"
   tar -xzf "${source_archive}" -C "${source_directory}" --strip-components=1
+  spire_bundle="${RUN_DIR}/spire-bundle.json"
+  kubectl \
+    --kubeconfig "${KUBECONFIG_PATH}" \
+    --context "${KUBE_CONTEXT}" \
+    -n spire \
+    get configmap spire-bundle \
+    -o jsonpath='{.data.bundle\.spiffe}' >"${spire_bundle}"
+  if ! jq -e \
+    '[.keys[] | select(.use == "x509-svid") | .x5c[]] | length > 0' \
+    "${spire_bundle}" >/dev/null
+  then
+    echo "SPIRE published no X.509 authorities for its OIDC certificate" >&2
+    exit 1
+  fi
+  spire_issuer_ca="${RUN_DIR}/spire-oidc-ca.pem"
+  while IFS= read -r authority; do
+    printf '%s' "${authority}" |
+      openssl base64 -d -A |
+      openssl x509 -inform DER
+  done < <(
+    jq -r '.keys[] | select(.use == "x509-svid") | .x5c[]' "${spire_bundle}"
+  ) >"${spire_issuer_ca}"
+  openssl x509 -in "${spire_issuer_ca}" -noout -subject >/dev/null
+  kubectl \
+    --kubeconfig "${KUBECONFIG_PATH}" \
+    --context "${KUBE_CONTEXT}" \
+    -n default \
+    create configmap "${SPIRE_ISSUER_CA_CONFIGMAP}" \
+    --from-file="ca.pem=${spire_issuer_ca}" \
+    --dry-run=client \
+    -o yaml |
+    kubectl \
+      --kubeconfig "${KUBECONFIG_PATH}" \
+      --context "${KUBE_CONTEXT}" \
+      apply -f -
+  demo_k8s_directory="${source_directory}/examples/spiffe-token-grant-demo/k8s"
+  if grep -q '^patches:' "${demo_k8s_directory}/kustomization.yaml"; then
+    echo "OpenShell demo now declares kustomize patches; rebase the Steward CA overlay" >&2
+    exit 1
+  fi
+  cp \
+    "${ROOT}/config/openshell/spiffe-token-issuer-ca-patch.yaml" \
+    "${demo_k8s_directory}/steward-token-issuer-ca-patch.yaml"
+  printf '\npatches:\n  - path: steward-token-issuer-ca-patch.yaml\n' \
+    >>"${demo_k8s_directory}/kustomization.yaml"
   service_subnet="$(
     kubectl \
       --kubeconfig "${KUBECONFIG_PATH}" \

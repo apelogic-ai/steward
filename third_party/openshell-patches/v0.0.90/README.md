@@ -54,12 +54,35 @@ privileged-setup and hardening boundary moves.
 - Live against the exact patched v0.0.90 base: the sandbox reached readiness,
   the `ClusterSPIFFEID` selected it using `openshell.io/sandbox-id`, and the
   supervisor obtained a JWT-SVID and sent it to the profile's configured token
-  endpoint. The upstream demo then stopped in its Node token issuer because
-  that process did not trust the SPIRE OIDC discovery provider's TLS chain
-  (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`); that is downstream of SVID acquisition.
+  endpoint. With SPIRE's published X.509 bundle mounted as the Node issuer's
+  trust anchor, the upstream demo completed audience-specific exchanges for
+  both protected services and preserved the sandbox SPIFFE ID as `azp`.
 
-The live command loads the locally built image only into its ephemeral kind
-cluster:
+Build the image from the recorded commit and patch with Rust 1.95.0, Zig
+0.14.1, and cargo-zigbuild 0.22.3:
+
+```bash
+scripts/build-patched-openshell-supervisor.sh
+```
+
+The script clones the immutable commit into `.steward-run/`, refuses a patch
+context mismatch, isolates Cargo and compiler configuration, cross-builds the
+Linux supervisor, and packages it with a digest-pinned Dockerfile frontend,
+base image, and a version-locked closure of every installed APK package.
+Packages absent from the base image are downloaded by exact artifact name,
+verified against architecture-specific SHA-256 digests, and installed with
+APK networking disabled; the runtime build never resolves a mutable
+`APKINDEX`. The cache contract includes the build script itself, so
+output-affecting build logic invalidates an older image. The script removes the
+source tree unconditionally.
+`STEWARD_DEV_KEEP=1` retains that source for debugging and prints its exact
+cleanup command.
+
+The identity spike reuses this image only when its complete declared build
+contract (including the pinned cross-toolchain), patch content digest, and
+architecture match; otherwise it rebuilds it automatically. It then loads the
+image only into its ephemeral kind cluster. An explicit image override remains
+available for upstream-fix verification:
 
 ```bash
 STEWARD_OPENSHELL_SUPERVISOR_IMAGE=openshell/supervisor:steward-spiffe-v0090 \
