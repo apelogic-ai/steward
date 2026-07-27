@@ -371,3 +371,32 @@ async fn introspection_requires_gateway_authentication_before_authority_lookup()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn introspection_accepts_case_insensitive_bearer_with_multiple_spaces() -> Result<(), String>
+{
+    let (app, _, _) = app(Ok(ValidatedWorkload {
+        spiffe_id: WORKLOAD.to_owned(),
+    }))?;
+    let (status, _, token_response) = call(app.clone(), "POST", "/token", VALID_FORM).await?;
+    if status != StatusCode::OK {
+        return Err(format!("token exchange failed with {status}"));
+    }
+    let token = token_response["access_token"]
+        .as_str()
+        .ok_or_else(|| "token exchange must return an access token".to_owned())?;
+
+    let form = format!("token={token}");
+    let (status, _, introspection) = call_with_authorization(
+        app,
+        "POST",
+        "/introspect",
+        &form,
+        Some("bearer  gateway-credential"),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(introspection["active"], true);
+    Ok(())
+}

@@ -163,6 +163,25 @@ fn mint_config_rejects_empty_identity_fields_and_out_of_bounds_ttls() {
         Err(MintConfigError::InvalidIntrospectionClientCredential)
     );
 
+    for credential in [
+        " gateway-credential",
+        "gateway-credential ",
+        "gateway-credential\n",
+        "gateway credential",
+        "gateway:credential",
+        "=",
+        "==",
+    ] {
+        let mut config = valid_config();
+        config.introspection_client_credential =
+            IntrospectionClientCredential::new(credential.to_owned());
+        assert_eq!(
+            config.validate(),
+            Err(MintConfigError::InvalidIntrospectionClientCredential),
+            "credential outside the Bearer token grammar must fail configuration"
+        );
+    }
+
     let mut config = valid_config();
     config.allowed_scopes = vec!["tools".to_owned(), "tools".to_owned()];
     assert_eq!(

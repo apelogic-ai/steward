@@ -212,12 +212,7 @@ impl MintConfig {
         if self.svid_audience.trim().is_empty() {
             return Err(MintConfigError::EmptySvidAudience);
         }
-        if self
-            .introspection_client_credential
-            .secret()
-            .trim()
-            .is_empty()
-        {
+        if !is_bearer_token(self.introspection_client_credential.secret()) {
             return Err(MintConfigError::InvalidIntrospectionClientCredential);
         }
         let mut scopes = BTreeSet::new();
@@ -529,8 +524,12 @@ where
     fn authenticates_introspection_client(&self, authorization: Option<&HeaderValue>) -> bool {
         let Some(candidate) = authorization
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .filter(|value| !value.is_empty())
+            .and_then(|value| value.split_once(' '))
+            .map(|(scheme, credential)| (scheme, credential.trim_start_matches(' ')))
+            .filter(|(scheme, credential)| {
+                scheme.eq_ignore_ascii_case("Bearer") && is_bearer_token(credential)
+            })
+            .map(|(_, credential)| credential)
         else {
             return false;
         };
@@ -672,6 +671,24 @@ fn constant_time_equal(left: &[u8; 32], right: &[u8; 32]) -> bool {
             difference | (left ^ right)
         })
         == 0
+}
+
+fn is_bearer_token(value: &str) -> bool {
+    let mut saw_padding = false;
+    let mut saw_payload = false;
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            if byte == b'=' {
+                saw_padding = true;
+                return saw_payload;
+            }
+            let allowed = byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/');
+            if allowed {
+                saw_payload = true;
+            }
+            !saw_padding && allowed
+        })
 }
 
 pub fn router<V, R>(mint: Arc<Mint<V, R>>) -> Router
