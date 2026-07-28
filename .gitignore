@@ -1,6 +1,7 @@
 # Rust
 /target/
 /e2e/target/
+/conformance/target/
 **/*.rs.bk
 
 # Secrets — AGENTS.md §11.1. A net, not the rule.

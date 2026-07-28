@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -34,6 +35,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
     match command {
         "ci" if rest.is_empty() => ci(),
         "e2e-s0" if rest.is_empty() => e2e_s0(),
+        "e2e-s1" if rest.is_empty() => e2e_s1(),
         "e2e-s3" if rest.is_empty() => e2e_s3(),
         "e2e-s4" if rest.is_empty() => e2e_s4(),
         "policy-test" if rest.is_empty() => policy_test(),
@@ -61,6 +63,7 @@ fn usage() -> String {
         "commands:",
         "  ci",
         "  e2e-s0",
+        "  e2e-s1",
         "  e2e-s3",
         "  e2e-s4",
         "  policy-test",
@@ -90,6 +93,16 @@ fn ci() -> TaskResult {
     run(
         "cargo",
         &[
+            "fmt",
+            "--manifest-path",
+            "conformance/Cargo.toml",
+            "--",
+            "--check",
+        ],
+    )?;
+    run(
+        "cargo",
+        &[
             "clippy",
             "--workspace",
             "--all-targets",
@@ -115,6 +128,10 @@ fn ci() -> TaskResult {
 
 fn e2e_s0() -> TaskResult {
     run("bash", &["scripts/s0-0-openshell-spike.sh", "--s0-e2e"])
+}
+
+fn e2e_s1() -> TaskResult {
+    run("bash", &["scripts/s1-identity-e2e.sh"])
 }
 
 fn e2e_s3() -> TaskResult {
@@ -323,11 +340,64 @@ fn conformance(arguments: &[String]) -> TaskResult {
         return Err("conformance requires exactly --pinned or --latest".to_owned());
     }
     validate_register()?;
-    println!(
-        "conformance {}: suite is introduced by prerequisite S0.0; register shape is valid",
-        arguments[0]
-    );
+    let target = arguments[0].trim_start_matches("--");
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "--manifest-path",
+            "conformance/Cargo.toml",
+            "--test",
+            "g2_credential_isolation",
+            "--",
+            "--nocapture",
+        ])
+        .env("STEWARD_CONFORMANCE_TARGET", target)
+        .current_dir(root())
+        .output()
+        .map_err(|error| format!("failed to run G-2 {target} conformance: {error}"))?;
+    io::stdout()
+        .write_all(&output.stdout)
+        .map_err(|error| format!("failed to relay G-2 conformance output: {error}"))?;
+    io::stderr()
+        .write_all(&output.stderr)
+        .map_err(|error| format!("failed to relay G-2 conformance diagnostics: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "G-2 {target} conformance exited with {}",
+            output.status
+        ));
+    }
+    validate_conformance_test_result(&String::from_utf8_lossy(&output.stdout))?;
+    println!("conformance --{target}: exactly one G-2 negative test passed");
     Ok(())
+}
+
+fn validate_conformance_test_result(output: &str) -> TaskResult {
+    const EXPECTED_RUST: &str =
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+    const EXPECTED_UPSTREAM: &str = "G-2 upstream result: 1 passed; 0 failed; 0 skipped";
+    let rust_summaries = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("test result:"))
+        .collect::<Vec<_>>();
+    let upstream_summaries = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("G-2 upstream result:"))
+        .collect::<Vec<_>>();
+    if rust_summaries.len() == 1
+        && rust_summaries[0].starts_with(EXPECTED_RUST)
+        && upstream_summaries == [EXPECTED_UPSTREAM]
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "G-2 evidence must execute exactly one upstream test and one Rust wrapper with none skipped, ignored, or filtered; upstream: {}; Rust: {}",
+            upstream_summaries.join(" | "),
+            rust_summaries.join(" | ")
+        ))
+    }
 }
 
 fn register(arguments: &[String]) -> TaskResult {
@@ -343,7 +413,18 @@ fn validate_register() -> TaskResult {
     let path = root().join("conformance/register.toml");
     let content = fs::read_to_string(&path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    validate_register_content(&content)
+    validate_register_content(&content)?;
+    let g2 = root()
+        .join("conformance")
+        .join("tests")
+        .join("g2_credential_isolation.rs");
+    if !g2.is_file() {
+        return Err(format!(
+            "G-2 claim has no conformance module {}",
+            g2.display()
+        ));
+    }
+    Ok(())
 }
 
 fn ports_check() -> TaskResult {
@@ -676,7 +757,7 @@ impl Drop for TemporaryTree {
 
 #[cfg(test)]
 mod tests {
-    use super::{migration_changes, root};
+    use super::{migration_changes, root, validate_conformance_test_result};
     use std::fs;
     use std::io::ErrorKind;
     use std::os::unix::fs::PermissionsExt;
@@ -785,6 +866,45 @@ mod tests {
             "fixture Git commands must not inherit system configuration"
         );
         Ok(())
+    }
+
+    #[test]
+    fn conformance_requires_exactly_one_executed_test() {
+        let rust_green =
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+        let green = format!("G-2 upstream result: 1 passed; 0 failed; 0 skipped\n{rust_green}");
+        assert!(
+            validate_conformance_test_result(&green).is_ok(),
+            "one executed upstream negative test and one Rust wrapper must be accepted as evidence"
+        );
+        assert!(
+            validate_conformance_test_result(rust_green).is_err(),
+            "a passing Rust wrapper without an executed Bun test must not count as evidence"
+        );
+        assert!(
+            validate_conformance_test_result("G-2 upstream result: 1 passed; 0 failed; 0 skipped")
+                .is_err(),
+            "an upstream sentinel without its Rust wrapper must not count as evidence"
+        );
+        let duplicate = format!(
+            "G-2 upstream result: 1 passed; 0 failed; 0 skipped\nG-2 upstream result: 1 passed; 0 failed; 0 skipped\n{rust_green}"
+        );
+        assert!(
+            validate_conformance_test_result(&duplicate).is_err(),
+            "duplicate upstream summaries must not count as exact evidence"
+        );
+
+        for invalid in [
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out",
+            "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out",
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+        ] {
+            let output = format!("G-2 upstream result: 1 passed; 0 failed; 0 skipped\n{invalid}");
+            assert!(
+                validate_conformance_test_result(&output).is_err(),
+                "zero, ignored, filtered, or duplicate tests must not count as evidence: {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -956,6 +1076,27 @@ mod tests {
                 "1d2caafeff04d08627cfcaf436edbcdda8ea0b57223744056e2741bed321fac8\n",
             ),
             "the carried patch must build from its recorded immutable source and image contract"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_gateway_patch_is_applied_in_an_isolated_repository() -> Result<(), String> {
+        let script_path = root().join("scripts/build-patched-mcp-gw.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        let source_init = script
+            .find("git -C \"${source_dir}\" init --quiet")
+            .ok_or_else(|| {
+                "the mcp-gw source archive must become an isolated repository before patching"
+                    .to_owned()
+            })?;
+        let patch_check = script
+            .find("git -C \"${source_dir}\" apply --check")
+            .ok_or_else(|| "the mcp-gw build must check its carried patch".to_owned())?;
+        assert!(
+            source_init < patch_check,
+            "the carried patch must not resolve against Steward's parent repository"
         );
         Ok(())
     }

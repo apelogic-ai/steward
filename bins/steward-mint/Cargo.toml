@@ -1,0 +1,19 @@
+[package]
+name = "steward-mint-bin"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+axum.workspace = true # Serves the internal token, JWKS, and authenticated introspection endpoints.
+kube = { workspace = true, features = ["client", "ring", "rustls-tls"] } # Resolves live AgentRuntime authority from the Kubernetes source of truth.
+steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.0.0", features = ["identity"] } # Resolves vendor sandbox UUIDs without leaking OpenShell labels into the mint.
+steward-adapter-spire = { path = "../../adapters/spire", version = "=0.0.0" } # Connects the workload-identity port to the mounted SPIRE socket.
+steward-mint = { path = "../../crates/steward-mint", version = "=0.0.0" } # Owns the reviewed SVID-to-HOP-1 exchange and signing-key boundary.
+steward-types = { path = "../../crates/steward-types", version = "=0.0.0" } # Reads AgentRuntime principal, tool authority, and lifecycle state.
+tokio.workspace = true # Runs Kubernetes, SPIRE, and HTTP I/O.
+
+[lints]
+workspace = true

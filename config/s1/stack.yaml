@@ -1,0 +1,400 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: steward-system
+  labels:
+    steward.test/component: s1
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+  labels:
+    steward.test/component: s1
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-b
+  labels:
+    steward.test/component: s1
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: steward-mint
+  namespace: steward-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: steward-s1-mint
+rules:
+  - apiGroups: ["agents.apelogic.ai"]
+    resources: ["agentruntimes"]
+    verbs: ["get", "list"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: steward-s1-mint
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: steward-s1-mint
+subjects:
+  - kind: ServiceAccount
+    name: steward-mint
+    namespace: steward-system
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: steward-s1-mint
+spec:
+  spiffeIDTemplate: spiffe://openshell.local/steward/mint
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: steward-system
+  podSelector:
+    matchLabels:
+      app: steward-mint
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: steward-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+          env:
+            - name: POSTGRES_DB
+              value: mcp
+            - name: POSTGRES_HOST_AUTH_METHOD
+              value: trust
+            - name: POSTGRES_USER
+              value: mcp
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "mcp", "-d", "mcp"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: steward-system
+spec:
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: steward-opa
+  namespace: steward-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: steward-opa
+  template:
+    metadata:
+      labels:
+        app: steward-opa
+    spec:
+      containers:
+        - name: opa
+          image: openpolicyagent/opa:1.18.2-static@sha256:57f7d06808fff6de3ea1d698e6430990973ca1370be0e54975f0083d615521da
+          args: ["run", "--server", "--addr=0.0.0.0:8181", "/policy/mcp_tools.rego"]
+          ports:
+            - name: http
+              containerPort: 8181
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          volumeMounts:
+            - name: policy
+              mountPath: /policy/mcp_tools.rego
+              subPath: mcp_tools.rego
+              readOnly: true
+      volumes:
+        - name: policy
+          configMap:
+            name: steward-s1-policy
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: steward-opa
+  namespace: steward-system
+spec:
+  selector:
+    app: steward-opa
+  ports:
+    - name: http
+      port: 8181
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fake-github-mcp
+  namespace: steward-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fake-github-mcp
+  template:
+    metadata:
+      labels:
+        app: fake-github-mcp
+    spec:
+      containers:
+        - name: server
+          image: steward/mcp-gw:c2af10d9-claims
+          imagePullPolicy: Never
+          command: ["bun", "run", "/fixture/fake-github-mcp.ts"]
+          ports:
+            - name: http
+              containerPort: 8082
+          readinessProbe:
+            tcpSocket:
+              port: http
+          volumeMounts:
+            - name: fixture
+              mountPath: /fixture
+              readOnly: true
+      volumes:
+        - name: fixture
+          configMap:
+            name: steward-s1-fixtures
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fake-github-mcp
+  namespace: steward-system
+spec:
+  selector:
+    app: fake-github-mcp
+  ports:
+    - name: http
+      port: 8082
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: steward-mint
+  namespace: steward-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: steward-mint
+  template:
+    metadata:
+      labels:
+        app: steward-mint
+    spec:
+      serviceAccountName: steward-mint
+      containers:
+        - name: mint
+          image: steward/mint:s1
+          imagePullPolicy: Never
+          env:
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: unix:///spiffe-workload-api/spire-agent.sock
+            - name: STEWARD_AUTHORITY_TTL
+              value: "10"
+            - name: STEWARD_MINT_ALLOWED_SCOPES
+              value: mcp
+            - name: STEWARD_MINT_AUDIENCE
+              value: steward-mcp
+            - name: STEWARD_MINT_BIND
+              value: 0.0.0.0:8080
+            - name: STEWARD_MINT_ISSUER
+              value: http://steward-mint.steward-system.svc.cluster.local:8080
+            - name: STEWARD_MINT_SVID_AUDIENCE
+              value: steward-mint
+            - name: STEWARD_MINT_INTROSPECTION_CLIENT_CREDENTIAL_FILE
+              value: /run/steward/introspection-client
+            - name: STEWARD_MINT_SIGNING_KEY_FILE
+              value: /run/steward/signing-key
+            - name: STEWARD_OPENSHELL_NAMESPACE
+              value: openshell
+            - name: STEWARD_SPIFFE_TRUST_DOMAIN
+              value: openshell.local
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /.well-known/jwks.json
+              port: http
+          volumeMounts:
+            - name: mint-secrets
+              mountPath: /run/steward
+              readOnly: true
+            - name: spiffe-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
+      volumes:
+        - name: mint-secrets
+          secret:
+            secretName: steward-s1-mint
+        - name: spiffe-workload-api
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: steward-mint
+  namespace: steward-system
+spec:
+  selector:
+    app: steward-mint
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-gw
+  namespace: steward-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-gw
+  template:
+    metadata:
+      labels:
+        app: mcp-gw
+    spec:
+      containers:
+        - name: mcp-gw
+          image: steward/mcp-gw:c2af10d9-claims
+          imagePullPolicy: Never
+          env:
+            - name: GITHUB_MCP_UPSTREAM_URL
+              value: http://fake-github-mcp.steward-system.svc.cluster.local:8082/mcp
+            - name: GITHUB_OAUTH_SCOPES
+              value: repo
+            - name: GITHUB_TOKEN_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: steward-s1-mcp-gw
+                  key: encryption-key
+            - name: HOP1_AUDIENCE
+              value: steward-mcp
+            - name: HOP1_EMAIL_CLAIM
+              value: email
+            - name: HOP1_INTROSPECTION_CLIENT_CREDENTIAL
+              valueFrom:
+                secretKeyRef:
+                  name: steward-s1-mcp-gw
+                  key: introspection-client
+            - name: HOP1_INTROSPECTION_URL
+              value: http://steward-mint.steward-system.svc.cluster.local:8080/introspect
+            - name: HOP1_ISSUER
+              value: http://steward-mint.steward-system.svc.cluster.local:8080
+            - name: HOP1_JWKS_URL
+              value: http://steward-mint.steward-system.svc.cluster.local:8080/.well-known/jwks.json
+            - name: HOP1_PROFILE
+              value: steward
+            - name: HOP1_SUBJECT_CLAIM
+              value: sub
+            - name: OPA_POLICY_URL
+              value: http://steward-opa.steward-system.svc.cluster.local:8181/v1/data/steward/mcp/decision
+            - name: PORT
+              value: "8080"
+            - name: TOKEN_STORE_DSN
+              value: postgres://mcp@postgres.steward-system.svc.cluster.local:5432/mcp
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: http
+      volumes: []
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-gw
+  namespace: steward-system
+spec:
+  selector:
+    app: mcp-gw
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed-mcp-gw
+  namespace: steward-system
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: seed
+          image: steward/mcp-gw:c2af10d9-claims
+          imagePullPolicy: Never
+          command: ["bun", "run", "/fixture/seed-mcp-gw.ts"]
+          env:
+            - name: GITHUB_TOKEN_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: steward-s1-mcp-gw
+                  key: encryption-key
+            - name: HOP1_ISSUER
+              value: http://steward-mint.steward-system.svc.cluster.local:8080
+            - name: TOKEN_STORE_DSN
+              value: postgres://mcp@postgres.steward-system.svc.cluster.local:5432/mcp
+          volumeMounts:
+            - name: fixture
+              mountPath: /fixture
+              readOnly: true
+      volumes:
+        - name: fixture
+          configMap:
+            name: steward-s1-fixtures

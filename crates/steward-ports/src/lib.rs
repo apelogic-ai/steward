@@ -2,7 +2,7 @@
 
 use std::future::Future;
 
-use steward_types::{AgentType, RuntimeId, RuntimeRefs};
+use steward_types::{AgentType, RuntimeId, RuntimeRefs, ToolGrant};
 
 /// Maturity derived from whether a non-fake adapter implements a port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,7 +42,7 @@ pub const PORTS: [PortDescriptor; 8] = [
     },
     PortDescriptor {
         name: "WorkloadIdentity",
-        maturity: Maturity::Provisional,
+        maturity: Maturity::Proven,
     },
     PortDescriptor {
         name: "PolicySink",
@@ -63,6 +63,41 @@ pub enum PortError {
     Failed { reason: String },
 }
 
+/// An untrusted workload assertion. Deliberately implements neither `Debug` nor `Display`.
+pub struct SvidAssertion(String);
+
+impl SvidAssertion {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SvidAssertion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedWorkload {
+    pub spiffe_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SvidValidationError {
+    Rejected,
+    Expired,
+    Unavailable,
+}
+
 /// Desired identity for one sandbox runtime.
 ///
 /// This is the class-B OpenShell seam, not a ninth replaceable-plane port.
@@ -71,6 +106,7 @@ pub struct SandboxRequest {
     pub runtime: RuntimeId,
     pub workspace_key: String,
     pub agent_type: AgentType,
+    pub tools: Vec<ToolGrant>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -188,9 +224,12 @@ pub trait SessionRelay {
     fn publish(&mut self, event: SessionEvent) -> Result<(), PortError>;
 }
 
-pub trait WorkloadIdentity {
-    fn attest(&mut self, runtime: &RuntimeId) -> Result<String, PortError>;
-    fn revoke(&mut self, runtime: &RuntimeId) -> Result<(), PortError>;
+pub trait WorkloadIdentity: Send + Sync + 'static {
+    fn validate(
+        &self,
+        audience: &str,
+        assertion: &SvidAssertion,
+    ) -> impl Future<Output = Result<ValidatedWorkload, SvidValidationError>> + Send;
 }
 
 pub trait PolicySink {

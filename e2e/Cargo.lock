@@ -2730,6 +2730,7 @@ dependencies = [
 name = "steward-ports"
 version = "0.0.0"
 dependencies = [
+ "serde",
  "steward-types",
 ]
 

@@ -19,7 +19,9 @@ use jwt_compact::prelude::UntrustedToken;
 use jwt_compact::{AlgorithmExt as _, Claims, Header, TimeOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use spiffe::WorkloadApiClient;
+pub use steward_ports::{
+    SvidAssertion, SvidValidationError, ValidatedWorkload, WorkloadIdentity as SvidValidator,
+};
 use steward_types::{Principal, RuntimeId, ToolGrant};
 use uuid::Uuid;
 
@@ -27,28 +29,6 @@ pub const HOP1_CLAIMS_VERSION: u8 = 1;
 pub const DEFAULT_AUTHORITY_TTL: Duration = Duration::from_secs(60);
 pub const SPIFFE_CLIENT_ASSERTION_TYPE: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe";
-
-/// An untrusted JWT-SVID. Deliberately implements neither `Debug` nor `Display`.
-pub struct SvidAssertion(String);
-
-impl SvidAssertion {
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-
-    pub(crate) fn secret(&self) -> &str {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for SvidAssertion {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        String::deserialize(deserializer).map(Self)
-    }
-}
 
 /// A signed HOP-1 presented for online authority verification.
 /// Deliberately implements neither `Debug` nor `Display`.
@@ -69,11 +49,6 @@ impl<'de> Deserialize<'de> for Hop1Token {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValidatedWorkload {
-    pub spiffe_id: String,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum AuthorityState {
@@ -90,61 +65,6 @@ pub struct AuthorityBinding {
     pub principal: Principal,
     pub tools: Vec<ToolGrant>,
     pub state: AuthorityState,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum SvidValidationError {
-    Rejected,
-    Expired,
-    Unavailable,
-}
-
-pub trait SvidValidator: Send + Sync + 'static {
-    fn validate(
-        &self,
-        audience: &str,
-        assertion: &SvidAssertion,
-    ) -> impl Future<Output = Result<ValidatedWorkload, SvidValidationError>> + Send;
-}
-
-#[derive(Clone)]
-pub struct SpireSvidValidator {
-    client: WorkloadApiClient,
-}
-
-impl SpireSvidValidator {
-    pub const fn new(client: WorkloadApiClient) -> Self {
-        Self { client }
-    }
-}
-
-impl SvidValidator for SpireSvidValidator {
-    fn validate(
-        &self,
-        audience: &str,
-        assertion: &SvidAssertion,
-    ) -> impl Future<Output = Result<ValidatedWorkload, SvidValidationError>> + Send {
-        let client = self.client.clone();
-        let audience = audience.to_owned();
-        let assertion = assertion.secret().to_owned();
-        async move {
-            let svid = client
-                .validate_jwt_token(&audience, &assertion)
-                .await
-                .map_err(|error| match error {
-                    spiffe::workload_api::WorkloadApiError::PermissionDenied(_)
-                    | spiffe::workload_api::WorkloadApiError::NoIdentityIssued
-                    | spiffe::workload_api::WorkloadApiError::JwtSvid(_) => {
-                        SvidValidationError::Rejected
-                    }
-                    _ => SvidValidationError::Unavailable,
-                })?;
-            Ok(ValidatedWorkload {
-                spiffe_id: svid.spiffe_id().to_string(),
-            })
-        }
-    }
 }
 
 pub trait AuthorityResolver: Send + Sync + 'static {
@@ -406,6 +326,7 @@ where
                     MintError::InvalidSvid
                 }
                 SvidValidationError::Unavailable => MintError::SvidValidatorUnavailable,
+                _ => MintError::SvidValidatorUnavailable,
             })?;
         let authority = self.resolver.resolve(&workload).await?;
 
