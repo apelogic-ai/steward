@@ -14,6 +14,12 @@ use kube::core::DynamicObject;
 #[cfg(feature = "identity")]
 use kube::discovery::Discovery;
 #[cfg(feature = "runtime")]
+use openshell_sdk::raw::proto::datamodel::v1::{ObjectMeta, Provider};
+#[cfg(feature = "runtime")]
+use openshell_sdk::raw::proto::{
+    AttachSandboxProviderRequest, CreateProviderRequest, GetProviderRequest,
+};
+#[cfg(feature = "runtime")]
 use openshell_sdk::{
     ClientConfig, OpenShellClient, SandboxPhase, SandboxSpec, SdkError, WorkspaceScopedClient,
 };
@@ -35,6 +41,10 @@ const BASE_SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/b
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
 #[cfg(feature = "runtime")]
 const TOOL_PROVIDER: &str = "steward-mcp-gw";
+#[cfg(feature = "runtime")]
+const GRPC_NOT_FOUND: i32 = 5;
+#[cfg(feature = "runtime")]
+const GRPC_ALREADY_EXISTS: i32 = 6;
 #[cfg(feature = "identity")]
 const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
 #[cfg(feature = "identity")]
@@ -297,6 +307,109 @@ impl OpenShellRuntime {
             Err(error) => Err(port_failure(error)),
         }
     }
+
+    async fn get_tool_provider(&self, workspace: &str) -> Result<Option<Provider>, PortError> {
+        let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
+        match client
+            .get_provider(GetProviderRequest {
+                name: TOOL_PROVIDER.to_owned(),
+                workspace: workspace.to_owned(),
+            })
+            .await
+        {
+            Ok(response) => {
+                response
+                    .into_inner()
+                    .provider
+                    .map(Some)
+                    .ok_or_else(|| PortError::Failed {
+                        reason: "OpenShell returned an empty provider response".to_owned(),
+                    })
+            }
+            Err(error) if error.code() as i32 == GRPC_NOT_FOUND => Ok(None),
+            Err(error) => Err(raw_port_failure(error)),
+        }
+    }
+
+    async fn ensure_tool_provider(&self, workspace: &str) -> Result<(), PortError> {
+        if let Some(provider) = self.get_tool_provider(workspace).await? {
+            return validate_tool_provider(&provider, workspace);
+        }
+
+        let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
+        let response = client
+            .create_provider(CreateProviderRequest {
+                provider: Some(Provider {
+                    metadata: Some(ObjectMeta {
+                        name: TOOL_PROVIDER.to_owned(),
+                        workspace: workspace.to_owned(),
+                        ..ObjectMeta::default()
+                    }),
+                    r#type: TOOL_PROVIDER.to_owned(),
+                    profile_workspace: String::new(),
+                    ..Provider::default()
+                }),
+                workspace: workspace.to_owned(),
+            })
+            .await;
+        match response {
+            Ok(response) => {
+                let provider = response
+                    .into_inner()
+                    .provider
+                    .ok_or_else(|| PortError::Failed {
+                        reason: "OpenShell returned an empty provider response".to_owned(),
+                    })?;
+                validate_tool_provider(&provider, workspace)
+            }
+            Err(error) if error.code() as i32 == GRPC_ALREADY_EXISTS => {
+                let provider =
+                    self.get_tool_provider(workspace)
+                        .await?
+                        .ok_or_else(|| PortError::Failed {
+                            reason: "OpenShell reported an existing provider that cannot be read"
+                                .to_owned(),
+                        })?;
+                validate_tool_provider(&provider, workspace)
+            }
+            Err(error) => Err(raw_port_failure(error)),
+        }
+    }
+
+    async fn attach_tool_provider(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        resource_version: u64,
+    ) -> Result<(), PortError> {
+        let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
+        client
+            .attach_sandbox_provider(AttachSandboxProviderRequest {
+                sandbox_name: sandbox.to_owned(),
+                provider_name: TOOL_PROVIDER.to_owned(),
+                expected_resource_version: resource_version,
+                workspace: workspace.to_owned(),
+            })
+            .await
+            .map(|_| ())
+            .map_err(raw_port_failure)
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn validate_tool_provider(provider: &Provider, workspace: &str) -> Result<(), PortError> {
+    let metadata = provider
+        .metadata
+        .as_ref()
+        .ok_or_else(|| PortError::Rejected {
+            reason: "OpenShell provider has no identity metadata".to_owned(),
+        })?;
+    if provider.r#type != TOOL_PROVIDER || metadata.workspace != workspace {
+        return Err(PortError::Rejected {
+            reason: "provider name resolved to a different type or workspace".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(feature = "runtime")]
@@ -357,6 +470,9 @@ impl SandboxRuntime for OpenShellRuntime {
         let projection = project_request(request)?;
         self.ensure_workspace(&projection.workspace, &projection.workspace_key)
             .await?;
+        if !projection.providers.is_empty() {
+            self.ensure_tool_provider(&projection.workspace).await?;
+        }
         let scoped = self.client.workspace(&projection.workspace);
         let snapshot = match scoped.get_sandbox(&projection.sandbox).await {
             Ok(snapshot) => snapshot,
@@ -387,6 +503,14 @@ impl SandboxRuntime for OpenShellRuntime {
             return Err(PortError::Rejected {
                 reason: "sandbox name resolved to a different runtime UID".to_owned(),
             });
+        }
+        if !projection.providers.is_empty() {
+            self.attach_tool_provider(
+                &projection.workspace,
+                &projection.sandbox,
+                snapshot.resource_version,
+            )
+            .await?;
         }
         let refs = runtime_refs(&projection);
         match snapshot.phase {
@@ -419,6 +543,13 @@ impl SandboxRuntime for OpenShellRuntime {
 
 #[cfg(feature = "runtime")]
 fn port_failure(error: SdkError) -> PortError {
+    PortError::Failed {
+        reason: error.to_string(),
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn raw_port_failure(error: impl std::fmt::Display) -> PortError {
     PortError::Failed {
         reason: error.to_string(),
     }

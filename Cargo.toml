@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["e2e"]
+exclude = ["conformance", "e2e"]
 members = [
     "adapters/fake",
     "adapters/jira",

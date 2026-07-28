@@ -7,8 +7,10 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const NAMESPACE: &str = "team-a";
-const RUNTIME_NAME: &str = "runtime-s1";
+const ALICE_NAMESPACE: &str = "team-a";
+const ALICE_RUNTIME: &str = "runtime-alice";
+const BOB_NAMESPACE: &str = "team-b";
+const BOB_RUNTIME: &str = "runtime-bob";
 const MCP_URL: &str = "http://mcp-gw.steward-system.svc.cluster.local:8080/mcp";
 
 struct Harness {
@@ -17,7 +19,7 @@ struct Harness {
     kubeconfig: PathBuf,
     mint_forward: Option<Child>,
     openshell: PathBuf,
-    runtime_manifest: PathBuf,
+    run_dir: PathBuf,
 }
 
 impl Harness {
@@ -35,8 +37,7 @@ impl Harness {
             kubeconfig: PathBuf::from(env::var("STEWARD_TEST_KUBECONFIG")?),
             mint_forward: None,
             openshell: PathBuf::from(env::var("STEWARD_OPENSHELL_CLI")?),
-            runtime_manifest: PathBuf::from(env::var("STEWARD_RUN_DIR")?)
-                .join("e2e-s1-runtime.json"),
+            run_dir: PathBuf::from(env::var("STEWARD_RUN_DIR")?),
         })
     }
 
@@ -75,13 +76,30 @@ impl Harness {
         Ok(())
     }
 
-    fn write_runtime(&self, acting_user: &str) -> Result<(), Box<dyn Error>> {
+    fn write_runtime(
+        &self,
+        namespace: &str,
+        name: &str,
+        acting_user: &str,
+        tools_enabled: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let runtime_manifest = self.run_dir.join(format!("e2e-s1-{name}.json"));
+        let tools = tools_enabled
+            .then(|| {
+                serde_json::json!({
+                    "provider": "github",
+                    "resource": "search_repositories",
+                    "action": "read",
+                })
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
         let manifest = serde_json::json!({
             "apiVersion": env::var("STEWARD_AGENTRUNTIME_API_VERSION")?,
             "kind": "AgentRuntime",
             "metadata": {
-                "name": RUNTIME_NAME,
-                "namespace": NAMESPACE,
+                "name": name,
+                "namespace": namespace,
             },
             "spec": {
                 "principal": {
@@ -91,11 +109,7 @@ impl Harness {
                 "owner": acting_user,
                 "agentType": { "name": "base" },
                 "llms": [],
-                "tools": [{
-                    "provider": "github",
-                    "resource": "search_repositories",
-                    "action": "read",
-                }],
+                "tools": tools,
                 "budget": {
                     "monthlyLimit": "1.00",
                     "currency": "USD",
@@ -103,21 +117,27 @@ impl Harness {
                 "ttl": "1h",
             },
         });
-        fs::write(&self.runtime_manifest, serde_json::to_vec_pretty(&manifest)?)?;
-        self.kubectl_ok(&["apply", "-f", path_text(&self.runtime_manifest)?])?;
+        fs::write(&runtime_manifest, serde_json::to_vec_pretty(&manifest)?)?;
+        self.kubectl_ok(&["apply", "-f", path_text(&runtime_manifest)?])?;
         Ok(())
     }
 
-    fn wait_phase(&self, expected: &str, timeout: Duration) -> Result<(), Box<dyn Error>> {
+    fn wait_phase(
+        &self,
+        namespace: &str,
+        name: &str,
+        expected: &str,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn Error>> {
         let deadline = Instant::now() + timeout;
         let mut last = String::new();
         while Instant::now() < deadline {
             let output = self.kubectl(&[
                 "-n",
-                NAMESPACE,
+                namespace,
                 "get",
                 "agentruntime",
-                RUNTIME_NAME,
+                name,
                 "-o",
                 "jsonpath={.status.phase}",
             ])?;
@@ -126,31 +146,47 @@ impl Harness {
                 if last == expected {
                     return Ok(());
                 }
+                if last == "Failed" {
+                    return Err(io::Error::other(format!(
+                        "AgentRuntime {namespace}/{name} reached Failed while waiting for {expected}"
+                    ))
+                    .into());
+                }
             }
             thread::sleep(Duration::from_secs(1));
         }
         Err(io::Error::other(format!(
-            "AgentRuntime did not reach {expected}; last phase was {last:?}"
+            "AgentRuntime {namespace}/{name} did not reach {expected}; last phase was {last:?}"
         ))
         .into())
     }
 
-    fn runtime_ref(&self, field: &str) -> Result<String, Box<dyn Error>> {
+    fn runtime_ref(
+        &self,
+        namespace: &str,
+        name: &str,
+        field: &str,
+    ) -> Result<String, Box<dyn Error>> {
         self.kubectl_ok(&[
             "-n",
-            NAMESPACE,
+            namespace,
             "get",
             "agentruntime",
-            RUNTIME_NAME,
+            name,
             "-o",
             &format!("jsonpath={{.status.refs.{field}}}"),
         ])
         .map(|value| value.trim().to_owned())
     }
 
-    fn call_tool(&self, tool: &str) -> Result<String, Box<dyn Error>> {
-        let workspace = self.runtime_ref("workspace")?;
-        let sandbox = self.runtime_ref("sandbox")?;
+    fn call_tool(
+        &self,
+        namespace: &str,
+        name: &str,
+        tool: &str,
+    ) -> Result<String, Box<dyn Error>> {
+        let workspace = self.runtime_ref(namespace, name, "workspace")?;
+        let sandbox = self.runtime_ref(namespace, name, "sandbox")?;
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -189,6 +225,30 @@ impl Harness {
             .into());
         }
         Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn wait_tool_response(
+        &self,
+        namespace: &str,
+        name: &str,
+        tool: &str,
+        expected: &str,
+        timeout: Duration,
+    ) -> Result<String, Box<dyn Error>> {
+        let deadline = Instant::now() + timeout;
+        let mut last = "tool call was not attempted".to_owned();
+        while Instant::now() < deadline {
+            match self.call_tool(namespace, name, tool) {
+                Ok(response) if response.contains(expected) => return Ok(response),
+                Ok(response) => last = response,
+                Err(error) => last = error.to_string(),
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        Err(io::Error::other(format!(
+            "tool call for {namespace}/{name} did not contain {expected:?}; last result: {last}"
+        ))
+        .into())
     }
 
     fn start_mint_forward(&mut self) -> Result<u16, Box<dyn Error>> {
@@ -259,13 +319,14 @@ impl Harness {
             .map_err(|error| io::Error::other(format!("invalid HTTP status: {error}")).into())
     }
 
-    fn delete_runtime(&self) -> Result<(), Box<dyn Error>> {
+    fn delete_runtime(&self, namespace: &str, name: &str) -> Result<(), Box<dyn Error>> {
         let output = self.kubectl(&[
             "-n",
-            NAMESPACE,
+            namespace,
             "delete",
             "agentruntime",
-            RUNTIME_NAME,
+            name,
+            "--ignore-not-found=true",
             "--timeout=120s",
         ])?;
         if !output.status.success() {
@@ -281,7 +342,8 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        let _ = self.delete_runtime();
+        let _ = self.delete_runtime(BOB_NAMESPACE, BOB_RUNTIME);
+        let _ = self.delete_runtime(ALICE_NAMESPACE, ALICE_RUNTIME);
         if let Some(mut controller) = self.controller.take() {
             let _ = controller.kill();
             let _ = controller.wait();
@@ -309,16 +371,34 @@ fn parse_forwarded_port(log: &str) -> Option<u16> {
 fn e2e_s1_tool_call_as_acting_user() -> Result<(), Box<dyn Error>> {
     let mut harness = Harness::from_environment()?;
     harness.start_controller()?;
-    harness.write_runtime("alice@example.com")?;
-    harness.wait_phase("Running", Duration::from_secs(300))?;
+    harness.write_runtime(
+        ALICE_NAMESPACE,
+        ALICE_RUNTIME,
+        "alice@example.com",
+        false,
+    )?;
+    harness.wait_phase(
+        ALICE_NAMESPACE,
+        ALICE_RUNTIME,
+        "Running",
+        Duration::from_secs(300),
+    )?;
 
-    let allowed = harness.call_tool("search_repositories")?;
-    assert!(
-        allowed.contains("example-org/fixture-repository"),
-        "the acting user's provider credential was not resolved: {allowed}"
-    );
+    harness.write_runtime(
+        ALICE_NAMESPACE,
+        ALICE_RUNTIME,
+        "alice@example.com",
+        true,
+    )?;
+    harness.wait_tool_response(
+        ALICE_NAMESPACE,
+        ALICE_RUNTIME,
+        "search_repositories",
+        "example-org/fixture-repository",
+        Duration::from_secs(60),
+    )?;
 
-    let denied = harness.call_tool("create_issue")?;
+    let denied = harness.call_tool(ALICE_NAMESPACE, ALICE_RUNTIME, "create_issue")?;
     assert!(
         denied.contains("Policy denied create_issue"),
         "a tool outside spec.tools was not rejected by mcp-gw: {denied}"
@@ -330,14 +410,22 @@ fn e2e_s1_tool_call_as_acting_user() -> Result<(), Box<dyn Error>> {
         "a forged and expired SVID must fail closed at the mint"
     );
 
-    harness.write_runtime("bob@example.org")?;
-    thread::sleep(Duration::from_secs(3));
-    let wrong_user = harness.call_tool("search_repositories")?;
-    assert!(
-        wrong_user.contains("GitHub account is not connected"),
-        "a HOP-1 for a different email obtained the acting user's credential: {wrong_user}"
-    );
+    harness.write_runtime(BOB_NAMESPACE, BOB_RUNTIME, "bob@example.org", true)?;
+    harness.wait_phase(
+        BOB_NAMESPACE,
+        BOB_RUNTIME,
+        "Running",
+        Duration::from_secs(300),
+    )?;
+    harness.wait_tool_response(
+        BOB_NAMESPACE,
+        BOB_RUNTIME,
+        "search_repositories",
+        "GitHub account is not connected",
+        Duration::from_secs(60),
+    )?;
 
-    harness.delete_runtime()?;
+    harness.delete_runtime(BOB_NAMESPACE, BOB_RUNTIME)?;
+    harness.delete_runtime(ALICE_NAMESPACE, ALICE_RUNTIME)?;
     Ok(())
 }

@@ -92,6 +92,16 @@ fn ci() -> TaskResult {
     run(
         "cargo",
         &[
+            "fmt",
+            "--manifest-path",
+            "conformance/Cargo.toml",
+            "--",
+            "--check",
+        ],
+    )?;
+    run(
+        "cargo",
+        &[
             "clippy",
             "--workspace",
             "--all-targets",
@@ -329,8 +339,25 @@ fn conformance(arguments: &[String]) -> TaskResult {
         return Err("conformance requires exactly --pinned or --latest".to_owned());
     }
     validate_register()?;
+    if arguments == ["--pinned"] {
+        run(
+            "cargo",
+            &[
+                "test",
+                "--manifest-path",
+                "conformance/Cargo.toml",
+                "--test",
+                "g2_credential_isolation",
+                "holds_runtime_bound_credentials_reject_cross_user_reuse",
+                "--",
+                "--exact",
+            ],
+        )?;
+        println!("conformance --pinned: G-2 executable evidence is green");
+        return Ok(());
+    }
     println!(
-        "conformance {}: suite is introduced by prerequisite S0.0; register shape is valid",
+        "conformance {}: latest-upstream executable target is not yet configured; register shape is valid",
         arguments[0]
     );
     Ok(())
@@ -349,7 +376,21 @@ fn validate_register() -> TaskResult {
     let path = root().join("conformance/register.toml");
     let content = fs::read_to_string(&path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    validate_register_content(&content)
+    validate_register_content(&content)?;
+    let g2 = root()
+        .join("conformance")
+        .join("tests")
+        .join("g2_credential_isolation.rs");
+    let evidence = fs::read_to_string(&g2).map_err(|error| {
+        format!(
+            "G-2 claim has no executable evidence {}: {error}",
+            g2.display()
+        )
+    })?;
+    if !evidence.contains("holds_runtime_bound_credentials_reject_cross_user_reuse") {
+        return Err("G-2 evidence must contain a holds_ credential-isolation test".to_owned());
+    }
+    Ok(())
 }
 
 fn ports_check() -> TaskResult {

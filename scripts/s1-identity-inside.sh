@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORKSPACE="w-9086ou4eujpgku8z0"
 MCP_GW_IMAGE="steward/mcp-gw:c2af10d9-claims"
 MINT_IMAGE="steward/mint:s1"
 
@@ -84,7 +83,7 @@ KUBECTL=(
   --for=condition=Established \
   crd/agentruntimes.agents.apelogic.ai \
   --timeout=120s
-for namespace in steward-system team-a; do
+for namespace in steward-system team-a team-b; do
   "${KUBECTL[@]}" create namespace "${namespace}" \
     --dry-run=client \
     -o yaml |
@@ -144,25 +143,15 @@ profile="${STEWARD_RUN_DIR}/steward-mcp-gw-profile.yaml"
 sed "s#SERVICE_SUBNET#${service_subnet}#g" \
   "${ROOT}/config/s1/provider-profile.yaml" >"${profile}"
 
-OS=(
-  "${OPEN_SHELL}"
-  --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}"
-  --workspace "${WORKSPACE}"
-)
-"${OPEN_SHELL}" \
-  --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
-  workspace create \
-  --name "${WORKSPACE}" \
-  --label agents.apelogic.ai/workspace-key=team-a
 "${OPEN_SHELL}" \
   --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
   settings set --global --key providers_v2_enabled --value true --yes
-"${OS[@]}" provider profile lint -f "${profile}"
-"${OS[@]}" provider profile import -f "${profile}"
-"${OS[@]}" provider create \
-  --name steward-mcp-gw \
-  --type steward-mcp-gw \
-  --runtime-credentials
+"${OPEN_SHELL}" \
+  --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
+  provider profile lint --global -f "${profile}"
+"${OPEN_SHELL}" \
+  --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
+  provider profile import --global -f "${profile}"
 
 cargo build -p steward-controller-bin
 export STEWARD_AGENTRUNTIME_API_VERSION="agents.apelogic.ai/v1alpha1"

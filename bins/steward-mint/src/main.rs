@@ -45,15 +45,7 @@ fn authority_from_runtimes(
         .as_ref()
         .map(|status| status.phase)
         .ok_or(MintError::WorkloadMismatch)?;
-    let state = match phase {
-        Phase::Running => AuthorityState::Active,
-        Phase::Suspended => AuthorityState::Suspended,
-        Phase::Terminating => AuthorityState::Revoked,
-        Phase::Terminated => AuthorityState::Terminated,
-        Phase::Pending | Phase::Admitted | Phase::Provisioning | Phase::Failed => {
-            AuthorityState::Revoked
-        }
-    };
+    let state = authority_state(runtime.metadata.deletion_timestamp.is_some(), phase);
     Ok(AuthorityBinding {
         workload_id: workload.spiffe_id.clone(),
         runtime: RuntimeId(runtime_uid),
@@ -61,6 +53,21 @@ fn authority_from_runtimes(
         tools: runtime.spec.tools.clone(),
         state,
     })
+}
+
+fn authority_state(deleting: bool, phase: Phase) -> AuthorityState {
+    if deleting {
+        return AuthorityState::Revoked;
+    }
+    match phase {
+        Phase::Running => AuthorityState::Active,
+        Phase::Suspended => AuthorityState::Suspended,
+        Phase::Terminating => AuthorityState::Revoked,
+        Phase::Terminated => AuthorityState::Terminated,
+        Phase::Pending | Phase::Admitted | Phase::Provisioning | Phase::Failed => {
+            AuthorityState::Revoked
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -166,7 +173,7 @@ mod tests {
         Phase, Principal, RuntimeRefs, ToolGrant,
     };
 
-    use super::authority_from_runtimes;
+    use super::{authority_from_runtimes, authority_state};
 
     fn runtime(uid: &str, workspace: &str, sandbox: &str) -> AgentRuntime {
         let mut runtime = AgentRuntime::new(
@@ -236,6 +243,15 @@ mod tests {
         assert!(
             matches!(result, Err(MintError::WorkloadMismatch)),
             "one sandbox must never resolve to more than one runtime; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn deletion_timestamp_revokes_running_authority_immediately() {
+        assert_eq!(
+            authority_state(true, Phase::Running),
+            AuthorityState::Revoked,
+            "deletion must revoke authority without waiting for cached status to reconcile"
         );
     }
 
