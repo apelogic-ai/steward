@@ -17,7 +17,8 @@ use kube::discovery::Discovery;
 use openshell_sdk::raw::proto::datamodel::v1::{ObjectMeta, Provider};
 #[cfg(feature = "runtime")]
 use openshell_sdk::raw::proto::{
-    AttachSandboxProviderRequest, CreateProviderRequest, GetProviderRequest,
+    AttachSandboxProviderRequest, CreateProviderRequest, DetachSandboxProviderRequest,
+    GetProviderRequest, ListSandboxProvidersRequest,
 };
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
@@ -45,6 +46,21 @@ const TOOL_PROVIDER: &str = "steward-mcp-gw";
 const GRPC_NOT_FOUND: i32 = 5;
 #[cfg(feature = "runtime")]
 const GRPC_ALREADY_EXISTS: i32 = 6;
+#[cfg(feature = "runtime")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderReconciliation {
+    Attach,
+    Detach,
+}
+
+#[cfg(feature = "runtime")]
+fn provider_reconciliation(attached: bool, desired: bool) -> Option<ProviderReconciliation> {
+    match (attached, desired) {
+        (false, true) => Some(ProviderReconciliation::Attach),
+        (true, false) => Some(ProviderReconciliation::Detach),
+        (false, false) | (true, true) => None,
+    }
+}
 #[cfg(feature = "identity")]
 const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
 #[cfg(feature = "identity")]
@@ -394,6 +410,84 @@ impl OpenShellRuntime {
             .map(|_| ())
             .map_err(raw_port_failure)
     }
+
+    async fn tool_provider_is_attached(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+    ) -> Result<bool, PortError> {
+        let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
+        let providers = client
+            .list_sandbox_providers(ListSandboxProvidersRequest {
+                sandbox_name: sandbox.to_owned(),
+                workspace: workspace.to_owned(),
+            })
+            .await
+            .map_err(raw_port_failure)?
+            .into_inner()
+            .providers;
+        let attached = providers
+            .iter()
+            .filter(|provider| {
+                provider
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.name.as_str())
+                    == Some(TOOL_PROVIDER)
+            })
+            .collect::<Vec<_>>();
+        let [provider] = attached.as_slice() else {
+            return if attached.is_empty() {
+                Ok(false)
+            } else {
+                Err(PortError::Rejected {
+                    reason: "OpenShell returned duplicate Steward provider attachments".to_owned(),
+                })
+            };
+        };
+        validate_tool_provider(provider, workspace)?;
+        Ok(true)
+    }
+
+    async fn detach_tool_provider(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        resource_version: u64,
+    ) -> Result<(), PortError> {
+        let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
+        client
+            .detach_sandbox_provider(DetachSandboxProviderRequest {
+                sandbox_name: sandbox.to_owned(),
+                provider_name: TOOL_PROVIDER.to_owned(),
+                expected_resource_version: resource_version,
+                workspace: workspace.to_owned(),
+            })
+            .await
+            .map(|_| ())
+            .map_err(raw_port_failure)
+    }
+
+    async fn reconcile_tool_provider(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        resource_version: u64,
+        desired: bool,
+    ) -> Result<(), PortError> {
+        let attached = self.tool_provider_is_attached(workspace, sandbox).await?;
+        match provider_reconciliation(attached, desired) {
+            Some(ProviderReconciliation::Attach) => {
+                self.attach_tool_provider(workspace, sandbox, resource_version)
+                    .await
+            }
+            Some(ProviderReconciliation::Detach) => {
+                self.detach_tool_provider(workspace, sandbox, resource_version)
+                    .await
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg(feature = "runtime")]
@@ -504,14 +598,13 @@ impl SandboxRuntime for OpenShellRuntime {
                 reason: "sandbox name resolved to a different runtime UID".to_owned(),
             });
         }
-        if !projection.providers.is_empty() {
-            self.attach_tool_provider(
-                &projection.workspace,
-                &projection.sandbox,
-                snapshot.resource_version,
-            )
-            .await?;
-        }
+        self.reconcile_tool_provider(
+            &projection.workspace,
+            &projection.sandbox,
+            snapshot.resource_version,
+            !projection.providers.is_empty(),
+        )
+        .await?;
         let refs = runtime_refs(&projection);
         match snapshot.phase {
             SandboxPhase::Ready => Ok(SandboxObservation::Running { refs }),
@@ -579,7 +672,10 @@ mod tests {
     use super::{IdentityResolutionError, SANDBOX_ID_LABEL, binding_from_sandbox};
     use super::{NameKind, stable_name};
     #[cfg(feature = "runtime")]
-    use super::{SandboxDeleteClient, delete_owned_sandbox, project_request};
+    use super::{
+        ProviderReconciliation, SandboxDeleteClient, delete_owned_sandbox, project_request,
+        provider_reconciliation,
+    };
 
     #[cfg(feature = "runtime")]
     struct FakeDeleteClient {
@@ -733,6 +829,36 @@ mod tests {
             "a tool-bearing runtime must use the token-grant provider and no ambient provider"
         );
         Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn removing_tool_authority_plans_provider_detach() {
+        assert_eq!(
+            provider_reconciliation(true, false),
+            Some(ProviderReconciliation::Detach),
+            "removing all tool grants must detach the Steward gateway provider"
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn unchanged_provider_authority_is_a_reconciliation_noop() {
+        assert_eq!(
+            provider_reconciliation(true, true),
+            None,
+            "an already-attached desired provider must not be rewritten"
+        );
+        assert_eq!(
+            provider_reconciliation(false, false),
+            None,
+            "an already-absent undesired provider must not be rewritten"
+        );
+        assert_eq!(
+            provider_reconciliation(false, true),
+            Some(ProviderReconciliation::Attach),
+            "a newly granted tool capability must attach the gateway provider"
+        );
     }
 
     #[cfg(feature = "runtime")]

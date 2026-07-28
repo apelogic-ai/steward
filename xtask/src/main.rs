@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -339,28 +340,54 @@ fn conformance(arguments: &[String]) -> TaskResult {
         return Err("conformance requires exactly --pinned or --latest".to_owned());
     }
     validate_register()?;
-    if arguments == ["--pinned"] {
-        run(
-            "cargo",
-            &[
-                "test",
-                "--manifest-path",
-                "conformance/Cargo.toml",
-                "--test",
-                "g2_credential_isolation",
-                "holds_runtime_bound_credentials_reject_cross_user_reuse",
-                "--",
-                "--exact",
-            ],
-        )?;
-        println!("conformance --pinned: G-2 executable evidence is green");
-        return Ok(());
+    let target = arguments[0].trim_start_matches("--");
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "--manifest-path",
+            "conformance/Cargo.toml",
+            "--test",
+            "g2_credential_isolation",
+            "--",
+            "--nocapture",
+        ])
+        .env("STEWARD_CONFORMANCE_TARGET", target)
+        .current_dir(root())
+        .output()
+        .map_err(|error| format!("failed to run G-2 {target} conformance: {error}"))?;
+    io::stdout()
+        .write_all(&output.stdout)
+        .map_err(|error| format!("failed to relay G-2 conformance output: {error}"))?;
+    io::stderr()
+        .write_all(&output.stderr)
+        .map_err(|error| format!("failed to relay G-2 conformance diagnostics: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "G-2 {target} conformance exited with {}",
+            output.status
+        ));
     }
-    println!(
-        "conformance {}: latest-upstream executable target is not yet configured; register shape is valid",
-        arguments[0]
-    );
+    validate_conformance_test_result(&String::from_utf8_lossy(&output.stdout))?;
+    println!("conformance --{target}: exactly one G-2 negative test passed");
     Ok(())
+}
+
+fn validate_conformance_test_result(output: &str) -> TaskResult {
+    const EXPECTED: &str =
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+    let summaries = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("test result:"))
+        .collect::<Vec<_>>();
+    if summaries.len() == 1 && summaries[0].starts_with(EXPECTED) {
+        Ok(())
+    } else {
+        Err(format!(
+            "G-2 evidence must execute exactly one passing test with none ignored or filtered; observed summaries: {}",
+            summaries.join(" | ")
+        ))
+    }
 }
 
 fn register(arguments: &[String]) -> TaskResult {
@@ -381,14 +408,11 @@ fn validate_register() -> TaskResult {
         .join("conformance")
         .join("tests")
         .join("g2_credential_isolation.rs");
-    let evidence = fs::read_to_string(&g2).map_err(|error| {
-        format!(
-            "G-2 claim has no executable evidence {}: {error}",
+    if !g2.is_file() {
+        return Err(format!(
+            "G-2 claim has no conformance module {}",
             g2.display()
-        )
-    })?;
-    if !evidence.contains("holds_runtime_bound_credentials_reject_cross_user_reuse") {
-        return Err("G-2 evidence must contain a holds_ credential-isolation test".to_owned());
+        ));
     }
     Ok(())
 }
@@ -723,7 +747,7 @@ impl Drop for TemporaryTree {
 
 #[cfg(test)]
 mod tests {
-    use super::{migration_changes, root};
+    use super::{migration_changes, root, validate_conformance_test_result};
     use std::fs;
     use std::io::ErrorKind;
     use std::os::unix::fs::PermissionsExt;
@@ -832,6 +856,26 @@ mod tests {
             "fixture Git commands must not inherit system configuration"
         );
         Ok(())
+    }
+
+    #[test]
+    fn conformance_requires_exactly_one_executed_test() {
+        let green = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+        assert!(
+            validate_conformance_test_result(green).is_ok(),
+            "one executed negative test must be accepted as evidence"
+        );
+
+        for invalid in [
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out",
+            "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out",
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+        ] {
+            assert!(
+                validate_conformance_test_result(invalid).is_err(),
+                "zero, ignored, filtered, or duplicate tests must not count as evidence: {invalid}"
+            );
+        }
     }
 
     #[test]

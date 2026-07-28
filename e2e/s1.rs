@@ -251,6 +251,57 @@ impl Harness {
         .into())
     }
 
+    fn tool_provider_is_attached(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        let workspace = self.runtime_ref(namespace, name, "workspace")?;
+        let sandbox = self.runtime_ref(namespace, name, "sandbox")?;
+        let output = Command::new(&self.openshell)
+            .args(["--gateway-endpoint"])
+            .arg(env::var("STEWARD_OPENSHELL_ENDPOINT")?)
+            .args([
+                "--workspace",
+                &workspace,
+                "sandbox",
+                "provider",
+                "list",
+                &sandbox,
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "sandbox provider lookup failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+            .into());
+        }
+        Ok(String::from_utf8(output.stdout)?.contains("steward-mcp-gw"))
+    }
+
+    fn wait_tool_provider_attached(
+        &self,
+        namespace: &str,
+        name: &str,
+        expected: bool,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn Error>> {
+        let deadline = Instant::now() + timeout;
+        let mut last = !expected;
+        while Instant::now() < deadline {
+            last = self.tool_provider_is_attached(namespace, name)?;
+            if last == expected {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        Err(io::Error::other(format!(
+            "tool provider attachment for {namespace}/{name} remained {last}, expected {expected}"
+        ))
+        .into())
+    }
+
     fn start_mint_forward(&mut self) -> Result<u16, Box<dyn Error>> {
         let namespace = env::var("STEWARD_MINT_TEST_NAMESPACE")?;
         let service = env::var("STEWARD_MINT_TEST_SERVICE")?;
@@ -409,6 +460,19 @@ fn e2e_s1_tool_call_as_acting_user() -> Result<(), Box<dyn Error>> {
         401,
         "a forged and expired SVID must fail closed at the mint"
     );
+
+    harness.write_runtime(
+        ALICE_NAMESPACE,
+        ALICE_RUNTIME,
+        "alice@example.com",
+        false,
+    )?;
+    harness.wait_tool_provider_attached(
+        ALICE_NAMESPACE,
+        ALICE_RUNTIME,
+        false,
+        Duration::from_secs(60),
+    )?;
 
     harness.write_runtime(BOB_NAMESPACE, BOB_RUNTIME, "bob@example.org", true)?;
     harness.wait_phase(
