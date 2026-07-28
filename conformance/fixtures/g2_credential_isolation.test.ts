@@ -4,22 +4,42 @@ import type { Hop1Identity } from "../shared/identity/hop1";
 import { encryptSecret } from "../shared/oauth/crypto";
 import { GitHubTokenBroker } from "../shared/oauth/github";
 import { InMemoryOAuthTokenStore } from "../shared/oauth/memory-store";
+import type { ToolPolicyInput } from "../shared/policy/policy";
 import { createGithubMcpProxyHandler } from "../servers/github-mcp/wrapper/src/proxy";
 
 const issuer = "https://issuer.example.test";
+const aliceTool = {
+  provider: "github",
+  resource: "search_repositories",
+  action: "read",
+};
 const alice: Hop1Identity = {
   profile: "fixture",
   issuer,
   subject: "runtime-alice",
   email: "alice@example.com",
-  claims: {},
+  claims: {
+    steward: {
+      acting_as: "user",
+      runtime_uid: "runtime-alice",
+      tools: [aliceTool],
+      version: 1,
+    },
+  },
 };
 const bob: Hop1Identity = {
   profile: "fixture",
   issuer,
   subject: "runtime-bob",
   email: "bob@example.org",
-  claims: {},
+  claims: {
+    steward: {
+      acting_as: "user",
+      runtime_uid: "runtime-bob",
+      tools: [],
+      version: 1,
+    },
+  },
 };
 
 test("one subject cannot resolve another subject's provider credential", async () => {
@@ -32,7 +52,10 @@ test("one subject cannot resolve another subject's provider credential", async (
     hop1Subject: alice.subject,
     email: alice.email,
     scopesGranted: ["repo"],
-    encryptedRefreshToken: encryptSecret("fixture-provider-token", encryptionKey),
+    encryptedRefreshToken: encryptSecret(
+      "fixture-provider-token",
+      encryptionKey,
+    ),
     createdAt: now,
     updatedAt: now,
   });
@@ -45,11 +68,30 @@ test("one subject cannot resolve another subject's provider credential", async (
     },
     tokenStore: store,
   });
+  const credentialResolutions: string[] = [];
+  const policyInputs: ToolPolicyInput[] = [];
   const upstreamAuthorizations: string[] = [];
   const handler = createGithubMcpProxyHandler({
     upstreamUrl: "https://provider.example.test/mcp",
-    authenticate: (token) => Promise.resolve(token === "hop1-alice" ? alice : bob),
-    resolveGithubToken: (identity) => broker.getAccessToken(identity, ["repo"]),
+    authenticate: (token) =>
+      Promise.resolve(token === "hop1-alice" ? alice : bob),
+    resolveGithubToken: (identity) => {
+      credentialResolutions.push(identity.subject);
+      return broker.getAccessToken(identity, ["repo"]);
+    },
+    policy: {
+      decide: (input) => {
+        policyInputs.push(input);
+        return Promise.resolve(
+          hasVerifiedToolAuthority(input)
+            ? { kind: "allow" }
+            : {
+                kind: "deny",
+                reason: "verified tool authority missing",
+              },
+        );
+      },
+    },
     fetch: (request) => {
       upstreamAuthorizations.push(request.headers.get("authorization") ?? "");
       return Promise.resolve(
@@ -66,20 +108,65 @@ test("one subject cannot resolve another subject's provider credential", async (
 
   const aliceResponse = await callTool(handler, "hop1-alice");
   expect(aliceResponse.status).toBe(200);
-  expect(await aliceResponse.text()).toContain("example-org/fixture-repository");
+  expect(await aliceResponse.text()).toContain(
+    "example-org/fixture-repository",
+  );
 
   const bobResponse = await callTool(handler, "hop1-bob");
-  expect(bobResponse.status).toBe(401);
+  expect(bobResponse.status).toBe(200);
   expect(await bobResponse.json()).toEqual({
     jsonrpc: "2.0",
-    id: null,
+    id: 1,
     error: {
-      code: -32001,
-      message: "Unauthorized: GitHub account is not connected",
+      code: -32003,
+      message:
+        "Policy denied search_repositories: verified tool authority missing",
     },
   });
+  expect(policyInputs).toHaveLength(2);
+  expect(credentialResolutions).toEqual(["runtime-alice"]);
   expect(upstreamAuthorizations).toEqual(["Bearer fixture-provider-token"]);
 });
+
+function hasVerifiedToolAuthority(input: ToolPolicyInput): boolean {
+  const expectedSubject =
+    input.principal === alice.email
+      ? alice.subject
+      : input.principal === bob.email
+        ? bob.subject
+        : "";
+  const tokenClaims = (
+    input as ToolPolicyInput & {
+      tokenClaims?: Record<string, unknown>;
+    }
+  ).tokenClaims;
+  const steward = tokenClaims?.steward;
+  if (
+    !tokenClaims ||
+    tokenClaims.email !== input.principal ||
+    tokenClaims.sub !== expectedSubject ||
+    typeof steward !== "object" ||
+    steward === null ||
+    Array.isArray(steward)
+  ) {
+    return false;
+  }
+  const claims = steward as Record<string, unknown>;
+  const tools = claims.tools;
+  return (
+    claims.runtime_uid === expectedSubject &&
+    Array.isArray(tools) &&
+    tools.some(
+      (tool) =>
+        typeof tool === "object" &&
+        tool !== null &&
+        !Array.isArray(tool) &&
+        (tool as Record<string, unknown>).provider === aliceTool.provider &&
+        (tool as Record<string, unknown>).resource === input.tool &&
+        (tool as Record<string, unknown>).action === aliceTool.action,
+    )
+  );
+}
 
 function callTool(
   handler: (request: Request) => Promise<Response>,

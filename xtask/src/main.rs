@@ -373,19 +373,29 @@ fn conformance(arguments: &[String]) -> TaskResult {
 }
 
 fn validate_conformance_test_result(output: &str) -> TaskResult {
-    const EXPECTED: &str =
+    const EXPECTED_RUST: &str =
         "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
-    let summaries = output
+    const EXPECTED_UPSTREAM: &str = "G-2 upstream result: 1 passed; 0 failed; 0 skipped";
+    let rust_summaries = output
         .lines()
         .map(str::trim)
         .filter(|line| line.starts_with("test result:"))
         .collect::<Vec<_>>();
-    if summaries.len() == 1 && summaries[0].starts_with(EXPECTED) {
+    let upstream_summaries = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("G-2 upstream result:"))
+        .collect::<Vec<_>>();
+    if rust_summaries.len() == 1
+        && rust_summaries[0].starts_with(EXPECTED_RUST)
+        && upstream_summaries == [EXPECTED_UPSTREAM]
+    {
         Ok(())
     } else {
         Err(format!(
-            "G-2 evidence must execute exactly one passing test with none ignored or filtered; observed summaries: {}",
-            summaries.join(" | ")
+            "G-2 evidence must execute exactly one upstream test and one Rust wrapper with none skipped, ignored, or filtered; upstream: {}; Rust: {}",
+            upstream_summaries.join(" | "),
+            rust_summaries.join(" | ")
         ))
     }
 }
@@ -860,10 +870,28 @@ mod tests {
 
     #[test]
     fn conformance_requires_exactly_one_executed_test() {
-        let green = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+        let rust_green =
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+        let green = format!("G-2 upstream result: 1 passed; 0 failed; 0 skipped\n{rust_green}");
         assert!(
-            validate_conformance_test_result(green).is_ok(),
-            "one executed negative test must be accepted as evidence"
+            validate_conformance_test_result(&green).is_ok(),
+            "one executed upstream negative test and one Rust wrapper must be accepted as evidence"
+        );
+        assert!(
+            validate_conformance_test_result(rust_green).is_err(),
+            "a passing Rust wrapper without an executed Bun test must not count as evidence"
+        );
+        assert!(
+            validate_conformance_test_result("G-2 upstream result: 1 passed; 0 failed; 0 skipped")
+                .is_err(),
+            "an upstream sentinel without its Rust wrapper must not count as evidence"
+        );
+        let duplicate = format!(
+            "G-2 upstream result: 1 passed; 0 failed; 0 skipped\nG-2 upstream result: 1 passed; 0 failed; 0 skipped\n{rust_green}"
+        );
+        assert!(
+            validate_conformance_test_result(&duplicate).is_err(),
+            "duplicate upstream summaries must not count as exact evidence"
         );
 
         for invalid in [
@@ -871,8 +899,9 @@ mod tests {
             "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out",
             "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
         ] {
+            let output = format!("G-2 upstream result: 1 passed; 0 failed; 0 skipped\n{invalid}");
             assert!(
-                validate_conformance_test_result(invalid).is_err(),
+                validate_conformance_test_result(&output).is_err(),
                 "zero, ignored, filtered, or duplicate tests must not count as evidence: {invalid}"
             );
         }

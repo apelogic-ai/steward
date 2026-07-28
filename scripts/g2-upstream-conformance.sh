@@ -17,7 +17,7 @@ case "${TARGET}" in
     ;;
 esac
 
-for command in curl docker git tar; do
+for command in awk curl docker git tar; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is missing: ${command}" >&2
     exit 2
@@ -82,12 +82,36 @@ cp \
   "${source_dir}/conformance/g2_credential_isolation.test.ts"
 mkdir -p "${source_dir}/node_modules"
 
-docker run --rm \
-  --mount "type=bind,source=${source_dir},target=/src,readonly" \
-  --mount "type=tmpfs,target=/src/node_modules" \
-  --workdir /src \
-  --entrypoint sh \
-  "${BUN_IMAGE}" \
-  -ceu 'bun install --frozen-lockfile; bun test conformance/g2_credential_isolation.test.ts'
+if bun_output="$(
+  docker run --rm \
+    --mount "type=bind,source=${source_dir},target=/src,readonly" \
+    --mount "type=tmpfs,target=/src/node_modules" \
+    --workdir /src \
+    --entrypoint sh \
+    "${BUN_IMAGE}" \
+    -ceu 'bun install --frozen-lockfile; bun test conformance/g2_credential_isolation.test.ts' \
+    2>&1
+)"; then
+  printf '%s\n' "${bun_output}"
+else
+  printf '%s\n' "${bun_output}" >&2
+  exit 1
+fi
 
+if ! printf '%s\n' "${bun_output}" | awk '
+  $0 == " 1 pass" { passes += 1 }
+  $0 == " 0 fail" { failures += 1 }
+  $0 ~ /^ [0-9]+ skip$/ { skips += $1 }
+  $0 ~ /^Ran 1 test across 1 file\./ { runs += 1 }
+  END {
+    if (passes != 1 || failures != 1 || skips != 0 || runs != 1) {
+      exit 1
+    }
+  }
+'; then
+  echo "G-2 upstream evidence must execute exactly one passing Bun test with none skipped" >&2
+  exit 1
+fi
+
+echo "G-2 upstream result: 1 passed; 0 failed; 0 skipped"
 echo "G-2 ${TARGET} upstream evidence passed against mcp-gw ${commit}"
