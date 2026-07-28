@@ -143,7 +143,6 @@ jobs:
   latest-nightly:
     name: latest-nightly
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -155,4 +154,19 @@ jobs:
         run: rustup toolchain install 1.95.0 --profile minimal
 
       - name: Run informational latest-upstream lane
+        id: latest_conformance
+        continue-on-error: true
         run: cargo xtask conformance --latest
+
+      - name: Report latest-upstream finding
+        if: steps.latest_conformance.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning title=Latest-upstream conformance finding::The latest upstream target does not yet provide the pinned guarantees; inspect the failed conformance step."
+          {
+            echo "### Latest-upstream conformance finding"
+            echo
+            echo "The informational latest-upstream test is red."
+            echo "The pinned lane remains the merge-blocking source of truth."
+            echo "Inspect the failed conformance step for the upstream gap."
+          } >> "${GITHUB_STEP_SUMMARY}"
