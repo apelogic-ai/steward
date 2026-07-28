@@ -10,10 +10,10 @@ use jwt_compact::{AlgorithmExt, Token};
 use rand_core::OsRng;
 use serde::Deserialize;
 use steward_mint::{
-    AuthorityBinding, AuthorityResolver, AuthorityState, DEFAULT_AUTHORITY_TTL,
-    IntrospectionClientCredential, Mint, MintConfig, MintConfigError, MintError, MintSigningKey,
-    SPIFFE_CLIENT_ASSERTION_TYPE, SvidAssertion, SvidValidationError, SvidValidator,
-    TokenGrantRequest, ValidatedWorkload,
+    AuthorityBinding, AuthorityResolver, AuthorityState, CredentialGrant, CredentialGrantResolver,
+    DEFAULT_AUTHORITY_TTL, IntrospectionClientCredential, Mint, MintConfig, MintConfigError,
+    MintError, MintSigningKey, OpaqueAccessToken, SPIFFE_CLIENT_ASSERTION_TYPE, SvidAssertion,
+    SvidValidationError, SvidValidator, TokenGrantRequest, ValidatedWorkload,
 };
 use steward_types::{Email, Principal, RuntimeId, ToolGrant};
 
@@ -48,6 +48,32 @@ impl AuthorityResolver for FixedResolver {
     ) -> impl Future<Output = Result<AuthorityBinding, MintError>> + Send {
         self.calls.fetch_add(1, Ordering::SeqCst);
         ready(self.outcome.clone())
+    }
+}
+
+struct FixedCredentialResolver {
+    calls: Arc<AtomicUsize>,
+    token: Option<&'static str>,
+}
+
+impl CredentialGrantResolver for FixedCredentialResolver {
+    async fn resolve(
+        &self,
+        scope: &[String],
+        _authority: &AuthorityBinding,
+    ) -> Result<CredentialGrant, MintError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if scope == ["inference"] {
+            self.token
+                .map(|token| {
+                    OpaqueAccessToken::new(token.to_owned())
+                        .map(CredentialGrant::AccessToken)
+                        .map_err(|_| MintError::CredentialUnavailable)
+                })
+                .unwrap_or(Err(MintError::CredentialUnavailable))
+        } else {
+            Ok(CredentialGrant::NotHandled)
+        }
     }
 }
 
@@ -112,6 +138,31 @@ fn mint(
     )
     .map_err(|error| format!("test mint config must be valid: {error:?}"))?;
     Ok((mint, calls, verifying_key))
+}
+
+fn mint_for_inference_without_credential_resolver() -> Result<TestMint, String> {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    Mint::new(
+        MintConfig {
+            issuer: "https://mint.example.test".to_owned(),
+            audience: "mcp-gw.example.test".to_owned(),
+            allowed_scopes: vec!["inference".to_owned()],
+            svid_audience: "https://mint.example.test".to_owned(),
+            authority_ttl: DEFAULT_AUTHORITY_TTL,
+            introspection_client_credential: IntrospectionClientCredential::new(
+                "gateway-credential".to_owned(),
+            ),
+        },
+        MintSigningKey::from_bytes(&signing_key.to_bytes()),
+        FixedValidator {
+            outcome: Ok(validated_workload()),
+        },
+        FixedResolver {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Ok(active_binding()),
+        },
+    )
+    .map_err(|error| format!("test mint config must be valid: {error:?}"))
 }
 
 fn validated_workload() -> ValidatedWorkload {
@@ -298,6 +349,152 @@ async fn service_principal_is_rejected_in_v0_1_0() -> Result<(), String> {
         result.err(),
         Some(MintError::UnsupportedPrincipal),
         "the service-principal arm is schema-only in v0.1.0"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn inference_scope_fails_closed_without_a_runtime_credential_resolver() -> Result<(), String>
+{
+    let mint = mint_for_inference_without_credential_resolver()?;
+    let mut inference_request = request();
+    inference_request.scope = vec!["inference".to_owned()];
+
+    let result = mint.exchange(inference_request).await;
+
+    assert!(
+        result.is_err(),
+        "an inference exchange must never fall back to a signed HOP-1 when no runtime credential resolver is configured"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn inference_scope_cannot_fall_back_to_hop1_when_combined_with_another_scope()
+-> Result<(), String> {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let mint = Mint::new(
+        MintConfig {
+            issuer: "https://mint.example.test".to_owned(),
+            audience: "mcp-gw.example.test".to_owned(),
+            allowed_scopes: vec!["inference".to_owned(), "tools".to_owned()],
+            svid_audience: "https://mint.example.test".to_owned(),
+            authority_ttl: DEFAULT_AUTHORITY_TTL,
+            introspection_client_credential: IntrospectionClientCredential::new(
+                "gateway-credential".to_owned(),
+            ),
+        },
+        MintSigningKey::from_bytes(&signing_key.to_bytes()),
+        FixedValidator {
+            outcome: Ok(validated_workload()),
+        },
+        FixedResolver {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Ok(active_binding()),
+        },
+    )
+    .map_err(|error| format!("test mint config must be valid: {error:?}"))?;
+    let mut mixed_request = request();
+    mixed_request.scope = vec!["inference".to_owned(), "tools".to_owned()];
+
+    let result = mint.exchange(mixed_request).await;
+
+    assert!(
+        result.is_err(),
+        "any request containing inference authority must fail closed instead of receiving HOP-1"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn inference_scope_returns_only_the_runtime_bound_opaque_credential() -> Result<(), String> {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let credential_calls = Arc::new(AtomicUsize::new(0));
+    let mint = Mint::new_with_credential_resolver(
+        MintConfig {
+            issuer: "https://mint.example.test".to_owned(),
+            audience: "mcp-gw.example.test".to_owned(),
+            allowed_scopes: vec!["inference".to_owned()],
+            svid_audience: "https://mint.example.test".to_owned(),
+            authority_ttl: DEFAULT_AUTHORITY_TTL,
+            introspection_client_credential: IntrospectionClientCredential::new(
+                "gateway-credential".to_owned(),
+            ),
+        },
+        MintSigningKey::from_bytes(&signing_key.to_bytes()),
+        FixedValidator {
+            outcome: Ok(validated_workload()),
+        },
+        FixedResolver {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Ok(active_binding()),
+        },
+        FixedCredentialResolver {
+            calls: credential_calls.clone(),
+            token: Some("sk-steward-test-runtime-key"),
+        },
+    )
+    .map_err(|error| format!("test mint config must be valid: {error:?}"))?;
+    let mut inference_request = request();
+    inference_request.scope = vec!["inference".to_owned()];
+
+    let response = mint
+        .exchange(inference_request)
+        .await
+        .map_err(|error| format!("active runtime inference exchange failed: {error:?}"))?;
+
+    assert_eq!(response.access_token(), "sk-steward-test-runtime-key");
+    assert_eq!(response.scope(), "inference");
+    assert_eq!(response.expires_in(), 60);
+    assert_eq!(
+        credential_calls.load(Ordering::SeqCst),
+        1,
+        "a verified active runtime must resolve exactly one runtime-bound credential"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn inactive_runtime_fails_before_inference_credential_lookup() -> Result<(), String> {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let credential_calls = Arc::new(AtomicUsize::new(0));
+    let mut binding = active_binding();
+    binding.state = AuthorityState::Suspended;
+    let mint = Mint::new_with_credential_resolver(
+        MintConfig {
+            issuer: "https://mint.example.test".to_owned(),
+            audience: "mcp-gw.example.test".to_owned(),
+            allowed_scopes: vec!["inference".to_owned()],
+            svid_audience: "https://mint.example.test".to_owned(),
+            authority_ttl: DEFAULT_AUTHORITY_TTL,
+            introspection_client_credential: IntrospectionClientCredential::new(
+                "gateway-credential".to_owned(),
+            ),
+        },
+        MintSigningKey::from_bytes(&signing_key.to_bytes()),
+        FixedValidator {
+            outcome: Ok(validated_workload()),
+        },
+        FixedResolver {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Ok(binding),
+        },
+        FixedCredentialResolver {
+            calls: credential_calls.clone(),
+            token: Some("sk-steward-test-runtime-key"),
+        },
+    )
+    .map_err(|error| format!("test mint config must be valid: {error:?}"))?;
+    let mut inference_request = request();
+    inference_request.scope = vec!["inference".to_owned()];
+
+    let result = mint.exchange(inference_request).await;
+
+    assert_eq!(result.err(), Some(MintError::AuthorityInactive));
+    assert_eq!(
+        credential_calls.load(Ordering::SeqCst),
+        0,
+        "suspended authority must fail before any credential Secret lookup"
     );
     Ok(())
 }

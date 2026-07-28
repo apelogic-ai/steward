@@ -3463,6 +3463,7 @@ name = "steward-mint-bin"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "k8s-openapi",
  "kube",
  "steward-adapter-openshell",
  "steward-adapter-spire",
