@@ -13,15 +13,18 @@ const aliceTool = {
   resource: "search_repositories",
   action: "read",
 };
+const aliceRuntimeUid = "runtime-alice";
+const bobRuntimeUid = "runtime-bob";
+const carolRuntimeUid = "runtime-carol";
 const alice: Hop1Identity = {
   profile: "fixture",
   issuer,
-  subject: "runtime-alice",
+  subject: "alice@example.com",
   email: "alice@example.com",
   claims: {
     steward: {
       acting_as: "user",
-      runtime_uid: "runtime-alice",
+      runtime_uid: aliceRuntimeUid,
       tools: [aliceTool],
       version: 1,
     },
@@ -30,12 +33,26 @@ const alice: Hop1Identity = {
 const bob: Hop1Identity = {
   profile: "fixture",
   issuer,
-  subject: "runtime-bob",
+  subject: "bob@example.org",
   email: "bob@example.org",
   claims: {
     steward: {
       acting_as: "user",
-      runtime_uid: "runtime-bob",
+      runtime_uid: bobRuntimeUid,
+      tools: [aliceTool],
+      version: 1,
+    },
+  },
+};
+const carol: Hop1Identity = {
+  profile: "fixture",
+  issuer,
+  subject: "carol@example.com",
+  email: "carol@example.com",
+  claims: {
+    steward: {
+      acting_as: "user",
+      runtime_uid: carolRuntimeUid,
       tools: [],
       version: 1,
     },
@@ -74,7 +91,9 @@ test("one subject cannot resolve another subject's provider credential", async (
   const handler = createGithubMcpProxyHandler({
     upstreamUrl: "https://provider.example.test/mcp",
     authenticate: (token) =>
-      Promise.resolve(token === "hop1-alice" ? alice : bob),
+      Promise.resolve(
+        token === "hop1-alice" ? alice : token === "hop1-bob" ? bob : carol,
+      ),
     resolveGithubToken: (identity) => {
       credentialResolutions.push(identity.subject);
       return broker.getAccessToken(identity, ["repo"]);
@@ -113,8 +132,19 @@ test("one subject cannot resolve another subject's provider credential", async (
   );
 
   const bobResponse = await callTool(handler, "hop1-bob");
-  expect(bobResponse.status).toBe(200);
+  expect(bobResponse.status).toBe(401);
   expect(await bobResponse.json()).toEqual({
+    jsonrpc: "2.0",
+    id: null,
+    error: {
+      code: -32001,
+      message: "Unauthorized: GitHub account is not connected",
+    },
+  });
+
+  const carolResponse = await callTool(handler, "hop1-carol");
+  expect(carolResponse.status).toBe(200);
+  expect(await carolResponse.json()).toEqual({
     jsonrpc: "2.0",
     id: 1,
     error: {
@@ -123,18 +153,20 @@ test("one subject cannot resolve another subject's provider credential", async (
         "Policy denied search_repositories: verified tool authority missing",
     },
   });
-  expect(policyInputs).toHaveLength(2);
-  expect(credentialResolutions).toEqual(["runtime-alice"]);
+  expect(policyInputs).toHaveLength(3);
+  expect(credentialResolutions).toEqual([alice.subject, bob.subject]);
   expect(upstreamAuthorizations).toEqual(["Bearer fixture-provider-token"]);
 });
 
 function hasVerifiedToolAuthority(input: ToolPolicyInput): boolean {
-  const expectedSubject =
+  const expectedRuntimeUid =
     input.principal === alice.email
-      ? alice.subject
+      ? aliceRuntimeUid
       : input.principal === bob.email
-        ? bob.subject
-        : "";
+        ? bobRuntimeUid
+        : input.principal === carol.email
+          ? carolRuntimeUid
+          : undefined;
   const tokenClaims = (
     input as ToolPolicyInput & {
       tokenClaims?: Record<string, unknown>;
@@ -144,7 +176,8 @@ function hasVerifiedToolAuthority(input: ToolPolicyInput): boolean {
   if (
     !tokenClaims ||
     tokenClaims.email !== input.principal ||
-    tokenClaims.sub !== expectedSubject ||
+    tokenClaims.sub !== input.principal ||
+    !expectedRuntimeUid ||
     typeof steward !== "object" ||
     steward === null ||
     Array.isArray(steward)
@@ -154,16 +187,18 @@ function hasVerifiedToolAuthority(input: ToolPolicyInput): boolean {
   const claims = steward as Record<string, unknown>;
   const tools = claims.tools;
   return (
-    claims.runtime_uid === expectedSubject &&
+    claims.acting_as === "user" &&
+    claims.version === 1 &&
+    claims.runtime_uid === expectedRuntimeUid &&
     Array.isArray(tools) &&
     tools.some(
       (tool) =>
         typeof tool === "object" &&
         tool !== null &&
         !Array.isArray(tool) &&
-        (tool as Record<string, unknown>).provider === aliceTool.provider &&
+        (tool as Record<string, unknown>).provider === input.service &&
         (tool as Record<string, unknown>).resource === input.tool &&
-        (tool as Record<string, unknown>).action === aliceTool.action,
+        (tool as Record<string, unknown>).action === input.actionClass,
     )
   );
 }
