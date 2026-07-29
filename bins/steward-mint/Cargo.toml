@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 axum.workspace = true # Serves the internal token, JWKS, and authenticated introspection endpoints.
+k8s-openapi.workspace = true # Reads runtime-bound inference credentials from typed Kubernetes Secrets without custom base64 parsing.
 kube = { workspace = true, features = ["client", "ring", "rustls-tls"] } # Resolves live AgentRuntime authority from the Kubernetes source of truth.
 steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.0.0", features = ["identity"] } # Resolves vendor sandbox UUIDs without leaking OpenShell labels into the mint.
 steward-adapter-spire = { path = "../../adapters/spire", version = "=0.0.0" } # Connects the workload-identity port to the mounted SPIRE socket.

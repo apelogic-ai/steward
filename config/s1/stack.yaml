@@ -50,6 +50,43 @@ subjects:
     name: steward-mint
     namespace: steward-system
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: steward-s1-mint-runtime-credentials
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: steward-s1-mint-runtime-credentials
+  namespace: team-a
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: steward-s1-mint-runtime-credentials
+subjects:
+  - kind: ServiceAccount
+    name: steward-mint
+    namespace: steward-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: steward-s1-mint-runtime-credentials
+  namespace: team-b
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: steward-s1-mint-runtime-credentials
+subjects:
+  - kind: ServiceAccount
+    name: steward-mint
+    namespace: steward-system
+---
 apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterSPIFFEID
 metadata:

@@ -47,6 +47,7 @@ impl AuthorityResolver for FixedResolver {
         ready(Ok(AuthorityBinding {
             workload_id: WORKLOAD.to_owned(),
             runtime: RuntimeId("runtime-uid-a".to_owned()),
+            runtime_namespace: "team-a".to_owned(),
             principal: Principal::User {
                 acting_user: Email("alice@example.com".to_owned()),
             },
@@ -269,6 +270,7 @@ impl AuthorityResolver for RevocableResolver {
         ready(Ok(AuthorityBinding {
             workload_id: WORKLOAD.to_owned(),
             runtime: RuntimeId("runtime-uid-a".to_owned()),
+            runtime_namespace: "team-a".to_owned(),
             principal: Principal::User {
                 acting_user: Email("alice@example.com".to_owned()),
             },

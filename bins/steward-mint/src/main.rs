@@ -5,6 +5,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use k8s_openapi::api::core::v1::Secret;
 use kube::Client;
 use kube::api::{Api, ListParams};
 use steward_adapter_openshell::{
@@ -12,12 +13,98 @@ use steward_adapter_openshell::{
 };
 use steward_adapter_spire::SpireSvidValidator;
 use steward_mint::{
-    AuthorityBinding, AuthorityResolver, AuthorityState, DEFAULT_AUTHORITY_TTL,
-    IntrospectionClientCredential, Mint, MintConfig, MintError, MintSigningKey, ValidatedWorkload,
-    router,
+    AuthorityBinding, AuthorityResolver, AuthorityState, CredentialGrant, CredentialGrantResolver,
+    DEFAULT_AUTHORITY_TTL, IntrospectionClientCredential, Mint, MintConfig, MintError,
+    MintSigningKey, OpaqueAccessToken, ValidatedWorkload, router,
 };
 use steward_types::{AgentRuntime, Phase, RuntimeId};
 use tokio::net::TcpListener;
+
+const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
+const INFERENCE_CREDENTIAL_DATA_KEY: &str = "access-token";
+
+fn credential_secret_name(runtime: &RuntimeId) -> Result<&str, MintError> {
+    let bytes = runtime.0.as_bytes();
+    let valid_boundary = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    if bytes.is_empty()
+        || bytes.len() > 63
+        || !bytes.first().copied().is_some_and(valid_boundary)
+        || !bytes.last().copied().is_some_and(valid_boundary)
+        || !bytes
+            .iter()
+            .all(|byte| valid_boundary(*byte) || *byte == b'-')
+    {
+        return Err(MintError::CredentialUnavailable);
+    }
+    Ok(&runtime.0)
+}
+
+fn credential_from_secret(
+    authority: &AuthorityBinding,
+    secret: &Secret,
+) -> Result<OpaqueAccessToken, MintError> {
+    if secret.metadata.namespace.as_deref() != Some(authority.runtime_namespace.as_str()) {
+        return Err(MintError::WorkloadMismatch);
+    }
+    if secret
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(RUNTIME_UID_LABEL))
+        != Some(&authority.runtime.0)
+    {
+        return Err(MintError::WorkloadMismatch);
+    }
+    let runtime_owns_secret = secret
+        .metadata
+        .owner_references
+        .as_ref()
+        .is_some_and(|owners| {
+            owners.iter().any(|owner| {
+                owner.api_version == "agents.apelogic.ai/v1alpha1"
+                    && owner.kind == "AgentRuntime"
+                    && owner.uid == authority.runtime.0
+                    && owner.controller == Some(true)
+            })
+        });
+    if !runtime_owns_secret {
+        return Err(MintError::WorkloadMismatch);
+    }
+    let material = secret
+        .data
+        .as_ref()
+        .and_then(|data| data.get(INFERENCE_CREDENTIAL_DATA_KEY))
+        .ok_or(MintError::CredentialUnavailable)?
+        .0
+        .clone();
+    let credential = String::from_utf8(material).map_err(|_| MintError::CredentialUnavailable)?;
+    OpaqueAccessToken::new(credential).map_err(|_| MintError::CredentialUnavailable)
+}
+
+#[derive(Clone)]
+struct KubernetesCredentialGrantResolver {
+    client: Client,
+}
+
+impl CredentialGrantResolver for KubernetesCredentialGrantResolver {
+    async fn resolve(
+        &self,
+        scope: &[String],
+        authority: &AuthorityBinding,
+    ) -> Result<CredentialGrant, MintError> {
+        if scope != ["inference"] {
+            return Ok(CredentialGrant::NotHandled);
+        }
+        let name = credential_secret_name(&authority.runtime)?;
+        let secrets = Api::<Secret>::namespaced(self.client.clone(), &authority.runtime_namespace);
+        let secret = secrets
+            .get_opt(name)
+            .await
+            .map_err(|_| MintError::AuthorityUnavailable)?
+            .ok_or(MintError::CredentialUnavailable)?;
+        credential_from_secret(authority, &secret).map(CredentialGrant::AccessToken)
+    }
+}
 
 fn authority_from_runtimes(
     workload: &ValidatedWorkload,
@@ -40,6 +127,12 @@ fn authority_from_runtimes(
         .clone()
         .filter(|uid| !uid.is_empty())
         .ok_or(MintError::WorkloadMismatch)?;
+    let runtime_namespace = runtime
+        .metadata
+        .namespace
+        .clone()
+        .filter(|namespace| !namespace.is_empty())
+        .ok_or(MintError::WorkloadMismatch)?;
     let phase = runtime
         .status
         .as_ref()
@@ -49,6 +142,7 @@ fn authority_from_runtimes(
     Ok(AuthorityBinding {
         workload_id: workload.spiffe_id.clone(),
         runtime: RuntimeId(runtime_uid),
+        runtime_namespace,
         principal: runtime.spec.principal.clone(),
         tools: runtime.spec.tools.clone(),
         state,
@@ -108,8 +202,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .map_err(|error| io::Error::other(format!("OpenShell identity discovery failed: {error:?}")))?;
     let resolver = KubernetesAuthorityResolver {
         identity,
-        runtimes: Api::all(client),
+        runtimes: Api::all(client.clone()),
     };
+    let credential_resolver = KubernetesCredentialGrantResolver { client };
     let validator = SpireSvidValidator::connect_env()
         .await
         .map_err(|_| io::Error::other("SPIRE Workload API connection failed"))?;
@@ -139,8 +234,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             introspection_credential,
         ),
     };
-    let mint = Mint::new(config, signing_key, validator, resolver)
-        .map_err(|error| io::Error::other(format!("mint configuration is invalid: {error:?}")))?;
+    let mint = Mint::new_with_credential_resolver(
+        config,
+        signing_key,
+        validator,
+        resolver,
+        credential_resolver,
+    )
+    .map_err(|error| io::Error::other(format!("mint configuration is invalid: {error:?}")))?;
     let listener = TcpListener::bind(
         env::var("STEWARD_MINT_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_owned()),
     )
@@ -166,14 +267,22 @@ fn load_signing_key(path: &str) -> Result<MintSigningKey, io::Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use k8s_openapi::ByteString;
+    use k8s_openapi::api::core::v1::Secret;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
     use steward_adapter_openshell::SandboxBinding;
-    use steward_mint::{AuthorityState, MintError, ValidatedWorkload};
+    use steward_mint::{AuthorityBinding, AuthorityState, MintError, ValidatedWorkload};
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget, Duration, Email,
-        Phase, Principal, RuntimeRefs, ToolGrant,
+        Phase, Principal, RuntimeId, RuntimeRefs, ToolGrant,
     };
 
-    use super::{authority_from_runtimes, authority_state};
+    use super::{
+        INFERENCE_CREDENTIAL_DATA_KEY, RUNTIME_UID_LABEL, authority_from_runtimes, authority_state,
+        credential_from_secret, credential_secret_name,
+    };
 
     fn runtime(uid: &str, workspace: &str, sandbox: &str) -> AgentRuntime {
         let mut runtime = AgentRuntime::new(
@@ -200,6 +309,7 @@ mod tests {
                 bindings: None,
             },
         );
+        runtime.metadata.namespace = Some("team-a".to_owned());
         runtime.metadata.uid = Some(uid.to_owned());
         runtime.status = Some(AgentRuntimeStatus {
             phase: Phase::Running,
@@ -229,6 +339,60 @@ mod tests {
         }
     }
 
+    fn credential_secret(runtime_uid: &str, owner_uid: &str) -> Secret {
+        Secret {
+            data: Some(BTreeMap::from([(
+                INFERENCE_CREDENTIAL_DATA_KEY.to_owned(),
+                ByteString(b"sk-steward-test-runtime-key".to_vec()),
+            )])),
+            metadata: kube::core::ObjectMeta {
+                labels: Some(BTreeMap::from([(
+                    RUNTIME_UID_LABEL.to_owned(),
+                    runtime_uid.to_owned(),
+                )])),
+                namespace: Some("team-a".to_owned()),
+                owner_references: Some(vec![OwnerReference {
+                    api_version: "agents.apelogic.ai/v1alpha1".to_owned(),
+                    block_owner_deletion: Some(true),
+                    controller: Some(true),
+                    kind: "AgentRuntime".to_owned(),
+                    name: "runtime-a".to_owned(),
+                    uid: owner_uid.to_owned(),
+                }]),
+                ..kube::core::ObjectMeta::default()
+            },
+            ..Secret::default()
+        }
+    }
+
+    fn authority(runtime_uid: &str, namespace: &str) -> AuthorityBinding {
+        AuthorityBinding {
+            workload_id: workload().spiffe_id,
+            runtime: RuntimeId(runtime_uid.to_owned()),
+            runtime_namespace: namespace.to_owned(),
+            principal: Principal::User {
+                acting_user: Email("alice@example.com".to_owned()),
+            },
+            tools: Vec::new(),
+            state: AuthorityState::Active,
+        }
+    }
+
+    fn manifest_document<'a>(
+        manifest: &'a str,
+        kind: &str,
+        name: &str,
+        namespace: Option<&str>,
+    ) -> Option<&'a str> {
+        manifest.split("\n---\n").find(|document| {
+            document.contains(&format!("kind: {kind}\n"))
+                && document.contains(&format!("  name: {name}\n"))
+                && namespace.is_none_or(|namespace| {
+                    document.contains(&format!("  namespace: {namespace}\n"))
+                })
+        })
+    }
+
     #[test]
     fn authority_resolution_rejects_an_ambiguous_runtime_binding() {
         let result = authority_from_runtimes(
@@ -256,6 +420,93 @@ mod tests {
     }
 
     #[test]
+    fn inference_credential_rejects_a_secret_bound_to_another_runtime() {
+        let result = credential_from_secret(
+            &authority("runtime-uid-a", "team-a"),
+            &credential_secret("runtime-uid-b", "runtime-uid-b"),
+        );
+
+        assert!(
+            matches!(result, Err(MintError::WorkloadMismatch)),
+            "a credential Secret must never cross its runtime-UID binding"
+        );
+    }
+
+    #[test]
+    fn inference_credential_rejects_a_non_kubernetes_runtime_uid() {
+        let runtime = RuntimeId("../runtime-a".to_owned());
+        let result = credential_secret_name(&runtime);
+
+        assert!(
+            matches!(result, Err(MintError::CredentialUnavailable)),
+            "an untrusted runtime identifier must not become a Kubernetes Secret name"
+        );
+    }
+
+    #[test]
+    fn inference_credential_accepts_only_the_matching_runtime_secret() {
+        let result = credential_from_secret(
+            &authority("runtime-uid-a", "team-a"),
+            &credential_secret("runtime-uid-a", "runtime-uid-a"),
+        );
+
+        assert!(
+            result.is_ok(),
+            "a well-formed credential bound to the exact runtime UID must be usable"
+        );
+    }
+
+    #[test]
+    fn inference_credential_rejects_a_forged_label_without_runtime_ownership() {
+        let result = credential_from_secret(
+            &authority("runtime-uid-a", "team-a"),
+            &credential_secret("runtime-uid-a", "runtime-uid-b"),
+        );
+
+        assert!(
+            matches!(result, Err(MintError::WorkloadMismatch)),
+            "a matching label must not substitute for Kubernetes ownership by the runtime UID"
+        );
+    }
+
+    #[test]
+    fn inference_credential_rejects_cross_namespace_runtime_ownership() {
+        let mut secret = credential_secret("runtime-uid-a", "runtime-uid-a");
+        secret.metadata.namespace = Some("steward-system".to_owned());
+
+        let result = credential_from_secret(&authority("runtime-uid-a", "team-a"), &secret);
+
+        assert!(
+            matches!(result, Err(MintError::WorkloadMismatch)),
+            "a namespaced runtime must never own a credential Secret in another namespace"
+        );
+    }
+
+    #[test]
+    fn deployed_mint_can_get_but_not_list_runtime_namespace_credentials() {
+        let manifest = include_str!("../../../config/s1/stack.yaml");
+        let role_name = "steward-s1-mint-runtime-credentials";
+        let role = manifest_document(manifest, "ClusterRole", role_name, None);
+        assert!(
+            role.is_some(),
+            "the deployed mint needs a reusable Secret-reader role"
+        );
+        let role = role.unwrap_or_default();
+        assert!(role.contains("resources: [\"secrets\"]"));
+        assert!(role.contains("verbs: [\"get\"]"));
+        assert!(
+            !role.contains("\"list\""),
+            "the mint resolves one UID-named Secret and must not enumerate namespace credentials"
+        );
+        for namespace in ["team-a", "team-b"] {
+            assert!(
+                manifest_document(manifest, "RoleBinding", role_name, Some(namespace)).is_some(),
+                "the mint Secret-reader role must be bound in runtime namespace {namespace}"
+            );
+        }
+    }
+
+    #[test]
     fn authority_resolution_binds_live_runtime_principal_and_tools() -> Result<(), String> {
         let authority = authority_from_runtimes(
             &workload(),
@@ -266,6 +517,7 @@ mod tests {
 
         assert_eq!(authority.workload_id, workload().spiffe_id);
         assert_eq!(authority.runtime.0, "runtime-uid-a");
+        assert_eq!(authority.runtime_namespace, "team-a");
         assert_eq!(
             authority.principal,
             Principal::User {

@@ -62,6 +62,7 @@ pub enum AuthorityState {
 pub struct AuthorityBinding {
     pub workload_id: String,
     pub runtime: RuntimeId,
+    pub runtime_namespace: String,
     pub principal: Principal,
     pub tools: Vec<ToolGrant>,
     pub state: AuthorityState,
@@ -72,6 +73,52 @@ pub trait AuthorityResolver: Send + Sync + 'static {
         &self,
         workload: &ValidatedWorkload,
     ) -> impl Future<Output = Result<AuthorityBinding, MintError>> + Send;
+}
+
+/// A bearer credential returned through a token grant.
+/// Deliberately implements neither `Debug` nor `Display`.
+pub struct OpaqueAccessToken(String);
+
+impl OpaqueAccessToken {
+    pub fn new(value: String) -> Result<Self, OpaqueAccessTokenError> {
+        if is_bearer_token(&value) {
+            Ok(Self(value))
+        } else {
+            Err(OpaqueAccessTokenError)
+        }
+    }
+
+    fn into_secret(self) -> String {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpaqueAccessTokenError;
+
+pub enum CredentialGrant {
+    NotHandled,
+    AccessToken(OpaqueAccessToken),
+}
+
+pub trait CredentialGrantResolver: Send + Sync + 'static {
+    fn resolve(
+        &self,
+        scope: &[String],
+        authority: &AuthorityBinding,
+    ) -> impl Future<Output = Result<CredentialGrant, MintError>> + Send;
+}
+
+pub struct NoCredentialGrantResolver;
+
+impl CredentialGrantResolver for NoCredentialGrantResolver {
+    async fn resolve(
+        &self,
+        _scope: &[String],
+        _authority: &AuthorityBinding,
+    ) -> Result<CredentialGrant, MintError> {
+        Ok(CredentialGrant::NotHandled)
+    }
 }
 
 pub struct MintSigningKey {
@@ -224,6 +271,7 @@ pub enum MintError {
     UnsupportedPrincipal,
     InvalidRequest,
     InvalidScope,
+    CredentialUnavailable,
     SigningFailed,
 }
 
@@ -246,8 +294,9 @@ struct StewardClaims {
     version: u8,
 }
 
-pub struct Mint<V, R> {
+pub struct Mint<V, R, C = NoCredentialGrantResolver> {
     config: MintRuntimeConfig,
+    credential_resolver: C,
     introspection_client_credential_hash: [u8; 32],
     _key: MintSigningKey,
     resolver: R,
@@ -262,7 +311,7 @@ struct MintRuntimeConfig {
     authority_ttl: Duration,
 }
 
-impl<V, R> Mint<V, R>
+impl<V, R> Mint<V, R, NoCredentialGrantResolver>
 where
     V: SvidValidator,
     R: AuthorityResolver,
@@ -272,6 +321,29 @@ where
         key: MintSigningKey,
         validator: V,
         resolver: R,
+    ) -> Result<Self, MintConfigError> {
+        Self::new_with_credential_resolver(
+            config,
+            key,
+            validator,
+            resolver,
+            NoCredentialGrantResolver,
+        )
+    }
+}
+
+impl<V, R, C> Mint<V, R, C>
+where
+    V: SvidValidator,
+    R: AuthorityResolver,
+    C: CredentialGrantResolver,
+{
+    pub fn new_with_credential_resolver(
+        config: MintConfig,
+        key: MintSigningKey,
+        validator: V,
+        resolver: R,
+        credential_resolver: C,
     ) -> Result<Self, MintConfigError> {
         config.validate()?;
         let introspection_client_credential_hash =
@@ -292,6 +364,7 @@ where
                 svid_audience,
                 authority_ttl,
             },
+            credential_resolver,
             introspection_client_credential_hash,
             _key: key,
             resolver,
@@ -339,6 +412,26 @@ where
         let Principal::User { acting_user } = &authority.principal else {
             return Err(MintError::UnsupportedPrincipal);
         };
+        match self
+            .credential_resolver
+            .resolve(&request.scope, &authority)
+            .await?
+        {
+            CredentialGrant::AccessToken(token) => {
+                return Ok(TokenGrantResponse {
+                    access_token: token.into_secret(),
+                    expires_in: self.config.authority_ttl.as_secs(),
+                    scope: request.scope.join(" "),
+                    token_type: "Bearer".to_owned(),
+                });
+            }
+            CredentialGrant::NotHandled
+                if request.scope.iter().any(|scope| scope == "inference") =>
+            {
+                return Err(MintError::CredentialUnavailable);
+            }
+            CredentialGrant::NotHandled => {}
+        }
         if self.config.authority_ttl.is_zero() || self.config.authority_ttl > DEFAULT_AUTHORITY_TTL
         {
             return Err(MintError::InvalidRequest);
@@ -493,13 +586,14 @@ struct OAuthError {
 type OAuthResult<T> = Result<Json<T>, (StatusCode, Json<OAuthError>)>;
 type TokenResult<T> = Result<(HeaderMap, Json<T>), (StatusCode, Json<OAuthError>)>;
 
-async fn token_handler<V, R>(
-    State(mint): State<Arc<Mint<V, R>>>,
+async fn token_handler<V, R, C>(
+    State(mint): State<Arc<Mint<V, R, C>>>,
     form: Result<Form<TokenGrantForm>, FormRejection>,
 ) -> TokenResult<TokenGrantResponse>
 where
     V: SvidValidator,
     R: AuthorityResolver,
+    C: CredentialGrantResolver,
 {
     let Form(form) = form.map_err(|_| oauth_error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     if form.grant_type != "client_credentials" {
@@ -529,13 +623,14 @@ where
         .map_err(map_mint_error)
 }
 
-async fn introspection_handler<V, R>(
-    State(mint): State<Arc<Mint<V, R>>>,
+async fn introspection_handler<V, R, C>(
+    State(mint): State<Arc<Mint<V, R, C>>>,
     request: Request,
 ) -> TokenResult<TokenIntrospectionResponse>
 where
     V: SvidValidator,
     R: AuthorityResolver,
+    C: CredentialGrantResolver,
 {
     if !mint.authenticates_introspection_client(request.headers().get(AUTHORIZATION)) {
         return Err(oauth_error(StatusCode::UNAUTHORIZED, "invalid_client"));
@@ -549,10 +644,11 @@ where
         .map_err(map_mint_error)
 }
 
-async fn jwks_handler<V, R>(State(mint): State<Arc<Mint<V, R>>>) -> OAuthResult<JwksDocument>
+async fn jwks_handler<V, R, C>(State(mint): State<Arc<Mint<V, R, C>>>) -> OAuthResult<JwksDocument>
 where
     V: SvidValidator,
     R: AuthorityResolver,
+    C: CredentialGrantResolver,
 {
     mint.jwks()
         .map(Json)
@@ -570,6 +666,9 @@ fn map_mint_error(error: MintError) -> (StatusCode, Json<OAuthError>) {
         | MintError::UnsupportedPrincipal => oauth_error(StatusCode::FORBIDDEN, "invalid_grant"),
         MintError::InvalidRequest => oauth_error(StatusCode::BAD_REQUEST, "invalid_request"),
         MintError::InvalidScope => oauth_error(StatusCode::BAD_REQUEST, "invalid_scope"),
+        MintError::CredentialUnavailable => {
+            oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
+        }
         MintError::SigningFailed => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
     }
 }
@@ -612,15 +711,16 @@ fn is_bearer_token(value: &str) -> bool {
         })
 }
 
-pub fn router<V, R>(mint: Arc<Mint<V, R>>) -> Router
+pub fn router<V, R, C>(mint: Arc<Mint<V, R, C>>) -> Router
 where
     V: SvidValidator,
     R: AuthorityResolver,
+    C: CredentialGrantResolver,
 {
     Router::new()
-        .route("/token", post(token_handler::<V, R>))
-        .route("/introspect", post(introspection_handler::<V, R>))
-        .route("/.well-known/jwks.json", get(jwks_handler::<V, R>))
+        .route("/token", post(token_handler::<V, R, C>))
+        .route("/introspect", post(introspection_handler::<V, R, C>))
+        .route("/.well-known/jwks.json", get(jwks_handler::<V, R, C>))
         .fallback(|| async {
             (
                 StatusCode::NOT_FOUND,
