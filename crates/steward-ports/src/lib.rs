@@ -2,7 +2,7 @@
 
 use std::future::Future;
 
-use steward_types::{AgentType, RuntimeId, RuntimeRefs, ToolGrant};
+use steward_types::{AgentType, Budget, ModelRef, RuntimeId, RuntimeRefs, SpendSummary, ToolGrant};
 
 /// Maturity derived from whether a non-fake adapter implements a port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,7 +22,7 @@ pub struct PortDescriptor {
 pub const PORTS: [PortDescriptor; 8] = [
     PortDescriptor {
         name: "InferencePlane",
-        maturity: Maturity::Provisional,
+        maturity: Maturity::Proven,
     },
     PortDescriptor {
         name: "ToolPlane",
@@ -106,6 +106,7 @@ pub struct SandboxRequest {
     pub runtime: RuntimeId,
     pub workspace_key: String,
     pub agent_type: AgentType,
+    pub models: Vec<ModelRef>,
     pub tools: Vec<ToolGrant>,
 }
 
@@ -133,6 +134,46 @@ pub trait SandboxRuntime: Send + Sync + 'static {
 pub struct InferenceCapabilities {
     pub model_allowlist: bool,
     pub spend_enforcement: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InferenceRequest {
+    pub runtime: RuntimeId,
+    pub models: Vec<ModelRef>,
+    pub budget: Budget,
+}
+
+/// A bearer credential returned by an inference plane.
+///
+/// Deliberately implements neither `Debug` nor `Display`.
+pub struct InferenceCredential(String);
+
+impl InferenceCredential {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+pub struct ProvisionedInference {
+    pub reference: String,
+    pub credential: InferenceCredential,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InferenceObservation {
+    Absent,
+    Active {
+        reference: String,
+        spend: SpendSummary,
+    },
+    Exhausted {
+        reference: String,
+        spend: SpendSummary,
+    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -193,9 +234,28 @@ pub enum SessionEvent {
     SessionEnd { sequence: u64, reason: String },
 }
 
-pub trait InferencePlane {
+pub trait InferencePlane: Send + Sync + 'static {
     fn capabilities(&self) -> InferenceCapabilities;
-    fn revoke_runtime(&mut self, runtime: &RuntimeId) -> Result<(), PortError>;
+
+    fn validate_models(
+        &self,
+        models: &[ModelRef],
+    ) -> impl Future<Output = Result<(), PortError>> + Send;
+
+    fn provision(
+        &self,
+        request: &InferenceRequest,
+    ) -> impl Future<Output = Result<ProvisionedInference, PortError>> + Send;
+
+    fn observe(
+        &self,
+        request: &InferenceRequest,
+    ) -> impl Future<Output = Result<InferenceObservation, PortError>> + Send;
+
+    fn revoke(
+        &self,
+        request: &InferenceRequest,
+    ) -> impl Future<Output = Result<(), PortError>> + Send;
 }
 
 pub trait ToolPlane {

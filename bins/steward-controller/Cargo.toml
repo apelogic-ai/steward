@@ -9,6 +9,7 @@ version.workspace = true
 [dependencies]
 axum.workspace = true # Serves the co-resident validating webhook.
 kube = { workspace = true, features = ["client", "ring", "rustls-tls"] }
+steward-adapter-litellm = { path = "../../adapters/litellm", version = "=0.0.0" } # Enforces per-runtime model allowlists and spend budgets at the inference plane.
 steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.0.0", features = ["runtime"] }
 steward-controller = { path = "../../crates/steward-controller", version = "=0.0.0" }
 steward-store = { path = "../../crates/steward-store", version = "=0.0.0" } # Shares the migrated authority ledger with reconciliation and admission.

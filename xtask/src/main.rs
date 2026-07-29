@@ -36,6 +36,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "ci" if rest.is_empty() => ci(),
         "e2e-s0" if rest.is_empty() => e2e_s0(),
         "e2e-s1" if rest.is_empty() => e2e_s1(),
+        "e2e-s2" if rest.is_empty() => e2e_s2(),
         "e2e-s3" if rest.is_empty() => e2e_s3(),
         "e2e-s4" if rest.is_empty() => e2e_s4(),
         "policy-test" if rest.is_empty() => policy_test(),
@@ -64,6 +65,7 @@ fn usage() -> String {
         "  ci",
         "  e2e-s0",
         "  e2e-s1",
+        "  e2e-s2",
         "  e2e-s3",
         "  e2e-s4",
         "  policy-test",
@@ -132,6 +134,10 @@ fn e2e_s0() -> TaskResult {
 
 fn e2e_s1() -> TaskResult {
     run("bash", &["scripts/s1-identity-e2e.sh"])
+}
+
+fn e2e_s2() -> TaskResult {
+    run("bash", &["scripts/s2-inference-e2e.sh"])
 }
 
 fn e2e_s3() -> TaskResult {
@@ -341,41 +347,52 @@ fn conformance(arguments: &[String]) -> TaskResult {
     }
     validate_register()?;
     let target = arguments[0].trim_start_matches("--");
+    run_conformance_module(target, "G-2", "g2_credential_isolation")?;
+    run_conformance_module(target, "G-5", "g5_model_allowlist")?;
+    println!("conformance --{target}: G-2 and G-5 each executed exactly one negative test");
+    Ok(())
+}
+
+fn run_conformance_module(target: &str, guarantee: &str, module: &str) -> TaskResult {
     let output = Command::new("cargo")
         .args([
             "test",
             "--manifest-path",
             "conformance/Cargo.toml",
             "--test",
-            "g2_credential_isolation",
+            module,
             "--",
             "--nocapture",
         ])
         .env("STEWARD_CONFORMANCE_TARGET", target)
         .current_dir(root())
         .output()
-        .map_err(|error| format!("failed to run G-2 {target} conformance: {error}"))?;
+        .map_err(|error| format!("failed to run {guarantee} {target} conformance: {error}"))?;
     io::stdout()
         .write_all(&output.stdout)
-        .map_err(|error| format!("failed to relay G-2 conformance output: {error}"))?;
+        .map_err(|error| format!("failed to relay {guarantee} conformance output: {error}"))?;
     io::stderr()
         .write_all(&output.stderr)
-        .map_err(|error| format!("failed to relay G-2 conformance diagnostics: {error}"))?;
+        .map_err(|error| format!("failed to relay {guarantee} conformance diagnostics: {error}"))?;
     if !output.status.success() {
         return Err(format!(
-            "G-2 {target} conformance exited with {}",
+            "{guarantee} {target} conformance exited with {}",
             output.status
         ));
     }
-    validate_conformance_test_result(&String::from_utf8_lossy(&output.stdout))?;
-    println!("conformance --{target}: exactly one G-2 negative test passed");
+    validate_conformance_test_result_for(&String::from_utf8_lossy(&output.stdout), guarantee)?;
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_conformance_test_result(output: &str) -> TaskResult {
+    validate_conformance_test_result_for(output, "G-2")
+}
+
+fn validate_conformance_test_result_for(output: &str, guarantee: &str) -> TaskResult {
     const EXPECTED_RUST: &str =
         "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
-    const EXPECTED_UPSTREAM: &str = "G-2 upstream result: 1 passed; 0 failed; 0 skipped";
+    let expected_upstream = format!("{guarantee} upstream result: 1 passed; 0 failed; 0 skipped");
     let rust_summaries = output
         .lines()
         .map(str::trim)
@@ -384,16 +401,16 @@ fn validate_conformance_test_result(output: &str) -> TaskResult {
     let upstream_summaries = output
         .lines()
         .map(str::trim)
-        .filter(|line| line.starts_with("G-2 upstream result:"))
+        .filter(|line| line.starts_with(&format!("{guarantee} upstream result:")))
         .collect::<Vec<_>>();
     if rust_summaries.len() == 1
         && rust_summaries[0].starts_with(EXPECTED_RUST)
-        && upstream_summaries == [EXPECTED_UPSTREAM]
+        && upstream_summaries == [expected_upstream]
     {
         Ok(())
     } else {
         Err(format!(
-            "G-2 evidence must execute exactly one upstream test and one Rust wrapper with none skipped, ignored, or filtered; upstream: {}; Rust: {}",
+            "{guarantee} evidence must execute exactly one upstream test and one Rust wrapper with none skipped, ignored, or filtered; upstream: {}; Rust: {}",
             upstream_summaries.join(" | "),
             rust_summaries.join(" | ")
         ))
@@ -414,15 +431,20 @@ fn validate_register() -> TaskResult {
     let content = fs::read_to_string(&path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     validate_register_content(&content)?;
-    let g2 = root()
-        .join("conformance")
-        .join("tests")
-        .join("g2_credential_isolation.rs");
-    if !g2.is_file() {
-        return Err(format!(
-            "G-2 claim has no conformance module {}",
-            g2.display()
-        ));
+    for (guarantee, module) in [
+        ("G-2", "g2_credential_isolation"),
+        ("G-5", "g5_model_allowlist"),
+    ] {
+        let path = root()
+            .join("conformance")
+            .join("tests")
+            .join(format!("{module}.rs"));
+        if !path.is_file() {
+            return Err(format!(
+                "{guarantee} claim has no conformance module {}",
+                path.display()
+            ));
+        }
     }
     Ok(())
 }

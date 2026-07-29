@@ -12,5 +12,9 @@ version = "0.0.0"
 name = "g2_credential_isolation"
 path = "tests/g2_credential_isolation.rs"
 
+[[test]]
+name = "g5_model_allowlist"
+path = "tests/g5_model_allowlist.rs"
+
 [lints.rust]
 unsafe_code = "forbid"

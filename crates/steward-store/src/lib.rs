@@ -37,6 +37,27 @@ impl PgStore {
             .map_err(|error| StoreError::Database(error.to_string()))
     }
 
+    pub async fn record_spend_observation(
+        &self,
+        runtime_uid: &str,
+        spend: &steward_types::SpendSummary,
+        exhausted: bool,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO spend_observations \
+             (runtime_uid, observed_amount, currency, exhausted) \
+             VALUES ($1, $2::numeric, $3, $4)",
+        )
+        .bind(runtime_uid)
+        .bind(&spend.observed_amount)
+        .bind(&spend.currency)
+        .bind(exhausted)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(database_error)
+    }
+
     pub async fn insert_envelope(
         &self,
         member_role: &str,

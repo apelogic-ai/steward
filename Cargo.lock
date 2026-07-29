@@ -3329,7 +3329,13 @@ dependencies = [
 name = "steward-adapter-litellm"
 version = "0.0.0"
 dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
  "steward-ports",
+ "steward-types",
+ "tokio",
 ]
 
 [[package]]
@@ -3432,6 +3438,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "kube",
+ "steward-adapter-litellm",
  "steward-adapter-openshell",
  "steward-controller",
  "steward-store",

@@ -17,6 +17,14 @@ name = "s1"
 path = "s1.rs"
 
 [[test]]
+name = "s2_store"
+path = "s2_store.rs"
+
+[[test]]
+name = "s2"
+path = "s2.rs"
+
+[[test]]
 name = "s3_store"
 path = "s3_store.rs"
 
