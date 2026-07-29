@@ -1,0 +1,158 @@
+name: Set up Steward CI tools
+description: Install checksum-verified tools required by a Steward CI job
+
+inputs:
+  gate-tools:
+    description: Install cargo-deny and OPA
+    required: false
+    default: "false"
+  kubernetes-tools:
+    description: Install kind, kubectl, and Helm
+    required: false
+    default: "false"
+  supervisor-tools:
+    description: Install Zig and cargo-zigbuild
+    required: false
+    default: "false"
+  cargo-deny-version:
+    description: cargo-deny version
+    required: false
+    default: "0.20.2"
+  opa-version:
+    description: OPA version
+    required: false
+    default: "1.18.2"
+  kind-version:
+    description: kind version
+    required: false
+    default: "0.31.0"
+  kubectl-version:
+    description: kubectl version
+    required: false
+    default: "1.32.1"
+  helm-version:
+    description: Helm version
+    required: false
+    default: "3.17.1"
+  zig-version:
+    description: Zig version
+    required: false
+    default: "0.14.1"
+  cargo-zigbuild-version:
+    description: cargo-zigbuild version
+    required: false
+    default: "0.22.3"
+
+runs:
+  using: composite
+  steps:
+    - name: Install gate tools
+      if: inputs.gate-tools == 'true'
+      shell: bash
+      env:
+        CARGO_DENY_VERSION: ${{ inputs.cargo-deny-version }}
+        OPA_VERSION: ${{ inputs.opa-version }}
+      run: |
+        set -euo pipefail
+        tools_dir="${RUNNER_TEMP}/steward-tools"
+        mkdir -p "${tools_dir}"
+
+        deny_asset="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+        deny_url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/${deny_asset}" "${deny_url}/${deny_asset}"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/${deny_asset}.sha256" "${deny_url}/${deny_asset}.sha256"
+        deny_hash="$(cut -d ' ' -f 1 "${tools_dir}/${deny_asset}.sha256")"
+        echo "${deny_hash}  ${tools_dir}/${deny_asset}" | sha256sum --check -
+        tar --extract --gzip --strip-components=1 \
+          --file "${tools_dir}/${deny_asset}" --directory "${tools_dir}"
+
+        opa_asset="opa_linux_amd64_static"
+        opa_url="https://www.openpolicyagent.org/downloads/v${OPA_VERSION}"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/${opa_asset}" "${opa_url}/${opa_asset}"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/${opa_asset}.sha256" "${opa_url}/${opa_asset}.sha256"
+        opa_hash="$(cut -d ' ' -f 1 "${tools_dir}/${opa_asset}.sha256")"
+        echo "${opa_hash}  ${tools_dir}/${opa_asset}" | sha256sum --check -
+        mv "${tools_dir}/${opa_asset}" "${tools_dir}/opa"
+        chmod +x "${tools_dir}/opa"
+
+        echo "${tools_dir}" >> "${GITHUB_PATH}"
+
+    - name: Install Kubernetes tools
+      if: inputs.kubernetes-tools == 'true'
+      shell: bash
+      env:
+        HELM_VERSION: ${{ inputs.helm-version }}
+        KIND_VERSION: ${{ inputs.kind-version }}
+        KUBECTL_VERSION: ${{ inputs.kubectl-version }}
+      run: |
+        set -euo pipefail
+        tools_dir="${RUNNER_TEMP}/steward-tools"
+        mkdir -p "${tools_dir}"
+
+        kind_asset="kind-linux-amd64"
+        kind_url="https://github.com/kubernetes-sigs/kind/releases/download/v${KIND_VERSION}"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/${kind_asset}" "${kind_url}/${kind_asset}"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/${kind_asset}.sha256sum" "${kind_url}/${kind_asset}.sha256sum"
+        kind_hash="$(cut -d ' ' -f 1 "${tools_dir}/${kind_asset}.sha256sum")"
+        echo "${kind_hash}  ${tools_dir}/${kind_asset}" | sha256sum --check -
+        mv "${tools_dir}/${kind_asset}" "${tools_dir}/kind"
+        chmod +x "${tools_dir}/kind"
+
+        kubectl_url="https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/kubectl" "${kubectl_url}/kubectl"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/kubectl.sha256" "${kubectl_url}/kubectl.sha256"
+        kubectl_hash="$(cat "${tools_dir}/kubectl.sha256")"
+        echo "${kubectl_hash}  ${tools_dir}/kubectl" | sha256sum --check -
+        chmod +x "${tools_dir}/kubectl"
+
+        helm_asset="helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+        helm_url="https://get.helm.sh"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/${helm_asset}" "${helm_url}/${helm_asset}"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/${helm_asset}.sha256sum" "${helm_url}/${helm_asset}.sha256sum"
+        helm_hash="$(cut -d ' ' -f 1 "${tools_dir}/${helm_asset}.sha256sum")"
+        echo "${helm_hash}  ${tools_dir}/${helm_asset}" | sha256sum --check -
+        tar --extract --gzip \
+          --file "${tools_dir}/${helm_asset}" --directory "${tools_dir}" linux-amd64/helm
+        mv "${tools_dir}/linux-amd64/helm" "${tools_dir}/helm"
+        chmod +x "${tools_dir}/helm"
+
+        echo "${tools_dir}" >> "${GITHUB_PATH}"
+
+    - name: Install supervisor build tools
+      if: inputs.supervisor-tools == 'true'
+      shell: bash
+      env:
+        CARGO_ZIGBUILD_VERSION: ${{ inputs.cargo-zigbuild-version }}
+        ZIG_VERSION: ${{ inputs.zig-version }}
+      run: |
+        set -euo pipefail
+        tools_dir="${RUNNER_TEMP}/steward-tools"
+        mkdir -p "${tools_dir}"
+
+        zig_asset="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+        zig_url="https://ziglang.org/download/${ZIG_VERSION}/${zig_asset}"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/${zig_asset}" "${zig_url}"
+        echo "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c  ${tools_dir}/${zig_asset}" \
+          | sha256sum --check -
+        tar --extract --xz \
+          --file "${tools_dir}/${zig_asset}" --directory "${tools_dir}"
+        zig_dir="${tools_dir}/zig-x86_64-linux-${ZIG_VERSION}"
+        chmod +x "${zig_dir}/zig"
+        echo "${zig_dir}" >> "${GITHUB_PATH}"
+
+        cargo install cargo-zigbuild \
+          --locked \
+          --version "${CARGO_ZIGBUILD_VERSION}" \
+          --root "${tools_dir}/cargo-zigbuild"
+        echo "${tools_dir}/cargo-zigbuild/bin" >> "${GITHUB_PATH}"

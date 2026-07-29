@@ -34,6 +34,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
 
     match command {
         "ci" if rest.is_empty() => ci(),
+        "quality" if rest.is_empty() => quality(),
         "e2e-s0" if rest.is_empty() => e2e_s0(),
         "e2e-s1" if rest.is_empty() => e2e_s1(),
         "e2e-s2" if rest.is_empty() => e2e_s2(),
@@ -63,6 +64,7 @@ fn usage() -> String {
         "usage: cargo xtask <command>",
         "commands:",
         "  ci",
+        "  quality",
         "  e2e-s0",
         "  e2e-s1",
         "  e2e-s2",
@@ -91,6 +93,11 @@ fn root() -> PathBuf {
 }
 
 fn ci() -> TaskResult {
+    quality()?;
+    conformance(&["--pinned".to_owned()])
+}
+
+fn quality() -> TaskResult {
     run("cargo", &["fmt", "--all", "--", "--check"])?;
     run(
         "cargo",
@@ -122,7 +129,6 @@ fn ci() -> TaskResult {
     verify_manifests()?;
     check_neutrality()?;
     check_secrets()?;
-    conformance(&["--pinned".to_owned()])?;
     register(&["--check".to_owned()])?;
     ports_check()?;
     layering_test()

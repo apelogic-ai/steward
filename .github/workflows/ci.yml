@@ -14,18 +14,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_DENY_VERSION: "0.20.2"
-  HELM_VERSION: "3.17.1"
-  KIND_VERSION: "0.31.0"
-  KUBECTL_VERSION: "1.32.1"
-  OPA_VERSION: "1.18.2"
-  ZIG_VERSION: "0.14.1"
-  CARGO_ZIGBUILD_VERSION: "0.22.3"
 
 jobs:
-  pinned:
-    name: pinned
+  quality:
+    name: quality
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -36,116 +30,184 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt
 
-      - name: Install pinned gate tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          tools_dir="${RUNNER_TEMP}/steward-tools"
-          mkdir -p "${tools_dir}"
+      - name: Install quality-gate tools
+        uses: ./.github/actions/setup-tools
+        with:
+          gate-tools: "true"
 
-          deny_asset="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz"
-          deny_url="https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}"
-          curl --fail --location --silent --show-error \
-            --output "${tools_dir}/${deny_asset}" "${deny_url}/${deny_asset}"
-          curl --fail --location --silent --show-error \
-            --output "${tools_dir}/${deny_asset}.sha256" "${deny_url}/${deny_asset}.sha256"
-          deny_hash="$(cut -d ' ' -f 1 "${tools_dir}/${deny_asset}.sha256")"
-          echo "${deny_hash}  ${tools_dir}/${deny_asset}" | sha256sum --check -
-          tar --extract --gzip --strip-components=1 \
-            --file "${tools_dir}/${deny_asset}" --directory "${tools_dir}"
-
-          opa_asset="opa_linux_amd64_static"
-          opa_url="https://www.openpolicyagent.org/downloads/v${OPA_VERSION}"
-          curl --fail --location --silent --show-error \
-            --output "${tools_dir}/${opa_asset}" "${opa_url}/${opa_asset}"
-          curl --fail --location --silent --show-error \
-            --output "${tools_dir}/${opa_asset}.sha256" "${opa_url}/${opa_asset}.sha256"
-          opa_hash="$(cut -d ' ' -f 1 "${tools_dir}/${opa_asset}.sha256")"
-          echo "${opa_hash}  ${tools_dir}/${opa_asset}" | sha256sum --check -
-          mv "${tools_dir}/${opa_asset}" "${tools_dir}/opa"
-          chmod +x "${tools_dir}/opa"
-
-          kind_asset="kind-linux-amd64"
-          kind_url="https://github.com/kubernetes-sigs/kind/releases/download/v${KIND_VERSION}"
-          curl --fail --location --silent --show-error \
-            --output "${tools_dir}/${kind_asset}" "${kind_url}/${kind_asset}"
-          curl --fail --location --silent --show-error \
-            --output "${tools_dir}/${kind_asset}.sha256sum" "${kind_url}/${kind_asset}.sha256sum"
-          kind_hash="$(cut -d ' ' -f 1 "${tools_dir}/${kind_asset}.sha256sum")"
-          echo "${kind_hash}  ${tools_dir}/${kind_asset}" | sha256sum --check -
-          mv "${tools_dir}/${kind_asset}" "${tools_dir}/kind"
-          chmod +x "${tools_dir}/kind"
-
-          kubectl_url="https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/amd64"
-          curl --fail --location --silent --show-error \
-            --output "${tools_dir}/kubectl" "${kubectl_url}/kubectl"
-          curl --fail --location --silent --show-error \
-            --output "${tools_dir}/kubectl.sha256" "${kubectl_url}/kubectl.sha256"
-          kubectl_hash="$(cat "${tools_dir}/kubectl.sha256")"
-          echo "${kubectl_hash}  ${tools_dir}/kubectl" | sha256sum --check -
-          chmod +x "${tools_dir}/kubectl"
-
-          helm_asset="helm-v${HELM_VERSION}-linux-amd64.tar.gz"
-          helm_url="https://get.helm.sh"
-          curl --fail --location --silent --show-error \
-            --output "${tools_dir}/${helm_asset}" "${helm_url}/${helm_asset}"
-          curl --fail --location --silent --show-error \
-            --output "${tools_dir}/${helm_asset}.sha256sum" "${helm_url}/${helm_asset}.sha256sum"
-          helm_hash="$(cut -d ' ' -f 1 "${tools_dir}/${helm_asset}.sha256sum")"
-          echo "${helm_hash}  ${tools_dir}/${helm_asset}" | sha256sum --check -
-          tar --extract --gzip \
-            --file "${tools_dir}/${helm_asset}" --directory "${tools_dir}" linux-amd64/helm
-          mv "${tools_dir}/linux-amd64/helm" "${tools_dir}/helm"
-          chmod +x "${tools_dir}/helm"
-
-          echo "${tools_dir}" >> "${GITHUB_PATH}"
-
-      - name: Install pinned S1 supervisor build tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          tools_dir="${RUNNER_TEMP}/steward-tools"
-          zig_asset="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          zig_url="https://ziglang.org/download/${ZIG_VERSION}/${zig_asset}"
-          curl --fail --location --silent --show-error \
-            --output "${tools_dir}/${zig_asset}" "${zig_url}"
-          echo "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c  ${tools_dir}/${zig_asset}" \
-            | sha256sum --check -
-          tar --extract --xz \
-            --file "${tools_dir}/${zig_asset}" --directory "${tools_dir}"
-          zig_dir="${tools_dir}/zig-x86_64-linux-${ZIG_VERSION}"
-          chmod +x "${zig_dir}/zig"
-          echo "${zig_dir}" >> "${GITHUB_PATH}"
-
-          cargo install cargo-zigbuild \
-            --locked \
-            --version "${CARGO_ZIGBUILD_VERSION}" \
-            --root "${tools_dir}/cargo-zigbuild"
-          echo "${tools_dir}/cargo-zigbuild/bin" >> "${GITHUB_PATH}"
-
-      - name: Run pinned gate
+      - name: Run quality gates
         env:
           STEWARD_MIGRATION_BASE: ${{ github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || github.sha }}
-        run: cargo xtask ci
+        run: cargo xtask quality
 
-      - name: Run S0 exit criterion
+  conformance-pinned:
+    name: conformance / pinned upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Run pinned upstream conformance
+        run: cargo xtask conformance --pinned
+
+  e2e-provisioning:
+    name: e2e / provisioning lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Install Kubernetes tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+
+      - name: Verify provisioning and teardown
         run: cargo xtask e2e-s0
 
-      - name: Run S1 exit criterion
+  e2e-identity:
+    name: e2e / workload identity and tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Install integration tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+          supervisor-tools: "true"
+
+      - name: Verify workload identity and tool access
         run: cargo xtask e2e-s1
 
-      - name: Run S2 exit criterion
+  e2e-inference:
+    name: e2e / inference budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Install integration tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+          supervisor-tools: "true"
+
+      - name: Verify inference budget enforcement
         run: cargo xtask e2e-s2
 
-      - name: Run S3 exit criterion
+  e2e-admission:
+    name: e2e / envelope admission
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Install Kubernetes tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+
+      - name: Verify envelope admission
         run: cargo xtask e2e-s3
 
-      - name: Run S4 exit criterion
+  e2e-escalation:
+    name: e2e / approvals and grants
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Install Kubernetes tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+
+      - name: Verify approval and instance-grant enforcement
         run: cargo xtask e2e-s4
+
+  pinned:
+    name: pinned
+    if: always()
+    needs:
+      - quality
+      - conformance-pinned
+      - e2e-provisioning
+      - e2e-identity
+      - e2e-inference
+      - e2e-admission
+      - e2e-escalation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every pinned functional lane
+        shell: bash
+        env:
+          QUALITY: ${{ needs.quality.result }}
+          CONFORMANCE: ${{ needs.conformance-pinned.result }}
+          PROVISIONING: ${{ needs.e2e-provisioning.result }}
+          IDENTITY: ${{ needs.e2e-identity.result }}
+          INFERENCE: ${{ needs.e2e-inference.result }}
+          ADMISSION: ${{ needs.e2e-admission.result }}
+          ESCALATION: ${{ needs.e2e-escalation.result }}
+        run: |
+          set -euo pipefail
+          for result in \
+            "${QUALITY}" \
+            "${CONFORMANCE}" \
+            "${PROVISIONING}" \
+            "${IDENTITY}" \
+            "${INFERENCE}" \
+            "${ADMISSION}" \
+            "${ESCALATION}"
+          do
+            if [[ "${result}" != "success" ]]; then
+              echo "a required pinned functional lane ended with: ${result}" >&2
+              exit 1
+            fi
+          done
 
   latest-nightly:
     name: latest-nightly
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
