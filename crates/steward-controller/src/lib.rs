@@ -22,7 +22,9 @@ use kube::runtime::finalizer::{Event, finalizer};
 use kube::runtime::watcher;
 use kube::{Client, Resource, ResourceExt};
 use sha2::{Digest, Sha256};
-use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, evaluate_with_grants};
+use steward_admission::{
+    AdmissionDecision, AdmissionDelta, Envelope, budget_is_exhausted, evaluate_with_grants,
+};
 use steward_ports::{
     InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
     InferenceRequest, PortError, ProvisionedInference, SandboxObservation, SandboxRequest,
@@ -68,13 +70,29 @@ fn inference_action(observation: steward_ports::InferenceObservation) -> Inferen
     }
 }
 
-fn exhausted_spend_to_preserve(runtime: &AgentRuntime) -> Option<steward_types::SpendSummary> {
-    runtime.status.as_ref().and_then(|status| {
-        (matches!(status.phase, Phase::Terminating | Phase::Suspended)
-            && status.observed_generation == runtime.metadata.generation.unwrap_or_default())
-        .then(|| status.spend.clone())
-        .flatten()
-    })
+fn spend_still_exhausts_runtime(
+    runtime: &AgentRuntime,
+    spend: steward_types::SpendSummary,
+) -> Result<Option<steward_types::SpendSummary>, ReconcileError> {
+    budget_is_exhausted(&spend, &runtime.spec.budget)
+        .map(|exhausted| exhausted.then_some(spend))
+        .map_err(|error| ReconcileError::InvalidSpec {
+            reason: format!("runtime spend could not be compared with its budget: {error:?}"),
+        })
+}
+
+fn exhausted_spend_to_preserve(
+    runtime: &AgentRuntime,
+) -> Result<Option<steward_types::SpendSummary>, ReconcileError> {
+    let Some(spend) = runtime
+        .status
+        .as_ref()
+        .filter(|status| matches!(status.phase, Phase::Terminating | Phase::Suspended))
+        .and_then(|status| status.spend.clone())
+    else {
+        return Ok(None);
+    };
+    spend_still_exhausts_runtime(runtime, spend)
 }
 
 fn runtime_spec_digest(runtime: &AgentRuntime) -> Result<String, ReconcileError> {
@@ -692,15 +710,17 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             .ok_or(ControllerError::Reconcile(
                                 ReconcileError::MissingRuntimeUid,
                             ))?;
-                    let observed_generation = runtime.metadata.generation.unwrap_or_default();
-                    let spec_digest =
-                        runtime_spec_digest(&runtime).map_err(ControllerError::Reconcile)?;
-                    if let Some(spend) = authority
-                        .inference_exhaustion(runtime_uid, observed_generation, &spec_digest)
-                        .await
-                        .map_err(|error| {
-                            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
-                        })?
+                    if let Some(spend) =
+                        authority
+                            .inference_exhaustion(runtime_uid)
+                            .await
+                            .map_err(|error| {
+                                ControllerError::Reconcile(ReconcileError::Authority(
+                                    error.to_string(),
+                                ))
+                            })?
+                        && let Some(spend) = spend_still_exhausts_runtime(&runtime, spend)
+                            .map_err(ControllerError::Reconcile)?
                     {
                         return suspend_runtime_with_inference_cleanup(
                             &runtime,
@@ -713,7 +733,9 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         .await;
                     }
                 }
-                if let Some(spend) = exhausted_spend_to_preserve(&runtime) {
+                if let Some(spend) =
+                    exhausted_spend_to_preserve(&runtime).map_err(ControllerError::Reconcile)?
+                {
                     return suspend_runtime_with_inference_cleanup(
                         &runtime,
                         &api,
@@ -860,12 +882,16 @@ async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferenceP
     spend: Option<steward_types::SpendSummary>,
 ) -> Result<Action, ControllerError> {
     let request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
-    inference
-        .revoke(&request)
-        .await
-        .map_err(|error| ControllerError::Reconcile(ReconcileError::Runtime(error)))?;
-    delete_credential_secret(client, runtime).await?;
-    suspend_runtime(runtime, api, sandbox_runtime, spend).await
+    let revoke_result = inference.revoke(&request).await;
+    let credential_result = delete_credential_secret(client, runtime).await;
+    let suspension_result = suspend_runtime(runtime, api, sandbox_runtime, spend).await;
+
+    let action = suspension_result?;
+    if let Err(error) = revoke_result {
+        return Err(ControllerError::Reconcile(ReconcileError::Runtime(error)));
+    }
+    credential_result?;
+    Ok(action)
 }
 
 #[derive(Clone, Debug)]
@@ -1339,20 +1365,30 @@ async fn webhook_handler<R: WebhookEnvelopeReader, C: WebhookModelCatalog>(
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
     use std::sync::Mutex;
 
+    use axum::body::Body;
+    use axum::http::{Method, Request, Response, StatusCode};
+    use kube::Client;
+    use kube::client::Body as KubeBody;
     use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
-    use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
+    use steward_ports::{
+        InferenceCapabilities, InferenceObservation, InferencePlane, InferenceRequest, PortError,
+        ProvisionedInference, SandboxObservation, SandboxRequest, SandboxRuntime,
+    };
     use steward_store::GrantReversion;
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Phase,
         Principal, RuntimeRefs,
     };
+    use tower::service_fn;
 
     use super::{
         AuthorityAction, InferenceAction, ReconcileDecision, ReconcileIntent, authority_action,
         authority_application_action, exhausted_spend_to_preserve, inference_action,
         reconcile_once, runtime_authority_action, status_merge_patch,
+        suspend_runtime_with_inference_cleanup,
     };
 
     #[derive(Default)]
@@ -1388,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_runtime_cannot_reprovision_during_teardown() {
+    fn exhausted_runtime_cannot_reprovision_during_teardown() -> Result<(), String> {
         let mut runtime = fixture();
         let spend = steward_types::SpendSummary {
             observed_amount: "1.00".to_owned(),
@@ -1404,16 +1440,46 @@ mod tests {
         });
 
         assert_eq!(
-            exhausted_spend_to_preserve(&runtime),
+            exhausted_spend_to_preserve(&runtime)
+                .map_err(|error| format!("fixture exhaustion must be comparable: {error:?}"))?,
             Some(spend),
             "an exhausted runtime must finish suspension instead of provisioning a fresh key"
         );
+        Ok(())
     }
 
     #[test]
-    fn a_new_spec_generation_clears_prior_budget_exhaustion() {
+    fn a_non_budget_spec_edit_cannot_clear_prior_budget_exhaustion() -> Result<(), String> {
         let mut runtime = fixture();
         runtime.metadata.generation = Some(4);
+        runtime.spec.ttl = Duration("30m".to_owned());
+        let spend = steward_types::SpendSummary {
+            observed_amount: "1.00".to_owned(),
+            currency: "USD".to_owned(),
+        };
+        runtime.status = Some(steward_types::AgentRuntimeStatus {
+            phase: Phase::Suspended,
+            observed_generation: 3,
+            spec_digest: "prior-spec-digest".to_owned(),
+            refs: RuntimeRefs::default(),
+            conditions: Vec::new(),
+            spend: Some(spend.clone()),
+        });
+
+        assert_eq!(
+            exhausted_spend_to_preserve(&runtime)
+                .map_err(|error| format!("fixture exhaustion must be comparable: {error:?}"))?,
+            Some(spend),
+            "a TTL-only edit must not provision a fresh monthly key after budget exhaustion"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_higher_budget_can_clear_prior_budget_exhaustion() -> Result<(), String> {
+        let mut runtime = fixture();
+        runtime.metadata.generation = Some(4);
+        runtime.spec.budget.monthly_limit = "2.00".to_owned();
         runtime.status = Some(steward_types::AgentRuntimeStatus {
             phase: Phase::Suspended,
             observed_generation: 3,
@@ -1427,10 +1493,133 @@ mod tests {
         });
 
         assert_eq!(
-            exhausted_spend_to_preserve(&runtime),
+            exhausted_spend_to_preserve(&runtime).map_err(|error| {
+                format!("fixture exhaustion must be comparable with raised budget: {error:?}")
+            })?,
             None,
-            "an admitted spec update must be reconciled instead of inheriting an older generation's exhaustion"
+            "a budget raised above accumulated spend must allow reconciliation to resume"
         );
+        Ok(())
+    }
+
+    struct FailingRevokeInference;
+
+    impl InferencePlane for FailingRevokeInference {
+        fn capabilities(&self) -> InferenceCapabilities {
+            InferenceCapabilities::default()
+        }
+
+        async fn validate_configuration(
+            &self,
+            _models: &[ModelRef],
+            _budget: &Budget,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        async fn provision(
+            &self,
+            _request: &InferenceRequest,
+        ) -> Result<ProvisionedInference, PortError> {
+            Err(PortError::Unsupported {
+                operation: "test inference provisioning",
+            })
+        }
+
+        async fn reconcile_configuration(
+            &self,
+            _request: &InferenceRequest,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        async fn observe(
+            &self,
+            _request: &InferenceRequest,
+        ) -> Result<InferenceObservation, PortError> {
+            Ok(InferenceObservation::Absent)
+        }
+
+        async fn revoke(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+            Err(PortError::Failed {
+                reason: "fixture LiteLLM management outage".to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn authority_suspension_deletes_the_sandbox_during_a_litellm_outage() -> Result<(), String>
+    {
+        let runtime = fixture();
+        let serialized_runtime = serde_json::to_vec(&runtime)
+            .map_err(|error| format!("fixture runtime must be serializable: {error}"))?;
+        let client = Client::new(
+            service_fn(move |request: Request<KubeBody>| {
+                let serialized_runtime = serialized_runtime.clone();
+                async move {
+                    let (status, body) = if request.method() == Method::DELETE
+                        && request.uri().path().contains("/secrets/")
+                    {
+                        (
+                            StatusCode::OK,
+                            br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success","code":200}"#
+                                .to_vec(),
+                        )
+                    } else if request.method() == Method::PATCH
+                        && request.uri().path().ends_with("/status")
+                    {
+                        (StatusCode::OK, serialized_runtime)
+                    } else {
+                        (
+                            StatusCode::NOT_FOUND,
+                            br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Failure","reason":"NotFound","code":404}"#
+                                .to_vec(),
+                        )
+                    };
+                    let mut response = Response::new(Body::from(body));
+                    *response.status_mut() = status;
+                    Ok::<_, Infallible>(response)
+                }
+            }),
+            "team-a",
+        );
+        let sandbox = FakeSandboxRuntime {
+            state: Mutex::new(FakeState {
+                created: 1,
+                deleted: 0,
+                refs: Some(RuntimeRefs {
+                    workspace: Some("workspace-a".to_owned()),
+                    sandbox: Some("sandbox-a".to_owned()),
+                    litellm_key: Some("key-a".to_owned()),
+                }),
+            }),
+        };
+        let api = kube::Api::<AgentRuntime>::namespaced(client.clone(), "team-a");
+
+        let result = suspend_runtime_with_inference_cleanup(
+            &runtime,
+            &api,
+            &sandbox,
+            client,
+            &FailingRevokeInference,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "failed credential revocation must remain retryable"
+        );
+        let deleted = sandbox
+            .state
+            .lock()
+            .map_err(|_| "fixture sandbox lock must be readable".to_owned())?
+            .deleted;
+        assert_eq!(
+            deleted, 1,
+            "authority suspension must tear down the sandbox even when LiteLLM is unavailable"
+        );
+        Ok(())
     }
 
     impl SandboxRuntime for FakeSandboxRuntime {

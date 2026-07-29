@@ -8,12 +8,11 @@ CREATE TABLE inference_exhaustions (
     at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX inference_exhaustions_by_runtime_spec
+CREATE INDEX inference_exhaustions_by_runtime
 ON inference_exhaustions (
     runtime_uid,
-    observed_generation,
-    spec_digest,
-    at DESC
+    at DESC,
+    id DESC
 );
 
 CREATE TRIGGER inference_exhaustions_are_append_only

@@ -74,6 +74,7 @@ impl Harness {
         name: &str,
         model: &str,
         monthly_limit: &str,
+        ttl: &str,
     ) -> Result<PathBuf, Box<dyn Error>> {
         let path = self.run_dir.join(format!("e2e-s2-{name}.json"));
         let manifest = serde_json::json!({
@@ -102,7 +103,7 @@ impl Harness {
                     "monthlyLimit": monthly_limit,
                     "currency": "USD"
                 },
-                "ttl": "1h"
+                "ttl": ttl
             }
         });
         fs::write(&path, serde_json::to_vec_pretty(&manifest)?)?;
@@ -331,7 +332,7 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
         )
         .await?;
 
-    let unpriced = harness.write_runtime(UNPRICED_RUNTIME, "unpriced-model", "1.00")?;
+    let unpriced = harness.write_runtime(UNPRICED_RUNTIME, "unpriced-model", "1.00", "1h")?;
     let rejected = harness.apply_runtime(&unpriced)?;
     assert!(
         !rejected.status.success(),
@@ -342,7 +343,7 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
         "unpriced-model rejection must identify the priced-catalog control"
     );
 
-    let priced = harness.write_runtime(PRICED_RUNTIME, "priced-model", "1.00")?;
+    let priced = harness.write_runtime(PRICED_RUNTIME, "priced-model", "1.00", "1h")?;
     let applied = harness.apply_runtime(&priced)?;
     if !applied.status.success() {
         return Err(io::Error::other(format!(
@@ -354,7 +355,7 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
     harness.wait_phase(PRICED_RUNTIME, "Running", Duration::from_secs(180))?;
     let alias = harness.runtime_ref("litellmKey")?;
 
-    let increased = harness.write_runtime(PRICED_RUNTIME, "priced-model", "100.00")?;
+    let increased = harness.write_runtime(PRICED_RUNTIME, "priced-model", "100.00", "1h")?;
     let applied = harness.apply_runtime(&increased)?;
     if !applied.status.success() {
         return Err(io::Error::other(format!(
@@ -375,7 +376,7 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
         "the fixture call must accumulate spend without exhausting the increased budget; observed {spend}"
     );
 
-    let lowered = harness.write_runtime(PRICED_RUNTIME, "priced-model", "0.01")?;
+    let lowered = harness.write_runtime(PRICED_RUNTIME, "priced-model", "0.01", "1h")?;
     let applied = harness.apply_runtime(&lowered)?;
     if !applied.status.success() {
         return Err(io::Error::other(format!(
@@ -387,7 +388,20 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
     harness.wait_phase(PRICED_RUNTIME, "Suspended", Duration::from_secs(120))?;
     harness.assert_key_absent(&alias)?;
 
-    let renewed = harness.write_runtime(PRICED_RUNTIME, "priced-model", "100.00")?;
+    let unrelated_edit =
+        harness.write_runtime(PRICED_RUNTIME, "priced-model", "0.01", "30m")?;
+    let applied = harness.apply_runtime(&unrelated_edit)?;
+    if !applied.status.success() {
+        return Err(io::Error::other(format!(
+            "unrelated spec edit admission failed: {}",
+            String::from_utf8_lossy(&applied.stderr).trim()
+        ))
+        .into());
+    }
+    harness.wait_phase(PRICED_RUNTIME, "Suspended", Duration::from_secs(120))?;
+    harness.assert_key_absent(&alias)?;
+
+    let renewed = harness.write_runtime(PRICED_RUNTIME, "priced-model", "100.00", "30m")?;
     let applied = harness.apply_runtime(&renewed)?;
     if !applied.status.success() {
         return Err(io::Error::other(format!(

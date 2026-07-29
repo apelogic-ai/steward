@@ -79,21 +79,15 @@ impl PgStore {
     pub async fn inference_exhaustion(
         &self,
         runtime_uid: &str,
-        observed_generation: i64,
-        spec_digest: &str,
     ) -> Result<Option<steward_types::SpendSummary>, StoreError> {
         sqlx::query(
             "SELECT observed_amount::text AS observed_amount, currency \
              FROM inference_exhaustions \
              WHERE runtime_uid = $1 \
-               AND observed_generation = $2 \
-               AND spec_digest = $3 \
              ORDER BY at DESC, id DESC \
              LIMIT 1",
         )
         .bind(runtime_uid)
-        .bind(observed_generation)
-        .bind(spec_digest)
         .fetch_optional(&self.pool)
         .await
         .map_err(database_error)?

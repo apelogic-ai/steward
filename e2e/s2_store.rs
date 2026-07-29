@@ -53,7 +53,7 @@ async fn s2_spend_observations_are_append_only() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
-async fn s2_exhaustion_authority_is_bound_to_one_spec_generation() -> Result<(), Box<dyn Error>> {
+async fn s2_exhaustion_authority_survives_spec_generation_changes() -> Result<(), Box<dyn Error>> {
     let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
         io::Error::other("STEWARD_TEST_DATABASE_URL is required for the S2 Postgres test")
     })?;
@@ -79,17 +79,10 @@ async fn s2_exhaustion_authority_is_bound_to_one_spec_generation() -> Result<(),
 
     assert_eq!(
         store
-            .inference_exhaustion("runtime-b", 3, "spec-digest-a")
+            .inference_exhaustion("runtime-b")
             .await?,
         Some(spend),
-        "the same spec generation must remain exhausted across controller retries"
-    );
-    let prior_generation_matches = store
-        .inference_exhaustion("runtime-b", 4, "spec-digest-b")
-        .await?;
-    assert!(
-        prior_generation_matches.is_none(),
-        "a newly admitted spec generation must not inherit prior budget exhaustion"
+        "durable exhaustion must remain visible after unrelated spec generation changes"
     );
     Ok(())
 }
