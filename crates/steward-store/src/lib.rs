@@ -37,6 +37,69 @@ impl PgStore {
             .map_err(|error| StoreError::Database(error.to_string()))
     }
 
+    pub async fn record_spend_observation(
+        &self,
+        runtime_uid: &str,
+        observed_generation: i64,
+        spec_digest: &str,
+        spend: &steward_types::SpendSummary,
+        exhausted: bool,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        if exhausted {
+            sqlx::query(
+                "INSERT INTO inference_exhaustions \
+                 (runtime_uid, observed_generation, spec_digest, observed_amount, currency) \
+                 VALUES ($1, $2, $3, $4::numeric, $5)",
+            )
+            .bind(runtime_uid)
+            .bind(observed_generation)
+            .bind(spec_digest)
+            .bind(&spend.observed_amount)
+            .bind(&spend.currency)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        }
+        sqlx::query(
+            "INSERT INTO spend_observations \
+             (runtime_uid, observed_amount, currency, exhausted) \
+             VALUES ($1, $2::numeric, $3, $4)",
+        )
+        .bind(runtime_uid)
+        .bind(&spend.observed_amount)
+        .bind(&spend.currency)
+        .bind(exhausted)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)
+    }
+
+    pub async fn inference_exhaustion(
+        &self,
+        runtime_uid: &str,
+    ) -> Result<Option<steward_types::SpendSummary>, StoreError> {
+        sqlx::query(
+            "SELECT observed_amount::text AS observed_amount, currency \
+             FROM inference_exhaustions \
+             WHERE runtime_uid = $1 \
+             ORDER BY at DESC, id DESC \
+             LIMIT 1",
+        )
+        .bind(runtime_uid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .map(|row| {
+            Ok(steward_types::SpendSummary {
+                observed_amount: row.try_get("observed_amount").map_err(database_error)?,
+                currency: row.try_get("currency").map_err(database_error)?,
+            })
+        })
+        .transpose()
+    }
+
     pub async fn insert_envelope(
         &self,
         member_role: &str,

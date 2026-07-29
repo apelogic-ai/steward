@@ -3,7 +3,9 @@
 use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
-use steward_types::{AgentRuntimeSpec, Budget, Duration, ModelRef, Principal, ToolGrant};
+use steward_types::{
+    AgentRuntimeSpec, Budget, Duration, ModelRef, Principal, SpendSummary, ToolGrant,
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,6 +136,18 @@ pub fn validate_envelope(envelope: &Envelope) -> Result<(), AdmissionError> {
     }
     duration_seconds(&envelope.spec.ttl)?;
     Ok(())
+}
+
+pub fn budget_is_exhausted(spend: &SpendSummary, budget: &Budget) -> Result<bool, AdmissionError> {
+    if spend.currency != budget.currency {
+        return Err(AdmissionError::CurrencyMismatch {
+            requested: spend.currency.clone(),
+            ceiling: budget.currency.clone(),
+        });
+    }
+    let observed = Decimal::parse(&spend.observed_amount)?;
+    let limit = Decimal::parse(&budget.monthly_limit)?;
+    Ok(observed.cmp(&limit) != Ordering::Less)
 }
 
 pub fn evaluate(

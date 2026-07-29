@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use axum::serve::Listener;
 use kube::Client;
+use steward_adapter_litellm::{LiteLlmAdapter, LiteLlmConfig};
 use steward_adapter_openshell::OpenShellRuntime;
 use steward_store::PgStore;
 use tokio::net::{TcpListener, TcpStream};
@@ -38,6 +39,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let database_url = required("STEWARD_DATABASE_URL")?;
     let store = PgStore::connect(&database_url).await?;
     store.migrate().await?;
+    let inference = LiteLlmAdapter::new(LiteLlmConfig {
+        base_url: required("STEWARD_LITELLM_URL")?,
+        master_key: required("STEWARD_LITELLM_MASTER_KEY")?,
+    })
+    .map_err(|error| {
+        io::Error::other(format!("inference plane configuration failed: {error:?}"))
+    })?;
     let listener = tls_listener(
         &env::var("STEWARD_WEBHOOK_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_owned()),
         &required("STEWARD_TLS_CERT_DER")?,
@@ -46,12 +54,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
     let webhook = axum::serve(
         listener,
-        steward_controller::webhook_router_for_controller(
+        steward_controller::webhook_router_for_controller_with_catalog(
             store.clone(),
+            inference.clone(),
             required("STEWARD_CONTROLLER_USERNAME")?,
         ),
     );
-    let controller = steward_controller::run_controller_with_store(client, sandbox_runtime, store);
+    let controller =
+        steward_controller::run_controller_with_planes(client, sandbox_runtime, inference, store);
     tokio::select! {
         result = webhook => result?,
         () = controller => return Err(io::Error::other("controller exited").into()),

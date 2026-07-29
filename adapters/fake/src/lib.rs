@@ -4,11 +4,12 @@ use std::sync::Mutex;
 
 use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, GitHostingPlane,
-    InferenceCapabilities, InferencePlane, Notification, NotificationSink, PolicySink, PortError,
+    InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
+    InferenceRequest, Notification, NotificationSink, PolicySink, PortError, ProvisionedInference,
     SessionEvent, SessionRelay, StreamGranularity, SvidAssertion, SvidValidationError,
     ToolCapabilities, ToolPlane, ValidatedWorkload, WorkloadIdentity,
 };
-use steward_types::RuntimeId;
+use steward_types::{RuntimeId, SpendSummary};
 
 pub const IMPLEMENTED_PORTS: [&str; 8] = [
     "InferencePlane",
@@ -27,7 +28,8 @@ pub struct FakeAdapter {
     pub decision_resolutions: Mutex<Vec<DecisionResolution>>,
     pub notifications: Vec<Notification>,
     pub events: Vec<SessionEvent>,
-    pub revoked_runtimes: Vec<RuntimeId>,
+    pub revoked_inference_runtimes: Mutex<Vec<RuntimeId>>,
+    pub revoked_tool_runtimes: Vec<RuntimeId>,
     pub policy_revisions: Vec<String>,
 }
 
@@ -39,8 +41,45 @@ impl InferencePlane for FakeAdapter {
         capabilities
     }
 
-    fn revoke_runtime(&mut self, runtime: &RuntimeId) -> Result<(), PortError> {
-        self.revoked_runtimes.push(runtime.clone());
+    async fn validate_configuration(
+        &self,
+        _models: &[steward_types::ModelRef],
+        _budget: &steward_types::Budget,
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn provision(
+        &self,
+        request: &InferenceRequest,
+    ) -> Result<ProvisionedInference, PortError> {
+        Ok(ProvisionedInference {
+            reference: request.runtime.0.clone(),
+            credential: InferenceCredential::new("fixture-inference-value".to_owned()),
+        })
+    }
+
+    async fn reconcile_configuration(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn observe(&self, request: &InferenceRequest) -> Result<InferenceObservation, PortError> {
+        Ok(InferenceObservation::Active {
+            reference: request.runtime.0.clone(),
+            spend: SpendSummary {
+                observed_amount: "0".to_owned(),
+                currency: request.budget.currency.clone(),
+            },
+        })
+    }
+
+    async fn revoke(&self, request: &InferenceRequest) -> Result<(), PortError> {
+        self.revoked_inference_runtimes
+            .lock()
+            .map_err(|_| PortError::Failed {
+                reason: "fake inference-revocation lock was poisoned".to_owned(),
+            })?
+            .push(request.runtime.clone());
         Ok(())
     }
 }
@@ -54,7 +93,7 @@ impl ToolPlane for FakeAdapter {
     }
 
     fn revoke_runtime(&mut self, runtime: &RuntimeId) -> Result<(), PortError> {
-        self.revoked_runtimes.push(runtime.clone());
+        self.revoked_tool_runtimes.push(runtime.clone());
         Ok(())
     }
 }

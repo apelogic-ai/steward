@@ -43,6 +43,8 @@ const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
 #[cfg(feature = "runtime")]
 const TOOL_PROVIDER: &str = "steward-mcp-gw";
 #[cfg(feature = "runtime")]
+const INFERENCE_PROVIDER: &str = "steward-litellm";
+#[cfg(feature = "runtime")]
 const GRPC_NOT_FOUND: i32 = 5;
 #[cfg(feature = "runtime")]
 const GRPC_ALREADY_EXISTS: i32 = 6;
@@ -270,10 +272,13 @@ fn project_request(request: &SandboxRequest) -> Result<OpenShellProjection, Port
         workspace_key: request.workspace_key.clone(),
         sandbox: stable_name(NameKind::Sandbox, request.runtime.0.as_bytes()),
         image,
-        providers: (!request.tools.is_empty())
-            .then(|| TOOL_PROVIDER.to_owned())
-            .into_iter()
-            .collect(),
+        providers: [
+            (!request.tools.is_empty()).then(|| TOOL_PROVIDER.to_owned()),
+            (!request.models.is_empty()).then(|| INFERENCE_PROVIDER.to_owned()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
         runtime_uid: request.runtime.0.clone(),
     })
 }
@@ -324,11 +329,15 @@ impl OpenShellRuntime {
         }
     }
 
-    async fn get_tool_provider(&self, workspace: &str) -> Result<Option<Provider>, PortError> {
+    async fn get_provider(
+        &self,
+        workspace: &str,
+        provider_name: &str,
+    ) -> Result<Option<Provider>, PortError> {
         let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
         match client
             .get_provider(GetProviderRequest {
-                name: TOOL_PROVIDER.to_owned(),
+                name: provider_name.to_owned(),
                 workspace: workspace.to_owned(),
             })
             .await
@@ -347,9 +356,9 @@ impl OpenShellRuntime {
         }
     }
 
-    async fn ensure_tool_provider(&self, workspace: &str) -> Result<(), PortError> {
-        if let Some(provider) = self.get_tool_provider(workspace).await? {
-            return validate_tool_provider(&provider, workspace);
+    async fn ensure_provider(&self, workspace: &str, provider_name: &str) -> Result<(), PortError> {
+        if let Some(provider) = self.get_provider(workspace, provider_name).await? {
+            return validate_provider(&provider, workspace, provider_name);
         }
 
         let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
@@ -357,11 +366,11 @@ impl OpenShellRuntime {
             .create_provider(CreateProviderRequest {
                 provider: Some(Provider {
                     metadata: Some(ObjectMeta {
-                        name: TOOL_PROVIDER.to_owned(),
+                        name: provider_name.to_owned(),
                         workspace: workspace.to_owned(),
                         ..ObjectMeta::default()
                     }),
-                    r#type: TOOL_PROVIDER.to_owned(),
+                    r#type: provider_name.to_owned(),
                     profile_workspace: String::new(),
                     ..Provider::default()
                 }),
@@ -376,33 +385,34 @@ impl OpenShellRuntime {
                     .ok_or_else(|| PortError::Failed {
                         reason: "OpenShell returned an empty provider response".to_owned(),
                     })?;
-                validate_tool_provider(&provider, workspace)
+                validate_provider(&provider, workspace, provider_name)
             }
             Err(error) if error.code() as i32 == GRPC_ALREADY_EXISTS => {
-                let provider =
-                    self.get_tool_provider(workspace)
-                        .await?
-                        .ok_or_else(|| PortError::Failed {
-                            reason: "OpenShell reported an existing provider that cannot be read"
-                                .to_owned(),
-                        })?;
-                validate_tool_provider(&provider, workspace)
+                let provider = self
+                    .get_provider(workspace, provider_name)
+                    .await?
+                    .ok_or_else(|| PortError::Failed {
+                        reason: "OpenShell reported an existing provider that cannot be read"
+                            .to_owned(),
+                    })?;
+                validate_provider(&provider, workspace, provider_name)
             }
             Err(error) => Err(raw_port_failure(error)),
         }
     }
 
-    async fn attach_tool_provider(
+    async fn attach_provider(
         &self,
         workspace: &str,
         sandbox: &str,
+        provider_name: &str,
         resource_version: u64,
     ) -> Result<(), PortError> {
         let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
         client
             .attach_sandbox_provider(AttachSandboxProviderRequest {
                 sandbox_name: sandbox.to_owned(),
-                provider_name: TOOL_PROVIDER.to_owned(),
+                provider_name: provider_name.to_owned(),
                 expected_resource_version: resource_version,
                 workspace: workspace.to_owned(),
             })
@@ -411,10 +421,11 @@ impl OpenShellRuntime {
             .map_err(raw_port_failure)
     }
 
-    async fn tool_provider_is_attached(
+    async fn provider_is_attached(
         &self,
         workspace: &str,
         sandbox: &str,
+        provider_name: &str,
     ) -> Result<bool, PortError> {
         let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
         let providers = client
@@ -433,7 +444,7 @@ impl OpenShellRuntime {
                     .metadata
                     .as_ref()
                     .map(|metadata| metadata.name.as_str())
-                    == Some(TOOL_PROVIDER)
+                    == Some(provider_name)
             })
             .collect::<Vec<_>>();
         let [provider] = attached.as_slice() else {
@@ -445,21 +456,22 @@ impl OpenShellRuntime {
                 })
             };
         };
-        validate_tool_provider(provider, workspace)?;
+        validate_provider(provider, workspace, provider_name)?;
         Ok(true)
     }
 
-    async fn detach_tool_provider(
+    async fn detach_provider(
         &self,
         workspace: &str,
         sandbox: &str,
+        provider_name: &str,
         resource_version: u64,
     ) -> Result<(), PortError> {
         let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
         client
             .detach_sandbox_provider(DetachSandboxProviderRequest {
                 sandbox_name: sandbox.to_owned(),
-                provider_name: TOOL_PROVIDER.to_owned(),
+                provider_name: provider_name.to_owned(),
                 expected_resource_version: resource_version,
                 workspace: workspace.to_owned(),
             })
@@ -468,21 +480,37 @@ impl OpenShellRuntime {
             .map_err(raw_port_failure)
     }
 
-    async fn reconcile_tool_provider(
+    async fn reconcile_provider(
         &self,
         workspace: &str,
         sandbox: &str,
-        resource_version: u64,
+        provider_name: &str,
         desired: bool,
     ) -> Result<(), PortError> {
-        let attached = self.tool_provider_is_attached(workspace, sandbox).await?;
+        let attached = self
+            .provider_is_attached(workspace, sandbox, provider_name)
+            .await?;
         match provider_reconciliation(attached, desired) {
             Some(ProviderReconciliation::Attach) => {
-                self.attach_tool_provider(workspace, sandbox, resource_version)
+                let resource_version = self
+                    .client
+                    .workspace(workspace)
+                    .get_sandbox(sandbox)
+                    .await
+                    .map_err(port_failure)?
+                    .resource_version;
+                self.attach_provider(workspace, sandbox, provider_name, resource_version)
                     .await
             }
             Some(ProviderReconciliation::Detach) => {
-                self.detach_tool_provider(workspace, sandbox, resource_version)
+                let resource_version = self
+                    .client
+                    .workspace(workspace)
+                    .get_sandbox(sandbox)
+                    .await
+                    .map_err(port_failure)?
+                    .resource_version;
+                self.detach_provider(workspace, sandbox, provider_name, resource_version)
                     .await
             }
             None => Ok(()),
@@ -491,14 +519,18 @@ impl OpenShellRuntime {
 }
 
 #[cfg(feature = "runtime")]
-fn validate_tool_provider(provider: &Provider, workspace: &str) -> Result<(), PortError> {
+fn validate_provider(
+    provider: &Provider,
+    workspace: &str,
+    provider_name: &str,
+) -> Result<(), PortError> {
     let metadata = provider
         .metadata
         .as_ref()
         .ok_or_else(|| PortError::Rejected {
             reason: "OpenShell provider has no identity metadata".to_owned(),
         })?;
-    if provider.r#type != TOOL_PROVIDER || metadata.workspace != workspace {
+    if provider.r#type != provider_name || metadata.workspace != workspace {
         return Err(PortError::Rejected {
             reason: "provider name resolved to a different type or workspace".to_owned(),
         });
@@ -564,8 +596,9 @@ impl SandboxRuntime for OpenShellRuntime {
         let projection = project_request(request)?;
         self.ensure_workspace(&projection.workspace, &projection.workspace_key)
             .await?;
-        if !projection.providers.is_empty() {
-            self.ensure_tool_provider(&projection.workspace).await?;
+        for provider in &projection.providers {
+            self.ensure_provider(&projection.workspace, provider)
+                .await?;
         }
         let scoped = self.client.workspace(&projection.workspace);
         let snapshot = match scoped.get_sandbox(&projection.sandbox).await {
@@ -598,13 +631,18 @@ impl SandboxRuntime for OpenShellRuntime {
                 reason: "sandbox name resolved to a different runtime UID".to_owned(),
             });
         }
-        self.reconcile_tool_provider(
-            &projection.workspace,
-            &projection.sandbox,
-            snapshot.resource_version,
-            !projection.providers.is_empty(),
-        )
-        .await?;
+        for provider_name in [TOOL_PROVIDER, INFERENCE_PROVIDER] {
+            self.reconcile_provider(
+                &projection.workspace,
+                &projection.sandbox,
+                provider_name,
+                projection
+                    .providers
+                    .iter()
+                    .any(|provider| provider == provider_name),
+            )
+            .await?;
+        }
         let refs = runtime_refs(&projection);
         match snapshot.phase {
             SandboxPhase::Ready => Ok(SandboxObservation::Running { refs }),
@@ -791,6 +829,7 @@ mod tests {
             agent_type: AgentType {
                 name: "base".to_owned(),
             },
+            models: Vec::new(),
             tools: Vec::new(),
         })
         .map_err(|error| format!("runtime projection failed: {error:?}"))?;
@@ -815,6 +854,7 @@ mod tests {
             agent_type: AgentType {
                 name: "base".to_owned(),
             },
+            models: Vec::new(),
             tools: vec![ToolGrant {
                 provider: "github".to_owned(),
                 resource: "search_repositories".to_owned(),
@@ -827,6 +867,31 @@ mod tests {
             projection.providers,
             ["steward-mcp-gw"],
             "a tool-bearing runtime must use the token-grant provider and no ambient provider"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn inference_authority_attaches_only_the_runtime_key_provider() -> Result<(), String> {
+        let projection = project_request(&SandboxRequest {
+            runtime: RuntimeId("runtime-uid-a".to_owned()),
+            workspace_key: "team-a".to_owned(),
+            agent_type: AgentType {
+                name: "base".to_owned(),
+            },
+            models: vec![steward_types::ModelRef {
+                provider: "openai".to_owned(),
+                model: "priced-model".to_owned(),
+            }],
+            tools: Vec::new(),
+        })
+        .map_err(|error| format!("runtime projection failed: {error:?}"))?;
+
+        assert_eq!(
+            projection.providers,
+            ["steward-litellm"],
+            "an inference-bearing runtime must receive only the runtime-bound token-grant provider"
         );
         Ok(())
     }

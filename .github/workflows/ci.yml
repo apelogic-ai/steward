@@ -134,6 +134,9 @@ jobs:
       - name: Run S1 exit criterion
         run: cargo xtask e2e-s1
 
+      - name: Run S2 exit criterion
+        run: cargo xtask e2e-s2
+
       - name: Run S3 exit criterion
         run: cargo xtask e2e-s3
 

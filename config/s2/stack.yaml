@@ -1,0 +1,447 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: steward-system
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: steward-s2-runtime-writers
+  namespace: team-a
+rules:
+  - apiGroups: ["agents.apelogic.ai"]
+    resources: ["agentruntimes"]
+    verbs: ["create", "get", "list", "patch", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: steward-s2-runtime-writers
+  namespace: team-a
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: steward-s2-runtime-writers
+subjects:
+  - kind: Group
+    name: agents.apelogic.ai/member-role:engineer
+    apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: steward-s2-litellm
+  namespace: steward-system
+data:
+  config.yaml: |
+    model_list:
+      - model_name: openai/priced-model
+        litellm_params:
+          model: openai/priced-model
+          mock_response: allowed fixture response
+        model_info:
+          input_cost_per_token: 1.0
+          output_cost_per_token: 1.0
+      - model_name: openai/unpriced-model
+        litellm_params:
+          model: openai/unpriced-model
+          mock_response: unpriced fixture response
+        model_info:
+          input_cost_per_token: 0
+          output_cost_per_token: 0
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: steward-s2-postgres-init
+  namespace: steward-system
+data:
+  00-create-litellm.sql: |
+    CREATE DATABASE litellm;
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: steward-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: steward-s2-postgres
+  template:
+    metadata:
+      labels:
+        app: steward-s2-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+          env:
+            - name: POSTGRES_DB
+              value: steward
+            - name: POSTGRES_HOST_AUTH_METHOD
+              value: trust
+            - name: POSTGRES_USER
+              value: steward
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "steward", "-d", "steward"]
+          ports:
+            - name: postgres
+              containerPort: 5432
+          volumeMounts:
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        - name: init
+          configMap:
+            name: steward-s2-postgres-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: steward-system
+spec:
+  selector:
+    app: steward-s2-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: steward-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: steward-s2-litellm
+  template:
+    metadata:
+      labels:
+        app: steward-s2-litellm
+    spec:
+      containers:
+        - name: litellm
+          image: ghcr.io/berriai/litellm-database:v1.93.0@sha256:72360d8bd5602faa49be5098a8ac3dd069d9fb74503d6bd014242d96dc753e43
+          args: ["--config", "/config/config.yaml", "--port", "4000"]
+          env:
+            - name: DATABASE_URL
+              value: postgresql://steward@postgres.steward-system.svc.cluster.local:5432/litellm
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: steward-s2-secrets
+                  key: litellm-master-key
+          ports:
+            - name: http
+              containerPort: 4000
+          readinessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 2
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: steward-s2-litellm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  namespace: steward-system
+spec:
+  selector:
+    app: steward-s2-litellm
+  ports:
+    - name: http
+      port: 4000
+      targetPort: http
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: steward-mint
+  namespace: steward-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: steward-s2-mint
+rules:
+  - apiGroups: ["agents.apelogic.ai"]
+    resources: ["agentruntimes"]
+    verbs: ["get", "list"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: steward-s2-mint
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: steward-s2-mint
+subjects:
+  - kind: ServiceAccount
+    name: steward-mint
+    namespace: steward-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: steward-s2-mint-credentials
+  namespace: team-a
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: steward-s2-mint-credentials
+  namespace: team-a
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: steward-s2-mint-credentials
+subjects:
+  - kind: ServiceAccount
+    name: steward-mint
+    namespace: steward-system
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: steward-s2-mint
+spec:
+  spiffeIDTemplate: spiffe://openshell.local/steward/mint
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: steward-system
+  podSelector:
+    matchLabels:
+      app: steward-s2-mint
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: steward-mint
+  namespace: steward-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: steward-s2-mint
+  template:
+    metadata:
+      labels:
+        app: steward-s2-mint
+    spec:
+      serviceAccountName: steward-mint
+      containers:
+        - name: mint
+          image: steward/mint:s1
+          imagePullPolicy: Never
+          env:
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: unix:///spiffe-workload-api/spire-agent.sock
+            - name: STEWARD_AUTHORITY_TTL
+              value: "10"
+            - name: STEWARD_MINT_ALLOWED_SCOPES
+              value: inference
+            - name: STEWARD_MINT_AUDIENCE
+              value: steward-inference
+            - name: STEWARD_MINT_BIND
+              value: 0.0.0.0:8080
+            - name: STEWARD_MINT_ISSUER
+              value: http://steward-mint.steward-system.svc.cluster.local:8080
+            - name: STEWARD_MINT_SVID_AUDIENCE
+              value: steward-mint
+            - name: STEWARD_MINT_INTROSPECTION_CLIENT_CREDENTIAL_FILE
+              value: /run/steward/introspection-client
+            - name: STEWARD_MINT_SIGNING_KEY_FILE
+              value: /run/steward/signing-key
+            - name: STEWARD_OPENSHELL_NAMESPACE
+              value: openshell
+            - name: STEWARD_SPIFFE_TRUST_DOMAIN
+              value: openshell.local
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /.well-known/jwks.json
+              port: http
+          volumeMounts:
+            - name: mint-secrets
+              mountPath: /run/steward
+              readOnly: true
+            - name: spiffe-workload-api
+              mountPath: /spiffe-workload-api
+              readOnly: true
+      volumes:
+        - name: mint-secrets
+          secret:
+            secretName: steward-s2-secrets
+        - name: spiffe-workload-api
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: steward-mint
+  namespace: steward-system
+spec:
+  selector:
+    app: steward-s2-mint
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: steward-controller
+  namespace: steward-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: steward-s2-controller
+rules:
+  - apiGroups: ["agents.apelogic.ai"]
+    resources: ["agentruntimes", "agentruntimes/status", "agentruntimes/finalizers"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: steward-s2-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: steward-s2-controller
+subjects:
+  - kind: ServiceAccount
+    name: steward-controller
+    namespace: steward-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: steward-s2-controller-credentials
+  namespace: team-a
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: steward-s2-controller-credentials
+  namespace: team-a
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: steward-s2-controller-credentials
+subjects:
+  - kind: ServiceAccount
+    name: steward-controller
+    namespace: steward-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: steward-controller
+  namespace: steward-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: steward-s2-controller
+  template:
+    metadata:
+      labels:
+        app: steward-s2-controller
+    spec:
+      serviceAccountName: steward-controller
+      initContainers:
+        - name: wait-postgres
+          image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+          command: ["sh", "-c", "until pg_isready -h postgres -U steward -d steward; do sleep 1; done"]
+      containers:
+        - name: controller
+          image: STEWARD_S2_CONTROLLER_IMAGE
+          imagePullPolicy: Never
+          env:
+            - name: STEWARD_CONTROLLER_USERNAME
+              value: system:serviceaccount:steward-system:steward-controller
+            - name: STEWARD_DATABASE_URL
+              value: postgres://steward@postgres.steward-system.svc.cluster.local:5432/steward
+            - name: STEWARD_LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: steward-s2-secrets
+                  key: litellm-master-key
+            - name: STEWARD_LITELLM_URL
+              value: http://litellm.steward-system.svc.cluster.local:4000
+            - name: STEWARD_OPENSHELL_ENDPOINT
+              value: http://openshell.openshell.svc.cluster.local:8080
+            - name: STEWARD_TLS_CERT_DER
+              value: /run/steward/tls-cert.der
+            - name: STEWARD_TLS_KEY_DER
+              value: /run/steward/tls-key.der
+            - name: STEWARD_WEBHOOK_BIND
+              value: 0.0.0.0:8443
+          ports:
+            - name: https
+              containerPort: 8443
+          readinessProbe:
+            tcpSocket:
+              port: https
+          volumeMounts:
+            - name: secrets
+              mountPath: /run/steward
+              readOnly: true
+      volumes:
+        - name: secrets
+          secret:
+            secretName: steward-s2-secrets
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: steward-controller
+  namespace: steward-system
+spec:
+  selector:
+    app: steward-s2-controller
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
