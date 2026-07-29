@@ -43,7 +43,7 @@ jobs:
   conformance-pinned:
     name: conformance / pinned upstream
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -52,6 +52,12 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Install conformance tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+          supervisor-tools: "true"
 
       - name: Run pinned upstream conformance
         run: cargo xtask conformance --pinned
@@ -163,6 +169,28 @@ jobs:
       - name: Verify approval and instance-grant enforcement
         run: cargo xtask e2e-s4
 
+  e2e-revocation:
+    name: e2e / revocation and teardown
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Install integration tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+          supervisor-tools: "true"
+
+      - name: Verify revocation and teardown
+        run: cargo xtask e2e-s5
+
   pinned:
     name: pinned
     if: always()
@@ -174,6 +202,7 @@ jobs:
       - e2e-inference
       - e2e-admission
       - e2e-escalation
+      - e2e-revocation
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -187,6 +216,7 @@ jobs:
           INFERENCE: ${{ needs.e2e-inference.result }}
           ADMISSION: ${{ needs.e2e-admission.result }}
           ESCALATION: ${{ needs.e2e-escalation.result }}
+          REVOCATION: ${{ needs.e2e-revocation.result }}
         run: |
           set -euo pipefail
           for result in \
@@ -196,7 +226,8 @@ jobs:
             "${IDENTITY}" \
             "${INFERENCE}" \
             "${ADMISSION}" \
-            "${ESCALATION}"
+            "${ESCALATION}" \
+            "${REVOCATION}"
           do
             if [[ "${result}" != "success" ]]; then
               echo "a required pinned functional lane ended with: ${result}" >&2
@@ -207,7 +238,7 @@ jobs:
   latest-nightly:
     name: latest-nightly
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -217,6 +248,11 @@ jobs:
       # "latest" means latest upstream conformance target, not a different Rust release.
       - name: Install Steward Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Install latest-upstream conformance tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
 
       - name: Run informational latest-upstream lane
         id: latest_conformance

@@ -40,6 +40,10 @@ path = "s4_store.rs"
 name = "s4"
 path = "s4.rs"
 
+[[test]]
+name = "s5"
+path = "s5.rs"
+
 [[bin]]
 name = "s3-server"
 path = "s3_server.rs"

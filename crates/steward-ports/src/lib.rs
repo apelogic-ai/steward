@@ -108,6 +108,7 @@ pub struct SandboxRequest {
     pub agent_type: AgentType,
     pub models: Vec<ModelRef>,
     pub tools: Vec<ToolGrant>,
+    pub refs: RuntimeRefs,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

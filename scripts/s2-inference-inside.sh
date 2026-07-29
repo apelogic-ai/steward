@@ -2,13 +2,19 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SLICE="${STEWARD_E2E_SLICE:-s2}"
+if [[ "${SLICE}" != "s2" && "${SLICE}" != "s5" ]]; then
+  echo "STEWARD_E2E_SLICE must be s2 or s5" >&2
+  exit 2
+fi
+CAPTURE_FORWARD_PID=""
 LITELLM_FORWARD_PID=""
 POSTGRES_FORWARD_PID=""
 
 cleanup() {
   status="$1"
   trap - EXIT INT TERM
-  for pid in "${LITELLM_FORWARD_PID}" "${POSTGRES_FORWARD_PID}"; do
+  for pid in "${CAPTURE_FORWARD_PID}" "${LITELLM_FORWARD_PID}" "${POSTGRES_FORWARD_PID}"; do
     if [[ -n "${pid}" ]]; then
       kill "${pid}" >/dev/null 2>&1 || true
       wait "${pid}" >/dev/null 2>&1 || true
@@ -28,6 +34,10 @@ do
     exit 2
   fi
 done
+if [[ "${SLICE}" == "s5" && -z "${STEWARD_S5_MCP_GW_IMAGE:-}" ]]; then
+  echo "STEWARD_S5_MCP_GW_IMAGE is required from the ephemeral S5 harness" >&2
+  exit 2
+fi
 for command in cargo curl docker jq kind kubectl openssl sed tar; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is missing: ${command}" >&2
@@ -78,6 +88,9 @@ fi
 
 kind load docker-image steward/mint:s1 --name "${cluster_name}"
 kind load docker-image "${STEWARD_S2_CONTROLLER_IMAGE}" --name "${cluster_name}"
+if [[ "${SLICE}" == "s5" ]]; then
+  kind load docker-image "${STEWARD_S5_MCP_GW_IMAGE}" --name "${cluster_name}"
+fi
 
 KUBECTL=(kubectl --kubeconfig "${STEWARD_TEST_KUBECONFIG}" --context "${STEWARD_TEST_KUBE_CONTEXT}")
 "${KUBECTL[@]}" apply -f "${ROOT}/manifests/agents.apelogic.ai_agentruntimes.yaml"
@@ -87,6 +100,7 @@ KUBECTL=(kubectl --kubeconfig "${STEWARD_TEST_KUBECONFIG}" --context "${STEWARD_
 signing_key="${STEWARD_RUN_DIR}/s2-signing-key"
 introspection_client="${STEWARD_RUN_DIR}/s2-introspection-client"
 master_key="${STEWARD_RUN_DIR}/s2-litellm-master-key"
+encryption_key="${STEWARD_RUN_DIR}/s5-mcp-encryption-key"
 tls_key="${STEWARD_RUN_DIR}/s2-tls-key.pem"
 tls_cert="${STEWARD_RUN_DIR}/s2-tls-cert.pem"
 tls_key_der="${STEWARD_RUN_DIR}/s2-tls-key.der"
@@ -94,6 +108,9 @@ tls_cert_der="${STEWARD_RUN_DIR}/s2-tls-cert.der"
 openssl rand 32 >"${signing_key}"
 openssl rand -hex 24 | tr -d '\n' >"${introspection_client}"
 openssl rand -hex 32 | tr -d '\n' >"${master_key}"
+if [[ "${SLICE}" == "s5" ]]; then
+  openssl rand -base64 32 | tr -d '\n' >"${encryption_key}"
+fi
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${tls_key}" >/dev/null 2>&1
 openssl req -new -x509 -key "${tls_key}" -out "${tls_cert}" -days 1 \
   -subj "/CN=steward-controller.steward-system.svc" \
@@ -101,6 +118,9 @@ openssl req -new -x509 -key "${tls_key}" -out "${tls_cert}" -days 1 \
 openssl x509 -in "${tls_cert}" -outform DER -out "${tls_cert_der}"
 openssl pkcs8 -topk8 -nocrypt -in "${tls_key}" -outform DER -out "${tls_key_der}"
 chmod 600 "${signing_key}" "${introspection_client}" "${master_key}" "${tls_key}" "${tls_key_der}"
+if [[ "${SLICE}" == "s5" ]]; then
+  chmod 600 "${encryption_key}"
+fi
 
 for namespace in steward-system team-a; do
   "${KUBECTL[@]}" create namespace "${namespace}" --dry-run=client -o yaml |
@@ -117,15 +137,43 @@ done
   --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
 "${KUBECTL[@]}" -n steward-system label secret steward-s2-secrets \
   "steward.test/run-id=${STEWARD_RUN_ID}" --overwrite
+if [[ "${SLICE}" == "s5" ]]; then
+  "${KUBECTL[@]}" -n steward-system create configmap steward-s5-policy \
+    --from-file="mcp_tools.rego=${ROOT}/policy/mcp_tools.rego" \
+    --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
+  "${KUBECTL[@]}" -n steward-system create configmap steward-s5-fixtures \
+    --from-file="capture-proxy.ts=${ROOT}/config/s5/capture-proxy.ts" \
+    --from-file="fake-github-mcp.ts=${ROOT}/config/s1/fake-github-mcp.ts" \
+    --from-file="seed-mcp-gw.ts=${ROOT}/config/s1/seed-mcp-gw.ts" \
+    --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
+  "${KUBECTL[@]}" -n steward-system create secret generic steward-s5-mcp-gw \
+    --from-file="encryption-key=${encryption_key}" \
+    --from-file="introspection-client=${introspection_client}" \
+    --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
+fi
 
 rendered_stack="${STEWARD_RUN_DIR}/s2-stack.yaml"
 sed "s#STEWARD_S2_CONTROLLER_IMAGE#${STEWARD_S2_CONTROLLER_IMAGE}#g" \
   "${ROOT}/config/s2/stack.yaml" >"${rendered_stack}"
 "${KUBECTL[@]}" apply -f "${rendered_stack}"
+if [[ "${SLICE}" == "s5" ]]; then
+  rendered_tools_stack="${STEWARD_RUN_DIR}/s5-tools-stack.yaml"
+  sed "s#STEWARD_S5_MCP_GW_IMAGE#${STEWARD_S5_MCP_GW_IMAGE}#g" \
+    "${ROOT}/config/s5/tools-stack.yaml" >"${rendered_tools_stack}"
+  "${KUBECTL[@]}" apply -f "${rendered_tools_stack}"
+fi
 "${KUBECTL[@]}" -n steward-system rollout status deployment/postgres --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/litellm --timeout=300s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-mint --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-controller --timeout=300s
+if [[ "${SLICE}" == "s5" ]]; then
+  "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-mint-tools --timeout=180s
+  "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-opa --timeout=180s
+  "${KUBECTL[@]}" -n steward-system rollout status deployment/fake-github-mcp --timeout=180s
+  "${KUBECTL[@]}" -n steward-system rollout status deployment/mcp-gw --timeout=180s
+  "${KUBECTL[@]}" -n steward-system rollout status deployment/hop1-capture --timeout=180s
+  "${KUBECTL[@]}" -n steward-system wait --for=condition=complete job/seed-mcp-gw --timeout=180s
+fi
 
 service_subnet="$(
   "${KUBECTL[@]}" -n kube-system get configmap kubeadm-config \
@@ -136,15 +184,24 @@ if [[ -z "${service_subnet}" ]]; then
   echo "could not derive the kind service subnet" >&2
   exit 1
 fi
-profile="${STEWARD_RUN_DIR}/steward-litellm-profile.yaml"
-sed "s#SERVICE_SUBNET#${service_subnet}#g" \
-  "${ROOT}/config/s2/provider-profile.yaml" >"${profile}"
 "${OPEN_SHELL}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
   settings set --global --key providers_v2_enabled --value true --yes
-"${OPEN_SHELL}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
-  provider profile lint --global -f "${profile}"
-"${OPEN_SHELL}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
-  provider profile import --global -f "${profile}"
+if [[ "${SLICE}" == "s5" ]]; then
+  profile_sources=(
+    "${ROOT}/config/s5/tool-provider-profile.yaml"
+    "${ROOT}/config/s5/inference-provider-profile.yaml"
+  )
+else
+  profile_sources=("${ROOT}/config/s2/provider-profile.yaml")
+fi
+for profile_source in "${profile_sources[@]}"; do
+  profile="${STEWARD_RUN_DIR}/$(basename "${profile_source}")"
+  sed "s#SERVICE_SUBNET#${service_subnet}#g" "${profile_source}" >"${profile}"
+  "${OPEN_SHELL}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
+    provider profile lint --global -f "${profile}"
+  "${OPEN_SHELL}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
+    provider profile import --global -f "${profile}"
+done
 
 ca_bundle="$(base64 <"${tls_cert}" | tr -d '\n')"
 cat <<EOF | "${KUBECTL[@]}" apply -f -
@@ -181,6 +238,11 @@ LITELLM_FORWARD_PID=$!
 postgres_log="${STEWARD_RUN_DIR}/s2-postgres-forward.log"
 "${KUBECTL[@]}" -n steward-system port-forward service/postgres :5432 >"${postgres_log}" 2>&1 &
 POSTGRES_FORWARD_PID=$!
+if [[ "${SLICE}" == "s5" ]]; then
+  capture_log="${STEWARD_RUN_DIR}/s5-capture-forward.log"
+  "${KUBECTL[@]}" -n steward-system port-forward service/hop1-capture :8085 >"${capture_log}" 2>&1 &
+  CAPTURE_FORWARD_PID=$!
+fi
 
 forwarded_port() {
   local log="$1"
@@ -203,12 +265,26 @@ forwarded_port() {
 
 litellm_port="$(forwarded_port "${litellm_log}" "${LITELLM_FORWARD_PID}")"
 postgres_port="$(forwarded_port "${postgres_log}" "${POSTGRES_FORWARD_PID}")"
+if [[ "${SLICE}" == "s5" ]]; then
+  capture_port="$(forwarded_port "${capture_log}" "${CAPTURE_FORWARD_PID}")"
+  export STEWARD_TEST_CAPTURE_URL="http://127.0.0.1:${capture_port}"
+fi
 export STEWARD_OPENSHELL_CLI="${OPEN_SHELL}"
 export STEWARD_TEST_DATABASE_URL="postgres://steward@127.0.0.1:${postgres_port}/steward"
-export STEWARD_TEST_INFERENCE_URL="http://litellm.steward-system.svc.cluster.local:4000/v1/chat/completions"
+if [[ "${SLICE}" == "s5" ]]; then
+  export STEWARD_TEST_INFERENCE_URL="http://hop1-capture-inference.steward-system.svc.cluster.local:8085/inference"
+  export STEWARD_TEST_TOOL_URL="http://hop1-capture-tools.steward-system.svc.cluster.local:8085/mcp"
+else
+  export STEWARD_TEST_INFERENCE_URL="http://litellm.steward-system.svc.cluster.local:4000/v1/chat/completions"
+fi
 export STEWARD_TEST_LITELLM_MASTER_KEY_FILE="${master_key}"
 export STEWARD_TEST_LITELLM_URL="http://127.0.0.1:${litellm_port}"
 
-cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s2_store
-cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s2 \
-  e2e_s2_budget_exhaustion_suspends -- --exact
+if [[ "${SLICE}" == "s5" ]]; then
+  cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s5 \
+    e2e_s5_terminated_runtime_holds_nothing -- --exact
+else
+  cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s2_store
+  cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s2 \
+    e2e_s2_budget_exhaustion_suspends -- --exact
+fi

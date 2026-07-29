@@ -258,6 +258,19 @@ fn runtime_refs(projection: &OpenShellProjection) -> RuntimeRefs {
 }
 
 #[cfg(feature = "runtime")]
+fn deletion_names(request: &SandboxRequest) -> (String, String) {
+    match (&request.refs.workspace, &request.refs.sandbox) {
+        (Some(workspace), Some(sandbox)) if !workspace.is_empty() && !sandbox.is_empty() => {
+            (workspace.clone(), sandbox.clone())
+        }
+        _ => (
+            stable_name(NameKind::Workspace, request.workspace_key.as_bytes()),
+            stable_name(NameKind::Sandbox, request.runtime.0.as_bytes()),
+        ),
+    }
+}
+
+#[cfg(feature = "runtime")]
 fn project_request(request: &SandboxRequest) -> Result<OpenShellProjection, PortError> {
     let image = match request.agent_type.name.as_str() {
         "base" => BASE_SANDBOX_IMAGE,
@@ -654,8 +667,7 @@ impl SandboxRuntime for OpenShellRuntime {
     }
 
     async fn delete(&self, request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
-        let workspace = stable_name(NameKind::Workspace, request.workspace_key.as_bytes());
-        let sandbox = stable_name(NameKind::Sandbox, request.runtime.0.as_bytes());
+        let (workspace, sandbox) = deletion_names(request);
         let scoped = self.client.workspace(&workspace);
         let deleted = delete_owned_sandbox(&scoped, &sandbox, &request.runtime.0).await?;
         if deleted {
@@ -704,15 +716,15 @@ mod tests {
     #[cfg(feature = "runtime")]
     use steward_ports::SandboxRequest;
     #[cfg(feature = "runtime")]
-    use steward_types::{AgentType, RuntimeId, ToolGrant};
+    use steward_types::{AgentType, RuntimeId, RuntimeRefs, ToolGrant};
 
     #[cfg(feature = "identity")]
     use super::{IdentityResolutionError, SANDBOX_ID_LABEL, binding_from_sandbox};
     use super::{NameKind, stable_name};
     #[cfg(feature = "runtime")]
     use super::{
-        ProviderReconciliation, SandboxDeleteClient, delete_owned_sandbox, project_request,
-        provider_reconciliation,
+        ProviderReconciliation, SandboxDeleteClient, delete_owned_sandbox, deletion_names,
+        project_request, provider_reconciliation,
     };
 
     #[cfg(feature = "runtime")]
@@ -831,6 +843,7 @@ mod tests {
             },
             models: Vec::new(),
             tools: Vec::new(),
+            refs: RuntimeRefs::default(),
         })
         .map_err(|error| format!("runtime projection failed: {error:?}"))?;
 
@@ -843,6 +856,34 @@ mod tests {
         );
         assert_eq!(projection.runtime_uid, "runtime-uid-a");
         Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn teardown_uses_the_external_objects_recorded_in_status() {
+        let request = SandboxRequest {
+            runtime: RuntimeId("runtime-uid-a".to_owned()),
+            workspace_key: "team-a".to_owned(),
+            agent_type: AgentType {
+                name: "base".to_owned(),
+            },
+            models: Vec::new(),
+            tools: Vec::new(),
+            refs: RuntimeRefs {
+                workspace: Some("workspace-recorded".to_owned()),
+                sandbox: Some("sandbox-recorded".to_owned()),
+                litellm_key: Some("key-recorded".to_owned()),
+            },
+        };
+
+        assert_eq!(
+            deletion_names(&request),
+            (
+                "workspace-recorded".to_owned(),
+                "sandbox-recorded".to_owned()
+            ),
+            "teardown must traverse status.refs instead of guessing external names from current spec"
+        );
     }
 
     #[cfg(feature = "runtime")]
@@ -860,6 +901,7 @@ mod tests {
                 resource: "search_repositories".to_owned(),
                 action: "read".to_owned(),
             }],
+            refs: RuntimeRefs::default(),
         })
         .map_err(|error| format!("runtime projection failed: {error:?}"))?;
 
@@ -885,6 +927,7 @@ mod tests {
                 model: "priced-model".to_owned(),
             }],
             tools: Vec::new(),
+            refs: RuntimeRefs::default(),
         })
         .map_err(|error| format!("runtime projection failed: {error:?}"))?;
 

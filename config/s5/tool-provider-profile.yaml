@@ -1,0 +1,29 @@
+id: steward-mcp-gw
+display_name: Steward MCP gateway
+description: Runtime-scoped HOP-1 exchange through the S5 evidence proxy
+category: source_control
+credentials:
+  - name: access_token
+    description: Short-lived HOP-1 derived from the sandbox JWT-SVID
+    required: false
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: http://hop1-capture-tools.steward-system.svc.cluster.local:8085/token-tools
+      audience: steward-mcp
+      jwt_svid_audience: steward-mint
+      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-spiffe
+      scopes: [mcp]
+      cache_ttl_seconds: 2
+endpoints:
+  - host: hop1-capture-tools.steward-system.svc.cluster.local
+    port: 8085
+    protocol: rest
+    tls: none
+    access: read-write
+    enforcement: enforce
+    allowed_ips:
+      - SERVICE_SUBNET
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl
