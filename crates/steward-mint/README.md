@@ -8,13 +8,12 @@ and only then signs a token.
 The same endpoint also dispatches the exact `inference` scope to a
 runtime-credential resolver after those identity and live-authority checks.
 That path returns the opaque bearer credential stored in a Kubernetes Secret
-named by the immutable runtime UID in
-`STEWARD_INFERENCE_CREDENTIAL_NAMESPACE` (default `steward-system`). The Secret
-must carry the matching `agents.apelogic.ai/runtime-uid` label, be
-controller-owned by the `AgentRuntime` with that UID, and contain an
-`access-token` data entry. The credential is never placed in HOP-1 claims,
-Postgres, or AgentRuntime status, and the mint's token wrapper implements
-neither `Debug` nor `Display`.
+named by the immutable runtime UID and colocated in the runtime's namespace.
+The Secret must carry the matching `agents.apelogic.ai/runtime-uid` label, be
+controller-owned by the `AgentRuntime` with that UID in the same namespace, and
+contain an `access-token` data entry. The credential is never placed in HOP-1
+claims, Postgres, or AgentRuntime status, and the mint's token wrapper
+implements neither `Debug` nor `Display`.
 
 Any request containing the `inference` scope fails closed unless a resolver
 returns a bound credential. It never falls back to HOP-1. The response

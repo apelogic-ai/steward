@@ -62,6 +62,7 @@ pub enum AuthorityState {
 pub struct AuthorityBinding {
     pub workload_id: String,
     pub runtime: RuntimeId,
+    pub runtime_namespace: String,
     pub principal: Principal,
     pub tools: Vec<ToolGrant>,
     pub state: AuthorityState,

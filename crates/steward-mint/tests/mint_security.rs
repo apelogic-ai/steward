@@ -81,6 +81,7 @@ fn active_binding() -> AuthorityBinding {
     AuthorityBinding {
         workload_id: EXPECTED_WORKLOAD.to_owned(),
         runtime: RuntimeId("runtime-uid-a".to_owned()),
+        runtime_namespace: "team-a".to_owned(),
         principal: Principal::User {
             acting_user: Email("alice@example.com".to_owned()),
         },
