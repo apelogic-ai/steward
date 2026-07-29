@@ -4,6 +4,7 @@ use std::io;
 
 use sqlx::postgres::PgPoolOptions;
 use steward_store::PgStore;
+use steward_types::SpendSummary;
 
 #[tokio::test]
 async fn s2_spend_observations_are_append_only() -> Result<(), Box<dyn Error>> {
@@ -47,6 +48,48 @@ async fn s2_spend_observations_are_append_only() -> Result<(), Box<dyn Error>> {
     assert!(
         deletion.is_err(),
         "observed spend history must reject deletion after it is recorded"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn s2_exhaustion_authority_is_bound_to_one_spec_generation() -> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the S2 Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+
+    let spend = SpendSummary {
+        observed_amount: "1.00".to_owned(),
+        currency: "USD".to_owned(),
+    };
+    store
+        .record_spend_observation("runtime-b", 3, "spec-digest-a", &spend, true)
+    .await
+    .map_err(|error| {
+        io::Error::other(format!(
+            "budget exhaustion must be durably recordable before credential revocation: {error}"
+        ))
+    })?;
+
+    assert_eq!(
+        store
+            .inference_exhaustion("runtime-b", 3, "spec-digest-a")
+            .await?,
+        Some(spend),
+        "the same spec generation must remain exhausted across controller retries"
+    );
+    let prior_generation_matches = store
+        .inference_exhaustion("runtime-b", 4, "spec-digest-b")
+        .await?;
+    assert!(
+        prior_generation_matches.is_none(),
+        "a newly admitted spec generation must not inherit prior budget exhaustion"
     );
     Ok(())
 }

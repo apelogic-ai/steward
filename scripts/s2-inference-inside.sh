@@ -209,5 +209,6 @@ export STEWARD_TEST_INFERENCE_URL="http://litellm.steward-system.svc.cluster.loc
 export STEWARD_TEST_LITELLM_MASTER_KEY_FILE="${master_key}"
 export STEWARD_TEST_LITELLM_URL="http://127.0.0.1:${litellm_port}"
 
+cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s2_store
 cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s2 \
   e2e_s2_budget_exhaustion_suspends -- --exact

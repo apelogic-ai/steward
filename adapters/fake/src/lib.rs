@@ -41,7 +41,11 @@ impl InferencePlane for FakeAdapter {
         capabilities
     }
 
-    async fn validate_models(&self, _models: &[steward_types::ModelRef]) -> Result<(), PortError> {
+    async fn validate_configuration(
+        &self,
+        _models: &[steward_types::ModelRef],
+        _budget: &steward_types::Budget,
+    ) -> Result<(), PortError> {
         Ok(())
     }
 
@@ -53,6 +57,10 @@ impl InferencePlane for FakeAdapter {
             reference: request.runtime.0.clone(),
             credential: InferenceCredential::new("fixture-inference-value".to_owned()),
         })
+    }
+
+    async fn reconcile_configuration(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+        Ok(())
     }
 
     async fn observe(&self, request: &InferenceRequest) -> Result<InferenceObservation, PortError> {

@@ -69,7 +69,12 @@ impl Harness {
             .output()?)
     }
 
-    fn write_runtime(&self, name: &str, model: &str) -> Result<PathBuf, Box<dyn Error>> {
+    fn write_runtime(
+        &self,
+        name: &str,
+        model: &str,
+        monthly_limit: &str,
+    ) -> Result<PathBuf, Box<dyn Error>> {
         let path = self.run_dir.join(format!("e2e-s2-{name}.json"));
         let manifest = serde_json::json!({
             "apiVersion": "agents.apelogic.ai/v1alpha1",
@@ -94,7 +99,7 @@ impl Harness {
                 }],
                 "tools": [],
                 "budget": {
-                    "monthlyLimit": "1.00",
+                    "monthlyLimit": monthly_limit,
                     "currency": "USD"
                 },
                 "ttl": "1h"
@@ -194,6 +199,16 @@ impl Harness {
     }
 
     fn assert_key_absent(&self, alias: &str) -> Result<(), Box<dyn Error>> {
+        let body = self.key_list(alias)?;
+        assert_eq!(
+            body.get("total_count").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "a suspended runtime must have no live inference key"
+        );
+        Ok(())
+    }
+
+    fn key_list(&self, alias: &str) -> Result<serde_json::Value, Box<dyn Error>> {
         let output = Command::new("curl")
             .arg("-fsS")
             .arg("-H")
@@ -208,13 +223,58 @@ impl Harness {
         if !output.status.success() {
             return Err(io::Error::other("LiteLLM key lookup failed").into());
         }
-        let body: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        assert_eq!(
-            body.get("total_count").and_then(serde_json::Value::as_u64),
-            Some(0),
-            "a suspended runtime must have no live inference key"
-        );
-        Ok(())
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+
+    fn wait_key_budget(
+        &self,
+        alias: &str,
+        expected: f64,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn Error>> {
+        let deadline = Instant::now() + timeout;
+        let mut last = None;
+        while Instant::now() < deadline {
+            let body = self.key_list(alias)?;
+            last = body
+                .pointer("/keys/0/max_budget")
+                .and_then(number_value);
+            if last == Some(expected) {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        Err(io::Error::other(format!(
+            "inference key budget did not reconcile to {expected}; last value was {last:?}"
+        ))
+        .into())
+    }
+
+    fn key_spend(&self, alias: &str) -> Result<f64, Box<dyn Error>> {
+        self.key_list(alias)?
+            .pointer("/keys/0/spend")
+            .and_then(number_value)
+            .ok_or_else(|| io::Error::other("LiteLLM key spend was not numeric").into())
+    }
+
+    fn wait_key_spend(
+        &self,
+        alias: &str,
+        timeout: Duration,
+    ) -> Result<f64, Box<dyn Error>> {
+        let deadline = Instant::now() + timeout;
+        let mut last = 0.0;
+        while Instant::now() < deadline {
+            last = self.key_spend(alias)?;
+            if last > 0.0 {
+                return Ok(last);
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        Err(io::Error::other(format!(
+            "inference spend was not observed before the deadline; last value was {last}"
+        ))
+        .into())
     }
 
     fn delete_runtime(&self, name: &str) {
@@ -261,7 +321,7 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
                     ],
                     tools: Vec::new(),
                     budget: Budget {
-                        monthly_limit: "1.00".to_owned(),
+                        monthly_limit: "100.00".to_owned(),
                         currency: "USD".to_owned(),
                     },
                     ttl: RuntimeDuration("1h".to_owned()),
@@ -271,7 +331,7 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
         )
         .await?;
 
-    let unpriced = harness.write_runtime(UNPRICED_RUNTIME, "unpriced-model")?;
+    let unpriced = harness.write_runtime(UNPRICED_RUNTIME, "unpriced-model", "1.00")?;
     let rejected = harness.apply_runtime(&unpriced)?;
     assert!(
         !rejected.status.success(),
@@ -282,7 +342,7 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
         "unpriced-model rejection must identify the priced-catalog control"
     );
 
-    let priced = harness.write_runtime(PRICED_RUNTIME, "priced-model")?;
+    let priced = harness.write_runtime(PRICED_RUNTIME, "priced-model", "1.00")?;
     let applied = harness.apply_runtime(&priced)?;
     if !applied.status.success() {
         return Err(io::Error::other(format!(
@@ -293,14 +353,87 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
     }
     harness.wait_phase(PRICED_RUNTIME, "Running", Duration::from_secs(180))?;
     let alias = harness.runtime_ref("litellmKey")?;
+
+    let increased = harness.write_runtime(PRICED_RUNTIME, "priced-model", "100.00")?;
+    let applied = harness.apply_runtime(&increased)?;
+    if !applied.status.success() {
+        return Err(io::Error::other(format!(
+            "budget increase admission failed: {}",
+            String::from_utf8_lossy(&applied.stderr).trim()
+        ))
+        .into());
+    }
+    harness.wait_key_budget(&alias, 100.0, Duration::from_secs(120))?;
     let response = harness.call_inference()?;
     assert!(
         response.contains("allowed fixture response"),
         "the runtime must execute inference through its token-grant credential"
     );
+    let spend = harness.wait_key_spend(&alias, Duration::from_secs(60))?;
+    assert!(
+        spend > 0.0 && spend < 100.0,
+        "the fixture call must accumulate spend without exhausting the increased budget; observed {spend}"
+    );
+
+    let lowered = harness.write_runtime(PRICED_RUNTIME, "priced-model", "0.01")?;
+    let applied = harness.apply_runtime(&lowered)?;
+    if !applied.status.success() {
+        return Err(io::Error::other(format!(
+            "budget tightening admission failed: {}",
+            String::from_utf8_lossy(&applied.stderr).trim()
+        ))
+        .into());
+    }
+    harness.wait_phase(PRICED_RUNTIME, "Suspended", Duration::from_secs(120))?;
+    harness.assert_key_absent(&alias)?;
+
+    let renewed = harness.write_runtime(PRICED_RUNTIME, "priced-model", "100.00")?;
+    let applied = harness.apply_runtime(&renewed)?;
+    if !applied.status.success() {
+        return Err(io::Error::other(format!(
+            "post-exhaustion budget update admission failed: {}",
+            String::from_utf8_lossy(&applied.stderr).trim()
+        ))
+        .into());
+    }
+    harness.wait_phase(PRICED_RUNTIME, "Running", Duration::from_secs(180))?;
+
+    store
+        .insert_envelope(
+            "engineer",
+            &Envelope {
+                revision: 2,
+                spec: EnvelopeSpec {
+                    llms: vec![
+                        ModelRef {
+                            provider: "openai".to_owned(),
+                            model: "priced-model".to_owned(),
+                        },
+                        ModelRef {
+                            provider: "openai".to_owned(),
+                            model: "unpriced-model".to_owned(),
+                        },
+                    ],
+                    tools: Vec::new(),
+                    budget: Budget {
+                        monthly_limit: "50.00".to_owned(),
+                        currency: "USD".to_owned(),
+                    },
+                    ttl: RuntimeDuration("1h".to_owned()),
+                },
+            },
+            "admin@example.com",
+        )
+        .await?;
     harness.wait_phase(PRICED_RUNTIME, "Suspended", Duration::from_secs(120))?;
     harness.assert_key_absent(&alias)?;
     Ok(())
+}
+
+fn number_value(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|number| number.parse().ok()))
 }
 
 fn path_text(path: &Path) -> Result<&str, io::Error> {

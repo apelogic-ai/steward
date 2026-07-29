@@ -70,10 +70,20 @@ fn inference_action(observation: steward_ports::InferenceObservation) -> Inferen
 
 fn exhausted_spend_to_preserve(runtime: &AgentRuntime) -> Option<steward_types::SpendSummary> {
     runtime.status.as_ref().and_then(|status| {
-        matches!(status.phase, Phase::Terminating | Phase::Suspended)
-            .then(|| status.spend.clone())
-            .flatten()
+        (matches!(status.phase, Phase::Terminating | Phase::Suspended)
+            && status.observed_generation == runtime.metadata.generation.unwrap_or_default())
+        .then(|| status.spend.clone())
+        .flatten()
     })
+}
+
+fn runtime_spec_digest(runtime: &AgentRuntime) -> Result<String, ReconcileError> {
+    let serialized_spec =
+        serde_json::to_vec(&runtime.spec).map_err(|error| ReconcileError::InvalidSpec {
+            reason: error.to_string(),
+        })?;
+    let digest = Sha256::digest(serialized_spec);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,7 +138,11 @@ impl InferencePlane for NoInferencePlane {
         InferenceCapabilities::default()
     }
 
-    async fn validate_models(&self, models: &[steward_types::ModelRef]) -> Result<(), PortError> {
+    async fn validate_configuration(
+        &self,
+        models: &[steward_types::ModelRef],
+        _budget: &steward_types::Budget,
+    ) -> Result<(), PortError> {
         if models.is_empty() {
             Ok(())
         } else {
@@ -145,6 +159,10 @@ impl InferencePlane for NoInferencePlane {
         Err(PortError::Unsupported {
             operation: "inference credential provisioning",
         })
+    }
+
+    async fn reconcile_configuration(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+        Ok(())
     }
 
     async fn observe(
@@ -205,19 +223,10 @@ pub async fn reconcile_once<R: SandboxRuntime>(
             return Ok(ReconcileDecision::Deleted);
         }
     };
-    let serialized_spec =
-        serde_json::to_vec(&runtime.spec).map_err(|error| ReconcileError::InvalidSpec {
-            reason: error.to_string(),
-        })?;
-    let digest = Sha256::digest(serialized_spec);
-    let mut spec_digest = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        spec_digest.push_str(&format!("{byte:02x}"));
-    }
     Ok(ReconcileDecision::Status(AgentRuntimeStatus {
         phase,
         observed_generation: runtime.metadata.generation.unwrap_or_default(),
-        spec_digest,
+        spec_digest: runtime_spec_digest(runtime)?,
         refs,
         conditions: Vec::new(),
         spend: None,
@@ -479,6 +488,10 @@ async fn reconcile_inference<I: InferencePlane>(
 
     if let Some(secret) = secret.as_ref() {
         credential_secret_is_bound(runtime, secret).map_err(ControllerError::Reconcile)?;
+        inference
+            .reconcile_configuration(&request)
+            .await
+            .map_err(|error| ControllerError::Reconcile(ReconcileError::Runtime(error)))?;
     } else {
         provision_inference(client.clone(), runtime, inference, &request).await?;
     }
@@ -499,14 +512,7 @@ async fn reconcile_inference<I: InferencePlane>(
         InferenceAction::Continue { reference, spend } => {
             Ok(InferenceReconcile::Active { reference, spend })
         }
-        InferenceAction::Suspend { spend, .. } => {
-            inference
-                .revoke(&request)
-                .await
-                .map_err(|error| ControllerError::Reconcile(ReconcileError::Runtime(error)))?;
-            delete_credential_secret(client, runtime).await?;
-            Ok(InferenceReconcile::Exhausted { spend })
-        }
+        InferenceAction::Suspend { spend, .. } => Ok(InferenceReconcile::Exhausted { spend }),
         InferenceAction::Reprovision => Err(ControllerError::Reconcile(ReconcileError::Runtime(
             PortError::Failed {
                 reason: "provisioned inference key was not observable".to_owned(),
@@ -584,10 +590,12 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 return Ok(Action::requeue(StdDuration::from_secs(2)));
                             }
                             AuthorityAction::Suspend => {
-                                return suspend_runtime(
+                                return suspend_runtime_with_inference_cleanup(
                                     &runtime,
                                     &api,
                                     &context.sandbox_runtime,
+                                    context.client.clone(),
+                                    &context.inference,
                                     None,
                                 )
                                 .await;
@@ -625,8 +633,15 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         .get(MEMBER_ROLE_ANNOTATION)
                         .filter(|role| !role.is_empty())
                     else {
-                        return suspend_runtime(&runtime, &api, &context.sandbox_runtime, None)
-                            .await;
+                        return suspend_runtime_with_inference_cleanup(
+                            &runtime,
+                            &api,
+                            &context.sandbox_runtime,
+                            context.client.clone(),
+                            &context.inference,
+                            None,
+                        )
+                        .await;
                     };
                     let latest_envelope = authority
                         .latest_envelope(member_role)
@@ -659,13 +674,55 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             .map_err(ControllerError::Reconcile)?,
                         AuthorityAction::Suspend
                     ) {
-                        return suspend_runtime(&runtime, &api, &context.sandbox_runtime, None)
-                            .await;
+                        return suspend_runtime_with_inference_cleanup(
+                            &runtime,
+                            &api,
+                            &context.sandbox_runtime,
+                            context.client.clone(),
+                            &context.inference,
+                            None,
+                        )
+                        .await;
+                    }
+                    let runtime_uid =
+                        runtime
+                            .metadata
+                            .uid
+                            .as_deref()
+                            .ok_or(ControllerError::Reconcile(
+                                ReconcileError::MissingRuntimeUid,
+                            ))?;
+                    let observed_generation = runtime.metadata.generation.unwrap_or_default();
+                    let spec_digest =
+                        runtime_spec_digest(&runtime).map_err(ControllerError::Reconcile)?;
+                    if let Some(spend) = authority
+                        .inference_exhaustion(runtime_uid, observed_generation, &spec_digest)
+                        .await
+                        .map_err(|error| {
+                            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
+                        })?
+                    {
+                        return suspend_runtime_with_inference_cleanup(
+                            &runtime,
+                            &api,
+                            &context.sandbox_runtime,
+                            context.client.clone(),
+                            &context.inference,
+                            Some(spend),
+                        )
+                        .await;
                     }
                 }
                 if let Some(spend) = exhausted_spend_to_preserve(&runtime) {
-                    return suspend_runtime(&runtime, &api, &context.sandbox_runtime, Some(spend))
-                        .await;
+                    return suspend_runtime_with_inference_cleanup(
+                        &runtime,
+                        &api,
+                        &context.sandbox_runtime,
+                        context.client.clone(),
+                        &context.inference,
+                        Some(spend),
+                    )
+                    .await;
                 }
                 let inference =
                     reconcile_inference(context.client.clone(), &runtime, &context.inference)
@@ -687,6 +744,8 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 .ok_or(ControllerError::Reconcile(
                                     ReconcileError::MissingRuntimeUid,
                                 ))?,
+                            runtime.metadata.generation.unwrap_or_default(),
+                            &runtime_spec_digest(&runtime).map_err(ControllerError::Reconcile)?,
                             spend,
                             exhausted,
                         )
@@ -697,10 +756,12 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                 }
                 let inference_status = match inference {
                     InferenceReconcile::Exhausted { spend } => {
-                        return suspend_runtime(
+                        return suspend_runtime_with_inference_cleanup(
                             &runtime,
                             &api,
                             &context.sandbox_runtime,
+                            context.client.clone(),
+                            &context.inference,
                             Some(spend),
                         )
                         .await;
@@ -790,6 +851,23 @@ async fn suspend_runtime<R: SandboxRuntime>(
     Ok(Action::requeue(StdDuration::from_secs(60)))
 }
 
+async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferencePlane>(
+    runtime: &AgentRuntime,
+    api: &Api<AgentRuntime>,
+    sandbox_runtime: &R,
+    client: Client,
+    inference: &I,
+    spend: Option<steward_types::SpendSummary>,
+) -> Result<Action, ControllerError> {
+    let request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
+    inference
+        .revoke(&request)
+        .await
+        .map_err(|error| ControllerError::Reconcile(ReconcileError::Runtime(error)))?;
+    delete_credential_secret(client, runtime).await?;
+    suspend_runtime(runtime, api, sandbox_runtime, spend).await
+}
+
 #[derive(Clone, Debug)]
 enum AuthorityAction {
     Continue,
@@ -877,17 +955,10 @@ fn validate_authority_binding(
 }
 
 fn suspended_status(runtime: &AgentRuntime) -> Result<AgentRuntimeStatus, ControllerError> {
-    let serialized_spec = serde_json::to_vec(&runtime.spec).map_err(|error| {
-        ControllerError::Reconcile(ReconcileError::InvalidSpec {
-            reason: error.to_string(),
-        })
-    })?;
-    let digest = Sha256::digest(serialized_spec);
-    let spec_digest = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     Ok(AgentRuntimeStatus {
         phase: Phase::Suspended,
         observed_generation: runtime.metadata.generation.unwrap_or_default(),
-        spec_digest,
+        spec_digest: runtime_spec_digest(runtime).map_err(ControllerError::Reconcile)?,
         refs: RuntimeRefs::default(),
         conditions: Vec::new(),
         spend: None,
@@ -976,18 +1047,22 @@ pub trait WebhookEnvelopeReader: Clone + Send + Sync + 'static {
 }
 
 pub trait WebhookModelCatalog: Clone + Send + Sync + 'static {
-    fn validate_models<'a>(
+    fn validate_configuration<'a>(
         &'a self,
         models: &'a [steward_types::ModelRef],
+        budget: &'a steward_types::Budget,
     ) -> WebhookFuture<'a, Result<(), PortError>>;
 }
 
 impl<T: steward_ports::InferencePlane + Clone> WebhookModelCatalog for T {
-    fn validate_models<'a>(
+    fn validate_configuration<'a>(
         &'a self,
         models: &'a [steward_types::ModelRef],
+        budget: &'a steward_types::Budget,
     ) -> WebhookFuture<'a, Result<(), PortError>> {
-        Box::pin(async move { steward_ports::InferencePlane::validate_models(self, models).await })
+        Box::pin(async move {
+            steward_ports::InferencePlane::validate_configuration(self, models, budget).await
+        })
     }
 }
 
@@ -1126,16 +1201,19 @@ pub async fn validate_admission_with_catalog<R: WebhookEnvelopeReader, C: Webhoo
     let Some(runtime) = request.object.as_ref() else {
         return response.deny("AgentRuntime admission request has no object");
     };
-    match catalog.validate_models(&runtime.spec.llms).await {
+    match catalog
+        .validate_configuration(&runtime.spec.llms, &runtime.spec.budget)
+        .await
+    {
         Ok(()) => response,
         Err(PortError::Rejected { reason }) | Err(PortError::Failed { reason }) => response.deny(
-            format!("AgentRuntime model catalog validation failed closed: {reason}"),
+            format!("AgentRuntime inference configuration validation failed closed: {reason}"),
         ),
         Err(PortError::Unsupported { operation }) => response.deny(format!(
-            "AgentRuntime model catalog validation failed closed: configured inference plane does not support {operation}"
+            "AgentRuntime inference configuration validation failed closed: configured inference plane does not support {operation}"
         )),
         Err(_) => response.deny(
-            "AgentRuntime model catalog validation failed closed: unrecognized inference-plane failure",
+            "AgentRuntime inference configuration validation failed closed: unrecognized inference-plane failure",
         ),
     }
 }
@@ -1186,9 +1264,10 @@ fn is_controller_finalizer_update(
 struct AllowConfiguredModels;
 
 impl WebhookModelCatalog for AllowConfiguredModels {
-    fn validate_models<'a>(
+    fn validate_configuration<'a>(
         &'a self,
         _models: &'a [steward_types::ModelRef],
+        _budget: &'a steward_types::Budget,
     ) -> WebhookFuture<'a, Result<(), PortError>> {
         Box::pin(async { Ok(()) })
     }
@@ -1328,6 +1407,29 @@ mod tests {
             exhausted_spend_to_preserve(&runtime),
             Some(spend),
             "an exhausted runtime must finish suspension instead of provisioning a fresh key"
+        );
+    }
+
+    #[test]
+    fn a_new_spec_generation_clears_prior_budget_exhaustion() {
+        let mut runtime = fixture();
+        runtime.metadata.generation = Some(4);
+        runtime.status = Some(steward_types::AgentRuntimeStatus {
+            phase: Phase::Suspended,
+            observed_generation: 3,
+            spec_digest: "prior-spec-digest".to_owned(),
+            refs: RuntimeRefs::default(),
+            conditions: Vec::new(),
+            spend: Some(steward_types::SpendSummary {
+                observed_amount: "1.00".to_owned(),
+                currency: "USD".to_owned(),
+            }),
+        });
+
+        assert_eq!(
+            exhausted_spend_to_preserve(&runtime),
+            None,
+            "an admitted spec update must be reconciled instead of inheriting an older generation's exhaustion"
         );
     }
 
@@ -1650,9 +1752,10 @@ mod webhook_tests {
     struct RejectUnpricedCatalog;
 
     impl WebhookModelCatalog for RejectUnpricedCatalog {
-        fn validate_models<'a>(
+        fn validate_configuration<'a>(
             &'a self,
             _models: &'a [ModelRef],
+            _budget: &'a Budget,
         ) -> WebhookFuture<'a, Result<(), steward_ports::PortError>> {
             Box::pin(async {
                 Err(steward_ports::PortError::Rejected {
@@ -1660,6 +1763,30 @@ mod webhook_tests {
                         "models are absent from the priced inference catalog: provider-a/model-a"
                             .to_owned(),
                 })
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct UsdOnlyCatalog;
+
+    impl WebhookModelCatalog for UsdOnlyCatalog {
+        fn validate_configuration<'a>(
+            &'a self,
+            _models: &'a [ModelRef],
+            budget: &'a Budget,
+        ) -> WebhookFuture<'a, Result<(), steward_ports::PortError>> {
+            Box::pin(async move {
+                if budget.currency == "USD" {
+                    Ok(())
+                } else {
+                    Err(steward_ports::PortError::Rejected {
+                        reason: format!(
+                            "configured inference plane cannot enforce {} budgets",
+                            budget.currency
+                        ),
+                    })
+                }
             })
         }
     }
@@ -1787,7 +1914,36 @@ mod webhook_tests {
         );
         assert_eq!(
             response.result.message,
-            "AgentRuntime model catalog validation failed closed: models are absent from the priced inference catalog: provider-a/model-a"
+            "AgentRuntime inference configuration validation failed closed: models are absent from the priced inference catalog: provider-a/model-a"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_unsupported_budget_currency_before_persistence() -> Result<(), String>
+    {
+        let mut value = admission_review_value();
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
+        value["request"]["object"]["spec"]["budget"]["currency"] = serde_json::json!("EUR");
+        value["request"]["oldObject"] = serde_json::Value::Null;
+        value["request"]["operation"] = serde_json::json!("CREATE");
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct non-USD review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read non-USD request: {error}"))?;
+        let mut envelopes = fake_envelopes();
+        envelopes.envelope.spec.budget.currency = "EUR".to_owned();
+
+        let response = validate_admission_with_catalog(&request, &envelopes, &UsdOnlyCatalog).await;
+
+        assert!(
+            !response.allowed,
+            "a budget the configured inference plane cannot enforce must not be persisted"
+        );
+        assert_eq!(
+            response.result.message,
+            "AgentRuntime inference configuration validation failed closed: configured inference plane cannot enforce EUR budgets"
         );
         Ok(())
     }

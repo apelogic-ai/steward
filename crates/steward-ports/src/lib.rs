@@ -237,15 +237,21 @@ pub enum SessionEvent {
 pub trait InferencePlane: Send + Sync + 'static {
     fn capabilities(&self) -> InferenceCapabilities;
 
-    fn validate_models(
+    fn validate_configuration(
         &self,
         models: &[ModelRef],
+        budget: &Budget,
     ) -> impl Future<Output = Result<(), PortError>> + Send;
 
     fn provision(
         &self,
         request: &InferenceRequest,
     ) -> impl Future<Output = Result<ProvisionedInference, PortError>> + Send;
+
+    fn reconcile_configuration(
+        &self,
+        request: &InferenceRequest,
+    ) -> impl Future<Output = Result<(), PortError>> + Send;
 
     fn observe(
         &self,
