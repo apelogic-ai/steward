@@ -927,11 +927,16 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
     sandbox_runtime: &R,
 ) -> Result<ReconcileDecision, ControllerError> {
     let inference_request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
-    let inference_result = inference.revoke(&inference_request).await;
-    let credential_result = delete_credential_secret(client, runtime).await;
-    let sandbox_result = reconcile_once(runtime, ReconcileIntent::Delete, sandbox_runtime)
-        .await
-        .map_err(ControllerError::Reconcile);
+    let sandbox_cleanup = async {
+        reconcile_once(runtime, ReconcileIntent::Delete, sandbox_runtime)
+            .await
+            .map_err(ControllerError::Reconcile)
+    };
+    let (inference_result, credential_result, sandbox_result) = futures::join!(
+        inference.revoke(&inference_request),
+        delete_credential_secret(client, runtime),
+        sandbox_cleanup,
+    );
 
     let decision = sandbox_result?;
     if let Err(error) = inference_result {
@@ -976,9 +981,11 @@ async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferenceP
     spend: Option<steward_types::SpendSummary>,
 ) -> Result<Action, ControllerError> {
     let request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
-    let revoke_result = inference.revoke(&request).await;
-    let credential_result = delete_credential_secret(client, runtime).await;
-    let suspension_result = suspend_runtime(runtime, api, sandbox_runtime, spend).await;
+    let (revoke_result, credential_result, suspension_result) = futures::join!(
+        inference.revoke(&request),
+        delete_credential_secret(client, runtime),
+        suspend_runtime(runtime, api, sandbox_runtime, spend),
+    );
 
     let action = suspension_result?;
     if let Err(error) = revoke_result {
@@ -1460,7 +1467,9 @@ async fn webhook_handler<R: WebhookEnvelopeReader, C: WebhookModelCatalog>(
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::Poll;
     use std::time::Duration as StdDuration;
 
     use axum::body::Body;
@@ -1661,6 +1670,66 @@ mod tests {
         }
     }
 
+    struct PendingRevokeInference;
+
+    impl InferencePlane for PendingRevokeInference {
+        fn capabilities(&self) -> InferenceCapabilities {
+            InferenceCapabilities::default()
+        }
+
+        async fn validate_configuration(
+            &self,
+            _models: &[ModelRef],
+            _budget: &Budget,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        async fn provision(
+            &self,
+            _request: &InferenceRequest,
+        ) -> Result<ProvisionedInference, PortError> {
+            Err(PortError::Unsupported {
+                operation: "test inference provisioning",
+            })
+        }
+
+        async fn reconcile_configuration(
+            &self,
+            _request: &InferenceRequest,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        async fn observe(
+            &self,
+            _request: &InferenceRequest,
+        ) -> Result<InferenceObservation, PortError> {
+            Ok(InferenceObservation::Absent)
+        }
+
+        async fn revoke(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+            std::future::pending().await
+        }
+    }
+
+    struct SignallingDeleteRuntime {
+        deleted: Arc<AtomicBool>,
+    }
+
+    impl SandboxRuntime for SignallingDeleteRuntime {
+        async fn ensure(&self, _request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+            Err(PortError::Unsupported {
+                operation: "test sandbox ensure",
+            })
+        }
+
+        async fn delete(&self, _request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+            self.deleted.store(true, Ordering::SeqCst);
+            Ok(SandboxObservation::Absent)
+        }
+    }
+
     #[tokio::test]
     async fn authority_suspension_deletes_the_sandbox_during_a_litellm_outage() -> Result<(), String>
     {
@@ -1790,6 +1859,58 @@ mod tests {
             "termination must attempt sandbox teardown even when LiteLLM is unavailable"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn termination_starts_teardown_while_litellm_revocation_is_pending() -> Result<(), String>
+    {
+        let runtime = fixture();
+        let secret_deleted = Arc::new(AtomicBool::new(false));
+        let secret_deleted_for_service = secret_deleted.clone();
+        let client = Client::new(
+            service_fn(move |request: Request<KubeBody>| {
+                if request.method() == Method::DELETE && request.uri().path().contains("/secrets/")
+                {
+                    secret_deleted_for_service.store(true, Ordering::SeqCst);
+                }
+                async move {
+                    let mut response = Response::new(Body::from(
+                        br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success","code":200}"#
+                            .to_vec(),
+                    ));
+                    *response.status_mut() = StatusCode::OK;
+                    Ok::<_, Infallible>(response)
+                }
+            }),
+            "team-a",
+        );
+        let sandbox_deleted = Arc::new(AtomicBool::new(false));
+        let sandbox = SignallingDeleteRuntime {
+            deleted: sandbox_deleted.clone(),
+        };
+        let mut cleanup = Box::pin(cleanup_runtime(
+            &runtime,
+            client,
+            &PendingRevokeInference,
+            &sandbox,
+        ));
+
+        for _ in 0..32 {
+            if let Poll::Ready(result) = futures::poll!(&mut cleanup) {
+                return Err(format!(
+                    "cleanup unexpectedly completed while revocation was pending: {result:?}"
+                ));
+            }
+            if secret_deleted.load(Ordering::SeqCst) && sandbox_deleted.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+
+        Err(
+            "credential and sandbox deletion did not start while LiteLLM revocation was pending"
+                .to_owned(),
+        )
     }
 
     impl SandboxRuntime for FakeSandboxRuntime {
