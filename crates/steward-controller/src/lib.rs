@@ -170,6 +170,7 @@ pub enum ReconcileError {
     Runtime(PortError),
     Authority(String),
     DeletionPending,
+    InferenceRevocationTimedOut,
 }
 
 impl fmt::Display for ReconcileError {
@@ -933,17 +934,30 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
             .map_err(ControllerError::Reconcile)
     };
     let (inference_result, credential_result, sandbox_result) = futures::join!(
-        inference.revoke(&inference_request),
+        revoke_inference_with_timeout(inference, &inference_request),
         delete_credential_secret(client, runtime),
         sandbox_cleanup,
     );
 
     let decision = sandbox_result?;
-    if let Err(error) = inference_result {
-        return Err(ControllerError::Reconcile(ReconcileError::Runtime(error)));
+    if matches!(decision, ReconcileDecision::Status(_)) {
+        return Ok(decision);
     }
     credential_result?;
+    inference_result.map_err(ControllerError::Reconcile)?;
     Ok(decision)
+}
+
+const INFERENCE_REVOCATION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
+async fn revoke_inference_with_timeout<I: InferencePlane>(
+    inference: &I,
+    request: &InferenceRequest,
+) -> Result<(), ReconcileError> {
+    tokio::time::timeout(INFERENCE_REVOCATION_TIMEOUT, inference.revoke(request))
+        .await
+        .map_err(|_| ReconcileError::InferenceRevocationTimedOut)?
+        .map_err(ReconcileError::Runtime)
 }
 
 async fn suspend_runtime<R: SandboxRuntime>(
@@ -982,16 +996,14 @@ async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferenceP
 ) -> Result<Action, ControllerError> {
     let request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
     let (revoke_result, credential_result, suspension_result) = futures::join!(
-        inference.revoke(&request),
+        revoke_inference_with_timeout(inference, &request),
         delete_credential_secret(client, runtime),
         suspend_runtime(runtime, api, sandbox_runtime, spend),
     );
 
     let action = suspension_result?;
-    if let Err(error) = revoke_result {
-        return Err(ControllerError::Reconcile(ReconcileError::Runtime(error)));
-    }
     credential_result?;
+    revoke_result.map_err(ControllerError::Reconcile)?;
     Ok(action)
 }
 
@@ -1469,7 +1481,6 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::task::Poll;
     use std::time::Duration as StdDuration;
 
     use axum::body::Body;
@@ -1730,6 +1741,26 @@ mod tests {
         }
     }
 
+    struct ProvisioningDeleteRuntime;
+
+    impl SandboxRuntime for ProvisioningDeleteRuntime {
+        async fn ensure(&self, _request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+            Err(PortError::Unsupported {
+                operation: "test sandbox ensure",
+            })
+        }
+
+        async fn delete(&self, _request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+            Ok(SandboxObservation::Provisioning {
+                refs: RuntimeRefs {
+                    workspace: Some("workspace-a".to_owned()),
+                    sandbox: Some("sandbox-a".to_owned()),
+                    litellm_key: None,
+                },
+            })
+        }
+    }
+
     #[tokio::test]
     async fn authority_suspension_deletes_the_sandbox_during_a_litellm_outage() -> Result<(), String>
     {
@@ -1861,7 +1892,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn termination_starts_teardown_while_litellm_revocation_is_pending() -> Result<(), String>
     {
         let runtime = fixture();
@@ -1888,29 +1919,134 @@ mod tests {
         let sandbox = SignallingDeleteRuntime {
             deleted: sandbox_deleted.clone(),
         };
-        let mut cleanup = Box::pin(cleanup_runtime(
-            &runtime,
-            client,
-            &PendingRevokeInference,
-            &sandbox,
-        ));
-
-        for _ in 0..32 {
-            if let Poll::Ready(result) = futures::poll!(&mut cleanup) {
-                return Err(format!(
-                    "cleanup unexpectedly completed while revocation was pending: {result:?}"
-                ));
-            }
-            if secret_deleted.load(Ordering::SeqCst) && sandbox_deleted.load(Ordering::SeqCst) {
-                return Ok(());
-            }
-            tokio::task::yield_now().await;
-        }
-
-        Err(
-            "credential and sandbox deletion did not start while LiteLLM revocation was pending"
-                .to_owned(),
+        let result = tokio::time::timeout(
+            StdDuration::from_secs(6),
+            cleanup_runtime(&runtime, client, &PendingRevokeInference, &sandbox),
         )
+        .await
+        .map_err(|_| {
+            "termination must requeue while LiteLLM revocation remains pending".to_owned()
+        })?;
+
+        assert!(
+            result.is_err(),
+            "pending inference revocation must keep finalizer cleanup retryable"
+        );
+        assert!(
+            secret_deleted.load(Ordering::SeqCst),
+            "termination must attempt credential deletion before requeueing"
+        );
+        assert!(
+            sandbox_deleted.load(Ordering::SeqCst),
+            "termination must attempt sandbox deletion before requeueing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authority_suspension_requeues_while_litellm_revocation_is_pending()
+    -> Result<(), String> {
+        let runtime = fixture();
+        let serialized_runtime = serde_json::to_vec(&runtime)
+            .map_err(|error| format!("fixture runtime must be serializable: {error}"))?;
+        let secret_deleted = Arc::new(AtomicBool::new(false));
+        let secret_deleted_for_service = secret_deleted.clone();
+        let client = Client::new(
+            service_fn(move |request: Request<KubeBody>| {
+                let serialized_runtime = serialized_runtime.clone();
+                if request.method() == Method::DELETE && request.uri().path().contains("/secrets/")
+                {
+                    secret_deleted_for_service.store(true, Ordering::SeqCst);
+                }
+                async move {
+                    let body = if request.method() == Method::PATCH
+                        && request.uri().path().ends_with("/status")
+                    {
+                        serialized_runtime
+                    } else {
+                        br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success","code":200}"#
+                            .to_vec()
+                    };
+                    let mut response = Response::new(Body::from(body));
+                    *response.status_mut() = StatusCode::OK;
+                    Ok::<_, Infallible>(response)
+                }
+            }),
+            "team-a",
+        );
+        let sandbox_deleted = Arc::new(AtomicBool::new(false));
+        let sandbox = SignallingDeleteRuntime {
+            deleted: sandbox_deleted.clone(),
+        };
+        let api = kube::Api::<AgentRuntime>::namespaced(client.clone(), "team-a");
+
+        let result = tokio::time::timeout(
+            StdDuration::from_secs(6),
+            suspend_runtime_with_inference_cleanup(
+                &runtime,
+                &api,
+                &sandbox,
+                client,
+                &PendingRevokeInference,
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            "authority suspension must requeue while LiteLLM revocation remains pending".to_owned()
+        })?;
+
+        assert!(
+            result.is_err(),
+            "pending inference revocation must keep authority suspension retryable"
+        );
+        assert!(
+            secret_deleted.load(Ordering::SeqCst),
+            "authority suspension must attempt credential deletion before requeueing"
+        );
+        assert!(
+            sandbox_deleted.load(Ordering::SeqCst),
+            "authority suspension must attempt sandbox deletion before requeueing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn termination_reports_sandbox_progress_while_litellm_revocation_is_pending()
+    -> Result<(), String> {
+        let runtime = fixture();
+        let client = Client::new(
+            service_fn(|_request: Request<KubeBody>| async move {
+                let mut response = Response::new(Body::from(
+                    br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success","code":200}"#
+                        .to_vec(),
+                ));
+                *response.status_mut() = StatusCode::OK;
+                Ok::<_, Infallible>(response)
+            }),
+            "team-a",
+        );
+
+        let result = tokio::time::timeout(
+            StdDuration::from_secs(6),
+            cleanup_runtime(
+                &runtime,
+                client,
+                &PendingRevokeInference,
+                &ProvisioningDeleteRuntime,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            "termination must report sandbox progress while revocation remains pending".to_owned()
+        })?
+        .map_err(|error| format!("sandbox progress must remain observable: {error}"))?;
+
+        let ReconcileDecision::Status(status) = result else {
+            return Err("a pending sandbox deletion must return terminating status".to_owned());
+        };
+        assert_eq!(status.phase, Phase::Terminating);
+        Ok(())
     }
 
     impl SandboxRuntime for FakeSandboxRuntime {
