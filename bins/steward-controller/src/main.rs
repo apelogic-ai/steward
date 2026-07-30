@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             store.clone(),
             inference.clone(),
             required("STEWARD_CONTROLLER_USERNAME")?,
+            required("STEWARD_APISERVER_USERNAME")?,
         ),
     );
     let controller =

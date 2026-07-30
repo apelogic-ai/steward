@@ -675,13 +675,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             .annotations
                             .get_or_insert_default()
                             .remove(PENDING_APPROVAL_ANNOTATION);
-                        replace_as_authority(
-                            &context.client,
-                            &proposed,
-                            &application.actor,
-                            &application.member_role,
-                        )
-                        .await?;
+                        replace_pending_as_controller(&context.client, &proposed).await?;
                         return Ok(Action::requeue(StdDuration::from_secs(2)));
                     }
                     let status =
@@ -1222,6 +1216,20 @@ async fn replace_as_authority(
         .map_err(ControllerError::Kubernetes)
 }
 
+async fn replace_pending_as_controller(
+    client: &Client,
+    runtime: &AgentRuntime,
+) -> Result<(), ControllerError> {
+    let namespace = runtime
+        .namespace()
+        .ok_or(ControllerError::Reconcile(ReconcileError::MissingNamespace))?;
+    Api::<AgentRuntime>::namespaced(client.clone(), &namespace)
+        .replace(&runtime.name_any(), &PostParams::default(), runtime)
+        .await
+        .map(|_| ())
+        .map_err(ControllerError::Kubernetes)
+}
+
 fn status_merge_patch(status: &AgentRuntimeStatus) -> serde_json::Value {
     serde_json::json!({
         "status": {
@@ -1309,6 +1317,14 @@ pub async fn validate_admission<R: WebhookEnvelopeReader>(
     request: &AdmissionRequest<AgentRuntime>,
     envelopes: &R,
 ) -> AdmissionResponse {
+    validate_admission_with_trusted_writers(request, envelopes, &BTreeSet::new()).await
+}
+
+async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
+    request: &AdmissionRequest<AgentRuntime>,
+    envelopes: &R,
+    trusted_writer_usernames: &BTreeSet<String>,
+) -> AdmissionResponse {
     let response = AdmissionResponse::from(request);
     if request.operation == Operation::Delete {
         return response;
@@ -1322,6 +1338,7 @@ pub async fn validate_admission<R: WebhookEnvelopeReader>(
     let Some(username) = request.user_info.username.as_deref() else {
         return response.deny("authenticated Kubernetes username is required");
     };
+    let mut trusted_pending_removal = false;
     if request.operation == Operation::Update {
         let Some(old_runtime) = request.old_object.as_ref() else {
             return response.deny("AgentRuntime UPDATE admission request has no old object");
@@ -1338,41 +1355,62 @@ pub async fn validate_admission<R: WebhookEnvelopeReader>(
             .annotations()
             .get(PENDING_APPROVAL_ANNOTATION)
             .map(String::as_str);
-        if pending.is_some() && pending != old_pending {
+        trusted_pending_removal = old_pending.is_some()
+            && pending.is_none()
+            && trusted_writer_usernames.contains(username);
+        if pending != old_pending && pending.is_some() {
             return response
                 .deny("agents.apelogic.ai/pending-approval cannot be added or changed on UPDATE");
         }
-        match &old_runtime.spec.principal {
+        if pending != old_pending && !trusted_pending_removal {
+            return response.deny(
+                "agents.apelogic.ai/pending-approval may be removed only by a trusted Steward writer",
+            );
+        }
+        if !trusted_pending_removal {
+            match &old_runtime.spec.principal {
+                steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
+                _ => {
+                    return response.deny(
+                        "existing AgentRuntime acting user must match the authenticated Kubernetes username",
+                    );
+                }
+            }
+        }
+    }
+    if !trusted_pending_removal {
+        match &runtime.spec.principal {
             steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
             _ => {
                 return response.deny(
-                    "existing AgentRuntime acting user must match the authenticated Kubernetes username",
+                    "AgentRuntime acting user must match the authenticated Kubernetes username",
                 );
             }
         }
     }
-    match &runtime.spec.principal {
-        steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
-        _ => {
-            return response
-                .deny("AgentRuntime acting user must match the authenticated Kubernetes username");
-        }
-    }
-    let roles = request
-        .user_info
-        .groups
-        .iter()
-        .flatten()
-        .filter_map(|group| group.strip_prefix(MEMBER_ROLE_GROUP_PREFIX))
-        .filter(|role| !role.is_empty())
-        .collect::<BTreeSet<_>>();
-    let Some(member_role) = roles.iter().next().copied().filter(|_| roles.len() == 1) else {
-        return response.deny("exactly one authenticated member-role group is required");
-    };
     let bound_role = runtime
         .annotations()
         .get(MEMBER_ROLE_ANNOTATION)
         .map(String::as_str);
+    let member_role = if trusted_pending_removal {
+        let Some(member_role) = bound_role.filter(|role| !role.is_empty()) else {
+            return response.deny("AgentRuntime member-role annotation is required");
+        };
+        member_role
+    } else {
+        let roles = request
+            .user_info
+            .groups
+            .iter()
+            .flatten()
+            .filter_map(|group| group.strip_prefix(MEMBER_ROLE_GROUP_PREFIX))
+            .filter(|role| !role.is_empty())
+            .collect::<BTreeSet<_>>();
+        let Some(member_role) = roles.iter().next().copied().filter(|_| roles.len() == 1) else {
+            return response.deny("exactly one authenticated member-role group is required");
+        };
+        member_role
+    };
     if bound_role != Some(member_role) {
         return response.deny(
             "AgentRuntime member-role annotation must match the authenticated member-role group",
@@ -1425,7 +1463,20 @@ pub async fn validate_admission_with_catalog<R: WebhookEnvelopeReader, C: Webhoo
     envelopes: &R,
     catalog: &C,
 ) -> AdmissionResponse {
-    let response = validate_admission(request, envelopes).await;
+    validate_admission_with_catalog_for_writers(request, envelopes, catalog, &BTreeSet::new()).await
+}
+
+async fn validate_admission_with_catalog_for_writers<
+    R: WebhookEnvelopeReader,
+    C: WebhookModelCatalog,
+>(
+    request: &AdmissionRequest<AgentRuntime>,
+    envelopes: &R,
+    catalog: &C,
+    trusted_writer_usernames: &BTreeSet<String>,
+) -> AdmissionResponse {
+    let response =
+        validate_admission_with_trusted_writers(request, envelopes, trusted_writer_usernames).await;
     if !response.allowed {
         return response;
     }
@@ -1461,7 +1512,12 @@ async fn validate_admission_for_controller<R: WebhookEnvelopeReader>(
     if is_controller_finalizer_update(request, controller_username) {
         return AdmissionResponse::from(request);
     }
-    validate_admission(request, envelopes).await
+    validate_admission_with_trusted_writers(
+        request,
+        envelopes,
+        &BTreeSet::from([controller_username.to_owned()]),
+    )
+    .await
 }
 
 fn is_controller_finalizer_update(
@@ -1512,17 +1568,23 @@ struct WebhookState<R, C> {
     envelopes: R,
     catalog: C,
     controller_username: Option<String>,
+    trusted_writer_usernames: BTreeSet<String>,
 }
 
 pub fn webhook_router<R: WebhookEnvelopeReader>(envelopes: R) -> Router {
-    webhook_router_with_controller(envelopes, AllowConfiguredModels, None)
+    webhook_router_with_controller(envelopes, AllowConfiguredModels, None, BTreeSet::new())
 }
 
 pub fn webhook_router_for_controller<R: WebhookEnvelopeReader>(
     envelopes: R,
     controller_username: String,
 ) -> Router {
-    webhook_router_with_controller(envelopes, AllowConfiguredModels, Some(controller_username))
+    webhook_router_with_controller(
+        envelopes,
+        AllowConfiguredModels,
+        Some(controller_username.clone()),
+        BTreeSet::from([controller_username]),
+    )
 }
 
 pub fn webhook_router_for_controller_with_catalog<
@@ -1532,14 +1594,21 @@ pub fn webhook_router_for_controller_with_catalog<
     envelopes: R,
     catalog: C,
     controller_username: String,
+    apiserver_username: String,
 ) -> Router {
-    webhook_router_with_controller(envelopes, catalog, Some(controller_username))
+    webhook_router_with_controller(
+        envelopes,
+        catalog,
+        Some(controller_username.clone()),
+        BTreeSet::from([controller_username, apiserver_username]),
+    )
 }
 
 fn webhook_router_with_controller<R: WebhookEnvelopeReader, C: WebhookModelCatalog>(
     envelopes: R,
     catalog: C,
     controller_username: Option<String>,
+    trusted_writer_usernames: BTreeSet<String>,
 ) -> Router {
     Router::new()
         .route("/validate-agent-runtime", post(webhook_handler::<R, C>))
@@ -1547,6 +1616,7 @@ fn webhook_router_with_controller<R: WebhookEnvelopeReader, C: WebhookModelCatal
             envelopes,
             catalog,
             controller_username,
+            trusted_writer_usernames,
         })
 }
 
@@ -1563,7 +1633,13 @@ async fn webhook_handler<R: WebhookEnvelopeReader, C: WebhookModelCatalog>(
             {
                 AdmissionResponse::from(&request)
             } else {
-                validate_admission_with_catalog(&request, &state.envelopes, &state.catalog).await
+                validate_admission_with_catalog_for_writers(
+                    &request,
+                    &state.envelopes,
+                    &state.catalog,
+                    &state.trusted_writer_usernames,
+                )
+                .await
             }
         }
         Err(error) => AdmissionResponse::invalid(error),
@@ -2861,6 +2937,77 @@ mod webhook_tests {
         assert_eq!(
             response.result.message,
             "agents.apelogic.ai/pending-approval cannot be added or changed on UPDATE"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_user_removed_pending_approval_marker() -> Result<(), String> {
+        let mut value = admission_review_value();
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
+        value["request"]["oldObject"]["spec"]["budget"]["monthlyLimit"] =
+            serde_json::json!("100.00");
+        value["request"]["oldObject"]["metadata"]["annotations"]["agents.apelogic.ai/pending-approval"] =
+            serde_json::json!("request-digest");
+        let review =
+            serde_json::from_value::<AdmissionReview<AgentRuntime>>(value).map_err(|error| {
+                format!("failed to construct removed pending-marker review: {error}")
+            })?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read removed pending-marker request: {error}"))?;
+
+        let response = validate_admission(&request, &fake_envelopes()).await;
+
+        assert!(
+            !response.allowed,
+            "a runtime writer must not be able to release an unapproved placeholder"
+        );
+        assert_eq!(
+            response.result.message,
+            "agents.apelogic.ai/pending-approval may be removed only by a trusted Steward writer"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_allows_its_controller_to_apply_an_approved_pending_runtime()
+    -> Result<(), String> {
+        let mut value = admission_review_value();
+        value["request"]["oldObject"]["metadata"]["annotations"]["agents.apelogic.ai/pending-approval"] =
+            serde_json::json!("request-digest");
+        value["request"]["oldObject"]["spec"]["llms"] = serde_json::json!([]);
+        value["request"]["oldObject"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("0");
+        value["request"]["userInfo"] = serde_json::json!({
+            "username": "system:serviceaccount:steward-system:steward-controller",
+            "groups": ["system:serviceaccounts"]
+        });
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct trusted pending transition: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read trusted pending transition: {error}"))?;
+        let mut envelopes = fake_envelopes();
+        envelopes.grants.insert(
+            "runtime-uid-a".to_owned(),
+            vec![AdmissionDelta::Budget {
+                requested: "220.00".to_owned(),
+                ceiling: "200.00".to_owned(),
+                currency: "USD".to_owned(),
+            }],
+        );
+
+        let response = super::validate_admission_for_controller(
+            &request,
+            &envelopes,
+            "system:serviceaccount:steward-system:steward-controller",
+        )
+        .await;
+
+        assert!(
+            response.allowed,
+            "the trusted controller must be able to apply the active approved spec: {}",
+            response.result.message
         );
         Ok(())
     }
