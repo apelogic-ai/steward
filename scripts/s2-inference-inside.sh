@@ -8,13 +8,21 @@ if [[ "${SLICE}" != "s2" && "${SLICE}" != "s5" ]]; then
   exit 2
 fi
 CAPTURE_FORWARD_PID=""
+JIRA_FORWARD_PID=""
 LITELLM_FORWARD_PID=""
+POC_API_FORWARD_PID=""
 POSTGRES_FORWARD_PID=""
 
 cleanup() {
   status="$1"
   trap - EXIT INT TERM
-  for pid in "${CAPTURE_FORWARD_PID}" "${LITELLM_FORWARD_PID}" "${POSTGRES_FORWARD_PID}"; do
+  for pid in \
+    "${CAPTURE_FORWARD_PID}" \
+    "${JIRA_FORWARD_PID}" \
+    "${LITELLM_FORWARD_PID}" \
+    "${POC_API_FORWARD_PID}" \
+    "${POSTGRES_FORWARD_PID}"
+  do
     if [[ -n "${pid}" ]]; then
       kill "${pid}" >/dev/null 2>&1 || true
       wait "${pid}" >/dev/null 2>&1 || true
@@ -36,6 +44,10 @@ do
 done
 if [[ "${SLICE}" == "s5" && -z "${STEWARD_S5_MCP_GW_IMAGE:-}" ]]; then
   echo "STEWARD_S5_MCP_GW_IMAGE is required from the ephemeral S5 harness" >&2
+  exit 2
+fi
+if [[ "${SLICE}" == "s5" && -z "${STEWARD_POC_API_IMAGE:-}" ]]; then
+  echo "STEWARD_POC_API_IMAGE is required from the ephemeral S5 harness" >&2
   exit 2
 fi
 for command in cargo curl docker jq kind kubectl openssl sed tar; do
@@ -90,6 +102,7 @@ kind load docker-image steward/mint:s1 --name "${cluster_name}"
 kind load docker-image "${STEWARD_S2_CONTROLLER_IMAGE}" --name "${cluster_name}"
 if [[ "${SLICE}" == "s5" ]]; then
   kind load docker-image "${STEWARD_S5_MCP_GW_IMAGE}" --name "${cluster_name}"
+  kind load docker-image "${STEWARD_POC_API_IMAGE}" --name "${cluster_name}"
 fi
 
 KUBECTL=(kubectl --kubeconfig "${STEWARD_TEST_KUBECONFIG}" --context "${STEWARD_TEST_KUBE_CONTEXT}")
@@ -114,7 +127,7 @@ fi
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${tls_key}" >/dev/null 2>&1
 openssl req -new -x509 -key "${tls_key}" -out "${tls_cert}" -days 1 \
   -subj "/CN=steward-controller.steward-system.svc" \
-  -addext "subjectAltName=DNS:steward-controller.steward-system.svc" >/dev/null 2>&1
+  -addext "subjectAltName=DNS:steward-controller.steward-system.svc,DNS:steward-poc.test,DNS:steward-poc-api.steward-system.svc" >/dev/null 2>&1
 openssl x509 -in "${tls_cert}" -outform DER -out "${tls_cert_der}"
 openssl pkcs8 -topk8 -nocrypt -in "${tls_key}" -outform DER -out "${tls_key_der}"
 chmod 600 "${signing_key}" "${introspection_client}" "${master_key}" "${tls_key}" "${tls_key_der}"
@@ -161,6 +174,12 @@ if [[ "${SLICE}" == "s5" ]]; then
   sed "s#STEWARD_S5_MCP_GW_IMAGE#${STEWARD_S5_MCP_GW_IMAGE}#g" \
     "${ROOT}/config/s5/tools-stack.yaml" >"${rendered_tools_stack}"
   "${KUBECTL[@]}" apply -f "${rendered_tools_stack}"
+  rendered_poc_stack="${STEWARD_RUN_DIR}/poc-api-stack.yaml"
+  sed \
+    -e "s#STEWARD_POC_API_IMAGE#${STEWARD_POC_API_IMAGE}#g" \
+    -e "s#STEWARD_RUN_ID#${STEWARD_RUN_ID}#g" \
+    "${ROOT}/config/poc/api-stack.yaml" >"${rendered_poc_stack}"
+  "${KUBECTL[@]}" apply -f "${rendered_poc_stack}"
 fi
 "${KUBECTL[@]}" -n steward-system rollout status deployment/postgres --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/litellm --timeout=300s
@@ -172,6 +191,7 @@ if [[ "${SLICE}" == "s5" ]]; then
   "${KUBECTL[@]}" -n steward-system rollout status deployment/fake-github-mcp --timeout=180s
   "${KUBECTL[@]}" -n steward-system rollout status deployment/mcp-gw --timeout=180s
   "${KUBECTL[@]}" -n steward-system rollout status deployment/hop1-capture --timeout=180s
+  "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-poc-api --timeout=180s
   "${KUBECTL[@]}" -n steward-system wait --for=condition=complete job/seed-mcp-gw --timeout=180s
 fi
 
@@ -242,6 +262,12 @@ if [[ "${SLICE}" == "s5" ]]; then
   capture_log="${STEWARD_RUN_DIR}/s5-capture-forward.log"
   "${KUBECTL[@]}" -n steward-system port-forward service/hop1-capture :8085 >"${capture_log}" 2>&1 &
   CAPTURE_FORWARD_PID=$!
+  poc_api_log="${STEWARD_RUN_DIR}/poc-api-forward.log"
+  "${KUBECTL[@]}" -n steward-system port-forward service/steward-poc-api :443 >"${poc_api_log}" 2>&1 &
+  POC_API_FORWARD_PID=$!
+  jira_log="${STEWARD_RUN_DIR}/poc-jira-forward.log"
+  "${KUBECTL[@]}" -n steward-system port-forward service/steward-poc-api :8081 >"${jira_log}" 2>&1 &
+  JIRA_FORWARD_PID=$!
 fi
 
 forwarded_port() {
@@ -267,7 +293,13 @@ litellm_port="$(forwarded_port "${litellm_log}" "${LITELLM_FORWARD_PID}")"
 postgres_port="$(forwarded_port "${postgres_log}" "${POSTGRES_FORWARD_PID}")"
 if [[ "${SLICE}" == "s5" ]]; then
   capture_port="$(forwarded_port "${capture_log}" "${CAPTURE_FORWARD_PID}")"
+  poc_api_port="$(forwarded_port "${poc_api_log}" "${POC_API_FORWARD_PID}")"
+  jira_port="$(forwarded_port "${jira_log}" "${JIRA_FORWARD_PID}")"
   export STEWARD_TEST_CAPTURE_URL="http://127.0.0.1:${capture_port}"
+  export STEWARD_POC_RESOLVE="steward-poc.test:${poc_api_port}:127.0.0.1"
+  export STEWARD_POC_URL="https://steward-poc.test:${poc_api_port}"
+  export STEWARD_TEST_JIRA_URL="http://127.0.0.1:${jira_port}"
+  export STEWARD_TEST_TLS_CA="${tls_cert}"
 fi
 export STEWARD_OPENSHELL_CLI="${OPEN_SHELL}"
 export STEWARD_TEST_DATABASE_URL="postgres://steward@127.0.0.1:${postgres_port}/steward"
@@ -283,6 +315,8 @@ export STEWARD_TEST_LITELLM_URL="http://127.0.0.1:${litellm_port}"
 if [[ "${SLICE}" == "s5" ]]; then
   cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s5 \
     e2e_s5_terminated_runtime_holds_nothing -- --exact
+  cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s5 \
+    e2e_poc_golden_journey -- --exact
 else
   cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s2_store
   cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s2 \

@@ -170,7 +170,7 @@ jobs:
         run: cargo xtask e2e-s4
 
   e2e-revocation:
-    name: e2e / revocation and teardown
+    name: e2e / PoC journey and revocation
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -188,7 +188,7 @@ jobs:
           kubernetes-tools: "true"
           supervisor-tools: "true"
 
-      - name: Verify revocation and teardown
+      - name: Verify the complete PoC journey and revocation
         run: cargo xtask e2e-s5
 
   pinned:

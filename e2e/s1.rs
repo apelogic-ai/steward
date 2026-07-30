@@ -67,7 +67,10 @@ impl Harness {
         self.controller = Some(
             Command::new(env::var("STEWARD_CONTROLLER_BIN")?)
                 .env("KUBECONFIG", &self.kubeconfig)
-                .env("STEWARD_OPENSHELL_ENDPOINT", env::var("STEWARD_OPENSHELL_ENDPOINT")?)
+                .env(
+                    "STEWARD_OPENSHELL_ENDPOINT",
+                    env::var("STEWARD_OPENSHELL_ENDPOINT")?,
+                )
                 .env("STEWARD_S0_BOOTSTRAP", "1")
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
@@ -179,12 +182,7 @@ impl Harness {
         .map(|value| value.trim().to_owned())
     }
 
-    fn call_tool(
-        &self,
-        namespace: &str,
-        name: &str,
-        tool: &str,
-    ) -> Result<String, Box<dyn Error>> {
+    fn call_tool(&self, namespace: &str, name: &str, tool: &str) -> Result<String, Box<dyn Error>> {
         let workspace = self.runtime_ref(namespace, name, "workspace")?;
         let sandbox = self.runtime_ref(namespace, name, "sandbox")?;
         let request = serde_json::json!({
@@ -200,7 +198,14 @@ impl Harness {
         let output = Command::new(&self.openshell)
             .args(["--gateway-endpoint"])
             .arg(env::var("STEWARD_OPENSHELL_ENDPOINT")?)
-            .args(["--workspace", &workspace, "sandbox", "exec", "--name", &sandbox])
+            .args([
+                "--workspace",
+                &workspace,
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox,
+            ])
             .args([
                 "--no-tty",
                 "--",
@@ -422,12 +427,7 @@ fn parse_forwarded_port(log: &str) -> Option<u16> {
 fn e2e_s1_tool_call_as_acting_user() -> Result<(), Box<dyn Error>> {
     let mut harness = Harness::from_environment()?;
     harness.start_controller()?;
-    harness.write_runtime(
-        ALICE_NAMESPACE,
-        ALICE_RUNTIME,
-        "alice@example.com",
-        false,
-    )?;
+    harness.write_runtime(ALICE_NAMESPACE, ALICE_RUNTIME, "alice@example.com", false)?;
     harness.wait_phase(
         ALICE_NAMESPACE,
         ALICE_RUNTIME,
@@ -435,12 +435,7 @@ fn e2e_s1_tool_call_as_acting_user() -> Result<(), Box<dyn Error>> {
         Duration::from_secs(300),
     )?;
 
-    harness.write_runtime(
-        ALICE_NAMESPACE,
-        ALICE_RUNTIME,
-        "alice@example.com",
-        true,
-    )?;
+    harness.write_runtime(ALICE_NAMESPACE, ALICE_RUNTIME, "alice@example.com", true)?;
     harness.wait_tool_response(
         ALICE_NAMESPACE,
         ALICE_RUNTIME,
@@ -461,12 +456,7 @@ fn e2e_s1_tool_call_as_acting_user() -> Result<(), Box<dyn Error>> {
         "a forged and expired SVID must fail closed at the mint"
     );
 
-    harness.write_runtime(
-        ALICE_NAMESPACE,
-        ALICE_RUNTIME,
-        "alice@example.com",
-        false,
-    )?;
+    harness.write_runtime(ALICE_NAMESPACE, ALICE_RUNTIME, "alice@example.com", false)?;
     harness.wait_tool_provider_attached(
         ALICE_NAMESPACE,
         ALICE_RUNTIME,

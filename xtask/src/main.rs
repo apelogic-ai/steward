@@ -113,6 +113,10 @@ fn quality() -> TaskResult {
     )?;
     run(
         "cargo",
+        &["fmt", "--manifest-path", "e2e/Cargo.toml", "--", "--check"],
+    )?;
+    run(
+        "cargo",
         &[
             "clippy",
             "--workspace",

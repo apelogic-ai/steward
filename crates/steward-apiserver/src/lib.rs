@@ -159,6 +159,13 @@ pub struct BudgetIncrease {
     pub amount: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateRuntimeRequest {
+    pub name: String,
+    pub spec: AgentRuntimeSpec,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApprovalRequest {
@@ -239,6 +246,13 @@ impl fmt::Display for ApiError {
 impl Error for ApiError {}
 
 pub trait RuntimeRepository: Clone + Send + Sync + 'static {
+    fn create<'a>(
+        &'a self,
+        namespace: &'a str,
+        runtime: &'a AgentRuntime,
+        context: &'a AdmissionContext,
+    ) -> BoxFuture<'a, Result<AgentRuntime, String>>;
+
     fn get<'a>(
         &'a self,
         namespace: &'a str,
@@ -271,6 +285,38 @@ impl KubeRuntimeRepository {
 }
 
 impl RuntimeRepository for KubeRuntimeRepository {
+    fn create<'a>(
+        &'a self,
+        namespace: &'a str,
+        runtime: &'a AgentRuntime,
+        context: &'a AdmissionContext,
+    ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+        Box::pin(async move {
+            let body = serde_json::to_vec(runtime).map_err(|error| error.to_string())?;
+            let mut request = KubeRequest::new(format!(
+                "/apis/agents.apelogic.ai/v1alpha1/namespaces/{namespace}/agentruntimes"
+            ))
+            .create(&PostParams::default(), body)
+            .map_err(|error| error.to_string())?;
+            request.headers_mut().insert(
+                HeaderName::from_static("impersonate-user"),
+                HeaderValue::from_str(&context.actor).map_err(|error| error.to_string())?,
+            );
+            request.headers_mut().insert(
+                HeaderName::from_static("impersonate-group"),
+                HeaderValue::from_str(&format!(
+                    "agents.apelogic.ai/member-role:{}",
+                    context.member_role
+                ))
+                .map_err(|error| error.to_string())?,
+            );
+            self.client
+                .request::<AgentRuntime>(request)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
     fn get<'a>(
         &'a self,
         namespace: &'a str,
@@ -561,6 +607,10 @@ where
 {
     let admission = Router::new()
         .route(
+            "/v1/namespaces/{namespace}/runtimes",
+            post(create_runtime_handler::<R, L, D>),
+        )
+        .route(
             "/v1/namespaces/{namespace}/runtimes/{name}/budget",
             patch(budget_increase_handler::<R, L, D>),
         )
@@ -719,6 +769,31 @@ where
         Ok(outcome @ SubmissionOutcome::Parked { .. }) => {
             (StatusCode::ACCEPTED, Json(outcome)).into_response()
         }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn create_runtime_handler<R, L, D>(
+    State(state): State<AppState<R, L, D>>,
+    Extension(context): Extension<AdmissionContext>,
+    Path(namespace): Path<String>,
+    Json(request): Json<CreateRuntimeRequest>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    match submit_runtime_request(
+        &state.runtimes,
+        &state.ledger,
+        &context,
+        &namespace,
+        &request,
+    )
+    .await
+    {
+        Ok(runtime) => (StatusCode::CREATED, Json(runtime)).into_response(),
         Err(error) => error.into_response(),
     }
 }
@@ -1034,6 +1109,50 @@ where
     }
 }
 
+pub async fn submit_runtime_request<R, L>(
+    runtimes: &R,
+    ledger: &L,
+    context: &AdmissionContext,
+    namespace: &str,
+    request: &CreateRuntimeRequest,
+) -> Result<AgentRuntime, ApiError>
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+{
+    match &request.spec.principal {
+        Principal::User { acting_user } if acting_user.0 == context.actor => {}
+        _ => return Err(ApiError::PrincipalMismatch),
+    }
+    let envelope = ledger
+        .latest_envelope(&context.member_role)
+        .await
+        .map_err(ApiError::Store)?
+        .ok_or(ApiError::MissingEnvelope)?;
+    match evaluate_with_grants(&request.spec, &envelope, &[])
+        .map_err(|error| ApiError::Admission(format!("{error:?}")))?
+    {
+        AdmissionDecision::Admit => {}
+        decision @ AdmissionDecision::Reject { .. } => {
+            return Err(ApiError::Admission(
+                decision
+                    .counterexample()
+                    .unwrap_or_else(|| "envelope exceeded".to_owned()),
+            ));
+        }
+    }
+    let mut runtime = AgentRuntime::new(&request.name, request.spec.clone());
+    runtime.metadata.namespace = Some(namespace.to_owned());
+    runtime.metadata.annotations = Some(std::collections::BTreeMap::from([(
+        "agents.apelogic.ai/member-role".to_owned(),
+        context.member_role.clone(),
+    )]));
+    runtimes
+        .create(namespace, &runtime, context)
+        .await
+        .map_err(ApiError::Runtime)
+}
+
 pub async fn approve_parked_request<R, L, D>(
     runtimes: &R,
     ledger: &L,
@@ -1234,6 +1353,7 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use k8s_openapi::api::authentication::v1::{TokenReviewStatus, UserInfo};
+    use kube::ResourceExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration as StdDuration;
@@ -1415,6 +1535,22 @@ mod tests {
     }
 
     impl RuntimeRepository for FakeRuntimeRepository {
+        fn create<'a>(
+            &'a self,
+            _namespace: &'a str,
+            runtime: &'a AgentRuntime,
+            _context: &'a AdmissionContext,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            Box::pin(async move {
+                let mut stored = self
+                    .runtime
+                    .lock()
+                    .map_err(|_| "fake runtime lock was poisoned".to_owned())?;
+                *stored = runtime.clone();
+                Ok(runtime.clone())
+            })
+        }
+
         fn get<'a>(
             &'a self,
             _namespace: &'a str,
@@ -2029,6 +2165,208 @@ mod tests {
         assert!(
             matches!(result, Ok(SubmissionOutcome::Applied { .. })),
             "the REST front door must honor the same instance grant as the webhook: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_rejects_principal_impersonation_before_writing_desired_state()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let app = router(
+            runtimes,
+            ledger(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/namespaces/team-a/runtimes")
+                    .header("authorization", "Bearer user-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "runtime-b",
+                            "spec": {
+                                "principal": {
+                                    "kind": "user",
+                                    "actingUser": "bob@example.org",
+                                },
+                                "owner": "bob@example.org",
+                                "agentType": {"name": "base"},
+                                "llms": [{
+                                    "provider": "provider-a",
+                                    "model": "model-a",
+                                }],
+                                "tools": [],
+                                "budget": {
+                                    "monthlyLimit": "100.00",
+                                    "currency": "USD",
+                                },
+                                "ttl": "24h",
+                            },
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("failed to build create request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("create request failed: {error}"))?;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "an authenticated member must not create a runtime for another principal"
+        );
+        assert_eq!(
+            runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?
+                .name_any(),
+            "runtime-a",
+            "a rejected create must not write desired state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authenticated_member_can_create_an_in_envelope_runtime() -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let app = router(
+            runtimes,
+            ledger(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/namespaces/team-a/runtimes")
+                    .header("authorization", "Bearer user-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "runtime-b",
+                            "spec": {
+                                "principal": {
+                                    "kind": "user",
+                                    "actingUser": "alice@example.com",
+                                },
+                                "owner": "bob@example.org",
+                                "agentType": {"name": "base"},
+                                "llms": [{
+                                    "provider": "provider-a",
+                                    "model": "model-a",
+                                }],
+                                "tools": [],
+                                "budget": {
+                                    "monthlyLimit": "100.00",
+                                    "currency": "USD",
+                                },
+                                "ttl": "24h",
+                            },
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("failed to build create request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("create request failed: {error}"))?;
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "an authenticated member's in-envelope request must create desired state"
+        );
+        let created = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert_eq!(created.name_any(), "runtime-b");
+        assert_eq!(created.namespace().as_deref(), Some("team-a"));
+        assert_eq!(
+            created.spec.owner.0, "bob@example.org",
+            "the accountable owner may differ from the acting user"
+        );
+        assert_eq!(
+            created
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get("agents.apelogic.ai/member-role"))
+                .map(String::as_str),
+            Some("engineer"),
+            "the API must bind the authenticated member role into desired state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_rejects_an_over_envelope_manifest_without_writing_desired_state()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let app = router(
+            runtimes,
+            ledger(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/namespaces/team-a/runtimes")
+                    .header("authorization", "Bearer user-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "runtime-b",
+                            "spec": {
+                                "principal": {
+                                    "kind": "user",
+                                    "actingUser": "alice@example.com",
+                                },
+                                "owner": "alice@example.com",
+                                "agentType": {"name": "base"},
+                                "llms": [{
+                                    "provider": "provider-a",
+                                    "model": "model-a",
+                                }],
+                                "tools": [],
+                                "budget": {
+                                    "monthlyLimit": "201.00",
+                                    "currency": "USD",
+                                },
+                                "ttl": "24h",
+                            },
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("failed to build create request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("create request failed: {error}"))?;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an over-envelope create must be rejected by the REST admission door"
+        );
+        assert_eq!(
+            runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?
+                .name_any(),
+            "runtime-a",
+            "an over-envelope create must not write desired state"
         );
         Ok(())
     }
