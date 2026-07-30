@@ -604,7 +604,7 @@ async fn e2e_poc_golden_journey() -> Result<(), Box<dyn Error>> {
                 "action": "read"
             }],
             "budget": {
-                "monthlyLimit": "5.00",
+                "monthlyLimit": "15.00",
                 "currency": "USD"
             },
             "ttl": "1h"
@@ -618,12 +618,68 @@ async fn e2e_poc_golden_journey() -> Result<(), Box<dyn Error>> {
         Caller::Alice,
     )?;
     assert_eq!(
-        create_status, 201,
-        "an in-envelope API request must provision without a human: {create_body}"
+        create_status, 202,
+        "an over-envelope initial API request must park: {create_body}"
+    );
+    let parked: serde_json::Value = serde_json::from_str(&create_body)?;
+    let approval_id = required_json_string(&parked, "/approvalId")?;
+    let evidence_url = required_json_string(&parked, "/evidenceUrl")?;
+    assert_eq!(
+        parked.pointer("/proposedSpec/budget/monthlyLimit"),
+        Some(&serde_json::json!("15.00"))
+    );
+    harness.wait_phase("Pending", Duration::from_secs(60))?;
+    let runtime_uid = harness.runtime_value("jsonpath={.metadata.uid}")?;
+    assert_eq!(
+        harness.runtime_value("jsonpath={.spec.budget.monthlyLimit}")?,
+        "0",
+        "parking an initial create must persist only an inert placeholder"
+    );
+    assert_eq!(
+        harness.runtime_value("jsonpath={.status.refs.sandbox}")?,
+        "",
+        "a parked initial create must not provision a sandbox"
+    );
+
+    let jira = harness.jira_state()?;
+    let issue = jira
+        .pointer("/issues/0/createBody")
+        .map(serde_json::Value::to_string)
+        .ok_or_else(|| io::Error::other("the parked request did not file Jira evidence"))?;
+    for expected in [
+        approval_id.as_str(),
+        runtime_uid.as_str(),
+        "requested 15.00 USD",
+        "ceiling 10.00 USD",
+    ] {
+        assert!(
+            issue.contains(expected),
+            "the Jira decision record must contain {expected:?}"
+        );
+    }
+
+    let approval = serde_json::json!({
+        "rationale": "approved for this runtime instance",
+        "evidenceUrl": evidence_url,
+        "expiresAt": "2999-01-01T00:00:00Z"
+    });
+    let (approval_status, approval_body) = harness.steward(
+        "POST",
+        &format!("/admin/approvals/{approval_id}/approve"),
+        Some(&approval.to_string()),
+        "poc-approved.json",
+        Caller::Admin,
+    )?;
+    assert_eq!(
+        approval_status, 200,
+        "the authenticated admin approval must apply the instance grant: {approval_body}"
     );
     harness.wait_phase("Running", Duration::from_secs(600))?;
+    assert_eq!(
+        harness.runtime_value("jsonpath={.spec.budget.monthlyLimit}")?,
+        "15.00"
+    );
 
-    let runtime_uid = harness.runtime_value("jsonpath={.metadata.uid}")?;
     let workspace = harness.runtime_value("jsonpath={.status.refs.workspace}")?;
     let sandbox = harness.runtime_value("jsonpath={.status.refs.sandbox}")?;
     let key_alias = harness.runtime_value("jsonpath={.status.refs.litellmKey}")?;
@@ -671,67 +727,6 @@ async fn e2e_poc_golden_journey() -> Result<(), Box<dyn Error>> {
         "the per-runtime LiteLLM key did not authorize inference: {inference_response}"
     );
 
-    let (parked_status, parked_body) = harness.steward(
-        "PATCH",
-        "/v1/namespaces/team-a/runtimes/runtime-revocation/budget",
-        Some(r#"{"amount":"10.00"}"#),
-        "poc-parked.json",
-        Caller::Alice,
-    )?;
-    assert_eq!(
-        parked_status, 202,
-        "the over-envelope modification must park: {parked_body}"
-    );
-    let parked: serde_json::Value = serde_json::from_str(&parked_body)?;
-    let approval_id = required_json_string(&parked, "/approvalId")?;
-    let evidence_url = required_json_string(&parked, "/evidenceUrl")?;
-    assert_eq!(
-        parked.pointer("/proposedSpec/budget/monthlyLimit"),
-        Some(&serde_json::json!("15.00"))
-    );
-    assert_eq!(
-        harness.runtime_value("jsonpath={.spec.budget.monthlyLimit}")?,
-        "5.00",
-        "parking must not change desired state"
-    );
-
-    let jira = harness.jira_state()?;
-    let issue = jira
-        .pointer("/issues/0/createBody")
-        .map(serde_json::Value::to_string)
-        .ok_or_else(|| io::Error::other("the parked request did not file Jira evidence"))?;
-    for expected in [
-        approval_id.as_str(),
-        runtime_uid.as_str(),
-        "requested 15.00 USD",
-        "ceiling 10.00 USD",
-    ] {
-        assert!(
-            issue.contains(expected),
-            "the Jira decision record must contain {expected:?}"
-        );
-    }
-
-    let approval = serde_json::json!({
-        "rationale": "approved for this runtime instance",
-        "evidenceUrl": evidence_url,
-        "expiresAt": "2999-01-01T00:00:00Z"
-    });
-    let (approval_status, approval_body) = harness.steward(
-        "POST",
-        &format!("/admin/approvals/{approval_id}/approve"),
-        Some(&approval.to_string()),
-        "poc-approved.json",
-        Caller::Admin,
-    )?;
-    assert_eq!(
-        approval_status, 200,
-        "the authenticated admin approval must apply the instance grant: {approval_body}"
-    );
-    assert_eq!(
-        harness.runtime_value("jsonpath={.spec.budget.monthlyLimit}")?,
-        "15.00"
-    );
     let grants = store
         .grants_for_runtime(&runtime_uid, "engineer", 2)
         .await?;

@@ -33,7 +33,10 @@ use steward_ports::{
     SandboxRuntime,
 };
 use steward_store::{GrantReversion, PgStore, StoreError};
-use steward_types::{AgentRuntime, AgentRuntimeStatus, Duration, Phase, RuntimeId, RuntimeRefs};
+use steward_types::{
+    AgentRuntime, AgentRuntimeStatus, Duration, PENDING_APPROVAL_ANNOTATION, Phase, RuntimeId,
+    RuntimeRefs,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReconcileIntent {
@@ -259,6 +262,9 @@ pub async fn reconcile_once<R: SandboxRuntime>(
     intent: ReconcileIntent,
     sandbox_runtime: &R,
 ) -> Result<ReconcileDecision, ReconcileError> {
+    if intent == ReconcileIntent::Ensure && is_pending_approval(runtime) {
+        return Ok(ReconcileDecision::Status(pending_approval_status(runtime)?));
+    }
     let workspace_key = runtime
         .metadata
         .namespace
@@ -317,6 +323,24 @@ pub async fn reconcile_once<R: SandboxRuntime>(
 
 const FINALIZER: &str = "agents.apelogic.ai/runtime";
 pub const MEMBER_ROLE_ANNOTATION: &str = "agents.apelogic.ai/member-role";
+
+fn is_pending_approval(runtime: &AgentRuntime) -> bool {
+    runtime
+        .annotations()
+        .get(PENDING_APPROVAL_ANNOTATION)
+        .is_some_and(|digest| !digest.is_empty())
+}
+
+fn pending_approval_status(runtime: &AgentRuntime) -> Result<AgentRuntimeStatus, ReconcileError> {
+    Ok(AgentRuntimeStatus {
+        phase: Phase::Pending,
+        observed_generation: runtime.metadata.generation.unwrap_or_default(),
+        spec_digest: runtime_spec_digest(runtime)?,
+        refs: RuntimeRefs::default(),
+        conditions: Vec::new(),
+        spend: None,
+    })
+}
 
 pub async fn run_controller<R: SandboxRuntime>(client: Client, sandbox_runtime: R) {
     run_controller_inner(client, sandbox_runtime, NoInferencePlane, None).await;
@@ -629,6 +653,51 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             return Ok(Action::await_change());
                         }
                     };
+                if is_pending_approval(&runtime) {
+                    if let Some(authority) = &context.authority
+                        && let Some(application) = authority
+                            .grant_application(runtime.metadata.uid.as_deref().ok_or(
+                                ControllerError::Reconcile(ReconcileError::MissingRuntimeUid),
+                            )?)
+                            .await
+                            .map_err(|error| {
+                                ControllerError::Reconcile(ReconcileError::Authority(
+                                    error.to_string(),
+                                ))
+                            })?
+                        && let AuthorityAction::Restore(mut proposed) =
+                            authority_application_action(&runtime, &application)
+                                .map_err(ControllerError::Reconcile)?
+                    {
+                        proposed.metadata = runtime.metadata.clone();
+                        proposed
+                            .metadata
+                            .annotations
+                            .get_or_insert_default()
+                            .remove(PENDING_APPROVAL_ANNOTATION);
+                        replace_as_authority(
+                            &context.client,
+                            &proposed,
+                            &application.actor,
+                            &application.member_role,
+                        )
+                        .await?;
+                        return Ok(Action::requeue(StdDuration::from_secs(2)));
+                    }
+                    let status =
+                        pending_approval_status(&runtime).map_err(ControllerError::Reconcile)?;
+                    if runtime.status.as_ref() != Some(&status) {
+                        let patch = status_merge_patch(&status);
+                        api.patch_status(
+                            &runtime.name_any(),
+                            &PatchParams::default(),
+                            &Patch::Merge(&patch),
+                        )
+                        .await
+                        .map_err(ControllerError::Kubernetes)?;
+                    }
+                    return Ok(Action::requeue(ttl_requeue));
+                }
                 if let Some(authority) = &context.authority {
                     if let Some(reversion) = authority
                         .grant_reversion(runtime.metadata.uid.as_deref().ok_or(
@@ -713,6 +782,11 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         {
                             AuthorityAction::Restore(mut proposed) => {
                                 proposed.metadata = runtime.metadata.clone();
+                                proposed
+                                    .metadata
+                                    .annotations
+                                    .get_or_insert_default()
+                                    .remove(PENDING_APPROVAL_ANNOTATION);
                                 replace_as_authority(
                                     &context.client,
                                     &proposed,
@@ -1346,6 +1420,9 @@ pub async fn validate_admission_with_catalog<R: WebhookEnvelopeReader, C: Webhoo
     let Some(runtime) = request.object.as_ref() else {
         return response.deny("AgentRuntime admission request has no object");
     };
+    if runtime.spec.llms.is_empty() {
+        return response;
+    }
     match catalog
         .validate_configuration(&runtime.spec.llms, &runtime.spec.budget)
         .await
@@ -2344,6 +2421,38 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn pending_initial_approval_does_not_provision_a_sandbox() -> Result<(), String> {
+        let mut runtime = fixture();
+        runtime.metadata.annotations.get_or_insert_default().insert(
+            "agents.apelogic.ai/pending-approval".to_owned(),
+            "request-digest".to_owned(),
+        );
+        let sandbox_runtime = FakeSandboxRuntime::default();
+
+        let decision = reconcile_once(&runtime, ReconcileIntent::Ensure, &sandbox_runtime)
+            .await
+            .map_err(|error| format!("pending reconcile failed: {error:?}"))?;
+        let ReconcileDecision::Status(status) = decision else {
+            return Err("pending create must remain observable in status".to_owned());
+        };
+        assert_eq!(
+            status.phase,
+            Phase::Pending,
+            "a parked initial create must remain inert until its approval is applied"
+        );
+        assert_eq!(
+            sandbox_runtime
+                .state
+                .lock()
+                .map_err(|_| "fake runtime state lock was poisoned")?
+                .created,
+            0,
+            "a pending create must not allocate an OpenShell sandbox"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2554,6 +2663,32 @@ mod webhook_tests {
         assert_eq!(
             response.result.message,
             "AgentRuntime inference configuration validation failed closed: models are absent from the priced inference catalog: provider-a/model-a"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_does_not_require_inference_configuration_without_models() -> Result<(), String>
+    {
+        let mut value = admission_review_value();
+        value["request"]["object"]["spec"]["llms"] = serde_json::json!([]);
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("0");
+        value["request"]["oldObject"] = serde_json::Value::Null;
+        value["request"]["operation"] = serde_json::json!("CREATE");
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct model-free review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read model-free request: {error}"))?;
+
+        let response =
+            validate_admission_with_catalog(&request, &fake_envelopes(), &RejectUnpricedCatalog)
+                .await;
+
+        assert!(
+            response.allowed,
+            "a model-free inert runtime must not require a LiteLLM budget or catalog entry: {}",
+            response.result.message
         );
         Ok(())
     }

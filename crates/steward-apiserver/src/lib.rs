@@ -31,7 +31,7 @@ use steward_store::{
     ApprovalCandidate, ApproveAdmission, ApprovedAdmission, DecisionFiling, DecisionFilingClaim,
     GrantReversion, ParkRejection, ParkedAdmission, PendingApproval, PgStore, StoreError,
 };
-use steward_types::{AgentRuntime, AgentRuntimeSpec, Principal};
+use steward_types::{AgentRuntime, AgentRuntimeSpec, PENDING_APPROVAL_ANNOTATION, Principal};
 use uuid::Uuid;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -159,7 +159,7 @@ pub struct BudgetIncrease {
     pub amount: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateRuntimeRequest {
     pub name: String,
@@ -181,8 +181,31 @@ pub struct GrantRevocationRequest {
 }
 
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(budget_increase_contract), components(schemas(BudgetIncrease)))]
+#[openapi(
+    paths(create_runtime_contract, budget_increase_contract),
+    components(schemas(CreateRuntimeRequest, BudgetIncrease))
+)]
 pub struct ApiDoc;
+
+#[utoipa::path(
+    post,
+    path = "/v1/namespaces/{namespace}/runtimes",
+    params(
+        ("namespace" = String, Path, description = "AgentRuntime namespace")
+    ),
+    request_body = CreateRuntimeRequest,
+    responses(
+        (status = 201, description = "In-envelope runtime manifest admitted and created"),
+        (status = 202, description = "Over-envelope runtime manifest parked for approval"),
+        (status = 403, description = "Authenticated principal does not own the runtime"),
+        (status = 404, description = "Kubernetes namespace does not exist"),
+        (status = 409, description = "AgentRuntime name already exists"),
+        (status = 422, description = "Manifest is invalid or cannot be bound to authority"),
+        (status = 503, description = "Kubernetes, authority store, or decision channel unavailable")
+    )
+)]
+#[doc(hidden)]
+pub async fn create_runtime_contract() {}
 
 #[utoipa::path(
     patch,
@@ -225,6 +248,7 @@ pub enum SubmissionOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApiError {
+    RuntimeCreate(RuntimeCreateError),
     Runtime(String),
     Store(StoreError),
     MissingRuntimeUid,
@@ -245,13 +269,19 @@ impl fmt::Display for ApiError {
 
 impl Error for ApiError {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeCreateError {
+    Kubernetes { status: u16, message: String },
+    Unavailable(String),
+}
+
 pub trait RuntimeRepository: Clone + Send + Sync + 'static {
     fn create<'a>(
         &'a self,
         namespace: &'a str,
         runtime: &'a AgentRuntime,
         context: &'a AdmissionContext,
-    ) -> BoxFuture<'a, Result<AgentRuntime, String>>;
+    ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>>;
 
     fn get<'a>(
         &'a self,
@@ -290,17 +320,20 @@ impl RuntimeRepository for KubeRuntimeRepository {
         namespace: &'a str,
         runtime: &'a AgentRuntime,
         context: &'a AdmissionContext,
-    ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+    ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
         Box::pin(async move {
-            let body = serde_json::to_vec(runtime).map_err(|error| error.to_string())?;
+            let unavailable = |error: String| RuntimeCreateError::Unavailable(error);
+            let body =
+                serde_json::to_vec(runtime).map_err(|error| unavailable(error.to_string()))?;
             let mut request = KubeRequest::new(format!(
                 "/apis/agents.apelogic.ai/v1alpha1/namespaces/{namespace}/agentruntimes"
             ))
             .create(&PostParams::default(), body)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| unavailable(error.to_string()))?;
             request.headers_mut().insert(
                 HeaderName::from_static("impersonate-user"),
-                HeaderValue::from_str(&context.actor).map_err(|error| error.to_string())?,
+                HeaderValue::from_str(&context.actor)
+                    .map_err(|error| unavailable(error.to_string()))?,
             );
             request.headers_mut().insert(
                 HeaderName::from_static("impersonate-group"),
@@ -308,12 +341,18 @@ impl RuntimeRepository for KubeRuntimeRepository {
                     "agents.apelogic.ai/member-role:{}",
                     context.member_role
                 ))
-                .map_err(|error| error.to_string())?,
+                .map_err(|error| unavailable(error.to_string()))?,
             );
             self.client
                 .request::<AgentRuntime>(request)
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| match error {
+                    kube::Error::Api(response) => RuntimeCreateError::Kubernetes {
+                        status: response.code,
+                        message: response.message,
+                    },
+                    other => RuntimeCreateError::Unavailable(other.to_string()),
+                })
         })
     }
 
@@ -787,13 +826,19 @@ where
     match submit_runtime_request(
         &state.runtimes,
         &state.ledger,
+        &state.decisions,
         &context,
         &namespace,
         &request,
     )
     .await
     {
-        Ok(runtime) => (StatusCode::CREATED, Json(runtime)).into_response(),
+        Ok(outcome @ SubmissionOutcome::Applied { .. }) => {
+            (StatusCode::CREATED, Json(outcome)).into_response()
+        }
+        Ok(outcome @ SubmissionOutcome::Parked { .. }) => {
+            (StatusCode::ACCEPTED, Json(outcome)).into_response()
+        }
         Err(error) => error.into_response(),
     }
 }
@@ -970,6 +1015,9 @@ fn escape_html(value: &str) -> String {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self {
+            Self::RuntimeCreate(RuntimeCreateError::Kubernetes { status, .. }) => {
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+            }
             Self::PrincipalMismatch => StatusCode::FORBIDDEN,
             Self::MissingEnvelope | Self::MissingRuntimeUid => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InvalidBudgetIncrease { .. } | Self::Admission(_) => {
@@ -990,7 +1038,8 @@ impl IntoResponse for ApiError {
             Self::Store(StoreError::InvalidGrantExpiry | StoreError::MissingRevocationReason) => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
-            Self::Runtime(_)
+            Self::RuntimeCreate(RuntimeCreateError::Unavailable(_))
+            | Self::Runtime(_)
             | Self::Store(StoreError::Database(_) | StoreError::DecisionFilingClaimLost)
             | Self::DecisionChannel(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
@@ -1109,16 +1158,18 @@ where
     }
 }
 
-pub async fn submit_runtime_request<R, L>(
+pub async fn submit_runtime_request<R, L, D>(
     runtimes: &R,
     ledger: &L,
+    decisions: &D,
     context: &AdmissionContext,
     namespace: &str,
     request: &CreateRuntimeRequest,
-) -> Result<AgentRuntime, ApiError>
+) -> Result<SubmissionOutcome, ApiError>
 where
     R: RuntimeRepository,
     L: AdmissionLedger,
+    D: DecisionChannel,
 {
     match &request.spec.principal {
         Principal::User { acting_user } if acting_user.0 == context.actor => {}
@@ -1129,28 +1180,113 @@ where
         .await
         .map_err(ApiError::Store)?
         .ok_or(ApiError::MissingEnvelope)?;
-    match evaluate_with_grants(&request.spec, &envelope, &[])
-        .map_err(|error| ApiError::Admission(format!("{error:?}")))?
-    {
-        AdmissionDecision::Admit => {}
-        decision @ AdmissionDecision::Reject { .. } => {
-            return Err(ApiError::Admission(
-                decision
-                    .counterexample()
-                    .unwrap_or_else(|| "envelope exceeded".to_owned()),
-            ));
-        }
-    }
+    let decision = evaluate_with_grants(&request.spec, &envelope, &[])
+        .map_err(|error| ApiError::Admission(format!("{error:?}")))?;
     let mut runtime = AgentRuntime::new(&request.name, request.spec.clone());
     runtime.metadata.namespace = Some(namespace.to_owned());
     runtime.metadata.annotations = Some(std::collections::BTreeMap::from([(
         "agents.apelogic.ai/member-role".to_owned(),
         context.member_role.clone(),
     )]));
-    runtimes
-        .create(namespace, &runtime, context)
-        .await
-        .map_err(ApiError::Runtime)
+    match decision {
+        AdmissionDecision::Admit => {
+            runtimes
+                .create(namespace, &runtime, context)
+                .await
+                .map_err(ApiError::RuntimeCreate)?;
+            Ok(SubmissionOutcome::Applied {
+                proposed_spec: request.spec.clone(),
+            })
+        }
+        AdmissionDecision::Reject { deltas } => {
+            let counterexample = AdmissionDecision::Reject {
+                deltas: deltas.clone(),
+            }
+            .counterexample()
+            .ok_or_else(|| {
+                ApiError::Admission("rejected decision did not carry a counterexample".to_owned())
+            })?;
+            let request_digest = spec_digest(&request.spec)?;
+            runtime.spec.llms.clear();
+            runtime.spec.tools.clear();
+            runtime.spec.budget.monthly_limit = "0".to_owned();
+            runtime.spec.budget.currency = envelope.spec.budget.currency.clone();
+            runtime.spec.ttl = envelope.spec.ttl.clone();
+            runtime.spec.bindings = None;
+            runtime.metadata.annotations.get_or_insert_default().insert(
+                PENDING_APPROVAL_ANNOTATION.to_owned(),
+                request_digest.clone(),
+            );
+            let created = match runtimes.create(namespace, &runtime, context).await {
+                Ok(created) => created,
+                Err(RuntimeCreateError::Kubernetes { status: 409, .. }) => {
+                    let existing = runtimes
+                        .get(namespace, &request.name)
+                        .await
+                        .map_err(ApiError::Runtime)?;
+                    let annotations = existing.annotations();
+                    if annotations
+                        .get(PENDING_APPROVAL_ANNOTATION)
+                        .map(String::as_str)
+                        != Some(request_digest.as_str())
+                        || annotations
+                            .get("agents.apelogic.ai/member-role")
+                            .map(String::as_str)
+                            != Some(context.member_role.as_str())
+                        || existing.spec != runtime.spec
+                    {
+                        return Err(ApiError::Conflict(
+                            "an unrelated AgentRuntime already uses this name".to_owned(),
+                        ));
+                    }
+                    existing
+                }
+                Err(error) => return Err(ApiError::RuntimeCreate(error)),
+            };
+            let runtime_uid = created
+                .metadata
+                .uid
+                .as_deref()
+                .ok_or(ApiError::MissingRuntimeUid)?;
+            let base_spec_digest = spec_digest(&created.spec)?;
+            let parked = ledger
+                .park_rejection(ParkRejection {
+                    runtime_uid,
+                    runtime_namespace: namespace,
+                    runtime_name: &request.name,
+                    spec_digest: &request_digest,
+                    base_spec_digest: &base_spec_digest,
+                    base_spec: &created.spec,
+                    envelope_revision: envelope.revision,
+                    deltas: &deltas,
+                    proposed_spec: &request.spec,
+                    actor: &context.actor,
+                    member_role: &context.member_role,
+                })
+                .await
+                .map_err(ApiError::Store)?;
+            let reference = match (parked.decision_key, parked.evidence_url) {
+                (Some(key), Some(evidence_url)) => DecisionReference { key, evidence_url },
+                (None, None) => {
+                    file_decision_reference(ledger, decisions, parked.approval_id).await?
+                }
+                _ => {
+                    return Err(ApiError::Conflict(
+                        "parked approval has an incomplete decision reference".to_owned(),
+                    ));
+                }
+            };
+            Ok(SubmissionOutcome::Parked {
+                approval_id: parked.approval_id,
+                decision_id: parked.decision_id,
+                decision_key: reference.key,
+                evidence_url: reference.evidence_url,
+                proposed_spec: request.spec.clone(),
+                deltas,
+                counterexample,
+            })
+        }
+    }
 }
 
 pub async fn approve_parked_request<R, L, D>(
@@ -1218,7 +1354,13 @@ where
         })
         .await
         .map_err(ApiError::Store)?;
-    if !already_applied {
+    let pending_annotation_removed = runtime
+        .metadata
+        .annotations
+        .get_or_insert_default()
+        .remove(PENDING_APPROVAL_ANNOTATION)
+        .is_some();
+    if !already_applied || pending_annotation_removed {
         runtime.spec = approved.proposed_spec.clone();
         runtimes
             .replace(
@@ -1371,12 +1513,14 @@ mod tests {
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal,
     };
     use tower::ServiceExt;
+    use utoipa::OpenApi;
     use uuid::Uuid;
 
     use super::{
-        AdmissionContext, AdmissionLedger, ApiError, AuthenticatedCaller, AuthenticationError,
-        BoxFuture, BudgetIncrease, RequestAuthenticator, RuntimeRepository, SubmissionOutcome,
-        caller_from_kubernetes_user, caller_from_token_review, router, submit_budget_increase,
+        AdmissionContext, AdmissionLedger, ApiDoc, ApiError, AuthenticatedCaller,
+        AuthenticationError, BoxFuture, BudgetIncrease, CreateRuntimeRequest, RequestAuthenticator,
+        RuntimeCreateError, RuntimeRepository, SubmissionOutcome, caller_from_kubernetes_user,
+        caller_from_token_review, router, submit_budget_increase,
     };
 
     #[derive(Clone)]
@@ -1469,6 +1613,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn runtime_create_is_published_in_the_openapi_contract() -> Result<(), String> {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        let operation = document
+            .pointer("/paths/~1v1~1namespaces~1{namespace}~1runtimes/post")
+            .ok_or_else(|| "runtime create operation is absent from OpenAPI".to_owned())?;
+        assert!(
+            operation
+                .pointer("/requestBody/content/application~1json/schema")
+                .is_some(),
+            "runtime create must advertise its request schema"
+        );
+        for status in ["201", "202", "403", "404", "409", "422", "503"] {
+            assert!(
+                operation.pointer(&format!("/responses/{status}")).is_some(),
+                "runtime create OpenAPI is missing its {status} response"
+            );
+        }
+        for schema in [
+            "CreateRuntimeRequest",
+            "AgentRuntimeSpec",
+            "Principal",
+            "AgentType",
+            "ModelRef",
+            "ToolGrant",
+            "Budget",
+            "Duration",
+            "BindingRef",
+            "Email",
+        ] {
+            assert!(
+                document
+                    .pointer(&format!("/components/schemas/{schema}"))
+                    .is_some(),
+                "runtime create OpenAPI is missing its {schema} component"
+            );
+        }
+        Ok(())
+    }
+
     #[derive(Clone, Default)]
     struct FakeDecisionChannel {
         requests: Arc<Mutex<Vec<DecisionRequest>>>,
@@ -1534,20 +1719,75 @@ mod tests {
         runtime: Arc<Mutex<AgentRuntime>>,
     }
 
+    #[derive(Clone)]
+    struct RejectedCreateRepository {
+        runtime: AgentRuntime,
+        status: u16,
+    }
+
+    impl RuntimeRepository for RejectedCreateRepository {
+        fn create<'a>(
+            &'a self,
+            _namespace: &'a str,
+            _runtime: &'a AgentRuntime,
+            _context: &'a AdmissionContext,
+        ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+            Box::pin(async {
+                Err(RuntimeCreateError::Kubernetes {
+                    status: self.status,
+                    message: "Kubernetes rejected the AgentRuntime".to_owned(),
+                })
+            })
+        }
+
+        fn get<'a>(
+            &'a self,
+            _namespace: &'a str,
+            _name: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            Box::pin(async move { Ok(self.runtime.clone()) })
+        }
+
+        fn get_bound<'a>(
+            &'a self,
+            _namespace: &'a str,
+            _name: &'a str,
+            _runtime_uid: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            Box::pin(async move { Ok(self.runtime.clone()) })
+        }
+
+        fn replace<'a>(
+            &'a self,
+            _runtime: &'a AgentRuntime,
+            _context: &'a AdmissionContext,
+        ) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     impl RuntimeRepository for FakeRuntimeRepository {
         fn create<'a>(
             &'a self,
             _namespace: &'a str,
             runtime: &'a AgentRuntime,
             _context: &'a AdmissionContext,
-        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+        ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
             Box::pin(async move {
-                let mut stored = self
-                    .runtime
-                    .lock()
-                    .map_err(|_| "fake runtime lock was poisoned".to_owned())?;
-                *stored = runtime.clone();
-                Ok(runtime.clone())
+                let mut stored = self.runtime.lock().map_err(|_| {
+                    RuntimeCreateError::Unavailable("fake runtime lock was poisoned".to_owned())
+                })?;
+                if stored.name_any() == runtime.name_any() {
+                    return Err(RuntimeCreateError::Kubernetes {
+                        status: 409,
+                        message: "AgentRuntime already exists".to_owned(),
+                    });
+                }
+                let mut created = runtime.clone();
+                created.metadata.uid = Some(format!("{}-uid", created.name_any()));
+                created.metadata.resource_version = Some("1".to_owned());
+                *stored = created.clone();
+                Ok(created)
             })
         }
 
@@ -2308,65 +2548,236 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_creation_rejects_an_over_envelope_manifest_without_writing_desired_state()
+    async fn runtime_creation_preserves_kubernetes_client_error_statuses() -> Result<(), String> {
+        for expected in [
+            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            let app = router(
+                RejectedCreateRepository {
+                    runtime: runtime(),
+                    status: expected.as_u16(),
+                },
+                ledger(),
+                FakeAuthenticator,
+                FakeDecisionChannel::default(),
+            );
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/namespaces/team-a/runtimes")
+                        .header("authorization", "Bearer user-session")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "name": "runtime-b",
+                                "spec": {
+                                    "principal": {
+                                        "kind": "user",
+                                        "actingUser": "alice@example.com",
+                                    },
+                                    "owner": "alice@example.com",
+                                    "agentType": {"name": "base"},
+                                    "llms": [{
+                                        "provider": "provider-a",
+                                        "model": "model-a",
+                                    }],
+                                    "tools": [],
+                                    "budget": {
+                                        "monthlyLimit": "100.00",
+                                        "currency": "USD",
+                                    },
+                                    "ttl": "24h",
+                                },
+                            })
+                            .to_string(),
+                        ))
+                        .map_err(|error| format!("failed to build create request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("create request failed: {error}"))?;
+            assert_eq!(
+                response.status(),
+                expected,
+                "a deterministic Kubernetes client error must not be reported as a retryable API outage"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_parks_an_over_envelope_manifest_without_provisioning_it()
     -> Result<(), String> {
         let runtimes = FakeRuntimeRepository {
             runtime: Arc::new(Mutex::new(runtime())),
         };
         let runtime_state = runtimes.runtime.clone();
-        let app = router(
-            runtimes,
-            ledger(),
-            FakeAuthenticator,
-            FakeDecisionChannel::default(),
-        );
+        let ledger = ledger();
+        let parked_state = ledger.parked.clone();
+        let decisions = FakeDecisionChannel::default();
+        let decision_requests = decisions.requests.clone();
+        let app = router(runtimes, ledger, FakeAuthenticator, decisions);
+        let body = serde_json::json!({
+            "name": "runtime-b",
+            "spec": {
+                "principal": {
+                    "kind": "user",
+                    "actingUser": "alice@example.com",
+                },
+                "owner": "alice@example.com",
+                "agentType": {"name": "base"},
+                "llms": [{
+                    "provider": "provider-a",
+                    "model": "model-a",
+                }],
+                "tools": [],
+                "budget": {
+                    "monthlyLimit": "201.00",
+                    "currency": "USD",
+                },
+                "ttl": "24h",
+            },
+        })
+        .to_string();
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/namespaces/team-a/runtimes")
+                .header("authorization", "Bearer user-session")
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .map_err(|error| format!("failed to build create request: {error}"))
+        };
         let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/namespaces/team-a/runtimes")
-                    .header("authorization", "Bearer user-session")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "name": "runtime-b",
-                            "spec": {
-                                "principal": {
-                                    "kind": "user",
-                                    "actingUser": "alice@example.com",
-                                },
-                                "owner": "alice@example.com",
-                                "agentType": {"name": "base"},
-                                "llms": [{
-                                    "provider": "provider-a",
-                                    "model": "model-a",
-                                }],
-                                "tools": [],
-                                "budget": {
-                                    "monthlyLimit": "201.00",
-                                    "currency": "USD",
-                                },
-                                "ttl": "24h",
-                            },
-                        })
-                        .to_string(),
-                    ))
-                    .map_err(|error| format!("failed to build create request: {error}"))?,
-            )
+            .clone()
+            .oneshot(request()?)
             .await
             .map_err(|error| format!("create request failed: {error}"))?;
         assert_eq!(
             response.status(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "an over-envelope create must be rejected by the REST admission door"
+            StatusCode::ACCEPTED,
+            "an over-envelope create must be parked by the REST admission door"
+        );
+        {
+            let pending = runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?;
+            assert_eq!(pending.name_any(), "runtime-b");
+            assert!(
+                pending.spec.llms.is_empty()
+                    && pending.spec.tools.is_empty()
+                    && pending.spec.budget.monthly_limit == "0",
+                "the persisted placeholder must carry no usable model, tool, or budget authority"
+            );
+            assert!(
+                pending
+                    .annotations()
+                    .contains_key("agents.apelogic.ai/pending-approval"),
+                "the controller must be able to hold the placeholder inert until approval"
+            );
+        }
+        assert_eq!(
+            parked_state
+                .lock()
+                .map_err(|_| "fake parked lock was poisoned")?
+                .len(),
+            1,
+            "the rejected initial manifest must create one instance-bound approval"
         );
         assert_eq!(
-            runtime_state
+            decision_requests
                 .lock()
-                .map_err(|_| "fake runtime lock was poisoned")?
-                .name_any(),
-            "runtime-a",
-            "an over-envelope create must not write desired state"
+                .map_err(|_| "fake decision-request lock was poisoned")?
+                .len(),
+            1,
+            "the parked initial manifest must be filed with the decision channel"
+        );
+        let replay = app
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("replayed create request failed: {error}"))?;
+        assert_eq!(
+            replay.status(),
+            StatusCode::ACCEPTED,
+            "a retry after the inert placeholder was created must resume the same parked request"
+        );
+        assert_eq!(
+            parked_state
+                .lock()
+                .map_err(|_| "fake parked lock was poisoned")?
+                .len(),
+            1,
+            "retrying an initial create must not create a second approval"
+        );
+        assert_eq!(
+            decision_requests
+                .lock()
+                .map_err(|_| "fake decision-request lock was poisoned")?
+                .len(),
+            1,
+            "retrying a filed initial create must not create another external decision"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approving_an_initial_create_replaces_and_unblocks_its_placeholder()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let outcome = super::submit_runtime_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &AdmissionContext {
+                actor: "alice@example.com".to_owned(),
+                member_role: "engineer".to_owned(),
+            },
+            "team-a",
+            &CreateRuntimeRequest {
+                name: "runtime-b".to_owned(),
+                spec: proposed_spec.clone(),
+            },
+        )
+        .await
+        .map_err(|error| format!("initial create was not parked: {error:?}"))?;
+        let SubmissionOutcome::Parked { approval_id, .. } = outcome else {
+            return Err("over-envelope initial create was not parked".to_owned());
+        };
+
+        super::approve_parked_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &super::AdminContext {
+                actor: "admin@example.com".to_owned(),
+            },
+            approval_id,
+            &super::ApprovalRequest {
+                rationale: "approved for this runtime".to_owned(),
+                evidence_url: "https://jira.example.com/browse/PROJ-123".to_owned(),
+                expires_at: "2999-01-01T00:00:00Z".to_owned(),
+            },
+        )
+        .await
+        .map_err(|error| format!("initial create approval failed: {error:?}"))?;
+
+        let approved = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert_eq!(approved.spec, proposed_spec);
+        assert!(
+            !approved
+                .annotations()
+                .contains_key("agents.apelogic.ai/pending-approval"),
+            "approval must remove the controller's inert-placeholder hold"
         );
         Ok(())
     }

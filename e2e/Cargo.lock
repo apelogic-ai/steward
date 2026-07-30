@@ -2754,6 +2754,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "utoipa",
 ]
 
 [[package]]

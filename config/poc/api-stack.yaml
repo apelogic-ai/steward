@@ -88,6 +88,11 @@ spec:
         - name: secrets
           secret:
             secretName: steward-s2-secrets
+            items:
+              - key: tls-cert.der
+                path: tls-cert.der
+              - key: tls-key.der
+                path: tls-key.der
 ---
 apiVersion: v1
 kind: Service
