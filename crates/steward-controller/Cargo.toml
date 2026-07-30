@@ -16,9 +16,10 @@ steward-admission = { path = "../steward-admission", version = "=0.0.0" }
 steward-ports = { path = "../steward-ports", version = "=0.0.0" }
 steward-store = { path = "../steward-store", version = "=0.0.0" }
 steward-types = { path = "../steward-types", version = "=0.0.0" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 
 [lints]

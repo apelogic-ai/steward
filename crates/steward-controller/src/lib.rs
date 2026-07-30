@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -23,7 +24,8 @@ use kube::runtime::watcher;
 use kube::{Client, Resource, ResourceExt};
 use sha2::{Digest, Sha256};
 use steward_admission::{
-    AdmissionDecision, AdmissionDelta, Envelope, budget_is_exhausted, evaluate_with_grants,
+    AdmissionDecision, AdmissionDelta, Envelope, budget_is_exhausted, duration_seconds,
+    evaluate_with_grants,
 };
 use steward_ports::{
     InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
@@ -31,7 +33,7 @@ use steward_ports::{
     SandboxRuntime,
 };
 use steward_store::{GrantReversion, PgStore, StoreError};
-use steward_types::{AgentRuntime, AgentRuntimeStatus, Phase, RuntimeId, RuntimeRefs};
+use steward_types::{AgentRuntime, AgentRuntimeStatus, Duration, Phase, RuntimeId, RuntimeRefs};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReconcileIntent {
@@ -56,6 +58,62 @@ enum InferenceAction {
         reference: String,
         spend: steward_types::SpendSummary,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TtlAction {
+    Continue { requeue_after: StdDuration },
+    Terminate,
+}
+
+fn ttl_action(
+    created_at_epoch_seconds: i64,
+    ttl: &Duration,
+    now_epoch_seconds: i64,
+) -> Result<TtlAction, ReconcileError> {
+    let ttl_seconds = duration_seconds(ttl).map_err(|error| ReconcileError::InvalidSpec {
+        reason: format!("runtime TTL is invalid: {error:?}"),
+    })?;
+    let ttl_seconds = i64::try_from(ttl_seconds).map_err(|_| ReconcileError::InvalidSpec {
+        reason: "runtime TTL exceeds the supported deadline range".to_owned(),
+    })?;
+    let deadline = created_at_epoch_seconds
+        .checked_add(ttl_seconds)
+        .ok_or_else(|| ReconcileError::InvalidSpec {
+            reason: "runtime TTL deadline overflowed".to_owned(),
+        })?;
+    if now_epoch_seconds >= deadline {
+        return Ok(TtlAction::Terminate);
+    }
+    let remaining =
+        u64::try_from(deadline - now_epoch_seconds).map_err(|_| ReconcileError::InvalidSpec {
+            reason: "runtime TTL deadline moved before the current time".to_owned(),
+        })?;
+    Ok(TtlAction::Continue {
+        requeue_after: StdDuration::from_secs(remaining.min(60)),
+    })
+}
+
+fn runtime_ttl_action(runtime: &AgentRuntime) -> Result<TtlAction, ReconcileError> {
+    let created_at = runtime
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .ok_or_else(|| ReconcileError::InvalidSpec {
+            reason: "persisted runtime has no creation timestamp".to_owned(),
+        })?
+        .0
+        .as_second();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ReconcileError::InvalidSpec {
+            reason: "system clock is before the Unix epoch".to_owned(),
+        })?
+        .as_secs();
+    let now = i64::try_from(now).map_err(|_| ReconcileError::InvalidSpec {
+        reason: "system clock exceeds the supported deadline range".to_owned(),
+    })?;
+    ttl_action(created_at, &runtime.spec.ttl, now)
 }
 
 fn inference_action(observation: steward_ports::InferenceObservation) -> InferenceAction {
@@ -112,6 +170,7 @@ pub enum ReconcileError {
     Runtime(PortError),
     Authority(String),
     DeletionPending,
+    InferenceRevocationTimedOut,
 }
 
 impl fmt::Display for ReconcileError {
@@ -217,6 +276,11 @@ pub async fn reconcile_once<R: SandboxRuntime>(
         agent_type: runtime.spec.agent_type.clone(),
         models: runtime.spec.llms.clone(),
         tools: runtime.spec.tools.clone(),
+        refs: runtime
+            .status
+            .as_ref()
+            .map(|status| status.refs.clone())
+            .unwrap_or_default(),
     };
 
     let observation = match intent {
@@ -550,6 +614,21 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
     finalizer(&api, FINALIZER, runtime, |event| async {
         match event {
             Event::Apply(runtime) => {
+                let ttl_requeue =
+                    match runtime_ttl_action(&runtime).map_err(ControllerError::Reconcile)? {
+                        TtlAction::Continue { requeue_after } => requeue_after,
+                        TtlAction::Terminate => {
+                            match api
+                                .delete(&runtime.name_any(), &DeleteParams::default())
+                                .await
+                            {
+                                Ok(_) => {}
+                                Err(kube::Error::Api(response)) if response.code == 404 => {}
+                                Err(error) => return Err(ControllerError::Kubernetes(error)),
+                            }
+                            return Ok(Action::await_change());
+                        }
+                    };
                 if let Some(authority) = &context.authority {
                     if let Some(reversion) = authority
                         .grant_reversion(runtime.metadata.uid.as_deref().ok_or(
@@ -811,24 +890,19 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         .map_err(ControllerError::Kubernetes)?;
                 }
                 Ok(if running {
-                    Action::requeue(StdDuration::from_secs(60))
+                    Action::requeue(ttl_requeue)
                 } else {
-                    Action::requeue(StdDuration::from_secs(2))
+                    Action::requeue(ttl_requeue.min(StdDuration::from_secs(2)))
                 })
             }
             Event::Cleanup(runtime) => {
-                let inference_request =
-                    inference_request(&runtime).map_err(ControllerError::Reconcile)?;
-                context
-                    .inference
-                    .revoke(&inference_request)
-                    .await
-                    .map_err(|error| ControllerError::Reconcile(ReconcileError::Runtime(error)))?;
-                delete_credential_secret(context.client.clone(), &runtime).await?;
-                let decision =
-                    reconcile_once(&runtime, ReconcileIntent::Delete, &context.sandbox_runtime)
-                        .await
-                        .map_err(ControllerError::Reconcile)?;
+                let decision = cleanup_runtime(
+                    &runtime,
+                    context.client.clone(),
+                    &context.inference,
+                    &context.sandbox_runtime,
+                )
+                .await?;
                 match decision {
                     ReconcileDecision::Deleted => Ok(Action::await_change()),
                     ReconcileDecision::Status(status) => {
@@ -845,6 +919,51 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
     })
     .await
     .map_err(|error| ControllerError::Finalizer(error.to_string()))
+}
+
+async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
+    runtime: &AgentRuntime,
+    client: Client,
+    inference: &I,
+    sandbox_runtime: &R,
+) -> Result<ReconcileDecision, ControllerError> {
+    let inference_request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
+    let sandbox_cleanup = async {
+        reconcile_once(runtime, ReconcileIntent::Delete, sandbox_runtime)
+            .await
+            .map_err(ControllerError::Reconcile)
+    };
+    let (inference_result, credential_result, sandbox_result) = futures::join!(
+        revoke_inference_with_timeout(inference, &inference_request),
+        delete_credential_secret(client, runtime),
+        sandbox_cleanup,
+    );
+
+    let mut decision = sandbox_result?;
+    if let ReconcileDecision::Status(status) = &mut decision {
+        if inference_result.is_err() {
+            status.refs.litellm_key = runtime
+                .status
+                .as_ref()
+                .and_then(|prior| prior.refs.litellm_key.clone());
+        }
+        return Ok(decision);
+    }
+    credential_result?;
+    inference_result.map_err(ControllerError::Reconcile)?;
+    Ok(decision)
+}
+
+const INFERENCE_REVOCATION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
+async fn revoke_inference_with_timeout<I: InferencePlane>(
+    inference: &I,
+    request: &InferenceRequest,
+) -> Result<(), ReconcileError> {
+    tokio::time::timeout(INFERENCE_REVOCATION_TIMEOUT, inference.revoke(request))
+        .await
+        .map_err(|_| ReconcileError::InferenceRevocationTimedOut)?
+        .map_err(ReconcileError::Runtime)
 }
 
 async fn suspend_runtime<R: SandboxRuntime>(
@@ -882,15 +1001,15 @@ async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferenceP
     spend: Option<steward_types::SpendSummary>,
 ) -> Result<Action, ControllerError> {
     let request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
-    let revoke_result = inference.revoke(&request).await;
-    let credential_result = delete_credential_secret(client, runtime).await;
-    let suspension_result = suspend_runtime(runtime, api, sandbox_runtime, spend).await;
+    let (revoke_result, credential_result, suspension_result) = futures::join!(
+        revoke_inference_with_timeout(inference, &request),
+        delete_credential_secret(client, runtime),
+        suspend_runtime(runtime, api, sandbox_runtime, spend),
+    );
 
     let action = suspension_result?;
-    if let Err(error) = revoke_result {
-        return Err(ControllerError::Reconcile(ReconcileError::Runtime(error)));
-    }
     credential_result?;
+    revoke_result.map_err(ControllerError::Reconcile)?;
     Ok(action)
 }
 
@@ -1366,7 +1485,9 @@ async fn webhook_handler<R: WebhookEnvelopeReader, C: WebhookModelCatalog>(
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration as StdDuration;
 
     use axum::body::Body;
     use axum::http::{Method, Request, Response, StatusCode};
@@ -1379,16 +1500,16 @@ mod tests {
     };
     use steward_store::GrantReversion;
     use steward_types::{
-        AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Phase,
-        Principal, RuntimeRefs,
+        AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget, Duration, Email,
+        ModelRef, Phase, Principal, RuntimeRefs,
     };
     use tower::service_fn;
 
     use super::{
         AuthorityAction, InferenceAction, ReconcileDecision, ReconcileIntent, authority_action,
-        authority_application_action, exhausted_spend_to_preserve, inference_action,
-        reconcile_once, runtime_authority_action, status_merge_patch,
-        suspend_runtime_with_inference_cleanup,
+        authority_application_action, cleanup_runtime, exhausted_spend_to_preserve,
+        inference_action, reconcile_once, runtime_authority_action, status_merge_patch,
+        suspend_runtime_with_inference_cleanup, ttl_action,
     };
 
     #[derive(Default)]
@@ -1401,6 +1522,25 @@ mod tests {
         created: usize,
         deleted: usize,
         refs: Option<RuntimeRefs>,
+    }
+
+    #[test]
+    fn ttl_expiry_terminates_at_the_creation_time_boundary() -> Result<(), String> {
+        assert_eq!(
+            ttl_action(1_000, &Duration("60s".to_owned()), 1_059)
+                .map_err(|error| format!("valid TTL must be schedulable: {error:?}"))?,
+            super::TtlAction::Continue {
+                requeue_after: StdDuration::from_secs(1),
+            },
+            "the controller must requeue at the remaining TTL rather than its ordinary poll"
+        );
+        assert_eq!(
+            ttl_action(1_000, &Duration("60s".to_owned()), 1_060)
+                .map_err(|error| format!("valid TTL must be schedulable: {error:?}"))?,
+            super::TtlAction::Terminate,
+            "authority must terminate exactly when the standing-delegation TTL expires"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1547,6 +1687,86 @@ mod tests {
         }
     }
 
+    struct PendingRevokeInference;
+
+    impl InferencePlane for PendingRevokeInference {
+        fn capabilities(&self) -> InferenceCapabilities {
+            InferenceCapabilities::default()
+        }
+
+        async fn validate_configuration(
+            &self,
+            _models: &[ModelRef],
+            _budget: &Budget,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        async fn provision(
+            &self,
+            _request: &InferenceRequest,
+        ) -> Result<ProvisionedInference, PortError> {
+            Err(PortError::Unsupported {
+                operation: "test inference provisioning",
+            })
+        }
+
+        async fn reconcile_configuration(
+            &self,
+            _request: &InferenceRequest,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        async fn observe(
+            &self,
+            _request: &InferenceRequest,
+        ) -> Result<InferenceObservation, PortError> {
+            Ok(InferenceObservation::Absent)
+        }
+
+        async fn revoke(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+            std::future::pending().await
+        }
+    }
+
+    struct SignallingDeleteRuntime {
+        deleted: Arc<AtomicBool>,
+    }
+
+    impl SandboxRuntime for SignallingDeleteRuntime {
+        async fn ensure(&self, _request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+            Err(PortError::Unsupported {
+                operation: "test sandbox ensure",
+            })
+        }
+
+        async fn delete(&self, _request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+            self.deleted.store(true, Ordering::SeqCst);
+            Ok(SandboxObservation::Absent)
+        }
+    }
+
+    struct ProvisioningDeleteRuntime;
+
+    impl SandboxRuntime for ProvisioningDeleteRuntime {
+        async fn ensure(&self, _request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+            Err(PortError::Unsupported {
+                operation: "test sandbox ensure",
+            })
+        }
+
+        async fn delete(&self, _request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+            Ok(SandboxObservation::Provisioning {
+                refs: RuntimeRefs {
+                    workspace: Some("workspace-a".to_owned()),
+                    sandbox: Some("sandbox-a".to_owned()),
+                    litellm_key: None,
+                },
+            })
+        }
+    }
+
     #[tokio::test]
     async fn authority_suspension_deletes_the_sandbox_during_a_litellm_outage() -> Result<(), String>
     {
@@ -1618,6 +1838,236 @@ mod tests {
         assert_eq!(
             deleted, 1,
             "authority suspension must tear down the sandbox even when LiteLLM is unavailable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn termination_deletes_the_sandbox_during_a_litellm_outage() -> Result<(), String> {
+        let runtime = fixture();
+        let client = Client::new(
+            service_fn(|request: Request<KubeBody>| async move {
+                let (status, body) = if request.method() == Method::DELETE
+                    && request.uri().path().contains("/secrets/")
+                {
+                    (
+                        StatusCode::OK,
+                        br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success","code":200}"#
+                            .to_vec(),
+                    )
+                } else {
+                    (
+                        StatusCode::NOT_FOUND,
+                        br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Failure","reason":"NotFound","code":404}"#
+                            .to_vec(),
+                    )
+                };
+                let mut response = Response::new(Body::from(body));
+                *response.status_mut() = status;
+                Ok::<_, Infallible>(response)
+            }),
+            "team-a",
+        );
+        let sandbox = FakeSandboxRuntime {
+            state: Mutex::new(FakeState {
+                created: 1,
+                deleted: 0,
+                refs: Some(RuntimeRefs {
+                    workspace: Some("workspace-a".to_owned()),
+                    sandbox: Some("sandbox-a".to_owned()),
+                    litellm_key: Some("key-a".to_owned()),
+                }),
+            }),
+        };
+
+        let result = cleanup_runtime(&runtime, client, &FailingRevokeInference, &sandbox).await;
+
+        assert!(
+            result.is_err(),
+            "failed inference revocation must keep the finalizer retryable"
+        );
+        assert_eq!(
+            sandbox
+                .state
+                .lock()
+                .map_err(|_| "fixture sandbox lock must be readable".to_owned())?
+                .deleted,
+            1,
+            "termination must attempt sandbox teardown even when LiteLLM is unavailable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn termination_starts_teardown_while_litellm_revocation_is_pending() -> Result<(), String>
+    {
+        let runtime = fixture();
+        let secret_deleted = Arc::new(AtomicBool::new(false));
+        let secret_deleted_for_service = secret_deleted.clone();
+        let client = Client::new(
+            service_fn(move |request: Request<KubeBody>| {
+                if request.method() == Method::DELETE && request.uri().path().contains("/secrets/")
+                {
+                    secret_deleted_for_service.store(true, Ordering::SeqCst);
+                }
+                async move {
+                    let mut response = Response::new(Body::from(
+                        br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success","code":200}"#
+                            .to_vec(),
+                    ));
+                    *response.status_mut() = StatusCode::OK;
+                    Ok::<_, Infallible>(response)
+                }
+            }),
+            "team-a",
+        );
+        let sandbox_deleted = Arc::new(AtomicBool::new(false));
+        let sandbox = SignallingDeleteRuntime {
+            deleted: sandbox_deleted.clone(),
+        };
+        let result = tokio::time::timeout(
+            StdDuration::from_secs(6),
+            cleanup_runtime(&runtime, client, &PendingRevokeInference, &sandbox),
+        )
+        .await
+        .map_err(|_| {
+            "termination must requeue while LiteLLM revocation remains pending".to_owned()
+        })?;
+
+        assert!(
+            result.is_err(),
+            "pending inference revocation must keep finalizer cleanup retryable"
+        );
+        assert!(
+            secret_deleted.load(Ordering::SeqCst),
+            "termination must attempt credential deletion before requeueing"
+        );
+        assert!(
+            sandbox_deleted.load(Ordering::SeqCst),
+            "termination must attempt sandbox deletion before requeueing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authority_suspension_requeues_while_litellm_revocation_is_pending()
+    -> Result<(), String> {
+        let runtime = fixture();
+        let serialized_runtime = serde_json::to_vec(&runtime)
+            .map_err(|error| format!("fixture runtime must be serializable: {error}"))?;
+        let secret_deleted = Arc::new(AtomicBool::new(false));
+        let secret_deleted_for_service = secret_deleted.clone();
+        let client = Client::new(
+            service_fn(move |request: Request<KubeBody>| {
+                let serialized_runtime = serialized_runtime.clone();
+                if request.method() == Method::DELETE && request.uri().path().contains("/secrets/")
+                {
+                    secret_deleted_for_service.store(true, Ordering::SeqCst);
+                }
+                async move {
+                    let body = if request.method() == Method::PATCH
+                        && request.uri().path().ends_with("/status")
+                    {
+                        serialized_runtime
+                    } else {
+                        br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success","code":200}"#
+                            .to_vec()
+                    };
+                    let mut response = Response::new(Body::from(body));
+                    *response.status_mut() = StatusCode::OK;
+                    Ok::<_, Infallible>(response)
+                }
+            }),
+            "team-a",
+        );
+        let sandbox_deleted = Arc::new(AtomicBool::new(false));
+        let sandbox = SignallingDeleteRuntime {
+            deleted: sandbox_deleted.clone(),
+        };
+        let api = kube::Api::<AgentRuntime>::namespaced(client.clone(), "team-a");
+
+        let result = tokio::time::timeout(
+            StdDuration::from_secs(6),
+            suspend_runtime_with_inference_cleanup(
+                &runtime,
+                &api,
+                &sandbox,
+                client,
+                &PendingRevokeInference,
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            "authority suspension must requeue while LiteLLM revocation remains pending".to_owned()
+        })?;
+
+        assert!(
+            result.is_err(),
+            "pending inference revocation must keep authority suspension retryable"
+        );
+        assert!(
+            secret_deleted.load(Ordering::SeqCst),
+            "authority suspension must attempt credential deletion before requeueing"
+        );
+        assert!(
+            sandbox_deleted.load(Ordering::SeqCst),
+            "authority suspension must attempt sandbox deletion before requeueing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn termination_reports_sandbox_progress_while_litellm_revocation_is_pending()
+    -> Result<(), String> {
+        let mut runtime = fixture();
+        runtime.status = Some(AgentRuntimeStatus {
+            phase: Phase::Running,
+            observed_generation: 3,
+            spec_digest: "fixture-digest".to_owned(),
+            refs: RuntimeRefs {
+                workspace: Some("workspace-a".to_owned()),
+                sandbox: Some("sandbox-a".to_owned()),
+                litellm_key: Some("key-a".to_owned()),
+            },
+            conditions: Vec::new(),
+            spend: None,
+        });
+        let client = Client::new(
+            service_fn(|_request: Request<KubeBody>| async move {
+                let mut response = Response::new(Body::from(
+                    br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success","code":200}"#
+                        .to_vec(),
+                ));
+                *response.status_mut() = StatusCode::OK;
+                Ok::<_, Infallible>(response)
+            }),
+            "team-a",
+        );
+
+        let result = tokio::time::timeout(
+            StdDuration::from_secs(6),
+            cleanup_runtime(
+                &runtime,
+                client,
+                &PendingRevokeInference,
+                &ProvisioningDeleteRuntime,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            "termination must report sandbox progress while revocation remains pending".to_owned()
+        })?
+        .map_err(|error| format!("sandbox progress must remain observable: {error}"))?;
+
+        let ReconcileDecision::Status(status) = result else {
+            return Err("a pending sandbox deletion must return terminating status".to_owned());
+        };
+        assert_eq!(status.phase, Phase::Terminating);
+        assert_eq!(
+            status.refs.litellm_key.as_deref(),
+            Some("key-a"),
+            "terminating status must preserve the inference ref until revocation succeeds"
         );
         Ok(())
     }

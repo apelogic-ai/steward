@@ -1,0 +1,30 @@
+id: steward-litellm
+display_name: Steward inference gateway
+description: Runtime-scoped LiteLLM exchange through the S5 evidence proxy
+category: inference
+inference_capable: true
+credentials:
+  - name: api_key
+    description: Runtime-bound inference credential
+    required: false
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: http://steward-mint.steward-system.svc.cluster.local:8080/token
+      audience: steward-inference
+      jwt_svid_audience: steward-mint
+      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-spiffe
+      scopes: [inference]
+      cache_ttl_seconds: 2
+endpoints:
+  - host: hop1-capture-inference.steward-system.svc.cluster.local
+    port: 8085
+    protocol: rest
+    tls: none
+    access: read-write
+    enforcement: enforce
+    allowed_ips:
+      - SERVICE_SUBNET
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl

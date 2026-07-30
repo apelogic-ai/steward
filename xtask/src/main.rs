@@ -40,6 +40,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "e2e-s2" if rest.is_empty() => e2e_s2(),
         "e2e-s3" if rest.is_empty() => e2e_s3(),
         "e2e-s4" if rest.is_empty() => e2e_s4(),
+        "e2e-s5" if rest.is_empty() => e2e_s5(),
         "policy-test" if rest.is_empty() => policy_test(),
         "migrate-check" if rest.is_empty() => migrate_check(),
         "generate-manifests" if rest.is_empty() => generate_manifests(),
@@ -70,6 +71,7 @@ fn usage() -> String {
         "  e2e-s2",
         "  e2e-s3",
         "  e2e-s4",
+        "  e2e-s5",
         "  policy-test",
         "  migrate-check",
         "  generate-manifests",
@@ -152,6 +154,10 @@ fn e2e_s3() -> TaskResult {
 
 fn e2e_s4() -> TaskResult {
     run("bash", &["scripts/s4-escalation-e2e.sh"])
+}
+
+fn e2e_s5() -> TaskResult {
+    run("bash", &["scripts/s5-revocation-e2e.sh"])
 }
 
 fn policy_test() -> TaskResult {
@@ -353,9 +359,13 @@ fn conformance(arguments: &[String]) -> TaskResult {
     }
     validate_register()?;
     let target = arguments[0].trim_start_matches("--");
+    run_conformance_module(target, "G-1", "g1_egress")?;
     run_conformance_module(target, "G-2", "g2_credential_isolation")?;
+    run_conformance_module(target, "G-4", "g4_revocation")?;
     run_conformance_module(target, "G-5", "g5_model_allowlist")?;
-    println!("conformance --{target}: G-2 and G-5 each executed exactly one negative test");
+    println!(
+        "conformance --{target}: G-1, G-2, G-4, and G-5 each executed exactly one negative test"
+    );
     Ok(())
 }
 

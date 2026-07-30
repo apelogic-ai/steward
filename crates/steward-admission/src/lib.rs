@@ -382,7 +382,7 @@ fn compare_fractional(left: &str, right: &str) -> Ordering {
         .unwrap_or(Ordering::Equal)
 }
 
-fn duration_seconds(duration: &Duration) -> Result<u64, AdmissionError> {
+pub fn duration_seconds(duration: &Duration) -> Result<u64, AdmissionError> {
     let value = duration.0.as_str();
     let split = value
         .find(|character: char| !character.is_ascii_digit())

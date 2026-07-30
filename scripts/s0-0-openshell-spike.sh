@@ -2,6 +2,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OPEN_SHELL_RELEASE="${STEWARD_OPEN_SHELL_RELEASE:-v0.0.90}"
+if [[ ! "${OPEN_SHELL_RELEASE}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "STEWARD_OPEN_SHELL_RELEASE must be a semantic release tag" >&2
+  exit 2
+fi
+OPEN_SHELL_HELM_VERSION="${OPEN_SHELL_RELEASE#v}"
 RUN_ID="${STEWARD_RUN_ID:-$(date -u +%Y%m%d%H%M%S)-$$}"
 if [[ ! "${RUN_ID}" =~ ^[a-z0-9-]+$ ]]; then
   echo "STEWARD_RUN_ID must contain only lowercase ASCII letters, digits, and hyphens" >&2
@@ -92,7 +98,10 @@ else
   exit 2
 fi
 
-if [[ "${S0_E2E}" == "0" && -z "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
+if [[ "${S0_E2E}" == "0" \
+  && "${STEWARD_USE_CHART_SUPERVISOR:-0}" != "1" \
+  && -z "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]
+then
   STEWARD_OPENSHELL_SUPERVISOR_IMAGE="${DEFAULT_IDENTITY_SUPERVISOR_IMAGE}"
   if ! "${ROOT}/scripts/build-patched-openshell-supervisor.sh" --image-is-current; then
     "${ROOT}/scripts/build-patched-openshell-supervisor.sh"
@@ -148,7 +157,7 @@ openshell_helm_args=(
   --kubeconfig "${KUBECONFIG_PATH}"
   --kube-context "${KUBE_CONTEXT}"
   install openshell oci://ghcr.io/nvidia/openshell/helm-chart
-  --version 0.0.90
+  --version "${OPEN_SHELL_HELM_VERSION}"
   --namespace openshell
   --create-namespace
 )
@@ -263,20 +272,20 @@ elif [[ "$#" -eq 0 ]]; then
   cli_archive="${RUN_DIR}/${openshell_cli_archive}"
   cli_checksums="${RUN_DIR}/openshell-checksums-sha256.txt"
   curl -fsSL \
-    "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.90/${openshell_cli_archive}" \
+    "https://github.com/NVIDIA/OpenShell/releases/download/${OPEN_SHELL_RELEASE}/${openshell_cli_archive}" \
     -o "${cli_archive}"
   curl -fsSL \
-    "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.90/openshell-checksums-sha256.txt" \
+    "https://github.com/NVIDIA/OpenShell/releases/download/${OPEN_SHELL_RELEASE}/openshell-checksums-sha256.txt" \
     -o "${cli_checksums}"
   (
     cd "${RUN_DIR}"
     grep " ${openshell_cli_archive}$" "${cli_checksums}" | "${checksum_command[@]}"
     tar -xzf "${cli_archive}"
   )
-  source_archive="${RUN_DIR}/openshell-v0.0.90.tar.gz"
+  source_archive="${RUN_DIR}/openshell-${OPEN_SHELL_RELEASE}.tar.gz"
   source_directory="${RUN_DIR}/openshell-source"
   curl -fsSL \
-    "https://github.com/NVIDIA/OpenShell/archive/refs/tags/v0.0.90.tar.gz" \
+    "https://github.com/NVIDIA/OpenShell/archive/refs/tags/${OPEN_SHELL_RELEASE}.tar.gz" \
     -o "${source_archive}"
   mkdir -p "${source_directory}"
   tar -xzf "${source_archive}" -C "${source_directory}" --strip-components=1
