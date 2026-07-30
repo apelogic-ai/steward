@@ -939,8 +939,14 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
         sandbox_cleanup,
     );
 
-    let decision = sandbox_result?;
-    if matches!(decision, ReconcileDecision::Status(_)) {
+    let mut decision = sandbox_result?;
+    if let ReconcileDecision::Status(status) = &mut decision {
+        if inference_result.is_err() {
+            status.refs.litellm_key = runtime
+                .status
+                .as_ref()
+                .and_then(|prior| prior.refs.litellm_key.clone());
+        }
         return Ok(decision);
     }
     credential_result?;
@@ -1494,8 +1500,8 @@ mod tests {
     };
     use steward_store::GrantReversion;
     use steward_types::{
-        AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Phase,
-        Principal, RuntimeRefs,
+        AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget, Duration, Email,
+        ModelRef, Phase, Principal, RuntimeRefs,
     };
     use tower::service_fn;
 
@@ -2014,7 +2020,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn termination_reports_sandbox_progress_while_litellm_revocation_is_pending()
     -> Result<(), String> {
-        let runtime = fixture();
+        let mut runtime = fixture();
+        runtime.status = Some(AgentRuntimeStatus {
+            phase: Phase::Running,
+            observed_generation: 3,
+            spec_digest: "fixture-digest".to_owned(),
+            refs: RuntimeRefs {
+                workspace: Some("workspace-a".to_owned()),
+                sandbox: Some("sandbox-a".to_owned()),
+                litellm_key: Some("key-a".to_owned()),
+            },
+            conditions: Vec::new(),
+            spend: None,
+        });
         let client = Client::new(
             service_fn(|_request: Request<KubeBody>| async move {
                 let mut response = Response::new(Body::from(
@@ -2046,6 +2064,11 @@ mod tests {
             return Err("a pending sandbox deletion must return terminating status".to_owned());
         };
         assert_eq!(status.phase, Phase::Terminating);
+        assert_eq!(
+            status.refs.litellm_key.as_deref(),
+            Some("key-a"),
+            "terminating status must preserve the inference ref until revocation succeeds"
+        );
         Ok(())
     }
 
