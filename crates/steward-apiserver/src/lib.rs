@@ -507,6 +507,11 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         &'a self,
         runtime_uid: &'a str,
     ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>>;
+
+    fn grant_application<'a>(
+        &'a self,
+        runtime_uid: &'a str,
+    ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>>;
 }
 
 impl AdmissionLedger for PgStore {
@@ -627,6 +632,13 @@ impl AdmissionLedger for PgStore {
         runtime_uid: &'a str,
     ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>> {
         Box::pin(async move { PgStore::grant_reversion(self, runtime_uid).await })
+    }
+
+    fn grant_application<'a>(
+        &'a self,
+        runtime_uid: &'a str,
+    ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>> {
+        Box::pin(async move { PgStore::grant_application(self, runtime_uid).await })
     }
 }
 
@@ -1248,6 +1260,38 @@ where
                 .uid
                 .as_deref()
                 .ok_or(ApiError::MissingRuntimeUid)?;
+            if let Some(application) = ledger
+                .grant_application(runtime_uid)
+                .await
+                .map_err(ApiError::Store)?
+            {
+                if application.runtime_uid != runtime_uid
+                    || application.runtime_namespace != namespace
+                    || application.runtime_name != request.name
+                    || application.actor != context.actor
+                    || application.member_role != context.member_role
+                    || application.base_spec != created.spec
+                    || application.proposed_spec != request.spec
+                {
+                    return Err(ApiError::Conflict(
+                        "active approved application does not match this create request".to_owned(),
+                    ));
+                }
+                let mut restored = created;
+                restored.spec = application.proposed_spec;
+                restored
+                    .metadata
+                    .annotations
+                    .get_or_insert_default()
+                    .remove(PENDING_APPROVAL_ANNOTATION);
+                runtimes
+                    .replace(&restored, context)
+                    .await
+                    .map_err(ApiError::Runtime)?;
+                return Ok(SubmissionOutcome::Applied {
+                    proposed_spec: request.spec.clone(),
+                });
+            }
             let base_spec_digest = spec_digest(&created.spec)?;
             let parked = ledger
                 .park_rejection(ParkRejection {
@@ -1854,6 +1898,7 @@ mod tests {
         decision_filing_claim: Arc<Mutex<Option<Uuid>>>,
         revoke_rows: u64,
         reversion: Option<GrantReversion>,
+        application: Arc<Mutex<Option<GrantReversion>>>,
     }
 
     #[derive(Clone)]
@@ -1902,7 +1947,16 @@ mod tests {
                 let mut parked = self.parked.lock().map_err(|_| {
                     StoreError::Database("fake ledger lock was poisoned".to_owned())
                 })?;
-                if parked.is_empty() {
+                let approved_application_exists = self
+                    .application
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake approved-application lock was poisoned".to_owned(),
+                        )
+                    })?
+                    .is_some();
+                if parked.is_empty() || approved_application_exists {
                     parked.push(FakeParked {
                         runtime_uid: request.runtime_uid.to_owned(),
                         runtime_namespace: request.runtime_namespace.to_owned(),
@@ -2163,6 +2217,22 @@ mod tests {
             Box::pin(async move { Ok(self.reversion.clone()) })
         }
 
+        fn grant_application<'a>(
+            &'a self,
+            _runtime_uid: &'a str,
+        ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>> {
+            Box::pin(async move {
+                self.application
+                    .lock()
+                    .map(|application| application.clone())
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake approved-application lock was poisoned".to_owned(),
+                        )
+                    })
+            })
+        }
+
         fn revoke_runtime_grants<'a>(
             &'a self,
             _runtime_uid: &'a str,
@@ -2228,6 +2298,7 @@ mod tests {
             decision_filing_claim: Arc::new(Mutex::new(None)),
             revoke_rows: 0,
             reversion: None,
+            application: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2718,6 +2789,87 @@ mod tests {
                 .len(),
             1,
             "retrying a filed initial create must not create another external decision"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_retry_reuses_an_approved_unapplied_request() -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let decisions = FakeDecisionChannel::default();
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+        };
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: proposed_spec.clone(),
+        };
+
+        let first = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| format!("initial create was not parked: {error:?}"))?;
+        assert!(
+            matches!(first, SubmissionOutcome::Parked { .. }),
+            "the over-envelope create must be parked before approval"
+        );
+        let placeholder = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?
+            .clone();
+        *ledger
+            .application
+            .lock()
+            .map_err(|_| "fake approved-application lock was poisoned")? = Some(GrantReversion {
+            runtime_uid: placeholder
+                .metadata
+                .uid
+                .clone()
+                .ok_or_else(|| "placeholder is missing its runtime UID".to_owned())?,
+            runtime_namespace: "team-a".to_owned(),
+            runtime_name: "runtime-b".to_owned(),
+            actor: context.actor.clone(),
+            member_role: context.member_role.clone(),
+            base_spec: placeholder.spec.clone(),
+            proposed_spec: proposed_spec.clone(),
+        });
+
+        let retry = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| format!("approved create retry failed: {error:?}"))?;
+
+        assert!(
+            matches!(retry, SubmissionOutcome::Applied { .. }),
+            "an approved-but-unapplied create must converge instead of parking another approval: {retry:?}"
+        );
+        assert_eq!(
+            ledger
+                .parked
+                .lock()
+                .map_err(|_| "fake parked lock was poisoned")?
+                .len(),
+            1,
+            "recovery must not create a second approval for the same UID and proposal"
+        );
+        let restored = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert_eq!(restored.spec, proposed_spec);
+        assert!(
+            !restored
+                .annotations()
+                .contains_key("agents.apelogic.ai/pending-approval"),
+            "recovery must clear the inert-placeholder marker"
         );
         Ok(())
     }

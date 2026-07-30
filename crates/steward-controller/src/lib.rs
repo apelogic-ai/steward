@@ -1330,6 +1330,18 @@ pub async fn validate_admission<R: WebhookEnvelopeReader>(
             return response
                 .deny("AgentRuntime principal is immutable through the validating admission path");
         }
+        let old_pending = old_runtime
+            .annotations()
+            .get(PENDING_APPROVAL_ANNOTATION)
+            .map(String::as_str);
+        let pending = runtime
+            .annotations()
+            .get(PENDING_APPROVAL_ANNOTATION)
+            .map(String::as_str);
+        if pending.is_some() && pending != old_pending {
+            return response
+                .deny("agents.apelogic.ai/pending-approval cannot be added or changed on UPDATE");
+        }
         match &old_runtime.spec.principal {
             steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
             _ => {
@@ -2820,6 +2832,35 @@ mod webhook_tests {
         assert_eq!(
             response.result.message,
             "AgentRuntime principal is immutable through the validating admission path"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_user_added_pending_approval_marker() -> Result<(), String> {
+        let mut value = admission_review_value();
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
+        value["request"]["oldObject"]["spec"]["budget"]["monthlyLimit"] =
+            serde_json::json!("100.00");
+        value["request"]["object"]["metadata"]["annotations"]["agents.apelogic.ai/pending-approval"] =
+            serde_json::json!("forged-request-digest");
+        let review =
+            serde_json::from_value::<AdmissionReview<AgentRuntime>>(value).map_err(|error| {
+                format!("failed to construct forged pending-marker review: {error}")
+            })?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read forged pending-marker request: {error}"))?;
+
+        let response = validate_admission(&request, &fake_envelopes()).await;
+
+        assert!(
+            !response.allowed,
+            "a runtime writer must not be able to place a live runtime into controller-owned pending state"
+        );
+        assert_eq!(
+            response.result.message,
+            "agents.apelogic.ai/pending-approval cannot be added or changed on UPDATE"
         );
         Ok(())
     }
