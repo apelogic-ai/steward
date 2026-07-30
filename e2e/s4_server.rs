@@ -19,7 +19,7 @@ use steward_apiserver::{
     AuthenticatedCaller, AuthenticationError, BoxFuture, KubeRuntimeRepository,
     RequestAuthenticator, router,
 };
-use steward_controller::webhook_router;
+use steward_controller::webhook_router_for_trusted_writer;
 use steward_store::PgStore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
@@ -70,7 +70,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         S4Authenticator,
         decisions,
     )
-    .merge(webhook_router(store));
+    .merge(webhook_router_for_trusted_writer(
+        store,
+        "system:serviceaccount:steward-system:steward-s3".to_owned(),
+    ));
     let listener = TcpListener::bind(&steward_bind).await?;
     let certificate = CertificateDer::from(fs::read(certificate_path)?);
     let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(fs::read(private_key_path)?));

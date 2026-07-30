@@ -1587,6 +1587,18 @@ pub fn webhook_router_for_controller<R: WebhookEnvelopeReader>(
     )
 }
 
+pub fn webhook_router_for_trusted_writer<R: WebhookEnvelopeReader>(
+    envelopes: R,
+    writer_username: String,
+) -> Router {
+    webhook_router_with_controller(
+        envelopes,
+        AllowConfiguredModels,
+        None,
+        BTreeSet::from([writer_username]),
+    )
+}
+
 pub fn webhook_router_for_controller_with_catalog<
     R: WebhookEnvelopeReader,
     C: WebhookModelCatalog,

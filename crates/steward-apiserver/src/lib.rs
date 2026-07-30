@@ -1333,6 +1333,21 @@ where
                     return Err(ApiError::Store(park_error));
                 }
             };
+            if let Some(application) = ledger
+                .grant_application(runtime_uid)
+                .await
+                .map_err(ApiError::Store)?
+            {
+                return converge_approved_create(
+                    runtimes,
+                    context,
+                    namespace,
+                    request,
+                    &created,
+                    application,
+                )
+                .await;
+            }
             let reference = match (parked.decision_key, parked.evidence_url) {
                 (Some(key), Some(evidence_url)) => DecisionReference { key, evidence_url },
                 (None, None) => {
@@ -2051,23 +2066,11 @@ mod tests {
                             "fake approved-application lock was poisoned".to_owned(),
                         )
                     })? = Some(application);
-                    return Err(StoreError::Database(
-                        "duplicate exact admission decision after concurrent approval".to_owned(),
-                    ));
                 }
                 let mut parked = self.parked.lock().map_err(|_| {
                     StoreError::Database("fake ledger lock was poisoned".to_owned())
                 })?;
-                let approved_application_exists = self
-                    .application
-                    .lock()
-                    .map_err(|_| {
-                        StoreError::Database(
-                            "fake approved-application lock was poisoned".to_owned(),
-                        )
-                    })?
-                    .is_some();
-                if parked.is_empty() || approved_application_exists {
+                if parked.is_empty() {
                     parked.push(FakeParked {
                         runtime_uid: request.runtime_uid.to_owned(),
                         runtime_namespace: request.runtime_namespace.to_owned(),

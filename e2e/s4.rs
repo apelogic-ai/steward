@@ -472,6 +472,68 @@ fn e2e_s4_grant_binds_to_instance() -> Result<(), Box<dyn Error>> {
             "resolution comment must contain {expected:?}"
         );
     }
+
+    let initial_create = serde_json::json!({
+        "name": "runtime-c",
+        "spec": {
+            "principal": {
+                "kind": "user",
+                "actingUser": "alice@example.com",
+            },
+            "owner": "alice@example.com",
+            "agentType": {"name": "base"},
+            "llms": [{"provider": "provider-a", "model": "model-a"}],
+            "tools": [],
+            "budget": {
+                "monthlyLimit": GRANTED_BUDGET,
+                "currency": "USD",
+            },
+            "ttl": "24h",
+        },
+    });
+    let (create_status, create_body) = harness.steward(
+        "POST",
+        "/v1/namespaces/team-a/runtimes",
+        Some(&initial_create.to_string()),
+        "initial-create-parked.json",
+        Caller::Alice,
+    )?;
+    assert_eq!(
+        create_status, 202,
+        "an over-envelope initial create must park: {create_body}"
+    );
+    let create_parked = serde_json::from_str::<serde_json::Value>(&create_body)?;
+    let create_approval_id = required_json_string(&create_parked, "/approvalId")?;
+    let create_evidence_url = required_json_string(&create_parked, "/evidenceUrl")?;
+    let create_approval = serde_json::json!({
+        "rationale": "approved initial runtime",
+        "evidenceUrl": create_evidence_url,
+        "expiresAt": "2999-01-01T00:00:00Z",
+    });
+    let (create_approval_status, create_approval_body) = harness.steward(
+        "POST",
+        &format!("/admin/approvals/{create_approval_id}/approve"),
+        Some(&create_approval.to_string()),
+        "initial-create-approved.json",
+        Caller::Admin,
+    )?;
+    assert_eq!(
+        create_approval_status, 200,
+        "the co-hosted Steward writer must remove the pending marker after approval: {create_approval_body}"
+    );
+    assert_eq!(
+        harness.runtime_field("runtime-c", "jsonpath={.spec.budget.monthlyLimit}")?,
+        GRANTED_BUDGET,
+        "approval must apply the requested initial manifest"
+    );
+    assert_eq!(
+        harness.runtime_field(
+            "runtime-c",
+            "jsonpath={.metadata.annotations.agents\\.apelogic\\.ai/pending-approval}"
+        )?,
+        "",
+        "approval must remove the controller-owned pending marker"
+    );
     Ok(())
 }
 
