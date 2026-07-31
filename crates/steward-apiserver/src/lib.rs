@@ -468,6 +468,14 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
 
     fn pending_approvals(&self) -> BoxFuture<'_, Result<Vec<PendingApproval>, StoreError>>;
 
+    fn retire_pending_approval<'a>(
+        &'a self,
+        approval_id: Uuid,
+        runtime_uid: &'a str,
+        decided_by: &'a str,
+        rationale: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StoreError>>;
+
     fn link_decision_reference<'a>(
         &'a self,
         approval_id: Uuid,
@@ -563,6 +571,19 @@ impl AdmissionLedger for PgStore {
 
     fn pending_approvals(&self) -> BoxFuture<'_, Result<Vec<PendingApproval>, StoreError>> {
         Box::pin(async move { PgStore::pending_approvals(self).await })
+    }
+
+    fn retire_pending_approval<'a>(
+        &'a self,
+        approval_id: Uuid,
+        runtime_uid: &'a str,
+        decided_by: &'a str,
+        rationale: &'a str,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async move {
+            PgStore::retire_pending_approval(self, approval_id, runtime_uid, decided_by, rationale)
+                .await
+        })
     }
 
     fn link_decision_reference<'a>(
@@ -1338,6 +1359,16 @@ where
                 .await
                 .map_err(ApiError::Store)?
             {
+                validate_approved_create(context, namespace, request, &created, &application)?;
+                ledger
+                    .retire_pending_approval(
+                        parked.approval_id,
+                        runtime_uid,
+                        "steward-apiserver",
+                        "superseded by an active approval during create convergence",
+                    )
+                    .await
+                    .map_err(ApiError::Store)?;
                 return converge_approved_create(
                     runtimes,
                     context,
@@ -1380,6 +1411,30 @@ async fn converge_approved_create<R: RuntimeRepository>(
     placeholder: &AgentRuntime,
     application: GrantReversion,
 ) -> Result<SubmissionOutcome, ApiError> {
+    validate_approved_create(context, namespace, request, placeholder, &application)?;
+    let mut restored = placeholder.clone();
+    restored.spec = application.proposed_spec;
+    restored
+        .metadata
+        .annotations
+        .get_or_insert_default()
+        .remove(PENDING_APPROVAL_ANNOTATION);
+    runtimes
+        .replace_as_authority(&restored)
+        .await
+        .map_err(ApiError::Runtime)?;
+    Ok(SubmissionOutcome::Applied {
+        proposed_spec: request.spec.clone(),
+    })
+}
+
+fn validate_approved_create(
+    context: &AdmissionContext,
+    namespace: &str,
+    request: &CreateRuntimeRequest,
+    placeholder: &AgentRuntime,
+    application: &GrantReversion,
+) -> Result<(), ApiError> {
     let runtime_uid = placeholder
         .metadata
         .uid
@@ -1397,20 +1452,7 @@ async fn converge_approved_create<R: RuntimeRepository>(
             "active approved application does not match this create request".to_owned(),
         ));
     }
-    let mut restored = placeholder.clone();
-    restored.spec = application.proposed_spec;
-    restored
-        .metadata
-        .annotations
-        .get_or_insert_default()
-        .remove(PENDING_APPROVAL_ANNOTATION);
-    runtimes
-        .replace_as_authority(&restored)
-        .await
-        .map_err(ApiError::Runtime)?;
-    Ok(SubmissionOutcome::Applied {
-        proposed_spec: request.spec.clone(),
-    })
+    Ok(())
 }
 
 pub async fn approve_parked_request<R, L, D>(
@@ -2053,7 +2095,7 @@ mod tests {
             request: ParkRejection<'a>,
         ) -> BoxFuture<'a, Result<ParkedAdmission, StoreError>> {
             Box::pin(async move {
-                if let Some(application) = self
+                let application_committed = if let Some(application) = self
                     .application_committed_during_park
                     .lock()
                     .map_err(|_| {
@@ -2066,11 +2108,17 @@ mod tests {
                             "fake approved-application lock was poisoned".to_owned(),
                         )
                     })? = Some(application);
-                }
+                    true
+                } else {
+                    false
+                };
                 let mut parked = self.parked.lock().map_err(|_| {
                     StoreError::Database("fake ledger lock was poisoned".to_owned())
                 })?;
-                if parked.is_empty() {
+                if application_committed {
+                    parked.clear();
+                }
+                if parked.is_empty() || application_committed {
                     parked.push(FakeParked {
                         runtime_uid: request.runtime_uid.to_owned(),
                         runtime_namespace: request.runtime_namespace.to_owned(),
@@ -2126,6 +2174,23 @@ mod tests {
                         member_role: parked.member_role.clone(),
                     })
                     .collect())
+            })
+        }
+
+        fn retire_pending_approval<'a>(
+            &'a self,
+            _approval_id: Uuid,
+            _runtime_uid: &'a str,
+            _decided_by: &'a str,
+            _rationale: &'a str,
+        ) -> BoxFuture<'a, Result<bool, StoreError>> {
+            Box::pin(async move {
+                self.parked
+                    .lock()
+                    .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))?
+                    .pop()
+                    .map(|_| true)
+                    .ok_or(StoreError::ApprovalNotFound)
             })
         }
 
@@ -3054,8 +3119,8 @@ mod tests {
                 .lock()
                 .map_err(|_| "fake parked lock was poisoned")?
                 .len(),
-            1,
-            "the losing park attempt must not create another approval"
+            0,
+            "the losing park attempt must retire its newly created pending approval"
         );
         Ok(())
     }

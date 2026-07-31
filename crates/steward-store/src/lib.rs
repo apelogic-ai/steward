@@ -324,6 +324,59 @@ impl PgStore {
             .collect()
     }
 
+    pub async fn retire_pending_approval(
+        &self,
+        approval_id: Uuid,
+        runtime_uid: &str,
+        decided_by: &str,
+        rationale: &str,
+    ) -> Result<bool, StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let row = sqlx::query(
+            "SELECT runtime_uid, state \
+             FROM approvals \
+             WHERE id = $1 \
+             FOR UPDATE",
+        )
+        .bind(approval_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::ApprovalNotFound)?;
+        if row
+            .try_get::<String, _>("runtime_uid")
+            .map_err(database_error)?
+            != runtime_uid
+        {
+            return Err(StoreError::ApprovalNotFound);
+        }
+        if row.try_get::<String, _>("state").map_err(database_error)? != "pending" {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(false);
+        }
+        let updated = sqlx::query(
+            "UPDATE approvals \
+             SET state = 'rejected', \
+                 decided_by = $2, \
+                 decided_at = now(), \
+                 rationale = $3, \
+                 decision_filing_token = NULL, \
+                 decision_filing_started_at = NULL \
+             WHERE id = $1 AND state = 'pending'",
+        )
+        .bind(approval_id)
+        .bind(decided_by)
+        .bind(rationale)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::ApprovalNotPending);
+        }
+        transaction.commit().await.map_err(database_error)?;
+        Ok(true)
+    }
+
     pub async fn link_decision_reference(
         &self,
         approval_id: Uuid,

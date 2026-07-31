@@ -97,12 +97,14 @@ async fn s4_grants_are_append_only_and_bound_to_one_runtime() -> Result<(), Box<
         "INSERT INTO admission_decisions \
          (id, runtime_uid, spec_digest, envelope_rev, verdict, deltas, proposed_spec, actor, \
           member_role, base_spec_digest, base_spec, runtime_namespace, runtime_name) \
-         VALUES ($1::uuid, $2, 'digest-a', 1, 'reject', '[]'::jsonb, '{}'::jsonb, \
-                 'alice@example.com', 'engineer', 'base-digest-a', '{}'::jsonb, \
+         VALUES ($1::uuid, $2, 'digest-a', 1, 'reject', '[]'::jsonb, $3::jsonb, \
+                 'alice@example.com', 'engineer', 'base-digest-a', $4::jsonb, \
                  'team-a', 'runtime-a')",
     )
     .bind(&decision_id)
     .bind(&runtime_a)
+    .bind(serde_json::to_value(proposed_spec())?)
+    .bind(serde_json::to_value(base_spec())?)
     .execute(store.pool())
     .await?;
     sqlx::query(
@@ -557,6 +559,30 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
             .await?
             .is_some(),
         "an approved grant must remain durable controller work until its spec converges"
+    );
+    assert!(
+        store
+            .retire_pending_approval(
+                next_escalation.approval_id,
+                "runtime-evidence-a",
+                "steward-apiserver",
+                "superseded by an active approval during create convergence",
+            )
+            .await?,
+        "the losing post-park approval must be retired atomically"
+    );
+    assert!(
+        !store
+            .pending_approvals()
+            .await?
+            .iter()
+            .any(|pending| pending.approval_id == next_escalation.approval_id),
+        "a retired loser must not remain reachable through the approval queue"
+    );
+    assert_eq!(
+        store.approval_for_filing(next_escalation.approval_id).await,
+        Err(StoreError::ApprovalNotPending),
+        "a retired loser must never be filed or approved later"
     );
     store
         .insert_envelope(
