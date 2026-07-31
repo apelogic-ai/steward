@@ -29,7 +29,8 @@ pub use steward_ports::{
 };
 use steward_store::{
     ApprovalCandidate, ApproveAdmission, ApprovedAdmission, DecisionFiling, DecisionFilingClaim,
-    GrantReversion, ParkRejection, ParkedAdmission, PendingApproval, PgStore, StoreError,
+    GrantApplication, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval, PgStore,
+    StoreError,
 };
 use steward_types::{AgentRuntime, AgentRuntimeSpec, PENDING_APPROVAL_ANNOTATION, Principal};
 use uuid::Uuid;
@@ -468,13 +469,14 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
 
     fn pending_approvals(&self) -> BoxFuture<'_, Result<Vec<PendingApproval>, StoreError>>;
 
-    fn retire_pending_approval<'a>(
+    fn retire_pending_approval_if_superseded<'a>(
         &'a self,
         approval_id: Uuid,
+        winning_approval_id: Uuid,
         runtime_uid: &'a str,
         decided_by: &'a str,
         rationale: &'a str,
-    ) -> BoxFuture<'a, Result<bool, StoreError>>;
+    ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>>;
 
     fn link_decision_reference<'a>(
         &'a self,
@@ -540,7 +542,7 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
     fn grant_application<'a>(
         &'a self,
         runtime_uid: &'a str,
-    ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>>;
+    ) -> BoxFuture<'a, Result<Option<GrantApplication>, StoreError>>;
 }
 
 impl AdmissionLedger for PgStore {
@@ -573,16 +575,24 @@ impl AdmissionLedger for PgStore {
         Box::pin(async move { PgStore::pending_approvals(self).await })
     }
 
-    fn retire_pending_approval<'a>(
+    fn retire_pending_approval_if_superseded<'a>(
         &'a self,
         approval_id: Uuid,
+        winning_approval_id: Uuid,
         runtime_uid: &'a str,
         decided_by: &'a str,
         rationale: &'a str,
-    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+    ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>> {
         Box::pin(async move {
-            PgStore::retire_pending_approval(self, approval_id, runtime_uid, decided_by, rationale)
-                .await
+            PgStore::retire_pending_approval_if_superseded(
+                self,
+                approval_id,
+                winning_approval_id,
+                runtime_uid,
+                decided_by,
+                rationale,
+            )
+            .await
         })
     }
 
@@ -679,7 +689,7 @@ impl AdmissionLedger for PgStore {
     fn grant_application<'a>(
         &'a self,
         runtime_uid: &'a str,
-    ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>> {
+    ) -> BoxFuture<'a, Result<Option<GrantApplication>, StoreError>> {
         Box::pin(async move { PgStore::grant_application(self, runtime_uid).await })
     }
 }
@@ -1313,7 +1323,7 @@ where
                     namespace,
                     request,
                     &created,
-                    application,
+                    application.application,
                 )
                 .await;
             }
@@ -1347,7 +1357,7 @@ where
                             namespace,
                             request,
                             &created,
-                            application,
+                            application.application,
                         )
                         .await;
                     }
@@ -1359,25 +1369,34 @@ where
                 .await
                 .map_err(ApiError::Store)?
             {
-                validate_approved_create(context, namespace, request, &created, &application)?;
-                ledger
-                    .retire_pending_approval(
+                validate_approved_create(
+                    context,
+                    namespace,
+                    request,
+                    &created,
+                    &application.application,
+                )?;
+                if let Some(active_application) = ledger
+                    .retire_pending_approval_if_superseded(
                         parked.approval_id,
+                        application.approval_id,
                         runtime_uid,
                         "steward-apiserver",
                         "superseded by an active approval during create convergence",
                     )
                     .await
-                    .map_err(ApiError::Store)?;
-                return converge_approved_create(
-                    runtimes,
-                    context,
-                    namespace,
-                    request,
-                    &created,
-                    application,
-                )
-                .await;
+                    .map_err(ApiError::Store)?
+                {
+                    return converge_approved_create(
+                        runtimes,
+                        context,
+                        namespace,
+                        request,
+                        &created,
+                        active_application,
+                    )
+                    .await;
+                }
             }
             let reference = match (parked.decision_key, parked.evidence_url) {
                 (Some(key), Some(evidence_url)) => DecisionReference { key, evidence_url },
@@ -1679,8 +1698,8 @@ mod tests {
     };
     use steward_store::{
         ApprovalCandidate, ApproveAdmission, ApprovedAdmission, DecisionFiling,
-        DecisionFilingClaim, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval,
-        StoreError,
+        DecisionFilingClaim, GrantApplication, GrantReversion, ParkRejection, ParkedAdmission,
+        PendingApproval, StoreError,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal,
@@ -2050,6 +2069,7 @@ mod tests {
         reversion: Option<GrantReversion>,
         application: Arc<Mutex<Option<GrantReversion>>>,
         application_committed_during_park: Arc<Mutex<Option<GrantReversion>>>,
+        application_revoked_during_retirement: Arc<Mutex<bool>>,
     }
 
     #[derive(Clone)]
@@ -2177,20 +2197,63 @@ mod tests {
             })
         }
 
-        fn retire_pending_approval<'a>(
+        fn retire_pending_approval_if_superseded<'a>(
             &'a self,
             _approval_id: Uuid,
+            winning_approval_id: Uuid,
             _runtime_uid: &'a str,
             _decided_by: &'a str,
             _rationale: &'a str,
-        ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>> {
             Box::pin(async move {
+                if self
+                    .decision_filing_claim
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database("fake filing claim lock was poisoned".to_owned())
+                    })?
+                    .is_some()
+                {
+                    return Err(StoreError::DecisionFilingInProgress);
+                }
+                let mut revoke =
+                    self.application_revoked_during_retirement
+                        .lock()
+                        .map_err(|_| {
+                            StoreError::Database(
+                                "fake retirement-race lock was poisoned".to_owned(),
+                            )
+                        })?;
+                if *revoke {
+                    *revoke = false;
+                    *self.application.lock().map_err(|_| {
+                        StoreError::Database(
+                            "fake approved-application lock was poisoned".to_owned(),
+                        )
+                    })? = None;
+                    return Ok(None);
+                }
+                let application = self
+                    .application
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake approved-application lock was poisoned".to_owned(),
+                        )
+                    })?
+                    .clone();
+                if winning_approval_id != Uuid::nil() {
+                    return Ok(None);
+                }
+                if application.is_none() {
+                    return Ok(None);
+                }
                 self.parked
                     .lock()
                     .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))?
                     .pop()
-                    .map(|_| true)
-                    .ok_or(StoreError::ApprovalNotFound)
+                    .ok_or(StoreError::ApprovalNotFound)?;
+                Ok(application)
             })
         }
 
@@ -2399,11 +2462,16 @@ mod tests {
         fn grant_application<'a>(
             &'a self,
             _runtime_uid: &'a str,
-        ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>> {
+        ) -> BoxFuture<'a, Result<Option<GrantApplication>, StoreError>> {
             Box::pin(async move {
                 self.application
                     .lock()
-                    .map(|application| application.clone())
+                    .map(|application| {
+                        application.clone().map(|application| GrantApplication {
+                            approval_id: Uuid::nil(),
+                            application,
+                        })
+                    })
                     .map_err(|_| {
                         StoreError::Database(
                             "fake approved-application lock was poisoned".to_owned(),
@@ -2479,6 +2547,7 @@ mod tests {
             reversion: None,
             application: Arc::new(Mutex::new(None)),
             application_committed_during_park: Arc::new(Mutex::new(None)),
+            application_revoked_during_retirement: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -3121,6 +3190,151 @@ mod tests {
                 .len(),
             0,
             "the losing park attempt must retire its newly created pending approval"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_does_not_retire_the_loser_after_winner_revocation()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let decisions = FakeDecisionChannel::default();
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+        };
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: proposed_spec.clone(),
+        };
+        let first = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| format!("initial create was not parked: {error:?}"))?;
+        assert!(matches!(first, SubmissionOutcome::Parked { .. }));
+        let placeholder = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?
+            .clone();
+        *ledger
+            .application_committed_during_park
+            .lock()
+            .map_err(|_| "fake approval-race lock was poisoned")? = Some(GrantReversion {
+            runtime_uid: placeholder
+                .metadata
+                .uid
+                .clone()
+                .ok_or_else(|| "placeholder is missing its runtime UID".to_owned())?,
+            runtime_namespace: "team-a".to_owned(),
+            runtime_name: "runtime-b".to_owned(),
+            actor: context.actor.clone(),
+            member_role: context.member_role.clone(),
+            base_spec: placeholder.spec,
+            proposed_spec,
+        });
+        *ledger
+            .application_revoked_during_retirement
+            .lock()
+            .map_err(|_| "fake retirement-race lock was poisoned")? = true;
+
+        let retry = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| format!("revoked-winner retry failed: {error:?}"))?;
+
+        assert!(
+            matches!(retry, SubmissionOutcome::Parked { .. }),
+            "a winner revoked before retirement must leave the current escalation parked: {retry:?}"
+        );
+        assert_eq!(
+            ledger
+                .parked
+                .lock()
+                .map_err(|_| "fake parked lock was poisoned")?
+                .len(),
+            1,
+            "the valid escalation must remain pending when its alleged winner is inactive"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_preserves_an_in_flight_loser_filing_lease() -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let decisions = FakeDecisionChannel::default();
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+        };
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: proposed_spec.clone(),
+        };
+        let first = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| format!("initial create was not parked: {error:?}"))?;
+        assert!(matches!(first, SubmissionOutcome::Parked { .. }));
+        let placeholder = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?
+            .clone();
+        *ledger
+            .application_committed_during_park
+            .lock()
+            .map_err(|_| "fake approval-race lock was poisoned")? = Some(GrantReversion {
+            runtime_uid: placeholder
+                .metadata
+                .uid
+                .clone()
+                .ok_or_else(|| "placeholder is missing its runtime UID".to_owned())?,
+            runtime_namespace: "team-a".to_owned(),
+            runtime_name: "runtime-b".to_owned(),
+            actor: context.actor.clone(),
+            member_role: context.member_role.clone(),
+            base_spec: placeholder.spec,
+            proposed_spec,
+        });
+        *ledger
+            .decision_filing_claim
+            .lock()
+            .map_err(|_| "fake filing claim lock was poisoned")? = Some(Uuid::new_v4());
+
+        let retry = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                retry,
+                Err(ApiError::Store(StoreError::DecisionFilingInProgress))
+            ),
+            "a leased filing must finish before its approval can be retired: {retry:?}"
+        );
+        assert_eq!(
+            ledger
+                .parked
+                .lock()
+                .map_err(|_| "fake parked lock was poisoned")?
+                .len(),
+            1,
+            "retirement must preserve the approval carrying the filing lease"
         );
         Ok(())
     }

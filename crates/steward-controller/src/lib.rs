@@ -666,7 +666,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 ))
                             })?
                         && let AuthorityAction::Restore(mut proposed) =
-                            authority_application_action(&runtime, &application)
+                            authority_application_action(&runtime, &application.application)
                                 .map_err(ControllerError::Reconcile)?
                     {
                         proposed.metadata = runtime.metadata.clone();
@@ -771,7 +771,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
                         })?
                     {
-                        match authority_application_action(&runtime, &application)
+                        match authority_application_action(&runtime, &application.application)
                             .map_err(ControllerError::Reconcile)?
                         {
                             AuthorityAction::Restore(mut proposed) => {
@@ -784,8 +784,8 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 replace_as_authority(
                                     &context.client,
                                     &proposed,
-                                    &application.actor,
-                                    &application.member_role,
+                                    &application.application.actor,
+                                    &application.application.member_role,
                                 )
                                 .await?;
                                 return Ok(Action::requeue(StdDuration::from_secs(2)));

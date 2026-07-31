@@ -553,22 +553,52 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
     );
     assert_eq!(next_escalation.decision_key, None);
     assert_eq!(next_escalation.evidence_url, None);
-    assert!(
+    let active_application = store
+        .grant_application("runtime-evidence-a")
+        .await?
+        .ok_or_else(|| {
+            io::Error::other(
+                "an approved grant must remain durable controller work until its spec converges",
+            )
+        })?;
+    let filing_claim = store
+        .claim_decision_filing(next_escalation.approval_id)
+        .await?;
+    let filing_token = filing_claim
+        .token
+        .ok_or_else(|| io::Error::other("new escalation did not receive a filing lease"))?;
+    assert_eq!(
         store
-            .grant_application("runtime-evidence-a")
-            .await?
-            .is_some(),
-        "an approved grant must remain durable controller work until its spec converges"
-    );
-    assert!(
-        store
-            .retire_pending_approval(
+            .retire_pending_approval_if_superseded(
                 next_escalation.approval_id,
+                active_application.approval_id,
                 "runtime-evidence-a",
                 "steward-apiserver",
                 "superseded by an active approval during create convergence",
             )
-            .await?,
+            .await,
+        Err(StoreError::DecisionFilingInProgress),
+        "retirement must not invalidate an external decision request in flight"
+    );
+    store
+        .complete_decision_filing(
+            next_escalation.approval_id,
+            filing_token,
+            "PROJ-456",
+            "https://jira.example.com/browse/PROJ-456",
+        )
+        .await?;
+    assert!(
+        store
+            .retire_pending_approval_if_superseded(
+                next_escalation.approval_id,
+                active_application.approval_id,
+                "runtime-evidence-a",
+                "steward-apiserver",
+                "superseded by an active approval during create convergence",
+            )
+            .await?
+            .is_some(),
         "the losing post-park approval must be retired atomically"
     );
     assert!(
@@ -583,6 +613,70 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
         store.approval_for_filing(next_escalation.approval_id).await,
         Err(StoreError::ApprovalNotPending),
         "a retired loser must never be filed or approved later"
+    );
+    let retired_reference = sqlx::query(
+        "SELECT state, decision_key, evidence_url \
+         FROM approvals \
+         WHERE id = $1",
+    )
+    .bind(next_escalation.approval_id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(retired_reference.try_get::<String, _>("state")?, "rejected");
+    assert_eq!(
+        retired_reference.try_get::<Option<String>, _>("decision_key")?,
+        Some("PROJ-456".to_owned()),
+        "retirement must preserve the completed external decision reference"
+    );
+    assert_eq!(
+        retired_reference.try_get::<Option<String>, _>("evidence_url")?,
+        Some("https://jira.example.com/browse/PROJ-456".to_owned())
+    );
+    let current_escalation = store
+        .park_rejection(ParkRejection {
+            runtime_uid: "runtime-evidence-a",
+            runtime_namespace: "team-a",
+            runtime_name: "runtime-evidence-a",
+            spec_digest: "digest-evidence-a",
+            base_spec_digest: "base-digest-evidence-a",
+            base_spec: &base_spec,
+            envelope_revision: 1,
+            deltas: &deltas,
+            proposed_spec: &proposed_spec,
+            actor: "alice@example.com",
+            member_role: "engineer-evidence",
+        })
+        .await?;
+    assert_eq!(
+        store
+            .revoke_runtime_grants(
+                "runtime-evidence-a",
+                "admin@example.com",
+                "winner revoked before convergence",
+            )
+            .await?,
+        1
+    );
+    assert!(
+        store
+            .retire_pending_approval_if_superseded(
+                current_escalation.approval_id,
+                active_application.approval_id,
+                "runtime-evidence-a",
+                "steward-apiserver",
+                "superseded by an active approval during create convergence",
+            )
+            .await?
+            .is_none(),
+        "a revoked winner must not authorize retirement"
+    );
+    assert!(
+        store
+            .pending_approvals()
+            .await?
+            .iter()
+            .any(|pending| pending.approval_id == current_escalation.approval_id),
+        "the current escalation must remain pending after winner revocation"
     );
     store
         .insert_envelope(
