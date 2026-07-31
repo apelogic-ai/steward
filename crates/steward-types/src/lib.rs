@@ -3,12 +3,23 @@
 use std::borrow::Cow;
 
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::{CustomResource, CustomResourceExt};
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
 pub const PENDING_APPROVAL_ANNOTATION: &str = "agents.apelogic.ai/pending-approval";
+
+pub fn runtime_activated_condition(observed_generation: i64) -> Condition {
+    Condition {
+        type_: "Activated".to_owned(),
+        status: "True".to_owned(),
+        observed_generation: Some(observed_generation),
+        last_transition_time: Time(k8s_openapi::jiff::Timestamp::now()),
+        reason: "PendingApprovalReleased".to_owned(),
+        message: "standing delegation TTL starts at hold release".to_owned(),
+    }
+}
 
 /// Stable identity for one runtime instance.
 #[derive(Clone, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]

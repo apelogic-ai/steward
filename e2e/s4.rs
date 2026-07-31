@@ -553,6 +553,48 @@ fn e2e_s4_grant_binds_to_instance() -> Result<(), Box<dyn Error>> {
         "held placeholder must not receive an inference credential Secret"
     );
 
+    let held_patch = harness.kubectl(&[
+        "--as",
+        "alice@example.com",
+        "--as-group",
+        "agents.apelogic.ai/member-role:engineer",
+        "-n",
+        NAMESPACE,
+        "patch",
+        "agentruntime",
+        "runtime-c",
+        "--type=merge",
+        "-p",
+        r#"{"spec":{"budget":{"monthlyLimit":"1.00"}}}"#,
+    ])?;
+    assert!(
+        !held_patch.status.success(),
+        "ordinary users must not mutate a held placeholder spec"
+    );
+    assert!(
+        String::from_utf8_lossy(&held_patch.stderr)
+            .contains("pending AgentRuntime spec may be changed only by a trusted Steward writer"),
+        "held spec mutation must be rejected by Steward admission: {}",
+        String::from_utf8_lossy(&held_patch.stderr)
+    );
+    let (held_retry_status, held_retry_body) = harness.steward(
+        "POST",
+        "/v1/namespaces/team-a/runtimes",
+        Some(&initial_create.to_string()),
+        "initial-create-held-retry.json",
+        Caller::Alice,
+    )?;
+    assert_eq!(
+        held_retry_status, 202,
+        "held retry must remain recognizable"
+    );
+    let held_retry = serde_json::from_str::<serde_json::Value>(&held_retry_body)?;
+    assert_eq!(
+        required_json_string(&held_retry, "/approvalId")?,
+        create_approval_id,
+        "a rejected held-spec PATCH must preserve approval idempotency"
+    );
+
     let user_delete = harness.kubectl(&[
         "--as",
         "alice@example.com",
@@ -637,6 +679,165 @@ fn e2e_s4_grant_binds_to_instance() -> Result<(), Box<dyn Error>> {
         trusted_cleanup.status.success(),
         "configured Steward writer must retain controlled cleanup authority: {}",
         String::from_utf8_lossy(&trusted_cleanup.stderr)
+    );
+
+    let delayed_create = serde_json::json!({
+        "name": "runtime-e",
+        "spec": {
+            "principal": {
+                "kind": "user",
+                "actingUser": "alice@example.com",
+            },
+            "owner": "alice@example.com",
+            "agentType": {"name": "base"},
+            "llms": [],
+            "tools": [],
+            "budget": {
+                "monthlyLimit": GRANTED_BUDGET,
+                "currency": "USD",
+            },
+            "ttl": "10s",
+        },
+    });
+    let (delayed_status, delayed_body) = harness.steward(
+        "POST",
+        "/v1/namespaces/team-a/runtimes",
+        Some(&delayed_create.to_string()),
+        "delayed-create-parked.json",
+        Caller::Alice,
+    )?;
+    assert_eq!(
+        delayed_status, 202,
+        "short-TTL initial request must park: {delayed_body}"
+    );
+    let delayed_parked = serde_json::from_str::<serde_json::Value>(&delayed_body)?;
+    let delayed_approval_id = required_json_string(&delayed_parked, "/approvalId")?;
+    let delayed_evidence_url = required_json_string(&delayed_parked, "/evidenceUrl")?;
+    let runtime_e_uid = harness.runtime_field("runtime-e", "jsonpath={.metadata.uid}")?;
+    let delayed_marker = harness.runtime_field("runtime-e", marker_path)?;
+    harness.wait_for_runtime_field("runtime-e", "jsonpath={.status.phase}", "Pending")?;
+
+    thread::sleep(Duration::from_secs(11));
+    database_runtime.block_on(async {
+        let store = PgStore::connect(&harness.database_url).await?;
+        store.migrate().await?;
+        store
+            .approve_admission(ApproveAdmission {
+                approval_id: delayed_approval_id.parse()?,
+                decided_by: "admin@example.com",
+                rationale: "approved after the placeholder deadline",
+                evidence_url: &delayed_evidence_url,
+                expires_at: "2999-01-01T00:00:00Z",
+            })
+            .await?;
+        Ok::<(), Box<dyn Error>>(())
+    })?;
+    harness.wait_for_runtime_field("runtime-e", marker_path, "")?;
+    harness.wait_for_runtime_field("runtime-e", "jsonpath={.status.phase}", "Running")?;
+    assert!(
+        !harness
+            .runtime_field("runtime-e", "jsonpath={.status.refs.workspace}")?
+            .is_empty(),
+        "approval after placeholder-age TTL must provision from release time"
+    );
+    let (delayed_revocation_status, delayed_revocation_body) = harness.steward(
+        "POST",
+        &format!("/admin/runtimes/{runtime_e_uid}/grants/revoke"),
+        Some(r#"{"reason":"short-TTL authority ended"}"#),
+        "delayed-create-revoked.json",
+        Caller::Admin,
+    )?;
+    assert_eq!(
+        delayed_revocation_status, 204,
+        "short-TTL grant revocation must restore its hold: {delayed_revocation_body}"
+    );
+    harness.wait_for_runtime_field("runtime-e", marker_path, &delayed_marker)?;
+    harness.wait_for_runtime_field("runtime-e", "jsonpath={.status.phase}", "Pending")?;
+    let delayed_cleanup = harness.kubectl(&[
+        "--as",
+        "system:serviceaccount:steward-system:steward-s3",
+        "-n",
+        NAMESPACE,
+        "delete",
+        "agentruntime",
+        "runtime-e",
+        "--wait=true",
+        "--timeout=30s",
+    ])?;
+    assert!(
+        delayed_cleanup.status.success(),
+        "trusted writer must clean up the restored short-TTL hold: {}",
+        String::from_utf8_lossy(&delayed_cleanup.stderr)
+    );
+
+    let expanding_create = serde_json::json!({
+        "name": "runtime-d",
+        "spec": {
+            "principal": {
+                "kind": "user",
+                "actingUser": "alice@example.com",
+            },
+            "owner": "alice@example.com",
+            "agentType": {"name": "base"},
+            "llms": [],
+            "tools": [],
+            "budget": {
+                "monthlyLimit": GRANTED_BUDGET,
+                "currency": "USD",
+            },
+            "ttl": "24h",
+        },
+    });
+    let (expanding_park_status, expanding_park_body) = harness.steward(
+        "POST",
+        "/v1/namespaces/team-a/runtimes",
+        Some(&expanding_create.to_string()),
+        "envelope-expansion-parked.json",
+        Caller::Alice,
+    )?;
+    assert_eq!(
+        expanding_park_status, 202,
+        "initial request must park before envelope expansion: {expanding_park_body}"
+    );
+    let expanded_envelope = serde_json::json!({
+        "revision": 2,
+        "spec": {
+            "llms": [{"provider": "provider-a", "model": "model-a"}],
+            "tools": [],
+            "budget": {"monthlyLimit": "300.00", "currency": "USD"},
+            "ttl": "24h",
+        },
+    });
+    let (expanded_envelope_status, expanded_envelope_body) = harness.steward(
+        "POST",
+        &format!("/admin/envelopes/{MEMBER_ROLE}"),
+        Some(&expanded_envelope.to_string()),
+        "s4-envelope-expanded.json",
+        Caller::Admin,
+    )?;
+    assert_eq!(
+        expanded_envelope_status, 201,
+        "expanded envelope must be authored: {expanded_envelope_body}"
+    );
+    let (expanded_retry_status, expanded_retry_body) = harness.steward(
+        "POST",
+        "/v1/namespaces/team-a/runtimes",
+        Some(&expanding_create.to_string()),
+        "envelope-expansion-retry.json",
+        Caller::Alice,
+    )?;
+    assert_eq!(
+        expanded_retry_status, 201,
+        "matching hold must release after envelope expansion: {expanded_retry_body}"
+    );
+    assert_eq!(
+        harness.runtime_field("runtime-d", "jsonpath={.spec.budget.monthlyLimit}")?,
+        GRANTED_BUDGET
+    );
+    assert_eq!(
+        harness.runtime_field("runtime-d", marker_path)?,
+        "",
+        "envelope release must remove the hold"
     );
     Ok(())
 }

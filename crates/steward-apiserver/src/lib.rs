@@ -1280,10 +1280,47 @@ where
     )]));
     match decision {
         AdmissionDecision::Admit => {
-            runtimes
-                .create(namespace, &runtime, context)
-                .await
-                .map_err(ApiError::RuntimeCreate)?;
+            match runtimes.create(namespace, &runtime, context).await {
+                Ok(_) => {}
+                Err(RuntimeCreateError::Kubernetes { status: 409, .. }) => {
+                    let existing = runtimes
+                        .get(namespace, &request.name)
+                        .await
+                        .map_err(ApiError::Runtime)?;
+                    let request_digest = spec_digest(&request.spec)?;
+                    let annotations = existing.annotations();
+                    let matching_actor = matches!(
+                        &existing.spec.principal,
+                        Principal::User { acting_user } if acting_user.0 == context.actor
+                    );
+                    if annotations
+                        .get(PENDING_APPROVAL_ANNOTATION)
+                        .map(String::as_str)
+                        != Some(request_digest.as_str())
+                        || annotations
+                            .get("agents.apelogic.ai/member-role")
+                            .map(String::as_str)
+                            != Some(context.member_role.as_str())
+                        || !matching_actor
+                    {
+                        return Err(ApiError::Conflict(
+                            "an unrelated AgentRuntime already uses this name".to_owned(),
+                        ));
+                    }
+                    let mut released = existing;
+                    released.spec = request.spec.clone();
+                    released
+                        .metadata
+                        .annotations
+                        .get_or_insert_default()
+                        .remove(PENDING_APPROVAL_ANNOTATION);
+                    runtimes
+                        .replace_as_authority(&released)
+                        .await
+                        .map_err(ApiError::Runtime)?;
+                }
+                Err(error) => return Err(ApiError::RuntimeCreate(error)),
+            }
             Ok(SubmissionOutcome::Applied {
                 proposed_spec: request.spec.clone(),
             })
@@ -3701,6 +3738,71 @@ mod tests {
                 .spec,
             proposed_spec,
             "mismatched provenance must leave the inert placeholder unchanged"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn envelope_expansion_retry_releases_the_matching_pending_create() -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+        };
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: proposed_spec.clone(),
+        };
+
+        let parked = super::submit_runtime_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &context,
+            "team-a",
+            &request,
+        )
+        .await
+        .map_err(|error| format!("initial create did not park: {error:?}"))?;
+        assert!(matches!(parked, SubmissionOutcome::Parked { .. }));
+        {
+            let mut envelope = ledger
+                .envelope
+                .lock()
+                .map_err(|_| "fake envelope lock was poisoned")?;
+            envelope.revision += 1;
+            envelope.spec.budget.monthly_limit = "300.00".to_owned();
+        }
+
+        let retry = super::submit_runtime_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &context,
+            "team-a",
+            &request,
+        )
+        .await;
+
+        assert!(
+            matches!(retry, Ok(SubmissionOutcome::Applied { .. })),
+            "an expanded envelope must release its matching hold instead of returning 409: {retry:?}"
+        );
+        let restored = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert_eq!(restored.spec, proposed_spec);
+        assert!(
+            !restored
+                .annotations()
+                .contains_key(PENDING_APPROVAL_ANNOTATION),
+            "envelope admission must remove the pending hold"
         );
         Ok(())
     }

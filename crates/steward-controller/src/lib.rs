@@ -35,7 +35,7 @@ pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRu
 use steward_store::{GrantReversion, PgStore, StoreError};
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, Duration, PENDING_APPROVAL_ANNOTATION,
-    Phase, RuntimeId, RuntimeRefs,
+    Phase, RuntimeId, RuntimeRefs, runtime_activated_condition,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,15 +103,26 @@ fn runtime_ttl_action(runtime: &AgentRuntime) -> Result<TtlAction, ReconcileErro
             requeue_after: StdDuration::from_secs(2),
         });
     }
-    let created_at = runtime
-        .metadata
-        .creation_timestamp
-        .as_ref()
-        .ok_or_else(|| ReconcileError::InvalidSpec {
+    let activated_at = runtime.status.as_ref().and_then(|status| {
+        status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Activated" && condition.status == "True")
+            .map(|condition| condition.last_transition_time.0.as_second())
+    });
+    let created_at = activated_at.unwrap_or_else(|| {
+        runtime
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .map(|created_at| created_at.0.as_second())
+            .unwrap_or_default()
+    });
+    if activated_at.is_none() && runtime.metadata.creation_timestamp.is_none() {
+        return Err(ReconcileError::InvalidSpec {
             reason: "persisted runtime has no creation timestamp".to_owned(),
-        })?
-        .0
-        .as_second();
+        });
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ReconcileError::InvalidSpec {
@@ -325,7 +336,11 @@ pub async fn reconcile_once<R: SandboxRuntime>(
         observed_generation: runtime.metadata.generation.unwrap_or_default(),
         spec_digest: runtime_spec_digest(runtime)?,
         refs,
-        conditions: Vec::new(),
+        conditions: runtime
+            .status
+            .as_ref()
+            .map(|status| status.conditions.clone())
+            .unwrap_or_default(),
         spend: None,
     }))
 }
@@ -347,6 +362,34 @@ fn pending_approval_status(runtime: &AgentRuntime) -> Result<AgentRuntimeStatus,
         spec_digest: runtime_spec_digest(runtime)?,
         refs: RuntimeRefs::default(),
         conditions: Vec::new(),
+        spend: None,
+    })
+}
+
+fn has_activation_condition(runtime: &AgentRuntime) -> bool {
+    runtime.status.as_ref().is_some_and(|status| {
+        status
+            .conditions
+            .iter()
+            .any(|condition| condition.type_ == "Activated" && condition.status == "True")
+    })
+}
+
+fn activated_status(runtime: &AgentRuntime) -> Result<AgentRuntimeStatus, ReconcileError> {
+    let observed_generation = runtime.metadata.generation.unwrap_or_default();
+    let mut conditions = runtime
+        .status
+        .as_ref()
+        .map(|status| status.conditions.clone())
+        .unwrap_or_default();
+    conditions.retain(|condition| condition.type_ != "Activated");
+    conditions.push(runtime_activated_condition(observed_generation));
+    Ok(AgentRuntimeStatus {
+        phase: Phase::Admitted,
+        observed_generation,
+        spec_digest: runtime_spec_digest(runtime)?,
+        refs: RuntimeRefs::default(),
+        conditions,
         spend: None,
     })
 }
@@ -647,6 +690,44 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
     finalizer(&api, FINALIZER, runtime, |event| async {
         match event {
             Event::Apply(runtime) => {
+                if !is_pending_approval(&runtime) && !has_activation_condition(&runtime) {
+                    let released_hold = runtime
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.phase == Phase::Pending)
+                        || if let Some(authority) = &context.authority {
+                            authority
+                                .grant_application(runtime.metadata.uid.as_deref().ok_or(
+                                    ControllerError::Reconcile(ReconcileError::MissingRuntimeUid),
+                                )?)
+                                .await
+                                .map_err(|error| {
+                                    ControllerError::Reconcile(ReconcileError::Authority(
+                                        error.to_string(),
+                                    ))
+                                })?
+                                .is_some_and(|application| {
+                                    application
+                                        .application
+                                        .base_pending_approval_digest
+                                        .is_some()
+                                })
+                        } else {
+                            false
+                        };
+                    if released_hold {
+                        let status =
+                            activated_status(&runtime).map_err(ControllerError::Reconcile)?;
+                        api.patch_status(
+                            &runtime.name_any(),
+                            &PatchParams::default(),
+                            &Patch::Merge(&status_merge_patch(&status)),
+                        )
+                        .await
+                        .map_err(ControllerError::Kubernetes)?;
+                        return Ok(Action::requeue(StdDuration::from_secs(2)));
+                    }
+                }
                 let ttl_requeue =
                     match runtime_ttl_action(&runtime).map_err(ControllerError::Reconcile)? {
                         TtlAction::Continue { requeue_after } => requeue_after,
@@ -1275,7 +1356,11 @@ fn suspended_status(runtime: &AgentRuntime) -> Result<AgentRuntimeStatus, Contro
         observed_generation: runtime.metadata.generation.unwrap_or_default(),
         spec_digest: runtime_spec_digest(runtime).map_err(ControllerError::Reconcile)?,
         refs: RuntimeRefs::default(),
-        conditions: Vec::new(),
+        conditions: runtime
+            .status
+            .as_ref()
+            .map(|status| status.conditions.clone())
+            .unwrap_or_default(),
         spend: None,
     })
 }
@@ -1481,6 +1566,8 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
             .annotations()
             .get(PENDING_APPROVAL_ANNOTATION)
             .map(String::as_str);
+        let trusted_pending_writer =
+            old_pending.is_some() && trusted_writer_usernames.contains(username);
         trusted_pending_transition =
             pending != old_pending && trusted_writer_usernames.contains(username);
         if pending != old_pending && pending.is_some() && !trusted_pending_transition {
@@ -1492,6 +1579,11 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
                 "agents.apelogic.ai/pending-approval may be removed only by a trusted Steward writer",
             );
         }
+        if old_pending.is_some() && old_runtime.spec != runtime.spec && !trusted_pending_writer {
+            return response
+                .deny("pending AgentRuntime spec may be changed only by a trusted Steward writer");
+        }
+        trusted_pending_transition |= trusted_pending_writer;
         if !trusted_pending_transition {
             match &old_runtime.spec.principal {
                 steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
@@ -1869,6 +1961,44 @@ mod tests {
                 requeue_after: StdDuration::from_secs(2),
             },
             "a pending approval is a governance hold and cannot enter TTL deletion"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn approved_runtime_ttl_uses_its_controller_owned_activation_time() -> Result<(), String> {
+        let mut runtime = fixture();
+        runtime.spec.ttl = Duration("60s".to_owned());
+        runtime.metadata.creation_timestamp = Some(
+            serde_json::from_value(serde_json::json!("1970-01-01T00:00:00Z"))
+                .map_err(|error| format!("failed to construct old creation timestamp: {error}"))?,
+        );
+        runtime.status = Some(AgentRuntimeStatus {
+            phase: Phase::Admitted,
+            observed_generation: 3,
+            spec_digest: "approved-spec-digest".to_owned(),
+            refs: RuntimeRefs::default(),
+            conditions: vec![
+                serde_json::from_value(serde_json::json!({
+                    "type": "Activated",
+                    "status": "True",
+                    "observedGeneration": 3,
+                    "lastTransitionTime": "2999-01-01T00:00:00Z",
+                    "reason": "PendingApprovalReleased",
+                    "message": "standing delegation TTL starts at hold release"
+                }))
+                .map_err(|error| format!("failed to construct activation condition: {error}"))?,
+            ],
+            spend: None,
+        });
+
+        assert_eq!(
+            runtime_ttl_action(&runtime)
+                .map_err(|error| format!("activated runtime TTL must be readable: {error:?}"))?,
+            super::TtlAction::Continue {
+                requeue_after: StdDuration::from_secs(60),
+            },
+            "placeholder age must not consume the approved standing delegation TTL"
         );
         Ok(())
     }
@@ -3238,6 +3368,35 @@ mod webhook_tests {
         assert_eq!(
             response.result.message,
             "agents.apelogic.ai/pending-approval cannot be added or changed on UPDATE"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_user_spec_patch_while_pending_marker_is_unchanged()
+    -> Result<(), String> {
+        let mut value = admission_review_value();
+        value["request"]["oldObject"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("0");
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
+        value["request"]["oldObject"]["metadata"]["annotations"]["agents.apelogic.ai/pending-approval"] =
+            serde_json::json!("request-digest");
+        value["request"]["object"]["metadata"]["annotations"]["agents.apelogic.ai/pending-approval"] =
+            serde_json::json!("request-digest");
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct held spec PATCH review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read held spec PATCH request: {error}"))?;
+
+        let response = validate_admission(&request, &fake_envelopes()).await;
+
+        assert!(
+            !response.allowed,
+            "an ordinary user must not drift a held anchor"
+        );
+        assert_eq!(
+            response.result.message,
+            "pending AgentRuntime spec may be changed only by a trusted Steward writer"
         );
         Ok(())
     }
