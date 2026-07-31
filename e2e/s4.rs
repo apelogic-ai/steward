@@ -4,9 +4,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
+use steward_store::{ApproveAdmission, PgStore};
 
 const NAMESPACE: &str = "team-a";
 const MEMBER_ROLE: &str = "engineer";
@@ -201,6 +204,27 @@ impl Harness {
             .kubectl_ok(&["-n", NAMESPACE, "get", "agentruntime", name, "-o", jsonpath])?
             .trim()
             .to_owned())
+    }
+
+    fn wait_for_runtime_field(
+        &self,
+        name: &str,
+        jsonpath: &str,
+        expected: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if self.runtime_field(name, jsonpath)? == expected {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(format!(
+                    "AgentRuntime {name} field {jsonpath} did not converge to {expected:?}"
+                ))
+                .into());
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
     }
 }
 
@@ -505,34 +529,114 @@ fn e2e_s4_grant_binds_to_instance() -> Result<(), Box<dyn Error>> {
     let create_parked = serde_json::from_str::<serde_json::Value>(&create_body)?;
     let create_approval_id = required_json_string(&create_parked, "/approvalId")?;
     let create_evidence_url = required_json_string(&create_parked, "/evidenceUrl")?;
-    let create_approval = serde_json::json!({
-        "rationale": "approved initial runtime",
-        "evidenceUrl": create_evidence_url,
-        "expiresAt": "2999-01-01T00:00:00Z",
-    });
-    let (create_approval_status, create_approval_body) = harness.steward(
+    let runtime_c_uid = harness.runtime_field("runtime-c", "jsonpath={.metadata.uid}")?;
+    let marker_path = "jsonpath={.metadata.annotations.agents\\.apelogic\\.ai/pending-approval}";
+    let pending_marker = harness.runtime_field("runtime-c", marker_path)?;
+    assert!(
+        !pending_marker.is_empty(),
+        "parked create must retain its marker"
+    );
+    harness.wait_for_runtime_field("runtime-c", "jsonpath={.status.phase}", "Pending")?;
+    assert_eq!(
+        harness.runtime_field("runtime-c", "jsonpath={.status.refs.workspace}")?,
+        "",
+        "held placeholder must not receive a sandbox reference"
+    );
+    assert_eq!(
+        harness.runtime_field("runtime-c", "jsonpath={.status.refs.litellmKey}")?,
+        "",
+        "held placeholder must not receive inference authority"
+    );
+    let held_secret = harness.kubectl(&["-n", NAMESPACE, "get", "secret", &runtime_c_uid])?;
+    assert!(
+        !held_secret.status.success(),
+        "held placeholder must not receive an inference credential Secret"
+    );
+
+    let user_delete = harness.kubectl(&[
+        "--as",
+        "alice@example.com",
+        "--as-group",
+        "agents.apelogic.ai/member-role:engineer",
+        "-n",
+        NAMESPACE,
+        "delete",
+        "agentruntime",
+        "runtime-c",
+        "--wait=false",
+    ])?;
+    assert!(
+        !user_delete.status.success(),
+        "ordinary user deletion must not remove the governance anchor"
+    );
+    assert!(
+        String::from_utf8_lossy(&user_delete.stderr)
+            .contains("pending AgentRuntime deletion requires a trusted Steward writer"),
+        "pending deletion must be rejected by Steward admission: {}",
+        String::from_utf8_lossy(&user_delete.stderr)
+    );
+
+    database_runtime.block_on(async {
+        let store = PgStore::connect(&harness.database_url).await?;
+        store.migrate().await?;
+        store
+            .approve_admission(ApproveAdmission {
+                approval_id: create_approval_id.parse()?,
+                decided_by: "admin@example.com",
+                rationale: "approved initial runtime in the authority ledger",
+                evidence_url: &create_evidence_url,
+                expires_at: "2999-01-01T00:00:00Z",
+            })
+            .await?;
+        Ok::<(), Box<dyn Error>>(())
+    })?;
+    harness.wait_for_runtime_field(
+        "runtime-c",
+        "jsonpath={.spec.budget.monthlyLimit}",
+        GRANTED_BUDGET,
+    )?;
+    harness.wait_for_runtime_field("runtime-c", marker_path, "")?;
+
+    let (create_revocation_status, create_revocation_body) = harness.steward(
         "POST",
-        &format!("/admin/approvals/{create_approval_id}/approve"),
-        Some(&create_approval.to_string()),
-        "initial-create-approved.json",
+        &format!("/admin/runtimes/{runtime_c_uid}/grants/revoke"),
+        Some(r#"{"reason":"initial-create authority ended"}"#),
+        "initial-create-revoked.json",
         Caller::Admin,
     )?;
     assert_eq!(
-        create_approval_status, 200,
-        "the co-hosted Steward writer must remove the pending marker after approval: {create_approval_body}"
+        create_revocation_status, 204,
+        "initial-create revocation must restore its hold: {create_revocation_body}"
     );
+    harness.wait_for_runtime_field("runtime-c", marker_path, &pending_marker)?;
+    harness.wait_for_runtime_field("runtime-c", "jsonpath={.spec.budget.monthlyLimit}", "0")?;
+    harness.wait_for_runtime_field("runtime-c", "jsonpath={.status.phase}", "Pending")?;
     assert_eq!(
-        harness.runtime_field("runtime-c", "jsonpath={.spec.budget.monthlyLimit}")?,
-        GRANTED_BUDGET,
-        "approval must apply the requested initial manifest"
-    );
-    assert_eq!(
-        harness.runtime_field(
-            "runtime-c",
-            "jsonpath={.metadata.annotations.agents\\.apelogic\\.ai/pending-approval}"
-        )?,
+        harness.runtime_field("runtime-c", "jsonpath={.status.refs.workspace}")?,
         "",
-        "approval must remove the controller-owned pending marker"
+        "restored hold must remain free of sandbox authority"
+    );
+    let reverted_secret = harness.kubectl(&["-n", NAMESPACE, "get", "secret", &runtime_c_uid])?;
+    assert!(
+        !reverted_secret.status.success(),
+        "restored hold must remain free of inference credentials"
+    );
+
+    let trusted_cleanup = harness.kubectl(&[
+        "--as",
+        "system:serviceaccount:steward-system:steward-s3",
+        "-n",
+        NAMESPACE,
+        "delete",
+        "agentruntime",
+        "runtime-c",
+        "--wait=true",
+        "--timeout=30s",
+    ])?;
+    assert!(
+        trusted_cleanup.status.success(),
+        "configured Steward writer must retain controlled cleanup authority: {}",
+        String::from_utf8_lossy(&trusted_cleanup.stderr)
     );
     Ok(())
 }

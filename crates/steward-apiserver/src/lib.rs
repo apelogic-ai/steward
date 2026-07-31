@@ -284,6 +284,12 @@ pub trait RuntimeRepository: Clone + Send + Sync + 'static {
         context: &'a AdmissionContext,
     ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>>;
 
+    fn create_as_authority<'a>(
+        &'a self,
+        namespace: &'a str,
+        runtime: &'a AgentRuntime,
+    ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>>;
+
     fn get<'a>(
         &'a self,
         namespace: &'a str,
@@ -351,6 +357,25 @@ impl RuntimeRepository for KubeRuntimeRepository {
             );
             self.client
                 .request::<AgentRuntime>(request)
+                .await
+                .map_err(|error| match error {
+                    kube::Error::Api(response) => RuntimeCreateError::Kubernetes {
+                        status: response.code,
+                        message: response.message,
+                    },
+                    other => RuntimeCreateError::Unavailable(other.to_string()),
+                })
+        })
+    }
+
+    fn create_as_authority<'a>(
+        &'a self,
+        namespace: &'a str,
+        runtime: &'a AgentRuntime,
+    ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+        Box::pin(async move {
+            Api::<AgentRuntime>::namespaced(self.client.clone(), namespace)
+                .create(&PostParams::default(), runtime)
                 .await
                 .map_err(|error| match error {
                     kube::Error::Api(response) => RuntimeCreateError::Kubernetes {
@@ -1189,6 +1214,7 @@ where
                     runtime_name: name,
                     spec_digest: &spec_digest,
                     base_spec_digest: &base_spec_digest,
+                    base_pending_approval_digest: None,
                     base_spec: &runtime.spec,
                     envelope_revision: envelope.revision,
                     deltas: &deltas,
@@ -1281,7 +1307,7 @@ where
                 PENDING_APPROVAL_ANNOTATION.to_owned(),
                 request_digest.clone(),
             );
-            let created = match runtimes.create(namespace, &runtime, context).await {
+            let created = match runtimes.create_as_authority(namespace, &runtime).await {
                 Ok(created) => created,
                 Err(RuntimeCreateError::Kubernetes { status: 409, .. }) => {
                     let existing = runtimes
@@ -1320,6 +1346,7 @@ where
                     runtime_name: &request.name,
                     spec_digest: &request_digest,
                     base_spec_digest: &base_spec_digest,
+                    base_pending_approval_digest: Some(&request_digest),
                     base_spec: &created.spec,
                     envelope_revision: envelope.revision,
                     deltas: &deltas,
@@ -1473,6 +1500,19 @@ fn validate_approved_create(
         .uid
         .as_deref()
         .ok_or(ApiError::MissingRuntimeUid)?;
+    let pending_digest = placeholder
+        .annotations()
+        .get(PENDING_APPROVAL_ANNOTATION)
+        .map(String::as_str);
+    let proposed_digest = spec_digest(&application.proposed_spec)?;
+    let bound_role = placeholder
+        .annotations()
+        .get("agents.apelogic.ai/member-role")
+        .map(String::as_str);
+    let proposed_actor = match &application.proposed_spec.principal {
+        Principal::User { acting_user } => acting_user.0.as_str(),
+        _ => "",
+    };
     if application.runtime_uid != runtime_uid
         || application.runtime_namespace != namespace
         || application.runtime_name != request.name
@@ -1480,6 +1520,10 @@ fn validate_approved_create(
         || application.member_role != context.member_role
         || application.base_spec != placeholder.spec
         || application.proposed_spec != request.spec
+        || application.base_pending_approval_digest.as_deref() != pending_digest
+        || pending_digest != Some(proposed_digest.as_str())
+        || bound_role != Some(application.member_role.as_str())
+        || proposed_actor != application.actor
     {
         return Err(ApiError::Conflict(
             "active approved application does not match this create request".to_owned(),
@@ -1534,6 +1578,31 @@ where
     if runtime.metadata.uid.as_deref() != Some(candidate.runtime_uid.as_str()) {
         return Err(ApiError::Runtime(
             "runtime repository returned a different runtime UID".to_owned(),
+        ));
+    }
+    let pending_digest = runtime
+        .annotations()
+        .get(PENDING_APPROVAL_ANNOTATION)
+        .map(String::as_str);
+    let proposed_digest = spec_digest(&candidate.proposed_spec)?;
+    let proposed_actor = match &candidate.proposed_spec.principal {
+        Principal::User { acting_user } => acting_user.0.as_str(),
+        _ => "",
+    };
+    if pending_digest != candidate.base_pending_approval_digest.as_deref()
+        || candidate
+            .base_pending_approval_digest
+            .as_deref()
+            .is_some_and(|digest| digest != proposed_digest)
+        || runtime
+            .annotations()
+            .get("agents.apelogic.ai/member-role")
+            .map(String::as_str)
+            != Some(candidate.member_role.as_str())
+        || proposed_actor != candidate.actor
+    {
+        return Err(ApiError::Conflict(
+            "parked approval provenance does not match the bound runtime".to_owned(),
         ));
     }
     let current_digest = spec_digest(&runtime.spec)?;
@@ -1673,16 +1742,28 @@ where
         .map_err(ApiError::Runtime)?;
     if runtime.spec == reversion.proposed_spec {
         runtime.spec = reversion.base_spec;
-        runtimes
-            .replace(
-                &runtime,
-                &AdmissionContext {
-                    actor: reversion.actor,
-                    member_role: reversion.member_role,
-                },
-            )
-            .await
-            .map_err(ApiError::Runtime)?;
+        if let Some(pending_digest) = reversion.base_pending_approval_digest {
+            runtime
+                .metadata
+                .annotations
+                .get_or_insert_default()
+                .insert(PENDING_APPROVAL_ANNOTATION.to_owned(), pending_digest);
+            runtimes
+                .replace_as_authority(&runtime)
+                .await
+                .map_err(ApiError::Runtime)?;
+        } else {
+            runtimes
+                .replace(
+                    &runtime,
+                    &AdmissionContext {
+                        actor: reversion.actor,
+                        member_role: reversion.member_role,
+                    },
+                )
+                .await
+                .map_err(ApiError::Runtime)?;
+        }
     }
     Ok(())
 }
@@ -1716,7 +1797,8 @@ mod tests {
         PendingApproval, StoreError,
     };
     use steward_types::{
-        AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal,
+        AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef,
+        PENDING_APPROVAL_ANNOTATION, Principal,
     };
     use tower::ServiceExt;
     use utoipa::OpenApi;
@@ -1726,7 +1808,7 @@ mod tests {
         AdmissionContext, AdmissionLedger, ApiDoc, ApiError, AuthenticatedCaller,
         AuthenticationError, BoxFuture, BudgetIncrease, CreateRuntimeRequest, RequestAuthenticator,
         RuntimeCreateError, RuntimeRepository, SubmissionOutcome, caller_from_kubernetes_user,
-        caller_from_token_review, router, submit_budget_increase,
+        caller_from_token_review, router, spec_digest, submit_budget_increase,
     };
 
     #[derive(Clone)]
@@ -1977,6 +2059,19 @@ mod tests {
             })
         }
 
+        fn create_as_authority<'a>(
+            &'a self,
+            _namespace: &'a str,
+            _runtime: &'a AgentRuntime,
+        ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+            Box::pin(async {
+                Err(RuntimeCreateError::Kubernetes {
+                    status: self.status,
+                    message: "Kubernetes rejected the AgentRuntime".to_owned(),
+                })
+            })
+        }
+
         fn get<'a>(
             &'a self,
             _namespace: &'a str,
@@ -2016,6 +2111,29 @@ mod tests {
             _namespace: &'a str,
             runtime: &'a AgentRuntime,
             _context: &'a AdmissionContext,
+        ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+            Box::pin(async move {
+                let mut stored = self.runtime.lock().map_err(|_| {
+                    RuntimeCreateError::Unavailable("fake runtime lock was poisoned".to_owned())
+                })?;
+                if stored.name_any() == runtime.name_any() {
+                    return Err(RuntimeCreateError::Kubernetes {
+                        status: 409,
+                        message: "AgentRuntime already exists".to_owned(),
+                    });
+                }
+                let mut created = runtime.clone();
+                created.metadata.uid = Some(format!("{}-uid", created.name_any()));
+                created.metadata.resource_version = Some("1".to_owned());
+                *stored = created.clone();
+                Ok(created)
+            })
+        }
+
+        fn create_as_authority<'a>(
+            &'a self,
+            _namespace: &'a str,
+            runtime: &'a AgentRuntime,
         ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
             Box::pin(async move {
                 let mut stored = self.runtime.lock().map_err(|_| {
@@ -2125,6 +2243,7 @@ mod tests {
         deltas: Vec<AdmissionDelta>,
         proposed_spec: AgentRuntimeSpec,
         base_spec_digest: String,
+        base_pending_approval_digest: Option<String>,
         actor: String,
         member_role: String,
         envelope_revision: i64,
@@ -2191,6 +2310,9 @@ mod tests {
                         deltas: request.deltas.to_vec(),
                         proposed_spec: request.proposed_spec.clone(),
                         base_spec_digest: request.base_spec_digest.to_owned(),
+                        base_pending_approval_digest: request
+                            .base_pending_approval_digest
+                            .map(str::to_owned),
                         actor: request.actor.to_owned(),
                         member_role: request.member_role.to_owned(),
                         envelope_revision: request.envelope_revision,
@@ -2234,6 +2356,7 @@ mod tests {
                         deltas: parked.deltas.clone(),
                         proposed_spec: parked.proposed_spec.clone(),
                         base_spec_digest: parked.base_spec_digest.clone(),
+                        base_pending_approval_digest: parked.base_pending_approval_digest.clone(),
                         envelope_revision: parked.envelope_revision,
                         actor: parked.actor.clone(),
                         member_role: parked.member_role.clone(),
@@ -2381,6 +2504,8 @@ mod tests {
                     runtime_uid: parked.runtime_uid.clone(),
                     proposed_spec: parked.proposed_spec.clone(),
                     base_spec_digest: parked.base_spec_digest.clone(),
+                    base_pending_approval_digest: parked.base_pending_approval_digest.clone(),
+                    actor: parked.actor.clone(),
                     member_role: parked.member_role.clone(),
                     envelope_revision: parked.envelope_revision,
                     runtime_namespace: parked.runtime_namespace.clone(),
@@ -3122,6 +3247,10 @@ mod tests {
             runtime_name: "runtime-b".to_owned(),
             actor: context.actor.clone(),
             member_role: context.member_role.clone(),
+            base_pending_approval_digest: placeholder
+                .annotations()
+                .get(PENDING_APPROVAL_ANNOTATION)
+                .cloned(),
             base_spec: placeholder.spec.clone(),
             proposed_spec: proposed_spec.clone(),
         });
@@ -3201,6 +3330,10 @@ mod tests {
             runtime_name: "runtime-b".to_owned(),
             actor: context.actor.clone(),
             member_role: context.member_role.clone(),
+            base_pending_approval_digest: placeholder
+                .annotations()
+                .get(PENDING_APPROVAL_ANNOTATION)
+                .cloned(),
             base_spec: placeholder.spec,
             proposed_spec: proposed_spec.clone(),
         });
@@ -3255,6 +3388,10 @@ mod tests {
                 runtime_name: "runtime-b".to_owned(),
                 actor: context.actor.clone(),
                 member_role: context.member_role.clone(),
+                base_pending_approval_digest: Some(
+                    spec_digest(&proposed_spec)
+                        .map_err(|error| format!("failed to digest approved spec: {error:?}"))?,
+                ),
                 base_spec: placeholder_spec,
                 proposed_spec: proposed_spec.clone(),
             },
@@ -3328,6 +3465,10 @@ mod tests {
             runtime_name: "runtime-b".to_owned(),
             actor: context.actor.clone(),
             member_role: context.member_role.clone(),
+            base_pending_approval_digest: placeholder
+                .annotations()
+                .get(PENDING_APPROVAL_ANNOTATION)
+                .cloned(),
             base_spec: placeholder.spec,
             proposed_spec,
         });
@@ -3399,6 +3540,10 @@ mod tests {
             runtime_name: "runtime-b".to_owned(),
             actor: context.actor.clone(),
             member_role: context.member_role.clone(),
+            base_pending_approval_digest: placeholder
+                .annotations()
+                .get(PENDING_APPROVAL_ANNOTATION)
+                .cloned(),
             base_spec: placeholder.spec,
             proposed_spec,
         });
@@ -3485,6 +3630,77 @@ mod tests {
                 .annotations()
                 .contains_key("agents.apelogic.ai/pending-approval"),
             "approval must remove the controller's inert-placeholder hold"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approval_rejects_a_placeholder_with_mismatched_stored_provenance() -> Result<(), String>
+    {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let outcome = super::submit_runtime_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &AdmissionContext {
+                actor: "alice@example.com".to_owned(),
+                member_role: "engineer".to_owned(),
+            },
+            "team-a",
+            &CreateRuntimeRequest {
+                name: "runtime-b".to_owned(),
+                spec: proposed_spec.clone(),
+            },
+        )
+        .await
+        .map_err(|error| format!("initial create was not parked: {error:?}"))?;
+        let SubmissionOutcome::Parked { approval_id, .. } = outcome else {
+            return Err("over-envelope initial create was not parked".to_owned());
+        };
+        runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?
+            .metadata
+            .annotations
+            .get_or_insert_default()
+            .insert(
+                PENDING_APPROVAL_ANNOTATION.to_owned(),
+                "different-request-digest".to_owned(),
+            );
+
+        let result = super::approve_parked_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &super::AdminContext {
+                actor: "admin@example.com".to_owned(),
+            },
+            approval_id,
+            &super::ApprovalRequest {
+                rationale: "approved for this runtime".to_owned(),
+                evidence_url: "https://jira.example.com/browse/PROJ-123".to_owned(),
+                expires_at: "2999-01-01T00:00:00Z".to_owned(),
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ApiError::Conflict(_))),
+            "approval must not release a placeholder whose marker no longer matches: {result:?}"
+        );
+        assert_ne!(
+            runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?
+                .spec,
+            proposed_spec,
+            "mismatched provenance must leave the inert placeholder unchanged"
         );
         Ok(())
     }
@@ -3820,6 +4036,7 @@ mod tests {
             member_role: "engineer".to_owned(),
             base_spec: base.spec,
             proposed_spec: escalated.spec,
+            base_pending_approval_digest: None,
         });
         let response = router(
             runtimes,
@@ -3848,6 +4065,54 @@ mod tests {
                 .monthly_limit,
             "100.00",
             "revoking an active grant must remove its already-applied authority"
+        );
+        assert!(
+            !runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?
+                .annotations()
+                .contains_key(PENDING_APPROVAL_ANNOTATION),
+            "edit-grant reversion must not add a pending marker"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initial_create_revocation_restores_its_exact_pending_marker() -> Result<(), String> {
+        let base = runtime();
+        let mut applied = base.clone();
+        applied.spec.budget.monthly_limit = "220.00".to_owned();
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(applied.clone())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let mut ledger = ledger();
+        ledger.reversion = Some(GrantReversion {
+            runtime_uid: "runtime-uid-a".to_owned(),
+            runtime_namespace: "team-a".to_owned(),
+            runtime_name: "runtime-a".to_owned(),
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+            base_spec: base.spec.clone(),
+            proposed_spec: applied.spec,
+            base_pending_approval_digest: Some("request-digest".to_owned()),
+        });
+
+        super::reconcile_grant_reversion(&runtimes, &ledger, "runtime-uid-a")
+            .await
+            .map_err(|error| format!("initial-create reversion failed: {error:?}"))?;
+
+        let restored = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert_eq!(restored.spec, base.spec);
+        assert_eq!(
+            restored
+                .annotations()
+                .get(PENDING_APPROVAL_ANNOTATION)
+                .map(String::as_str),
+            Some("request-digest"),
+            "API recovery must restore the durable pending marker verbatim"
         );
         Ok(())
     }

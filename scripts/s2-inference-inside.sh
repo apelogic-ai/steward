@@ -247,7 +247,7 @@ webhooks:
     rules:
       - apiGroups: ["agents.apelogic.ai"]
         apiVersions: ["v1alpha1"]
-        operations: ["CREATE", "UPDATE"]
+        operations: ["CREATE", "DELETE", "UPDATE"]
         resources: ["agentruntimes"]
         scope: Namespaced
 EOF

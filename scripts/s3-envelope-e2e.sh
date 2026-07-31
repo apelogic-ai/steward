@@ -141,7 +141,13 @@ metadata:
 rules:
   - apiGroups: ["agents.apelogic.ai"]
     resources: ["agentruntimes"]
-    verbs: ["get", "list", "update"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["agents.apelogic.ai"]
+    resources: ["agentruntimes/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete", "get"]
   - apiGroups: [""]
     resources: ["users"]
     resourceNames: ["alice@example.com", "bob@example.org"]
@@ -175,7 +181,7 @@ metadata:
 rules:
   - apiGroups: ["agents.apelogic.ai"]
     resources: ["agentruntimes"]
-    verbs: ["create", "get", "patch", "update"]
+    verbs: ["create", "delete", "get", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -368,7 +374,7 @@ webhooks:
     rules:
       - apiGroups: ["agents.apelogic.ai"]
         apiVersions: ["v1alpha1"]
-        operations: ["CREATE", "UPDATE"]
+        operations: ["CREATE", "DELETE", "UPDATE"]
         resources: ["agentruntimes"]
         scope: Namespaced
 EOF

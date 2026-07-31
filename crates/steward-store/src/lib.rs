@@ -184,11 +184,12 @@ impl PgStore {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!(
-                "{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}",
                 request.runtime_uid,
                 request.spec_digest,
                 request.envelope_revision,
                 request.base_spec_digest,
+                request.base_pending_approval_digest.unwrap_or_default(),
                 request.actor,
                 request.member_role,
             ))
@@ -209,6 +210,7 @@ impl PgStore {
                AND admission_decisions.base_spec_digest = $4 \
                AND admission_decisions.actor = $5 \
                AND admission_decisions.member_role = $6 \
+               AND admission_decisions.base_pending_approval_digest IS NOT DISTINCT FROM $7 \
                AND approvals.state = 'pending' \
              ORDER BY admission_decisions.at DESC \
              LIMIT 1",
@@ -219,6 +221,7 @@ impl PgStore {
         .bind(request.base_spec_digest)
         .bind(request.actor)
         .bind(request.member_role)
+        .bind(request.base_pending_approval_digest)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -238,8 +241,9 @@ impl PgStore {
         sqlx::query(
             "INSERT INTO admission_decisions \
              (id, runtime_uid, spec_digest, envelope_rev, verdict, deltas, proposed_spec, actor, \
-              member_role, base_spec_digest, base_spec, runtime_namespace, runtime_name) \
-             VALUES ($1, $2, $3, $4, 'reject', $5, $6, $7, $8, $9, $10, $11, $12)",
+              member_role, base_spec_digest, base_spec, runtime_namespace, runtime_name, \
+              base_pending_approval_digest) \
+             VALUES ($1, $2, $3, $4, 'reject', $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(decision_id)
         .bind(request.runtime_uid)
@@ -253,6 +257,7 @@ impl PgStore {
         .bind(Json(request.base_spec))
         .bind(request.runtime_namespace)
         .bind(request.runtime_name)
+        .bind(request.base_pending_approval_digest)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -287,6 +292,7 @@ impl PgStore {
                 admission_decisions.deltas, \
                 admission_decisions.proposed_spec, \
                 admission_decisions.base_spec_digest, \
+                admission_decisions.base_pending_approval_digest, \
                 admission_decisions.envelope_rev, \
                 admission_decisions.actor, \
                 admission_decisions.member_role \
@@ -316,6 +322,9 @@ impl PgStore {
                     deltas,
                     proposed_spec,
                     base_spec_digest: row.try_get("base_spec_digest").map_err(database_error)?,
+                    base_pending_approval_digest: row
+                        .try_get("base_pending_approval_digest")
+                        .map_err(database_error)?,
                     envelope_revision: row.try_get("envelope_rev").map_err(database_error)?,
                     actor: row.try_get("actor").map_err(database_error)?,
                     member_role: row.try_get("member_role").map_err(database_error)?,
@@ -352,6 +361,7 @@ impl PgStore {
                 admission_decisions.member_role, \
                 admission_decisions.runtime_namespace, \
                 admission_decisions.runtime_name, \
+                admission_decisions.base_pending_approval_digest, \
                 admission_decisions.envelope_rev \
              FROM approvals \
              JOIN admission_decisions \
@@ -415,6 +425,9 @@ impl PgStore {
             .map_err(database_error)?;
         let Json(proposed_spec) = winner
             .try_get::<Json<AgentRuntimeSpec>, _>("proposed_spec")
+            .map_err(database_error)?;
+        let base_pending_approval_digest = winner
+            .try_get("base_pending_approval_digest")
             .map_err(database_error)?;
         let losing_state = losing
             .try_get::<String, _>("state")
@@ -493,6 +506,7 @@ impl PgStore {
             member_role,
             base_spec,
             proposed_spec,
+            base_pending_approval_digest,
         }))
     }
 
@@ -601,6 +615,8 @@ impl PgStore {
                 approvals.runtime_uid, \
                 admission_decisions.proposed_spec, \
                 admission_decisions.base_spec_digest, \
+                admission_decisions.base_pending_approval_digest, \
+                admission_decisions.actor, \
                 admission_decisions.member_role, \
                 admission_decisions.envelope_rev, \
                 admission_decisions.runtime_namespace, \
@@ -634,6 +650,10 @@ impl PgStore {
             runtime_uid: row.try_get("runtime_uid").map_err(database_error)?,
             proposed_spec,
             base_spec_digest: row.try_get("base_spec_digest").map_err(database_error)?,
+            base_pending_approval_digest: row
+                .try_get("base_pending_approval_digest")
+                .map_err(database_error)?,
+            actor: row.try_get("actor").map_err(database_error)?,
             member_role: row.try_get("member_role").map_err(database_error)?,
             envelope_revision: row.try_get("envelope_rev").map_err(database_error)?,
             runtime_namespace: row.try_get("runtime_namespace").map_err(database_error)?,
@@ -788,6 +808,7 @@ impl PgStore {
                 admission_decisions.member_role, \
                 admission_decisions.runtime_namespace, \
                 admission_decisions.runtime_name, \
+                admission_decisions.base_pending_approval_digest, \
                 admission_decisions.envelope_rev, \
                 latest_envelope.revision AS latest_envelope_rev, \
                 bool_and( \
@@ -843,6 +864,9 @@ impl PgStore {
             member_role: row.try_get("member_role").map_err(database_error)?,
             base_spec,
             proposed_spec,
+            base_pending_approval_digest: row
+                .try_get("base_pending_approval_digest")
+                .map_err(database_error)?,
         }))
     }
 
@@ -859,6 +883,7 @@ impl PgStore {
                 admission_decisions.member_role, \
                 admission_decisions.runtime_namespace, \
                 admission_decisions.runtime_name, \
+                admission_decisions.base_pending_approval_digest, \
                 admission_decisions.envelope_rev, \
                 latest_envelope.revision AS latest_envelope_rev, \
                 bool_and( \
@@ -916,6 +941,9 @@ impl PgStore {
                 member_role: row.try_get("member_role").map_err(database_error)?,
                 base_spec,
                 proposed_spec,
+                base_pending_approval_digest: row
+                    .try_get("base_pending_approval_digest")
+                    .map_err(database_error)?,
             },
         }))
     }
@@ -1110,6 +1138,7 @@ pub struct ParkRejection<'a> {
     pub runtime_name: &'a str,
     pub spec_digest: &'a str,
     pub base_spec_digest: &'a str,
+    pub base_pending_approval_digest: Option<&'a str>,
     pub base_spec: &'a AgentRuntimeSpec,
     pub envelope_revision: i64,
     pub deltas: &'a [AdmissionDelta],
@@ -1136,6 +1165,7 @@ pub struct PendingApproval {
     pub deltas: Vec<AdmissionDelta>,
     pub proposed_spec: AgentRuntimeSpec,
     pub base_spec_digest: String,
+    pub base_pending_approval_digest: Option<String>,
     pub envelope_revision: i64,
     pub actor: String,
     pub member_role: String,
@@ -1147,6 +1177,8 @@ pub struct ApprovalCandidate {
     pub runtime_uid: String,
     pub proposed_spec: AgentRuntimeSpec,
     pub base_spec_digest: String,
+    pub base_pending_approval_digest: Option<String>,
+    pub actor: String,
     pub member_role: String,
     pub envelope_revision: i64,
     pub runtime_namespace: String,
@@ -1179,6 +1211,7 @@ pub struct GrantReversion {
     pub member_role: String,
     pub base_spec: AgentRuntimeSpec,
     pub proposed_spec: AgentRuntimeSpec,
+    pub base_pending_approval_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -29,13 +29,13 @@ use steward_admission::{
 };
 use steward_ports::{
     InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
-    InferenceRequest, PortError, ProvisionedInference, SandboxObservation, SandboxRequest,
-    SandboxRuntime,
+    InferenceRequest, ProvisionedInference,
 };
+pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
 use steward_store::{GrantReversion, PgStore, StoreError};
 use steward_types::{
-    AgentRuntime, AgentRuntimeStatus, Duration, PENDING_APPROVAL_ANNOTATION, Phase, RuntimeId,
-    RuntimeRefs,
+    AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, Duration, PENDING_APPROVAL_ANNOTATION,
+    Phase, RuntimeId, RuntimeRefs,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +98,11 @@ fn ttl_action(
 }
 
 fn runtime_ttl_action(runtime: &AgentRuntime) -> Result<TtlAction, ReconcileError> {
+    if is_pending_approval(runtime) {
+        return Ok(TtlAction::Continue {
+            requeue_after: StdDuration::from_secs(2),
+        });
+    }
     let created_at = runtime
         .metadata
         .creation_timestamp
@@ -157,8 +162,12 @@ fn exhausted_spend_to_preserve(
 }
 
 fn runtime_spec_digest(runtime: &AgentRuntime) -> Result<String, ReconcileError> {
+    spec_digest(&runtime.spec)
+}
+
+fn spec_digest(spec: &AgentRuntimeSpec) -> Result<String, ReconcileError> {
     let serialized_spec =
-        serde_json::to_vec(&runtime.spec).map_err(|error| ReconcileError::InvalidSpec {
+        serde_json::to_vec(spec).map_err(|error| ReconcileError::InvalidSpec {
             reason: error.to_string(),
         })?;
     let digest = Sha256::digest(serialized_spec);
@@ -654,8 +663,16 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         }
                     };
                 if is_pending_approval(&runtime) {
-                    if let Some(authority) = &context.authority
-                        && let Some(application) = authority
+                    if let Some(authority) = &context.authority {
+                        let runtime_uid =
+                            runtime
+                                .metadata
+                                .uid
+                                .as_deref()
+                                .ok_or(ControllerError::Reconcile(
+                                    ReconcileError::MissingRuntimeUid,
+                                ))?;
+                        if let Some(application) = authority
                             .grant_application(runtime.metadata.uid.as_deref().ok_or(
                                 ControllerError::Reconcile(ReconcileError::MissingRuntimeUid),
                             )?)
@@ -665,18 +682,33 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                     error.to_string(),
                                 ))
                             })?
-                        && let AuthorityAction::Restore(mut proposed) =
-                            authority_application_action(&runtime, &application.application)
-                                .map_err(ControllerError::Reconcile)?
-                    {
-                        proposed.metadata = runtime.metadata.clone();
-                        proposed
-                            .metadata
-                            .annotations
-                            .get_or_insert_default()
-                            .remove(PENDING_APPROVAL_ANNOTATION);
-                        replace_pending_as_controller(&context.client, &proposed).await?;
-                        return Ok(Action::requeue(StdDuration::from_secs(2)));
+                            && let Some(active_application) = authority
+                                .retire_pending_approval_if_superseded(
+                                    application.approval_id,
+                                    application.approval_id,
+                                    runtime_uid,
+                                    "steward-controller",
+                                    "active approval validated during pending convergence",
+                                )
+                                .await
+                                .map_err(|error| {
+                                    ControllerError::Reconcile(ReconcileError::Authority(
+                                        error.to_string(),
+                                    ))
+                                })?
+                            && let AuthorityAction::Restore(mut proposed) =
+                                authority_application_action(&runtime, &active_application)
+                                    .map_err(ControllerError::Reconcile)?
+                        {
+                            proposed.metadata = runtime.metadata.clone();
+                            proposed
+                                .metadata
+                                .annotations
+                                .get_or_insert_default()
+                                .remove(PENDING_APPROVAL_ANNOTATION);
+                            replace_pending_as_controller(&context.client, &proposed).await?;
+                            return Ok(Action::requeue(StdDuration::from_secs(2)));
+                        }
                     }
                     let status =
                         pending_approval_status(&runtime).map_err(ControllerError::Reconcile)?;
@@ -1105,8 +1137,26 @@ fn authority_action(
         return Ok(AuthorityAction::Continue);
     }
     if runtime.spec == reversion.proposed_spec && base_is_admitted {
+        if runtime
+            .annotations()
+            .contains_key(PENDING_APPROVAL_ANNOTATION)
+        {
+            return Err(ReconcileError::Authority(
+                "applied grant unexpectedly retained a pending-approval marker".to_owned(),
+            ));
+        }
         let mut restored = runtime.clone();
         restored.spec = reversion.base_spec.clone();
+        if let Some(pending_digest) = &reversion.base_pending_approval_digest {
+            restored
+                .metadata
+                .annotations
+                .get_or_insert_default()
+                .insert(
+                    PENDING_APPROVAL_ANNOTATION.to_owned(),
+                    pending_digest.clone(),
+                );
+        }
         Ok(AuthorityAction::Restore(Box::new(restored)))
     } else {
         Ok(AuthorityAction::Suspend)
@@ -1118,13 +1168,40 @@ fn authority_application_action(
     application: &GrantReversion,
 ) -> Result<AuthorityAction, ReconcileError> {
     validate_authority_binding(runtime, application)?;
+    let pending_digest = runtime
+        .annotations()
+        .get(PENDING_APPROVAL_ANNOTATION)
+        .map(String::as_str);
     if runtime.spec == application.base_spec {
+        validate_pending_application_provenance(pending_digest, application)?;
         let mut proposed = runtime.clone();
         proposed.spec = application.proposed_spec.clone();
         Ok(AuthorityAction::Restore(Box::new(proposed)))
+    } else if runtime.spec == application.proposed_spec && pending_digest.is_some() {
+        validate_pending_application_provenance(pending_digest, application)?;
+        Ok(AuthorityAction::Restore(Box::new(runtime.clone())))
     } else {
         Ok(AuthorityAction::Continue)
     }
+}
+
+fn validate_pending_application_provenance(
+    pending_digest: Option<&str>,
+    application: &GrantReversion,
+) -> Result<(), ReconcileError> {
+    if pending_digest != application.base_pending_approval_digest.as_deref() {
+        return Err(ReconcileError::Authority(
+            "pending marker does not match approved request provenance".to_owned(),
+        ));
+    }
+    if let Some(pending_digest) = pending_digest
+        && spec_digest(&application.proposed_spec)? != pending_digest
+    {
+        return Err(ReconcileError::Authority(
+            "pending marker does not match the approved proposed spec".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn runtime_authority_action(
@@ -1164,6 +1241,31 @@ fn validate_authority_binding(
             "grant authority is bound to a different runtime instance".to_owned(),
         ));
     }
+    if runtime
+        .annotations()
+        .get(MEMBER_ROLE_ANNOTATION)
+        .map(String::as_str)
+        != Some(authority.member_role.as_str())
+    {
+        return Err(ReconcileError::Authority(
+            "grant authority member role does not match the runtime binding".to_owned(),
+        ));
+    }
+    let base_actor = match &authority.base_spec.principal {
+        steward_types::Principal::User { acting_user } => Some(acting_user.0.as_str()),
+        _ => None,
+    };
+    let proposed_actor = match &authority.proposed_spec.principal {
+        steward_types::Principal::User { acting_user } => Some(acting_user.0.as_str()),
+        _ => None,
+    };
+    if base_actor != Some(authority.actor.as_str())
+        || proposed_actor != Some(authority.actor.as_str())
+    {
+        return Err(ReconcileError::Authority(
+            "grant authority actor does not match its stored runtime specs".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1184,6 +1286,9 @@ async fn replace_as_authority(
     actor: &str,
     member_role: &str,
 ) -> Result<(), ControllerError> {
+    if is_pending_approval(runtime) {
+        return replace_pending_as_controller(client, runtime).await;
+    }
     let namespace = runtime
         .namespace()
         .ok_or(ControllerError::Reconcile(ReconcileError::MissingNamespace))?;
@@ -1327,7 +1432,21 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
 ) -> AdmissionResponse {
     let response = AdmissionResponse::from(request);
     if request.operation == Operation::Delete {
-        return response;
+        let Some(old_runtime) = request.old_object.as_ref() else {
+            return response.deny("AgentRuntime DELETE admission request has no old object");
+        };
+        if !is_pending_approval(old_runtime) {
+            return response;
+        }
+        let Some(username) = request.user_info.username.as_deref() else {
+            return response.deny(
+                "authenticated Kubernetes username is required to delete a pending AgentRuntime",
+            );
+        };
+        if trusted_writer_usernames.contains(username) {
+            return response;
+        }
+        return response.deny("pending AgentRuntime deletion requires a trusted Steward writer");
     }
     if !matches!(request.operation, Operation::Create | Operation::Update) {
         return response.deny("AgentRuntime admission supports CREATE and UPDATE only");
@@ -1338,7 +1457,18 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
     let Some(username) = request.user_info.username.as_deref() else {
         return response.deny("authenticated Kubernetes username is required");
     };
-    let mut trusted_pending_removal = false;
+    let pending = runtime
+        .annotations()
+        .get(PENDING_APPROVAL_ANNOTATION)
+        .map(String::as_str);
+    let mut trusted_pending_transition = request.operation == Operation::Create
+        && pending.is_some()
+        && trusted_writer_usernames.contains(username);
+    if request.operation == Operation::Create && pending.is_some() && !trusted_pending_transition {
+        return response.deny(
+            "agents.apelogic.ai/pending-approval may be set only by a trusted Steward writer",
+        );
+    }
     if request.operation == Operation::Update {
         let Some(old_runtime) = request.old_object.as_ref() else {
             return response.deny("AgentRuntime UPDATE admission request has no old object");
@@ -1351,23 +1481,18 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
             .annotations()
             .get(PENDING_APPROVAL_ANNOTATION)
             .map(String::as_str);
-        let pending = runtime
-            .annotations()
-            .get(PENDING_APPROVAL_ANNOTATION)
-            .map(String::as_str);
-        trusted_pending_removal = old_pending.is_some()
-            && pending.is_none()
-            && trusted_writer_usernames.contains(username);
-        if pending != old_pending && pending.is_some() {
+        trusted_pending_transition =
+            pending != old_pending && trusted_writer_usernames.contains(username);
+        if pending != old_pending && pending.is_some() && !trusted_pending_transition {
             return response
                 .deny("agents.apelogic.ai/pending-approval cannot be added or changed on UPDATE");
         }
-        if pending != old_pending && !trusted_pending_removal {
+        if pending != old_pending && !trusted_pending_transition {
             return response.deny(
                 "agents.apelogic.ai/pending-approval may be removed only by a trusted Steward writer",
             );
         }
-        if !trusted_pending_removal {
+        if !trusted_pending_transition {
             match &old_runtime.spec.principal {
                 steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
                 _ => {
@@ -1378,7 +1503,7 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
             }
         }
     }
-    if !trusted_pending_removal {
+    if !trusted_pending_transition {
         match &runtime.spec.principal {
             steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
             _ => {
@@ -1392,7 +1517,7 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
         .annotations()
         .get(MEMBER_ROLE_ANNOTATION)
         .map(String::as_str);
-    let member_role = if trusted_pending_removal {
+    let member_role = if trusted_pending_transition {
         let Some(member_role) = bound_role.filter(|role| !role.is_empty()) else {
             return response.deny("AgentRuntime member-role annotation is required");
         };
@@ -1478,6 +1603,9 @@ async fn validate_admission_with_catalog_for_writers<
     let response =
         validate_admission_with_trusted_writers(request, envelopes, trusted_writer_usernames).await;
     if !response.allowed {
+        return response;
+    }
+    if request.operation == Operation::Delete {
         return response;
     }
     let Some(runtime) = request.object.as_ref() else {
@@ -1668,8 +1796,8 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{Method, Request, Response, StatusCode};
-    use kube::Client;
     use kube::client::Body as KubeBody;
+    use kube::{Client, ResourceExt};
     use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
     use steward_ports::{
         InferenceCapabilities, InferenceObservation, InferencePlane, InferenceRequest, PortError,
@@ -1683,9 +1811,10 @@ mod tests {
     use tower::service_fn;
 
     use super::{
-        AuthorityAction, InferenceAction, ReconcileDecision, ReconcileIntent, authority_action,
-        authority_application_action, cleanup_runtime, exhausted_spend_to_preserve,
-        inference_action, reconcile_once, runtime_authority_action, status_merge_patch,
+        AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ReconcileDecision,
+        ReconcileIntent, authority_action, authority_application_action, cleanup_runtime,
+        exhausted_spend_to_preserve, inference_action, reconcile_once, replace_as_authority,
+        runtime_authority_action, runtime_ttl_action, status_merge_patch,
         suspend_runtime_with_inference_cleanup, ttl_action,
     };
 
@@ -1716,6 +1845,30 @@ mod tests {
                 .map_err(|error| format!("valid TTL must be schedulable: {error:?}"))?,
             super::TtlAction::Terminate,
             "authority must terminate exactly when the standing-delegation TTL expires"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expired_ttl_does_not_terminate_a_pending_approval_placeholder() -> Result<(), String> {
+        let mut runtime = fixture();
+        runtime.metadata.creation_timestamp = Some(
+            serde_json::from_value(serde_json::json!("1970-01-01T00:00:00Z"))
+                .map_err(|error| format!("failed to construct old creation timestamp: {error}"))?,
+        );
+        runtime.metadata.annotations.get_or_insert_default().insert(
+            "agents.apelogic.ai/pending-approval".to_owned(),
+            "request-digest".to_owned(),
+        );
+
+        assert_eq!(
+            runtime_ttl_action(&runtime).map_err(|error| format!(
+                "pending placeholder must remain schedulable: {error:?}"
+            ))?,
+            super::TtlAction::Continue {
+                requeue_after: StdDuration::from_secs(2),
+            },
+            "a pending approval is a governance hold and cannot enter TTL deletion"
         );
         Ok(())
     }
@@ -2324,6 +2477,10 @@ mod tests {
         runtime.metadata.namespace = Some("team-a".to_owned());
         runtime.metadata.uid = Some("runtime-uid-a".to_owned());
         runtime.metadata.generation = Some(3);
+        runtime.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            MEMBER_ROLE_ANNOTATION.to_owned(),
+            "engineer".to_owned(),
+        )]));
         runtime
     }
 
@@ -2356,6 +2513,7 @@ mod tests {
             member_role: "engineer".to_owned(),
             base_spec: runtime.spec.clone(),
             proposed_spec,
+            base_pending_approval_digest: None,
         }
     }
 
@@ -2370,6 +2528,36 @@ mod tests {
             return Err("an unchanged escalated spec must be restored after expiry".to_owned());
         };
         assert_eq!(restored.spec, reversion.base_spec);
+        assert!(
+            !restored
+                .annotations()
+                .contains_key("agents.apelogic.ai/pending-approval"),
+            "an edit-grant reversion must not invent a pending hold"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expired_initial_create_grant_restores_its_exact_pending_marker() -> Result<(), String> {
+        let mut runtime = fixture();
+        let mut reversion = grant_reversion(&runtime);
+        reversion.base_pending_approval_digest = Some("request-digest".to_owned());
+        runtime.spec = reversion.proposed_spec.clone();
+
+        let action = authority_action(&runtime, &reversion, &envelope("1.00"), &[])
+            .map_err(|error| format!("authority evaluation failed: {error:?}"))?;
+        let AuthorityAction::Restore(restored) = action else {
+            return Err("expired initial-create authority must restore its hold".to_owned());
+        };
+        assert_eq!(restored.spec, reversion.base_spec);
+        assert_eq!(
+            restored
+                .annotations()
+                .get("agents.apelogic.ai/pending-approval")
+                .map(String::as_str),
+            Some("request-digest"),
+            "initial-create reversion must restore the stored marker verbatim"
+        );
         Ok(())
     }
 
@@ -2384,6 +2572,107 @@ mod tests {
         };
         assert_eq!(proposed.spec, application.proposed_spec);
         Ok(())
+    }
+
+    #[test]
+    fn approved_initial_create_converges_only_with_matching_provenance() -> Result<(), String> {
+        let mut runtime = fixture();
+        let mut application = grant_reversion(&runtime);
+        let digest = super::spec_digest(&application.proposed_spec)
+            .map_err(|error| format!("failed to digest proposed spec: {error:?}"))?;
+        runtime.metadata.annotations.get_or_insert_default().insert(
+            "agents.apelogic.ai/pending-approval".to_owned(),
+            digest.clone(),
+        );
+        application.base_pending_approval_digest = Some(digest);
+
+        let action = authority_application_action(&runtime, &application)
+            .map_err(|error| format!("matching authority failed validation: {error:?}"))?;
+        let AuthorityAction::Restore(proposed) = action else {
+            return Err("matching initial-create authority did not converge".to_owned());
+        };
+        assert_eq!(proposed.spec, application.proposed_spec);
+        Ok(())
+    }
+
+    #[test]
+    fn approved_spec_with_its_pending_marker_still_releases_the_hold() -> Result<(), String> {
+        let mut runtime = fixture();
+        let mut application = grant_reversion(&runtime);
+        let digest = super::spec_digest(&application.proposed_spec)
+            .map_err(|error| format!("failed to digest proposed spec: {error:?}"))?;
+        runtime.spec = application.proposed_spec.clone();
+        runtime.metadata.annotations.get_or_insert_default().insert(
+            "agents.apelogic.ai/pending-approval".to_owned(),
+            digest.clone(),
+        );
+        application.base_pending_approval_digest = Some(digest);
+
+        let action = authority_application_action(&runtime, &application)
+            .map_err(|error| format!("matching authority failed validation: {error:?}"))?;
+        let AuthorityAction::Restore(proposed) = action else {
+            return Err(
+                "an already-applied approved spec must still remove its pending hold".to_owned(),
+            );
+        };
+        assert_eq!(proposed.spec, application.proposed_spec);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_marker_restoration_uses_the_controller_identity() -> Result<(), String> {
+        let mut runtime = fixture();
+        runtime.metadata.annotations.get_or_insert_default().insert(
+            "agents.apelogic.ai/pending-approval".to_owned(),
+            "request-digest".to_owned(),
+        );
+        let serialized_runtime = serde_json::to_vec(&runtime)
+            .map_err(|error| format!("fixture runtime must be serializable: {error}"))?;
+        let impersonated = Arc::new(AtomicBool::new(false));
+        let impersonated_for_service = impersonated.clone();
+        let client = Client::new(
+            service_fn(move |request: Request<KubeBody>| {
+                let serialized_runtime = serialized_runtime.clone();
+                if request.headers().contains_key("impersonate-user") {
+                    impersonated_for_service.store(true, Ordering::SeqCst);
+                }
+                async move {
+                    let mut response = Response::new(Body::from(serialized_runtime));
+                    *response.status_mut() = StatusCode::OK;
+                    Ok::<_, Infallible>(response)
+                }
+            }),
+            "team-a",
+        );
+
+        replace_as_authority(&client, &runtime, "alice@example.com", "engineer")
+            .await
+            .map_err(|error| format!("pending restoration must be writable: {error:?}"))?;
+
+        assert!(
+            !impersonated.load(Ordering::SeqCst),
+            "a pending marker must be restored by the trusted controller identity"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn approved_grant_cannot_release_a_placeholder_with_a_mismatched_request_digest() {
+        let mut runtime = fixture();
+        runtime.metadata.annotations.get_or_insert_default().insert(
+            "agents.apelogic.ai/pending-approval".to_owned(),
+            "different-request-digest".to_owned(),
+        );
+        let application = grant_reversion(&runtime);
+        let application = GrantReversion {
+            base_pending_approval_digest: Some("different-request-digest".to_owned()),
+            ..application
+        };
+
+        assert!(
+            authority_application_action(&runtime, &application).is_err(),
+            "controller convergence must bind the pending marker to the approved proposed spec"
+        );
     }
 
     #[test]
@@ -2557,7 +2846,7 @@ mod tests {
 
 #[cfg(test)]
 mod webhook_tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -2954,6 +3243,35 @@ mod webhook_tests {
     }
 
     #[tokio::test]
+    async fn webhook_rejects_user_created_pending_approval_marker() -> Result<(), String> {
+        let mut value = admission_review_value();
+        value["request"]["operation"] = serde_json::json!("CREATE");
+        value["request"]["oldObject"] = serde_json::Value::Null;
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
+        value["request"]["object"]["metadata"]["annotations"]["agents.apelogic.ai/pending-approval"] =
+            serde_json::json!("forged-request-digest");
+        let review =
+            serde_json::from_value::<AdmissionReview<AgentRuntime>>(value).map_err(|error| {
+                format!("failed to construct forged pending CREATE review: {error}")
+            })?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read forged pending CREATE request: {error}"))?;
+
+        let response = validate_admission(&request, &fake_envelopes()).await;
+
+        assert!(
+            !response.allowed,
+            "an ordinary runtime writer must not create a controller-owned pending marker"
+        );
+        assert_eq!(
+            response.result.message,
+            "agents.apelogic.ai/pending-approval may be set only by a trusted Steward writer"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn webhook_rejects_user_removed_pending_approval_marker() -> Result<(), String> {
         let mut value = admission_review_value();
         value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
@@ -2978,6 +3296,136 @@ mod webhook_tests {
         assert_eq!(
             response.result.message,
             "agents.apelogic.ai/pending-approval may be removed only by a trusted Steward writer"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_user_deletion_of_pending_approval_placeholder() -> Result<(), String> {
+        let mut value = admission_review_value();
+        value["request"]["operation"] = serde_json::json!("DELETE");
+        value["request"]["object"] = serde_json::Value::Null;
+        value["request"]["oldObject"]["metadata"]["annotations"]["agents.apelogic.ai/pending-approval"] =
+            serde_json::json!("request-digest");
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct pending DELETE review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read pending DELETE request: {error}"))?;
+
+        let response = validate_admission(&request, &fake_envelopes()).await;
+
+        assert!(
+            !response.allowed,
+            "an ordinary user must not delete a durable pending-approval anchor"
+        );
+        assert_eq!(
+            response.result.message,
+            "pending AgentRuntime deletion requires a trusted Steward writer"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_fails_closed_when_delete_has_no_old_object() -> Result<(), String> {
+        let mut value = admission_review_value();
+        value["request"]["operation"] = serde_json::json!("DELETE");
+        value["request"]["object"] = serde_json::Value::Null;
+        value["request"]["oldObject"] = serde_json::Value::Null;
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct incomplete DELETE review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read incomplete DELETE request: {error}"))?;
+
+        let response = validate_admission(&request, &fake_envelopes()).await;
+
+        assert!(
+            !response.allowed,
+            "DELETE without oldObject must fail closed"
+        );
+        assert_eq!(
+            response.result.message,
+            "AgentRuntime DELETE admission request has no old object"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_fails_closed_when_pending_delete_has_no_username() -> Result<(), String> {
+        let mut value = admission_review_value();
+        value["request"]["operation"] = serde_json::json!("DELETE");
+        value["request"]["object"] = serde_json::Value::Null;
+        value["request"]["userInfo"] = serde_json::json!({});
+        value["request"]["oldObject"]["metadata"]["annotations"]["agents.apelogic.ai/pending-approval"] =
+            serde_json::json!("request-digest");
+        let review =
+            serde_json::from_value::<AdmissionReview<AgentRuntime>>(value).map_err(|error| {
+                format!("failed to construct unauthenticated DELETE review: {error}")
+            })?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read unauthenticated DELETE request: {error}"))?;
+
+        let response = validate_admission(&request, &fake_envelopes()).await;
+
+        assert!(
+            !response.allowed,
+            "pending DELETE without a username must fail closed"
+        );
+        assert_eq!(
+            response.result.message,
+            "authenticated Kubernetes username is required to delete a pending AgentRuntime"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_allows_trusted_writer_to_delete_pending_placeholder() -> Result<(), String> {
+        let controller_username = "system:serviceaccount:steward-system:steward-controller";
+        let mut value = admission_review_value();
+        value["request"]["operation"] = serde_json::json!("DELETE");
+        value["request"]["object"] = serde_json::Value::Null;
+        value["request"]["userInfo"] = serde_json::json!({"username": controller_username});
+        value["request"]["oldObject"]["metadata"]["annotations"]["agents.apelogic.ai/pending-approval"] =
+            serde_json::json!("request-digest");
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct trusted DELETE review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read trusted DELETE request: {error}"))?;
+
+        let response = super::validate_admission_with_trusted_writers(
+            &request,
+            &fake_envelopes(),
+            &BTreeSet::from([controller_username.to_owned()]),
+        )
+        .await;
+
+        assert!(
+            response.allowed,
+            "the configured trusted writer must retain a controlled cleanup path: {}",
+            response.result.message
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_preserves_normal_deletion_for_non_pending_runtime() -> Result<(), String> {
+        let mut value = admission_review_value();
+        value["request"]["operation"] = serde_json::json!("DELETE");
+        value["request"]["object"] = serde_json::Value::Null;
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct ordinary DELETE review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read ordinary DELETE request: {error}"))?;
+
+        let response = validate_admission(&request, &fake_envelopes()).await;
+
+        assert!(
+            response.allowed,
+            "ordinary runtime deletion must remain allowed"
         );
         Ok(())
     }
@@ -3019,6 +3467,40 @@ mod webhook_tests {
         assert!(
             response.allowed,
             "the trusted controller must be able to apply the active approved spec: {}",
+            response.result.message
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_allows_trusted_writer_to_restore_pending_marker() -> Result<(), String> {
+        let controller_username = "system:serviceaccount:steward-system:steward-controller";
+        let mut value = admission_review_value();
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
+        value["request"]["oldObject"]["spec"]["budget"]["monthlyLimit"] =
+            serde_json::json!("220.00");
+        value["request"]["object"]["metadata"]["annotations"]["agents.apelogic.ai/pending-approval"] =
+            serde_json::json!("request-digest");
+        value["request"]["userInfo"] = serde_json::json!({
+            "username": controller_username,
+            "groups": ["system:serviceaccounts"]
+        });
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct trusted hold restoration: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read trusted hold restoration: {error}"))?;
+
+        let response = super::validate_admission_with_trusted_writers(
+            &request,
+            &fake_envelopes(),
+            &BTreeSet::from([controller_username.to_owned()]),
+        )
+        .await;
+
+        assert!(
+            response.allowed,
+            "the authority writer must be able to restore a revoked initial-create hold: {}",
             response.result.message
         );
         Ok(())
