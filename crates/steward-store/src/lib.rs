@@ -324,6 +324,14 @@ impl PgStore {
             .collect()
     }
 
+    /// Resolve the only valid transitions for a parked create that encounters
+    /// an approved winner:
+    ///
+    /// - inactive winner: leave the loser pending;
+    /// - active winner, no filing lease: reject the loser;
+    /// - active winner, filing lease: reject the loser but preserve the lease
+    ///   so its external record can complete or be reclaimed;
+    /// - terminal loser: return the active winner idempotently.
     pub async fn retire_pending_approval_if_superseded(
         &self,
         approval_id: Uuid,
@@ -338,7 +346,6 @@ impl PgStore {
                 approvals.id, \
                 approvals.runtime_uid, \
                 approvals.state, \
-                approvals.decision_filing_token, \
                 admission_decisions.base_spec, \
                 admission_decisions.proposed_spec, \
                 admission_decisions.actor, \
@@ -412,13 +419,9 @@ impl PgStore {
         let losing_state = losing
             .try_get::<String, _>("state")
             .map_err(database_error)?;
-        let filing_token = losing
-            .try_get::<Option<Uuid>, _>("decision_filing_token")
-            .map_err(database_error)?;
-
         lock_member_role(&mut transaction, &member_role).await?;
         let grants = sqlx::query(
-            "SELECT id, expires_at > now() AS active \
+            "SELECT id \
              FROM grants \
              WHERE approval_id = $1 \
              ORDER BY id \
@@ -428,20 +431,24 @@ impl PgStore {
         .fetch_all(&mut *transaction)
         .await
         .map_err(database_error)?;
-        let mut grants_active = !grants.is_empty();
-        for grant in &grants {
-            grants_active &= grant.try_get::<bool, _>("active").map_err(database_error)?;
-        }
-        let revoked_grants = sqlx::query_scalar::<_, i64>(
-            "SELECT count(*)::bigint \
-             FROM grant_revocations \
-             JOIN grants ON grants.id = grant_revocations.grant_id \
-             WHERE grants.approval_id = $1",
-        )
-        .bind(winning_approval_id)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(database_error)?;
+        let grants_active = if grants.is_empty() {
+            false
+        } else {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT COALESCE(bool_and( \
+                    grants.expires_at > clock_timestamp() \
+                    AND grant_revocations.grant_id IS NULL \
+                 ), false) \
+                 FROM grants \
+                 LEFT JOIN grant_revocations \
+                   ON grant_revocations.grant_id = grants.id \
+                 WHERE grants.approval_id = $1",
+            )
+            .bind(winning_approval_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?
+        };
         let latest_envelope_revision = sqlx::query_scalar::<_, i64>(
             "SELECT revision \
              FROM envelopes \
@@ -453,15 +460,9 @@ impl PgStore {
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
-        if !grants_active
-            || revoked_grants != 0
-            || latest_envelope_revision != Some(envelope_revision)
-        {
+        if !grants_active || latest_envelope_revision != Some(envelope_revision) {
             transaction.commit().await.map_err(database_error)?;
             return Ok(None);
-        }
-        if losing_state == "pending" && filing_token.is_some() {
-            return Err(StoreError::DecisionFilingInProgress);
         }
         if losing_state == "pending" {
             let updated = sqlx::query(
@@ -471,8 +472,7 @@ impl PgStore {
                      decided_at = now(), \
                      rationale = $3 \
                  WHERE id = $1 \
-                   AND state = 'pending' \
-                   AND decision_filing_token IS NULL",
+                   AND state = 'pending'",
             )
             .bind(approval_id)
             .bind(decided_by)
@@ -648,6 +648,7 @@ impl PgStore {
         let row = sqlx::query(
             "SELECT \
                 approvals.state, \
+                approvals.decision_filing_token, \
                 approvals.decision_key, \
                 approvals.evidence_url, \
                 approvals.runtime_uid, \
@@ -664,7 +665,11 @@ impl PgStore {
         .await
         .map_err(database_error)?
         .ok_or(StoreError::ApprovalNotFound)?;
-        if row.try_get::<String, _>("state").map_err(database_error)? != "pending" {
+        let state = row.try_get::<String, _>("state").map_err(database_error)?;
+        let filing_token = row
+            .try_get::<Option<Uuid>, _>("decision_filing_token")
+            .map_err(database_error)?;
+        if state != "pending" && !(state == "rejected" && filing_token.is_some()) {
             return Err(StoreError::ApprovalNotPending);
         }
         let Json(deltas) = row
@@ -690,7 +695,10 @@ impl PgStore {
             "UPDATE approvals \
              SET decision_filing_token = $2, decision_filing_started_at = now() \
              WHERE id = $1 \
-               AND state = 'pending' \
+               AND ( \
+                    state = 'pending' \
+                    OR (state = 'rejected' AND decision_filing_token IS NOT NULL) \
+               ) \
                AND decision_key IS NULL \
                AND evidence_url IS NULL \
                AND (decision_filing_token IS NULL \
@@ -732,7 +740,7 @@ impl PgStore {
                  decision_filing_token = NULL, decision_filing_started_at = NULL \
              WHERE id = $1 \
                AND decision_filing_token = $2 \
-               AND state = 'pending' \
+               AND state IN ('pending', 'rejected') \
                AND decision_key IS NULL \
                AND evidence_url IS NULL",
         )
@@ -850,7 +858,13 @@ impl PgStore {
                 admission_decisions.actor, \
                 admission_decisions.member_role, \
                 admission_decisions.runtime_namespace, \
-                admission_decisions.runtime_name \
+                admission_decisions.runtime_name, \
+                admission_decisions.envelope_rev, \
+                latest_envelope.revision AS latest_envelope_rev, \
+                bool_and( \
+                    grants.expires_at > clock_timestamp() \
+                    AND grant_revocations.grant_id IS NULL \
+                ) AS grants_active \
              FROM approvals \
              JOIN admission_decisions \
                ON admission_decisions.id = approvals.admission_decision_id \
@@ -866,10 +880,9 @@ impl PgStore {
              ) latest_envelope ON true \
              WHERE approvals.runtime_uid = $1 \
                AND approvals.state = 'approved' \
-               AND grants.expires_at > now() \
-               AND grant_revocations.grant_id IS NULL \
-               AND latest_envelope.revision = admission_decisions.envelope_rev \
-             GROUP BY approvals.decided_at, approvals.id, admission_decisions.id \
+             GROUP BY \
+                approvals.decided_at, approvals.id, admission_decisions.id, \
+                latest_envelope.revision \
              ORDER BY approvals.decided_at DESC, approvals.id DESC \
              LIMIT 1",
         )
@@ -880,6 +893,13 @@ impl PgStore {
         let Some(row) = row else {
             return Ok(None);
         };
+        let envelope_revision: i64 = row.try_get("envelope_rev").map_err(database_error)?;
+        let latest_envelope_revision: Option<i64> =
+            row.try_get("latest_envelope_rev").map_err(database_error)?;
+        let grants_active: bool = row.try_get("grants_active").map_err(database_error)?;
+        if !grants_active || latest_envelope_revision != Some(envelope_revision) {
+            return Ok(None);
+        }
         let Json(base_spec) = row
             .try_get::<Json<AgentRuntimeSpec>, _>("base_spec")
             .map_err(database_error)?;

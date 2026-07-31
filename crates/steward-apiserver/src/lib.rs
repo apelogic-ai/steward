@@ -1312,23 +1312,8 @@ where
                 .uid
                 .as_deref()
                 .ok_or(ApiError::MissingRuntimeUid)?;
-            if let Some(application) = ledger
-                .grant_application(runtime_uid)
-                .await
-                .map_err(ApiError::Store)?
-            {
-                return converge_approved_create(
-                    runtimes,
-                    context,
-                    namespace,
-                    request,
-                    &created,
-                    application.application,
-                )
-                .await;
-            }
             let base_spec_digest = spec_digest(&created.spec)?;
-            let parked = match ledger
+            let parked = ledger
                 .park_rejection(ParkRejection {
                     runtime_uid,
                     runtime_namespace: namespace,
@@ -1343,60 +1328,19 @@ where
                     member_role: &context.member_role,
                 })
                 .await
+                .map_err(ApiError::Store)?;
+            if let Some(outcome) = converge_superseded_create(
+                runtimes,
+                ledger,
+                context,
+                namespace,
+                request,
+                &created,
+                parked.approval_id,
+            )
+            .await?
             {
-                Ok(parked) => parked,
-                Err(park_error) => {
-                    if let Some(application) = ledger
-                        .grant_application(runtime_uid)
-                        .await
-                        .map_err(ApiError::Store)?
-                    {
-                        return converge_approved_create(
-                            runtimes,
-                            context,
-                            namespace,
-                            request,
-                            &created,
-                            application.application,
-                        )
-                        .await;
-                    }
-                    return Err(ApiError::Store(park_error));
-                }
-            };
-            if let Some(application) = ledger
-                .grant_application(runtime_uid)
-                .await
-                .map_err(ApiError::Store)?
-            {
-                validate_approved_create(
-                    context,
-                    namespace,
-                    request,
-                    &created,
-                    &application.application,
-                )?;
-                if let Some(active_application) = ledger
-                    .retire_pending_approval_if_superseded(
-                        parked.approval_id,
-                        application.approval_id,
-                        runtime_uid,
-                        "steward-apiserver",
-                        "superseded by an active approval during create convergence",
-                    )
-                    .await
-                    .map_err(ApiError::Store)?
-                {
-                    return converge_approved_create(
-                        runtimes,
-                        context,
-                        namespace,
-                        request,
-                        &created,
-                        active_application,
-                    )
-                    .await;
-                }
+                return Ok(outcome);
             }
             let reference = match (parked.decision_key, parked.evidence_url) {
                 (Some(key), Some(evidence_url)) => DecisionReference { key, evidence_url },
@@ -1409,6 +1353,19 @@ where
                     ));
                 }
             };
+            if let Some(outcome) = converge_superseded_create(
+                runtimes,
+                ledger,
+                context,
+                namespace,
+                request,
+                &created,
+                parked.approval_id,
+            )
+            .await?
+            {
+                return Ok(outcome);
+            }
             Ok(SubmissionOutcome::Parked {
                 approval_id: parked.approval_id,
                 decision_id: parked.decision_id,
@@ -1420,6 +1377,63 @@ where
             })
         }
     }
+}
+
+async fn converge_superseded_create<R, L>(
+    runtimes: &R,
+    ledger: &L,
+    context: &AdmissionContext,
+    namespace: &str,
+    request: &CreateRuntimeRequest,
+    placeholder: &AgentRuntime,
+    parked_approval_id: Uuid,
+) -> Result<Option<SubmissionOutcome>, ApiError>
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+{
+    let runtime_uid = placeholder
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or(ApiError::MissingRuntimeUid)?;
+    let Some(application) = ledger
+        .grant_application(runtime_uid)
+        .await
+        .map_err(ApiError::Store)?
+    else {
+        return Ok(None);
+    };
+    validate_approved_create(
+        context,
+        namespace,
+        request,
+        placeholder,
+        &application.application,
+    )?;
+    let Some(active_application) = ledger
+        .retire_pending_approval_if_superseded(
+            parked_approval_id,
+            application.approval_id,
+            runtime_uid,
+            "steward-apiserver",
+            "superseded by an active approval during create convergence",
+        )
+        .await
+        .map_err(ApiError::Store)?
+    else {
+        return Ok(None);
+    };
+    converge_approved_create(
+        runtimes,
+        context,
+        namespace,
+        request,
+        placeholder,
+        active_application,
+    )
+    .await
+    .map(Some)
 }
 
 async fn converge_approved_create<R: RuntimeRepository>(
@@ -1857,6 +1871,12 @@ mod tests {
         requests: Arc<AtomicUsize>,
     }
 
+    #[derive(Clone)]
+    struct ApprovalDuringDecisionFiling {
+        application_slot: Arc<Mutex<Option<GrantReversion>>>,
+        application: GrantReversion,
+    }
+
     impl DecisionChannel for SlowDecisionChannel {
         async fn request(
             &self,
@@ -1864,6 +1884,31 @@ mod tests {
         ) -> Result<DecisionReference, PortError> {
             self.requests.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(StdDuration::from_millis(25)).await;
+            Ok(DecisionReference {
+                key: "PROJ-123".to_owned(),
+                evidence_url: "https://jira.example.com/browse/PROJ-123".to_owned(),
+            })
+        }
+
+        async fn record_resolution(
+            &self,
+            _resolution: &DecisionResolution,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    impl DecisionChannel for ApprovalDuringDecisionFiling {
+        async fn request(
+            &self,
+            _request: &DecisionRequest,
+        ) -> Result<DecisionReference, PortError> {
+            *self
+                .application_slot
+                .lock()
+                .map_err(|_| PortError::Failed {
+                    reason: "fake approved-application lock was poisoned".to_owned(),
+                })? = Some(self.application.clone());
             Ok(DecisionReference {
                 key: "PROJ-123".to_owned(),
                 evidence_url: "https://jira.example.com/browse/PROJ-123".to_owned(),
@@ -2206,16 +2251,6 @@ mod tests {
             _rationale: &'a str,
         ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>> {
             Box::pin(async move {
-                if self
-                    .decision_filing_claim
-                    .lock()
-                    .map_err(|_| {
-                        StoreError::Database("fake filing claim lock was poisoned".to_owned())
-                    })?
-                    .is_some()
-                {
-                    return Err(StoreError::DecisionFilingInProgress);
-                }
                 let mut revoke =
                     self.application_revoked_during_retirement
                         .lock()
@@ -3107,8 +3142,8 @@ mod tests {
                 .lock()
                 .map_err(|_| "fake parked lock was poisoned")?
                 .len(),
-            1,
-            "recovery must not create a second approval for the same UID and proposal"
+            0,
+            "recovery must retire the durable parked loser before applying its winning approval"
         );
         let restored = runtime_state
             .lock()
@@ -3190,6 +3225,63 @@ mod tests {
                 .len(),
             0,
             "the losing park attempt must retire its newly created pending approval"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_converges_when_approval_commits_during_decision_filing()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let ledger = ledger();
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+        };
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let mut placeholder_spec = proposed_spec.clone();
+        placeholder_spec.llms.clear();
+        placeholder_spec.tools.clear();
+        placeholder_spec.budget.monthly_limit = "0".to_owned();
+        placeholder_spec.bindings = None;
+        let decisions = ApprovalDuringDecisionFiling {
+            application_slot: ledger.application.clone(),
+            application: GrantReversion {
+                runtime_uid: "runtime-b-uid".to_owned(),
+                runtime_namespace: "team-a".to_owned(),
+                runtime_name: "runtime-b".to_owned(),
+                actor: context.actor.clone(),
+                member_role: context.member_role.clone(),
+                base_spec: placeholder_spec,
+                proposed_spec: proposed_spec.clone(),
+            },
+        };
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: proposed_spec,
+        };
+
+        let outcome = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| format!("decision-filing race failed: {error:?}"))?;
+
+        assert!(
+            matches!(outcome, SubmissionOutcome::Applied { .. }),
+            "an approval committed during decision filing must converge in the same request: {outcome:?}"
+        );
+        assert_eq!(
+            ledger
+                .parked
+                .lock()
+                .map_err(|_| "fake parked lock was poisoned")?
+                .len(),
+            0,
+            "the approval that lost during decision filing must be terminal before convergence"
         );
         Ok(())
     }
@@ -3318,14 +3410,12 @@ mod tests {
         let retry = super::submit_runtime_request(
             &runtimes, &ledger, &decisions, &context, "team-a", &request,
         )
-        .await;
+        .await
+        .map_err(|error| format!("filing-race retry failed: {error:?}"))?;
 
         assert!(
-            matches!(
-                retry,
-                Err(ApiError::Store(StoreError::DecisionFilingInProgress))
-            ),
-            "a leased filing must finish before its approval can be retired: {retry:?}"
+            matches!(retry, SubmissionOutcome::Applied { .. }),
+            "an in-flight filing must not keep a superseded approval live: {retry:?}"
         );
         assert_eq!(
             ledger
@@ -3333,8 +3423,8 @@ mod tests {
                 .lock()
                 .map_err(|_| "fake parked lock was poisoned")?
                 .len(),
-            1,
-            "retirement must preserve the approval carrying the filing lease"
+            0,
+            "the superseded approval must become terminal while its filing lease finishes"
         );
         Ok(())
     }
