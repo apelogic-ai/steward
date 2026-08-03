@@ -1,0 +1,113 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: steward-poc-api
+  namespace: steward-system
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: steward-poc-api
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+rules:
+  - apiGroups: ["agents.apelogic.ai"]
+    resources: ["agentruntimes"]
+    verbs: ["get", "list", "create", "update"]
+  - apiGroups: [""]
+    resources: ["users"]
+    resourceNames: ["alice@example.com"]
+    verbs: ["impersonate"]
+  - apiGroups: [""]
+    resources: ["groups"]
+    resourceNames: ["agents.apelogic.ai/member-role:engineer"]
+    verbs: ["impersonate"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: steward-poc-api
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: steward-poc-api
+subjects:
+  - kind: ServiceAccount
+    name: steward-poc-api
+    namespace: steward-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: steward-poc-api
+  namespace: steward-system
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: steward-poc-api
+  template:
+    metadata:
+      labels:
+        app: steward-poc-api
+        steward.test/run-id: STEWARD_RUN_ID
+    spec:
+      serviceAccountName: steward-poc-api
+      containers:
+        - name: api
+          image: STEWARD_POC_API_IMAGE
+          imagePullPolicy: Never
+          env:
+            - name: STEWARD_TEST_DATABASE_URL
+              value: postgres://steward@postgres.steward-system.svc.cluster.local:5432/steward
+            - name: STEWARD_TEST_JIRA_URL
+              value: http://127.0.0.1:8081
+            - name: STEWARD_TEST_TLS_CERT_DER
+              value: /run/steward/tls-cert.der
+            - name: STEWARD_TEST_TLS_KEY_DER
+              value: /run/steward/tls-key.der
+          ports:
+            - name: https
+              containerPort: 8080
+            - name: jira
+              containerPort: 8081
+          readinessProbe:
+            tcpSocket:
+              port: https
+          volumeMounts:
+            - name: secrets
+              mountPath: /run/steward
+              readOnly: true
+      volumes:
+        - name: secrets
+          secret:
+            secretName: steward-s2-secrets
+            items:
+              - key: tls-cert.der
+                path: tls-cert.der
+              - key: tls-key.der
+                path: tls-key.der
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: steward-poc-api
+  namespace: steward-system
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+spec:
+  selector:
+    app: steward-poc-api
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+    - name: jira
+      port: 8081
+      targetPort: jira

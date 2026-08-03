@@ -29,9 +29,10 @@ pub use steward_ports::{
 };
 use steward_store::{
     ApprovalCandidate, ApproveAdmission, ApprovedAdmission, DecisionFiling, DecisionFilingClaim,
-    GrantReversion, ParkRejection, ParkedAdmission, PendingApproval, PgStore, StoreError,
+    GrantApplication, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval, PgStore,
+    StoreError,
 };
-use steward_types::{AgentRuntime, AgentRuntimeSpec, Principal};
+use steward_types::{AgentRuntime, AgentRuntimeSpec, PENDING_APPROVAL_ANNOTATION, Principal};
 use uuid::Uuid;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -159,6 +160,13 @@ pub struct BudgetIncrease {
     pub amount: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateRuntimeRequest {
+    pub name: String,
+    pub spec: AgentRuntimeSpec,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApprovalRequest {
@@ -174,8 +182,31 @@ pub struct GrantRevocationRequest {
 }
 
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(budget_increase_contract), components(schemas(BudgetIncrease)))]
+#[openapi(
+    paths(create_runtime_contract, budget_increase_contract),
+    components(schemas(CreateRuntimeRequest, BudgetIncrease))
+)]
 pub struct ApiDoc;
+
+#[utoipa::path(
+    post,
+    path = "/v1/namespaces/{namespace}/runtimes",
+    params(
+        ("namespace" = String, Path, description = "AgentRuntime namespace")
+    ),
+    request_body = CreateRuntimeRequest,
+    responses(
+        (status = 201, description = "In-envelope runtime manifest admitted and created"),
+        (status = 202, description = "Over-envelope runtime manifest parked for approval"),
+        (status = 403, description = "Authenticated principal does not own the runtime"),
+        (status = 404, description = "Kubernetes namespace does not exist"),
+        (status = 409, description = "AgentRuntime name already exists"),
+        (status = 422, description = "Manifest is invalid or cannot be bound to authority"),
+        (status = 503, description = "Kubernetes, authority store, or decision channel unavailable")
+    )
+)]
+#[doc(hidden)]
+pub async fn create_runtime_contract() {}
 
 #[utoipa::path(
     patch,
@@ -218,6 +249,7 @@ pub enum SubmissionOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApiError {
+    RuntimeCreate(RuntimeCreateError),
     Runtime(String),
     Store(StoreError),
     MissingRuntimeUid,
@@ -238,7 +270,26 @@ impl fmt::Display for ApiError {
 
 impl Error for ApiError {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeCreateError {
+    Kubernetes { status: u16, message: String },
+    Unavailable(String),
+}
+
 pub trait RuntimeRepository: Clone + Send + Sync + 'static {
+    fn create<'a>(
+        &'a self,
+        namespace: &'a str,
+        runtime: &'a AgentRuntime,
+        context: &'a AdmissionContext,
+    ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>>;
+
+    fn create_as_authority<'a>(
+        &'a self,
+        namespace: &'a str,
+        runtime: &'a AgentRuntime,
+    ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>>;
+
     fn get<'a>(
         &'a self,
         namespace: &'a str,
@@ -257,6 +308,11 @@ pub trait RuntimeRepository: Clone + Send + Sync + 'static {
         runtime: &'a AgentRuntime,
         context: &'a AdmissionContext,
     ) -> BoxFuture<'a, Result<(), String>>;
+
+    fn replace_as_authority<'a>(
+        &'a self,
+        runtime: &'a AgentRuntime,
+    ) -> BoxFuture<'a, Result<(), String>>;
 }
 
 #[derive(Clone)]
@@ -271,6 +327,66 @@ impl KubeRuntimeRepository {
 }
 
 impl RuntimeRepository for KubeRuntimeRepository {
+    fn create<'a>(
+        &'a self,
+        namespace: &'a str,
+        runtime: &'a AgentRuntime,
+        context: &'a AdmissionContext,
+    ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+        Box::pin(async move {
+            let unavailable = |error: String| RuntimeCreateError::Unavailable(error);
+            let body =
+                serde_json::to_vec(runtime).map_err(|error| unavailable(error.to_string()))?;
+            let mut request = KubeRequest::new(format!(
+                "/apis/agents.apelogic.ai/v1alpha1/namespaces/{namespace}/agentruntimes"
+            ))
+            .create(&PostParams::default(), body)
+            .map_err(|error| unavailable(error.to_string()))?;
+            request.headers_mut().insert(
+                HeaderName::from_static("impersonate-user"),
+                HeaderValue::from_str(&context.actor)
+                    .map_err(|error| unavailable(error.to_string()))?,
+            );
+            request.headers_mut().insert(
+                HeaderName::from_static("impersonate-group"),
+                HeaderValue::from_str(&format!(
+                    "agents.apelogic.ai/member-role:{}",
+                    context.member_role
+                ))
+                .map_err(|error| unavailable(error.to_string()))?,
+            );
+            self.client
+                .request::<AgentRuntime>(request)
+                .await
+                .map_err(|error| match error {
+                    kube::Error::Api(response) => RuntimeCreateError::Kubernetes {
+                        status: response.code,
+                        message: response.message,
+                    },
+                    other => RuntimeCreateError::Unavailable(other.to_string()),
+                })
+        })
+    }
+
+    fn create_as_authority<'a>(
+        &'a self,
+        namespace: &'a str,
+        runtime: &'a AgentRuntime,
+    ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+        Box::pin(async move {
+            Api::<AgentRuntime>::namespaced(self.client.clone(), namespace)
+                .create(&PostParams::default(), runtime)
+                .await
+                .map_err(|error| match error {
+                    kube::Error::Api(response) => RuntimeCreateError::Kubernetes {
+                        status: response.code,
+                        message: response.message,
+                    },
+                    other => RuntimeCreateError::Unavailable(other.to_string()),
+                })
+        })
+    }
+
     fn get<'a>(
         &'a self,
         namespace: &'a str,
@@ -340,6 +456,22 @@ impl RuntimeRepository for KubeRuntimeRepository {
                 .map_err(|error| error.to_string())
         })
     }
+
+    fn replace_as_authority<'a>(
+        &'a self,
+        runtime: &'a AgentRuntime,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let namespace = runtime
+                .namespace()
+                .ok_or_else(|| "AgentRuntime namespace is required".to_owned())?;
+            Api::<AgentRuntime>::namespaced(self.client.clone(), &namespace)
+                .replace(&runtime.name_any(), &PostParams::default(), runtime)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
 }
 
 pub trait AdmissionLedger: Clone + Send + Sync + 'static {
@@ -361,6 +493,15 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<ParkedAdmission, StoreError>>;
 
     fn pending_approvals(&self) -> BoxFuture<'_, Result<Vec<PendingApproval>, StoreError>>;
+
+    fn retire_pending_approval_if_superseded<'a>(
+        &'a self,
+        approval_id: Uuid,
+        winning_approval_id: Uuid,
+        runtime_uid: &'a str,
+        decided_by: &'a str,
+        rationale: &'a str,
+    ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>>;
 
     fn link_decision_reference<'a>(
         &'a self,
@@ -422,6 +563,11 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         &'a self,
         runtime_uid: &'a str,
     ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>>;
+
+    fn grant_application<'a>(
+        &'a self,
+        runtime_uid: &'a str,
+    ) -> BoxFuture<'a, Result<Option<GrantApplication>, StoreError>>;
 }
 
 impl AdmissionLedger for PgStore {
@@ -452,6 +598,27 @@ impl AdmissionLedger for PgStore {
 
     fn pending_approvals(&self) -> BoxFuture<'_, Result<Vec<PendingApproval>, StoreError>> {
         Box::pin(async move { PgStore::pending_approvals(self).await })
+    }
+
+    fn retire_pending_approval_if_superseded<'a>(
+        &'a self,
+        approval_id: Uuid,
+        winning_approval_id: Uuid,
+        runtime_uid: &'a str,
+        decided_by: &'a str,
+        rationale: &'a str,
+    ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>> {
+        Box::pin(async move {
+            PgStore::retire_pending_approval_if_superseded(
+                self,
+                approval_id,
+                winning_approval_id,
+                runtime_uid,
+                decided_by,
+                rationale,
+            )
+            .await
+        })
     }
 
     fn link_decision_reference<'a>(
@@ -543,6 +710,13 @@ impl AdmissionLedger for PgStore {
     ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>> {
         Box::pin(async move { PgStore::grant_reversion(self, runtime_uid).await })
     }
+
+    fn grant_application<'a>(
+        &'a self,
+        runtime_uid: &'a str,
+    ) -> BoxFuture<'a, Result<Option<GrantApplication>, StoreError>> {
+        Box::pin(async move { PgStore::grant_application(self, runtime_uid).await })
+    }
 }
 
 #[derive(Clone)]
@@ -560,6 +734,10 @@ where
     D: DecisionChannel + Clone,
 {
     let admission = Router::new()
+        .route(
+            "/v1/namespaces/{namespace}/runtimes",
+            post(create_runtime_handler::<R, L, D>),
+        )
         .route(
             "/v1/namespaces/{namespace}/runtimes/{name}/budget",
             patch(budget_increase_handler::<R, L, D>),
@@ -715,6 +893,37 @@ where
     {
         Ok(outcome @ SubmissionOutcome::Applied { .. }) => {
             (StatusCode::OK, Json(outcome)).into_response()
+        }
+        Ok(outcome @ SubmissionOutcome::Parked { .. }) => {
+            (StatusCode::ACCEPTED, Json(outcome)).into_response()
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn create_runtime_handler<R, L, D>(
+    State(state): State<AppState<R, L, D>>,
+    Extension(context): Extension<AdmissionContext>,
+    Path(namespace): Path<String>,
+    Json(request): Json<CreateRuntimeRequest>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    match submit_runtime_request(
+        &state.runtimes,
+        &state.ledger,
+        &state.decisions,
+        &context,
+        &namespace,
+        &request,
+    )
+    .await
+    {
+        Ok(outcome @ SubmissionOutcome::Applied { .. }) => {
+            (StatusCode::CREATED, Json(outcome)).into_response()
         }
         Ok(outcome @ SubmissionOutcome::Parked { .. }) => {
             (StatusCode::ACCEPTED, Json(outcome)).into_response()
@@ -895,6 +1104,9 @@ fn escape_html(value: &str) -> String {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self {
+            Self::RuntimeCreate(RuntimeCreateError::Kubernetes { status, .. }) => {
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+            }
             Self::PrincipalMismatch => StatusCode::FORBIDDEN,
             Self::MissingEnvelope | Self::MissingRuntimeUid => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InvalidBudgetIncrease { .. } | Self::Admission(_) => {
@@ -915,7 +1127,8 @@ impl IntoResponse for ApiError {
             Self::Store(StoreError::InvalidGrantExpiry | StoreError::MissingRevocationReason) => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
-            Self::Runtime(_)
+            Self::RuntimeCreate(RuntimeCreateError::Unavailable(_))
+            | Self::Runtime(_)
             | Self::Store(StoreError::Database(_) | StoreError::DecisionFilingClaimLost)
             | Self::DecisionChannel(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
@@ -1001,6 +1214,7 @@ where
                     runtime_name: name,
                     spec_digest: &spec_digest,
                     base_spec_digest: &base_spec_digest,
+                    base_pending_approval_digest: None,
                     base_spec: &runtime.spec,
                     envelope_revision: envelope.revision,
                     deltas: &deltas,
@@ -1032,6 +1246,327 @@ where
             })
         }
     }
+}
+
+pub async fn submit_runtime_request<R, L, D>(
+    runtimes: &R,
+    ledger: &L,
+    decisions: &D,
+    context: &AdmissionContext,
+    namespace: &str,
+    request: &CreateRuntimeRequest,
+) -> Result<SubmissionOutcome, ApiError>
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel,
+{
+    match &request.spec.principal {
+        Principal::User { acting_user } if acting_user.0 == context.actor => {}
+        _ => return Err(ApiError::PrincipalMismatch),
+    }
+    let envelope = ledger
+        .latest_envelope(&context.member_role)
+        .await
+        .map_err(ApiError::Store)?
+        .ok_or(ApiError::MissingEnvelope)?;
+    let decision = evaluate_with_grants(&request.spec, &envelope, &[])
+        .map_err(|error| ApiError::Admission(format!("{error:?}")))?;
+    let mut runtime = AgentRuntime::new(&request.name, request.spec.clone());
+    runtime.metadata.namespace = Some(namespace.to_owned());
+    runtime.metadata.annotations = Some(std::collections::BTreeMap::from([(
+        "agents.apelogic.ai/member-role".to_owned(),
+        context.member_role.clone(),
+    )]));
+    match decision {
+        AdmissionDecision::Admit => {
+            match runtimes.create(namespace, &runtime, context).await {
+                Ok(_) => {}
+                Err(RuntimeCreateError::Kubernetes { status: 409, .. }) => {
+                    let existing = runtimes
+                        .get(namespace, &request.name)
+                        .await
+                        .map_err(ApiError::Runtime)?;
+                    let request_digest = spec_digest(&request.spec)?;
+                    let annotations = existing.annotations();
+                    let matching_actor = matches!(
+                        &existing.spec.principal,
+                        Principal::User { acting_user } if acting_user.0 == context.actor
+                    );
+                    if annotations
+                        .get(PENDING_APPROVAL_ANNOTATION)
+                        .map(String::as_str)
+                        != Some(request_digest.as_str())
+                        || annotations
+                            .get("agents.apelogic.ai/member-role")
+                            .map(String::as_str)
+                            != Some(context.member_role.as_str())
+                        || !matching_actor
+                    {
+                        return Err(ApiError::Conflict(
+                            "an unrelated AgentRuntime already uses this name".to_owned(),
+                        ));
+                    }
+                    let mut released = existing;
+                    released.spec = request.spec.clone();
+                    released
+                        .metadata
+                        .annotations
+                        .get_or_insert_default()
+                        .remove(PENDING_APPROVAL_ANNOTATION);
+                    runtimes
+                        .replace_as_authority(&released)
+                        .await
+                        .map_err(ApiError::Runtime)?;
+                }
+                Err(error) => return Err(ApiError::RuntimeCreate(error)),
+            }
+            Ok(SubmissionOutcome::Applied {
+                proposed_spec: request.spec.clone(),
+            })
+        }
+        AdmissionDecision::Reject { deltas } => {
+            let counterexample = AdmissionDecision::Reject {
+                deltas: deltas.clone(),
+            }
+            .counterexample()
+            .ok_or_else(|| {
+                ApiError::Admission("rejected decision did not carry a counterexample".to_owned())
+            })?;
+            let request_digest = spec_digest(&request.spec)?;
+            runtime.spec.llms.clear();
+            runtime.spec.tools.clear();
+            runtime.spec.budget.monthly_limit = "0".to_owned();
+            runtime.spec.budget.currency = envelope.spec.budget.currency.clone();
+            runtime.spec.ttl = envelope.spec.ttl.clone();
+            runtime.spec.bindings = None;
+            runtime.metadata.annotations.get_or_insert_default().insert(
+                PENDING_APPROVAL_ANNOTATION.to_owned(),
+                request_digest.clone(),
+            );
+            let created = match runtimes.create_as_authority(namespace, &runtime).await {
+                Ok(created) => created,
+                Err(RuntimeCreateError::Kubernetes { status: 409, .. }) => {
+                    let existing = runtimes
+                        .get(namespace, &request.name)
+                        .await
+                        .map_err(ApiError::Runtime)?;
+                    let annotations = existing.annotations();
+                    if annotations
+                        .get(PENDING_APPROVAL_ANNOTATION)
+                        .map(String::as_str)
+                        != Some(request_digest.as_str())
+                        || annotations
+                            .get("agents.apelogic.ai/member-role")
+                            .map(String::as_str)
+                            != Some(context.member_role.as_str())
+                        || existing.spec != runtime.spec
+                    {
+                        return Err(ApiError::Conflict(
+                            "an unrelated AgentRuntime already uses this name".to_owned(),
+                        ));
+                    }
+                    existing
+                }
+                Err(error) => return Err(ApiError::RuntimeCreate(error)),
+            };
+            let runtime_uid = created
+                .metadata
+                .uid
+                .as_deref()
+                .ok_or(ApiError::MissingRuntimeUid)?;
+            let base_spec_digest = spec_digest(&created.spec)?;
+            let parked = ledger
+                .park_rejection(ParkRejection {
+                    runtime_uid,
+                    runtime_namespace: namespace,
+                    runtime_name: &request.name,
+                    spec_digest: &request_digest,
+                    base_spec_digest: &base_spec_digest,
+                    base_pending_approval_digest: Some(&request_digest),
+                    base_spec: &created.spec,
+                    envelope_revision: envelope.revision,
+                    deltas: &deltas,
+                    proposed_spec: &request.spec,
+                    actor: &context.actor,
+                    member_role: &context.member_role,
+                })
+                .await
+                .map_err(ApiError::Store)?;
+            if let Some(outcome) = converge_superseded_create(
+                runtimes,
+                ledger,
+                context,
+                namespace,
+                request,
+                &created,
+                parked.approval_id,
+            )
+            .await?
+            {
+                return Ok(outcome);
+            }
+            let reference = match (parked.decision_key, parked.evidence_url) {
+                (Some(key), Some(evidence_url)) => DecisionReference { key, evidence_url },
+                (None, None) => {
+                    file_decision_reference(ledger, decisions, parked.approval_id).await?
+                }
+                _ => {
+                    return Err(ApiError::Conflict(
+                        "parked approval has an incomplete decision reference".to_owned(),
+                    ));
+                }
+            };
+            if let Some(outcome) = converge_superseded_create(
+                runtimes,
+                ledger,
+                context,
+                namespace,
+                request,
+                &created,
+                parked.approval_id,
+            )
+            .await?
+            {
+                return Ok(outcome);
+            }
+            Ok(SubmissionOutcome::Parked {
+                approval_id: parked.approval_id,
+                decision_id: parked.decision_id,
+                decision_key: reference.key,
+                evidence_url: reference.evidence_url,
+                proposed_spec: request.spec.clone(),
+                deltas,
+                counterexample,
+            })
+        }
+    }
+}
+
+async fn converge_superseded_create<R, L>(
+    runtimes: &R,
+    ledger: &L,
+    context: &AdmissionContext,
+    namespace: &str,
+    request: &CreateRuntimeRequest,
+    placeholder: &AgentRuntime,
+    parked_approval_id: Uuid,
+) -> Result<Option<SubmissionOutcome>, ApiError>
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+{
+    let runtime_uid = placeholder
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or(ApiError::MissingRuntimeUid)?;
+    let Some(application) = ledger
+        .grant_application(runtime_uid)
+        .await
+        .map_err(ApiError::Store)?
+    else {
+        return Ok(None);
+    };
+    validate_approved_create(
+        context,
+        namespace,
+        request,
+        placeholder,
+        &application.application,
+    )?;
+    let Some(active_application) = ledger
+        .retire_pending_approval_if_superseded(
+            parked_approval_id,
+            application.approval_id,
+            runtime_uid,
+            "steward-apiserver",
+            "superseded by an active approval during create convergence",
+        )
+        .await
+        .map_err(ApiError::Store)?
+    else {
+        return Ok(None);
+    };
+    converge_approved_create(
+        runtimes,
+        context,
+        namespace,
+        request,
+        placeholder,
+        active_application,
+    )
+    .await
+    .map(Some)
+}
+
+async fn converge_approved_create<R: RuntimeRepository>(
+    runtimes: &R,
+    context: &AdmissionContext,
+    namespace: &str,
+    request: &CreateRuntimeRequest,
+    placeholder: &AgentRuntime,
+    application: GrantReversion,
+) -> Result<SubmissionOutcome, ApiError> {
+    validate_approved_create(context, namespace, request, placeholder, &application)?;
+    let mut restored = placeholder.clone();
+    restored.spec = application.proposed_spec;
+    restored
+        .metadata
+        .annotations
+        .get_or_insert_default()
+        .remove(PENDING_APPROVAL_ANNOTATION);
+    runtimes
+        .replace_as_authority(&restored)
+        .await
+        .map_err(ApiError::Runtime)?;
+    Ok(SubmissionOutcome::Applied {
+        proposed_spec: request.spec.clone(),
+    })
+}
+
+fn validate_approved_create(
+    context: &AdmissionContext,
+    namespace: &str,
+    request: &CreateRuntimeRequest,
+    placeholder: &AgentRuntime,
+    application: &GrantReversion,
+) -> Result<(), ApiError> {
+    let runtime_uid = placeholder
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or(ApiError::MissingRuntimeUid)?;
+    let pending_digest = placeholder
+        .annotations()
+        .get(PENDING_APPROVAL_ANNOTATION)
+        .map(String::as_str);
+    let proposed_digest = spec_digest(&application.proposed_spec)?;
+    let bound_role = placeholder
+        .annotations()
+        .get("agents.apelogic.ai/member-role")
+        .map(String::as_str);
+    let proposed_actor = match &application.proposed_spec.principal {
+        Principal::User { acting_user } => acting_user.0.as_str(),
+        _ => "",
+    };
+    if application.runtime_uid != runtime_uid
+        || application.runtime_namespace != namespace
+        || application.runtime_name != request.name
+        || application.actor != context.actor
+        || application.member_role != context.member_role
+        || application.base_spec != placeholder.spec
+        || application.proposed_spec != request.spec
+        || application.base_pending_approval_digest.as_deref() != pending_digest
+        || pending_digest != Some(proposed_digest.as_str())
+        || bound_role != Some(application.member_role.as_str())
+        || proposed_actor != application.actor
+    {
+        return Err(ApiError::Conflict(
+            "active approved application does not match this create request".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn approve_parked_request<R, L, D>(
@@ -1082,6 +1617,31 @@ where
             "runtime repository returned a different runtime UID".to_owned(),
         ));
     }
+    let pending_digest = runtime
+        .annotations()
+        .get(PENDING_APPROVAL_ANNOTATION)
+        .map(String::as_str);
+    let proposed_digest = spec_digest(&candidate.proposed_spec)?;
+    let proposed_actor = match &candidate.proposed_spec.principal {
+        Principal::User { acting_user } => acting_user.0.as_str(),
+        _ => "",
+    };
+    if pending_digest != candidate.base_pending_approval_digest.as_deref()
+        || candidate
+            .base_pending_approval_digest
+            .as_deref()
+            .is_some_and(|digest| digest != proposed_digest)
+        || runtime
+            .annotations()
+            .get("agents.apelogic.ai/member-role")
+            .map(String::as_str)
+            != Some(candidate.member_role.as_str())
+        || proposed_actor != candidate.actor
+    {
+        return Err(ApiError::Conflict(
+            "parked approval provenance does not match the bound runtime".to_owned(),
+        ));
+    }
     let current_digest = spec_digest(&runtime.spec)?;
     let already_applied = runtime.spec == candidate.proposed_spec;
     if !already_applied && current_digest != candidate.base_spec_digest {
@@ -1099,18 +1659,31 @@ where
         })
         .await
         .map_err(ApiError::Store)?;
-    if !already_applied {
+    let pending_annotation_removed = runtime
+        .metadata
+        .annotations
+        .get_or_insert_default()
+        .remove(PENDING_APPROVAL_ANNOTATION)
+        .is_some();
+    if !already_applied || pending_annotation_removed {
         runtime.spec = approved.proposed_spec.clone();
-        runtimes
-            .replace(
-                &runtime,
-                &AdmissionContext {
-                    actor: approved.actor.clone(),
-                    member_role: approved.member_role.clone(),
-                },
-            )
-            .await
-            .map_err(ApiError::Runtime)?;
+        if pending_annotation_removed {
+            runtimes
+                .replace_as_authority(&runtime)
+                .await
+                .map_err(ApiError::Runtime)?;
+        } else {
+            runtimes
+                .replace(
+                    &runtime,
+                    &AdmissionContext {
+                        actor: approved.actor.clone(),
+                        member_role: approved.member_role.clone(),
+                    },
+                )
+                .await
+                .map_err(ApiError::Runtime)?;
+        }
     }
     decisions
         .record_resolution(&DecisionResolution {
@@ -1206,16 +1779,28 @@ where
         .map_err(ApiError::Runtime)?;
     if runtime.spec == reversion.proposed_spec {
         runtime.spec = reversion.base_spec;
-        runtimes
-            .replace(
-                &runtime,
-                &AdmissionContext {
-                    actor: reversion.actor,
-                    member_role: reversion.member_role,
-                },
-            )
-            .await
-            .map_err(ApiError::Runtime)?;
+        if let Some(pending_digest) = reversion.base_pending_approval_digest {
+            runtime
+                .metadata
+                .annotations
+                .get_or_insert_default()
+                .insert(PENDING_APPROVAL_ANNOTATION.to_owned(), pending_digest);
+            runtimes
+                .replace_as_authority(&runtime)
+                .await
+                .map_err(ApiError::Runtime)?;
+        } else {
+            runtimes
+                .replace(
+                    &runtime,
+                    &AdmissionContext {
+                        actor: reversion.actor,
+                        member_role: reversion.member_role,
+                    },
+                )
+                .await
+                .map_err(ApiError::Runtime)?;
+        }
     }
     Ok(())
 }
@@ -1234,6 +1819,7 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use k8s_openapi::api::authentication::v1::{TokenReviewStatus, UserInfo};
+    use kube::ResourceExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration as StdDuration;
@@ -1244,19 +1830,22 @@ mod tests {
     };
     use steward_store::{
         ApprovalCandidate, ApproveAdmission, ApprovedAdmission, DecisionFiling,
-        DecisionFilingClaim, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval,
-        StoreError,
+        DecisionFilingClaim, GrantApplication, GrantReversion, ParkRejection, ParkedAdmission,
+        PendingApproval, StoreError,
     };
     use steward_types::{
-        AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal,
+        AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef,
+        PENDING_APPROVAL_ANNOTATION, Principal,
     };
     use tower::ServiceExt;
+    use utoipa::OpenApi;
     use uuid::Uuid;
 
     use super::{
-        AdmissionContext, AdmissionLedger, ApiError, AuthenticatedCaller, AuthenticationError,
-        BoxFuture, BudgetIncrease, RequestAuthenticator, RuntimeRepository, SubmissionOutcome,
-        caller_from_kubernetes_user, caller_from_token_review, router, submit_budget_increase,
+        AdmissionContext, AdmissionLedger, ApiDoc, ApiError, AuthenticatedCaller,
+        AuthenticationError, BoxFuture, BudgetIncrease, CreateRuntimeRequest, RequestAuthenticator,
+        RuntimeCreateError, RuntimeRepository, SubmissionOutcome, caller_from_kubernetes_user,
+        caller_from_token_review, router, spec_digest, submit_budget_increase,
     };
 
     #[derive(Clone)]
@@ -1349,6 +1938,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn runtime_create_is_published_in_the_openapi_contract() -> Result<(), String> {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        let operation = document
+            .pointer("/paths/~1v1~1namespaces~1{namespace}~1runtimes/post")
+            .ok_or_else(|| "runtime create operation is absent from OpenAPI".to_owned())?;
+        assert!(
+            operation
+                .pointer("/requestBody/content/application~1json/schema")
+                .is_some(),
+            "runtime create must advertise its request schema"
+        );
+        for status in ["201", "202", "403", "404", "409", "422", "503"] {
+            assert!(
+                operation.pointer(&format!("/responses/{status}")).is_some(),
+                "runtime create OpenAPI is missing its {status} response"
+            );
+        }
+        for schema in [
+            "CreateRuntimeRequest",
+            "AgentRuntimeSpec",
+            "Principal",
+            "AgentType",
+            "ModelRef",
+            "ToolGrant",
+            "Budget",
+            "Duration",
+            "BindingRef",
+            "Email",
+        ] {
+            assert!(
+                document
+                    .pointer(&format!("/components/schemas/{schema}"))
+                    .is_some(),
+                "runtime create OpenAPI is missing its {schema} component"
+            );
+        }
+        Ok(())
+    }
+
     #[derive(Clone, Default)]
     struct FakeDecisionChannel {
         requests: Arc<Mutex<Vec<DecisionRequest>>>,
@@ -1360,6 +1990,12 @@ mod tests {
         requests: Arc<AtomicUsize>,
     }
 
+    #[derive(Clone)]
+    struct ApprovalDuringDecisionFiling {
+        application_slot: Arc<Mutex<Option<GrantReversion>>>,
+        application: GrantReversion,
+    }
+
     impl DecisionChannel for SlowDecisionChannel {
         async fn request(
             &self,
@@ -1367,6 +2003,31 @@ mod tests {
         ) -> Result<DecisionReference, PortError> {
             self.requests.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(StdDuration::from_millis(25)).await;
+            Ok(DecisionReference {
+                key: "PROJ-123".to_owned(),
+                evidence_url: "https://jira.example.com/browse/PROJ-123".to_owned(),
+            })
+        }
+
+        async fn record_resolution(
+            &self,
+            _resolution: &DecisionResolution,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    impl DecisionChannel for ApprovalDuringDecisionFiling {
+        async fn request(
+            &self,
+            _request: &DecisionRequest,
+        ) -> Result<DecisionReference, PortError> {
+            *self
+                .application_slot
+                .lock()
+                .map_err(|_| PortError::Failed {
+                    reason: "fake approved-application lock was poisoned".to_owned(),
+                })? = Some(self.application.clone());
             Ok(DecisionReference {
                 key: "PROJ-123".to_owned(),
                 evidence_url: "https://jira.example.com/browse/PROJ-123".to_owned(),
@@ -1414,7 +2075,121 @@ mod tests {
         runtime: Arc<Mutex<AgentRuntime>>,
     }
 
+    #[derive(Clone)]
+    struct RejectedCreateRepository {
+        runtime: AgentRuntime,
+        status: u16,
+    }
+
+    impl RuntimeRepository for RejectedCreateRepository {
+        fn create<'a>(
+            &'a self,
+            _namespace: &'a str,
+            _runtime: &'a AgentRuntime,
+            _context: &'a AdmissionContext,
+        ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+            Box::pin(async {
+                Err(RuntimeCreateError::Kubernetes {
+                    status: self.status,
+                    message: "Kubernetes rejected the AgentRuntime".to_owned(),
+                })
+            })
+        }
+
+        fn create_as_authority<'a>(
+            &'a self,
+            _namespace: &'a str,
+            _runtime: &'a AgentRuntime,
+        ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+            Box::pin(async {
+                Err(RuntimeCreateError::Kubernetes {
+                    status: self.status,
+                    message: "Kubernetes rejected the AgentRuntime".to_owned(),
+                })
+            })
+        }
+
+        fn get<'a>(
+            &'a self,
+            _namespace: &'a str,
+            _name: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            Box::pin(async move { Ok(self.runtime.clone()) })
+        }
+
+        fn get_bound<'a>(
+            &'a self,
+            _namespace: &'a str,
+            _name: &'a str,
+            _runtime_uid: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            Box::pin(async move { Ok(self.runtime.clone()) })
+        }
+
+        fn replace<'a>(
+            &'a self,
+            _runtime: &'a AgentRuntime,
+            _context: &'a AdmissionContext,
+        ) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn replace_as_authority<'a>(
+            &'a self,
+            _runtime: &'a AgentRuntime,
+        ) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     impl RuntimeRepository for FakeRuntimeRepository {
+        fn create<'a>(
+            &'a self,
+            _namespace: &'a str,
+            runtime: &'a AgentRuntime,
+            _context: &'a AdmissionContext,
+        ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+            Box::pin(async move {
+                let mut stored = self.runtime.lock().map_err(|_| {
+                    RuntimeCreateError::Unavailable("fake runtime lock was poisoned".to_owned())
+                })?;
+                if stored.name_any() == runtime.name_any() {
+                    return Err(RuntimeCreateError::Kubernetes {
+                        status: 409,
+                        message: "AgentRuntime already exists".to_owned(),
+                    });
+                }
+                let mut created = runtime.clone();
+                created.metadata.uid = Some(format!("{}-uid", created.name_any()));
+                created.metadata.resource_version = Some("1".to_owned());
+                *stored = created.clone();
+                Ok(created)
+            })
+        }
+
+        fn create_as_authority<'a>(
+            &'a self,
+            _namespace: &'a str,
+            runtime: &'a AgentRuntime,
+        ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+            Box::pin(async move {
+                let mut stored = self.runtime.lock().map_err(|_| {
+                    RuntimeCreateError::Unavailable("fake runtime lock was poisoned".to_owned())
+                })?;
+                if stored.name_any() == runtime.name_any() {
+                    return Err(RuntimeCreateError::Kubernetes {
+                        status: 409,
+                        message: "AgentRuntime already exists".to_owned(),
+                    });
+                }
+                let mut created = runtime.clone();
+                created.metadata.uid = Some(format!("{}-uid", created.name_any()));
+                created.metadata.resource_version = Some("1".to_owned());
+                *stored = created.clone();
+                Ok(created)
+            })
+        }
+
         fn get<'a>(
             &'a self,
             _namespace: &'a str,
@@ -1467,6 +2242,20 @@ mod tests {
                 Ok(())
             })
         }
+
+        fn replace_as_authority<'a>(
+            &'a self,
+            runtime: &'a AgentRuntime,
+        ) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                let mut stored = self
+                    .runtime
+                    .lock()
+                    .map_err(|_| "fake runtime lock was poisoned".to_owned())?;
+                *stored = runtime.clone();
+                Ok(())
+            })
+        }
     }
 
     #[derive(Clone)]
@@ -1478,6 +2267,9 @@ mod tests {
         decision_filing_claim: Arc<Mutex<Option<Uuid>>>,
         revoke_rows: u64,
         reversion: Option<GrantReversion>,
+        application: Arc<Mutex<Option<GrantReversion>>>,
+        application_committed_during_park: Arc<Mutex<Option<GrantReversion>>>,
+        application_revoked_during_retirement: Arc<Mutex<bool>>,
     }
 
     #[derive(Clone)]
@@ -1488,6 +2280,7 @@ mod tests {
         deltas: Vec<AdmissionDelta>,
         proposed_spec: AgentRuntimeSpec,
         base_spec_digest: String,
+        base_pending_approval_digest: Option<String>,
         actor: String,
         member_role: String,
         envelope_revision: i64,
@@ -1523,10 +2316,30 @@ mod tests {
             request: ParkRejection<'a>,
         ) -> BoxFuture<'a, Result<ParkedAdmission, StoreError>> {
             Box::pin(async move {
+                let application_committed = if let Some(application) = self
+                    .application_committed_during_park
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database("fake approval-race lock was poisoned".to_owned())
+                    })?
+                    .take()
+                {
+                    *self.application.lock().map_err(|_| {
+                        StoreError::Database(
+                            "fake approved-application lock was poisoned".to_owned(),
+                        )
+                    })? = Some(application);
+                    true
+                } else {
+                    false
+                };
                 let mut parked = self.parked.lock().map_err(|_| {
                     StoreError::Database("fake ledger lock was poisoned".to_owned())
                 })?;
-                if parked.is_empty() {
+                if application_committed {
+                    parked.clear();
+                }
+                if parked.is_empty() || application_committed {
                     parked.push(FakeParked {
                         runtime_uid: request.runtime_uid.to_owned(),
                         runtime_namespace: request.runtime_namespace.to_owned(),
@@ -1534,6 +2347,9 @@ mod tests {
                         deltas: request.deltas.to_vec(),
                         proposed_spec: request.proposed_spec.clone(),
                         base_spec_digest: request.base_spec_digest.to_owned(),
+                        base_pending_approval_digest: request
+                            .base_pending_approval_digest
+                            .map(str::to_owned),
                         actor: request.actor.to_owned(),
                         member_role: request.member_role.to_owned(),
                         envelope_revision: request.envelope_revision,
@@ -1577,11 +2393,62 @@ mod tests {
                         deltas: parked.deltas.clone(),
                         proposed_spec: parked.proposed_spec.clone(),
                         base_spec_digest: parked.base_spec_digest.clone(),
+                        base_pending_approval_digest: parked.base_pending_approval_digest.clone(),
                         envelope_revision: parked.envelope_revision,
                         actor: parked.actor.clone(),
                         member_role: parked.member_role.clone(),
                     })
                     .collect())
+            })
+        }
+
+        fn retire_pending_approval_if_superseded<'a>(
+            &'a self,
+            _approval_id: Uuid,
+            winning_approval_id: Uuid,
+            _runtime_uid: &'a str,
+            _decided_by: &'a str,
+            _rationale: &'a str,
+        ) -> BoxFuture<'a, Result<Option<GrantReversion>, StoreError>> {
+            Box::pin(async move {
+                let mut revoke =
+                    self.application_revoked_during_retirement
+                        .lock()
+                        .map_err(|_| {
+                            StoreError::Database(
+                                "fake retirement-race lock was poisoned".to_owned(),
+                            )
+                        })?;
+                if *revoke {
+                    *revoke = false;
+                    *self.application.lock().map_err(|_| {
+                        StoreError::Database(
+                            "fake approved-application lock was poisoned".to_owned(),
+                        )
+                    })? = None;
+                    return Ok(None);
+                }
+                let application = self
+                    .application
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake approved-application lock was poisoned".to_owned(),
+                        )
+                    })?
+                    .clone();
+                if winning_approval_id != Uuid::nil() {
+                    return Ok(None);
+                }
+                if application.is_none() {
+                    return Ok(None);
+                }
+                self.parked
+                    .lock()
+                    .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))?
+                    .pop()
+                    .ok_or(StoreError::ApprovalNotFound)?;
+                Ok(application)
             })
         }
 
@@ -1674,6 +2541,8 @@ mod tests {
                     runtime_uid: parked.runtime_uid.clone(),
                     proposed_spec: parked.proposed_spec.clone(),
                     base_spec_digest: parked.base_spec_digest.clone(),
+                    base_pending_approval_digest: parked.base_pending_approval_digest.clone(),
+                    actor: parked.actor.clone(),
                     member_role: parked.member_role.clone(),
                     envelope_revision: parked.envelope_revision,
                     runtime_namespace: parked.runtime_namespace.clone(),
@@ -1787,6 +2656,27 @@ mod tests {
             Box::pin(async move { Ok(self.reversion.clone()) })
         }
 
+        fn grant_application<'a>(
+            &'a self,
+            _runtime_uid: &'a str,
+        ) -> BoxFuture<'a, Result<Option<GrantApplication>, StoreError>> {
+            Box::pin(async move {
+                self.application
+                    .lock()
+                    .map(|application| {
+                        application.clone().map(|application| GrantApplication {
+                            approval_id: Uuid::nil(),
+                            application,
+                        })
+                    })
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake approved-application lock was poisoned".to_owned(),
+                        )
+                    })
+            })
+        }
+
         fn revoke_runtime_grants<'a>(
             &'a self,
             _runtime_uid: &'a str,
@@ -1852,6 +2742,9 @@ mod tests {
             decision_filing_claim: Arc::new(Mutex::new(None)),
             revoke_rows: 0,
             reversion: None,
+            application: Arc::new(Mutex::new(None)),
+            application_committed_during_park: Arc::new(Mutex::new(None)),
+            application_revoked_during_retirement: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -2029,6 +2922,887 @@ mod tests {
         assert!(
             matches!(result, Ok(SubmissionOutcome::Applied { .. })),
             "the REST front door must honor the same instance grant as the webhook: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_rejects_principal_impersonation_before_writing_desired_state()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let app = router(
+            runtimes,
+            ledger(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/namespaces/team-a/runtimes")
+                    .header("authorization", "Bearer user-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "runtime-b",
+                            "spec": {
+                                "principal": {
+                                    "kind": "user",
+                                    "actingUser": "bob@example.org",
+                                },
+                                "owner": "bob@example.org",
+                                "agentType": {"name": "base"},
+                                "llms": [{
+                                    "provider": "provider-a",
+                                    "model": "model-a",
+                                }],
+                                "tools": [],
+                                "budget": {
+                                    "monthlyLimit": "100.00",
+                                    "currency": "USD",
+                                },
+                                "ttl": "24h",
+                            },
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("failed to build create request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("create request failed: {error}"))?;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "an authenticated member must not create a runtime for another principal"
+        );
+        assert_eq!(
+            runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?
+                .name_any(),
+            "runtime-a",
+            "a rejected create must not write desired state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authenticated_member_can_create_an_in_envelope_runtime() -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let app = router(
+            runtimes,
+            ledger(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/namespaces/team-a/runtimes")
+                    .header("authorization", "Bearer user-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "runtime-b",
+                            "spec": {
+                                "principal": {
+                                    "kind": "user",
+                                    "actingUser": "alice@example.com",
+                                },
+                                "owner": "bob@example.org",
+                                "agentType": {"name": "base"},
+                                "llms": [{
+                                    "provider": "provider-a",
+                                    "model": "model-a",
+                                }],
+                                "tools": [],
+                                "budget": {
+                                    "monthlyLimit": "100.00",
+                                    "currency": "USD",
+                                },
+                                "ttl": "24h",
+                            },
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("failed to build create request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("create request failed: {error}"))?;
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "an authenticated member's in-envelope request must create desired state"
+        );
+        let created = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert_eq!(created.name_any(), "runtime-b");
+        assert_eq!(created.namespace().as_deref(), Some("team-a"));
+        assert_eq!(
+            created.spec.owner.0, "bob@example.org",
+            "the accountable owner may differ from the acting user"
+        );
+        assert_eq!(
+            created
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get("agents.apelogic.ai/member-role"))
+                .map(String::as_str),
+            Some("engineer"),
+            "the API must bind the authenticated member role into desired state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_preserves_kubernetes_client_error_statuses() -> Result<(), String> {
+        for expected in [
+            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            let app = router(
+                RejectedCreateRepository {
+                    runtime: runtime(),
+                    status: expected.as_u16(),
+                },
+                ledger(),
+                FakeAuthenticator,
+                FakeDecisionChannel::default(),
+            );
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/namespaces/team-a/runtimes")
+                        .header("authorization", "Bearer user-session")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "name": "runtime-b",
+                                "spec": {
+                                    "principal": {
+                                        "kind": "user",
+                                        "actingUser": "alice@example.com",
+                                    },
+                                    "owner": "alice@example.com",
+                                    "agentType": {"name": "base"},
+                                    "llms": [{
+                                        "provider": "provider-a",
+                                        "model": "model-a",
+                                    }],
+                                    "tools": [],
+                                    "budget": {
+                                        "monthlyLimit": "100.00",
+                                        "currency": "USD",
+                                    },
+                                    "ttl": "24h",
+                                },
+                            })
+                            .to_string(),
+                        ))
+                        .map_err(|error| format!("failed to build create request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("create request failed: {error}"))?;
+            assert_eq!(
+                response.status(),
+                expected,
+                "a deterministic Kubernetes client error must not be reported as a retryable API outage"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_parks_an_over_envelope_manifest_without_provisioning_it()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let parked_state = ledger.parked.clone();
+        let decisions = FakeDecisionChannel::default();
+        let decision_requests = decisions.requests.clone();
+        let app = router(runtimes, ledger, FakeAuthenticator, decisions);
+        let body = serde_json::json!({
+            "name": "runtime-b",
+            "spec": {
+                "principal": {
+                    "kind": "user",
+                    "actingUser": "alice@example.com",
+                },
+                "owner": "alice@example.com",
+                "agentType": {"name": "base"},
+                "llms": [{
+                    "provider": "provider-a",
+                    "model": "model-a",
+                }],
+                "tools": [],
+                "budget": {
+                    "monthlyLimit": "201.00",
+                    "currency": "USD",
+                },
+                "ttl": "24h",
+            },
+        })
+        .to_string();
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/namespaces/team-a/runtimes")
+                .header("authorization", "Bearer user-session")
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .map_err(|error| format!("failed to build create request: {error}"))
+        };
+        let response = app
+            .clone()
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("create request failed: {error}"))?;
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "an over-envelope create must be parked by the REST admission door"
+        );
+        {
+            let pending = runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?;
+            assert_eq!(pending.name_any(), "runtime-b");
+            assert!(
+                pending.spec.llms.is_empty()
+                    && pending.spec.tools.is_empty()
+                    && pending.spec.budget.monthly_limit == "0",
+                "the persisted placeholder must carry no usable model, tool, or budget authority"
+            );
+            assert!(
+                pending
+                    .annotations()
+                    .contains_key("agents.apelogic.ai/pending-approval"),
+                "the controller must be able to hold the placeholder inert until approval"
+            );
+        }
+        assert_eq!(
+            parked_state
+                .lock()
+                .map_err(|_| "fake parked lock was poisoned")?
+                .len(),
+            1,
+            "the rejected initial manifest must create one instance-bound approval"
+        );
+        assert_eq!(
+            decision_requests
+                .lock()
+                .map_err(|_| "fake decision-request lock was poisoned")?
+                .len(),
+            1,
+            "the parked initial manifest must be filed with the decision channel"
+        );
+        let replay = app
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("replayed create request failed: {error}"))?;
+        assert_eq!(
+            replay.status(),
+            StatusCode::ACCEPTED,
+            "a retry after the inert placeholder was created must resume the same parked request"
+        );
+        assert_eq!(
+            parked_state
+                .lock()
+                .map_err(|_| "fake parked lock was poisoned")?
+                .len(),
+            1,
+            "retrying an initial create must not create a second approval"
+        );
+        assert_eq!(
+            decision_requests
+                .lock()
+                .map_err(|_| "fake decision-request lock was poisoned")?
+                .len(),
+            1,
+            "retrying a filed initial create must not create another external decision"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_retry_reuses_an_approved_unapplied_request() -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let decisions = FakeDecisionChannel::default();
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+        };
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: proposed_spec.clone(),
+        };
+
+        let first = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| format!("initial create was not parked: {error:?}"))?;
+        assert!(
+            matches!(first, SubmissionOutcome::Parked { .. }),
+            "the over-envelope create must be parked before approval"
+        );
+        let placeholder = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?
+            .clone();
+        *ledger
+            .application
+            .lock()
+            .map_err(|_| "fake approved-application lock was poisoned")? = Some(GrantReversion {
+            runtime_uid: placeholder
+                .metadata
+                .uid
+                .clone()
+                .ok_or_else(|| "placeholder is missing its runtime UID".to_owned())?,
+            runtime_namespace: "team-a".to_owned(),
+            runtime_name: "runtime-b".to_owned(),
+            actor: context.actor.clone(),
+            member_role: context.member_role.clone(),
+            base_pending_approval_digest: placeholder
+                .annotations()
+                .get(PENDING_APPROVAL_ANNOTATION)
+                .cloned(),
+            base_spec: placeholder.spec.clone(),
+            proposed_spec: proposed_spec.clone(),
+        });
+
+        let retry = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| format!("approved create retry failed: {error:?}"))?;
+
+        assert!(
+            matches!(retry, SubmissionOutcome::Applied { .. }),
+            "an approved-but-unapplied create must converge instead of parking another approval: {retry:?}"
+        );
+        assert_eq!(
+            ledger
+                .parked
+                .lock()
+                .map_err(|_| "fake parked lock was poisoned")?
+                .len(),
+            0,
+            "recovery must retire the durable parked loser before applying its winning approval"
+        );
+        let restored = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert_eq!(restored.spec, proposed_spec);
+        assert!(
+            !restored
+                .annotations()
+                .contains_key("agents.apelogic.ai/pending-approval"),
+            "recovery must clear the inert-placeholder marker"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_retry_recovers_when_approval_commits_during_parking()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let decisions = FakeDecisionChannel::default();
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+        };
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: proposed_spec.clone(),
+        };
+
+        let first = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| format!("initial create was not parked: {error:?}"))?;
+        assert!(matches!(first, SubmissionOutcome::Parked { .. }));
+        let placeholder = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?
+            .clone();
+        *ledger
+            .application_committed_during_park
+            .lock()
+            .map_err(|_| "fake approval-race lock was poisoned")? = Some(GrantReversion {
+            runtime_uid: placeholder
+                .metadata
+                .uid
+                .clone()
+                .ok_or_else(|| "placeholder is missing its runtime UID".to_owned())?,
+            runtime_namespace: "team-a".to_owned(),
+            runtime_name: "runtime-b".to_owned(),
+            actor: context.actor.clone(),
+            member_role: context.member_role.clone(),
+            base_pending_approval_digest: placeholder
+                .annotations()
+                .get(PENDING_APPROVAL_ANNOTATION)
+                .cloned(),
+            base_spec: placeholder.spec,
+            proposed_spec: proposed_spec.clone(),
+        });
+
+        let retry = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| {
+            format!("concurrent approval must be recovered instead of surfacing a store error: {error:?}")
+        })?;
+
+        assert!(
+            matches!(retry, SubmissionOutcome::Applied { .. }),
+            "the retry must converge the approval that won the parking race: {retry:?}"
+        );
+        assert_eq!(
+            ledger
+                .parked
+                .lock()
+                .map_err(|_| "fake parked lock was poisoned")?
+                .len(),
+            0,
+            "the losing park attempt must retire its newly created pending approval"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_converges_when_approval_commits_during_decision_filing()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let ledger = ledger();
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+        };
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let mut placeholder_spec = proposed_spec.clone();
+        placeholder_spec.llms.clear();
+        placeholder_spec.tools.clear();
+        placeholder_spec.budget.monthly_limit = "0".to_owned();
+        placeholder_spec.bindings = None;
+        let decisions = ApprovalDuringDecisionFiling {
+            application_slot: ledger.application.clone(),
+            application: GrantReversion {
+                runtime_uid: "runtime-b-uid".to_owned(),
+                runtime_namespace: "team-a".to_owned(),
+                runtime_name: "runtime-b".to_owned(),
+                actor: context.actor.clone(),
+                member_role: context.member_role.clone(),
+                base_pending_approval_digest: Some(
+                    spec_digest(&proposed_spec)
+                        .map_err(|error| format!("failed to digest approved spec: {error:?}"))?,
+                ),
+                base_spec: placeholder_spec,
+                proposed_spec: proposed_spec.clone(),
+            },
+        };
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: proposed_spec,
+        };
+
+        let outcome = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| format!("decision-filing race failed: {error:?}"))?;
+
+        assert!(
+            matches!(outcome, SubmissionOutcome::Applied { .. }),
+            "an approval committed during decision filing must converge in the same request: {outcome:?}"
+        );
+        assert_eq!(
+            ledger
+                .parked
+                .lock()
+                .map_err(|_| "fake parked lock was poisoned")?
+                .len(),
+            0,
+            "the approval that lost during decision filing must be terminal before convergence"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_does_not_retire_the_loser_after_winner_revocation()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let decisions = FakeDecisionChannel::default();
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+        };
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: proposed_spec.clone(),
+        };
+        let first = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| format!("initial create was not parked: {error:?}"))?;
+        assert!(matches!(first, SubmissionOutcome::Parked { .. }));
+        let placeholder = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?
+            .clone();
+        *ledger
+            .application_committed_during_park
+            .lock()
+            .map_err(|_| "fake approval-race lock was poisoned")? = Some(GrantReversion {
+            runtime_uid: placeholder
+                .metadata
+                .uid
+                .clone()
+                .ok_or_else(|| "placeholder is missing its runtime UID".to_owned())?,
+            runtime_namespace: "team-a".to_owned(),
+            runtime_name: "runtime-b".to_owned(),
+            actor: context.actor.clone(),
+            member_role: context.member_role.clone(),
+            base_pending_approval_digest: placeholder
+                .annotations()
+                .get(PENDING_APPROVAL_ANNOTATION)
+                .cloned(),
+            base_spec: placeholder.spec,
+            proposed_spec,
+        });
+        *ledger
+            .application_revoked_during_retirement
+            .lock()
+            .map_err(|_| "fake retirement-race lock was poisoned")? = true;
+
+        let retry = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| format!("revoked-winner retry failed: {error:?}"))?;
+
+        assert!(
+            matches!(retry, SubmissionOutcome::Parked { .. }),
+            "a winner revoked before retirement must leave the current escalation parked: {retry:?}"
+        );
+        assert_eq!(
+            ledger
+                .parked
+                .lock()
+                .map_err(|_| "fake parked lock was poisoned")?
+                .len(),
+            1,
+            "the valid escalation must remain pending when its alleged winner is inactive"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_preserves_an_in_flight_loser_filing_lease() -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let decisions = FakeDecisionChannel::default();
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+        };
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: proposed_spec.clone(),
+        };
+        let first = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| format!("initial create was not parked: {error:?}"))?;
+        assert!(matches!(first, SubmissionOutcome::Parked { .. }));
+        let placeholder = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?
+            .clone();
+        *ledger
+            .application_committed_during_park
+            .lock()
+            .map_err(|_| "fake approval-race lock was poisoned")? = Some(GrantReversion {
+            runtime_uid: placeholder
+                .metadata
+                .uid
+                .clone()
+                .ok_or_else(|| "placeholder is missing its runtime UID".to_owned())?,
+            runtime_namespace: "team-a".to_owned(),
+            runtime_name: "runtime-b".to_owned(),
+            actor: context.actor.clone(),
+            member_role: context.member_role.clone(),
+            base_pending_approval_digest: placeholder
+                .annotations()
+                .get(PENDING_APPROVAL_ANNOTATION)
+                .cloned(),
+            base_spec: placeholder.spec,
+            proposed_spec,
+        });
+        *ledger
+            .decision_filing_claim
+            .lock()
+            .map_err(|_| "fake filing claim lock was poisoned")? = Some(Uuid::new_v4());
+
+        let retry = super::submit_runtime_request(
+            &runtimes, &ledger, &decisions, &context, "team-a", &request,
+        )
+        .await
+        .map_err(|error| format!("filing-race retry failed: {error:?}"))?;
+
+        assert!(
+            matches!(retry, SubmissionOutcome::Applied { .. }),
+            "an in-flight filing must not keep a superseded approval live: {retry:?}"
+        );
+        assert_eq!(
+            ledger
+                .parked
+                .lock()
+                .map_err(|_| "fake parked lock was poisoned")?
+                .len(),
+            0,
+            "the superseded approval must become terminal while its filing lease finishes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approving_an_initial_create_replaces_and_unblocks_its_placeholder()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let outcome = super::submit_runtime_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &AdmissionContext {
+                actor: "alice@example.com".to_owned(),
+                member_role: "engineer".to_owned(),
+            },
+            "team-a",
+            &CreateRuntimeRequest {
+                name: "runtime-b".to_owned(),
+                spec: proposed_spec.clone(),
+            },
+        )
+        .await
+        .map_err(|error| format!("initial create was not parked: {error:?}"))?;
+        let SubmissionOutcome::Parked { approval_id, .. } = outcome else {
+            return Err("over-envelope initial create was not parked".to_owned());
+        };
+
+        super::approve_parked_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &super::AdminContext {
+                actor: "admin@example.com".to_owned(),
+            },
+            approval_id,
+            &super::ApprovalRequest {
+                rationale: "approved for this runtime".to_owned(),
+                evidence_url: "https://jira.example.com/browse/PROJ-123".to_owned(),
+                expires_at: "2999-01-01T00:00:00Z".to_owned(),
+            },
+        )
+        .await
+        .map_err(|error| format!("initial create approval failed: {error:?}"))?;
+
+        let approved = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert_eq!(approved.spec, proposed_spec);
+        assert!(
+            !approved
+                .annotations()
+                .contains_key("agents.apelogic.ai/pending-approval"),
+            "approval must remove the controller's inert-placeholder hold"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approval_rejects_a_placeholder_with_mismatched_stored_provenance() -> Result<(), String>
+    {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let outcome = super::submit_runtime_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &AdmissionContext {
+                actor: "alice@example.com".to_owned(),
+                member_role: "engineer".to_owned(),
+            },
+            "team-a",
+            &CreateRuntimeRequest {
+                name: "runtime-b".to_owned(),
+                spec: proposed_spec.clone(),
+            },
+        )
+        .await
+        .map_err(|error| format!("initial create was not parked: {error:?}"))?;
+        let SubmissionOutcome::Parked { approval_id, .. } = outcome else {
+            return Err("over-envelope initial create was not parked".to_owned());
+        };
+        runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?
+            .metadata
+            .annotations
+            .get_or_insert_default()
+            .insert(
+                PENDING_APPROVAL_ANNOTATION.to_owned(),
+                "different-request-digest".to_owned(),
+            );
+
+        let result = super::approve_parked_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &super::AdminContext {
+                actor: "admin@example.com".to_owned(),
+            },
+            approval_id,
+            &super::ApprovalRequest {
+                rationale: "approved for this runtime".to_owned(),
+                evidence_url: "https://jira.example.com/browse/PROJ-123".to_owned(),
+                expires_at: "2999-01-01T00:00:00Z".to_owned(),
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ApiError::Conflict(_))),
+            "approval must not release a placeholder whose marker no longer matches: {result:?}"
+        );
+        assert_ne!(
+            runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?
+                .spec,
+            proposed_spec,
+            "mismatched provenance must leave the inert placeholder unchanged"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn envelope_expansion_retry_releases_the_matching_pending_create() -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+        };
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: proposed_spec.clone(),
+        };
+
+        let parked = super::submit_runtime_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &context,
+            "team-a",
+            &request,
+        )
+        .await
+        .map_err(|error| format!("initial create did not park: {error:?}"))?;
+        assert!(matches!(parked, SubmissionOutcome::Parked { .. }));
+        {
+            let mut envelope = ledger
+                .envelope
+                .lock()
+                .map_err(|_| "fake envelope lock was poisoned")?;
+            envelope.revision += 1;
+            envelope.spec.budget.monthly_limit = "300.00".to_owned();
+        }
+
+        let retry = super::submit_runtime_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &context,
+            "team-a",
+            &request,
+        )
+        .await;
+
+        assert!(
+            matches!(retry, Ok(SubmissionOutcome::Applied { .. })),
+            "an expanded envelope must release its matching hold instead of returning 409: {retry:?}"
+        );
+        let restored = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert_eq!(restored.spec, proposed_spec);
+        assert!(
+            !restored
+                .annotations()
+                .contains_key(PENDING_APPROVAL_ANNOTATION),
+            "envelope admission must remove the pending hold"
         );
         Ok(())
     }
@@ -2364,6 +4138,7 @@ mod tests {
             member_role: "engineer".to_owned(),
             base_spec: base.spec,
             proposed_spec: escalated.spec,
+            base_pending_approval_digest: None,
         });
         let response = router(
             runtimes,
@@ -2392,6 +4167,54 @@ mod tests {
                 .monthly_limit,
             "100.00",
             "revoking an active grant must remove its already-applied authority"
+        );
+        assert!(
+            !runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?
+                .annotations()
+                .contains_key(PENDING_APPROVAL_ANNOTATION),
+            "edit-grant reversion must not add a pending marker"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initial_create_revocation_restores_its_exact_pending_marker() -> Result<(), String> {
+        let base = runtime();
+        let mut applied = base.clone();
+        applied.spec.budget.monthly_limit = "220.00".to_owned();
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(applied.clone())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let mut ledger = ledger();
+        ledger.reversion = Some(GrantReversion {
+            runtime_uid: "runtime-uid-a".to_owned(),
+            runtime_namespace: "team-a".to_owned(),
+            runtime_name: "runtime-a".to_owned(),
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+            base_spec: base.spec.clone(),
+            proposed_spec: applied.spec,
+            base_pending_approval_digest: Some("request-digest".to_owned()),
+        });
+
+        super::reconcile_grant_reversion(&runtimes, &ledger, "runtime-uid-a")
+            .await
+            .map_err(|error| format!("initial-create reversion failed: {error:?}"))?;
+
+        let restored = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert_eq!(restored.spec, base.spec);
+        assert_eq!(
+            restored
+                .annotations()
+                .get(PENDING_APPROVAL_ANNOTATION)
+                .map(String::as_str),
+            Some("request-digest"),
+            "API recovery must restore the durable pending marker verbatim"
         );
         Ok(())
     }

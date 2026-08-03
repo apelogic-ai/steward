@@ -458,7 +458,7 @@ mod tests {
 
     impl MockLiteLlm {
         fn start(responses: Vec<&str>) -> Result<Self, String> {
-            let listener = TcpListener::bind(("localhost", 0))
+            let listener = TcpListener::bind(("127.0.0.1", 0))
                 .map_err(|error| format!("failed to bind mock LiteLLM: {error}"))?;
             listener
                 .set_nonblocking(true)

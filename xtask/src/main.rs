@@ -113,6 +113,10 @@ fn quality() -> TaskResult {
     )?;
     run(
         "cargo",
+        &["fmt", "--manifest-path", "e2e/Cargo.toml", "--", "--check"],
+    )?;
+    run(
+        "cargo",
         &[
             "clippy",
             "--workspace",
@@ -943,6 +947,57 @@ mod tests {
                 "zero, ignored, filtered, or duplicate tests must not count as evidence: {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn poc_api_projects_only_its_tls_material() -> Result<(), String> {
+        let manifest_path = root().join("config/poc/api-stack.yaml");
+        let content = fs::read_to_string(&manifest_path)
+            .map_err(|error| format!("failed to read {}: {error}", manifest_path.display()))?;
+        let api_deployment = content
+            .split("\n---\n")
+            .map(serde_saphyr::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("failed to parse {}: {error}", manifest_path.display()))?
+            .into_iter()
+            .find(|document| {
+                document
+                    .pointer("/kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("Deployment")
+                    && document
+                        .pointer("/metadata/name")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("steward-poc-api")
+            })
+            .ok_or_else(|| "PoC API Deployment is missing".to_owned())?;
+        let projected_keys = api_deployment
+            .pointer("/spec/template/spec/volumes")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|volumes| {
+                volumes.iter().find(|volume| {
+                    volume.get("name").and_then(serde_json::Value::as_str) == Some("secrets")
+                })
+            })
+            .and_then(|volume| volume.pointer("/secret/items"))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        item.get("key")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            projected_keys,
+            ["tls-cert.der", "tls-key.der"],
+            "the API pod must not receive the mint signing key, LiteLLM master key, or introspection credential"
+        );
+        Ok(())
     }
 
     #[test]

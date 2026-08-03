@@ -401,6 +401,8 @@ spec:
           env:
             - name: STEWARD_CONTROLLER_USERNAME
               value: system:serviceaccount:steward-system:steward-controller
+            - name: STEWARD_APISERVER_USERNAME
+              value: system:serviceaccount:steward-system:steward-poc-api
             - name: STEWARD_DATABASE_URL
               value: postgres://steward@postgres.steward-system.svc.cluster.local:5432/steward
             - name: STEWARD_LITELLM_MASTER_KEY

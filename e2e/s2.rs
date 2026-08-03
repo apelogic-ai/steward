@@ -237,9 +237,7 @@ impl Harness {
         let mut last = None;
         while Instant::now() < deadline {
             let body = self.key_list(alias)?;
-            last = body
-                .pointer("/keys/0/max_budget")
-                .and_then(number_value);
+            last = body.pointer("/keys/0/max_budget").and_then(number_value);
             if last == Some(expected) {
                 return Ok(());
             }
@@ -258,11 +256,7 @@ impl Harness {
             .ok_or_else(|| io::Error::other("LiteLLM key spend was not numeric").into())
     }
 
-    fn wait_key_spend(
-        &self,
-        alias: &str,
-        timeout: Duration,
-    ) -> Result<f64, Box<dyn Error>> {
+    fn wait_key_spend(&self, alias: &str, timeout: Duration) -> Result<f64, Box<dyn Error>> {
         let deadline = Instant::now() + timeout;
         let mut last = 0.0;
         while Instant::now() < deadline {
@@ -388,8 +382,7 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
     harness.wait_phase(PRICED_RUNTIME, "Suspended", Duration::from_secs(120))?;
     harness.assert_key_absent(&alias)?;
 
-    let unrelated_edit =
-        harness.write_runtime(PRICED_RUNTIME, "priced-model", "0.01", "30m")?;
+    let unrelated_edit = harness.write_runtime(PRICED_RUNTIME, "priced-model", "0.01", "30m")?;
     let applied = harness.apply_runtime(&unrelated_edit)?;
     if !applied.status.success() {
         return Err(io::Error::other(format!(

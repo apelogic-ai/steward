@@ -14,15 +14,34 @@ use steward_types::{Budget, Duration as RuntimeDuration, ModelRef, ToolGrant};
 const NAMESPACE: &str = "team-a";
 const RUNTIME_NAME: &str = "runtime-revocation";
 
+#[derive(Clone, Copy)]
+enum Caller {
+    Alice,
+    Admin,
+}
+
+impl Caller {
+    fn bearer_token(self) -> &'static str {
+        match self {
+            Self::Alice => "test-alice-session",
+            Self::Admin => "test-admin-session",
+        }
+    }
+}
+
 struct Harness {
+    api_url: String,
     capture_url: String,
     context: String,
     inference_url: String,
+    jira_url: String,
     kubeconfig: PathBuf,
     litellm_url: String,
     master_key: String,
     openshell: PathBuf,
+    resolve: String,
     run_dir: PathBuf,
+    tls_ca: PathBuf,
     tool_url: String,
 }
 
@@ -36,14 +55,18 @@ impl Harness {
             .into());
         }
         Ok(Self {
+            api_url: env::var("STEWARD_POC_URL")?,
             capture_url: env::var("STEWARD_TEST_CAPTURE_URL")?,
             context,
             inference_url: env::var("STEWARD_TEST_INFERENCE_URL")?,
+            jira_url: env::var("STEWARD_TEST_JIRA_URL")?,
             kubeconfig: PathBuf::from(env::var("STEWARD_TEST_KUBECONFIG")?),
             litellm_url: env::var("STEWARD_TEST_LITELLM_URL")?,
             master_key: fs::read_to_string(env::var("STEWARD_TEST_LITELLM_MASTER_KEY_FILE")?)?,
             openshell: PathBuf::from(env::var("STEWARD_OPENSHELL_CLI")?),
+            resolve: env::var("STEWARD_POC_RESOLVE")?,
             run_dir: PathBuf::from(env::var("STEWARD_RUN_DIR")?),
+            tls_ca: PathBuf::from(env::var("STEWARD_TEST_TLS_CA")?),
             tool_url: env::var("STEWARD_TEST_TOOL_URL")?,
         })
     }
@@ -83,6 +106,58 @@ impl Harness {
             .into());
         }
         Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn steward(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        output_name: &str,
+        caller: Caller,
+    ) -> Result<(u16, String), Box<dyn Error>> {
+        let output_path = self.run_dir.join(output_name);
+        let mut command = Command::new("curl");
+        command
+            .args(["--silent", "--show-error", "--cacert"])
+            .arg(&self.tls_ca)
+            .args(["--resolve", &self.resolve, "--request", method, "--header"])
+            .arg(format!("authorization: Bearer {}", caller.bearer_token()))
+            .arg("--output")
+            .arg(&output_path)
+            .args(["--write-out", "%{http_code}"]);
+        if let Some(body) = body {
+            command
+                .args(["--header", "content-type: application/json", "--data"])
+                .arg(body);
+        }
+        let output = command.arg(format!("{}{}", self.api_url, path)).output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "curl {method} {path} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+            .into());
+        }
+        let status = String::from_utf8(output.stdout)?
+            .parse::<u16>()
+            .map_err(|error| io::Error::other(format!("invalid HTTP status: {error}")))?;
+        Ok((status, fs::read_to_string(output_path)?))
+    }
+
+    fn jira_state(&self) -> Result<serde_json::Value, Box<dyn Error>> {
+        let output = Command::new("curl")
+            .args(["--silent", "--show-error"])
+            .arg(format!("{}/test/state", self.jira_url))
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "mock Jira state request failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+            .into());
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
     }
 
     fn write_runtime(&self) -> Result<PathBuf, Box<dyn Error>> {
@@ -199,6 +274,40 @@ impl Harness {
             .into());
         }
         Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn wait_authorized_tool_call(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        request: &str,
+        timeout: Duration,
+    ) -> Result<String, Box<dyn Error>> {
+        let deadline = Instant::now() + timeout;
+        let mut last_response = String::new();
+        while Instant::now() < deadline {
+            last_response = self.sandbox_request(
+                workspace,
+                sandbox,
+                &self.tool_url,
+                &[
+                    ("Content-Type", "application/json"),
+                    ("MCP-Protocol-Version", "2025-06-18"),
+                ],
+                request,
+            )?;
+            if last_response.contains("example-org/fixture-repository") {
+                return Ok(last_response);
+            }
+            if !last_response.contains("token_grant_failed") {
+                break;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        Err(io::Error::other(format!(
+            "the acting user's runtime could not call its authorized tool: {last_response}"
+        ))
+        .into())
     }
 
     fn replay_status(&self, path: &str) -> Result<u16, Box<dyn Error>> {
@@ -413,15 +522,11 @@ async fn e2e_s5_terminated_runtime_holds_nothing() -> Result<(), Box<dyn Error>>
         }
     })
     .to_string();
-    let tool_response = harness.sandbox_request(
+    let tool_response = harness.wait_authorized_tool_call(
         &workspace,
         &sandbox,
-        &harness.tool_url,
-        &[
-            ("Content-Type", "application/json"),
-            ("MCP-Protocol-Version", "2025-06-18"),
-        ],
         &tool_request,
+        Duration::from_secs(60),
     )?;
     assert!(
         tool_response.contains("example-org/fixture-repository"),
@@ -447,6 +552,213 @@ async fn e2e_s5_terminated_runtime_holds_nothing() -> Result<(), Box<dyn Error>>
     thread::sleep(Duration::from_secs(3));
     harness.assert_holds_nothing(&runtime_uid, &workspace, &sandbox, &key_alias)?;
     Ok(())
+}
+
+#[tokio::test]
+async fn e2e_poc_golden_journey() -> Result<(), Box<dyn Error>> {
+    let harness = Harness::from_environment()?;
+    let store = PgStore::connect(&env::var("STEWARD_TEST_DATABASE_URL")?).await?;
+    store.migrate().await?;
+    store
+        .insert_envelope(
+            "engineer",
+            &Envelope {
+                revision: 2,
+                spec: EnvelopeSpec {
+                    llms: vec![ModelRef {
+                        provider: "openai".to_owned(),
+                        model: "priced-model".to_owned(),
+                    }],
+                    tools: vec![ToolGrant {
+                        provider: "github".to_owned(),
+                        resource: "search_repositories".to_owned(),
+                        action: "read".to_owned(),
+                    }],
+                    budget: Budget {
+                        monthly_limit: "10.00".to_owned(),
+                        currency: "USD".to_owned(),
+                    },
+                    ttl: RuntimeDuration("1h".to_owned()),
+                },
+            },
+            "admin@example.com",
+        )
+        .await?;
+
+    let create = serde_json::json!({
+        "name": RUNTIME_NAME,
+        "spec": {
+            "principal": {
+                "kind": "user",
+                "actingUser": "alice@example.com"
+            },
+            "owner": "alice@example.com",
+            "agentType": {"name": "base"},
+            "llms": [{
+                "provider": "openai",
+                "model": "priced-model"
+            }],
+            "tools": [{
+                "provider": "github",
+                "resource": "search_repositories",
+                "action": "read"
+            }],
+            "budget": {
+                "monthlyLimit": "15.00",
+                "currency": "USD"
+            },
+            "ttl": "1h"
+        }
+    });
+    let (create_status, create_body) = harness.steward(
+        "POST",
+        "/v1/namespaces/team-a/runtimes",
+        Some(&create.to_string()),
+        "poc-create.json",
+        Caller::Alice,
+    )?;
+    assert_eq!(
+        create_status, 202,
+        "an over-envelope initial API request must park: {create_body}"
+    );
+    let parked: serde_json::Value = serde_json::from_str(&create_body)?;
+    let approval_id = required_json_string(&parked, "/approvalId")?;
+    let evidence_url = required_json_string(&parked, "/evidenceUrl")?;
+    assert_eq!(
+        parked.pointer("/proposedSpec/budget/monthlyLimit"),
+        Some(&serde_json::json!("15.00"))
+    );
+    harness.wait_phase("Pending", Duration::from_secs(60))?;
+    let runtime_uid = harness.runtime_value("jsonpath={.metadata.uid}")?;
+    assert_eq!(
+        harness.runtime_value("jsonpath={.spec.budget.monthlyLimit}")?,
+        "0",
+        "parking an initial create must persist only an inert placeholder"
+    );
+    assert_eq!(
+        harness.runtime_value("jsonpath={.status.refs.sandbox}")?,
+        "",
+        "a parked initial create must not provision a sandbox"
+    );
+
+    let jira = harness.jira_state()?;
+    let issue = jira
+        .pointer("/issues/0/createBody")
+        .map(serde_json::Value::to_string)
+        .ok_or_else(|| io::Error::other("the parked request did not file Jira evidence"))?;
+    for expected in [
+        approval_id.as_str(),
+        runtime_uid.as_str(),
+        "requested 15.00 USD",
+        "ceiling 10.00 USD",
+    ] {
+        assert!(
+            issue.contains(expected),
+            "the Jira decision record must contain {expected:?}"
+        );
+    }
+
+    let approval = serde_json::json!({
+        "rationale": "approved for this runtime instance",
+        "evidenceUrl": evidence_url,
+        "expiresAt": "2999-01-01T00:00:00Z"
+    });
+    let (approval_status, approval_body) = harness.steward(
+        "POST",
+        &format!("/admin/approvals/{approval_id}/approve"),
+        Some(&approval.to_string()),
+        "poc-approved.json",
+        Caller::Admin,
+    )?;
+    assert_eq!(
+        approval_status, 200,
+        "the authenticated admin approval must apply the instance grant: {approval_body}"
+    );
+    harness.wait_phase("Running", Duration::from_secs(600))?;
+    assert_eq!(
+        harness.runtime_value("jsonpath={.spec.budget.monthlyLimit}")?,
+        "15.00"
+    );
+
+    let workspace = harness.runtime_value("jsonpath={.status.refs.workspace}")?;
+    let sandbox = harness.runtime_value("jsonpath={.status.refs.sandbox}")?;
+    let key_alias = harness.runtime_value("jsonpath={.status.refs.litellmKey}")?;
+    for (label, value) in [
+        ("runtime UID", runtime_uid.as_str()),
+        ("workspace", workspace.as_str()),
+        ("sandbox", sandbox.as_str()),
+        ("LiteLLM key alias", key_alias.as_str()),
+    ] {
+        if value.is_empty() {
+            return Err(io::Error::other(format!("PoC runtime has no {label}")).into());
+        }
+    }
+
+    let tool_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "search_repositories",
+            "arguments": {}
+        }
+    })
+    .to_string();
+    let tool_response = harness.wait_authorized_tool_call(
+        &workspace,
+        &sandbox,
+        &tool_request,
+        Duration::from_secs(60),
+    )?;
+    assert!(
+        tool_response.contains("example-org/fixture-repository"),
+        "the acting user's runtime could not call its authorized tool: {tool_response}"
+    );
+
+    let inference_response = harness.sandbox_request(
+        &workspace,
+        &sandbox,
+        &harness.inference_url,
+        &[("Content-Type", "application/json")],
+        r#"{"model":"openai/priced-model","messages":[{"role":"user","content":"hello"}]}"#,
+    )?;
+    assert!(
+        inference_response.contains("allowed fixture response"),
+        "the per-runtime LiteLLM key did not authorize inference: {inference_response}"
+    );
+
+    let grants = store
+        .grants_for_runtime(&runtime_uid, "engineer", 2)
+        .await?;
+    assert_eq!(
+        grants.len(),
+        1,
+        "the approval must create one runtime-bound grant"
+    );
+    let envelope = store
+        .latest_envelope("engineer")
+        .await?
+        .ok_or_else(|| io::Error::other("the member-role envelope disappeared"))?;
+    assert_eq!(
+        envelope.spec.budget.monthly_limit, "10.00",
+        "an approval must not ratchet the role ceiling"
+    );
+
+    harness.expire_runtime()?;
+    harness.wait_runtime_absent(Duration::from_secs(300))?;
+    harness.assert_holds_nothing(&runtime_uid, &workspace, &sandbox, &key_alias)?;
+    Ok(())
+}
+
+fn required_json_string(
+    value: &serde_json::Value,
+    pointer: &str,
+) -> Result<String, Box<dyn Error>> {
+    value
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::other(format!("response is missing {pointer}")).into())
 }
 
 fn path_text(path: &Path) -> Result<&str, Box<dyn Error>> {

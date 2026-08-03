@@ -70,17 +70,15 @@ async fn s2_exhaustion_authority_survives_spec_generation_changes() -> Result<()
     };
     store
         .record_spend_observation("runtime-b", 3, "spec-digest-a", &spend, true)
-    .await
-    .map_err(|error| {
-        io::Error::other(format!(
-            "budget exhaustion must be durably recordable before credential revocation: {error}"
-        ))
-    })?;
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "budget exhaustion must be durably recordable before credential revocation: {error}"
+            ))
+        })?;
 
     assert_eq!(
-        store
-            .inference_exhaustion("runtime-b")
-            .await?,
+        store.inference_exhaustion("runtime-b").await?,
         Some(spend),
         "durable exhaustion must remain visible after unrelated spec generation changes"
     );

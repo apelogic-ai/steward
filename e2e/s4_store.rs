@@ -97,12 +97,14 @@ async fn s4_grants_are_append_only_and_bound_to_one_runtime() -> Result<(), Box<
         "INSERT INTO admission_decisions \
          (id, runtime_uid, spec_digest, envelope_rev, verdict, deltas, proposed_spec, actor, \
           member_role, base_spec_digest, base_spec, runtime_namespace, runtime_name) \
-         VALUES ($1::uuid, $2, 'digest-a', 1, 'reject', '[]'::jsonb, '{}'::jsonb, \
-                 'alice@example.com', 'engineer', 'base-digest-a', '{}'::jsonb, \
+         VALUES ($1::uuid, $2, 'digest-a', 1, 'reject', '[]'::jsonb, $3::jsonb, \
+                 'alice@example.com', 'engineer', 'base-digest-a', $4::jsonb, \
                  'team-a', 'runtime-a')",
     )
     .bind(&decision_id)
     .bind(&runtime_a)
+    .bind(serde_json::to_value(proposed_spec())?)
+    .bind(serde_json::to_value(base_spec())?)
     .execute(store.pool())
     .await?;
     sqlx::query(
@@ -186,6 +188,7 @@ async fn s4_repeated_parking_reuses_one_approval_and_one_channel_marker()
         runtime_name: "runtime-retry-a",
         spec_digest: "digest-retry-a",
         base_spec_digest: "base-digest-retry-a",
+        base_pending_approval_digest: None,
         base_spec: &base_spec,
         envelope_revision: 1,
         deltas: &deltas,
@@ -241,6 +244,7 @@ async fn s4_active_grants_expire_and_can_be_revoked_without_erasing_history()
             runtime_name: "runtime-revocation-a",
             spec_digest: "digest-revocation-a",
             base_spec_digest: "base-digest-revocation-a",
+            base_pending_approval_digest: None,
             base_spec: &base_spec,
             envelope_revision: 7,
             deltas: &deltas,
@@ -327,6 +331,100 @@ async fn s4_active_grants_expire_and_can_be_revoked_without_erasing_history()
 }
 
 #[tokio::test]
+async fn s4_application_requires_every_granted_dimension_to_remain_active()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the S4 Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let runtime_uid = format!("runtime-multigrant-{suffix}");
+    let member_role = format!("engineer-multigrant-{suffix}");
+    let mut proposed = proposed_spec();
+    proposed.ttl = Duration("48h".to_owned());
+    let base = base_spec();
+    let deltas = vec![
+        AdmissionDelta::Budget {
+            requested: "220.00".to_owned(),
+            ceiling: "200.00".to_owned(),
+            currency: "USD".to_owned(),
+        },
+        AdmissionDelta::Ttl {
+            requested: "48h".to_owned(),
+            ceiling: "24h".to_owned(),
+        },
+    ];
+    store
+        .insert_envelope(&member_role, &envelope("200.00", 1), "admin@example.com")
+        .await?;
+    let parked = store
+        .park_rejection(ParkRejection {
+            runtime_uid: &runtime_uid,
+            runtime_namespace: "team-a",
+            runtime_name: "runtime-multigrant",
+            spec_digest: &format!("digest-{suffix}"),
+            base_spec_digest: &format!("base-digest-{suffix}"),
+            base_pending_approval_digest: None,
+            base_spec: &base,
+            envelope_revision: 1,
+            deltas: &deltas,
+            proposed_spec: &proposed,
+            actor: "alice@example.com",
+            member_role: &member_role,
+        })
+        .await?;
+    store
+        .link_decision_reference(
+            parked.approval_id,
+            "PROJ-123",
+            "https://jira.example.com/browse/PROJ-123",
+        )
+        .await?;
+    store
+        .approve_admission(ApproveAdmission {
+            approval_id: parked.approval_id,
+            decided_by: "admin@example.com",
+            rationale: "bounded multi-dimension exception",
+            evidence_url: "https://jira.example.com/browse/PROJ-123",
+            expires_at: "2999-01-01T00:00:00Z",
+        })
+        .await?;
+    assert!(store.grant_application(&runtime_uid).await?.is_some());
+    let revoked_grant = sqlx::query_scalar::<_, String>(
+        "SELECT id::text FROM grants WHERE approval_id = $1 AND dimension = 'budget'",
+    )
+    .bind(parked.approval_id)
+    .fetch_one(store.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO grant_revocations (grant_id, revoked_by, reason) \
+         VALUES (($1::text)::uuid, $2, $3)",
+    )
+    .bind(revoked_grant)
+    .bind("admin@example.com")
+    .bind("one dimension revoked")
+    .execute(store.pool())
+    .await?;
+    assert!(
+        store.grant_application(&runtime_uid).await?.is_none(),
+        "a partially revoked approval must not restore its complete proposed spec"
+    );
+    assert!(
+        store.grant_reversion(&runtime_uid).await?.is_some(),
+        "partial revocation must schedule restoration of the pre-grant spec"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<(), Box<dyn Error>>
 {
     let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
@@ -391,6 +489,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
             runtime_name: "runtime-evidence-a",
             spec_digest: "digest-evidence-a",
             base_spec_digest: "base-digest-evidence-a",
+            base_pending_approval_digest: None,
             base_spec: &base_spec,
             envelope_revision: 1,
             deltas: &deltas,
@@ -537,6 +636,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
             runtime_name: "runtime-evidence-a",
             spec_digest: "digest-evidence-a",
             base_spec_digest: "base-digest-evidence-a",
+            base_pending_approval_digest: None,
             base_spec: &base_spec,
             envelope_revision: 1,
             deltas: &deltas,
@@ -551,12 +651,195 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
     );
     assert_eq!(next_escalation.decision_key, None);
     assert_eq!(next_escalation.evidence_url, None);
+    let active_application = store
+        .grant_application("runtime-evidence-a")
+        .await?
+        .ok_or_else(|| {
+            io::Error::other(
+                "an approved grant must remain durable controller work until its spec converges",
+            )
+        })?;
+    let filing_claim = store
+        .claim_decision_filing(next_escalation.approval_id)
+        .await?;
+    let filing_token = filing_claim
+        .token
+        .ok_or_else(|| io::Error::other("new escalation did not receive a filing lease"))?;
     assert!(
         store
-            .grant_application("runtime-evidence-a")
+            .retire_pending_approval_if_superseded(
+                next_escalation.approval_id,
+                active_application.approval_id,
+                "runtime-evidence-a",
+                "steward-apiserver",
+                "superseded by an active approval during create convergence",
+            )
             .await?
             .is_some(),
-        "an approved grant must remain durable controller work until its spec converges"
+        "an active filing lease must not keep a superseded approval pending"
+    );
+    assert!(
+        !store
+            .pending_approvals()
+            .await?
+            .iter()
+            .any(|pending| pending.approval_id == next_escalation.approval_id),
+        "a retired loser must not remain reachable through the approval queue"
+    );
+    store
+        .complete_decision_filing(
+            next_escalation.approval_id,
+            filing_token,
+            "PROJ-456",
+            "https://jira.example.com/browse/PROJ-456",
+        )
+        .await?;
+    assert_eq!(
+        store.approval_for_filing(next_escalation.approval_id).await,
+        Err(StoreError::ApprovalNotPending),
+        "a retired loser must never be filed or approved later"
+    );
+    let retired_reference = sqlx::query(
+        "SELECT state, decision_key, evidence_url \
+         FROM approvals \
+         WHERE id = $1",
+    )
+    .bind(next_escalation.approval_id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(retired_reference.try_get::<String, _>("state")?, "rejected");
+    assert_eq!(
+        retired_reference.try_get::<Option<String>, _>("decision_key")?,
+        Some("PROJ-456".to_owned()),
+        "retirement must preserve the completed external decision reference"
+    );
+    assert_eq!(
+        retired_reference.try_get::<Option<String>, _>("evidence_url")?,
+        Some("https://jira.example.com/browse/PROJ-456".to_owned())
+    );
+    let recoverable_escalation = store
+        .park_rejection(ParkRejection {
+            runtime_uid: "runtime-evidence-a",
+            runtime_namespace: "team-a",
+            runtime_name: "runtime-evidence-a",
+            spec_digest: "digest-evidence-a",
+            base_spec_digest: "base-digest-evidence-a",
+            base_pending_approval_digest: None,
+            base_spec: &base_spec,
+            envelope_revision: 1,
+            deltas: &deltas,
+            proposed_spec: &proposed_spec,
+            actor: "alice@example.com",
+            member_role: "engineer-evidence",
+        })
+        .await?;
+    let abandoned_claim = store
+        .claim_decision_filing(recoverable_escalation.approval_id)
+        .await?;
+    let abandoned_token = abandoned_claim
+        .token
+        .ok_or_else(|| io::Error::other("recoverable escalation did not receive a filing lease"))?;
+    assert!(
+        store
+            .retire_pending_approval_if_superseded(
+                recoverable_escalation.approval_id,
+                active_application.approval_id,
+                "runtime-evidence-a",
+                "steward-apiserver",
+                "superseded by an active approval during create convergence",
+            )
+            .await?
+            .is_some()
+    );
+    sqlx::query(
+        "UPDATE approvals \
+         SET decision_filing_started_at = clock_timestamp() - interval '6 minutes' \
+         WHERE id = $1",
+    )
+    .bind(recoverable_escalation.approval_id)
+    .execute(store.pool())
+    .await?;
+    let recovered_claim = store
+        .claim_decision_filing(recoverable_escalation.approval_id)
+        .await?;
+    let recovered_token = recovered_claim
+        .token
+        .ok_or_else(|| io::Error::other("expired filing lease was not recovered"))?;
+    assert_ne!(
+        recovered_token, abandoned_token,
+        "recovery must replace the abandoned filing lease"
+    );
+    store
+        .complete_decision_filing(
+            recoverable_escalation.approval_id,
+            recovered_token,
+            "PROJ-789",
+            "https://jira.example.com/browse/PROJ-789",
+        )
+        .await?;
+    let recovered_reference = sqlx::query(
+        "SELECT state, decision_key, evidence_url \
+         FROM approvals \
+         WHERE id = $1",
+    )
+    .bind(recoverable_escalation.approval_id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        recovered_reference.try_get::<String, _>("state")?,
+        "rejected"
+    );
+    assert_eq!(
+        recovered_reference.try_get::<Option<String>, _>("decision_key")?,
+        Some("PROJ-789".to_owned()),
+        "a replacement worker must be able to finish the retired approval's external record"
+    );
+    let current_escalation = store
+        .park_rejection(ParkRejection {
+            runtime_uid: "runtime-evidence-a",
+            runtime_namespace: "team-a",
+            runtime_name: "runtime-evidence-a",
+            spec_digest: "digest-evidence-a",
+            base_spec_digest: "base-digest-evidence-a",
+            base_pending_approval_digest: None,
+            base_spec: &base_spec,
+            envelope_revision: 1,
+            deltas: &deltas,
+            proposed_spec: &proposed_spec,
+            actor: "alice@example.com",
+            member_role: "engineer-evidence",
+        })
+        .await?;
+    assert_eq!(
+        store
+            .revoke_runtime_grants(
+                "runtime-evidence-a",
+                "admin@example.com",
+                "winner revoked before convergence",
+            )
+            .await?,
+        1
+    );
+    assert!(
+        store
+            .retire_pending_approval_if_superseded(
+                current_escalation.approval_id,
+                active_application.approval_id,
+                "runtime-evidence-a",
+                "steward-apiserver",
+                "superseded by an active approval during create convergence",
+            )
+            .await?
+            .is_none(),
+        "a revoked winner must not authorize retirement"
+    );
+    assert!(
+        store
+            .pending_approvals()
+            .await?
+            .iter()
+            .any(|pending| pending.approval_id == current_escalation.approval_id),
+        "the current escalation must remain pending after winner revocation"
     );
     store
         .insert_envelope(
@@ -575,6 +858,118 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
     assert!(
         store.grant_reversion("runtime-evidence-a").await?.is_some(),
         "superseding an unapplied grant must produce durable reconciliation work"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn s4_retirement_checks_expiry_after_waiting_for_authority_locks()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the S4 Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let runtime_uid = format!("runtime-expiry-{suffix}");
+    let member_role = format!("engineer-expiry-{suffix}");
+    let proposed = proposed_spec();
+    let base = base_spec();
+    let deltas = budget_deltas();
+    store
+        .insert_envelope(&member_role, &envelope("200.00", 1), "admin@example.com")
+        .await?;
+    let winner = store
+        .park_rejection(ParkRejection {
+            runtime_uid: &runtime_uid,
+            runtime_namespace: "team-a",
+            runtime_name: "runtime-expiry",
+            spec_digest: &format!("winner-digest-{suffix}"),
+            base_spec_digest: &format!("winner-base-digest-{suffix}"),
+            base_pending_approval_digest: None,
+            base_spec: &base,
+            envelope_revision: 1,
+            deltas: &deltas,
+            proposed_spec: &proposed,
+            actor: "alice@example.com",
+            member_role: &member_role,
+        })
+        .await?;
+    store
+        .link_decision_reference(
+            winner.approval_id,
+            "PROJ-123",
+            "https://jira.example.com/browse/PROJ-123",
+        )
+        .await?;
+    let expires_at =
+        sqlx::query_scalar::<_, String>("SELECT (clock_timestamp() + interval '1 second')::text")
+            .fetch_one(store.pool())
+            .await?;
+    store
+        .approve_admission(ApproveAdmission {
+            approval_id: winner.approval_id,
+            decided_by: "admin@example.com",
+            rationale: "short-lived authority for lock timing",
+            evidence_url: "https://jira.example.com/browse/PROJ-123",
+            expires_at: &expires_at,
+        })
+        .await?;
+    let loser = store
+        .park_rejection(ParkRejection {
+            runtime_uid: &runtime_uid,
+            runtime_namespace: "team-a",
+            runtime_name: "runtime-expiry",
+            spec_digest: &format!("loser-digest-{suffix}"),
+            base_spec_digest: &format!("loser-base-digest-{suffix}"),
+            base_pending_approval_digest: None,
+            base_spec: &base,
+            envelope_revision: 1,
+            deltas: &deltas,
+            proposed_spec: &proposed,
+            actor: "alice@example.com",
+            member_role: &member_role,
+        })
+        .await?;
+    let mut blocker = store.pool().begin().await?;
+    sqlx::query("SELECT id FROM approvals WHERE id = $1 FOR UPDATE")
+        .bind(winner.approval_id)
+        .execute(&mut *blocker)
+        .await?;
+
+    let retirement = store.retire_pending_approval_if_superseded(
+        loser.approval_id,
+        winner.approval_id,
+        &runtime_uid,
+        "steward-apiserver",
+        "superseded by an active approval during create convergence",
+    );
+    let release = async move {
+        sqlx::query("SELECT pg_sleep(2)")
+            .execute(&mut *blocker)
+            .await?;
+        blocker.commit().await
+    };
+    let (retirement, release) = tokio::join!(retirement, release);
+    release?;
+    assert!(
+        retirement?.is_none(),
+        "authority that expires while retirement waits for its locks must not retire the loser"
+    );
+    assert!(
+        store
+            .pending_approvals()
+            .await?
+            .iter()
+            .any(|approval| approval.approval_id == loser.approval_id),
+        "the escalation must remain pending when the alleged winner has expired"
     );
     Ok(())
 }
@@ -605,6 +1000,7 @@ async fn s4_decision_filing_claim_serializes_concurrent_retries() -> Result<(), 
             runtime_name: "runtime-filing",
             spec_digest: &format!("digest-{suffix}"),
             base_spec_digest: &format!("base-digest-{suffix}"),
+            base_pending_approval_digest: None,
             base_spec: &base,
             envelope_revision: 1,
             deltas: &deltas,
@@ -642,5 +1038,183 @@ async fn s4_decision_filing_claim_serializes_concurrent_retries() -> Result<(), 
     let replay = store.claim_decision_filing(parked.approval_id).await?;
     assert_eq!(replay.token, None);
     assert_eq!(replay.filing.decision_key.as_deref(), Some("PROJ-123"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn s4_pending_create_provenance_survives_every_authority_transition()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the S4 Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let runtime_uid = format!("runtime-provenance-{suffix}");
+    let edit_runtime_uid = format!("runtime-edit-provenance-{suffix}");
+    let invalid_runtime_uid = format!("runtime-invalid-provenance-{suffix}");
+    let member_role = format!("engineer-provenance-{suffix}");
+    let marker_digest = format!("request-digest-{suffix}");
+    let proposed = proposed_spec();
+    let base = base_spec();
+    let deltas = budget_deltas();
+    store
+        .insert_envelope(&member_role, &envelope("200.00", 1), "admin@example.com")
+        .await?;
+
+    let parked = store
+        .park_rejection(ParkRejection {
+            runtime_uid: &runtime_uid,
+            runtime_namespace: "team-a",
+            runtime_name: "runtime-provenance",
+            spec_digest: &marker_digest,
+            base_spec_digest: &format!("base-digest-{suffix}"),
+            base_pending_approval_digest: Some(&marker_digest),
+            base_spec: &base,
+            envelope_revision: 1,
+            deltas: &deltas,
+            proposed_spec: &proposed,
+            actor: "alice@example.com",
+            member_role: &member_role,
+        })
+        .await?;
+    let pending = store
+        .pending_approvals()
+        .await?
+        .into_iter()
+        .find(|approval| approval.approval_id == parked.approval_id)
+        .ok_or_else(|| io::Error::other("parked approval was not queryable"))?;
+    assert_eq!(
+        pending.base_pending_approval_digest.as_deref(),
+        Some(marker_digest.as_str()),
+        "parking must retain the exact pending marker provenance"
+    );
+
+    store
+        .link_decision_reference(
+            parked.approval_id,
+            "PROJ-123",
+            "https://jira.example.com/browse/PROJ-123",
+        )
+        .await?;
+    let candidate = store
+        .approval_candidate(
+            parked.approval_id,
+            "https://jira.example.com/browse/PROJ-123",
+        )
+        .await?;
+    assert_eq!(
+        candidate.base_pending_approval_digest.as_deref(),
+        Some(marker_digest.as_str())
+    );
+    assert_eq!(candidate.actor, "alice@example.com");
+    store
+        .approve_admission(ApproveAdmission {
+            approval_id: parked.approval_id,
+            decided_by: "admin@example.com",
+            rationale: "bounded initial-create authority",
+            evidence_url: "https://jira.example.com/browse/PROJ-123",
+            expires_at: "2999-01-01T00:00:00Z",
+        })
+        .await?;
+
+    let application = store
+        .grant_application(&runtime_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("active grant application was not queryable"))?;
+    assert_eq!(
+        application
+            .application
+            .base_pending_approval_digest
+            .as_deref(),
+        Some(marker_digest.as_str()),
+        "application must retain initial-create provenance"
+    );
+    let retired = store
+        .retire_pending_approval_if_superseded(
+            parked.approval_id,
+            parked.approval_id,
+            &runtime_uid,
+            "steward-controller",
+            "validate authority before convergence",
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("active authority did not validate during retirement"))?;
+    assert_eq!(
+        retired.base_pending_approval_digest.as_deref(),
+        Some(marker_digest.as_str()),
+        "the locked retirement transition must return the same provenance"
+    );
+
+    assert_eq!(
+        store
+            .revoke_runtime_grants(&runtime_uid, "admin@example.com", "scope ended")
+            .await?,
+        1
+    );
+    let reversion = store
+        .grant_reversion(&runtime_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("inactive initial-create grant was not reversible"))?;
+    assert_eq!(
+        reversion.base_pending_approval_digest.as_deref(),
+        Some(marker_digest.as_str()),
+        "reversion must restore the exact marker persisted at parking"
+    );
+
+    let edit = store
+        .park_rejection(ParkRejection {
+            runtime_uid: &edit_runtime_uid,
+            runtime_namespace: "team-a",
+            runtime_name: "runtime-edit-provenance",
+            spec_digest: &format!("edit-digest-{suffix}"),
+            base_spec_digest: &format!("edit-base-digest-{suffix}"),
+            base_pending_approval_digest: None,
+            base_spec: &base,
+            envelope_revision: 1,
+            deltas: &deltas,
+            proposed_spec: &proposed,
+            actor: "alice@example.com",
+            member_role: &member_role,
+        })
+        .await?;
+    let edit_pending = store
+        .pending_approvals()
+        .await?
+        .into_iter()
+        .find(|approval| approval.approval_id == edit.approval_id)
+        .ok_or_else(|| io::Error::other("edit approval was not queryable"))?;
+    assert_eq!(
+        edit_pending.base_pending_approval_digest, None,
+        "ordinary edit escalation must not acquire initial-create provenance"
+    );
+
+    let empty_marker = store
+        .park_rejection(ParkRejection {
+            runtime_uid: &invalid_runtime_uid,
+            runtime_namespace: "team-a",
+            runtime_name: "runtime-invalid-provenance",
+            spec_digest: &format!("invalid-digest-{suffix}"),
+            base_spec_digest: &format!("invalid-base-digest-{suffix}"),
+            base_pending_approval_digest: Some(""),
+            base_spec: &base,
+            envelope_revision: 1,
+            deltas: &deltas,
+            proposed_spec: &proposed,
+            actor: "alice@example.com",
+            member_role: &member_role,
+        })
+        .await;
+    assert!(
+        empty_marker.is_err(),
+        "the migration must reject empty pending-marker provenance"
+    );
     Ok(())
 }

@@ -19,8 +19,12 @@ use steward_apiserver::{
     AuthenticatedCaller, AuthenticationError, BoxFuture, KubeRuntimeRepository,
     RequestAuthenticator, router,
 };
-use steward_controller::webhook_router;
+use steward_controller::{
+    PortError, SandboxObservation, SandboxRequest, SandboxRuntime, run_controller_with_store,
+    webhook_router_for_controller,
+};
 use steward_store::PgStore;
+use steward_types::RuntimeRefs;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 use tokio_rustls::TlsAcceptor;
@@ -55,6 +59,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let store = PgStore::new(pool);
     store.migrate().await?;
     let client = kube::Client::try_default().await?;
+    let controller_task = tokio::spawn(run_controller_with_store(
+        client.clone(),
+        S4SandboxRuntime,
+        store.clone(),
+    ));
     let decisions = JiraAdapter::new(
         JiraConfig {
             base_url: jira_base_url,
@@ -70,7 +79,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         S4Authenticator,
         decisions,
     )
-    .merge(webhook_router(store));
+    .merge(webhook_router_for_controller(
+        store,
+        "system:serviceaccount:steward-system:steward-s3".to_owned(),
+    ));
     let listener = TcpListener::bind(&steward_bind).await?;
     let certificate = CertificateDer::from(fs::read(certificate_path)?);
     let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(fs::read(private_key_path)?));
@@ -86,8 +98,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await;
     jira_task.abort();
+    controller_task.abort();
     steward_result?;
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct S4SandboxRuntime;
+
+impl SandboxRuntime for S4SandboxRuntime {
+    async fn ensure(&self, request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+        Ok(SandboxObservation::Running {
+            refs: RuntimeRefs {
+                workspace: Some(format!("workspace-{}", request.runtime.0)),
+                sandbox: Some(format!("sandbox-{}", request.runtime.0)),
+                litellm_key: None,
+            },
+        })
+    }
+
+    async fn delete(&self, _request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+        Ok(SandboxObservation::Absent)
+    }
 }
 
 #[derive(Clone)]
