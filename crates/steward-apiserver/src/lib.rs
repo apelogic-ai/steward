@@ -1,5 +1,14 @@
 //! REST admission path and server-rendered approval queue.
 
+mod tasks;
+
+pub use tasks::{
+    KubernetesTaskIdentityResolver, StaticTaskWorkflowCatalog, TaskAdmissionDelta, TaskArchive,
+    TaskAuthenticationError, TaskErrorResponse, TaskIdentity, TaskIdentityResolver,
+    TaskStatusResponse, TaskSubmissionLedger, TaskSubmissionRequest, TaskWorkflow,
+    TaskWorkflowCatalog, task_router,
+};
+
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
@@ -15,7 +24,7 @@ use axum::{Extension, Json, Router};
 use k8s_openapi::api::authentication::v1::{
     TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
 };
-use kube::api::{Api, PostParams};
+use kube::api::{Api, ListParams, PostParams};
 use kube::core::Request as KubeRequest;
 use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
@@ -183,10 +192,48 @@ pub struct GrantRevocationRequest {
 
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(create_runtime_contract, budget_increase_contract),
-    components(schemas(CreateRuntimeRequest, BudgetIncrease))
+    paths(
+        create_runtime_contract,
+        budget_increase_contract,
+        task_submission_contract,
+        task_inputs_contract,
+        task_execute_contract,
+        task_status_contract,
+        task_outputs_contract,
+        task_delete_contract
+    ),
+    components(schemas(
+        CreateRuntimeRequest,
+        BudgetIncrease,
+        TaskSubmissionRequest,
+        TaskStatusResponse,
+        TaskAdmissionDelta,
+        TaskArchive,
+        TaskErrorResponse
+    )),
+    modifiers(&TaskSecurity)
 )]
 pub struct ApiDoc;
+
+struct TaskSecurity;
+
+impl utoipa::Modify for TaskSecurity {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "taskBearer",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("OIDC assertion")
+                        .build(),
+                ),
+            );
+        }
+    }
+}
 
 #[utoipa::path(
     post,
@@ -226,6 +273,115 @@ pub async fn create_runtime_contract() {}
 #[doc(hidden)]
 pub async fn budget_increase_contract() {}
 
+#[utoipa::path(
+    post,
+    path = "/v1/tasks",
+    request_body(content = TaskSubmissionRequest, content_type = "application/json"),
+    params(
+        ("Idempotency-Key" = String, Header, description = "Submitter-scoped upstream job identity")
+    ),
+    security(("taskBearer" = [])),
+    responses(
+        (status = 201, description = "Task admitted without an approval hold and bound to its runtime", body = TaskStatusResponse, content_type = "application/json"),
+        (status = 202, description = "Task parked on a governed approval hold; execution resumes after approval", body = TaskStatusResponse, content_type = "application/json"),
+        (status = 400, description = "Submission JSON is malformed", body = String, content_type = "text/plain"),
+        (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Selected workflow does not exist", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 409, description = "Idempotency key or adopted runtime conflicts", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 415, description = "Content-Type is not application/json", body = String, content_type = "text/plain"),
+        (status = 422, description = "Workflow, runtime version, service envelope, or authority is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity, Kubernetes, persistence, or decision dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+    )
+)]
+#[doc(hidden)]
+pub async fn task_submission_contract() {}
+
+#[utoipa::path(
+    put,
+    path = "/v1/tasks/{taskUid}/inputs",
+    params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
+    request_body(content = TaskArchive, content_type = "application/x-tar", description = "Opaque workspace-relative tar archive; maximum 64 MiB"),
+    security(("taskBearer" = [])),
+    responses(
+        (status = 204, description = "Input archive staged durably; an identical retry is idempotent"),
+        (status = 400, description = "taskUid is not a UUID", body = String, content_type = "text/plain"),
+        (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Task is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 409, description = "Task no longer accepts inputs or the retry body differs", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 413, description = "Input archive exceeds 64 MiB", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 415, description = "Content-Type is not application/x-tar", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+    )
+)]
+#[doc(hidden)]
+pub async fn task_inputs_contract() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/tasks/{taskUid}/execute",
+    params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
+    security(("taskBearer" = [])),
+    responses(
+        (status = 202, description = "Execution requested durably; repeated requests are idempotent", body = TaskStatusResponse, content_type = "application/json"),
+        (status = 400, description = "taskUid is not a UUID", body = String, content_type = "text/plain"),
+        (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Task is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 409, description = "Inputs are absent, cleanup was requested, or the phase cannot execute", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+    )
+)]
+#[doc(hidden)]
+pub async fn task_execute_contract() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/tasks/{taskUid}",
+    params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
+    security(("taskBearer" = [])),
+    responses(
+        (status = 200, description = "Current durable Task phase and cleanup state", body = TaskStatusResponse, content_type = "application/json"),
+        (status = 400, description = "taskUid is not a UUID", body = String, content_type = "text/plain"),
+        (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Task is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+    )
+)]
+#[doc(hidden)]
+pub async fn task_status_contract() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/tasks/{taskUid}/outputs",
+    params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
+    security(("taskBearer" = [])),
+    responses(
+        (status = 200, description = "Opaque workspace-relative output tar archive; maximum 64 MiB", body = TaskArchive, content_type = "application/x-tar"),
+        (status = 400, description = "taskUid is not a UUID", body = String, content_type = "text/plain"),
+        (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Task is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 409, description = "Task has not succeeded or output is not available", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+    )
+)]
+#[doc(hidden)]
+pub async fn task_outputs_contract() {}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/tasks/{taskUid}",
+    params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
+    security(("taskBearer" = [])),
+    responses(
+        (status = 202, description = "Cleanup requested durably; repeated requests are idempotent", body = TaskStatusResponse, content_type = "application/json"),
+        (status = 400, description = "taskUid is not a UUID", body = String, content_type = "text/plain"),
+        (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Task is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+    )
+)]
+#[doc(hidden)]
+pub async fn task_delete_contract() {}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(
     rename_all = "camelCase",
@@ -260,6 +416,11 @@ pub enum ApiError {
     DecisionChannel(String),
     Conflict(String),
     NoActiveGrants,
+    TaskAuthentication,
+    TaskAuthenticationUnavailable,
+    TaskWorkflowNotFound,
+    TaskNotReady,
+    TaskOutputNotReady,
 }
 
 impl fmt::Display for ApiError {
@@ -300,6 +461,11 @@ pub trait RuntimeRepository: Clone + Send + Sync + 'static {
         &'a self,
         namespace: &'a str,
         name: &'a str,
+        runtime_uid: &'a str,
+    ) -> BoxFuture<'a, Result<AgentRuntime, String>>;
+
+    fn get_by_uid<'a>(
+        &'a self,
         runtime_uid: &'a str,
     ) -> BoxFuture<'a, Result<AgentRuntime, String>>;
 
@@ -418,6 +584,30 @@ impl RuntimeRepository for KubeRuntimeRepository {
                     "AgentRuntime {namespace}/{name} no longer has UID {runtime_uid}"
                 ))
             }
+        })
+    }
+
+    fn get_by_uid<'a>(
+        &'a self,
+        runtime_uid: &'a str,
+    ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+        Box::pin(async move {
+            let mut matches = Api::<AgentRuntime>::all(self.client.clone())
+                .list(&ListParams::default())
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+                .into_iter()
+                .filter(|runtime| runtime.metadata.uid.as_deref() == Some(runtime_uid));
+            let runtime = matches
+                .next()
+                .ok_or_else(|| format!("AgentRuntime UID {runtime_uid} does not exist"))?;
+            if matches.next().is_some() {
+                return Err(format!(
+                    "AgentRuntime UID {runtime_uid} resolved to more than one object"
+                ));
+            }
+            Ok(runtime)
         })
     }
 
@@ -1208,6 +1398,13 @@ impl IntoResponse for ApiError {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
             }
             Self::PrincipalMismatch => StatusCode::FORBIDDEN,
+            Self::TaskAuthentication => StatusCode::UNAUTHORIZED,
+            Self::TaskAuthenticationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TaskWorkflowNotFound | Self::Store(StoreError::TaskNotFound) => {
+                StatusCode::NOT_FOUND
+            }
+            Self::TaskNotReady => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TaskOutputNotReady => StatusCode::CONFLICT,
             Self::MissingEnvelope | Self::MissingRuntimeUid => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InvalidBudgetIncrease { .. } | Self::Admission(_) => {
                 StatusCode::UNPROCESSABLE_ENTITY
@@ -1222,7 +1419,9 @@ impl IntoResponse for ApiError {
                 | StoreError::DecisionFilingInProgress
                 | StoreError::EvidenceMismatch
                 | StoreError::StaleEnvelope
-                | StoreError::EnvelopeRevisionNotIncreasing,
+                | StoreError::EnvelopeRevisionNotIncreasing
+                | StoreError::TaskIdempotencyConflict
+                | StoreError::InvalidTaskTransition,
             ) => StatusCode::CONFLICT,
             Self::Store(StoreError::InvalidGrantExpiry | StoreError::MissingRevocationReason) => {
                 StatusCode::UNPROCESSABLE_ENTITY
@@ -1965,25 +2164,65 @@ mod tests {
     use steward_store::{
         ApprovalCandidate, ApproveAdmission, ApprovedAdmission, DecisionFiling,
         DecisionFilingClaim, GrantApplication, GrantReversion, ParkRejection, ParkedAdmission,
-        PendingApproval, StoreError,
+        PendingApproval, StoreError, TaskRecord, TaskReservation, TaskReservationRequest,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef,
-        PENDING_APPROVAL_ANNOTATION, Principal,
+        PENDING_APPROVAL_ANNOTATION, Principal, TaskPhase,
     };
     use tower::ServiceExt;
     use utoipa::OpenApi;
     use uuid::Uuid;
 
+    use super::tasks::task_identity_from_token_review;
     use super::{
         AdmissionContext, AdmissionLedger, ApiDoc, ApiError, AuthenticatedCaller,
         AuthenticationError, BoxFuture, BudgetIncrease, CreateRuntimeRequest, RequestAuthenticator,
-        RuntimeCreateError, RuntimeRepository, SubmissionOutcome, caller_from_kubernetes_user,
-        caller_from_token_review, router, spec_digest, submit_budget_increase,
+        RuntimeCreateError, RuntimeRepository, StaticTaskWorkflowCatalog, SubmissionOutcome,
+        TaskAuthenticationError, TaskIdentity, TaskIdentityResolver, TaskSubmissionLedger,
+        TaskWorkflow, caller_from_kubernetes_user, caller_from_token_review, router, spec_digest,
+        submit_budget_increase, task_router,
     };
 
     #[derive(Clone)]
     struct FakeAuthenticator;
+
+    #[derive(Clone)]
+    struct FakeTaskIdentityResolver;
+
+    impl TaskIdentityResolver for FakeTaskIdentityResolver {
+        fn resolve<'a>(
+            &'a self,
+            assertion: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<TaskIdentity, TaskAuthenticationError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                match assertion {
+                    "github-assertion" => Ok(TaskIdentity {
+                        service: "steward-run".to_owned(),
+                        acting_user: Some(Email("alice@example.com".to_owned())),
+                        owner: Email("alice@example.com".to_owned()),
+                    }),
+                    "github-bob-assertion" => Ok(TaskIdentity {
+                        service: "steward-run".to_owned(),
+                        acting_user: Some(Email("bob@example.org".to_owned())),
+                        owner: Email("bob@example.org".to_owned()),
+                    }),
+                    "scheduled-assertion" => Ok(TaskIdentity {
+                        service: "scheduled-scanner".to_owned(),
+                        acting_user: None,
+                        owner: Email("owner@example.org".to_owned()),
+                    }),
+                    _ => Err(TaskAuthenticationError::InvalidCredentials),
+                }
+            })
+        }
+    }
 
     #[test]
     fn kubernetes_identity_is_the_only_source_of_roles_and_admin_authority() -> Result<(), String> {
@@ -2042,6 +2281,73 @@ mod tests {
             Err(AuthenticationError::InvalidCredentials),
             "a valid Kubernetes token for another audience must fail closed"
         );
+    }
+
+    #[test]
+    fn task_identity_is_resolved_only_from_authenticated_token_review_attributes()
+    -> Result<(), String> {
+        let delegated = task_identity_from_token_review(
+            Some(TokenReviewStatus {
+                authenticated: Some(true),
+                audiences: Some(vec!["steward-tasks".to_owned()]),
+                user: Some(UserInfo {
+                    username: Some("github-assertion:job-123".to_owned()),
+                    groups: Some(vec![
+                        "agents.apelogic.ai/service-principal:steward-run".to_owned(),
+                        "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                    ]),
+                    ..UserInfo::default()
+                }),
+                ..TokenReviewStatus::default()
+            }),
+            Some("steward-tasks"),
+        )
+        .map_err(|error| format!("server-validated delegated assertion was rejected: {error:?}"))?;
+        assert_eq!(delegated.service, "steward-run");
+        assert_eq!(
+            delegated.acting_user,
+            Some(Email("alice@example.com".to_owned()))
+        );
+        assert_eq!(delegated.owner, Email("alice@example.com".to_owned()));
+
+        let scheduled = task_identity_from_token_review(
+            Some(TokenReviewStatus {
+                authenticated: Some(true),
+                user: Some(UserInfo {
+                    username: Some("scheduler:trigger-123".to_owned()),
+                    groups: Some(vec![
+                        "agents.apelogic.ai/service-principal:scheduled-scanner".to_owned(),
+                        "agents.apelogic.ai/task-owner:owner@example.org".to_owned(),
+                    ]),
+                    ..UserInfo::default()
+                }),
+                ..TokenReviewStatus::default()
+            }),
+            None,
+        )
+        .map_err(|error| format!("server-validated scheduled assertion was rejected: {error:?}"))?;
+        assert_eq!(scheduled.service, "scheduled-scanner");
+        assert_eq!(scheduled.acting_user, None);
+        assert_eq!(scheduled.owner, Email("owner@example.org".to_owned()));
+
+        let self_asserted_only = task_identity_from_token_review(
+            Some(TokenReviewStatus {
+                authenticated: Some(true),
+                user: Some(UserInfo {
+                    username: Some("alice@example.com".to_owned()),
+                    groups: Some(Vec::new()),
+                    ..UserInfo::default()
+                }),
+                ..TokenReviewStatus::default()
+            }),
+            None,
+        );
+        assert_eq!(
+            self_asserted_only,
+            Err(TaskAuthenticationError::InvalidCredentials),
+            "an authenticated username without a server-resolved service binding is not a task principal"
+        );
+        Ok(())
     }
 
     impl RequestAuthenticator for FakeAuthenticator {
@@ -2110,6 +2416,197 @@ mod tests {
                 "runtime create OpenAPI is missing its {schema} component"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn task_lifecycle_is_fully_published_in_the_openapi_contract() -> Result<(), String> {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        let operations = [
+            (
+                "/paths/~1v1~1tasks/post",
+                ["201", "202"].as_slice(),
+                [
+                    ("400", "text/plain"),
+                    ("401", "application/json"),
+                    ("404", "application/json"),
+                    ("409", "application/json"),
+                    ("415", "text/plain"),
+                    ("422", "application/json"),
+                    ("503", "application/json"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "/paths/~1v1~1tasks~1{taskUid}~1inputs/put",
+                ["204"].as_slice(),
+                [
+                    ("400", "text/plain"),
+                    ("401", "application/json"),
+                    ("404", "application/json"),
+                    ("409", "application/json"),
+                    ("413", "application/json"),
+                    ("415", "application/json"),
+                    ("503", "application/json"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "/paths/~1v1~1tasks~1{taskUid}~1execute/post",
+                ["202"].as_slice(),
+                [
+                    ("400", "text/plain"),
+                    ("401", "application/json"),
+                    ("404", "application/json"),
+                    ("409", "application/json"),
+                    ("503", "application/json"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "/paths/~1v1~1tasks~1{taskUid}/get",
+                ["200"].as_slice(),
+                [
+                    ("400", "text/plain"),
+                    ("401", "application/json"),
+                    ("404", "application/json"),
+                    ("503", "application/json"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "/paths/~1v1~1tasks~1{taskUid}~1outputs/get",
+                ["200"].as_slice(),
+                [
+                    ("400", "text/plain"),
+                    ("401", "application/json"),
+                    ("404", "application/json"),
+                    ("409", "application/json"),
+                    ("503", "application/json"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "/paths/~1v1~1tasks~1{taskUid}/delete",
+                ["202"].as_slice(),
+                [
+                    ("400", "text/plain"),
+                    ("401", "application/json"),
+                    ("404", "application/json"),
+                    ("503", "application/json"),
+                ]
+                .as_slice(),
+            ),
+        ];
+        for (pointer, success_statuses, error_responses) in operations {
+            let operation = document
+                .pointer(pointer)
+                .ok_or_else(|| format!("Task operation {pointer} is absent from OpenAPI"))?;
+            assert_eq!(
+                operation.pointer("/security/0/taskBearer/type"),
+                None,
+                "operation security must reference, not inline, the taskBearer scheme"
+            );
+            assert!(
+                operation.pointer("/security/0/taskBearer").is_some(),
+                "Task operation {pointer} must require taskBearer"
+            );
+            for status in success_statuses {
+                assert!(
+                    operation.pointer(&format!("/responses/{status}")).is_some(),
+                    "Task operation {pointer} is missing success status {status}"
+                );
+            }
+            for (status, content_type) in error_responses {
+                let content_type = content_type.replace('/', "~1");
+                assert!(
+                    operation
+                        .pointer(&format!(
+                            "/responses/{status}/content/{content_type}/schema"
+                        ))
+                        .is_some(),
+                    "Task {pointer} error {status} must publish its {content_type} schema"
+                );
+            }
+        }
+
+        assert_eq!(
+            document.pointer("/components/securitySchemes/taskBearer/type"),
+            Some(&serde_json::json!("http"))
+        );
+        assert_eq!(
+            document.pointer("/components/securitySchemes/taskBearer/scheme"),
+            Some(&serde_json::json!("bearer"))
+        );
+        let status = document
+            .pointer("/components/schemas/TaskStatusResponse")
+            .ok_or_else(|| "TaskStatusResponse schema is absent".to_owned())?;
+        for property in [
+            "taskUid",
+            "runtimeUid",
+            "phase",
+            "runtimeOwnership",
+            "finalized",
+            "failureReason",
+            "deltas",
+        ] {
+            assert!(
+                status.pointer(&format!("/properties/{property}")).is_some(),
+                "TaskStatusResponse is missing {property}"
+            );
+        }
+        assert_eq!(
+            document.pointer("/components/schemas/TaskPhase/enum"),
+            Some(&serde_json::json!([
+                "submitted",
+                "parked",
+                "queued",
+                "running",
+                "succeeded",
+                "failed",
+                "cancelled"
+            ]))
+        );
+        assert!(
+            document
+                .pointer("/components/schemas/TaskAdmissionDelta")
+                .is_some(),
+            "Task admission deltas must be machine-readable"
+        );
+        let submission = document
+            .pointer("/paths/~1v1~1tasks/post/responses")
+            .ok_or_else(|| "Task submission responses are absent".to_owned())?;
+        assert!(
+            submission
+                .pointer("/201/description")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains("without an approval hold")),
+            "201 must explicitly mean admitted without a hold"
+        );
+        assert!(
+            submission
+                .pointer("/202/description")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains("parked")),
+            "202 must explicitly mean parked for approval"
+        );
+        assert!(
+            document
+                .pointer(
+                    "/paths/~1v1~1tasks~1{taskUid}~1inputs/put/requestBody/content/application~1x-tar/schema",
+                )
+                .is_some(),
+            "Task inputs must publish application/x-tar"
+        );
+        assert!(
+            document
+                .pointer(
+                    "/paths/~1v1~1tasks~1{taskUid}~1outputs/get/responses/200/content/application~1x-tar/schema",
+                )
+                .is_some(),
+            "Task outputs must publish application/x-tar"
+        );
         Ok(())
     }
 
@@ -2260,6 +2757,19 @@ mod tests {
             Box::pin(async move { Ok(self.runtime.clone()) })
         }
 
+        fn get_by_uid<'a>(
+            &'a self,
+            runtime_uid: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            Box::pin(async move {
+                if self.runtime.metadata.uid.as_deref() == Some(runtime_uid) {
+                    Ok(self.runtime.clone())
+                } else {
+                    Err(format!("AgentRuntime UID {runtime_uid} does not exist"))
+                }
+            })
+        }
+
         fn replace<'a>(
             &'a self,
             _runtime: &'a AgentRuntime,
@@ -2362,6 +2872,24 @@ mod tests {
             })
         }
 
+        fn get_by_uid<'a>(
+            &'a self,
+            runtime_uid: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            Box::pin(async move {
+                let runtime = self
+                    .runtime
+                    .lock()
+                    .map_err(|_| "fake runtime lock was poisoned".to_owned())?
+                    .clone();
+                if runtime.metadata.uid.as_deref() == Some(runtime_uid) {
+                    Ok(runtime)
+                } else {
+                    Err(format!("AgentRuntime UID {runtime_uid} does not exist"))
+                }
+            })
+        }
+
         fn replace<'a>(
             &'a self,
             runtime: &'a AgentRuntime,
@@ -2404,6 +2932,7 @@ mod tests {
         application: Arc<Mutex<Option<GrantReversion>>>,
         application_committed_during_park: Arc<Mutex<Option<GrantReversion>>>,
         application_revoked_during_retirement: Arc<Mutex<bool>>,
+        tasks: Arc<Mutex<Vec<TaskRecord>>>,
     }
 
     #[derive(Clone)]
@@ -2852,6 +3381,191 @@ mod tests {
         }
     }
 
+    impl TaskSubmissionLedger for FakeLedger {
+        fn reserve_task<'a>(
+            &'a self,
+            request: TaskReservationRequest<'a>,
+        ) -> BoxFuture<'a, Result<TaskReservation, StoreError>> {
+            Box::pin(async move {
+                let mut tasks = self.tasks.lock().map_err(|_| {
+                    StoreError::Database("fake task ledger lock was poisoned".to_owned())
+                })?;
+                if let Some(existing) = tasks.iter().find(|task| {
+                    task.submitter_service == request.submitter_service
+                        && task.idempotency_key == request.idempotency_key
+                }) {
+                    return Ok(TaskReservation {
+                        inserted: false,
+                        record: existing.clone(),
+                    });
+                }
+                let record = TaskRecord {
+                    task_uid: Uuid::new_v4(),
+                    idempotency_key: request.idempotency_key.to_owned(),
+                    submitter_service: request.submitter_service.to_owned(),
+                    acting_user: request.acting_user.map(str::to_owned),
+                    owner: request.owner.to_owned(),
+                    workflow: request.workflow.to_owned(),
+                    coding_agent_runtime: request.coding_agent_runtime.to_owned(),
+                    runtime_uid: None,
+                    runtime_namespace: request.runtime_namespace.to_owned(),
+                    runtime_name: request.runtime_name.to_owned(),
+                    runtime_ownership: request.runtime_ownership,
+                    phase: TaskPhase::Submitted,
+                    runtime_spec: request.runtime_spec.clone(),
+                    agent_command: request.agent_command.to_vec(),
+                    input_archive: None,
+                    output_archive: None,
+                    execute_requested: false,
+                    finalize_requested: false,
+                    finalized: false,
+                    failure_reason: None,
+                };
+                tasks.push(record.clone());
+                Ok(TaskReservation {
+                    inserted: true,
+                    record,
+                })
+            })
+        }
+
+        fn bind_task_runtime<'a>(
+            &'a self,
+            task_uid: Uuid,
+            runtime_uid: &'a str,
+            phase: TaskPhase,
+        ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
+            Box::pin(async move {
+                let mut tasks = self.tasks.lock().map_err(|_| {
+                    StoreError::Database("fake task ledger lock was poisoned".to_owned())
+                })?;
+                let task = tasks
+                    .iter_mut()
+                    .find(|task| task.task_uid == task_uid)
+                    .ok_or(StoreError::TaskNotFound)?;
+                task.runtime_uid = Some(runtime_uid.to_owned());
+                task.phase = phase;
+                Ok(task.clone())
+            })
+        }
+
+        fn put_task_inputs<'a>(
+            &'a self,
+            task_uid: Uuid,
+            submitter_service: &'a str,
+            acting_user: Option<&'a str>,
+            archive: &'a [u8],
+        ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
+            Box::pin(async move {
+                let mut tasks = self.tasks.lock().map_err(|_| {
+                    StoreError::Database("fake task ledger lock was poisoned".to_owned())
+                })?;
+                let task = tasks
+                    .iter_mut()
+                    .find(|task| {
+                        task.task_uid == task_uid
+                            && task.submitter_service == submitter_service
+                            && task.acting_user.as_deref() == acting_user
+                    })
+                    .ok_or(StoreError::TaskNotFound)?;
+                if task.execute_requested
+                    || !matches!(task.phase, TaskPhase::Submitted | TaskPhase::Parked)
+                    || task
+                        .input_archive
+                        .as_deref()
+                        .is_some_and(|existing| existing != archive)
+                {
+                    return Err(StoreError::InvalidTaskTransition);
+                }
+                task.input_archive = Some(archive.to_vec());
+                Ok(task.clone())
+            })
+        }
+
+        fn request_task_execution<'a>(
+            &'a self,
+            task_uid: Uuid,
+            submitter_service: &'a str,
+            acting_user: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
+            Box::pin(async move {
+                let mut tasks = self.tasks.lock().map_err(|_| {
+                    StoreError::Database("fake task ledger lock was poisoned".to_owned())
+                })?;
+                let task = tasks
+                    .iter_mut()
+                    .find(|task| {
+                        task.task_uid == task_uid
+                            && task.submitter_service == submitter_service
+                            && task.acting_user.as_deref() == acting_user
+                    })
+                    .ok_or(StoreError::TaskNotFound)?;
+                if task.input_archive.is_none() || task.finalize_requested {
+                    return Err(StoreError::InvalidTaskTransition);
+                }
+                task.execute_requested = true;
+                if task.phase == TaskPhase::Submitted {
+                    task.phase = TaskPhase::Queued;
+                }
+                Ok(task.clone())
+            })
+        }
+
+        fn task_for_submitter<'a>(
+            &'a self,
+            task_uid: Uuid,
+            submitter_service: &'a str,
+            acting_user: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
+            Box::pin(async move {
+                self.tasks
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database("fake task ledger lock was poisoned".to_owned())
+                    })
+                    .map(|tasks| {
+                        tasks
+                            .iter()
+                            .find(|task| {
+                                task.task_uid == task_uid
+                                    && task.submitter_service == submitter_service
+                                    && task.acting_user.as_deref() == acting_user
+                            })
+                            .cloned()
+                    })
+            })
+        }
+
+        fn request_task_finalization<'a>(
+            &'a self,
+            task_uid: Uuid,
+            submitter_service: &'a str,
+            acting_user: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
+            Box::pin(async move {
+                let mut tasks = self.tasks.lock().map_err(|_| {
+                    StoreError::Database("fake task ledger lock was poisoned".to_owned())
+                })?;
+                let task = tasks
+                    .iter_mut()
+                    .find(|task| {
+                        task.task_uid == task_uid
+                            && task.submitter_service == submitter_service
+                            && task.acting_user.as_deref() == acting_user
+                    })
+                    .ok_or(StoreError::TaskNotFound)?;
+                task.finalize_requested = true;
+                if matches!(
+                    task.phase,
+                    TaskPhase::Submitted | TaskPhase::Parked | TaskPhase::Queued
+                ) {
+                    task.phase = TaskPhase::Cancelled;
+                }
+                Ok(task.clone())
+            })
+        }
+    }
+
     fn runtime() -> AgentRuntime {
         let spec = AgentRuntimeSpec {
             principal: Principal::User {
@@ -2910,6 +3624,26 @@ mod tests {
             application: Arc::new(Mutex::new(None)),
             application_committed_during_park: Arc::new(Mutex::new(None)),
             application_revoked_during_retirement: Arc::new(Mutex::new(false)),
+            tasks: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn task_workflow(monthly_limit: &str) -> TaskWorkflow {
+        TaskWorkflow {
+            name: "code-review".to_owned(),
+            namespace: "team-a".to_owned(),
+            coding_agent_runtime: "agent-v1".to_owned(),
+            llms: vec![ModelRef {
+                provider: "provider-a".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: monthly_limit.to_owned(),
+                currency: "USD".to_owned(),
+            },
+            ttl: Duration("24h".to_owned()),
+            command: vec!["agent-v1".to_owned()],
         }
     }
 
@@ -4598,6 +5332,403 @@ mod tests {
                 "approval queue must render {expected:?} from the parked row"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_submission_outside_service_envelope_returns_a_structured_delta()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let decisions = FakeDecisionChannel::default();
+        let app = router(
+            runtimes.clone(),
+            ledger.clone(),
+            FakeAuthenticator,
+            decisions.clone(),
+        )
+        .merge(task_router(
+            runtimes,
+            ledger,
+            decisions,
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([TaskWorkflow {
+                name: "wide-review".to_owned(),
+                namespace: "team-a".to_owned(),
+                coding_agent_runtime: "agent-v1".to_owned(),
+                llms: vec![ModelRef {
+                    provider: "provider-a".to_owned(),
+                    model: "model-a".to_owned(),
+                }],
+                tools: Vec::new(),
+                budget: Budget {
+                    monthly_limit: "250.00".to_owned(),
+                    currency: "USD".to_owned(),
+                },
+                ttl: Duration("24h".to_owned()),
+                command: vec!["agent-v1".to_owned()],
+            }]),
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "github-job-123")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"workflow":"wide-review","codingAgentRuntime":"agent-v1"}"#,
+                    ))
+                    .map_err(|error| format!("failed to build task submission: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("task submission failed: {error}"))?;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "an over-envelope workflow must be parked without provisioning"
+        );
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("failed to read task rejection: {error}"))?;
+        let response = serde_json::from_slice::<serde_json::Value>(&body)
+            .map_err(|error| format!("task rejection was not JSON: {error}"))?;
+        assert_eq!(
+            response.pointer("/deltas/0/dimension"),
+            Some(&serde_json::json!("budget")),
+            "task anti-ratchet rejection must preserve the admission delta"
+        );
+        assert_eq!(
+            response.pointer("/phase"),
+            Some(&serde_json::json!("parked"))
+        );
+        let parked = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert!(
+            parked
+                .annotations()
+                .contains_key(PENDING_APPROVAL_ANNOTATION),
+            "the parked task runtime must carry the controller-enforced pending marker"
+        );
+        assert!(parked.spec.llms.is_empty() && parked.spec.tools.is_empty());
+        assert_eq!(parked.spec.budget.monthly_limit, "0");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_input_archive_is_persisted_for_the_resolved_submitter() -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let ledger = ledger();
+        let task_rows = ledger.tasks.clone();
+        let decisions = FakeDecisionChannel::default();
+        let app = router(
+            runtimes.clone(),
+            ledger.clone(),
+            FakeAuthenticator,
+            decisions.clone(),
+        )
+        .merge(task_router(
+            runtimes,
+            ledger,
+            decisions,
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+        ));
+        let submitted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "github-job-inputs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"workflow":"code-review","codingAgentRuntime":"agent-v1"}"#,
+                    ))
+                    .map_err(|error| format!("failed to build task submission: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("task submission failed: {error}"))?;
+        assert_eq!(submitted.status(), StatusCode::CREATED);
+        let body = to_bytes(submitted.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("failed to read task submission: {error}"))?;
+        let task_uid = serde_json::from_slice::<serde_json::Value>(&body)
+            .map_err(|error| format!("task submission was not JSON: {error}"))?
+            .get("taskUid")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "task submission did not return taskUid".to_owned())?
+            .to_owned();
+        let cross_user = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/tasks/{task_uid}"))
+                    .header("authorization", "Bearer github-bob-assertion")
+                    .body(Body::empty())
+                    .map_err(|error| format!("failed to build cross-user task read: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("cross-user task read failed: {error}"))?;
+        assert_eq!(
+            cross_user.status(),
+            StatusCode::NOT_FOUND,
+            "task lookup must bind to the full resolved submitting identity, not only its service"
+        );
+        const CONTRACT_MAX_TASK_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+        let oversized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/tasks/{task_uid}/inputs"))
+                    .header("authorization", "Bearer github-assertion")
+                    .header("content-type", "application/x-tar")
+                    .body(Body::from(vec![0; CONTRACT_MAX_TASK_ARCHIVE_BYTES + 1]))
+                    .map_err(|error| format!("failed to build oversized Task input: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("oversized Task input request failed: {error}"))?;
+        assert_eq!(
+            oversized.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Task inputs larger than the published 64 MiB limit must be rejected"
+        );
+        assert_eq!(
+            oversized
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json"),
+            "the documented Task error response must remain machine-readable at the size boundary"
+        );
+        let oversized_body = to_bytes(oversized.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("failed to read oversized Task error: {error}"))?;
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&oversized_body)
+                .ok()
+                .and_then(|body| body.get("error").cloned())
+                .is_some(),
+            "the 413 response must match TaskErrorResponse"
+        );
+
+        let archive = vec![0; 2 * 1024 * 1024 + 1];
+        let staged = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/tasks/{task_uid}/inputs"))
+                    .header("authorization", "Bearer github-assertion")
+                    .header("content-type", "application/x-tar")
+                    .body(Body::from(archive.clone()))
+                    .map_err(|error| format!("failed to build task input request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("task input request failed: {error}"))?;
+
+        assert_eq!(
+            staged.status(),
+            StatusCode::NO_CONTENT,
+            "the explicit Task limit must replace axum's smaller default while preserving opaque tar bytes"
+        );
+        {
+            let rows = task_rows
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].input_archive.as_deref(), Some(archive.as_slice()));
+        }
+
+        let execute = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/tasks/{task_uid}/execute"))
+                    .header("authorization", "Bearer github-assertion")
+                    .body(Body::empty())
+                    .map_err(|error| format!("failed to build task execute request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("task execute request failed: {error}"))?;
+        assert_eq!(
+            execute.status(),
+            StatusCode::ACCEPTED,
+            "execute must record desired work instead of running it in the HTTP handler"
+        );
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/tasks/{task_uid}"))
+                    .header("authorization", "Bearer github-assertion")
+                    .body(Body::empty())
+                    .map_err(|error| format!("failed to build task status request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("task status request failed: {error}"))?;
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = to_bytes(status.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("failed to read task status: {error}"))?;
+        let status = serde_json::from_slice::<serde_json::Value>(&body)
+            .map_err(|error| format!("task status was not JSON: {error}"))?;
+        assert_eq!(status.pointer("/phase"), Some(&serde_json::json!("queued")));
+
+        let cancelled = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/tasks/{task_uid}"))
+                    .header("authorization", "Bearer github-assertion")
+                    .body(Body::empty())
+                    .map_err(|error| format!("failed to build task cancellation: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("task cancellation failed: {error}"))?;
+        assert_eq!(
+            cancelled.status(),
+            StatusCode::ACCEPTED,
+            "cancellation must record desired cleanup and return before controller teardown"
+        );
+        {
+            let rows = task_rows
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?;
+            assert_eq!(rows[0].phase, TaskPhase::Cancelled);
+            assert!(rows[0].finalize_requested);
+            assert!(!rows[0].finalized);
+        }
+
+        {
+            let mut rows = task_rows
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?;
+            rows[0].phase = TaskPhase::Failed;
+            rows[0].failure_reason = Some("task agent exited with code 23".to_owned());
+        }
+        let failed = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/tasks/{task_uid}"))
+                    .header("authorization", "Bearer github-assertion")
+                    .body(Body::empty())
+                    .map_err(|error| format!("failed to build failed task status: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("failed task status request failed: {error}"))?;
+        let body = to_bytes(failed.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("failed to read failed task status: {error}"))?;
+        let failed = serde_json::from_slice::<serde_json::Value>(&body)
+            .map_err(|error| format!("failed task status was not JSON: {error}"))?;
+        assert_eq!(
+            failed.pointer("/failureReason"),
+            Some(&serde_json::json!("task agent exited with code 23")),
+            "a failed Task must expose its safe server-generated reason"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pure_service_task_is_attributed_to_its_server_resolved_owner() -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let task_rows = ledger.tasks.clone();
+        let decisions = FakeDecisionChannel::default();
+        let mut workflow = task_workflow("100.00");
+        workflow.name = "scheduled-review".to_owned();
+        let app = router(
+            runtimes.clone(),
+            ledger.clone(),
+            FakeAuthenticator,
+            decisions.clone(),
+        )
+        .merge(task_router(
+            runtimes,
+            ledger,
+            decisions,
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([workflow]),
+        ));
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer scheduled-assertion")
+                .header("idempotency-key", "schedule-firing-123")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"workflow":"scheduled-review","codingAgentRuntime":"agent-v1"}"#,
+                ))
+                .map_err(|error| format!("failed to build scheduled task: {error}"))
+        };
+        let response = app
+            .clone()
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("scheduled task submission failed: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let first_body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("failed to read scheduled task: {error}"))?;
+        let first_uid = serde_json::from_slice::<serde_json::Value>(&first_body)
+            .map_err(|error| format!("scheduled task was not JSON: {error}"))?
+            .get("taskUid")
+            .cloned();
+        let retried = app
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("scheduled task retry failed: {error}"))?;
+        assert_eq!(retried.status(), StatusCode::CREATED);
+        let retry_body = to_bytes(retried.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("failed to read scheduled retry: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&retry_body)
+                .map_err(|error| format!("scheduled retry was not JSON: {error}"))?
+                .get("taskUid")
+                .cloned(),
+            first_uid,
+            "the same submitter idempotency key must return the same task"
+        );
+        let rows = task_rows
+            .lock()
+            .map_err(|_| "fake task ledger lock was poisoned")?;
+        assert_eq!(rows[0].acting_user, None);
+        assert_eq!(
+            rows.len(),
+            1,
+            "idempotent retry must not create a second task"
+        );
+        assert_eq!(rows[0].owner, "owner@example.org");
+        let runtime = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert_eq!(runtime.spec.owner, Email("owner@example.org".to_owned()));
+        assert_eq!(
+            runtime.spec.principal,
+            Principal::Service {
+                name: "scheduled-scanner".to_owned(),
+                acting_user: None,
+            }
+        );
         Ok(())
     }
 

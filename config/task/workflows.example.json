@@ -1,0 +1,30 @@
+[
+  {
+    "name": "code-review",
+    "namespace": "team-a",
+    "codingAgentRuntime": "base",
+    "llms": [
+      {
+        "provider": "provider-a",
+        "model": "model-a"
+      }
+    ],
+    "tools": [
+      {
+        "provider": "github",
+        "resource": "repository",
+        "action": "read"
+      }
+    ],
+    "budget": {
+      "monthlyLimit": "10.00",
+      "currency": "USD"
+    },
+    "ttl": "1h",
+    "command": [
+      "/bin/sh",
+      "-c",
+      "set -eu; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; cp in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\""
+    ]
+  }
+]

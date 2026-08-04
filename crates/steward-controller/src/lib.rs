@@ -14,7 +14,7 @@ use axum::http::{HeaderName, HeaderValue};
 use axum::routing::post;
 use axum::{Json, Router};
 use futures::StreamExt;
-use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
+use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::core::Request as KubeRequest;
 use kube::core::admission::{AdmissionRequest, AdmissionResponse, Operation};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
@@ -29,13 +29,14 @@ use steward_admission::{
 };
 use steward_ports::{
     InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
-    InferenceRequest, ProvisionedInference,
+    InferenceRequest, MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProvisionedInference, SandboxTaskOutput,
+    SandboxTaskRequest, SandboxTaskRuntime,
 };
 pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
-use steward_store::{GrantReversion, PgStore, StoreError};
+use steward_store::{GrantReversion, PgStore, StoreError, TaskRecord};
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, Duration, PENDING_APPROVAL_ANNOTATION,
-    Phase, RuntimeId, RuntimeRefs, runtime_activated_condition,
+    Phase, RuntimeId, RuntimeOwnership, RuntimeRefs, TaskPhase, runtime_activated_condition,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +68,54 @@ enum InferenceAction {
 enum TtlAction {
     Continue { requeue_after: StdDuration },
     Terminate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskRuntimeAction {
+    Wait,
+    Release,
+    Execute,
+    DeleteRuntime,
+    MarkFinalized,
+}
+
+fn task_runtime_action(
+    phase: TaskPhase,
+    ownership: RuntimeOwnership,
+    finalize_requested: bool,
+    runtime_spec: &AgentRuntimeSpec,
+    runtime: Option<&AgentRuntime>,
+) -> TaskRuntimeAction {
+    if finalize_requested {
+        return match (ownership, runtime.is_some()) {
+            (RuntimeOwnership::Adopted, _) | (RuntimeOwnership::Provisioned, false) => {
+                TaskRuntimeAction::MarkFinalized
+            }
+            (RuntimeOwnership::Provisioned, true) => TaskRuntimeAction::DeleteRuntime,
+        };
+    }
+    let Some(runtime) = runtime else {
+        return TaskRuntimeAction::Wait;
+    };
+    if runtime.spec != *runtime_spec
+        || runtime
+            .annotations()
+            .contains_key(PENDING_APPROVAL_ANNOTATION)
+    {
+        return TaskRuntimeAction::Wait;
+    }
+    match phase {
+        TaskPhase::Parked => TaskRuntimeAction::Release,
+        TaskPhase::Queued
+            if runtime
+                .status
+                .as_ref()
+                .is_some_and(|status| status.phase == Phase::Running) =>
+        {
+            TaskRuntimeAction::Execute
+        }
+        _ => TaskRuntimeAction::Wait,
+    }
 }
 
 fn ttl_action(
@@ -418,14 +467,208 @@ pub async fn run_controller_with_store<R: SandboxRuntime>(
     run_controller_inner(client, sandbox_runtime, NoInferencePlane, Some(authority)).await;
 }
 
-pub async fn run_controller_with_planes<R: SandboxRuntime, I: InferencePlane>(
+pub async fn run_controller_with_planes<
+    R: SandboxRuntime + SandboxTaskRuntime + Clone,
+    I: InferencePlane,
+>(
     client: Client,
     sandbox_runtime: R,
     inference: I,
     authority: PgStore,
 ) {
-    run_controller_inner(client, sandbox_runtime, inference, Some(authority)).await;
+    let task_controller =
+        run_task_controller(client.clone(), sandbox_runtime.clone(), authority.clone());
+    let runtime_controller =
+        run_controller_inner(client, sandbox_runtime, inference, Some(authority));
+    tokio::select! {
+        () = task_controller => eprintln!("task controller exited"),
+        () = runtime_controller => eprintln!("runtime controller exited"),
+    }
 }
+
+async fn run_task_controller<R: SandboxTaskRuntime>(
+    client: Client,
+    sandbox_runtime: R,
+    authority: PgStore,
+) {
+    loop {
+        match authority.task_work_items().await {
+            Ok(tasks) => {
+                for task in tasks {
+                    if let Err(error) =
+                        reconcile_task(&client, &sandbox_runtime, &authority, &task).await
+                    {
+                        eprintln!("task reconcile error: {error}");
+                    }
+                }
+            }
+            Err(error) => eprintln!("task queue read failed: {error}"),
+        }
+        tokio::time::sleep(StdDuration::from_secs(1)).await;
+    }
+}
+
+async fn reconcile_task<R: SandboxTaskRuntime>(
+    client: &Client,
+    sandbox_runtime: &R,
+    authority: &PgStore,
+    task: &TaskRecord,
+) -> Result<(), TaskControllerError> {
+    let runtime = task_runtime(client, task).await?;
+    match task_runtime_action(
+        task.phase,
+        task.runtime_ownership,
+        task.finalize_requested,
+        &task.runtime_spec,
+        runtime.as_ref(),
+    ) {
+        TaskRuntimeAction::Wait => Ok(()),
+        TaskRuntimeAction::Release => authority
+            .release_parked_task(task.task_uid)
+            .await
+            .map(|_| ())
+            .map_err(TaskControllerError::Store),
+        TaskRuntimeAction::Execute => {
+            if !authority
+                .claim_task_execution(task.task_uid)
+                .await
+                .map_err(TaskControllerError::Store)?
+            {
+                return Ok(());
+            }
+            let runtime = runtime.ok_or_else(|| {
+                TaskControllerError::InvalidState("claimed task runtime disappeared".to_owned())
+            })?;
+            let refs = runtime
+                .status
+                .as_ref()
+                .map(|status| status.refs.clone())
+                .ok_or_else(|| {
+                    TaskControllerError::InvalidState(
+                        "claimed task runtime has no observed references".to_owned(),
+                    )
+                })?;
+            let input = task.input_archive.as_deref().ok_or_else(|| {
+                TaskControllerError::InvalidState("queued task has no input archive".to_owned())
+            })?;
+            let result = sandbox_runtime
+                .run_task(
+                    &SandboxTaskRequest {
+                        runtime: RuntimeId(task.runtime_uid.clone().ok_or_else(|| {
+                            TaskControllerError::InvalidState(
+                                "task has no bound runtime UID".to_owned(),
+                            )
+                        })?),
+                        refs,
+                        command: task.agent_command.clone(),
+                    },
+                    input,
+                )
+                .await;
+            match result {
+                Ok(SandboxTaskOutput { archive }) => {
+                    if let Some(reason) = task_output_archive_failure(archive.len()) {
+                        authority
+                            .fail_task_execution(task.task_uid, reason)
+                            .await
+                            .map_err(TaskControllerError::Store)
+                    } else {
+                        authority
+                            .complete_task_execution(task.task_uid, &archive)
+                            .await
+                            .map_err(TaskControllerError::Store)
+                    }
+                }
+                Err(error) => {
+                    let reason = task_failure_reason(&error);
+                    authority
+                        .fail_task_execution(task.task_uid, &reason)
+                        .await
+                        .map_err(TaskControllerError::Store)
+                }
+            }
+        }
+        TaskRuntimeAction::DeleteRuntime => {
+            let runtime = runtime.ok_or_else(|| {
+                TaskControllerError::InvalidState("task runtime disappeared".to_owned())
+            })?;
+            let namespace = runtime.namespace().ok_or_else(|| {
+                TaskControllerError::InvalidState("task runtime has no namespace".to_owned())
+            })?;
+            let uid = runtime.metadata.uid.clone().ok_or_else(|| {
+                TaskControllerError::InvalidState("task runtime has no UID".to_owned())
+            })?;
+            Api::<AgentRuntime>::namespaced(client.clone(), &namespace)
+                .delete(
+                    &runtime.name_any(),
+                    &DeleteParams {
+                        preconditions: Some(Preconditions {
+                            uid: Some(uid),
+                            resource_version: None,
+                        }),
+                        ..DeleteParams::default()
+                    },
+                )
+                .await
+                .map(|_| ())
+                .map_err(TaskControllerError::Kubernetes)
+        }
+        TaskRuntimeAction::MarkFinalized => authority
+            .mark_task_finalized(task.task_uid)
+            .await
+            .map_err(TaskControllerError::Store),
+    }
+}
+
+fn task_output_archive_failure(archive_bytes: usize) -> Option<&'static str> {
+    (archive_bytes > MAX_TASK_OUTPUT_ARCHIVE_BYTES)
+        .then_some("Task output archive exceeds the 64 MiB limit")
+}
+
+fn task_failure_reason(error: &PortError) -> String {
+    match error {
+        PortError::Unsupported { operation } => {
+            format!("sandbox does not support task operation {operation}")
+        }
+        PortError::Rejected { reason } | PortError::Failed { reason } => reason.clone(),
+        _ => "sandbox task execution failed".to_owned(),
+    }
+}
+
+async fn task_runtime(
+    client: &Client,
+    task: &TaskRecord,
+) -> Result<Option<AgentRuntime>, TaskControllerError> {
+    let Some(expected_uid) = task.runtime_uid.as_deref() else {
+        return Ok(None);
+    };
+    let runtime = Api::<AgentRuntime>::namespaced(client.clone(), &task.runtime_namespace)
+        .get_opt(&task.runtime_name)
+        .await
+        .map_err(TaskControllerError::Kubernetes)?;
+    Ok(runtime.filter(|runtime| runtime.metadata.uid.as_deref() == Some(expected_uid)))
+}
+
+#[derive(Debug)]
+enum TaskControllerError {
+    Kubernetes(kube::Error),
+    Store(StoreError),
+    InvalidState(String),
+}
+
+impl fmt::Display for TaskControllerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Kubernetes(error) => {
+                write!(formatter, "Kubernetes task operation failed: {error}")
+            }
+            Self::Store(error) => write!(formatter, "task store operation failed: {error}"),
+            Self::InvalidState(reason) => write!(formatter, "task state is invalid: {reason}"),
+        }
+    }
+}
+
+impl Error for TaskControllerError {}
 
 async fn run_controller_inner<R: SandboxRuntime, I: InferencePlane>(
     client: Client,
@@ -2012,23 +2255,118 @@ mod tests {
     use kube::{Client, ResourceExt};
     use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
     use steward_ports::{
-        InferenceCapabilities, InferenceObservation, InferencePlane, InferenceRequest, PortError,
-        ProvisionedInference, SandboxObservation, SandboxRequest, SandboxRuntime,
+        InferenceCapabilities, InferenceObservation, InferencePlane, InferenceRequest,
+        MAX_TASK_OUTPUT_ARCHIVE_BYTES, PortError, ProvisionedInference, SandboxObservation,
+        SandboxRequest, SandboxRuntime,
     };
     use steward_store::GrantReversion;
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget, Duration, Email,
-        ModelRef, Phase, Principal, RuntimeRefs,
+        ModelRef, PENDING_APPROVAL_ANNOTATION, Phase, Principal, RuntimeOwnership, RuntimeRefs,
+        TaskPhase,
     };
     use tower::service_fn;
 
     use super::{
         AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ReconcileDecision,
-        ReconcileIntent, SERVICE_PRINCIPAL_ANNOTATION, authority_action,
+        ReconcileIntent, SERVICE_PRINCIPAL_ANNOTATION, TaskRuntimeAction, authority_action,
         authority_application_action, cleanup_runtime, exhausted_spend_to_preserve,
         inference_action, reconcile_once, replace_as_authority, runtime_authority_action,
-        runtime_ttl_action, status_merge_patch, suspend_runtime_with_inference_cleanup, ttl_action,
+        runtime_ttl_action, status_merge_patch, suspend_runtime_with_inference_cleanup,
+        task_output_archive_failure, task_runtime_action, ttl_action,
     };
+
+    #[test]
+    fn task_state_table_releases_holds_executes_running_runtimes_and_preserves_ownership() {
+        let mut runtime = fixture();
+        runtime.status = Some(AgentRuntimeStatus {
+            phase: Phase::Running,
+            observed_generation: 3,
+            spec_digest: "runtime-spec-digest".to_owned(),
+            refs: RuntimeRefs {
+                workspace: Some("workspace-a".to_owned()),
+                sandbox: Some("sandbox-a".to_owned()),
+                litellm_key: None,
+            },
+            conditions: Vec::new(),
+            spend: None,
+        });
+        assert_eq!(
+            task_runtime_action(
+                TaskPhase::Queued,
+                RuntimeOwnership::Provisioned,
+                false,
+                &runtime.spec,
+                Some(&runtime),
+            ),
+            TaskRuntimeAction::Execute
+        );
+
+        runtime.metadata.annotations.get_or_insert_default().insert(
+            PENDING_APPROVAL_ANNOTATION.to_owned(),
+            "request-digest".to_owned(),
+        );
+        assert_eq!(
+            task_runtime_action(
+                TaskPhase::Parked,
+                RuntimeOwnership::Provisioned,
+                false,
+                &runtime.spec,
+                Some(&runtime),
+            ),
+            TaskRuntimeAction::Wait
+        );
+        runtime
+            .metadata
+            .annotations
+            .get_or_insert_default()
+            .remove(PENDING_APPROVAL_ANNOTATION);
+        assert_eq!(
+            task_runtime_action(
+                TaskPhase::Parked,
+                RuntimeOwnership::Provisioned,
+                false,
+                &runtime.spec,
+                Some(&runtime),
+            ),
+            TaskRuntimeAction::Release
+        );
+
+        assert_eq!(
+            task_runtime_action(
+                TaskPhase::Cancelled,
+                RuntimeOwnership::Provisioned,
+                true,
+                &runtime.spec,
+                Some(&runtime),
+            ),
+            TaskRuntimeAction::DeleteRuntime
+        );
+        assert_eq!(
+            task_runtime_action(
+                TaskPhase::Cancelled,
+                RuntimeOwnership::Adopted,
+                true,
+                &runtime.spec,
+                Some(&runtime),
+            ),
+            TaskRuntimeAction::MarkFinalized
+        );
+    }
+
+    #[test]
+    fn oversized_task_output_is_rejected_before_persistence() {
+        assert_eq!(
+            task_output_archive_failure(MAX_TASK_OUTPUT_ARCHIVE_BYTES),
+            None,
+            "the documented 64 MiB boundary must remain usable"
+        );
+        assert_eq!(
+            task_output_archive_failure(MAX_TASK_OUTPUT_ARCHIVE_BYTES + 1),
+            Some("Task output archive exceeds the 64 MiB limit"),
+            "adapter output over the contract limit must fail before Postgres persistence"
+        );
+    }
 
     #[derive(Default)]
     struct FakeSandboxRuntime {

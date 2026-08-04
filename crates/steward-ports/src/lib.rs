@@ -4,6 +4,11 @@ use std::future::Future;
 
 use steward_types::{AgentType, Budget, ModelRef, RuntimeId, RuntimeRefs, SpendSummary, ToolGrant};
 
+/// Maximum raw tar body accepted by the Task input endpoint.
+pub const MAX_TASK_INPUT_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum raw tar body returned by a Task runtime and persisted as output.
+pub const MAX_TASK_OUTPUT_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Maturity derived from whether a non-fake adapter implements a port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Maturity {
@@ -128,6 +133,29 @@ pub trait SandboxRuntime: Send + Sync + 'static {
         &self,
         request: &SandboxRequest,
     ) -> impl Future<Output = Result<SandboxObservation, PortError>> + Send;
+}
+
+/// One server-selected single-shot command over an opaque input archive.
+///
+/// This extends the class-B sandbox seam; it is not a replaceable plane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SandboxTaskRequest {
+    pub runtime: RuntimeId,
+    pub refs: RuntimeRefs,
+    pub command: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SandboxTaskOutput {
+    pub archive: Vec<u8>,
+}
+
+pub trait SandboxTaskRuntime: Send + Sync + 'static {
+    fn run_task(
+        &self,
+        request: &SandboxTaskRequest,
+        input_archive: &[u8],
+    ) -> impl Future<Output = Result<SandboxTaskOutput, PortError>> + Send;
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

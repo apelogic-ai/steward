@@ -44,6 +44,10 @@ path = "s4.rs"
 name = "s5"
 path = "s5.rs"
 
+[[test]]
+name = "task"
+path = "task.rs"
+
 [[bin]]
 name = "s3-server"
 path = "s3_server.rs"
@@ -51,6 +55,10 @@ path = "s3_server.rs"
 [[bin]]
 name = "s4-server"
 path = "s4_server.rs"
+
+[[bin]]
+name = "task-server"
+path = "task_server.rs"
 
 [dependencies]
 axum = "0.8"

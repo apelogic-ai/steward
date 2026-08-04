@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use axum::serve::Listener;
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
-use steward_apiserver::{KubeRuntimeRepository, KubernetesTokenAuthenticator, router};
+use steward_apiserver::{
+    KubeRuntimeRepository, KubernetesTaskIdentityResolver, KubernetesTokenAuthenticator,
+    StaticTaskWorkflowCatalog, router, task_router,
+};
 use steward_store::PgStore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinError, JoinSet};
@@ -42,12 +45,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
         env::var("STEWARD_ADMIN_GROUP").unwrap_or_else(|_| "agents.apelogic.ai/admin".to_owned()),
         env::var("STEWARD_TOKEN_AUDIENCE").ok(),
     );
-    let app = router(
-        KubeRuntimeRepository::new(client),
-        store,
-        authenticator,
-        decisions,
+    let task_identities = KubernetesTaskIdentityResolver::new(
+        client.clone(),
+        task_token_audience(env::var("STEWARD_TASK_TOKEN_AUDIENCE").ok())?,
     );
+    let task_workflows =
+        StaticTaskWorkflowCatalog::from_json(&required("STEWARD_TASK_WORKFLOWS_JSON")?)
+            .map_err(io::Error::other)?;
+    let runtimes = KubeRuntimeRepository::new(client);
+    let app = router(
+        runtimes.clone(),
+        store.clone(),
+        authenticator,
+        decisions.clone(),
+    )
+    .merge(task_router(
+        runtimes,
+        store,
+        decisions,
+        task_identities,
+        task_workflows,
+    ));
     let listener = tls_listener(
         &env::var("STEWARD_APISERVER_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_owned()),
         &required("STEWARD_TLS_CERT_DER")?,
@@ -60,6 +78,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 fn required(name: &str) -> Result<String, io::Error> {
     env::var(name).map_err(|_| io::Error::other(format!("{name} is required")))
+}
+
+fn task_token_audience(value: Option<String>) -> Result<Option<String>, io::Error> {
+    value
+        .filter(|audience| !audience.is_empty())
+        .map(Some)
+        .ok_or_else(|| io::Error::other("STEWARD_TASK_TOKEN_AUDIENCE is required and non-empty"))
 }
 
 async fn tls_listener(
@@ -162,7 +187,27 @@ mod tests {
     use tokio_rustls::rustls::ServerConfig;
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
-    use super::TlsListener;
+    use super::{TlsListener, task_token_audience};
+
+    #[test]
+    fn task_api_requires_an_explicit_nonempty_token_audience() {
+        assert!(
+            task_token_audience(None).is_err(),
+            "production Task authentication must never omit audience validation"
+        );
+        assert!(
+            task_token_audience(Some(String::new())).is_err(),
+            "an empty Task audience must not disable audience validation"
+        );
+        let audience = task_token_audience(Some("steward-task-api".to_owned()));
+        assert_eq!(
+            audience
+                .as_ref()
+                .ok()
+                .and_then(|configured| configured.as_deref()),
+            Some("steward-task-api")
+        );
+    }
 
     #[tokio::test]
     async fn stalled_tls_handshakes_do_not_serialize_acceptance() -> Result<(), String> {

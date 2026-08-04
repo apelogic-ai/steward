@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SLICE="${STEWARD_E2E_SLICE:-s2}"
-if [[ "${SLICE}" != "s2" && "${SLICE}" != "s5" ]]; then
-  echo "STEWARD_E2E_SLICE must be s2 or s5" >&2
+if [[ "${SLICE}" != "s2" && "${SLICE}" != "s5" && "${SLICE}" != "task" ]]; then
+  echo "STEWARD_E2E_SLICE must be s2, s5, or task" >&2
   exit 2
 fi
 CAPTURE_FORWARD_PID=""
@@ -12,6 +12,7 @@ JIRA_FORWARD_PID=""
 LITELLM_FORWARD_PID=""
 POC_API_FORWARD_PID=""
 POSTGRES_FORWARD_PID=""
+TASK_FORWARD_PID=""
 
 cleanup() {
   status="$1"
@@ -21,7 +22,8 @@ cleanup() {
     "${JIRA_FORWARD_PID}" \
     "${LITELLM_FORWARD_PID}" \
     "${POC_API_FORWARD_PID}" \
-    "${POSTGRES_FORWARD_PID}"
+    "${POSTGRES_FORWARD_PID}" \
+    "${TASK_FORWARD_PID}"
   do
     if [[ -n "${pid}" ]]; then
       kill "${pid}" >/dev/null 2>&1 || true
@@ -42,12 +44,16 @@ do
     exit 2
   fi
 done
-if [[ "${SLICE}" == "s5" && -z "${STEWARD_S5_MCP_GW_IMAGE:-}" ]]; then
-  echo "STEWARD_S5_MCP_GW_IMAGE is required from the ephemeral S5 harness" >&2
+if [[ ("${SLICE}" == "s5" || "${SLICE}" == "task") && -z "${STEWARD_S5_MCP_GW_IMAGE:-}" ]]; then
+  echo "STEWARD_S5_MCP_GW_IMAGE is required from the ephemeral S5/Task harness" >&2
   exit 2
 fi
 if [[ "${SLICE}" == "s5" && -z "${STEWARD_POC_API_IMAGE:-}" ]]; then
   echo "STEWARD_POC_API_IMAGE is required from the ephemeral S5 harness" >&2
+  exit 2
+fi
+if [[ "${SLICE}" == "task" && -z "${STEWARD_TASK_IMAGE:-}" ]]; then
+  echo "STEWARD_TASK_IMAGE is required from the ephemeral Task harness" >&2
   exit 2
 fi
 for command in cargo curl docker jq kind kubectl openssl sed tar; do
@@ -100,11 +106,12 @@ fi
 
 kind load docker-image steward/mint:s1 --name "${cluster_name}"
 kind load docker-image "${STEWARD_S2_CONTROLLER_IMAGE}" --name "${cluster_name}"
-if [[ "${SLICE}" == "s5" ]]; then
+if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   kind load docker-image "${STEWARD_S5_MCP_GW_IMAGE}" --name "${cluster_name}"
+fi
+if [[ "${SLICE}" == "s5" ]]; then
   kind load docker-image "${STEWARD_POC_API_IMAGE}" --name "${cluster_name}"
 fi
-
 KUBECTL=(kubectl --kubeconfig "${STEWARD_TEST_KUBECONFIG}" --context "${STEWARD_TEST_KUBE_CONTEXT}")
 "${KUBECTL[@]}" apply -f "${ROOT}/manifests/agents.apelogic.ai_agentruntimes.yaml"
 "${KUBECTL[@]}" wait --for=condition=Established \
@@ -121,7 +128,7 @@ tls_cert_der="${STEWARD_RUN_DIR}/s2-tls-cert.der"
 openssl rand 32 >"${signing_key}"
 openssl rand -hex 24 | tr -d '\n' >"${introspection_client}"
 openssl rand -hex 32 | tr -d '\n' >"${master_key}"
-if [[ "${SLICE}" == "s5" ]]; then
+if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   openssl rand -base64 32 | tr -d '\n' >"${encryption_key}"
 fi
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${tls_key}" >/dev/null 2>&1
@@ -131,10 +138,9 @@ openssl req -new -x509 -key "${tls_key}" -out "${tls_cert}" -days 1 \
 openssl x509 -in "${tls_cert}" -outform DER -out "${tls_cert_der}"
 openssl pkcs8 -topk8 -nocrypt -in "${tls_key}" -outform DER -out "${tls_key_der}"
 chmod 600 "${signing_key}" "${introspection_client}" "${master_key}" "${tls_key}" "${tls_key_der}"
-if [[ "${SLICE}" == "s5" ]]; then
+if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   chmod 600 "${encryption_key}"
 fi
-
 for namespace in steward-system team-a; do
   "${KUBECTL[@]}" create namespace "${namespace}" --dry-run=client -o yaml |
     "${KUBECTL[@]}" apply -f -
@@ -150,7 +156,7 @@ done
   --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
 "${KUBECTL[@]}" -n steward-system label secret steward-s2-secrets \
   "steward.test/run-id=${STEWARD_RUN_ID}" --overwrite
-if [[ "${SLICE}" == "s5" ]]; then
+if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   "${KUBECTL[@]}" -n steward-system create configmap steward-s5-policy \
     --from-file="mcp_tools.rego=${ROOT}/policy/mcp_tools.rego" \
     --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
@@ -164,16 +170,17 @@ if [[ "${SLICE}" == "s5" ]]; then
     --from-file="introspection-client=${introspection_client}" \
     --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
 fi
-
 rendered_stack="${STEWARD_RUN_DIR}/s2-stack.yaml"
 sed "s#STEWARD_S2_CONTROLLER_IMAGE#${STEWARD_S2_CONTROLLER_IMAGE}#g" \
   "${ROOT}/config/s2/stack.yaml" >"${rendered_stack}"
 "${KUBECTL[@]}" apply -f "${rendered_stack}"
-if [[ "${SLICE}" == "s5" ]]; then
+if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   rendered_tools_stack="${STEWARD_RUN_DIR}/s5-tools-stack.yaml"
   sed "s#STEWARD_S5_MCP_GW_IMAGE#${STEWARD_S5_MCP_GW_IMAGE}#g" \
     "${ROOT}/config/s5/tools-stack.yaml" >"${rendered_tools_stack}"
   "${KUBECTL[@]}" apply -f "${rendered_tools_stack}"
+fi
+if [[ "${SLICE}" == "s5" ]]; then
   rendered_poc_stack="${STEWARD_RUN_DIR}/poc-api-stack.yaml"
   sed \
     -e "s#STEWARD_POC_API_IMAGE#${STEWARD_POC_API_IMAGE}#g" \
@@ -181,18 +188,31 @@ if [[ "${SLICE}" == "s5" ]]; then
     "${ROOT}/config/poc/api-stack.yaml" >"${rendered_poc_stack}"
   "${KUBECTL[@]}" apply -f "${rendered_poc_stack}"
 fi
+if [[ "${SLICE}" == "task" ]]; then
+  rendered_task_stack="${STEWARD_RUN_DIR}/task-stack.yaml"
+  sed \
+    -e "s#STEWARD_TASK_IMAGE#${STEWARD_TASK_IMAGE}#g" \
+    -e "s#STEWARD_RUN_ID#${STEWARD_RUN_ID}#g" \
+    "${ROOT}/config/task/stack.yaml" >"${rendered_task_stack}"
+  "${KUBECTL[@]}" apply -f "${rendered_task_stack}"
+fi
 "${KUBECTL[@]}" -n steward-system rollout status deployment/postgres --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/litellm --timeout=300s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-mint --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-controller --timeout=300s
-if [[ "${SLICE}" == "s5" ]]; then
+if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-mint-tools --timeout=180s
   "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-opa --timeout=180s
   "${KUBECTL[@]}" -n steward-system rollout status deployment/fake-github-mcp --timeout=180s
   "${KUBECTL[@]}" -n steward-system rollout status deployment/mcp-gw --timeout=180s
   "${KUBECTL[@]}" -n steward-system rollout status deployment/hop1-capture --timeout=180s
-  "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-poc-api --timeout=180s
   "${KUBECTL[@]}" -n steward-system wait --for=condition=complete job/seed-mcp-gw --timeout=180s
+fi
+if [[ "${SLICE}" == "s5" ]]; then
+  "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-poc-api --timeout=180s
+fi
+if [[ "${SLICE}" == "task" ]]; then
+  "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-task-server --timeout=180s
 fi
 
 service_subnet="$(
@@ -211,6 +231,8 @@ if [[ "${SLICE}" == "s5" ]]; then
     "${ROOT}/config/s5/tool-provider-profile.yaml"
     "${ROOT}/config/s5/inference-provider-profile.yaml"
   )
+elif [[ "${SLICE}" == "task" ]]; then
+  profile_sources=("${ROOT}/config/s5/tool-provider-profile.yaml")
 else
   profile_sources=("${ROOT}/config/s2/provider-profile.yaml")
 fi
@@ -269,6 +291,11 @@ if [[ "${SLICE}" == "s5" ]]; then
   "${KUBECTL[@]}" -n steward-system port-forward service/steward-poc-api :8081 >"${jira_log}" 2>&1 &
   JIRA_FORWARD_PID=$!
 fi
+if [[ "${SLICE}" == "task" ]]; then
+  task_log="${STEWARD_RUN_DIR}/task-server-forward.log"
+  "${KUBECTL[@]}" -n steward-system port-forward service/steward-task-server :8082 >"${task_log}" 2>&1 &
+  TASK_FORWARD_PID=$!
+fi
 
 forwarded_port() {
   local log="$1"
@@ -301,11 +328,17 @@ if [[ "${SLICE}" == "s5" ]]; then
   export STEWARD_TEST_JIRA_URL="http://127.0.0.1:${jira_port}"
   export STEWARD_TEST_TLS_CA="${tls_cert}"
 fi
+if [[ "${SLICE}" == "task" ]]; then
+  task_port="$(forwarded_port "${task_log}" "${TASK_FORWARD_PID}")"
+  export STEWARD_TASK_URL="http://127.0.0.1:${task_port}"
+fi
 export STEWARD_OPENSHELL_CLI="${OPEN_SHELL}"
 export STEWARD_TEST_DATABASE_URL="postgres://steward@127.0.0.1:${postgres_port}/steward"
 if [[ "${SLICE}" == "s5" ]]; then
   export STEWARD_TEST_INFERENCE_URL="http://hop1-capture-inference.steward-system.svc.cluster.local:8085/inference"
   export STEWARD_TEST_TOOL_URL="http://hop1-capture-tools.steward-system.svc.cluster.local:8085/mcp"
+elif [[ "${SLICE}" == "task" ]]; then
+  :
 else
   export STEWARD_TEST_INFERENCE_URL="http://litellm.steward-system.svc.cluster.local:4000/v1/chat/completions"
 fi
@@ -317,6 +350,8 @@ if [[ "${SLICE}" == "s5" ]]; then
     e2e_s5_terminated_runtime_holds_nothing -- --exact
   cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s5 \
     e2e_poc_golden_journey -- --exact
+elif [[ "${SLICE}" == "task" ]]; then
+  cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test task -- --nocapture
 else
   cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s2_store
   cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s2 \

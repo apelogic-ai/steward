@@ -185,6 +185,26 @@ pub struct SpendSummary {
     pub currency: String,
 }
 
+/// Durable lifecycle state for one single-shot governed task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskPhase {
+    Submitted,
+    Parked,
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeOwnership {
+    Provisioned,
+    Adopted,
+}
+
 pub fn agent_runtime_crd() -> CustomResourceDefinition {
     AgentRuntime::crd()
 }

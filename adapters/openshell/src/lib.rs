@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 #[cfg(feature = "runtime")]
 use std::future::Future;
+#[cfg(feature = "runtime")]
+use std::time::Duration as StdDuration;
 
 #[cfg(feature = "identity")]
 use kube::Client;
@@ -22,13 +24,17 @@ use openshell_sdk::raw::proto::{
 };
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
-    ClientConfig, OpenShellClient, SandboxPhase, SandboxSpec, SdkError, WorkspaceScopedClient,
+    ClientConfig, ExecOptions, OpenShellClient, SandboxPhase, SandboxSpec, SdkError,
+    WorkspaceScopedClient,
 };
 use sha2::{Digest, Sha256};
 #[cfg(feature = "runtime")]
 use steward_ports::PortError;
 #[cfg(feature = "runtime")]
-use steward_ports::{SandboxObservation, SandboxRequest, SandboxRuntime};
+use steward_ports::{
+    SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskOutput, SandboxTaskRequest,
+    SandboxTaskRuntime,
+};
 #[cfg(feature = "runtime")]
 use steward_types::RuntimeRefs;
 
@@ -681,6 +687,113 @@ impl SandboxRuntime for OpenShellRuntime {
         } else {
             Ok(SandboxObservation::Absent)
         }
+    }
+}
+
+#[cfg(feature = "runtime")]
+impl SandboxTaskRuntime for OpenShellRuntime {
+    async fn run_task(
+        &self,
+        request: &SandboxTaskRequest,
+        input_archive: &[u8],
+    ) -> Result<SandboxTaskOutput, PortError> {
+        let workspace = request
+            .refs
+            .workspace
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PortError::Rejected {
+                reason: "task runtime has no sandbox workspace reference".to_owned(),
+            })?;
+        let sandbox = request
+            .refs
+            .sandbox
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PortError::Rejected {
+                reason: "task runtime has no sandbox name reference".to_owned(),
+            })?;
+        if request.command.is_empty() || request.command.iter().any(String::is_empty) {
+            return Err(PortError::Rejected {
+                reason: "task command must contain only non-empty arguments".to_owned(),
+            });
+        }
+        let scoped = self.client.workspace(workspace);
+        let snapshot = scoped.get_sandbox(sandbox).await.map_err(port_failure)?;
+        if snapshot.labels.get(RUNTIME_UID_LABEL).map(String::as_str)
+            != Some(request.runtime.0.as_str())
+        {
+            return Err(PortError::Rejected {
+                reason: "task sandbox is bound to a different runtime UID".to_owned(),
+            });
+        }
+        let stage = scoped
+            .exec(
+                sandbox,
+                &[
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "set -eu; rm -rf /sandbox/steward-input /sandbox/steward-output; mkdir -p /sandbox/steward-input /sandbox/steward-output; tar -xf - -C /sandbox/steward-input".to_owned(),
+                ],
+                ExecOptions {
+                    timeout: Some(StdDuration::from_secs(120)),
+                    stdin: Some(input_archive.to_vec()),
+                    ..ExecOptions::default()
+                },
+            )
+            .await
+            .map_err(port_failure)?;
+        if stage.exit_code != 0 {
+            return Err(PortError::Rejected {
+                reason: "task input archive could not be staged".to_owned(),
+            });
+        }
+        let mut environment = HashMap::new();
+        environment.insert(
+            "STEWARD_OUTPUT_DIR".to_owned(),
+            "/sandbox/steward-output".to_owned(),
+        );
+        let executed = scoped
+            .exec(
+                sandbox,
+                &request.command,
+                ExecOptions {
+                    workdir: Some("/sandbox/steward-input".to_owned()),
+                    environment,
+                    timeout: Some(StdDuration::from_secs(30 * 60)),
+                    ..ExecOptions::default()
+                },
+            )
+            .await
+            .map_err(port_failure)?;
+        if executed.exit_code != 0 {
+            return Err(PortError::Failed {
+                reason: format!("task agent exited with code {}", executed.exit_code),
+            });
+        }
+        let collected = scoped
+            .exec(
+                sandbox,
+                &[
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    "set -eu; tar -cf - -C /sandbox/steward-output .".to_owned(),
+                ],
+                ExecOptions {
+                    timeout: Some(StdDuration::from_secs(120)),
+                    ..ExecOptions::default()
+                },
+            )
+            .await
+            .map_err(port_failure)?;
+        if collected.exit_code != 0 {
+            return Err(PortError::Failed {
+                reason: "task output archive could not be collected".to_owned(),
+            });
+        }
+        Ok(SandboxTaskOutput {
+            archive: collected.stdout,
+        })
     }
 }
 

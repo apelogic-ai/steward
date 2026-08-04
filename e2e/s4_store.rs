@@ -6,8 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
-use steward_store::{ApproveAdmission, ParkRejection, PgStore, StoreError};
-use steward_types::{AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal};
+use steward_store::{ApproveAdmission, ParkRejection, PgStore, StoreError, TaskReservationRequest};
+use steward_types::{
+    AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal, RuntimeOwnership,
+    TaskPhase,
+};
 
 fn proposed_spec() -> AgentRuntimeSpec {
     AgentRuntimeSpec {
@@ -30,6 +33,100 @@ fn proposed_spec() -> AgentRuntimeSpec {
         ttl: Duration("24h".to_owned()),
         bindings: None,
     }
+}
+
+#[tokio::test]
+async fn task_submission_state_is_idempotent_durable_and_single_claimed()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Task Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let idempotency_key = format!("job-{suffix}");
+    let runtime_name = format!("task-{suffix}");
+    let runtime_uid = format!("runtime-{suffix}");
+    let spec = proposed_spec();
+    let command = vec!["agent-v1".to_owned()];
+    let request = TaskReservationRequest {
+        idempotency_key: &idempotency_key,
+        submitter_service: "steward-run",
+        acting_user: Some("alice@example.com"),
+        owner: "alice@example.com",
+        workflow: "code-review",
+        coding_agent_runtime: "agent-v1",
+        runtime_namespace: "team-a",
+        runtime_name: &runtime_name,
+        runtime_ownership: RuntimeOwnership::Provisioned,
+        runtime_spec: &spec,
+        agent_command: &command,
+    };
+    let first = store.reserve_task(&request).await?;
+    assert!(first.inserted);
+    let second = store.reserve_task(&request).await?;
+    assert!(!second.inserted);
+    assert_eq!(second.record.task_uid, first.record.task_uid);
+
+    store
+        .bind_task_runtime(first.record.task_uid, &runtime_uid, TaskPhase::Submitted)
+        .await?;
+    let archive = b"neutral-tar-fixture";
+    store
+        .put_task_inputs(
+            first.record.task_uid,
+            "steward-run",
+            Some("alice@example.com"),
+            archive,
+        )
+        .await?;
+    store
+        .request_task_execution(
+            first.record.task_uid,
+            "steward-run",
+            Some("alice@example.com"),
+        )
+        .await?;
+    assert!(store.claim_task_execution(first.record.task_uid).await?);
+    assert!(
+        !store.claim_task_execution(first.record.task_uid).await?,
+        "a task execution must have only one durable winner"
+    );
+    store
+        .complete_task_execution(first.record.task_uid, b"neutral-output-tar")
+        .await?;
+    let completed = store
+        .task(first.record.task_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("completed task disappeared"))?;
+    assert_eq!(completed.phase, TaskPhase::Succeeded);
+    assert_eq!(
+        completed.output_archive.as_deref(),
+        Some(b"neutral-output-tar".as_slice())
+    );
+    store
+        .request_task_finalization(
+            first.record.task_uid,
+            "steward-run",
+            Some("alice@example.com"),
+        )
+        .await?;
+    store.mark_task_finalized(first.record.task_uid).await?;
+    assert!(
+        store
+            .task(first.record.task_uid)
+            .await?
+            .ok_or_else(|| io::Error::other("finalized task disappeared"))?
+            .finalized
+    );
+    Ok(())
 }
 
 fn budget_deltas() -> Vec<AdmissionDelta> {
