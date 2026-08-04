@@ -4,6 +4,11 @@ use std::future::Future;
 
 use steward_types::{AgentType, Budget, ModelRef, RuntimeId, RuntimeRefs, SpendSummary, ToolGrant};
 
+/// Maximum raw tar body accepted by the Task input endpoint.
+pub const MAX_TASK_INPUT_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum raw tar body returned by a Task runtime and persisted as output.
+pub const MAX_TASK_OUTPUT_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Maturity derived from whether a non-fake adapter implements a port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Maturity {

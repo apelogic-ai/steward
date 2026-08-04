@@ -15,8 +15,11 @@ async fn task_submission_real_sandbox_lifecycle() -> Result<(), Box<dyn Error>> 
     let base_url = required("STEWARD_TASK_URL")?;
     let runtime_api = Api::<AgentRuntime>::all(kube::Client::try_default().await?);
     let run_dir = PathBuf::from(required("STEWARD_RUN_DIR")?).join("task-client");
-    fs::create_dir_all(run_dir.join("input"))?;
-    fs::write(run_dir.join("input/input.txt"), b"governed task payload\n")?;
+    fs::create_dir_all(run_dir.join("input/in"))?;
+    fs::write(
+        run_dir.join("input/in/payload.bin"),
+        b"governed task payload\n",
+    )?;
     let input_tar = run_dir.join("input.tar");
     command(
         Command::new("tar")
@@ -100,11 +103,11 @@ async fn task_submission_real_sandbox_lifecycle() -> Result<(), Box<dyn Error>> 
         "extract task output tar",
     )?;
     assert_eq!(
-        fs::read(output_dir.join("input.txt"))?,
+        fs::read(output_dir.join("out/payload.bin"))?,
         b"governed task payload\n"
     );
     assert!(
-        fs::read_to_string(output_dir.join("tool.json"))?
+        fs::read_to_string(output_dir.join("out/tool.json"))?
             .contains("example-org/fixture-repository"),
         "the Task output must contain the governed tool result"
     );

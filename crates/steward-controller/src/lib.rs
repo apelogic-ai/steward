@@ -29,8 +29,8 @@ use steward_admission::{
 };
 use steward_ports::{
     InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
-    InferenceRequest, ProvisionedInference, SandboxTaskOutput, SandboxTaskRequest,
-    SandboxTaskRuntime,
+    InferenceRequest, MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProvisionedInference, SandboxTaskOutput,
+    SandboxTaskRequest, SandboxTaskRuntime,
 };
 pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
 use steward_store::{GrantReversion, PgStore, StoreError, TaskRecord};
@@ -566,10 +566,19 @@ async fn reconcile_task<R: SandboxTaskRuntime>(
                 )
                 .await;
             match result {
-                Ok(SandboxTaskOutput { archive }) => authority
-                    .complete_task_execution(task.task_uid, &archive)
-                    .await
-                    .map_err(TaskControllerError::Store),
+                Ok(SandboxTaskOutput { archive }) => {
+                    if let Some(reason) = task_output_archive_failure(archive.len()) {
+                        authority
+                            .fail_task_execution(task.task_uid, reason)
+                            .await
+                            .map_err(TaskControllerError::Store)
+                    } else {
+                        authority
+                            .complete_task_execution(task.task_uid, &archive)
+                            .await
+                            .map_err(TaskControllerError::Store)
+                    }
+                }
                 Err(error) => {
                     let reason = task_failure_reason(&error);
                     authority
@@ -609,6 +618,11 @@ async fn reconcile_task<R: SandboxTaskRuntime>(
             .await
             .map_err(TaskControllerError::Store),
     }
+}
+
+fn task_output_archive_failure(archive_bytes: usize) -> Option<&'static str> {
+    (archive_bytes > MAX_TASK_OUTPUT_ARCHIVE_BYTES)
+        .then_some("Task output archive exceeds the 64 MiB limit")
 }
 
 fn task_failure_reason(error: &PortError) -> String {
@@ -2241,8 +2255,9 @@ mod tests {
     use kube::{Client, ResourceExt};
     use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
     use steward_ports::{
-        InferenceCapabilities, InferenceObservation, InferencePlane, InferenceRequest, PortError,
-        ProvisionedInference, SandboxObservation, SandboxRequest, SandboxRuntime,
+        InferenceCapabilities, InferenceObservation, InferencePlane, InferenceRequest,
+        MAX_TASK_OUTPUT_ARCHIVE_BYTES, PortError, ProvisionedInference, SandboxObservation,
+        SandboxRequest, SandboxRuntime,
     };
     use steward_store::GrantReversion;
     use steward_types::{
@@ -2258,7 +2273,7 @@ mod tests {
         authority_application_action, cleanup_runtime, exhausted_spend_to_preserve,
         inference_action, reconcile_once, replace_as_authority, runtime_authority_action,
         runtime_ttl_action, status_merge_patch, suspend_runtime_with_inference_cleanup,
-        task_runtime_action, ttl_action,
+        task_output_archive_failure, task_runtime_action, ttl_action,
     };
 
     #[test]
@@ -2336,6 +2351,20 @@ mod tests {
                 Some(&runtime),
             ),
             TaskRuntimeAction::MarkFinalized
+        );
+    }
+
+    #[test]
+    fn oversized_task_output_is_rejected_before_persistence() {
+        assert_eq!(
+            task_output_archive_failure(MAX_TASK_OUTPUT_ARCHIVE_BYTES),
+            None,
+            "the documented 64 MiB boundary must remain usable"
+        );
+        assert_eq!(
+            task_output_archive_failure(MAX_TASK_OUTPUT_ARCHIVE_BYTES + 1),
+            Some("Task output archive exceeds the 64 MiB limit"),
+            "adapter output over the contract limit must fail before Postgres persistence"
         );
     }
 

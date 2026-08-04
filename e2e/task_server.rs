@@ -113,15 +113,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     let task_command = concat!(
-        "set -eu; cp input.txt \"$STEWARD_OUTPUT_DIR/input.txt\"; ",
+        "set -eu; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; ",
+        "cp in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"; ",
         "attempt=0; while :; do ",
         "curl -sS --max-time 20 -H 'Content-Type: application/json' ",
         "-H 'MCP-Protocol-Version: 2025-06-18' ",
         "-d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",",
         "\"params\":{\"name\":\"search_repositories\",\"arguments\":{}}}' ",
         "http://hop1-capture-tools.steward-system.svc.cluster.local:8085/mcp ",
-        "> \"$STEWARD_OUTPUT_DIR/tool.json\"; ",
-        "if grep -q 'example-org/fixture-repository' \"$STEWARD_OUTPUT_DIR/tool.json\"; ",
+        "> \"$STEWARD_OUTPUT_DIR/out/tool.json\"; ",
+        "if grep -q 'example-org/fixture-repository' \"$STEWARD_OUTPUT_DIR/out/tool.json\"; ",
         "then break; fi; attempt=$((attempt + 1)); ",
         "if [ \"$attempt\" -ge 60 ]; then exit 1; fi; sleep 1; done",
     );

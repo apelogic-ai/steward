@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let task_identities = KubernetesTaskIdentityResolver::new(
         client.clone(),
-        env::var("STEWARD_TASK_TOKEN_AUDIENCE").ok(),
+        task_token_audience(env::var("STEWARD_TASK_TOKEN_AUDIENCE").ok())?,
     );
     let task_workflows =
         StaticTaskWorkflowCatalog::from_json(&required("STEWARD_TASK_WORKFLOWS_JSON")?)
@@ -78,6 +78,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 fn required(name: &str) -> Result<String, io::Error> {
     env::var(name).map_err(|_| io::Error::other(format!("{name} is required")))
+}
+
+fn task_token_audience(value: Option<String>) -> Result<Option<String>, io::Error> {
+    value
+        .filter(|audience| !audience.is_empty())
+        .map(Some)
+        .ok_or_else(|| io::Error::other("STEWARD_TASK_TOKEN_AUDIENCE is required and non-empty"))
 }
 
 async fn tls_listener(
@@ -180,7 +187,27 @@ mod tests {
     use tokio_rustls::rustls::ServerConfig;
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
-    use super::TlsListener;
+    use super::{TlsListener, task_token_audience};
+
+    #[test]
+    fn task_api_requires_an_explicit_nonempty_token_audience() {
+        assert!(
+            task_token_audience(None).is_err(),
+            "production Task authentication must never omit audience validation"
+        );
+        assert!(
+            task_token_audience(Some(String::new())).is_err(),
+            "an empty Task audience must not disable audience validation"
+        );
+        let audience = task_token_audience(Some("steward-task-api".to_owned()));
+        assert_eq!(
+            audience
+                .as_ref()
+                .ok()
+                .and_then(|configured| configured.as_deref()),
+            Some("steward-task-api")
+        );
+    }
 
     #[tokio::test]
     async fn stalled_tls_handshakes_do_not_serialize_acceptance() -> Result<(), String> {

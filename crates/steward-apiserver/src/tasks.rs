@@ -3,7 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::rejection::BytesRejection;
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -14,6 +15,7 @@ use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, evaluate_with_grants};
+use steward_ports::MAX_TASK_INPUT_ARCHIVE_BYTES;
 use steward_store::{ParkRejection, PgStore, StoreError, TaskRecord, TaskReservationRequest};
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, Budget, Duration, Email, ModelRef, PENDING_APPROVAL_ANNOTATION,
@@ -344,9 +346,10 @@ pub struct TaskSubmissionRequest {
     pub agent_runtime_uid: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskStatusResponse {
+    #[schema(value_type = String, format = "uuid")]
     pub task_uid: Uuid,
     pub runtime_uid: String,
     pub phase: TaskPhase,
@@ -355,8 +358,46 @@ pub struct TaskStatusResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<TaskAdmissionDelta>)]
     pub deltas: Vec<AdmissionDelta>,
 }
+
+/// Machine-readable shape of an admission delta returned in Task status.
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", tag = "dimension")]
+pub enum TaskAdmissionDelta {
+    Budget {
+        requested: String,
+        ceiling: String,
+        currency: String,
+    },
+    Ttl {
+        requested: String,
+        ceiling: String,
+    },
+    Models {
+        requested: Vec<ModelRef>,
+        ceiling: Vec<ModelRef>,
+    },
+    Tools {
+        requested: Vec<ToolGrant>,
+        ceiling: Vec<ToolGrant>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskErrorResponse {
+    pub error: String,
+}
+
+#[derive(utoipa::ToSchema)]
+#[schema(
+    value_type = String,
+    format = Binary,
+    description = "Opaque tar archive, limited to 67,108,864 raw bytes"
+)]
+pub struct TaskArchive(pub Vec<u8>);
 
 #[derive(Clone)]
 struct TaskApiState<R, L, D, I, W> {
@@ -399,6 +440,7 @@ where
             "/v1/tasks/{task_uid}",
             get(get_task::<R, L, D, I, W>).delete(delete_task::<R, L, D, I, W>),
         )
+        .layer(DefaultBodyLimit::max(MAX_TASK_INPUT_ARCHIVE_BYTES))
         .with_state(TaskApiState {
             runtimes,
             ledger,
@@ -556,7 +598,7 @@ async fn put_task_inputs<R, L, D, I, W>(
     State(state): State<TaskApiState<R, L, D, I, W>>,
     Path(task_uid): Path<Uuid>,
     headers: HeaderMap,
-    archive: Bytes,
+    archive: Result<Bytes, BytesRejection>,
 ) -> Response
 where
     R: RuntimeRepository,
@@ -565,6 +607,18 @@ where
     I: TaskIdentityResolver,
     W: TaskWorkflowCatalog,
 {
+    let archive = match archive {
+        Ok(archive) => archive,
+        Err(rejection) => {
+            let status = rejection.status();
+            let error = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                "Task input archive exceeds the 64 MiB limit"
+            } else {
+                "Task input archive body could not be read"
+            };
+            return (status, Json(serde_json::json!({"error": error}))).into_response();
+        }
+    };
     if headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())

@@ -3,9 +3,10 @@
 mod tasks;
 
 pub use tasks::{
-    KubernetesTaskIdentityResolver, StaticTaskWorkflowCatalog, TaskAuthenticationError,
-    TaskIdentity, TaskIdentityResolver, TaskStatusResponse, TaskSubmissionLedger,
-    TaskSubmissionRequest, TaskWorkflow, TaskWorkflowCatalog, task_router,
+    KubernetesTaskIdentityResolver, StaticTaskWorkflowCatalog, TaskAdmissionDelta, TaskArchive,
+    TaskAuthenticationError, TaskErrorResponse, TaskIdentity, TaskIdentityResolver,
+    TaskStatusResponse, TaskSubmissionLedger, TaskSubmissionRequest, TaskWorkflow,
+    TaskWorkflowCatalog, task_router,
 };
 
 use std::collections::BTreeSet;
@@ -194,11 +195,45 @@ pub struct GrantRevocationRequest {
     paths(
         create_runtime_contract,
         budget_increase_contract,
-        task_submission_contract
+        task_submission_contract,
+        task_inputs_contract,
+        task_execute_contract,
+        task_status_contract,
+        task_outputs_contract,
+        task_delete_contract
     ),
-    components(schemas(CreateRuntimeRequest, BudgetIncrease, TaskSubmissionRequest))
+    components(schemas(
+        CreateRuntimeRequest,
+        BudgetIncrease,
+        TaskSubmissionRequest,
+        TaskStatusResponse,
+        TaskAdmissionDelta,
+        TaskArchive,
+        TaskErrorResponse
+    )),
+    modifiers(&TaskSecurity)
 )]
 pub struct ApiDoc;
+
+struct TaskSecurity;
+
+impl utoipa::Modify for TaskSecurity {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "taskBearer",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("OIDC assertion")
+                        .build(),
+                ),
+            );
+        }
+    }
+}
 
 #[utoipa::path(
     post,
@@ -241,21 +276,111 @@ pub async fn budget_increase_contract() {}
 #[utoipa::path(
     post,
     path = "/v1/tasks",
-    request_body = TaskSubmissionRequest,
+    request_body(content = TaskSubmissionRequest, content_type = "application/json"),
     params(
         ("Idempotency-Key" = String, Header, description = "Submitter-scoped upstream job identity")
     ),
+    security(("taskBearer" = [])),
     responses(
-        (status = 201, description = "Task desired state and runtime binding recorded"),
-        (status = 202, description = "Task parked on a governed approval hold"),
-        (status = 401, description = "Identity assertion is invalid"),
-        (status = 409, description = "Idempotency key or adopted runtime conflicts"),
-        (status = 422, description = "Workflow, runtime version, or authority is invalid"),
-        (status = 503, description = "Identity, Kubernetes, or persistence dependency unavailable")
+        (status = 201, description = "Task admitted without an approval hold and bound to its runtime", body = TaskStatusResponse, content_type = "application/json"),
+        (status = 202, description = "Task parked on a governed approval hold; execution resumes after approval", body = TaskStatusResponse, content_type = "application/json"),
+        (status = 400, description = "Submission JSON is malformed", body = String, content_type = "text/plain"),
+        (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Selected workflow does not exist", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 409, description = "Idempotency key or adopted runtime conflicts", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 415, description = "Content-Type is not application/json", body = String, content_type = "text/plain"),
+        (status = 422, description = "Workflow, runtime version, service envelope, or authority is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity, Kubernetes, persistence, or decision dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
     )
 )]
 #[doc(hidden)]
 pub async fn task_submission_contract() {}
+
+#[utoipa::path(
+    put,
+    path = "/v1/tasks/{taskUid}/inputs",
+    params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
+    request_body(content = TaskArchive, content_type = "application/x-tar", description = "Opaque workspace-relative tar archive; maximum 64 MiB"),
+    security(("taskBearer" = [])),
+    responses(
+        (status = 204, description = "Input archive staged durably; an identical retry is idempotent"),
+        (status = 400, description = "taskUid is not a UUID", body = String, content_type = "text/plain"),
+        (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Task is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 409, description = "Task no longer accepts inputs or the retry body differs", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 413, description = "Input archive exceeds 64 MiB", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 415, description = "Content-Type is not application/x-tar", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+    )
+)]
+#[doc(hidden)]
+pub async fn task_inputs_contract() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/tasks/{taskUid}/execute",
+    params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
+    security(("taskBearer" = [])),
+    responses(
+        (status = 202, description = "Execution requested durably; repeated requests are idempotent", body = TaskStatusResponse, content_type = "application/json"),
+        (status = 400, description = "taskUid is not a UUID", body = String, content_type = "text/plain"),
+        (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Task is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 409, description = "Inputs are absent, cleanup was requested, or the phase cannot execute", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+    )
+)]
+#[doc(hidden)]
+pub async fn task_execute_contract() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/tasks/{taskUid}",
+    params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
+    security(("taskBearer" = [])),
+    responses(
+        (status = 200, description = "Current durable Task phase and cleanup state", body = TaskStatusResponse, content_type = "application/json"),
+        (status = 400, description = "taskUid is not a UUID", body = String, content_type = "text/plain"),
+        (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Task is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+    )
+)]
+#[doc(hidden)]
+pub async fn task_status_contract() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/tasks/{taskUid}/outputs",
+    params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
+    security(("taskBearer" = [])),
+    responses(
+        (status = 200, description = "Opaque workspace-relative output tar archive; maximum 64 MiB", body = TaskArchive, content_type = "application/x-tar"),
+        (status = 400, description = "taskUid is not a UUID", body = String, content_type = "text/plain"),
+        (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Task is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 409, description = "Task has not succeeded or output is not available", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+    )
+)]
+#[doc(hidden)]
+pub async fn task_outputs_contract() {}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/tasks/{taskUid}",
+    params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
+    security(("taskBearer" = [])),
+    responses(
+        (status = 202, description = "Cleanup requested durably; repeated requests are idempotent", body = TaskStatusResponse, content_type = "application/json"),
+        (status = 400, description = "taskUid is not a UUID", body = String, content_type = "text/plain"),
+        (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 404, description = "Task is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+    )
+)]
+#[doc(hidden)]
+pub async fn task_delete_contract() {}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(
@@ -2291,6 +2416,197 @@ mod tests {
                 "runtime create OpenAPI is missing its {schema} component"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn task_lifecycle_is_fully_published_in_the_openapi_contract() -> Result<(), String> {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        let operations = [
+            (
+                "/paths/~1v1~1tasks/post",
+                ["201", "202"].as_slice(),
+                [
+                    ("400", "text/plain"),
+                    ("401", "application/json"),
+                    ("404", "application/json"),
+                    ("409", "application/json"),
+                    ("415", "text/plain"),
+                    ("422", "application/json"),
+                    ("503", "application/json"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "/paths/~1v1~1tasks~1{taskUid}~1inputs/put",
+                ["204"].as_slice(),
+                [
+                    ("400", "text/plain"),
+                    ("401", "application/json"),
+                    ("404", "application/json"),
+                    ("409", "application/json"),
+                    ("413", "application/json"),
+                    ("415", "application/json"),
+                    ("503", "application/json"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "/paths/~1v1~1tasks~1{taskUid}~1execute/post",
+                ["202"].as_slice(),
+                [
+                    ("400", "text/plain"),
+                    ("401", "application/json"),
+                    ("404", "application/json"),
+                    ("409", "application/json"),
+                    ("503", "application/json"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "/paths/~1v1~1tasks~1{taskUid}/get",
+                ["200"].as_slice(),
+                [
+                    ("400", "text/plain"),
+                    ("401", "application/json"),
+                    ("404", "application/json"),
+                    ("503", "application/json"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "/paths/~1v1~1tasks~1{taskUid}~1outputs/get",
+                ["200"].as_slice(),
+                [
+                    ("400", "text/plain"),
+                    ("401", "application/json"),
+                    ("404", "application/json"),
+                    ("409", "application/json"),
+                    ("503", "application/json"),
+                ]
+                .as_slice(),
+            ),
+            (
+                "/paths/~1v1~1tasks~1{taskUid}/delete",
+                ["202"].as_slice(),
+                [
+                    ("400", "text/plain"),
+                    ("401", "application/json"),
+                    ("404", "application/json"),
+                    ("503", "application/json"),
+                ]
+                .as_slice(),
+            ),
+        ];
+        for (pointer, success_statuses, error_responses) in operations {
+            let operation = document
+                .pointer(pointer)
+                .ok_or_else(|| format!("Task operation {pointer} is absent from OpenAPI"))?;
+            assert_eq!(
+                operation.pointer("/security/0/taskBearer/type"),
+                None,
+                "operation security must reference, not inline, the taskBearer scheme"
+            );
+            assert!(
+                operation.pointer("/security/0/taskBearer").is_some(),
+                "Task operation {pointer} must require taskBearer"
+            );
+            for status in success_statuses {
+                assert!(
+                    operation.pointer(&format!("/responses/{status}")).is_some(),
+                    "Task operation {pointer} is missing success status {status}"
+                );
+            }
+            for (status, content_type) in error_responses {
+                let content_type = content_type.replace('/', "~1");
+                assert!(
+                    operation
+                        .pointer(&format!(
+                            "/responses/{status}/content/{content_type}/schema"
+                        ))
+                        .is_some(),
+                    "Task {pointer} error {status} must publish its {content_type} schema"
+                );
+            }
+        }
+
+        assert_eq!(
+            document.pointer("/components/securitySchemes/taskBearer/type"),
+            Some(&serde_json::json!("http"))
+        );
+        assert_eq!(
+            document.pointer("/components/securitySchemes/taskBearer/scheme"),
+            Some(&serde_json::json!("bearer"))
+        );
+        let status = document
+            .pointer("/components/schemas/TaskStatusResponse")
+            .ok_or_else(|| "TaskStatusResponse schema is absent".to_owned())?;
+        for property in [
+            "taskUid",
+            "runtimeUid",
+            "phase",
+            "runtimeOwnership",
+            "finalized",
+            "failureReason",
+            "deltas",
+        ] {
+            assert!(
+                status.pointer(&format!("/properties/{property}")).is_some(),
+                "TaskStatusResponse is missing {property}"
+            );
+        }
+        assert_eq!(
+            document.pointer("/components/schemas/TaskPhase/enum"),
+            Some(&serde_json::json!([
+                "submitted",
+                "parked",
+                "queued",
+                "running",
+                "succeeded",
+                "failed",
+                "cancelled"
+            ]))
+        );
+        assert!(
+            document
+                .pointer("/components/schemas/TaskAdmissionDelta")
+                .is_some(),
+            "Task admission deltas must be machine-readable"
+        );
+        let submission = document
+            .pointer("/paths/~1v1~1tasks/post/responses")
+            .ok_or_else(|| "Task submission responses are absent".to_owned())?;
+        assert!(
+            submission
+                .pointer("/201/description")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains("without an approval hold")),
+            "201 must explicitly mean admitted without a hold"
+        );
+        assert!(
+            submission
+                .pointer("/202/description")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains("parked")),
+            "202 must explicitly mean parked for approval"
+        );
+        assert!(
+            document
+                .pointer(
+                    "/paths/~1v1~1tasks~1{taskUid}~1inputs/put/requestBody/content/application~1x-tar/schema",
+                )
+                .is_some(),
+            "Task inputs must publish application/x-tar"
+        );
+        assert!(
+            document
+                .pointer(
+                    "/paths/~1v1~1tasks~1{taskUid}~1outputs/get/responses/200/content/application~1x-tar/schema",
+                )
+                .is_some(),
+            "Task outputs must publish application/x-tar"
+        );
         Ok(())
     }
 
@@ -5169,7 +5485,45 @@ mod tests {
             StatusCode::NOT_FOUND,
             "task lookup must bind to the full resolved submitting identity, not only its service"
         );
-        let archive = b"neutral-tar-fixture".to_vec();
+        const CONTRACT_MAX_TASK_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+        let oversized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/tasks/{task_uid}/inputs"))
+                    .header("authorization", "Bearer github-assertion")
+                    .header("content-type", "application/x-tar")
+                    .body(Body::from(vec![0; CONTRACT_MAX_TASK_ARCHIVE_BYTES + 1]))
+                    .map_err(|error| format!("failed to build oversized Task input: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("oversized Task input request failed: {error}"))?;
+        assert_eq!(
+            oversized.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Task inputs larger than the published 64 MiB limit must be rejected"
+        );
+        assert_eq!(
+            oversized
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json"),
+            "the documented Task error response must remain machine-readable at the size boundary"
+        );
+        let oversized_body = to_bytes(oversized.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("failed to read oversized Task error: {error}"))?;
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&oversized_body)
+                .ok()
+                .and_then(|body| body.get("error").cloned())
+                .is_some(),
+            "the 413 response must match TaskErrorResponse"
+        );
+
+        let archive = vec![0; 2 * 1024 * 1024 + 1];
         let staged = app
             .clone()
             .oneshot(
@@ -5187,7 +5541,7 @@ mod tests {
         assert_eq!(
             staged.status(),
             StatusCode::NO_CONTENT,
-            "an admitted task must accept its opaque tar input exactly once"
+            "the explicit Task limit must replace axum's smaller default while preserving opaque tar bytes"
         );
         {
             let rows = task_rows
