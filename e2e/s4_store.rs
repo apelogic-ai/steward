@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
-use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
+use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
 use steward_store::{ApproveAdmission, ParkRejection, PgStore, StoreError};
 use steward_types::{AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal};
 
@@ -60,6 +60,136 @@ fn envelope(member_limit: &str, revision: i64) -> Envelope {
             ttl: spec.ttl,
         },
     }
+}
+
+#[tokio::test]
+async fn s4_service_envelopes_and_grants_are_isolated_from_equal_role_names()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the S4 Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let scope_ref = format!("shared-scope-{suffix}");
+    let runtime_uid = format!("runtime-service-{suffix}");
+
+    store
+        .insert_envelope(&scope_ref, &envelope("200.00", 1), "admin@example.com")
+        .await?;
+    store
+        .insert_service_envelope(&scope_ref, &envelope("50.00", 1), "admin@example.com")
+        .await?;
+    assert_eq!(
+        store
+            .latest_envelope(&scope_ref)
+            .await?
+            .ok_or_else(|| io::Error::other("member-role envelope disappeared"))?
+            .spec
+            .budget
+            .monthly_limit,
+        "200.00"
+    );
+    assert_eq!(
+        store
+            .latest_service_envelope(&scope_ref)
+            .await?
+            .ok_or_else(|| io::Error::other("service envelope disappeared"))?
+            .spec
+            .budget
+            .monthly_limit,
+        "50.00"
+    );
+
+    let mut proposed = proposed_spec();
+    proposed.principal = Principal::Service {
+        name: scope_ref.clone(),
+        acting_user: None,
+    };
+    proposed.owner = Email("alice@example.com".to_owned());
+    proposed.budget.monthly_limit = "60.00".to_owned();
+    let mut base = proposed.clone();
+    base.budget.monthly_limit = "0.00".to_owned();
+    let deltas = vec![AdmissionDelta::Budget {
+        requested: "60.00".to_owned(),
+        ceiling: "50.00".to_owned(),
+        currency: "USD".to_owned(),
+    }];
+    let parked = store
+        .park_rejection(ParkRejection {
+            runtime_uid: &runtime_uid,
+            runtime_namespace: "team-a",
+            runtime_name: &runtime_uid,
+            spec_digest: "service-proposed-digest",
+            base_spec_digest: "service-base-digest",
+            base_pending_approval_digest: None,
+            base_spec: &base,
+            envelope_revision: 1,
+            deltas: &deltas,
+            proposed_spec: &proposed,
+            actor: &scope_ref,
+            member_role: &scope_ref,
+        })
+        .await?;
+    store
+        .link_decision_reference(
+            parked.approval_id,
+            "PROJ-123",
+            "https://jira.example.com/browse/PROJ-123",
+        )
+        .await?;
+    store
+        .approve_admission(ApproveAdmission {
+            approval_id: parked.approval_id,
+            decided_by: "admin@example.com",
+            rationale: "approve one service runtime",
+            evidence_url: "https://jira.example.com/browse/PROJ-123",
+            expires_at: "2999-01-01T00:00:00Z",
+        })
+        .await?;
+
+    assert_eq!(
+        store
+            .grants_for_runtime_scoped(&runtime_uid, EnvelopeScopeKind::Service, &scope_ref, 1,)
+            .await?,
+        deltas
+    );
+    assert!(
+        store
+            .grants_for_runtime(&runtime_uid, &scope_ref, 1)
+            .await?
+            .is_empty(),
+        "an equal member-role scope must not inherit the service grant"
+    );
+
+    store
+        .insert_envelope(&scope_ref, &envelope("250.00", 2), "admin@example.com")
+        .await?;
+    assert_eq!(
+        store
+            .grants_for_runtime_scoped(&runtime_uid, EnvelopeScopeKind::Service, &scope_ref, 1,)
+            .await?,
+        deltas,
+        "a role-envelope revision must not revoke an equal-named service grant"
+    );
+    store
+        .insert_service_envelope(&scope_ref, &envelope("75.00", 2), "admin@example.com")
+        .await?;
+    assert!(
+        store
+            .grants_for_runtime_scoped(&runtime_uid, EnvelopeScopeKind::Service, &scope_ref, 1,)
+            .await?
+            .is_empty(),
+        "a new service-envelope revision must revoke the stale service grant"
+    );
+    Ok(())
 }
 
 #[tokio::test]

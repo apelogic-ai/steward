@@ -66,15 +66,18 @@ spec:
                     - service
                     type: string
                   name:
+                    minLength: 1
                     type: string
                 required:
                 - kind
                 type: object
                 x-kubernetes-validations:
-                - message: user principals require actingUser; service principals require name
+                - message: >-
+                    user principals require actingUser and no name; service principals require name
+                    and may carry actingUser
                   rule: >-
                     (self.kind == 'user' && has(self.actingUser) && !has(self.name)) || (self.kind
-                    == 'service' && has(self.name) && !has(self.actingUser))
+                    == 'service' && has(self.name))
               tools:
                 items:
                   properties:

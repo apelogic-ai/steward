@@ -18,13 +18,66 @@ allowed_input := {
 				"resource": "search_repositories",
 				"action": "read",
 			}],
-			"version": 1,
+			"version": 2,
+		},
+	},
+}
+
+delegated_service_input := object.union(allowed_input, {
+	"tokenClaims": object.union(allowed_input.tokenClaims, {
+		"steward": object.union(allowed_input.tokenClaims.steward, {
+			"acting_as": "service_for_user",
+			"service": "steward-run",
+		}),
+	}),
+})
+
+pure_service_input := {
+	"principal": "service:scheduled-scanner",
+	"service": "github",
+	"tool": "search_repositories",
+	"actionClass": "read",
+	"scopes": ["repo"],
+	"args": {},
+	"tokenClaims": {
+		"email": "service:scheduled-scanner",
+		"sub": "service:scheduled-scanner",
+		"steward": {
+			"acting_as": "service",
+			"service": "scheduled-scanner",
+			"runtime_uid": "runtime-uid-service-a",
+			"tools": [{
+				"provider": "github",
+				"resource": "search_repositories",
+				"action": "read",
+			}],
+			"version": 2,
 		},
 	},
 }
 
 test_runtime_tool_grant_allows_the_exact_tool if {
 	data.steward.mcp.allow with input as allowed_input
+}
+
+test_delegated_service_preserves_user_and_service_attribution if {
+	data.steward.mcp.allow with input as delegated_service_input
+}
+
+test_pure_service_uses_its_dedicated_subject if {
+	data.steward.mcp.allow with input as pure_service_input
+}
+
+test_pure_service_cannot_resolve_a_user_principal if {
+	request := object.union(pure_service_input, {"principal": "alice@example.com"})
+	not data.steward.mcp.allow with input as request
+}
+
+test_service_claim_without_service_name_fails_closed if {
+	authority := object.remove(delegated_service_input.tokenClaims.steward, {"service"})
+	claims := object.union(object.remove(delegated_service_input.tokenClaims, {"steward"}), {"steward": authority})
+	request := object.union(object.remove(delegated_service_input, {"tokenClaims"}), {"tokenClaims": claims})
+	not data.steward.mcp.allow with input as request
 }
 
 test_gateway_contract_returns_an_allow_object if {

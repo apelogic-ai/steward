@@ -21,8 +21,8 @@ use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use steward_admission::{
-    AdmissionDecision, AdmissionDelta, Envelope, add_budget_amount, evaluate_with_grants,
-    validate_envelope,
+    AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, add_budget_amount,
+    evaluate_with_grants, validate_envelope,
 };
 pub use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
@@ -482,9 +482,21 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         authored_by: &'a str,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
+    fn insert_service_envelope<'a>(
+        &'a self,
+        service: &'a str,
+        envelope: &'a Envelope,
+        authored_by: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
     fn latest_envelope<'a>(
         &'a self,
         member_role: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Envelope>, StoreError>>;
+
+    fn latest_service_envelope<'a>(
+        &'a self,
+        service: &'a str,
     ) -> BoxFuture<'a, Result<Option<Envelope>, StoreError>>;
 
     fn park_rejection<'a>(
@@ -519,6 +531,14 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         &'a self,
         runtime_uid: &'a str,
         member_role: &'a str,
+        envelope_revision: i64,
+    ) -> BoxFuture<'a, Result<Vec<AdmissionDelta>, StoreError>>;
+
+    fn grants_for_runtime_scoped<'a>(
+        &'a self,
+        runtime_uid: &'a str,
+        scope_kind: EnvelopeScopeKind,
+        scope_ref: &'a str,
         envelope_revision: i64,
     ) -> BoxFuture<'a, Result<Vec<AdmissionDelta>, StoreError>>;
 
@@ -582,11 +602,29 @@ impl AdmissionLedger for PgStore {
         )
     }
 
+    fn insert_service_envelope<'a>(
+        &'a self,
+        service: &'a str,
+        envelope: &'a Envelope,
+        authored_by: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            PgStore::insert_service_envelope(self, service, envelope, authored_by).await
+        })
+    }
+
     fn latest_envelope<'a>(
         &'a self,
         member_role: &'a str,
     ) -> BoxFuture<'a, Result<Option<Envelope>, StoreError>> {
         Box::pin(async move { PgStore::latest_envelope(self, member_role).await })
+    }
+
+    fn latest_service_envelope<'a>(
+        &'a self,
+        service: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Envelope>, StoreError>> {
+        Box::pin(async move { PgStore::latest_service_envelope(self, service).await })
     }
 
     fn park_rejection<'a>(
@@ -647,6 +685,25 @@ impl AdmissionLedger for PgStore {
     ) -> BoxFuture<'a, Result<Vec<AdmissionDelta>, StoreError>> {
         Box::pin(async move {
             PgStore::grants_for_runtime(self, runtime_uid, member_role, envelope_revision).await
+        })
+    }
+
+    fn grants_for_runtime_scoped<'a>(
+        &'a self,
+        runtime_uid: &'a str,
+        scope_kind: EnvelopeScopeKind,
+        scope_ref: &'a str,
+        envelope_revision: i64,
+    ) -> BoxFuture<'a, Result<Vec<AdmissionDelta>, StoreError>> {
+        Box::pin(async move {
+            PgStore::grants_for_runtime_scoped(
+                self,
+                runtime_uid,
+                scope_kind,
+                scope_ref,
+                envelope_revision,
+            )
+            .await
         })
     }
 
@@ -751,6 +808,10 @@ where
         .route(
             "/admin/envelopes/{member_role}",
             post(author_envelope_handler::<R, L, D>),
+        )
+        .route(
+            "/admin/service-envelopes/{service}",
+            post(author_service_envelope_handler::<R, L, D>),
         )
         .route(
             "/admin/approvals/{approval_id}/approve",
@@ -979,6 +1040,45 @@ where
     match state
         .ledger
         .insert_envelope(&member_role, &envelope, &admin.actor)
+        .await
+    {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(error) => ApiError::Store(error).into_response(),
+    }
+}
+
+async fn author_service_envelope_handler<R, L, D>(
+    State(state): State<AppState<R, L, D>>,
+    Extension(admin): Extension<AdminContext>,
+    Path(service): Path<String>,
+    Json(envelope): Json<Envelope>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    if service.is_empty() || envelope.revision <= 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "service name and positive envelope revision are required",
+            })),
+        )
+            .into_response();
+    }
+    if let Err(error) = validate_envelope(&envelope) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": format!("invalid envelope: {error:?}"),
+            })),
+        )
+            .into_response();
+    }
+    match state
+        .ledger
+        .insert_service_envelope(&service, &envelope, &admin.actor)
         .await
     {
         Ok(()) => StatusCode::CREATED.into_response(),
@@ -1594,11 +1694,13 @@ where
         .approval_candidate(approval_id, &request.evidence_url)
         .await
         .map_err(ApiError::Store)?;
-    let latest_envelope = ledger
-        .latest_envelope(&candidate.member_role)
-        .await
-        .map_err(ApiError::Store)?
-        .ok_or(ApiError::MissingEnvelope)?;
+    let scope_kind = approval_scope_kind(&candidate.proposed_spec, &candidate.member_role)?;
+    let latest_envelope = match scope_kind {
+        EnvelopeScopeKind::MemberRole => ledger.latest_envelope(&candidate.member_role).await,
+        EnvelopeScopeKind::Service => ledger.latest_service_envelope(&candidate.member_role).await,
+    }
+    .map_err(ApiError::Store)?
+    .ok_or(ApiError::MissingEnvelope)?;
     if latest_envelope.revision != candidate.envelope_revision {
         return Err(ApiError::Conflict(
             "approval envelope is no longer current".to_owned(),
@@ -1622,20 +1724,23 @@ where
         .get(PENDING_APPROVAL_ANNOTATION)
         .map(String::as_str);
     let proposed_digest = spec_digest(&candidate.proposed_spec)?;
-    let proposed_actor = match &candidate.proposed_spec.principal {
-        Principal::User { acting_user } => acting_user.0.as_str(),
-        _ => "",
+    let proposed_actor = principal_actor(&candidate.proposed_spec);
+    let bound_scope = match scope_kind {
+        EnvelopeScopeKind::MemberRole => runtime
+            .annotations()
+            .get("agents.apelogic.ai/member-role")
+            .map(String::as_str),
+        EnvelopeScopeKind::Service => runtime
+            .annotations()
+            .get("agents.apelogic.ai/service-principal")
+            .map(String::as_str),
     };
     if pending_digest != candidate.base_pending_approval_digest.as_deref()
         || candidate
             .base_pending_approval_digest
             .as_deref()
             .is_some_and(|digest| digest != proposed_digest)
-        || runtime
-            .annotations()
-            .get("agents.apelogic.ai/member-role")
-            .map(String::as_str)
-            != Some(candidate.member_role.as_str())
+        || bound_scope != Some(candidate.member_role.as_str())
         || proposed_actor != candidate.actor
     {
         return Err(ApiError::Conflict(
@@ -1667,7 +1772,9 @@ where
         .is_some();
     if !already_applied || pending_annotation_removed {
         runtime.spec = approved.proposed_spec.clone();
-        if pending_annotation_removed {
+        if pending_annotation_removed
+            || matches!(&approved.proposed_spec.principal, Principal::Service { .. })
+        {
             runtimes
                 .replace_as_authority(&runtime)
                 .await
@@ -1698,6 +1805,26 @@ where
     Ok(SubmissionOutcome::Applied {
         proposed_spec: approved.proposed_spec,
     })
+}
+
+fn principal_actor(spec: &AgentRuntimeSpec) -> &str {
+    match &spec.principal {
+        Principal::User { acting_user } => &acting_user.0,
+        Principal::Service { name, .. } => name,
+    }
+}
+
+fn approval_scope_kind(
+    spec: &AgentRuntimeSpec,
+    scope_ref: &str,
+) -> Result<EnvelopeScopeKind, ApiError> {
+    match &spec.principal {
+        Principal::User { .. } => Ok(EnvelopeScopeKind::MemberRole),
+        Principal::Service { name, .. } if name == scope_ref => Ok(EnvelopeScopeKind::Service),
+        Principal::Service { .. } => Err(ApiError::Conflict(
+            "service approval scope does not match its principal name".to_owned(),
+        )),
+    }
 }
 
 async fn file_decision_reference<L, D>(
@@ -1789,6 +1916,11 @@ where
                 .replace_as_authority(&runtime)
                 .await
                 .map_err(ApiError::Runtime)?;
+        } else if matches!(&runtime.spec.principal, Principal::Service { .. }) {
+            runtimes
+                .replace_as_authority(&runtime)
+                .await
+                .map_err(ApiError::Runtime)?;
         } else {
             runtimes
                 .replace(
@@ -1824,7 +1956,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration as StdDuration;
 
-    use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec};
+    use steward_admission::{
+        AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec,
+    };
     use steward_ports::{
         DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
     };
@@ -2299,9 +2433,30 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
+        fn insert_service_envelope<'a>(
+            &'a self,
+            _service: &'a str,
+            _envelope: &'a Envelope,
+            _authored_by: &'a str,
+        ) -> BoxFuture<'a, Result<(), StoreError>> {
+            Box::pin(async { Ok(()) })
+        }
+
         fn latest_envelope<'a>(
             &'a self,
             _member_role: &'a str,
+        ) -> BoxFuture<'a, Result<Option<Envelope>, StoreError>> {
+            Box::pin(async move {
+                self.envelope
+                    .lock()
+                    .map(|envelope| Some(envelope.clone()))
+                    .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))
+            })
+        }
+
+        fn latest_service_envelope<'a>(
+            &'a self,
+            _service: &'a str,
         ) -> BoxFuture<'a, Result<Option<Envelope>, StoreError>> {
             Box::pin(async move {
                 self.envelope
@@ -2511,6 +2666,16 @@ mod tests {
             &'a self,
             _runtime_uid: &'a str,
             _member_role: &'a str,
+            _envelope_revision: i64,
+        ) -> BoxFuture<'a, Result<Vec<AdmissionDelta>, StoreError>> {
+            Box::pin(async move { Ok(self.grants.clone()) })
+        }
+
+        fn grants_for_runtime_scoped<'a>(
+            &'a self,
+            _runtime_uid: &'a str,
+            _scope_kind: EnvelopeScopeKind,
+            _scope_ref: &'a str,
             _envelope_revision: i64,
         ) -> BoxFuture<'a, Result<Vec<AdmissionDelta>, StoreError>> {
             Box::pin(async move { Ok(self.grants.clone()) })
@@ -4282,6 +4447,10 @@ mod tests {
                     "/admin/runtimes/runtime-uid-a/grants/revoke",
                     r#"{"reason":"not authorized"}"#,
                 ),
+                (
+                    "/admin/service-envelopes/scheduled-scanner",
+                    r#"{"revision":1,"spec":{"llms":[],"tools":[],"budget":{"monthlyLimit":"1.00","currency":"USD"},"ttl":"1h"}}"#,
+                ),
             ] {
                 let mut request = Request::builder()
                     .method("POST")
@@ -4429,6 +4598,48 @@ mod tests {
                 "approval queue must render {expected:?} from the parked row"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_can_author_a_service_envelope_in_a_distinct_scope() -> Result<(), String> {
+        let ledger = ledger();
+        let envelope_body = serde_json::to_vec(
+            &*ledger
+                .envelope
+                .lock()
+                .map_err(|_| "fake envelope lock was poisoned")?,
+        )
+        .map_err(|error| format!("failed to serialize service envelope: {error}"))?;
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger,
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/service-envelopes/scheduled-scanner")
+                    .header("authorization", "Bearer admin-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(envelope_body))
+                    .map_err(|error| {
+                        format!("failed to build service envelope request: {error}")
+                    })?,
+            )
+            .await
+            .map_err(|error| format!("service envelope authoring request failed: {error}"))?;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "a service envelope must have an administrator-authored authority path distinct from member roles"
+        );
         Ok(())
     }
 

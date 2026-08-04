@@ -25,7 +25,7 @@ pub use steward_ports::{
 use steward_types::{Principal, RuntimeId, ToolGrant};
 use uuid::Uuid;
 
-pub const HOP1_CLAIMS_VERSION: u8 = 1;
+pub const HOP1_CLAIMS_VERSION: u8 = 2;
 pub const DEFAULT_AUTHORITY_TTL: Duration = Duration::from_secs(60);
 pub const SPIFFE_CLIENT_ASSERTION_TYPE: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe";
@@ -268,7 +268,6 @@ pub enum MintError {
     AuthorityUnavailable,
     WorkloadMismatch,
     AuthorityInactive,
-    UnsupportedPrincipal,
     InvalidRequest,
     InvalidScope,
     CredentialUnavailable,
@@ -279,7 +278,8 @@ pub enum MintError {
 struct Hop1Claims {
     aud: Vec<String>,
     azp: String,
-    email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
     iss: String,
     jti: String,
     steward: StewardClaims,
@@ -290,6 +290,8 @@ struct Hop1Claims {
 struct StewardClaims {
     acting_as: String,
     runtime_uid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service: Option<String>,
     tools: Vec<ToolGrant>,
     version: u8,
 }
@@ -409,8 +411,28 @@ where
         if authority.state != AuthorityState::Active {
             return Err(MintError::AuthorityInactive);
         }
-        let Principal::User { acting_user } = &authority.principal else {
-            return Err(MintError::UnsupportedPrincipal);
+        let (acting_as, email, service, subject) = match &authority.principal {
+            Principal::User { acting_user } => (
+                "user",
+                Some(acting_user.0.clone()),
+                None,
+                acting_user.0.clone(),
+            ),
+            Principal::Service { name, acting_user } if !name.is_empty() => match acting_user {
+                Some(acting_user) => (
+                    "service_for_user",
+                    Some(acting_user.0.clone()),
+                    Some(name.clone()),
+                    acting_user.0.clone(),
+                ),
+                None => (
+                    "service",
+                    Some(format!("service:{name}")),
+                    Some(name.clone()),
+                    format!("service:{name}"),
+                ),
+            },
+            Principal::Service { .. } => return Err(MintError::InvalidRequest),
         };
         match self
             .credential_resolver
@@ -442,16 +464,17 @@ where
         let claims = Claims::new(Hop1Claims {
             aud: vec![self.config.audience.clone()],
             azp: workload.spiffe_id,
-            email: acting_user.0.clone(),
+            email,
             iss: self.config.issuer.clone(),
             jti: Uuid::new_v4().to_string(),
             steward: StewardClaims {
-                acting_as: "user".to_owned(),
+                acting_as: acting_as.to_owned(),
                 runtime_uid: authority.runtime.0,
+                service,
                 tools: authority.tools,
                 version: HOP1_CLAIMS_VERSION,
             },
-            sub: acting_user.0.clone(),
+            sub: subject,
         })
         .set_duration_and_issuance(&time, authority_ttl);
         let header = Header::empty()
@@ -519,18 +542,36 @@ where
             Err(MintError::AuthorityUnavailable) => return Err(MintError::AuthorityUnavailable),
             Err(_) => return Ok(TokenIntrospectionResponse::inactive()),
         };
-        let principal_matches = matches!(
-            &authority.principal,
-            Principal::User { acting_user }
-                if acting_user.0 == claims.custom.email
-                    && acting_user.0 == claims.custom.sub
-        );
+        let principal_matches = match &authority.principal {
+            Principal::User { acting_user } => {
+                claims.custom.steward.acting_as == "user"
+                    && claims.custom.steward.service.is_none()
+                    && claims.custom.email.as_ref() == Some(&acting_user.0)
+                    && claims.custom.sub == acting_user.0
+            }
+            Principal::Service { name, acting_user } if !name.is_empty() => {
+                claims.custom.steward.service.as_ref() == Some(name)
+                    && match acting_user {
+                        Some(acting_user) => {
+                            claims.custom.steward.acting_as == "service_for_user"
+                                && claims.custom.email.as_ref() == Some(&acting_user.0)
+                                && claims.custom.sub == acting_user.0
+                        }
+                        None => {
+                            claims.custom.steward.acting_as == "service"
+                                && claims.custom.email.as_deref()
+                                    == Some(claims.custom.sub.as_str())
+                                && claims.custom.sub == format!("service:{name}")
+                        }
+                    }
+            }
+            Principal::Service { .. } => false,
+        };
         let active = authority.state == AuthorityState::Active
             && authority.workload_id == claims.custom.azp
             && authority.runtime.0 == claims.custom.steward.runtime_uid
             && authority.tools == claims.custom.steward.tools
             && claims.custom.steward.version == HOP1_CLAIMS_VERSION
-            && claims.custom.steward.acting_as == "user"
             && principal_matches;
         Ok(TokenIntrospectionResponse { active })
     }
@@ -661,9 +702,9 @@ fn map_mint_error(error: MintError) -> (StatusCode, Json<OAuthError>) {
         MintError::SvidValidatorUnavailable | MintError::AuthorityUnavailable => {
             oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
         }
-        MintError::WorkloadMismatch
-        | MintError::AuthorityInactive
-        | MintError::UnsupportedPrincipal => oauth_error(StatusCode::FORBIDDEN, "invalid_grant"),
+        MintError::WorkloadMismatch | MintError::AuthorityInactive => {
+            oauth_error(StatusCode::FORBIDDEN, "invalid_grant")
+        }
         MintError::InvalidRequest => oauth_error(StatusCode::BAD_REQUEST, "invalid_request"),
         MintError::InvalidScope => oauth_error(StatusCode::BAD_REQUEST, "invalid_scope"),
         MintError::CredentialUnavailable => {

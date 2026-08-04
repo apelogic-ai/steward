@@ -24,8 +24,8 @@ use kube::runtime::watcher;
 use kube::{Client, Resource, ResourceExt};
 use sha2::{Digest, Sha256};
 use steward_admission::{
-    AdmissionDecision, AdmissionDelta, Envelope, budget_is_exhausted, duration_seconds,
-    evaluate_with_grants,
+    AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, budget_is_exhausted,
+    duration_seconds, evaluate_with_grants,
 };
 use steward_ports::{
     InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
@@ -347,6 +347,7 @@ pub async fn reconcile_once<R: SandboxRuntime>(
 
 const FINALIZER: &str = "agents.apelogic.ai/runtime";
 pub const MEMBER_ROLE_ANNOTATION: &str = "agents.apelogic.ai/member-role";
+pub const SERVICE_PRINCIPAL_ANNOTATION: &str = "agents.apelogic.ai/service-principal";
 
 fn is_pending_approval(runtime: &AgentRuntime) -> bool {
     runtime
@@ -815,8 +816,13 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
                         })?
                     {
+                        let (scope_kind, scope_ref) = authority_envelope_scope(
+                            &reversion.proposed_spec,
+                            &reversion.member_role,
+                        )
+                        .map_err(ControllerError::Reconcile)?;
                         let latest_envelope = authority
-                            .latest_envelope(&reversion.member_role)
+                            .latest_scoped_envelope(scope_kind, scope_ref)
                             .await
                             .map_err(|error| {
                                 ControllerError::Reconcile(ReconcileError::Authority(
@@ -825,15 +831,16 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             })?
                             .ok_or_else(|| {
                                 ControllerError::Reconcile(ReconcileError::Authority(
-                                    "grant member role no longer has an envelope".to_owned(),
+                                    "grant principal no longer has an envelope".to_owned(),
                                 ))
                             })?;
                         let surviving_grants = authority
-                            .grants_for_runtime(
+                            .grants_for_runtime_scoped(
                                 runtime.metadata.uid.as_deref().ok_or(
                                     ControllerError::Reconcile(ReconcileError::MissingRuntimeUid),
                                 )?,
-                                &reversion.member_role,
+                                scope_kind,
+                                scope_ref,
                                 latest_envelope.revision,
                             )
                             .await
@@ -853,7 +860,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             AuthorityAction::Continue => {}
                             AuthorityAction::Restore(mut restored) => {
                                 restored.metadata = runtime.metadata.clone();
-                                replace_as_authority(
+                                replace_grant_as_authority(
                                     &context.client,
                                     &restored,
                                     &reversion.actor,
@@ -894,7 +901,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                     .annotations
                                     .get_or_insert_default()
                                     .remove(PENDING_APPROVAL_ANNOTATION);
-                                replace_as_authority(
+                                replace_grant_as_authority(
                                     &context.client,
                                     &proposed,
                                     &application.application.actor,
@@ -906,11 +913,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             AuthorityAction::Continue | AuthorityAction::Suspend => {}
                         }
                     }
-                    let Some(member_role) = runtime
-                        .annotations()
-                        .get(MEMBER_ROLE_ANNOTATION)
-                        .filter(|role| !role.is_empty())
-                    else {
+                    let Ok((scope_kind, scope_ref)) = runtime_envelope_scope(&runtime) else {
                         return suspend_runtime_with_inference_cleanup(
                             &runtime,
                             &api,
@@ -922,23 +925,24 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         .await;
                     };
                     let latest_envelope = authority
-                        .latest_envelope(member_role)
+                        .latest_scoped_envelope(scope_kind, scope_ref)
                         .await
                         .map_err(|error| {
                             ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
                         })?
                         .ok_or_else(|| {
                             ControllerError::Reconcile(ReconcileError::Authority(
-                                "runtime member role no longer has an envelope".to_owned(),
+                                "runtime principal no longer has an envelope".to_owned(),
                             ))
                         })?;
                     let grants =
                         authority
-                            .grants_for_runtime(
+                            .grants_for_runtime_scoped(
                                 runtime.metadata.uid.as_deref().ok_or(
                                     ControllerError::Reconcile(ReconcileError::MissingRuntimeUid),
                                 )?,
-                                member_role,
+                                scope_kind,
+                                scope_ref,
                                 latest_envelope.revision,
                             )
                             .await
@@ -1322,32 +1326,84 @@ fn validate_authority_binding(
             "grant authority is bound to a different runtime instance".to_owned(),
         ));
     }
-    if runtime
-        .annotations()
-        .get(MEMBER_ROLE_ANNOTATION)
-        .map(String::as_str)
-        != Some(authority.member_role.as_str())
-    {
+    let runtime_scope = runtime_envelope_scope(runtime)?;
+    let base_scope = authority_envelope_scope(&authority.base_spec, &authority.member_role)?;
+    let proposed_scope =
+        authority_envelope_scope(&authority.proposed_spec, &authority.member_role)?;
+    if runtime_scope != base_scope || runtime_scope != proposed_scope {
         return Err(ReconcileError::Authority(
-            "grant authority member role does not match the runtime binding".to_owned(),
+            "grant authority envelope scope does not match the runtime binding".to_owned(),
         ));
     }
-    let base_actor = match &authority.base_spec.principal {
-        steward_types::Principal::User { acting_user } => Some(acting_user.0.as_str()),
-        _ => None,
-    };
-    let proposed_actor = match &authority.proposed_spec.principal {
-        steward_types::Principal::User { acting_user } => Some(acting_user.0.as_str()),
-        _ => None,
-    };
-    if base_actor != Some(authority.actor.as_str())
-        || proposed_actor != Some(authority.actor.as_str())
+    if principal_actor(&authority.base_spec) != authority.actor
+        || principal_actor(&authority.proposed_spec) != authority.actor
     {
         return Err(ReconcileError::Authority(
             "grant authority actor does not match its stored runtime specs".to_owned(),
         ));
     }
     Ok(())
+}
+
+fn principal_actor(spec: &AgentRuntimeSpec) -> &str {
+    match &spec.principal {
+        steward_types::Principal::User { acting_user } => &acting_user.0,
+        steward_types::Principal::Service { name, .. } => name,
+    }
+}
+
+fn authority_envelope_scope<'a>(
+    spec: &AgentRuntimeSpec,
+    scope_ref: &'a str,
+) -> Result<(EnvelopeScopeKind, &'a str), ReconcileError> {
+    match &spec.principal {
+        steward_types::Principal::User { .. } => Ok((EnvelopeScopeKind::MemberRole, scope_ref)),
+        steward_types::Principal::Service { name, .. } if name == scope_ref => {
+            Ok((EnvelopeScopeKind::Service, scope_ref))
+        }
+        steward_types::Principal::Service { .. } => Err(ReconcileError::Authority(
+            "service grant scope does not match its principal name".to_owned(),
+        )),
+    }
+}
+
+fn runtime_envelope_scope(
+    runtime: &AgentRuntime,
+) -> Result<(EnvelopeScopeKind, &str), ReconcileError> {
+    match &runtime.spec.principal {
+        steward_types::Principal::User { .. }
+            if runtime
+                .annotations()
+                .contains_key(SERVICE_PRINCIPAL_ANNOTATION) =>
+        {
+            Err(ReconcileError::Authority(
+                "user runtime carries a service envelope binding".to_owned(),
+            ))
+        }
+        steward_types::Principal::User { .. } => runtime
+            .annotations()
+            .get(MEMBER_ROLE_ANNOTATION)
+            .filter(|scope_ref| !scope_ref.is_empty())
+            .map(|scope_ref| (EnvelopeScopeKind::MemberRole, scope_ref.as_str()))
+            .ok_or_else(|| ReconcileError::Authority("runtime member role is missing".to_owned())),
+        steward_types::Principal::Service { .. }
+            if runtime.annotations().contains_key(MEMBER_ROLE_ANNOTATION) =>
+        {
+            Err(ReconcileError::Authority(
+                "service runtime carries a member-role envelope binding".to_owned(),
+            ))
+        }
+        steward_types::Principal::Service { name, .. } => runtime
+            .annotations()
+            .get(SERVICE_PRINCIPAL_ANNOTATION)
+            .filter(|scope_ref| !scope_ref.is_empty() && scope_ref.as_str() == name)
+            .map(|scope_ref| (EnvelopeScopeKind::Service, scope_ref.as_str()))
+            .ok_or_else(|| {
+                ReconcileError::Authority(
+                    "runtime service envelope binding does not match its principal".to_owned(),
+                )
+            }),
+    }
 }
 
 fn suspended_status(runtime: &AgentRuntime) -> Result<AgentRuntimeStatus, ControllerError> {
@@ -1406,6 +1462,22 @@ async fn replace_as_authority(
         .map_err(ControllerError::Kubernetes)
 }
 
+async fn replace_grant_as_authority(
+    client: &Client,
+    runtime: &AgentRuntime,
+    actor: &str,
+    scope_ref: &str,
+) -> Result<(), ControllerError> {
+    match &runtime.spec.principal {
+        steward_types::Principal::User { .. } => {
+            replace_as_authority(client, runtime, actor, scope_ref).await
+        }
+        steward_types::Principal::Service { .. } => {
+            replace_pending_as_controller(client, runtime).await
+        }
+    }
+}
+
 async fn replace_pending_as_controller(
     client: &Client,
     runtime: &AgentRuntime,
@@ -1452,13 +1524,15 @@ pub type WebhookFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait WebhookEnvelopeReader: Clone + Send + Sync + 'static {
     fn latest_envelope<'a>(
         &'a self,
-        member_role: &'a str,
+        scope_kind: EnvelopeScopeKind,
+        scope_ref: &'a str,
     ) -> WebhookFuture<'a, Result<Option<Envelope>, StoreError>>;
 
     fn grants_for_runtime<'a>(
         &'a self,
         runtime_uid: &'a str,
-        member_role: &'a str,
+        scope_kind: EnvelopeScopeKind,
+        scope_ref: &'a str,
         envelope_revision: i64,
     ) -> WebhookFuture<'a, Result<Vec<AdmissionDelta>, StoreError>>;
 }
@@ -1486,19 +1560,28 @@ impl<T: steward_ports::InferencePlane + Clone> WebhookModelCatalog for T {
 impl WebhookEnvelopeReader for PgStore {
     fn latest_envelope<'a>(
         &'a self,
-        member_role: &'a str,
+        scope_kind: EnvelopeScopeKind,
+        scope_ref: &'a str,
     ) -> WebhookFuture<'a, Result<Option<Envelope>, StoreError>> {
-        Box::pin(async move { PgStore::latest_envelope(self, member_role).await })
+        Box::pin(async move { PgStore::latest_scoped_envelope(self, scope_kind, scope_ref).await })
     }
 
     fn grants_for_runtime<'a>(
         &'a self,
         runtime_uid: &'a str,
-        member_role: &'a str,
+        scope_kind: EnvelopeScopeKind,
+        scope_ref: &'a str,
         envelope_revision: i64,
     ) -> WebhookFuture<'a, Result<Vec<AdmissionDelta>, StoreError>> {
         Box::pin(async move {
-            PgStore::grants_for_runtime(self, runtime_uid, member_role, envelope_revision).await
+            PgStore::grants_for_runtime_scoped(
+                self,
+                runtime_uid,
+                scope_kind,
+                scope_ref,
+                envelope_revision,
+            )
+            .await
         })
     }
 }
@@ -1542,6 +1625,10 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
     let Some(username) = request.user_info.username.as_deref() else {
         return response.deny("authenticated Kubernetes username is required");
     };
+    let trusted_service_write = matches!(
+        &runtime.spec.principal,
+        steward_types::Principal::Service { .. }
+    ) && trusted_writer_usernames.contains(username);
     let pending = runtime
         .annotations()
         .get(PENDING_APPROVAL_ANNOTATION)
@@ -1584,7 +1671,7 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
                 .deny("pending AgentRuntime spec may be changed only by a trusted Steward writer");
         }
         trusted_pending_transition |= trusted_pending_writer;
-        if !trusted_pending_transition {
+        if !trusted_pending_transition && !trusted_service_write {
             match &old_runtime.spec.principal {
                 steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
                 _ => {
@@ -1595,7 +1682,7 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
             }
         }
     }
-    if !trusted_pending_transition {
+    if !trusted_pending_transition && !trusted_service_write {
         match &runtime.spec.principal {
             steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
             _ => {
@@ -1609,52 +1696,85 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
         .annotations()
         .get(MEMBER_ROLE_ANNOTATION)
         .map(String::as_str);
-    let member_role = if trusted_pending_transition {
-        let Some(member_role) = bound_role.filter(|role| !role.is_empty()) else {
-            return response.deny("AgentRuntime member-role annotation is required");
-        };
-        member_role
-    } else {
-        let roles = request
-            .user_info
-            .groups
-            .iter()
-            .flatten()
-            .filter_map(|group| group.strip_prefix(MEMBER_ROLE_GROUP_PREFIX))
-            .filter(|role| !role.is_empty())
-            .collect::<BTreeSet<_>>();
-        let Some(member_role) = roles.iter().next().copied().filter(|_| roles.len() == 1) else {
-            return response.deny("exactly one authenticated member-role group is required");
-        };
-        member_role
+    let bound_service = runtime
+        .annotations()
+        .get(SERVICE_PRINCIPAL_ANNOTATION)
+        .map(String::as_str);
+    let (scope_kind, scope_ref) = match &runtime.spec.principal {
+        steward_types::Principal::User { .. } => {
+            if bound_service.is_some() {
+                return response
+                    .deny("user AgentRuntime must not carry a service-principal annotation");
+            }
+            let member_role = if trusted_pending_transition {
+                let Some(member_role) = bound_role.filter(|role| !role.is_empty()) else {
+                    return response.deny("AgentRuntime member-role annotation is required");
+                };
+                member_role
+            } else {
+                let roles = request
+                    .user_info
+                    .groups
+                    .iter()
+                    .flatten()
+                    .filter_map(|group| group.strip_prefix(MEMBER_ROLE_GROUP_PREFIX))
+                    .filter(|role| !role.is_empty())
+                    .collect::<BTreeSet<_>>();
+                let Some(member_role) = roles.iter().next().copied().filter(|_| roles.len() == 1)
+                else {
+                    return response
+                        .deny("exactly one authenticated member-role group is required");
+                };
+                member_role
+            };
+            if bound_role != Some(member_role) {
+                return response.deny(
+                    "AgentRuntime member-role annotation must match the authenticated member-role group",
+                );
+            }
+            (EnvelopeScopeKind::MemberRole, member_role)
+        }
+        steward_types::Principal::Service { name, .. } => {
+            if !trusted_service_write {
+                return response
+                    .deny("service AgentRuntime may be written only by a trusted Steward writer");
+            }
+            if name.is_empty() || bound_service != Some(name.as_str()) {
+                return response.deny(
+                    "AgentRuntime service-principal annotation must match the service principal name",
+                );
+            }
+            if bound_role.is_some() {
+                return response
+                    .deny("service AgentRuntime must not carry a member-role annotation");
+            }
+            (EnvelopeScopeKind::Service, name.as_str())
+        }
     };
-    if bound_role != Some(member_role) {
-        return response.deny(
-            "AgentRuntime member-role annotation must match the authenticated member-role group",
-        );
+    if request.operation == Operation::Update {
+        let old = request.old_object.as_ref();
+        let old_scope_binding = match scope_kind {
+            EnvelopeScopeKind::MemberRole => old
+                .and_then(|runtime| runtime.annotations().get(MEMBER_ROLE_ANNOTATION))
+                .map(String::as_str),
+            EnvelopeScopeKind::Service => old
+                .and_then(|runtime| runtime.annotations().get(SERVICE_PRINCIPAL_ANNOTATION))
+                .map(String::as_str),
+        };
+        if old_scope_binding != Some(scope_ref) {
+            return response.deny("AgentRuntime envelope scope binding is immutable");
+        }
     }
-    if request.operation == Operation::Update
-        && request
-            .old_object
-            .as_ref()
-            .and_then(|old| old.annotations().get(MEMBER_ROLE_ANNOTATION))
-            .map(String::as_str)
-            != Some(member_role)
-    {
-        return response.deny("AgentRuntime member-role binding is immutable");
-    }
-    let envelope = match envelopes.latest_envelope(member_role).await {
+    let envelope = match envelopes.latest_envelope(scope_kind, scope_ref).await {
         Ok(Some(envelope)) => envelope,
-        Ok(None) => return response.deny("no envelope exists for the authenticated member role"),
+        Ok(None) => return response.deny("no envelope exists for the authenticated principal"),
         Err(error) => {
-            return response.deny(format!(
-                "member-role envelope lookup failed closed: {error}"
-            ));
+            return response.deny(format!("principal envelope lookup failed closed: {error}"));
         }
     };
     let grants = match runtime.metadata.uid.as_deref() {
         Some(runtime_uid) => match envelopes
-            .grants_for_runtime(runtime_uid, member_role, envelope.revision)
+            .grants_for_runtime(runtime_uid, scope_kind, scope_ref, envelope.revision)
             .await
         {
             Ok(grants) => grants,
@@ -1904,10 +2024,10 @@ mod tests {
 
     use super::{
         AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ReconcileDecision,
-        ReconcileIntent, authority_action, authority_application_action, cleanup_runtime,
-        exhausted_spend_to_preserve, inference_action, reconcile_once, replace_as_authority,
-        runtime_authority_action, runtime_ttl_action, status_merge_patch,
-        suspend_runtime_with_inference_cleanup, ttl_action,
+        ReconcileIntent, SERVICE_PRINCIPAL_ANNOTATION, authority_action,
+        authority_application_action, cleanup_runtime, exhausted_spend_to_preserve,
+        inference_action, reconcile_once, replace_as_authority, runtime_authority_action,
+        runtime_ttl_action, status_merge_patch, suspend_runtime_with_inference_cleanup, ttl_action,
     };
 
     #[derive(Default)]
@@ -2648,6 +2768,72 @@ mod tests {
     }
 
     #[test]
+    fn service_grant_authority_is_bound_to_its_service_annotation_and_actor() -> Result<(), String>
+    {
+        let mut runtime = fixture();
+        runtime.spec.principal = Principal::Service {
+            name: "scheduled-scanner".to_owned(),
+            acting_user: None,
+        };
+        runtime.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            SERVICE_PRINCIPAL_ANNOTATION.to_owned(),
+            "scheduled-scanner".to_owned(),
+        )]));
+        let mut application = grant_reversion(&runtime);
+        application.actor = "scheduled-scanner".to_owned();
+        application.member_role = "scheduled-scanner".to_owned();
+
+        let action = authority_application_action(&runtime, &application)
+            .map_err(|error| format!("matching service grant must apply: {error:?}"))?;
+        assert!(matches!(action, AuthorityAction::Restore(_)));
+
+        runtime.metadata.annotations.get_or_insert_default().insert(
+            SERVICE_PRINCIPAL_ANNOTATION.to_owned(),
+            "different-service".to_owned(),
+        );
+        assert!(
+            authority_application_action(&runtime, &application).is_err(),
+            "a service grant must not cross its annotated service scope"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_scope_rejects_cross_kind_annotations() {
+        let mut user_runtime = fixture();
+        user_runtime
+            .metadata
+            .annotations
+            .get_or_insert_default()
+            .insert(
+                SERVICE_PRINCIPAL_ANNOTATION.to_owned(),
+                "scheduled-scanner".to_owned(),
+            );
+        assert!(
+            super::runtime_envelope_scope(&user_runtime).is_err(),
+            "a user runtime must not reconcile with a service envelope binding"
+        );
+
+        let mut service_runtime = fixture();
+        service_runtime.spec.principal = Principal::Service {
+            name: "scheduled-scanner".to_owned(),
+            acting_user: None,
+        };
+        service_runtime
+            .metadata
+            .annotations
+            .get_or_insert_default()
+            .insert(
+                SERVICE_PRINCIPAL_ANNOTATION.to_owned(),
+                "scheduled-scanner".to_owned(),
+            );
+        assert!(
+            super::runtime_envelope_scope(&service_runtime).is_err(),
+            "a service runtime must not reconcile with a member-role binding"
+        );
+    }
+
+    #[test]
     fn expired_grant_restores_the_exact_parked_base_spec() -> Result<(), String> {
         let mut runtime = fixture();
         let reversion = grant_reversion(&runtime);
@@ -2981,7 +3167,7 @@ mod webhook_tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use kube::core::admission::{AdmissionRequest, AdmissionReview};
-    use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
+    use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
     use steward_store::StoreError;
     use steward_types::{AgentRuntime, Budget, Duration, ModelRef};
     use tower::ServiceExt;
@@ -3000,7 +3186,8 @@ mod webhook_tests {
     impl WebhookEnvelopeReader for FakeEnvelopes {
         fn latest_envelope<'a>(
             &'a self,
-            _member_role: &'a str,
+            _scope_kind: EnvelopeScopeKind,
+            _scope_ref: &'a str,
         ) -> WebhookFuture<'a, Result<Option<Envelope>, StoreError>> {
             Box::pin(async move { Ok(Some(self.envelope.clone())) })
         }
@@ -3008,7 +3195,8 @@ mod webhook_tests {
         fn grants_for_runtime<'a>(
             &'a self,
             runtime_uid: &'a str,
-            _member_role: &'a str,
+            _scope_kind: EnvelopeScopeKind,
+            _scope_ref: &'a str,
             _envelope_revision: i64,
         ) -> WebhookFuture<'a, Result<Vec<AdmissionDelta>, StoreError>> {
             Box::pin(async move { Ok(self.grants.get(runtime_uid).cloned().unwrap_or_default()) })
@@ -3339,6 +3527,93 @@ mod webhook_tests {
         assert_eq!(
             response.result.message,
             "AgentRuntime principal is immutable through the validating admission path"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_allows_only_a_trusted_writer_to_create_a_service_principal()
+    -> Result<(), String> {
+        let controller_username = "system:serviceaccount:steward-system:steward-controller";
+        let mut value = admission_review_value();
+        value["request"]["operation"] = serde_json::json!("CREATE");
+        value["request"]["oldObject"] = serde_json::Value::Null;
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
+        value["request"]["object"]["spec"]["principal"] = serde_json::json!({
+            "kind": "service",
+            "name": "scheduled-scanner"
+        });
+        value["request"]["object"]["spec"]["owner"] = serde_json::json!("alice@example.com");
+        value["request"]["object"]["metadata"]["annotations"] = serde_json::json!({
+            "agents.apelogic.ai/service-principal": "scheduled-scanner"
+        });
+
+        let ordinary_review =
+            serde_json::from_value::<AdmissionReview<AgentRuntime>>(value.clone())
+                .map_err(|error| format!("failed to construct service CREATE review: {error}"))?;
+        let ordinary_request: AdmissionRequest<AgentRuntime> = ordinary_review
+            .try_into()
+            .map_err(|error| format!("failed to read service CREATE request: {error}"))?;
+        let ordinary = validate_admission(&ordinary_request, &fake_envelopes()).await;
+        assert!(
+            !ordinary.allowed,
+            "an ordinary user must not self-assert a service principal"
+        );
+
+        value["request"]["userInfo"] = serde_json::json!({"username": controller_username});
+        let trusted_review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct trusted service CREATE: {error}"))?;
+        let trusted_request: AdmissionRequest<AgentRuntime> = trusted_review
+            .try_into()
+            .map_err(|error| format!("failed to read trusted service CREATE: {error}"))?;
+        let trusted = super::validate_admission_with_trusted_writers(
+            &trusted_request,
+            &fake_envelopes(),
+            &BTreeSet::from([controller_username.to_owned()]),
+        )
+        .await;
+        assert!(
+            trusted.allowed,
+            "the trusted Steward writer must admit a service runtime through its service envelope: {}",
+            trusted.result.message
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_a_service_principal_annotation_mismatch() -> Result<(), String> {
+        let controller_username = "system:serviceaccount:steward-system:steward-controller";
+        let mut value = admission_review_value();
+        value["request"]["operation"] = serde_json::json!("CREATE");
+        value["request"]["oldObject"] = serde_json::Value::Null;
+        value["request"]["userInfo"] = serde_json::json!({"username": controller_username});
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
+        value["request"]["object"]["spec"]["principal"] = serde_json::json!({
+            "kind": "service",
+            "name": "scheduled-scanner"
+        });
+        value["request"]["object"]["metadata"]["annotations"] = serde_json::json!({
+            "agents.apelogic.ai/service-principal": "different-service"
+        });
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct mismatched service review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read mismatched service review: {error}"))?;
+
+        let response = super::validate_admission_with_trusted_writers(
+            &request,
+            &fake_envelopes(),
+            &BTreeSet::from([controller_username.to_owned()]),
+        )
+        .await;
+        assert!(
+            !response.allowed,
+            "a service name cannot cross envelope scopes"
+        );
+        assert_eq!(
+            response.result.message,
+            "AgentRuntime service-principal annotation must match the service principal name"
         );
         Ok(())
     }

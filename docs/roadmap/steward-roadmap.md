@@ -362,8 +362,8 @@ channel, because a channel is not a door. And adding an input channel touches no
 code — which is the actual test of whether the boundary is in the right place.
 
 The translator authenticates as itself and acts on behalf of a resolved human. That is a
-service principal acting for a user, which is precisely the `Principal` shape §4 reserves
-and does not implement in v0.1.0. The reservation was worth making.
+delegated service principal, which uses the `Principal` shape in §4 and preserves both the
+resolved human credential subject and the service identity in HOP-1.
 
 #### 2.6.2 Outbound is three ports, not one
 
@@ -534,8 +534,8 @@ grants                -- instance-bound exceptions. The anti-ratchet artifact
 
 envelopes             -- immutable revisions
   scope_kind, scope_ref, revision, spec jsonb, authored_by, at
-  -- scope_kind is 'member_role' only in v0.1.0 (D5). Team and cost-centre
-  -- scopes are admitted by the key and rejected by admission.
+  -- scope_kind is 'member_role' or 'service'. Team and cost-centre scopes remain
+  -- rejected by admission.
   -- Composition, when it arrives: intersect, never union.
 
 spend_observations    -- projections FROM LiteLLM; not authoritative
@@ -571,8 +571,11 @@ pub enum Principal {
     /// A standing, attenuated delegation of one person's access.
     User { acting_user: Email },
     /// Envelope authored directly by an admin, not derived from a person.
-    /// Schema only in v0.1.0 — admission rejects it.
-    Service { name: String },
+    Service {
+        name: String,
+        /// Present only when a service acts for a server-resolved user.
+        acting_user: Option<Email>,
+    },
 }
 ```
 
@@ -581,12 +584,14 @@ pub enum Principal {
   notification, and is explicitly *not* the acting user.
 - **The mint takes a `Principal`, not an email.** The acting-as claim carries either a
   delegated user or a service-principal id.
-- **Only the `User` arm is implemented.** The service branch of `mcp-gw` credential
-  resolution — a custodied credential with an authored scope, not per-user token
-  resolution — is `unimplemented!()` with the type in place.
+- **Both arms are implemented.** A delegated service retains the resolved user's
+  credential subject and explicit service attribution. A pure service uses a dedicated
+  `service:<name>` subject whose custodied provider credential has an explicitly authored
+  scope; it cannot resolve a user's credential.
 
 The trap being avoided is shipping `acting_user: String` threaded through the mint and
-the projections. Model the enum; wire the user arm; stub the service arm.
+the projections. The enum carries user, delegated-service, and pure-service identity to
+the mint without collapsing their credential subjects.
 
 ---
 
@@ -792,11 +797,10 @@ finds nothing. Size: **M**.
 
 `Workflow` / `WorkflowBinding` / `Task` · the journal · the executor and step gate · the
 data plane (git gateway, blob CAS, registry proxy, fetch proxy) · the knowledge layer ·
-service principals beyond schema · `TaskTrigger` · the human↔agent interactive plane ·
+`TaskTrigger` · the human↔agent interactive plane ·
 per-team and per-cost-center envelopes · multi-cluster.
 
-**Two exceptions, both schema-only and both cheap now:** the `Principal` enum's service
-arm (§4), and the reserved `bindings` field (§5).
+The reserved `bindings` field remains schema-only (§5).
 
 ### 7.1 The human↔agent plane — deferred, with one decision taken now
 
@@ -1064,7 +1068,7 @@ slice and one a decision.
 | **D2** | **RESOLVED — LiteLLM key delivery** | **Token-grant exchange, with the Steward mint as the `token_endpoint`. The supervisor pulls a per-sandbox JWT-SVID (`ClusterSPIFFEID` from `openshell.io/sandbox-id`), exchanges it at the mint, and injects the returned per-runtime virtual key — nothing is delivered into the sandbox. Revocation becomes a property of the mechanism, attribution is structural, and it reuses S1's exchanger. The #1970 uniform-scope concern applies to third-party endpoints, not to one we operate: what returns is derived from the SVID identity, not the requested scope** | — | **S2** |
 | **D3** | **RATIFIED — session recording granularity** | **At the relay, one tap, typed events. Not inside the sandbox (that breaks role-implementation purity), not per-frontend (that fragments it). Access to recordings is a **separate authorization path** from live subscription — see D4 point 5** | deferred with the plane | — |
 | **D4** | **RESOLVED — break-glass admin access** | **Yes, and defensible because it is loud. (1) A distinct named operation, never an admin role that quietly passes the entitlement check — otherwise there is no line between routine and emergency and no signal that anything happened. (2) The acting user is **always** notified, immediately; this is the property that makes it acceptable. (3) Recorded in `runtime_events` with a reason, visible in the fleet view. (4) Time-bounded to T; continuing means re-invoking, which re-notifies. (5) **Never retroactive** — a live subscription only. Recordings are a separate authorization path, because "watch during an incident" and "read everything this person's agent has done" are different powers. The requirement is narrower than it looks: most incident response is *suspend or terminate*, which needs no session access at all** | deferred with the plane | — |
-| **D5** | **RESOLVED — envelope granularity** | **Member role only in v0.1.0. Schema admits more without implementing it: key `envelopes` on `(scope_kind, scope_ref, revision)` with `scope_kind` restricted to `member_role` — a column now instead of a migration plus an admission-query rewrite later. Composition rule stated now, unimplemented: **envelopes intersect, never union.** A team envelope can only narrow. Widening is what escalation and instance-bound `grants` are for** | — | **S3** |
+| **D5** | **RESOLVED — envelope granularity** | **Member-role envelopes shipped in S3; Phase C adds service envelopes on the same `(scope_kind, scope_ref, revision)` key. Equal role and service names remain isolated by `scope_kind`. Team and cost-centre composition is still unimplemented: when it arrives, envelopes intersect, never union. Widening remains the job of instance-bound `grants`, never envelope mutation.** | — | **S3, Phase C** |
 | **D6** | **RESOLVED — HOP-1 signing algorithm** | **EdDSA (Ed25519). The premise for RS256 was false: `mcp-gw`'s `validateHop1Jwt` passes no `algorithms` option to `jwtVerify`, so it accepts whatever the trusted issuer's JWKS advertises. Ed25519 costs zero verifier changes. `validateHop1JwtForIssuers` already iterates issuers with independent JWKS, so the Steward mint is added beside the proto-mint with a different algorithm — no cutover. Algorithm is mint-side config as a closed enum (`Ed25519 \| RS256`), never a free string, never `none`, never an HMAC family** | — | **S1** |
 | **D7** | **RESOLVED — `steward-admission` vs #2109** | **Split by role, decided in advance. **Containment** (manifest vs. ceiling — pure, stateless, no Steward concepts) is *deletable*: if #2109's managed maximum can express our four envelope dimensions (models, tools, budget, TTL), we delete ours and call theirs. **Composition and consequence** (envelope revisions, structured deltas, parking, instance grants, the queue) never goes upstream — it is the product. If containment moves, G-1/G-5 mechanism lines change from ours to upstream's and gain conformance tests, because we would then depend on a behaviour rather than implement it. Build nothing toward it: a separable crate is deletable, and that is all the preparation an unmerged draft warrants** | — | — |
 | **D8** | **RESOLVED — authority re-verification interval** | **G-3 restated: not "a policy change propagates within N seconds" but **an agent's authority is re-verified at most every T seconds.** The enforcement clock is the HOP-1 TTL — a number we set, not a latency we measure. `STEWARD_AUTHORITY_TTL`, default **60s**, with the token-grant access-token cache aligned to it so the two clocks cannot disagree. Revocation does not wait for T: suspend and terminate delete the LiteLLM key and refuse at the mint immediately (G-4, different mechanism, faster)** | — | **S3** |

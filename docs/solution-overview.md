@@ -155,10 +155,10 @@ access** — for a month, unattended. That deserves to be modeled deliberately.
 
 - The **workload** (the sandbox) has a SPIFFE identity, issued by SPIRE. That is
   the root of trust for "this is a genuine OpenShell agent."
-- Steward binds that workload, **at provisioning**, to the **acting user** — and mints
-  the short-lived tokens the agent presents to the shared gateways, carrying the
-  user's identity plus an explicit "acting-as" marker. The agent never holds the
-  user's actual credentials; the gateways resolve those from the user's identity.
+- Steward binds that workload, **at provisioning**, to its `Principal` and mints
+  short-lived tokens for the shared gateways. A user runtime carries the acting user;
+  a delegated service carries both its service name and server-resolved user; a pure
+  service carries only `service:<name>`. The agent never holds provider credentials.
 - The agent's granted tools and models are an **attenuation**: it gets a subset of
   what the user could do, never a superset.
 - Because this is standing delegation, **revocation is first-class**. Suspending or
@@ -167,9 +167,9 @@ access** — for a month, unattended. That deserves to be modeled deliberately.
   short-lived identity the agent can no longer obtain. A "stopped" agent must not
   still hold live access.
 
-The user's email is the join key that ties their portal identity, their delegated
-agent, and their stored provider credentials together. Getting that binding right
-is what makes the whole thing safe.
+The verified HOP-1 subject is the credential join key. It is a user's email for user
+and delegated-service work, and `service:<name>` for a pure service. Those namespaces
+are deliberately distinct so a service cannot resolve a user's provider credential.
 
 ## 6. Governance, evidence, and audit
 

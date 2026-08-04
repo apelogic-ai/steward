@@ -29,4 +29,17 @@ await store.saveAccount({
   createdAt: now,
   updatedAt: now,
 });
+await store.saveAccount({
+  provider: "github",
+  hop1Issuer: issuer,
+  hop1Subject: "service:scheduled-scanner",
+  email: "service:scheduled-scanner",
+  scopesGranted: ["repo"],
+  encryptedRefreshToken: encryptSecret(
+    "fixture-service-provider-token",
+    encryptionKey,
+  ),
+  createdAt: now,
+  updatedAt: now,
+});
 await pool.end();

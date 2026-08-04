@@ -3,9 +3,23 @@
 use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
-use steward_types::{
-    AgentRuntimeSpec, Budget, Duration, ModelRef, Principal, SpendSummary, ToolGrant,
-};
+use steward_types::{AgentRuntimeSpec, Budget, Duration, ModelRef, SpendSummary, ToolGrant};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvelopeScopeKind {
+    MemberRole,
+    Service,
+}
+
+impl EnvelopeScopeKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MemberRole => "member_role",
+            Self::Service => "service",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,7 +130,6 @@ pub enum AdmissionError {
     InvalidCurrency { value: String },
     CurrencyMismatch { requested: String, ceiling: String },
     InvalidTtl { value: String },
-    UnsupportedServicePrincipal,
     UnsupportedBindings,
 }
 
@@ -155,9 +168,6 @@ pub fn evaluate(
     envelope: &Envelope,
 ) -> Result<AdmissionDecision, AdmissionError> {
     validate_envelope(envelope)?;
-    if matches!(request.principal, Principal::Service { .. }) {
-        return Err(AdmissionError::UnsupportedServicePrincipal);
-    }
     if request.bindings.is_some() {
         return Err(AdmissionError::UnsupportedBindings);
     }
@@ -618,15 +628,27 @@ mod tests {
     }
 
     #[test]
-    fn reserved_plane_b_and_service_shapes_fail_closed() {
+    fn reserved_plane_b_shape_fails_closed_but_service_uses_the_same_envelope_fence() {
         let envelope = envelope_with_budget("200.00");
         let mut service = request_with_budget("100.00");
         service.principal = Principal::Service {
             name: "service-a".to_owned(),
+            acting_user: None,
         };
-        assert_eq!(
-            evaluate(&service, &envelope),
-            Err(AdmissionError::UnsupportedServicePrincipal)
+        assert_eq!(evaluate(&service, &envelope), Ok(AdmissionDecision::Admit));
+
+        service.tools.push(ToolGrant {
+            provider: "mcp".to_owned(),
+            resource: "repository:outside-service-scope".to_owned(),
+            action: "read".to_owned(),
+        });
+        assert!(
+            matches!(
+                evaluate(&service, &envelope),
+                Ok(AdmissionDecision::Reject { deltas })
+                    if matches!(deltas.as_slice(), [AdmissionDelta::Tools { .. }])
+            ),
+            "a service principal must not bypass the envelope anti-ratchet"
         );
 
         let mut bound = request_with_budget("100.00");

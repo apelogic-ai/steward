@@ -18,16 +18,61 @@ subject_matches if {
 	input.tokenClaims.sub == input.principal
 }
 
-principal_matches if {
+user_principal_matches if {
 	email_matches
 	subject_matches
+	input.tokenClaims.steward.acting_as == "user"
+}
+
+delegated_service_principal_matches if {
+	email_matches
+	subject_matches
+	authority := input.tokenClaims.steward
+	authority.acting_as == "service_for_user"
+	is_string(authority.service)
+	authority.service != ""
+}
+
+pure_service_principal_matches if {
+	claims := input.tokenClaims
+	authority := claims.steward
+	authority.acting_as == "service"
+	is_string(authority.service)
+	authority.service != ""
+	input.principal == concat("", ["service:", authority.service])
+	claims.sub == input.principal
+	claims.email == input.principal
+}
+
+principal_matches if {
+	user_principal_matches
+}
+
+principal_matches if {
+	delegated_service_principal_matches
+}
+
+principal_matches if {
+	pure_service_principal_matches
 }
 
 authority_claims_match if {
 	claims := input.tokenClaims
 	authority := claims.steward
 	authority.acting_as == "user"
-	authority.version == 1
+	not authority.service
+	authority.version == 2
+	is_string(authority.runtime_uid)
+	authority.runtime_uid != ""
+}
+
+authority_claims_match if {
+	claims := input.tokenClaims
+	authority := claims.steward
+	authority.acting_as in {"service", "service_for_user"}
+	is_string(authority.service)
+	authority.service != ""
+	authority.version == 2
 	is_string(authority.runtime_uid)
 	authority.runtime_uid != ""
 }
@@ -49,10 +94,12 @@ allow if {
 denial_reason := "verified token claims are unavailable" if {
 	not is_object(input.tokenClaims)
 } else := "verified token email is unavailable" if {
+	input.tokenClaims.steward.acting_as in {"user", "service_for_user"}
 	not email_available
 } else := "authenticated request principal is unavailable" if {
 	not principal_available
 } else := "verified token email does not match the request" if {
+	input.tokenClaims.steward.acting_as in {"user", "service_for_user"}
 	not email_matches
 } else := "verified token subject does not match the request" if {
 	not subject_matches
