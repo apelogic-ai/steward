@@ -130,6 +130,29 @@ pub trait SandboxRuntime: Send + Sync + 'static {
     ) -> impl Future<Output = Result<SandboxObservation, PortError>> + Send;
 }
 
+/// One server-selected single-shot command over an opaque input archive.
+///
+/// This extends the class-B sandbox seam; it is not a replaceable plane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SandboxTaskRequest {
+    pub runtime: RuntimeId,
+    pub refs: RuntimeRefs,
+    pub command: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SandboxTaskOutput {
+    pub archive: Vec<u8>,
+}
+
+pub trait SandboxTaskRuntime: Send + Sync + 'static {
+    fn run_task(
+        &self,
+        request: &SandboxTaskRequest,
+        input_archive: &[u8],
+    ) -> impl Future<Output = Result<SandboxTaskOutput, PortError>> + Send;
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct InferenceCapabilities {

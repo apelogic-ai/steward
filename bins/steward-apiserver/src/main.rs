@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use axum::serve::Listener;
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
-use steward_apiserver::{KubeRuntimeRepository, KubernetesTokenAuthenticator, router};
+use steward_apiserver::{
+    KubeRuntimeRepository, KubernetesTaskIdentityResolver, KubernetesTokenAuthenticator,
+    StaticTaskWorkflowCatalog, router, task_router,
+};
 use steward_store::PgStore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinError, JoinSet};
@@ -42,12 +45,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
         env::var("STEWARD_ADMIN_GROUP").unwrap_or_else(|_| "agents.apelogic.ai/admin".to_owned()),
         env::var("STEWARD_TOKEN_AUDIENCE").ok(),
     );
-    let app = router(
-        KubeRuntimeRepository::new(client),
-        store,
-        authenticator,
-        decisions,
+    let task_identities = KubernetesTaskIdentityResolver::new(
+        client.clone(),
+        env::var("STEWARD_TASK_TOKEN_AUDIENCE").ok(),
     );
+    let task_workflows =
+        StaticTaskWorkflowCatalog::from_json(&required("STEWARD_TASK_WORKFLOWS_JSON")?)
+            .map_err(io::Error::other)?;
+    let runtimes = KubeRuntimeRepository::new(client);
+    let app = router(
+        runtimes.clone(),
+        store.clone(),
+        authenticator,
+        decisions.clone(),
+    )
+    .merge(task_router(
+        runtimes,
+        store,
+        decisions,
+        task_identities,
+        task_workflows,
+    ));
     let listener = tls_listener(
         &env::var("STEWARD_APISERVER_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_owned()),
         &required("STEWARD_TLS_CERT_DER")?,

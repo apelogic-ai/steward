@@ -1,0 +1,90 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: steward-poc-api
+  namespace: steward-system
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: steward-task-server
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+rules:
+  - apiGroups: ["agents.apelogic.ai"]
+    resources: ["agentruntimes"]
+    verbs: ["create", "delete", "get", "list", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: steward-task-server
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: steward-task-server
+subjects:
+  - kind: ServiceAccount
+    name: steward-poc-api
+    namespace: steward-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: steward-task-server
+  namespace: steward-system
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: steward-task-server
+  template:
+    metadata:
+      labels:
+        app: steward-task-server
+        steward.test/run-id: STEWARD_RUN_ID
+    spec:
+      serviceAccountName: steward-poc-api
+      initContainers:
+        - name: wait-postgres
+          image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+          command: ["sh", "-c", "until pg_isready -h postgres -U steward -d steward; do sleep 1; done"]
+      containers:
+        - name: task-server
+          image: STEWARD_TASK_IMAGE
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/steward-task-server"]
+          env:
+            - name: STEWARD_TEST_DATABASE_URL
+              value: postgres://steward@postgres.steward-system.svc.cluster.local:5432/steward
+            - name: STEWARD_TEST_TASK_BIND
+              value: 0.0.0.0:8082
+          ports:
+            - name: http
+              containerPort: 8082
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: steward-task-server
+  namespace: steward-system
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+spec:
+  selector:
+    app: steward-task-server
+  ports:
+    - name: http
+      port: 8082
+      targetPort: http

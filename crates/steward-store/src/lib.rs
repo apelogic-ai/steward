@@ -1212,6 +1212,370 @@ impl PgStore {
     }
 }
 
+impl PgStore {
+    pub async fn reserve_task(
+        &self,
+        request: &TaskReservationRequest<'_>,
+    ) -> Result<TaskReservation, StoreError> {
+        let task_uid = Uuid::new_v4();
+        let inserted = sqlx::query(
+            "INSERT INTO task_submissions \
+             (task_uid, idempotency_key, submitter_service, acting_user, owner, workflow, \
+              coding_agent_runtime, runtime_namespace, runtime_name, runtime_ownership, phase, \
+              runtime_spec, agent_command) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'submitted', $11, $12) \
+             ON CONFLICT (submitter_service, idempotency_key) DO NOTHING",
+        )
+        .bind(task_uid)
+        .bind(request.idempotency_key)
+        .bind(request.submitter_service)
+        .bind(request.acting_user)
+        .bind(request.owner)
+        .bind(request.workflow)
+        .bind(request.coding_agent_runtime)
+        .bind(request.runtime_namespace)
+        .bind(request.runtime_name)
+        .bind(ownership_text(request.runtime_ownership))
+        .bind(Json(request.runtime_spec))
+        .bind(Json(request.agent_command))
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?
+        .rows_affected()
+            == 1;
+        let record = self
+            .task_by_idempotency(request.submitter_service, request.idempotency_key)
+            .await?
+            .ok_or_else(|| {
+                StoreError::Database(
+                    "task reservation disappeared after idempotent insert".to_owned(),
+                )
+            })?;
+        if record.submitter_service != request.submitter_service
+            || record.acting_user.as_deref() != request.acting_user
+            || record.owner != request.owner
+            || record.workflow != request.workflow
+            || record.coding_agent_runtime != request.coding_agent_runtime
+            || record.runtime_namespace != request.runtime_namespace
+            || record.runtime_name != request.runtime_name
+            || record.runtime_ownership != request.runtime_ownership
+            || record.runtime_spec != *request.runtime_spec
+            || record.agent_command != request.agent_command
+        {
+            return Err(StoreError::TaskIdempotencyConflict);
+        }
+        Ok(TaskReservation { inserted, record })
+    }
+
+    pub async fn bind_task_runtime(
+        &self,
+        task_uid: Uuid,
+        runtime_uid: &str,
+        phase: steward_types::TaskPhase,
+    ) -> Result<TaskRecord, StoreError> {
+        if runtime_uid.is_empty() {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        let result = sqlx::query(
+            "UPDATE task_submissions \
+             SET runtime_uid = $2, phase = $3, updated_at = now() \
+             WHERE task_uid = $1 AND (runtime_uid IS NULL OR runtime_uid = $2)",
+        )
+        .bind(task_uid)
+        .bind(runtime_uid)
+        .bind(task_phase_text(phase))
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        self.task(task_uid).await?.ok_or(StoreError::TaskNotFound)
+    }
+
+    pub async fn task(&self, task_uid: Uuid) -> Result<Option<TaskRecord>, StoreError> {
+        let row = sqlx::query("SELECT * FROM task_submissions WHERE task_uid = $1")
+            .bind(task_uid)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?;
+        row.map(task_record).transpose()
+    }
+
+    pub async fn put_task_inputs(
+        &self,
+        task_uid: Uuid,
+        submitter_service: &str,
+        acting_user: Option<&str>,
+        archive: &[u8],
+    ) -> Result<TaskRecord, StoreError> {
+        let result = sqlx::query(
+            "UPDATE task_submissions \
+             SET input_archive = $4, updated_at = now() \
+             WHERE task_uid = $1 AND submitter_service = $2 \
+               AND acting_user IS NOT DISTINCT FROM $3 \
+               AND phase IN ('submitted', 'parked') \
+               AND NOT execute_requested \
+               AND (input_archive IS NULL OR input_archive = $4)",
+        )
+        .bind(task_uid)
+        .bind(submitter_service)
+        .bind(acting_user)
+        .bind(archive)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        self.task(task_uid).await?.ok_or(StoreError::TaskNotFound)
+    }
+
+    pub async fn request_task_execution(
+        &self,
+        task_uid: Uuid,
+        submitter_service: &str,
+        acting_user: Option<&str>,
+    ) -> Result<TaskRecord, StoreError> {
+        let result = sqlx::query(
+            "UPDATE task_submissions \
+             SET execute_requested = true, \
+                 phase = CASE WHEN phase = 'submitted' THEN 'queued' ELSE phase END, \
+                 updated_at = now() \
+             WHERE task_uid = $1 AND submitter_service = $2 \
+               AND acting_user IS NOT DISTINCT FROM $3 \
+               AND input_archive IS NOT NULL \
+               AND phase IN ('submitted', 'parked', 'queued') \
+               AND NOT finalize_requested",
+        )
+        .bind(task_uid)
+        .bind(submitter_service)
+        .bind(acting_user)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        self.task(task_uid).await?.ok_or(StoreError::TaskNotFound)
+    }
+
+    pub async fn task_for_submitter(
+        &self,
+        task_uid: Uuid,
+        submitter_service: &str,
+        acting_user: Option<&str>,
+    ) -> Result<Option<TaskRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT * FROM task_submissions \
+             WHERE task_uid = $1 AND submitter_service = $2 \
+               AND acting_user IS NOT DISTINCT FROM $3",
+        )
+        .bind(task_uid)
+        .bind(submitter_service)
+        .bind(acting_user)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        row.map(task_record).transpose()
+    }
+
+    pub async fn request_task_finalization(
+        &self,
+        task_uid: Uuid,
+        submitter_service: &str,
+        acting_user: Option<&str>,
+    ) -> Result<TaskRecord, StoreError> {
+        let result = sqlx::query(
+            "UPDATE task_submissions \
+             SET finalize_requested = true, \
+                 phase = CASE \
+                     WHEN phase IN ('submitted', 'parked', 'queued') THEN 'cancelled' \
+                     ELSE phase \
+                 END, \
+                 updated_at = now() \
+             WHERE task_uid = $1 AND submitter_service = $2 \
+               AND acting_user IS NOT DISTINCT FROM $3",
+        )
+        .bind(task_uid)
+        .bind(submitter_service)
+        .bind(acting_user)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::TaskNotFound);
+        }
+        self.task(task_uid).await?.ok_or(StoreError::TaskNotFound)
+    }
+
+    pub async fn task_work_items(&self) -> Result<Vec<TaskRecord>, StoreError> {
+        sqlx::query(
+            "SELECT * FROM task_submissions \
+             WHERE (execute_requested AND phase IN ('parked', 'queued')) \
+                OR (finalize_requested AND NOT finalized) \
+             ORDER BY created_at, task_uid",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(task_record)
+        .collect()
+    }
+
+    pub async fn release_parked_task(&self, task_uid: Uuid) -> Result<bool, StoreError> {
+        sqlx::query(
+            "UPDATE task_submissions SET phase = 'queued', updated_at = now() \
+             WHERE task_uid = $1 AND phase = 'parked' AND execute_requested \
+               AND NOT finalize_requested",
+        )
+        .bind(task_uid)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(database_error)
+    }
+
+    pub async fn claim_task_execution(&self, task_uid: Uuid) -> Result<bool, StoreError> {
+        sqlx::query(
+            "UPDATE task_submissions SET phase = 'running', updated_at = now() \
+             WHERE task_uid = $1 AND phase = 'queued' AND execute_requested \
+               AND NOT finalize_requested",
+        )
+        .bind(task_uid)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(database_error)
+    }
+
+    pub async fn complete_task_execution(
+        &self,
+        task_uid: Uuid,
+        output_archive: &[u8],
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "UPDATE task_submissions \
+             SET phase = 'succeeded', output_archive = $2, updated_at = now() \
+             WHERE task_uid = $1 AND phase = 'running' AND NOT finalize_requested",
+        )
+        .bind(task_uid)
+        .bind(output_archive)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if result.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidTaskTransition)
+        }
+    }
+
+    pub async fn fail_task_execution(
+        &self,
+        task_uid: Uuid,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        if reason.is_empty() {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        let result = sqlx::query(
+            "UPDATE task_submissions \
+             SET phase = CASE WHEN finalize_requested THEN 'cancelled' ELSE 'failed' END, \
+                 finalize_requested = true, failure_reason = $2, updated_at = now() \
+             WHERE task_uid = $1 AND phase = 'running'",
+        )
+        .bind(task_uid)
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if result.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidTaskTransition)
+        }
+    }
+
+    pub async fn mark_task_finalized(&self, task_uid: Uuid) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "UPDATE task_submissions SET finalized = true, updated_at = now() \
+             WHERE task_uid = $1 AND finalize_requested AND NOT finalized",
+        )
+        .bind(task_uid)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if result.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidTaskTransition)
+        }
+    }
+
+    async fn task_by_idempotency(
+        &self,
+        submitter_service: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<TaskRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT * FROM task_submissions \
+             WHERE submitter_service = $1 AND idempotency_key = $2",
+        )
+        .bind(submitter_service)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        row.map(task_record).transpose()
+    }
+}
+
+pub struct TaskReservationRequest<'a> {
+    pub idempotency_key: &'a str,
+    pub submitter_service: &'a str,
+    pub acting_user: Option<&'a str>,
+    pub owner: &'a str,
+    pub workflow: &'a str,
+    pub coding_agent_runtime: &'a str,
+    pub runtime_namespace: &'a str,
+    pub runtime_name: &'a str,
+    pub runtime_ownership: steward_types::RuntimeOwnership,
+    pub runtime_spec: &'a AgentRuntimeSpec,
+    pub agent_command: &'a [String],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskReservation {
+    pub inserted: bool,
+    pub record: TaskRecord,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskRecord {
+    pub task_uid: Uuid,
+    pub idempotency_key: String,
+    pub submitter_service: String,
+    pub acting_user: Option<String>,
+    pub owner: String,
+    pub workflow: String,
+    pub coding_agent_runtime: String,
+    pub runtime_uid: Option<String>,
+    pub runtime_namespace: String,
+    pub runtime_name: String,
+    pub runtime_ownership: steward_types::RuntimeOwnership,
+    pub phase: steward_types::TaskPhase,
+    pub runtime_spec: AgentRuntimeSpec,
+    pub agent_command: Vec<String>,
+    pub input_archive: Option<Vec<u8>>,
+    pub output_archive: Option<Vec<u8>>,
+    pub execute_requested: bool,
+    pub finalize_requested: bool,
+    pub finalized: bool,
+    pub failure_reason: Option<String>,
+}
+
 pub struct ParkRejection<'a> {
     pub runtime_uid: &'a str,
     pub runtime_namespace: &'a str,
@@ -1338,6 +1702,9 @@ pub enum StoreError {
     MissingRevocationReason,
     StaleEnvelope,
     EnvelopeRevisionNotIncreasing,
+    TaskNotFound,
+    TaskIdempotencyConflict,
+    InvalidTaskTransition,
 }
 
 impl fmt::Display for StoreError {
@@ -1379,6 +1746,16 @@ impl fmt::Display for StoreError {
             Self::EnvelopeRevisionNotIncreasing => {
                 write!(formatter, "envelope revision must increase monotonically")
             }
+            Self::TaskNotFound => write!(formatter, "task does not exist"),
+            Self::TaskIdempotencyConflict => {
+                write!(
+                    formatter,
+                    "idempotency key is already bound to another task request"
+                )
+            }
+            Self::InvalidTaskTransition => {
+                write!(formatter, "task lifecycle transition is invalid")
+            }
         }
     }
 }
@@ -1387,6 +1764,81 @@ impl Error for StoreError {}
 
 fn database_error(error: sqlx::Error) -> StoreError {
     StoreError::Database(error.to_string())
+}
+
+fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
+    let runtime_ownership = match row
+        .try_get::<String, _>("runtime_ownership")
+        .map_err(database_error)?
+        .as_str()
+    {
+        "provisioned" => steward_types::RuntimeOwnership::Provisioned,
+        "adopted" => steward_types::RuntimeOwnership::Adopted,
+        _ => return Err(StoreError::InvalidTaskTransition),
+    };
+    let phase = match row
+        .try_get::<String, _>("phase")
+        .map_err(database_error)?
+        .as_str()
+    {
+        "submitted" => steward_types::TaskPhase::Submitted,
+        "parked" => steward_types::TaskPhase::Parked,
+        "queued" => steward_types::TaskPhase::Queued,
+        "running" => steward_types::TaskPhase::Running,
+        "succeeded" => steward_types::TaskPhase::Succeeded,
+        "failed" => steward_types::TaskPhase::Failed,
+        "cancelled" => steward_types::TaskPhase::Cancelled,
+        _ => return Err(StoreError::InvalidTaskTransition),
+    };
+    Ok(TaskRecord {
+        task_uid: row.try_get("task_uid").map_err(database_error)?,
+        idempotency_key: row.try_get("idempotency_key").map_err(database_error)?,
+        submitter_service: row.try_get("submitter_service").map_err(database_error)?,
+        acting_user: row.try_get("acting_user").map_err(database_error)?,
+        owner: row.try_get("owner").map_err(database_error)?,
+        workflow: row.try_get("workflow").map_err(database_error)?,
+        coding_agent_runtime: row
+            .try_get("coding_agent_runtime")
+            .map_err(database_error)?,
+        runtime_uid: row.try_get("runtime_uid").map_err(database_error)?,
+        runtime_namespace: row.try_get("runtime_namespace").map_err(database_error)?,
+        runtime_name: row.try_get("runtime_name").map_err(database_error)?,
+        runtime_ownership,
+        phase,
+        runtime_spec: row
+            .try_get::<Json<AgentRuntimeSpec>, _>("runtime_spec")
+            .map_err(database_error)?
+            .0,
+        agent_command: row
+            .try_get::<Json<Vec<String>>, _>("agent_command")
+            .map_err(database_error)?
+            .0,
+        input_archive: row.try_get("input_archive").map_err(database_error)?,
+        output_archive: row.try_get("output_archive").map_err(database_error)?,
+        execute_requested: row.try_get("execute_requested").map_err(database_error)?,
+        finalize_requested: row.try_get("finalize_requested").map_err(database_error)?,
+        finalized: row.try_get("finalized").map_err(database_error)?,
+        failure_reason: row.try_get("failure_reason").map_err(database_error)?,
+    })
+}
+
+const fn ownership_text(ownership: steward_types::RuntimeOwnership) -> &'static str {
+    match ownership {
+        steward_types::RuntimeOwnership::Provisioned => "provisioned",
+        steward_types::RuntimeOwnership::Adopted => "adopted",
+    }
+}
+
+const fn task_phase_text(phase: steward_types::TaskPhase) -> &'static str {
+    match phase {
+        steward_types::TaskPhase::Submitted => "submitted",
+        steward_types::TaskPhase::Parked => "parked",
+        steward_types::TaskPhase::Queued => "queued",
+        steward_types::TaskPhase::Running => "running",
+        steward_types::TaskPhase::Succeeded => "succeeded",
+        steward_types::TaskPhase::Failed => "failed",
+        steward_types::TaskPhase::Cancelled => "cancelled",
+    }
 }
 
 fn envelope_scope_kind(spec: &AgentRuntimeSpec) -> EnvelopeScopeKind {
