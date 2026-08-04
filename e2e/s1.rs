@@ -11,6 +11,8 @@ const ALICE_NAMESPACE: &str = "team-a";
 const ALICE_RUNTIME: &str = "runtime-alice";
 const BOB_NAMESPACE: &str = "team-b";
 const BOB_RUNTIME: &str = "runtime-bob";
+const DELEGATED_SERVICE_RUNTIME: &str = "runtime-steward-run";
+const PURE_SERVICE_RUNTIME: &str = "runtime-scheduled-scanner";
 const MCP_URL: &str = "http://mcp-gw.steward-system.svc.cluster.local:8080/mcp";
 
 struct Harness {
@@ -113,6 +115,53 @@ impl Harness {
                 "agentType": { "name": "base" },
                 "llms": [],
                 "tools": tools,
+                "budget": {
+                    "monthlyLimit": "1.00",
+                    "currency": "USD",
+                },
+                "ttl": "1h",
+            },
+        });
+        fs::write(&runtime_manifest, serde_json::to_vec_pretty(&manifest)?)?;
+        self.kubectl_ok(&["apply", "-f", path_text(&runtime_manifest)?])?;
+        Ok(())
+    }
+
+    fn write_service_runtime(
+        &self,
+        namespace: &str,
+        name: &str,
+        service: &str,
+        acting_user: Option<&str>,
+    ) -> Result<(), Box<dyn Error>> {
+        let runtime_manifest = self.run_dir.join(format!("e2e-s1-{name}.json"));
+        let mut principal = serde_json::json!({
+            "kind": "service",
+            "name": service,
+        });
+        if let Some(acting_user) = acting_user {
+            principal["actingUser"] = serde_json::json!(acting_user);
+        }
+        let manifest = serde_json::json!({
+            "apiVersion": env::var("STEWARD_AGENTRUNTIME_API_VERSION")?,
+            "kind": "AgentRuntime",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "annotations": {
+                    "agents.apelogic.ai/service-principal": service,
+                },
+            },
+            "spec": {
+                "principal": principal,
+                "owner": "alice@example.com",
+                "agentType": { "name": "base" },
+                "llms": [],
+                "tools": [{
+                    "provider": "github",
+                    "resource": "search_repositories",
+                    "action": "read",
+                }],
                 "budget": {
                     "monthlyLimit": "1.00",
                     "currency": "USD",
@@ -398,6 +447,8 @@ impl Harness {
 
 impl Drop for Harness {
     fn drop(&mut self) {
+        let _ = self.delete_runtime(ALICE_NAMESPACE, PURE_SERVICE_RUNTIME);
+        let _ = self.delete_runtime(ALICE_NAMESPACE, DELEGATED_SERVICE_RUNTIME);
         let _ = self.delete_runtime(BOB_NAMESPACE, BOB_RUNTIME);
         let _ = self.delete_runtime(ALICE_NAMESPACE, ALICE_RUNTIME);
         if let Some(mut controller) = self.controller.take() {
@@ -436,6 +487,12 @@ fn e2e_s1_tool_call_as_acting_user() -> Result<(), Box<dyn Error>> {
     )?;
 
     harness.write_runtime(ALICE_NAMESPACE, ALICE_RUNTIME, "alice@example.com", true)?;
+    harness.wait_tool_provider_attached(
+        ALICE_NAMESPACE,
+        ALICE_RUNTIME,
+        true,
+        Duration::from_secs(60),
+    )?;
     harness.wait_tool_response(
         ALICE_NAMESPACE,
         ALICE_RUNTIME,
@@ -471,6 +528,12 @@ fn e2e_s1_tool_call_as_acting_user() -> Result<(), Box<dyn Error>> {
         "Running",
         Duration::from_secs(300),
     )?;
+    harness.wait_tool_provider_attached(
+        BOB_NAMESPACE,
+        BOB_RUNTIME,
+        true,
+        Duration::from_secs(60),
+    )?;
     harness.wait_tool_response(
         BOB_NAMESPACE,
         BOB_RUNTIME,
@@ -479,6 +542,60 @@ fn e2e_s1_tool_call_as_acting_user() -> Result<(), Box<dyn Error>> {
         Duration::from_secs(60),
     )?;
 
+    harness.write_service_runtime(
+        ALICE_NAMESPACE,
+        DELEGATED_SERVICE_RUNTIME,
+        "steward-run",
+        Some("alice@example.com"),
+    )?;
+    harness.wait_phase(
+        ALICE_NAMESPACE,
+        DELEGATED_SERVICE_RUNTIME,
+        "Running",
+        Duration::from_secs(300),
+    )?;
+    harness.wait_tool_provider_attached(
+        ALICE_NAMESPACE,
+        DELEGATED_SERVICE_RUNTIME,
+        true,
+        Duration::from_secs(60),
+    )?;
+    harness.wait_tool_response(
+        ALICE_NAMESPACE,
+        DELEGATED_SERVICE_RUNTIME,
+        "search_repositories",
+        "example-org/fixture-repository",
+        Duration::from_secs(60),
+    )?;
+
+    harness.write_service_runtime(
+        ALICE_NAMESPACE,
+        PURE_SERVICE_RUNTIME,
+        "scheduled-scanner",
+        None,
+    )?;
+    harness.wait_phase(
+        ALICE_NAMESPACE,
+        PURE_SERVICE_RUNTIME,
+        "Running",
+        Duration::from_secs(300),
+    )?;
+    harness.wait_tool_provider_attached(
+        ALICE_NAMESPACE,
+        PURE_SERVICE_RUNTIME,
+        true,
+        Duration::from_secs(60),
+    )?;
+    harness.wait_tool_response(
+        ALICE_NAMESPACE,
+        PURE_SERVICE_RUNTIME,
+        "search_repositories",
+        "example-org/fixture-repository",
+        Duration::from_secs(60),
+    )?;
+
+    harness.delete_runtime(ALICE_NAMESPACE, PURE_SERVICE_RUNTIME)?;
+    harness.delete_runtime(ALICE_NAMESPACE, DELEGATED_SERVICE_RUNTIME)?;
     harness.delete_runtime(BOB_NAMESPACE, BOB_RUNTIME)?;
     harness.delete_runtime(ALICE_NAMESPACE, ALICE_RUNTIME)?;
     Ok(())

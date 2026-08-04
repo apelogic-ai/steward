@@ -5,7 +5,7 @@ use std::fmt;
 
 use sqlx::types::Json;
 use sqlx::{PgPool, Row};
-use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
+use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
 use steward_types::AgentRuntimeSpec;
 use uuid::Uuid;
 
@@ -106,14 +106,41 @@ impl PgStore {
         envelope: &Envelope,
         authored_by: &str,
     ) -> Result<(), StoreError> {
+        self.insert_scoped_envelope(
+            EnvelopeScopeKind::MemberRole,
+            member_role,
+            envelope,
+            authored_by,
+        )
+        .await
+    }
+
+    pub async fn insert_service_envelope(
+        &self,
+        service: &str,
+        envelope: &Envelope,
+        authored_by: &str,
+    ) -> Result<(), StoreError> {
+        self.insert_scoped_envelope(EnvelopeScopeKind::Service, service, envelope, authored_by)
+            .await
+    }
+
+    async fn insert_scoped_envelope(
+        &self,
+        scope_kind: EnvelopeScopeKind,
+        scope_ref: &str,
+        envelope: &Envelope,
+        authored_by: &str,
+    ) -> Result<(), StoreError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        lock_member_role(&mut transaction, member_role).await?;
+        lock_envelope_scope(&mut transaction, scope_kind, scope_ref).await?;
         let latest_revision = sqlx::query_scalar::<_, Option<i64>>(
             "SELECT max(revision) \
              FROM envelopes \
-             WHERE scope_kind = 'member_role' AND scope_ref = $1",
+             WHERE scope_kind = $1 AND scope_ref = $2",
         )
-        .bind(member_role)
+        .bind(scope_kind.as_str())
+        .bind(scope_ref)
         .fetch_one(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -123,9 +150,10 @@ impl PgStore {
         sqlx::query(
             "INSERT INTO envelopes \
              (scope_kind, scope_ref, revision, spec, authored_by) \
-             VALUES ('member_role', $1, $2, $3, $4)",
+             VALUES ($1, $2, $3, $4, $5)",
         )
-        .bind(member_role)
+        .bind(scope_kind.as_str())
+        .bind(scope_ref)
         .bind(envelope.revision)
         .bind(Json(&envelope.spec))
         .bind(authored_by)
@@ -134,18 +162,23 @@ impl PgStore {
         .map_err(database_error)?;
         sqlx::query(
             "INSERT INTO grant_revocations (grant_id, revoked_by, reason) \
-             SELECT grants.id, $2, 'member-role envelope superseded' \
+             SELECT grants.id, $3, 'envelope scope superseded' \
              FROM grants \
              JOIN approvals ON approvals.id = grants.approval_id \
              JOIN admission_decisions \
                ON admission_decisions.id = approvals.admission_decision_id \
              LEFT JOIN grant_revocations ON grant_revocations.grant_id = grants.id \
              WHERE admission_decisions.member_role = $1 \
-               AND admission_decisions.envelope_rev <> $3 \
+               AND admission_decisions.proposed_spec->'principal'->>'kind' = $2 \
+               AND admission_decisions.envelope_rev <> $4 \
                AND grant_revocations.grant_id IS NULL \
              ON CONFLICT (grant_id) DO NOTHING",
         )
-        .bind(member_role)
+        .bind(scope_ref)
+        .bind(match scope_kind {
+            EnvelopeScopeKind::MemberRole => "user",
+            EnvelopeScopeKind::Service => "service",
+        })
         .bind(authored_by)
         .bind(envelope.revision)
         .execute(&mut *transaction)
@@ -156,14 +189,32 @@ impl PgStore {
     }
 
     pub async fn latest_envelope(&self, member_role: &str) -> Result<Option<Envelope>, StoreError> {
+        self.latest_scoped_envelope(EnvelopeScopeKind::MemberRole, member_role)
+            .await
+    }
+
+    pub async fn latest_service_envelope(
+        &self,
+        service: &str,
+    ) -> Result<Option<Envelope>, StoreError> {
+        self.latest_scoped_envelope(EnvelopeScopeKind::Service, service)
+            .await
+    }
+
+    pub async fn latest_scoped_envelope(
+        &self,
+        scope_kind: EnvelopeScopeKind,
+        scope_ref: &str,
+    ) -> Result<Option<Envelope>, StoreError> {
         let row = sqlx::query(
             "SELECT revision, spec \
              FROM envelopes \
-             WHERE scope_kind = 'member_role' AND scope_ref = $1 \
+             WHERE scope_kind = $1 AND scope_ref = $2 \
              ORDER BY revision DESC \
              LIMIT 1",
         )
-        .bind(member_role)
+        .bind(scope_kind.as_str())
+        .bind(scope_ref)
         .fetch_optional(&self.pool)
         .await
         .map_err(database_error)?;
@@ -432,7 +483,8 @@ impl PgStore {
         let losing_state = losing
             .try_get::<String, _>("state")
             .map_err(database_error)?;
-        lock_member_role(&mut transaction, &member_role).await?;
+        let scope_kind = envelope_scope_kind(&proposed_spec);
+        lock_envelope_scope(&mut transaction, scope_kind, &member_role).await?;
         let grants = sqlx::query(
             "SELECT id \
              FROM grants \
@@ -465,11 +517,12 @@ impl PgStore {
         let latest_envelope_revision = sqlx::query_scalar::<_, i64>(
             "SELECT revision \
              FROM envelopes \
-             WHERE scope_kind = 'member_role' AND scope_ref = $1 \
+             WHERE scope_kind = $2 AND scope_ref = $1 \
              ORDER BY revision DESC \
              LIMIT 1",
         )
         .bind(&member_role)
+        .bind(scope_kind.as_str())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -567,6 +620,22 @@ impl PgStore {
         member_role: &str,
         envelope_revision: i64,
     ) -> Result<Vec<AdmissionDelta>, StoreError> {
+        self.grants_for_runtime_scoped(
+            runtime_uid,
+            EnvelopeScopeKind::MemberRole,
+            member_role,
+            envelope_revision,
+        )
+        .await
+    }
+
+    pub async fn grants_for_runtime_scoped(
+        &self,
+        runtime_uid: &str,
+        scope_kind: EnvelopeScopeKind,
+        scope_ref: &str,
+        envelope_revision: i64,
+    ) -> Result<Vec<AdmissionDelta>, StoreError> {
         let rows = sqlx::query(
             "SELECT grants.granted_value \
              FROM grants \
@@ -576,7 +645,8 @@ impl PgStore {
              LEFT JOIN grant_revocations ON grant_revocations.grant_id = grants.id \
              WHERE grants.runtime_uid = $1 \
                AND admission_decisions.member_role = $2 \
-               AND admission_decisions.envelope_rev = $3 \
+               AND admission_decisions.proposed_spec->'principal'->>'kind' = $3 \
+               AND admission_decisions.envelope_rev = $4 \
                AND grants.envelope_revision = admission_decisions.envelope_rev \
                AND grants.expires_at > now() \
                AND grant_revocations.grant_id IS NULL \
@@ -589,7 +659,11 @@ impl PgStore {
              END, grants.at, grants.id",
         )
         .bind(runtime_uid)
-        .bind(member_role)
+        .bind(scope_ref)
+        .bind(match scope_kind {
+            EnvelopeScopeKind::MemberRole => "user",
+            EnvelopeScopeKind::Service => "service",
+        })
         .bind(envelope_revision)
         .fetch_all(&self.pool)
         .await
@@ -823,7 +897,9 @@ impl PgStore {
              LEFT JOIN LATERAL ( \
                  SELECT revision \
                  FROM envelopes \
-                 WHERE scope_kind = 'member_role' \
+                 WHERE scope_kind = CASE \
+                       WHEN admission_decisions.proposed_spec->'principal'->>'kind' = 'service' \
+                       THEN 'service' ELSE 'member_role' END \
                    AND scope_ref = admission_decisions.member_role \
                  ORDER BY revision DESC \
                  LIMIT 1 \
@@ -898,7 +974,9 @@ impl PgStore {
              JOIN LATERAL ( \
                  SELECT revision \
                  FROM envelopes \
-                 WHERE scope_kind = 'member_role' \
+                 WHERE scope_kind = CASE \
+                       WHEN admission_decisions.proposed_spec->'principal'->>'kind' = 'service' \
+                       THEN 'service' ELSE 'member_role' END \
                    AND scope_ref = admission_decisions.member_role \
                  ORDER BY revision DESC \
                  LIMIT 1 \
@@ -1033,15 +1111,17 @@ impl PgStore {
         if state != "pending" {
             return Err(StoreError::ApprovalNotPending);
         }
-        lock_member_role(&mut transaction, &member_role).await?;
+        let scope_kind = envelope_scope_kind(&proposed_spec);
+        lock_envelope_scope(&mut transaction, scope_kind, &member_role).await?;
         let latest_revision = sqlx::query_scalar::<_, i64>(
             "SELECT revision \
              FROM envelopes \
-             WHERE scope_kind = 'member_role' AND scope_ref = $1 \
+             WHERE scope_kind = $2 AND scope_ref = $1 \
              ORDER BY revision DESC \
              LIMIT 1",
         )
         .bind(&member_role)
+        .bind(scope_kind.as_str())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -1309,6 +1389,13 @@ fn database_error(error: sqlx::Error) -> StoreError {
     StoreError::Database(error.to_string())
 }
 
+fn envelope_scope_kind(spec: &AgentRuntimeSpec) -> EnvelopeScopeKind {
+    match &spec.principal {
+        steward_types::Principal::User { .. } => EnvelopeScopeKind::MemberRole,
+        steward_types::Principal::Service { .. } => EnvelopeScopeKind::Service,
+    }
+}
+
 fn grant_expiry_error(error: sqlx::Error) -> StoreError {
     if error
         .as_database_error()
@@ -1322,12 +1409,13 @@ fn grant_expiry_error(error: sqlx::Error) -> StoreError {
     }
 }
 
-async fn lock_member_role(
+async fn lock_envelope_scope(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    member_role: &str,
+    scope_kind: EnvelopeScopeKind,
+    scope_ref: &str,
 ) -> Result<(), StoreError> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(member_role)
+        .bind(format!("{}:{scope_ref}", scope_kind.as_str()))
         .execute(&mut **transaction)
         .await
         .map_err(database_error)?;

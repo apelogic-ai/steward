@@ -16,6 +16,7 @@ const aliceTool = {
 const aliceRuntimeUid = "runtime-alice";
 const bobRuntimeUid = "runtime-bob";
 const carolRuntimeUid = "runtime-carol";
+const serviceRuntimeUid = "runtime-service";
 const alice: Hop1Identity = {
   profile: "fixture",
   issuer,
@@ -26,7 +27,7 @@ const alice: Hop1Identity = {
       acting_as: "user",
       runtime_uid: aliceRuntimeUid,
       tools: [aliceTool],
-      version: 1,
+      version: 2,
     },
   },
 };
@@ -40,7 +41,7 @@ const bob: Hop1Identity = {
       acting_as: "user",
       runtime_uid: bobRuntimeUid,
       tools: [aliceTool],
-      version: 1,
+      version: 2,
     },
   },
 };
@@ -54,7 +55,22 @@ const carol: Hop1Identity = {
       acting_as: "user",
       runtime_uid: carolRuntimeUid,
       tools: [],
-      version: 1,
+      version: 2,
+    },
+  },
+};
+const scheduledScanner: Hop1Identity = {
+  profile: "fixture",
+  issuer,
+  subject: "service:scheduled-scanner",
+  email: "service:scheduled-scanner",
+  claims: {
+    steward: {
+      acting_as: "service",
+      service: "scheduled-scanner",
+      runtime_uid: serviceRuntimeUid,
+      tools: [aliceTool],
+      version: 2,
     },
   },
 };
@@ -76,6 +92,19 @@ test("one subject cannot resolve another subject's provider credential", async (
     createdAt: now,
     updatedAt: now,
   });
+  await store.saveAccount({
+    provider: "github",
+    hop1Issuer: scheduledScanner.issuer,
+    hop1Subject: scheduledScanner.subject,
+    email: scheduledScanner.email,
+    scopesGranted: ["repo"],
+    encryptedRefreshToken: encryptSecret(
+      "fixture-service-provider-token",
+      encryptionKey,
+    ),
+    createdAt: now,
+    updatedAt: now,
+  });
   const broker = new GitHubTokenBroker({
     config: {
       clientId: "",
@@ -92,7 +121,13 @@ test("one subject cannot resolve another subject's provider credential", async (
     upstreamUrl: "https://provider.example.test/mcp",
     authenticate: (token) =>
       Promise.resolve(
-        token === "hop1-alice" ? alice : token === "hop1-bob" ? bob : carol,
+        token === "hop1-alice"
+          ? alice
+          : token === "hop1-bob"
+            ? bob
+            : token === "hop1-service"
+              ? scheduledScanner
+              : carol,
       ),
     resolveGithubToken: (identity) => {
       credentialResolutions.push(identity.subject);
@@ -153,9 +188,22 @@ test("one subject cannot resolve another subject's provider credential", async (
         "Policy denied search_repositories: verified tool authority missing",
     },
   });
-  expect(policyInputs).toHaveLength(3);
-  expect(credentialResolutions).toEqual([alice.subject, bob.subject]);
-  expect(upstreamAuthorizations).toEqual(["Bearer fixture-provider-token"]);
+  const serviceResponse = await callTool(handler, "hop1-service");
+  expect(serviceResponse.status).toBe(200);
+  expect(await serviceResponse.text()).toContain(
+    "example-org/fixture-repository",
+  );
+
+  expect(policyInputs).toHaveLength(4);
+  expect(credentialResolutions).toEqual([
+    alice.subject,
+    bob.subject,
+    scheduledScanner.subject,
+  ]);
+  expect(upstreamAuthorizations).toEqual([
+    "Bearer fixture-provider-token",
+    "Bearer fixture-service-provider-token",
+  ]);
 });
 
 function hasVerifiedToolAuthority(input: ToolPolicyInput): boolean {
@@ -166,6 +214,8 @@ function hasVerifiedToolAuthority(input: ToolPolicyInput): boolean {
         ? bobRuntimeUid
         : input.principal === carol.email
           ? carolRuntimeUid
+          : input.principal === scheduledScanner.subject
+            ? serviceRuntimeUid
           : undefined;
   const tokenClaims = (
     input as ToolPolicyInput & {
@@ -175,7 +225,6 @@ function hasVerifiedToolAuthority(input: ToolPolicyInput): boolean {
   const steward = tokenClaims?.steward;
   if (
     !tokenClaims ||
-    tokenClaims.email !== input.principal ||
     tokenClaims.sub !== input.principal ||
     !expectedRuntimeUid ||
     typeof steward !== "object" ||
@@ -186,9 +235,16 @@ function hasVerifiedToolAuthority(input: ToolPolicyInput): boolean {
   }
   const claims = steward as Record<string, unknown>;
   const tools = claims.tools;
+  const principalClaimsMatch =
+    (claims.acting_as === "user" &&
+      claims.version === 2 &&
+      tokenClaims.email === input.principal) ||
+    (claims.acting_as === "service" &&
+      claims.version === 2 &&
+      claims.service === "scheduled-scanner" &&
+      input.principal === "service:scheduled-scanner");
   return (
-    claims.acting_as === "user" &&
-    claims.version === 1 &&
+    principalClaimsMatch &&
     claims.runtime_uid === expectedRuntimeUid &&
     Array.isArray(tools) &&
     tools.some(

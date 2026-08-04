@@ -38,8 +38,14 @@ pub struct Email(pub String);
     deny_unknown_fields
 )]
 pub enum Principal {
-    User { acting_user: Email },
-    Service { name: String },
+    User {
+        acting_user: Email,
+    },
+    Service {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acting_user: Option<Email>,
+    },
 }
 
 impl JsonSchema for Principal {
@@ -62,14 +68,15 @@ impl JsonSchema for Principal {
                 },
                 "actingUser": email,
                 "name": {
-                    "type": "string"
+                    "type": "string",
+                    "minLength": 1
                 }
             },
             "required": ["kind"],
             "additionalProperties": false,
             "x-kubernetes-validations": [{
-                "rule": "(self.kind == 'user' && has(self.actingUser) && !has(self.name)) || (self.kind == 'service' && has(self.name) && !has(self.actingUser))",
-                "message": "user principals require actingUser; service principals require name"
+                "rule": "(self.kind == 'user' && has(self.actingUser) && !has(self.name)) || (self.kind == 'service' && has(self.name))",
+                "message": "user principals require actingUser and no name; service principals require name and may carry actingUser"
             }]
         })
     }
@@ -206,6 +213,32 @@ mod tests {
             "a principal must not carry both user and service identity"
         );
 
+        let delegated_service = serde_json::from_value::<Principal>(json!({
+            "kind": "service",
+            "name": "steward-run",
+            "actingUser": "alice@example.com"
+        }))
+        .map_err(|error| format!("delegated service principal must deserialize: {error}"))?;
+        let delegated_service = serde_json::to_value(delegated_service)
+            .map_err(|error| format!("failed to serialize delegated service principal: {error}"))?;
+        assert_eq!(
+            delegated_service,
+            json!({
+                "kind": "service",
+                "name": "steward-run",
+                "actingUser": "alice@example.com"
+            })
+        );
+        let pure_service = serde_json::to_value(Principal::Service {
+            name: "scheduled-scanner".to_owned(),
+            acting_user: None,
+        })
+        .map_err(|error| format!("failed to serialize pure service principal: {error}"))?;
+        assert_eq!(
+            pure_service,
+            json!({"kind": "service", "name": "scheduled-scanner"})
+        );
+
         let crd = serde_json::to_value(agent_runtime_crd())
             .map_err(|error| format!("failed to inspect AgentRuntime CRD: {error}"))?;
         let validations = crd
@@ -218,6 +251,18 @@ mod tests {
             validations.len(),
             1,
             "Principal CRD schema must have one authoritative exclusivity rule"
+        );
+        let rule = validations[0]
+            .get("rule")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "Principal CRD validation must contain a CEL rule".to_owned())?;
+        assert!(
+            rule.contains("self.kind == 'service' && has(self.name)"),
+            "service principals must require a service name"
+        );
+        assert!(
+            !rule.contains("has(self.name) && !has(self.actingUser)"),
+            "service principals must allow an optional resolved acting user"
         );
         Ok(())
     }

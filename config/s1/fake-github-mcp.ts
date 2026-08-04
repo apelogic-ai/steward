@@ -1,9 +1,13 @@
-const expectedAuthorization = "Bearer fixture-provider-token";
+const expectedAuthorizations = new Set([
+  "Bearer fixture-provider-token",
+  "Bearer fixture-service-provider-token",
+]);
 
 Bun.serve({
   port: 8082,
   async fetch(request) {
-    if (request.headers.get("authorization") !== expectedAuthorization) {
+    const authorization = request.headers.get("authorization");
+    if (!authorization || !expectedAuthorizations.has(authorization)) {
       return Response.json(
         {
           jsonrpc: "2.0",

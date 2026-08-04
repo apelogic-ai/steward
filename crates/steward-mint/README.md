@@ -30,18 +30,22 @@ must fail closed. The route requires the configured gateway credential as an
 `Authorization: Bearer` value before it parses the presented token or resolves
 authority. The mint retains only the credential's SHA-256 digest.
 
-## HOP-1 claim contract v1
+## HOP-1 claim contract v2
 
 The protected header is `alg=EdDSA`, `typ=JWT`, and a public-key `kid`.
 
 The payload contains the standard `iss`, `sub`, `aud`, `iat`, `exp`, and `jti`
-claims. For a user principal, `sub` and `email` are the acting user's email and
-`azp` is the validated workload SPIFFE ID.
+claims. `azp` is always the validated workload SPIFFE ID. For a user principal,
+`sub` and `email` are the acting user's email. A delegated service uses the same
+user subject while retaining its service name below. A pure service uses
+`service:<name>` for both `sub` and `email`; this is a service identifier for
+gateway compatibility, not a human acting user.
 
 Steward-specific claims live under `steward`:
 
-- `version`: `1`
-- `acting_as`: `user`
+- `version`: `2`
+- `acting_as`: `user`, `service_for_user`, or `service`
+- `service`: the service name for either service mode; absent for users
 - `runtime_uid`: the immutable Kubernetes runtime UID
 - `tools`: the exact `provider`, `resource`, and `action` attenuation
 

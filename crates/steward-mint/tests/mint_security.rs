@@ -337,20 +337,64 @@ async fn terminated_runtime_cannot_obtain_a_token() -> Result<(), String> {
 }
 
 #[tokio::test]
-async fn service_principal_is_rejected_in_v0_1_0() -> Result<(), String> {
+async fn pure_service_principal_receives_an_isolated_service_subject() -> Result<(), String> {
     let mut binding = active_binding();
     binding.principal = Principal::Service {
         name: "service-a".to_owned(),
+        acting_user: None,
     };
-    let (mint, _, _) = mint(Ok(validated_workload()), Ok(binding))?;
+    let (mint, _, verifying_key) = mint(Ok(validated_workload()), Ok(binding))?;
 
-    let result = mint.exchange(request()).await;
+    let response = mint
+        .exchange(request())
+        .await
+        .map_err(|error| format!("pure service principal must mint HOP-1: {error:?}"))?;
+    let untrusted = UntrustedToken::new(response.access_token())
+        .map_err(|error| format!("mint returned malformed JWT: {error}"))?;
+    let token: Token<serde_json::Value> = Ed25519
+        .validator(&verifying_key)
+        .validate(&untrusted)
+        .map_err(|error| format!("mint returned an invalid EdDSA signature: {error}"))?;
+    let claims = &token.claims().custom;
 
+    assert_eq!(claims["sub"], "service:service-a");
     assert_eq!(
-        result.err(),
-        Some(MintError::UnsupportedPrincipal),
-        "the service-principal arm is schema-only in v0.1.0"
+        claims["email"], "service:service-a",
+        "pure service must carry its service subject, never a human acting-user email"
     );
+    assert_eq!(claims["steward"]["acting_as"], "service");
+    assert_eq!(claims["steward"]["service"], "service-a");
+    assert_eq!(claims["steward"]["version"], 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn delegated_service_preserves_both_service_and_acting_user_attribution() -> Result<(), String>
+{
+    let mut binding = active_binding();
+    binding.principal = Principal::Service {
+        name: "steward-run".to_owned(),
+        acting_user: Some(Email("alice@example.com".to_owned())),
+    };
+    let (mint, _, verifying_key) = mint(Ok(validated_workload()), Ok(binding))?;
+
+    let response = mint
+        .exchange(request())
+        .await
+        .map_err(|error| format!("delegated service principal must mint HOP-1: {error:?}"))?;
+    let untrusted = UntrustedToken::new(response.access_token())
+        .map_err(|error| format!("mint returned malformed JWT: {error}"))?;
+    let token: Token<serde_json::Value> = Ed25519
+        .validator(&verifying_key)
+        .validate(&untrusted)
+        .map_err(|error| format!("mint returned an invalid EdDSA signature: {error}"))?;
+    let claims = &token.claims().custom;
+
+    assert_eq!(claims["sub"], "alice@example.com");
+    assert_eq!(claims["email"], "alice@example.com");
+    assert_eq!(claims["steward"]["acting_as"], "service_for_user");
+    assert_eq!(claims["steward"]["service"], "steward-run");
+    assert_eq!(claims["steward"]["version"], 2);
     Ok(())
 }
 
@@ -504,7 +548,7 @@ async fn inactive_runtime_fails_before_inference_credential_lookup() -> Result<(
 struct TestHop1Claims {
     aud: Vec<String>,
     azp: String,
-    email: String,
+    email: Option<String>,
     iss: String,
     jti: String,
     steward: TestStewardClaims,
@@ -515,6 +559,7 @@ struct TestHop1Claims {
 struct TestStewardClaims {
     acting_as: String,
     runtime_uid: String,
+    service: Option<String>,
     tools: Vec<ToolGrant>,
     version: u8,
 }
@@ -555,11 +600,12 @@ async fn active_user_receives_a_versioned_sixty_second_eddsa_hop1() -> Result<()
     assert_eq!(claims.custom.iss, "https://mint.example.test");
     assert_eq!(claims.custom.aud, ["mcp-gw.example.test"]);
     assert_eq!(claims.custom.sub, "alice@example.com");
-    assert_eq!(claims.custom.email, "alice@example.com");
+    assert_eq!(claims.custom.email.as_deref(), Some("alice@example.com"));
     assert_eq!(claims.custom.azp, EXPECTED_WORKLOAD);
     assert!(!claims.custom.jti.is_empty(), "HOP-1 must carry a jti");
-    assert_eq!(claims.custom.steward.version, 1);
+    assert_eq!(claims.custom.steward.version, 2);
     assert_eq!(claims.custom.steward.acting_as, "user");
+    assert_eq!(claims.custom.steward.service, None);
     assert_eq!(claims.custom.steward.runtime_uid, "runtime-uid-a");
     assert_eq!(claims.custom.steward.tools, binding_with_tool().tools);
     Ok::<(), String>(())
