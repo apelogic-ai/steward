@@ -816,6 +816,23 @@ mod tests {
     static NEXT_REPOSITORY_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn release_ci_installs_supervisor_build_tools() -> Result<(), String> {
+        let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("published Steward release workflow is required: {error}"))?;
+
+        assert!(
+            workflow.contains("run: cargo xtask ci"),
+            "release validation must run the complete Steward CI gate"
+        );
+        assert!(
+            workflow.contains("supervisor-tools: \"true\""),
+            "release validation must install Zig and cargo-zigbuild before pinned conformance"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn production_release_contract_is_complete_and_fail_closed() -> Result<(), String> {
         let chart = root().join("charts/steward");
         let values = fs::read_to_string(chart.join("values.yaml"))

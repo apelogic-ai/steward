@@ -30,6 +30,7 @@ jobs:
         with:
           gate-tools: "true"
           kubernetes-tools: "true"
+          supervisor-tools: "true"
           workflow-tools: "true"
 
       - name: Lint privileged workflows and release scripts
