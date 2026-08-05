@@ -205,6 +205,15 @@ jobs:
         uses: ./.github/actions/setup-tools
         with:
           kubernetes-tools: "true"
+          workflow-tools: "true"
+
+      - name: Lint privileged workflows and release scripts
+        run: |
+          actionlint
+          shellcheck \
+            scripts/promote-ecr-artifact.sh \
+            scripts/test-promote-ecr-artifact.sh \
+            scripts/validate-release-artifacts.sh
 
       - name: Render the chart and build all component images
         run: scripts/validate-release-artifacts.sh --build-images

@@ -41,11 +41,12 @@ config:
     litellmUrl: http://litellm-litellm.litellm.svc.cluster.local:4000
   mint:
     issuer: http://steward-mint.steward.svc.cluster.local:8080
-    audience: mcp-gw
-    allowedScopes: inference tools
+    audience: steward-mcp
+    allowedScopes: mcp inference
     svidAudience: steward-mint
     spiffeTrustDomain: example.test
     openshellNamespace: openshell
+runtimeNamespaces: []
 networkPolicy:
   enabled: true
   dnsNamespace: kube-system
@@ -66,6 +67,7 @@ networkPolicy:
 spire:
   csiDriver: csi.spiffe.io
   socketPath: /run/spire/sockets
+  identityPath: /steward/mint
 services:
   clusterDomain: cluster.local
   apiserverPort: 443

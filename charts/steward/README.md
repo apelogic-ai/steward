@@ -26,7 +26,10 @@ The release handoff attached to every GitHub release records these three image
 digests and the OCI chart digest. If repository variable
 `ECR_PROMOTION_ENABLED` is `true`, the release workflow also copies those exact
 manifests to the configured ECR repositories, verifies that the digests did not
-change, signs them, and publishes a private-registry handoff artifact.
+change, waits for native ECR scanning, rejects critical findings, signs them,
+and publishes a private-registry handoff artifact. Promotion is retry-safe: a
+missing immutable tag is created, a matching tag is reused, and a tag pointing
+to any other digest fails closed.
 
 ## Required secrets
 
@@ -44,6 +47,12 @@ Deployment. `steward-apiserver-tls` and `steward-webhook-tls` are issued by
 cert-manager from `tls.issuerRef`; the binaries accept cert-manager's PEM
 certificate chains and private keys.
 
+The globally bound controller and mint ClusterRoles have no Secret verbs.
+Runtime Secret access is granted by namespaced Roles and RoleBindings only for
+names listed in `runtimeNamespaces`. The default is an empty list, so a release
+consumer must explicitly authorize every runtime namespace; namespaces outside
+that allowlist remain inaccessible to both service accounts.
+
 ## Runtime configuration
 
 - `config.apiserver.taskTokenAudience` is the required Kubernetes TokenReview
@@ -55,8 +64,15 @@ certificate chains and private keys.
   `config.controller.openshellEndpoint` are internal service endpoints.
 - `config.mint.issuer` is the issuer that must also be configured in MCP-GW.
   Steward publishes JWKS at `<issuer>/.well-known/jwks.json` and uses EdDSA.
+- `config.mint.audience` defaults to `steward-mcp` and
+  `config.mint.allowedScopes` defaults to `mcp inference`. These include the
+  checked-in OpenShell provider contract (`audience=steward-mcp`, `scope=mcp`)
+  and the inference exchange on the same Mint instance.
 - `spire.csiDriver` and `spire.socketPath` mount the SPIFFE Workload API only in
-  the mint pod.
+  the mint pod. The chart creates a `ClusterSPIFFEID` selecting the release
+  namespace and Mint pod labels, with trust domain
+  `config.mint.spiffeTrustDomain` and stable path `spire.identityPath`
+  (`/steward/mint` by default).
 
 Both the apiserver and controller apply the embedded Postgres migration set on
 startup, including migration `0011`. They must receive the same database URL.

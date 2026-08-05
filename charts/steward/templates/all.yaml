@@ -30,9 +30,6 @@ rules:
     resources: ["agentruntimes", "agentruntimes/status", "agentruntimes/finalizers"]
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
   - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["create", "delete", "get"]
-  - apiGroups: [""]
     resources: ["users", "groups"]
     verbs: ["impersonate"]
 ---
@@ -46,9 +43,6 @@ rules:
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
     verbs: ["get", "list"]
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get"]
 {{- range $component := list "apiserver" "controller" "mint" }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -61,6 +55,64 @@ subjects:
     name: {{ include (printf "steward.%sName" $component) $ }}
     namespace: {{ $.Release.Namespace }}
 {{- end }}
+{{- range $namespace := .Values.runtimeNamespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: steward-controller-runtime-secrets
+  namespace: {{ $namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: steward-controller-runtime-secrets
+  namespace: {{ $namespace }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: steward-controller-runtime-secrets }
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "steward.controllerName" $ }}
+    namespace: {{ $.Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: steward-mint-runtime-secrets
+  namespace: {{ $namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: steward-mint-runtime-secrets
+  namespace: {{ $namespace }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: steward-mint-runtime-secrets }
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "steward.mintName" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: steward-mint
+spec:
+  spiffeIDTemplate: spiffe://{{ .Values.config.mint.spiffeTrustDomain }}{{ .Values.spire.identityPath }}
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: {{ .Release.Namespace }}
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: steward
+      app.kubernetes.io/component: mint
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate

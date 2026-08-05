@@ -30,6 +30,15 @@ jobs:
         with:
           gate-tools: "true"
           kubernetes-tools: "true"
+          workflow-tools: "true"
+
+      - name: Lint privileged workflows and release scripts
+        run: |
+          actionlint
+          shellcheck \
+            scripts/promote-ecr-artifact.sh \
+            scripts/test-promote-ecr-artifact.sh \
+            scripts/validate-release-artifacts.sh
 
       - name: Run Steward quality gates
         env:
@@ -123,6 +132,22 @@ jobs:
           exit-code: "0"
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
 
+      - name: Retain complete image vulnerability report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: release-${{ matrix.component }}-vulnerability-report
+          path: dist/${{ matrix.component }}.vulnerabilities.json
+          if-no-files-found: error
+
+      - name: Enforce critical image vulnerability policy
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/steward@${{ steps.build.outputs.digest }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+
       - name: Attest image provenance
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
@@ -200,6 +225,23 @@ jobs:
           output: dist/helm-chart.vulnerabilities.json
           exit-code: "0"
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+
+      - name: Retain complete chart vulnerability report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: release-helm-chart-vulnerability-report
+          path: dist/helm-chart.vulnerabilities.json
+          if-no-files-found: error
+
+      - name: Enforce critical chart vulnerability policy
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          scan-type: fs
+          scan-ref: ${{ runner.temp }}/chart-scan
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
 
       - name: Attest chart provenance
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
@@ -290,26 +332,73 @@ jobs:
           for component in apiserver controller mint; do
             source_digest="$(cat "dist/$component.digest")"
             source="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward@$source_digest"
-            target="$image_repository:$version-$component"
-            oras cp "$source" "$target"
-            target_digest="$(oras manifest fetch --descriptor "$target" | jq -r '.digest')"
-            test "$target_digest" = "$source_digest"
-            printf '%s\n' "$target_digest" > "dist/ecr-$component.digest"
+            scripts/promote-ecr-artifact.sh \
+              "$source" \
+              "$ECR_REGISTRY" \
+              "$STEWARD_ECR_IMAGE_REPOSITORY" \
+              "$version-$component" \
+              "$source_digest"
+            printf '%s\n' "$source_digest" > "dist/ecr-$component.digest"
           done
           source_chart_digest="$(cat dist/helm-chart.digest)"
-          target_chart="$chart_repository:$version"
-          oras cp "ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward@$source_chart_digest" "$target_chart"
-          target_chart_digest="$(oras manifest fetch --descriptor "$target_chart" | jq -r '.digest')"
-          test "$target_chart_digest" = "$source_chart_digest"
-          printf '%s\n' "$target_chart_digest" > dist/ecr-helm-chart.digest
+          scripts/promote-ecr-artifact.sh \
+            "ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward@$source_chart_digest" \
+            "$ECR_REGISTRY" \
+            "$STEWARD_ECR_CHART_REPOSITORY" \
+            "$version" \
+            "$source_chart_digest"
+          printf '%s\n' "$source_chart_digest" > dist/ecr-helm-chart.digest
           {
             printf 'image-repository=%s\n' "$image_repository"
             printf 'chart-repository=%s\n' "$chart_repository"
             printf 'apiserver-digest=%s\n' "$(cat dist/ecr-apiserver.digest)"
             printf 'controller-digest=%s\n' "$(cat dist/ecr-controller.digest)"
             printf 'mint-digest=%s\n' "$(cat dist/ecr-mint.digest)"
-            printf 'chart-digest=%s\n' "$target_chart_digest"
+            printf 'chart-digest=%s\n' "$source_chart_digest"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Wait for and enforce native ECR image scans
+        run: |
+          set -euo pipefail
+          scan_failed=0
+          for component in apiserver controller mint; do
+            digest="$(cat "dist/ecr-$component.digest")"
+            report="dist/ecr-$component-scan.json"
+            if ! aws ecr wait image-scan-complete \
+              --repository-name "$STEWARD_ECR_IMAGE_REPOSITORY" \
+              --image-id "imageDigest=$digest"
+            then
+              echo "ECR scan did not complete for $component@$digest" >&2
+              scan_failed=1
+              continue
+            fi
+            if ! aws ecr describe-image-scan-findings \
+              --repository-name "$STEWARD_ECR_IMAGE_REPOSITORY" \
+              --image-id "imageDigest=$digest" \
+              --output json > "$report"
+            then
+              echo "ECR scan findings were unavailable for $component@$digest" >&2
+              scan_failed=1
+              continue
+            fi
+            critical="$(jq '[
+              .imageScanFindings.findingSeverityCounts.CRITICAL // 0,
+              ([.imageScanFindings.enhancedFindings[]? | select(.severity == "CRITICAL")] | length)
+            ] | max' "$report")"
+            if [[ "$critical" -ne 0 ]]; then
+              echo "ECR reported $critical critical findings for $component@$digest" >&2
+              scan_failed=1
+            fi
+          done
+          test "$scan_failed" -eq 0
+
+      - name: Retain native ECR scan evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: ecr-release-scan-evidence
+          path: dist/ecr-*-scan.json
+          if-no-files-found: warn
 
       - name: Sign promoted artifacts
         env:
@@ -366,13 +455,13 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           {
             printf '# Steward private registry handoff %s\n\n' "$version"
-            printf 'Release commit: `%s`\n\n' "$GITHUB_SHA"
+            printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '| Artifact | Immutable reference |\n|---|---|\n'
             for component in apiserver controller mint; do
-              printf '| %s | `%s:%s-%s@%s` |\n' \
+              printf '| %s | %s:%s-%s@%s |\n' \
                 "$component" "$IMAGE_REPOSITORY" "$version" "$component" "$(cat "dist/ecr-$component.digest")"
             done
-            printf '| chart | `oci://%s@%s` |\n' \
+            printf '| chart | oci://%s@%s |\n' \
               "$CHART_REPOSITORY" "$(cat dist/ecr-helm-chart.digest)"
           } > dist/ecr-release-handoff.md
 
@@ -423,13 +512,13 @@ jobs:
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
           {
             printf '# Steward release %s\n\n' "$version"
-            printf 'Release commit: `%s`\n\n' "$GITHUB_SHA"
+            printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
             for component in apiserver controller mint; do
-              printf '| %s | `%s:%s-%s` | `%s` |\n' \
+              printf '| %s | %s:%s-%s | %s |\n' \
                 "$component" "$repository" "$version" "$component" "$(cat "dist/$component.digest")"
             done
-            printf '| chart | `oci://%s:%s` | `%s` |\n' \
+            printf '| chart | oci://%s:%s | %s |\n' \
               "$chart" "$version" "$(cat dist/helm-chart.digest)"
             printf '\nEach image and the chart includes an SPDX SBOM, a vulnerability report, and GitHub artifact provenance.\n'
           } > dist/release-handoff.md

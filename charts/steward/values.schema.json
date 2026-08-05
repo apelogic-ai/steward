@@ -7,6 +7,7 @@
     "secrets",
     "tls",
     "config",
+    "runtimeNamespaces",
     "networkPolicy",
     "spire",
     "services",
@@ -119,6 +120,11 @@
         }
       }
     },
+    "runtimeNamespaces": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
     "networkPolicy": {
       "type": "object",
       "additionalProperties": false,
@@ -163,10 +169,11 @@
     "spire": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["csiDriver", "socketPath"],
+      "required": ["csiDriver", "socketPath", "identityPath"],
       "properties": {
         "csiDriver": {"$ref": "#/definitions/nonempty"},
-        "socketPath": {"type": "string", "pattern": "^/", "minLength": 2}
+        "socketPath": {"type": "string", "pattern": "^/", "minLength": 2},
+        "identityPath": {"type": "string", "pattern": "^/[a-z0-9/_-]+$", "minLength": 2}
       }
     },
     "services": {
