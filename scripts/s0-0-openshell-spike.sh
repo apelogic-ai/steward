@@ -21,6 +21,7 @@ KUBECONFIG_PATH="${RUN_DIR}/kubeconfig"
 PORT_FORWARD_LOG="${RUN_DIR}/openshell-port-forward.log"
 PORT_FORWARD_PID=""
 CLUSTER_CREATED=0
+OIDC_AUDIENCE="steward-test"
 S0_E2E=0
 if [[ "$#" -eq 1 && "$1" == "--s0-e2e" ]]; then
   S0_E2E=1
@@ -82,7 +83,7 @@ if [[ "$#" -eq 1 && "$1" == "--print-openshell-cli-asset" ]]; then
   exit 0
 fi
 
-for command in kind kubectl helm cargo curl openssl sed tar; do
+for command in kind kubectl helm cargo curl openssl sed tar xxd; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is missing: ${command}" >&2
     exit 2
@@ -141,6 +142,137 @@ if [[ "${actual_context}" != "${KUBE_CONTEXT}" ]]; then
   exit 1
 fi
 
+kubectl \
+  --kubeconfig "${KUBECONFIG_PATH}" \
+  --context "${KUBE_CONTEXT}" \
+  apply -f - <<YAML
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu
+  labels:
+    steward.test/run-id: ${RUN_ID}
+handler: runc
+YAML
+
+oidc_issuer="http://oidc.openshell.svc.cluster.local:8000"
+oidc_private_key="${RUN_DIR}/oidc-private.pem"
+oidc_discovery="${RUN_DIR}/openid-configuration"
+oidc_jwks="${RUN_DIR}/jwks.json"
+openssl genrsa -out "${oidc_private_key}" 2048 >/dev/null 2>&1
+chmod 600 "${oidc_private_key}"
+kubectl \
+  --kubeconfig "${KUBECONFIG_PATH}" \
+  --context "${KUBE_CONTEXT}" \
+  create namespace openshell \
+  --dry-run=client \
+  -o yaml |
+  kubectl \
+    --kubeconfig "${KUBECONFIG_PATH}" \
+    --context "${KUBE_CONTEXT}" \
+    apply -f -
+
+base64url() {
+  openssl base64 -A | tr '+/' '-_' | tr -d '='
+}
+
+oidc_modulus="$(
+  openssl rsa -in "${oidc_private_key}" -noout -modulus 2>/dev/null |
+    cut -d= -f2 |
+    xxd -r -p |
+    base64url
+)"
+printf '{"issuer":"%s","jwks_uri":"%s/jwks.json"}\n' \
+  "${oidc_issuer}" "${oidc_issuer}" >"${oidc_discovery}"
+printf '{"keys":[{"kty":"RSA","kid":"steward-test","use":"sig","alg":"RS256","n":"%s","e":"AQAB"}]}\n' \
+  "${oidc_modulus}" >"${oidc_jwks}"
+
+kubectl \
+  --kubeconfig "${KUBECONFIG_PATH}" \
+  --context "${KUBE_CONTEXT}" \
+  -n openshell \
+  create configmap test-oidc-documents \
+  --from-file=openid-configuration="${oidc_discovery}" \
+  --from-file=jwks.json="${oidc_jwks}" \
+  --dry-run=client \
+  -o yaml |
+  kubectl \
+    --kubeconfig "${KUBECONFIG_PATH}" \
+    --context "${KUBE_CONTEXT}" \
+    apply -f -
+kubectl \
+  --kubeconfig "${KUBECONFIG_PATH}" \
+  --context "${KUBE_CONTEXT}" \
+  apply -f - <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-oidc
+  namespace: openshell
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-oidc
+  template:
+    metadata:
+      labels:
+        app: test-oidc
+    spec:
+      containers:
+        - name: server
+          image: python:3.13.5-alpine3.22@sha256:37b14db89f587f9eaa890e4a442a3fe55db452b69cca1403cc730bd0fbdc8aaf
+          args: ["python3", "-m", "http.server", "8000", "--directory", "/srv"]
+          ports:
+            - { name: http, containerPort: 8000 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+            runAsUser: 65534
+          volumeMounts:
+            - { name: documents, mountPath: /srv, readOnly: true }
+      volumes:
+        - name: documents
+          configMap:
+            name: test-oidc-documents
+            items:
+              - { key: openid-configuration, path: .well-known/openid-configuration }
+              - { key: jwks.json, path: jwks.json }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oidc
+  namespace: openshell
+spec:
+  selector:
+    app: test-oidc
+  ports:
+    - { name: http, port: 8000, targetPort: http }
+YAML
+kubectl \
+  --kubeconfig "${KUBECONFIG_PATH}" \
+  --context "${KUBE_CONTEXT}" \
+  -n openshell \
+  rollout status deployment/test-oidc \
+  --timeout=300s
+
+issued_at="$(date +%s)"
+expires_at="$((issued_at + 3600))"
+jwt_header="$(printf '%s' '{"alg":"RS256","kid":"steward-test","typ":"JWT"}' | base64url)"
+jwt_payload="$(
+  printf '{"iss":"%s","sub":"steward-e2e","preferred_username":"alice","aud":"%s","roles":["openshell-admin","openshell-user"],"iat":%s,"exp":%s}' \
+    "${oidc_issuer}" "${OIDC_AUDIENCE}" "${issued_at}" "${expires_at}" |
+    base64url
+)"
+jwt_signature="$(
+  printf '%s.%s' "${jwt_header}" "${jwt_payload}" |
+    openssl dgst -sha256 -sign "${oidc_private_key}" |
+    base64url
+)"
+oidc_token="${jwt_header}.${jwt_payload}.${jwt_signature}"
+
 agent_sandbox_base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.5.0"
 kubectl \
   --kubeconfig "${KUBECONFIG_PATH}" \
@@ -195,8 +327,13 @@ if [[ "${S0_E2E}" == "0" ]]; then
   openshell_helm_args+=(--values "${ROOT}/config/openshell/provider-token-grants.yaml")
 fi
 openshell_helm_args+=(
-  --set server.disableTls=true
-  --set server.auth.allowUnauthenticatedUsers=true
+  --set-string server.defaultRuntimeClassName=kata-qemu
+  --set server.auth.allowUnauthenticatedUsers=false
+  --set-string "server.oidc.issuer=${oidc_issuer}"
+  --set-string "server.oidc.audience=${OIDC_AUDIENCE}"
+  --set-string server.oidc.rolesClaim=roles
+  --set-string server.oidc.adminRole=openshell-admin
+  --set-string server.oidc.userRole=openshell-user
 )
 if [[ -n "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
   openshell_helm_args+=("${supervisor_image_args[@]}")
@@ -208,6 +345,35 @@ env \
   HELM_CONFIG_HOME="${RUN_DIR}/helm/config" \
   HELM_DATA_HOME="${RUN_DIR}/helm/data" \
   helm "${openshell_helm_args[@]}"
+
+extract_secret_key() {
+  secret_name="$1"
+  secret_key="$2"
+  destination="$3"
+  encoded="$(
+    kubectl \
+      --kubeconfig "${KUBECONFIG_PATH}" \
+      --context "${KUBE_CONTEXT}" \
+      -n openshell \
+      get secret "${secret_name}" \
+      -o "go-template={{ index .data \"${secret_key}\" }}"
+  )"
+  if [[ -z "${encoded}" ]]; then
+    echo "OpenShell Secret ${secret_name} has no ${secret_key}" >&2
+    exit 1
+  fi
+  printf '%s' "${encoded}" | openssl base64 -d -A >"${destination}"
+}
+
+gateway_ca="${RUN_DIR}/gateway-ca.crt"
+client_certificate="${RUN_DIR}/client.crt"
+client_private_key="${RUN_DIR}/client.key"
+bearer_token="${RUN_DIR}/openshell-bearer-token"
+extract_secret_key openshell-client-tls ca.crt "${gateway_ca}"
+extract_secret_key openshell-client-tls tls.crt "${client_certificate}"
+extract_secret_key openshell-client-tls tls.key "${client_private_key}"
+printf '%s' "${oidc_token}" >"${bearer_token}"
+chmod 600 "${client_private_key}" "${bearer_token}"
 
 kubectl \
   --kubeconfig "${KUBECONFIG_PATH}" \
@@ -224,19 +390,50 @@ for _ in $(seq 1 60); do
     exit 1
   fi
   port="$(sed -nE 's/.*127\.0\.0\.1:([0-9]+).*/\1/p' "${PORT_FORWARD_LOG}" | head -1)"
-  if [[ -n "${port}" ]] && curl -sS --connect-timeout 1 "http://127.0.0.1:${port}" >/dev/null; then
-    endpoint="http://127.0.0.1:${port}"
+  if [[ -n "${port}" ]] && curl \
+    --silent \
+    --show-error \
+    --connect-timeout 1 \
+    --cacert "${gateway_ca}" \
+    --cert "${client_certificate}" \
+    --key "${client_private_key}" \
+    "https://localhost:${port}" >/dev/null
+  then
+    endpoint="https://localhost:${port}"
     break
   fi
   sleep 1
 done
 if [[ -z "${endpoint}" ]]; then
-  echo "OpenShell gateway did not become reachable" >&2
+  echo "OpenShell authenticated TLS gateway did not become reachable" >&2
   cat "${PORT_FORWARD_LOG}" >&2
   exit 1
 fi
 
+export XDG_CONFIG_HOME="${RUN_DIR}/config"
+gateway_directory="${XDG_CONFIG_HOME}/openshell/gateways/openshell"
+mkdir -p "${gateway_directory}/mtls"
+cp "${gateway_ca}" "${gateway_directory}/mtls/ca.crt"
+cp "${client_certificate}" "${gateway_directory}/mtls/tls.crt"
+cp "${client_private_key}" "${gateway_directory}/mtls/tls.key"
+printf '%s\n' openshell >"${XDG_CONFIG_HOME}/openshell/active_gateway"
+printf '{"name":"openshell","gateway_endpoint":"%s","is_remote":false,"gateway_port":%s,"auth_mode":"oidc","oidc_issuer":"%s","oidc_client_id":"openshell-cli","oidc_audience":"%s"}\n' \
+  "${endpoint}" "${port}" "${oidc_issuer}" "${OIDC_AUDIENCE}" \
+  >"${gateway_directory}/metadata.json"
+printf '{"access_token":"%s","expires_at":%s,"issuer":"%s","client_id":"openshell-cli"}\n' \
+  "${oidc_token}" "${expires_at}" "${oidc_issuer}" \
+  >"${gateway_directory}/oidc_token.json"
+chmod 600 \
+  "${gateway_directory}/mtls/tls.key" \
+  "${gateway_directory}/oidc_token.json"
+
 export STEWARD_OPENSHELL_ENDPOINT="${endpoint}"
+export STEWARD_OPENSHELL_CA_CERTIFICATE_FILE="${gateway_ca}"
+export STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE="${client_certificate}"
+export STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE="${client_private_key}"
+export STEWARD_OPENSHELL_BEARER_TOKEN_FILE="${bearer_token}"
+export STEWARD_OPENSHELL_SERVER_NAME="localhost"
+export STEWARD_OPENSHELL_RUNTIME_CLASS_NAME="kata-qemu"
 export STEWARD_TEST_KUBE_CONTEXT="${KUBE_CONTEXT}"
 export STEWARD_TEST_KUBECONFIG="${KUBECONFIG_PATH}"
 export STEWARD_RUN_DIR="${RUN_DIR}"

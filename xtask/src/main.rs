@@ -993,6 +993,82 @@ mod tests {
     }
 
     #[test]
+    fn controller_e2e_harnesses_require_authenticated_openshell_transport() -> Result<(), String> {
+        let shared_harness = fs::read_to_string(root().join("scripts/s0-0-openshell-spike.sh"))
+            .map_err(|error| format!("shared OpenShell E2E harness is required: {error}"))?;
+        for unsafe_setting in [
+            "server.disableTls=true",
+            "server.auth.allowUnauthenticatedUsers=true",
+        ] {
+            assert!(
+                !shared_harness.contains(unsafe_setting),
+                "controller E2E lanes must not enable unsafe OpenShell setting {unsafe_setting}"
+            );
+        }
+        for required in [
+            "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
+            "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
+            "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
+            "STEWARD_OPENSHELL_BEARER_TOKEN_FILE",
+            "STEWARD_OPENSHELL_SERVER_NAME",
+            "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
+        ] {
+            assert!(
+                shared_harness.contains(required),
+                "shared controller E2E harness must export {required}"
+            );
+        }
+
+        for test_path in ["e2e/s0.rs", "e2e/s1.rs"] {
+            let harness = fs::read_to_string(root().join(test_path)).map_err(|error| {
+                format!("controller E2E launch path {test_path} is required: {error}")
+            })?;
+            for required in [
+                "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
+                "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
+                "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
+                "STEWARD_OPENSHELL_BEARER_TOKEN_FILE",
+                "STEWARD_OPENSHELL_SERVER_NAME",
+                "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
+            ] {
+                assert!(
+                    harness.contains(required),
+                    "controller E2E launch path {test_path} must forward {required}"
+                );
+            }
+        }
+
+        let in_cluster_harness = fs::read_to_string(root().join("scripts/s2-inference-inside.sh"))
+            .map_err(|error| format!("in-cluster controller E2E harness is required: {error}"))?;
+        let in_cluster_controller = fs::read_to_string(root().join("config/s2/stack.yaml"))
+            .map_err(|error| format!("in-cluster controller fixture is required: {error}"))?;
+        for required in [
+            "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
+            "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
+            "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
+            "STEWARD_OPENSHELL_BEARER_TOKEN_FILE",
+            "STEWARD_OPENSHELL_SERVER_NAME",
+            "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
+        ] {
+            assert!(
+                in_cluster_harness.contains(required),
+                "in-cluster controller E2E harness must require {required}"
+            );
+            assert!(
+                in_cluster_controller.contains(required),
+                "in-cluster controller fixture must provide {required}"
+            );
+        }
+        assert!(
+            in_cluster_controller
+                .contains("value: https://openshell.openshell.svc.cluster.local:8080"),
+            "in-cluster controller must use authenticated TLS to OpenShell"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn production_release_contract_is_complete_and_fail_closed() -> Result<(), String> {
         let chart = root().join("charts/steward");
         let values = fs::read_to_string(chart.join("values.yaml"))
@@ -2037,8 +2113,15 @@ esac
         let script_path = root().join("scripts/s0-0-openshell-spike.sh");
         let script = fs::read_to_string(&script_path)
             .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        let common_requirements = script
+            .split_once("for command in ")
+            .and_then(|(_, remainder)| remainder.split_once("; do"))
+            .map(|(commands, _)| commands)
+            .ok_or_else(|| "the common S0 prerequisite set must be explicit".to_owned())?;
         assert!(
-            script.contains("for command in kind kubectl helm cargo curl openssl sed tar;"),
+            !common_requirements
+                .split_whitespace()
+                .any(|command| command == "jq"),
             "the common S0 prerequisite set must not include identity-demo-only jq"
         );
         let jq_requirement = script

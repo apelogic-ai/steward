@@ -36,8 +36,19 @@ trap 'cleanup "$?"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for variable in STEWARD_OPENSHELL_ENDPOINT STEWARD_RUN_DIR STEWARD_RUN_ID \
-  STEWARD_S2_CONTROLLER_IMAGE STEWARD_TEST_KUBE_CONTEXT STEWARD_TEST_KUBECONFIG
+for variable in \
+  STEWARD_OPENSHELL_ENDPOINT \
+  STEWARD_OPENSHELL_CA_CERTIFICATE_FILE \
+  STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE \
+  STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE \
+  STEWARD_OPENSHELL_BEARER_TOKEN_FILE \
+  STEWARD_OPENSHELL_SERVER_NAME \
+  STEWARD_OPENSHELL_RUNTIME_CLASS_NAME \
+  STEWARD_RUN_DIR \
+  STEWARD_RUN_ID \
+  STEWARD_S2_CONTROLLER_IMAGE \
+  STEWARD_TEST_KUBE_CONTEXT \
+  STEWARD_TEST_KUBECONFIG
 do
   if [[ -z "${!variable:-}" ]]; then
     echo "${variable} is required from the ephemeral S2 harness" >&2
@@ -153,6 +164,10 @@ done
   --from-file="litellm-master-key=${master_key}" \
   --from-file="tls-cert.der=${tls_cert_der}" \
   --from-file="tls-key.der=${tls_key_der}" \
+  --from-file="openshell-ca.crt=${STEWARD_OPENSHELL_CA_CERTIFICATE_FILE}" \
+  --from-file="openshell-client.crt=${STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE}" \
+  --from-file="openshell-client.key=${STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE}" \
+  --from-file="openshell-bearer-token=${STEWARD_OPENSHELL_BEARER_TOKEN_FILE}" \
   --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
 "${KUBECTL[@]}" -n steward-system label secret steward-s2-secrets \
   "steward.test/run-id=${STEWARD_RUN_ID}" --overwrite

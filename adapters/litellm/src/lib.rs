@@ -450,6 +450,8 @@ mod tests {
         unpriced_models,
     };
 
+    const MOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
     struct MockLiteLlm {
         base_url: String,
         requests: Arc<Mutex<Vec<String>>>,
@@ -471,7 +473,7 @@ mod tests {
             let responses = responses.into_iter().map(str::to_owned).collect::<Vec<_>>();
             let server = thread::spawn(move || {
                 for response_body in responses {
-                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let deadline = Instant::now() + MOCK_REQUEST_TIMEOUT;
                     let (mut stream, _) = loop {
                         match listener.accept() {
                             Ok(connection) => break connection,
