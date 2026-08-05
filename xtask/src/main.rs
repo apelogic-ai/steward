@@ -815,6 +815,162 @@ mod tests {
 
     static NEXT_REPOSITORY_ID: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn production_release_contract_is_complete_and_fail_closed() -> Result<(), String> {
+        let chart = root().join("charts/steward");
+        let values = fs::read_to_string(chart.join("values.yaml"))
+            .map_err(|error| format!("published Steward chart values are required: {error}"))?;
+        let schema = fs::read_to_string(chart.join("values.schema.json"))
+            .map_err(|error| format!("published Steward values schema is required: {error}"))?;
+        serde_json::from_str::<serde_json::Value>(&schema)
+            .map_err(|error| format!("published Steward values schema is invalid JSON: {error}"))?;
+        let templates = fs::read_to_string(chart.join("templates/all.yaml")).map_err(|error| {
+            format!("published Steward Kubernetes templates are required: {error}")
+        })?;
+        let crd = fs::read_to_string(chart.join("crds/agentruntimes.yaml"))
+            .map_err(|error| format!("published Steward CRD is required: {error}"))?;
+        let generated_crd =
+            fs::read_to_string(root().join("manifests/agents.apelogic.ai_agentruntimes.yaml"))
+                .map_err(|error| format!("failed to read generated AgentRuntime CRD: {error}"))?;
+        let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("published Steward release workflow is required: {error}"))?;
+        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let release_validation = fs::read_to_string(
+            root().join("scripts/validate-release-artifacts.sh"),
+        )
+        .map_err(|error| format!("release artifact validation script is required: {error}"))?;
+        let container = fs::read_to_string(root().join("build/package.Dockerfile"))
+            .map_err(|error| format!("production container build is required: {error}"))?;
+
+        for required in [
+            "apiserver:",
+            "controller:",
+            "mint:",
+            "digest:",
+            "pullPolicy:",
+        ] {
+            assert!(
+                values.contains(required),
+                "chart values are missing {required}"
+            );
+            assert!(
+                schema.contains(required.trim_end_matches(':')),
+                "values schema is missing {required}"
+            );
+        }
+        for required in [
+            "kind: ServiceAccount",
+            "name: {{ include \"steward.apiserverName\" . }}",
+            "name: {{ include \"steward.controllerName\" . }}",
+            "name: {{ include \"steward.mintName\" . }}",
+            "failurePolicy: Fail",
+            "kind: Certificate",
+            ".Values.spire.csiDriver",
+            "kind: NetworkPolicy",
+        ] {
+            assert!(
+                templates.contains(required),
+                "chart templates are missing {required}"
+            );
+        }
+        assert!(
+            values.contains("csiDriver: csi.spiffe.io"),
+            "the SPIRE CSI driver must be enabled by default"
+        );
+        assert!(
+            crd.contains("kind: CustomResourceDefinition"),
+            "the published chart must install the AgentRuntime CRD"
+        );
+        assert_eq!(
+            crd, generated_crd,
+            "the chart CRD must be byte-identical to the generated manifest"
+        );
+        for binary in [
+            "bins/steward-apiserver/src/main.rs",
+            "bins/steward-controller/src/main.rs",
+        ] {
+            let source = fs::read_to_string(root().join(binary))
+                .map_err(|error| format!("failed to inspect {binary}: {error}"))?;
+            assert!(
+                source.contains("PemObject"),
+                "{binary} must accept cert-manager's PEM certificate and key files"
+            );
+        }
+        assert!(
+            !templates.contains("kind: Ingress"),
+            "Steward chart must not publish an Ingress"
+        );
+        let apiserver = templates
+            .split("kind: Deployment")
+            .nth(1)
+            .ok_or_else(|| "apiserver Deployment template is missing".to_owned())?;
+        let controller = templates
+            .split("kind: Deployment")
+            .nth(2)
+            .ok_or_else(|| "controller Deployment template is missing".to_owned())?;
+        let mint = templates
+            .split("kind: Deployment")
+            .nth(3)
+            .ok_or_else(|| "mint Deployment template is missing".to_owned())?;
+        assert!(!apiserver.contains(".Values.secrets.mint"));
+        assert!(!apiserver.contains(".Values.secrets.litellm"));
+        assert!(!controller.contains(".Values.secrets.mint"));
+        assert!(!controller.contains(".Values.secrets.jira"));
+        assert!(!mint.contains(".Values.secrets.database"));
+        assert!(!mint.contains(".Values.secrets.jira"));
+        assert!(!mint.contains(".Values.secrets.litellm"));
+        for artifact in [
+            "apiserver.digest",
+            "controller.digest",
+            "mint.digest",
+            "helm-chart.digest",
+        ] {
+            assert!(
+                workflow.contains(artifact),
+                "release workflow must record {artifact}"
+            );
+        }
+        assert_eq!(
+            container.matches("FROM ").count(),
+            2,
+            "production images must use a build stage and a minimal runtime stage"
+        );
+        assert_eq!(
+            container.matches("@sha256:").count(),
+            2,
+            "every production image base must be pinned by digest"
+        );
+        assert!(
+            container.contains("USER 65532:65532"),
+            "production images must run as a numeric non-root user"
+        );
+        assert!(
+            workflow.contains("${{ steps.version.outputs.version }}-${{ matrix.component }}"),
+            "component tags must match the published chart contract"
+        );
+        assert!(
+            workflow.contains("push:\n    tags:"),
+            "release must run only from a version tag"
+        );
+        for required in [
+            "release-candidate:",
+            "scripts/validate-release-artifacts.sh --build-images",
+        ] {
+            assert!(
+                ci.contains(required),
+                "pull-request CI must validate release artifacts: missing {required}"
+            );
+        }
+        for required in ["helm template steward", "docker build"] {
+            assert!(
+                release_validation.contains(required),
+                "release validation must exercise artifact construction: missing {required}"
+            );
+        }
+        Ok(())
+    }
+
     struct TestRepository {
         path: PathBuf,
     }

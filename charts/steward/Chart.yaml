@@ -1,0 +1,7 @@
+apiVersion: v2
+name: steward
+description: Steward governance control plane
+type: application
+version: 0.0.0
+appVersion: 0.0.0
+kubeVersion: ">=1.30.0-0"

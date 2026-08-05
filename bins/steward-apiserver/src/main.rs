@@ -17,6 +17,7 @@ use tokio::task::{JoinError, JoinSet};
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::server::TlsStream;
 
@@ -92,16 +93,36 @@ async fn tls_listener(
     certificate_path: &str,
     private_key_path: &str,
 ) -> Result<TlsListener, Box<dyn Error>> {
-    let certificate = CertificateDer::from(fs::read(certificate_path)?);
-    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(fs::read(private_key_path)?));
+    let (certificates, private_key) =
+        decode_tls_material(fs::read(certificate_path)?, fs::read(private_key_path)?)?;
     let config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![certificate], private_key)?;
+        .with_single_cert(certificates, private_key)?;
     Ok(TlsListener {
         acceptor: TlsAcceptor::from(Arc::new(config)),
         handshakes: JoinSet::new(),
         listener: TcpListener::bind(bind).await?,
     })
+}
+
+fn decode_tls_material(
+    certificate_bytes: Vec<u8>,
+    private_key_bytes: Vec<u8>,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Box<dyn Error>> {
+    let certificates = if certificate_bytes.starts_with(b"-----BEGIN") {
+        CertificateDer::pem_slice_iter(&certificate_bytes).collect::<Result<Vec<_>, _>>()?
+    } else {
+        vec![CertificateDer::from(certificate_bytes)]
+    };
+    if certificates.is_empty() {
+        return Err(io::Error::other("TLS certificate file contains no certificates").into());
+    }
+    let private_key = if private_key_bytes.starts_with(b"-----BEGIN") {
+        PrivateKeyDer::from_pem_slice(&private_key_bytes)?
+    } else {
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_bytes))
+    };
+    Ok((certificates, private_key))
 }
 
 struct TlsListener {
@@ -187,7 +208,25 @@ mod tests {
     use tokio_rustls::rustls::ServerConfig;
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
-    use super::{TlsListener, task_token_audience};
+    use super::{TlsListener, decode_tls_material, task_token_audience};
+
+    #[test]
+    fn cert_manager_pem_tls_material_is_decoded() -> Result<(), String> {
+        let private_key_pem = [
+            b"-----BEGIN ".as_slice(),
+            b"PRIVATE KEY-----\nBAUG\n-----END PRIVATE KEY-----\n".as_slice(),
+        ]
+        .concat();
+        let (certificates, private_key) = decode_tls_material(
+            b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n".to_vec(),
+            private_key_pem,
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(certificates.len(), 1);
+        assert_eq!(certificates[0].as_ref(), &[1, 2, 3]);
+        assert_eq!(private_key.secret_der(), &[4, 5, 6]);
+        Ok(())
+    }
 
     #[test]
     fn task_api_requires_an_explicit_nonempty_token_audience() {

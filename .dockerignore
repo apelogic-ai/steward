@@ -1,6 +1,8 @@
 .git
 .steward-run
 .worktrees
+build
+charts
 target
 e2e/target
 .env*
