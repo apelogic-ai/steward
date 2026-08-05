@@ -14,6 +14,10 @@ inputs:
     description: Install Zig and cargo-zigbuild
     required: false
     default: "false"
+  workflow-tools:
+    description: Install actionlint and ShellCheck
+    required: false
+    default: "false"
   cargo-deny-version:
     description: cargo-deny version
     required: false
@@ -42,6 +46,14 @@ inputs:
     description: cargo-zigbuild version
     required: false
     default: "0.22.3"
+  actionlint-version:
+    description: actionlint version
+    required: false
+    default: "1.7.7"
+  shellcheck-version:
+    description: ShellCheck version
+    required: false
+    default: "0.10.0"
 
 runs:
   using: composite
@@ -156,3 +168,36 @@ runs:
           --version "${CARGO_ZIGBUILD_VERSION}" \
           --root "${tools_dir}/cargo-zigbuild"
         echo "${tools_dir}/cargo-zigbuild/bin" >> "${GITHUB_PATH}"
+
+    - name: Install workflow lint tools
+      if: inputs.workflow-tools == 'true'
+      shell: bash
+      env:
+        ACTIONLINT_VERSION: ${{ inputs.actionlint-version }}
+        SHELLCHECK_VERSION: ${{ inputs.shellcheck-version }}
+      run: |
+        set -euo pipefail
+        tools_dir="${RUNNER_TEMP}/steward-tools"
+        mkdir -p "${tools_dir}"
+
+        actionlint_asset="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+        actionlint_url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/${actionlint_asset}" "${actionlint_url}/${actionlint_asset}"
+        echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  ${tools_dir}/${actionlint_asset}" \
+          | sha256sum --check -
+        tar --extract --gzip \
+          --file "${tools_dir}/${actionlint_asset}" --directory "${tools_dir}" actionlint
+
+        shellcheck_asset="shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+        shellcheck_url="https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/${shellcheck_asset}" "${shellcheck_url}/${shellcheck_asset}"
+        echo "6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87  ${tools_dir}/${shellcheck_asset}" \
+          | sha256sum --check -
+        tar --extract --xz \
+          --file "${tools_dir}/${shellcheck_asset}" --directory "${tools_dir}"
+        mv "${tools_dir}/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" "${tools_dir}/shellcheck"
+        chmod +x "${tools_dir}/actionlint" "${tools_dir}/shellcheck"
+
+        echo "${tools_dir}" >> "${GITHUB_PATH}"

@@ -1,0 +1,428 @@
+{{- range $component := list "apiserver" "controller" "mint" }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include (printf "steward.%sName" $component) $ }}
+  labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: {{ $component }} }
+automountServiceAccountToken: true
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: steward-apiserver }
+rules:
+  - apiGroups: ["agents.apelogic.ai"]
+    resources: ["agentruntimes"]
+    verbs: ["create", "delete", "get", "list", "patch", "update"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["users", "groups"]
+    verbs: ["impersonate"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: steward-controller }
+rules:
+  - apiGroups: ["agents.apelogic.ai"]
+    resources: ["agentruntimes", "agentruntimes/status", "agentruntimes/finalizers"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  - apiGroups: [""]
+    resources: ["users", "groups"]
+    verbs: ["impersonate"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: steward-mint }
+rules:
+  - apiGroups: ["agents.apelogic.ai"]
+    resources: ["agentruntimes"]
+    verbs: ["get", "list"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list"]
+{{- range $component := list "apiserver" "controller" "mint" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: steward-{{ $component }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: steward-{{ $component }} }
+subjects:
+  - kind: ServiceAccount
+    name: {{ include (printf "steward.%sName" $component) $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- range $namespace := .Values.runtimeNamespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: steward-controller-runtime-secrets
+  namespace: {{ $namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: steward-controller-runtime-secrets
+  namespace: {{ $namespace }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: steward-controller-runtime-secrets }
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "steward.controllerName" $ }}
+    namespace: {{ $.Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: steward-mint-runtime-secrets
+  namespace: {{ $namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: steward-mint-runtime-secrets
+  namespace: {{ $namespace }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: steward-mint-runtime-secrets }
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "steward.mintName" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: steward-mint
+spec:
+  spiffeIDTemplate: spiffe://{{ .Values.config.mint.spiffeTrustDomain }}{{ .Values.spire.identityPath }}
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: {{ .Release.Namespace }}
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: steward
+      app.kubernetes.io/component: mint
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: steward-apiserver-tls }
+spec:
+  secretName: steward-apiserver-tls
+  dnsNames:
+    - steward-apiserver
+    - steward-apiserver.{{ .Release.Namespace }}.svc
+    - steward-apiserver.{{ .Release.Namespace }}.svc.{{ .Values.services.clusterDomain }}
+  issuerRef:
+{{ toYaml .Values.tls.issuerRef | nindent 4 }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: { name: steward-webhook-tls }
+spec:
+  secretName: steward-webhook-tls
+  dnsNames:
+    - steward-webhook
+    - steward-webhook.{{ .Release.Namespace }}.svc
+    - steward-webhook.{{ .Release.Namespace }}.svc.{{ .Values.services.clusterDomain }}
+  issuerRef:
+{{ toYaml .Values.tls.issuerRef | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata: { name: steward-apiserver }
+spec:
+  selector: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver }
+  ports: [{ name: https, port: {{ .Values.services.apiserverPort }}, targetPort: https }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: steward-webhook }
+spec:
+  selector: { app.kubernetes.io/name: steward, app.kubernetes.io/component: controller }
+  ports: [{ name: https, port: {{ .Values.services.webhookPort }}, targetPort: webhook }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: steward-mint }
+spec:
+  selector: { app.kubernetes.io/name: steward, app.kubernetes.io/component: mint }
+  ports: [{ name: http, port: {{ .Values.services.mintPort }}, targetPort: http }]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: steward-agentruntime
+  annotations: { cert-manager.io/inject-ca-from: {{ printf "%s/steward-webhook-tls" .Release.Namespace | quote }} }
+webhooks:
+  - name: agentruntime.steward.agents.apelogic.ai
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    matchPolicy: Equivalent
+    clientConfig:
+      service: { name: steward-webhook, namespace: {{ .Release.Namespace }}, path: /validate-agent-runtime, port: {{ .Values.services.webhookPort }} }
+    rules:
+      - apiGroups: ["agents.apelogic.ai"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "DELETE", "UPDATE"]
+        resources: ["agentruntimes"]
+        scope: "*"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: {{ include "steward.apiserverName" . }} }
+spec:
+  replicas: {{ .Values.replicaCount.apiserver }}
+  selector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
+  template:
+    metadata: { labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
+    spec:
+      serviceAccountName: {{ include "steward.apiserverName" . }}
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: apiserver
+          image: {{ include "steward.image" (dict "root" . "image" .Values.images.apiserver) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          ports: [{ name: https, containerPort: 8443 }]
+          readinessProbe: { tcpSocket: { port: https }, initialDelaySeconds: 2, periodSeconds: 5 }
+          livenessProbe: { tcpSocket: { port: https }, initialDelaySeconds: 10, periodSeconds: 10 }
+          env:
+            - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.database.name }}, key: {{ .Values.secrets.database.key }} } } }
+            - { name: STEWARD_JIRA_TOKEN, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.jira.name }}, key: {{ .Values.secrets.jira.key }} } } }
+            - { name: STEWARD_JIRA_BASE_URL, value: {{ .Values.config.apiserver.jiraBaseUrl | quote }} }
+            - { name: STEWARD_JIRA_PROJECT_KEY, value: {{ .Values.config.apiserver.jiraProjectKey | quote }} }
+            - { name: STEWARD_JIRA_ACCOUNT_EMAIL, value: {{ .Values.config.apiserver.jiraAccountEmail | quote }} }
+            - { name: STEWARD_TOKEN_AUDIENCE, value: {{ .Values.config.apiserver.tokenAudience | quote }} }
+            - { name: STEWARD_TASK_TOKEN_AUDIENCE, value: {{ .Values.config.apiserver.taskTokenAudience | quote }} }
+            - { name: STEWARD_TASK_WORKFLOWS_JSON, value: {{ .Values.config.apiserver.taskWorkflowsJson | quote }} }
+            - { name: STEWARD_TLS_CERT_DER, value: /run/tls/tls.crt }
+            - { name: STEWARD_TLS_KEY_DER, value: /run/tls/tls.key }
+          volumeMounts: [{ name: tls, mountPath: /run/tls, readOnly: true }]
+          resources:
+{{ toYaml .Values.resources.apiserver | nindent 12 }}
+      volumes: [{ name: tls, secret: { secretName: steward-apiserver-tls } }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: {{ include "steward.controllerName" . }} }
+spec:
+  replicas: {{ .Values.replicaCount.controller }}
+  selector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: controller } }
+  template:
+    metadata: { labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: controller } }
+    spec:
+      serviceAccountName: {{ include "steward.controllerName" . }}
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: controller
+          image: {{ include "steward.image" (dict "root" . "image" .Values.images.controller) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          ports: [{ name: webhook, containerPort: 8443 }]
+          readinessProbe: { tcpSocket: { port: webhook }, initialDelaySeconds: 2, periodSeconds: 5 }
+          livenessProbe: { tcpSocket: { port: webhook }, initialDelaySeconds: 10, periodSeconds: 10 }
+          env:
+            - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.database.name }}, key: {{ .Values.secrets.database.key }} } } }
+            - { name: STEWARD_LITELLM_MASTER_KEY, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.litellm.name }}, key: {{ .Values.secrets.litellm.key }} } } }
+            - { name: STEWARD_LITELLM_URL, value: {{ .Values.config.controller.litellmUrl | quote }} }
+            - { name: STEWARD_OPENSHELL_ENDPOINT, value: {{ .Values.config.controller.openshellEndpoint | quote }} }
+            - { name: STEWARD_CONTROLLER_USERNAME, value: {{ printf "system:serviceaccount:%s:steward-controller" .Release.Namespace | quote }} }
+            - { name: STEWARD_APISERVER_USERNAME, value: {{ printf "system:serviceaccount:%s:steward-apiserver" .Release.Namespace | quote }} }
+            - { name: STEWARD_TLS_CERT_DER, value: /run/tls/tls.crt }
+            - { name: STEWARD_TLS_KEY_DER, value: /run/tls/tls.key }
+          volumeMounts: [{ name: tls, mountPath: /run/tls, readOnly: true }]
+          resources:
+{{ toYaml .Values.resources.controller | nindent 12 }}
+      volumes: [{ name: tls, secret: { secretName: steward-webhook-tls } }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: {{ include "steward.mintName" . }} }
+spec:
+  replicas: {{ .Values.replicaCount.mint }}
+  selector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: mint } }
+  template:
+    metadata: { labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: mint } }
+    spec:
+      serviceAccountName: {{ include "steward.mintName" . }}
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: mint
+          image: {{ include "steward.image" (dict "root" . "image" .Values.images.mint) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { tcpSocket: { port: http }, initialDelaySeconds: 2, periodSeconds: 5 }
+          livenessProbe: { tcpSocket: { port: http }, initialDelaySeconds: 10, periodSeconds: 10 }
+          env:
+            - { name: SPIFFE_ENDPOINT_SOCKET, value: {{ printf "unix://%s/spire-agent.sock" .Values.spire.socketPath | quote }} }
+            - { name: STEWARD_MINT_SIGNING_KEY_FILE, value: /run/mint/signing-key }
+            - { name: STEWARD_MINT_INTROSPECTION_CLIENT_CREDENTIAL_FILE, value: /run/mint/introspection-credential }
+            - { name: STEWARD_MINT_ISSUER, value: {{ .Values.config.mint.issuer | quote }} }
+            - { name: STEWARD_MINT_AUDIENCE, value: {{ .Values.config.mint.audience | quote }} }
+            - { name: STEWARD_MINT_ALLOWED_SCOPES, value: {{ .Values.config.mint.allowedScopes | quote }} }
+            - { name: STEWARD_MINT_SVID_AUDIENCE, value: {{ .Values.config.mint.svidAudience | quote }} }
+            - { name: STEWARD_SPIFFE_TRUST_DOMAIN, value: {{ .Values.config.mint.spiffeTrustDomain | quote }} }
+            - { name: STEWARD_OPENSHELL_NAMESPACE, value: {{ .Values.config.mint.openshellNamespace | quote }} }
+          volumeMounts:
+            - { name: mint-secret, mountPath: /run/mint, readOnly: true }
+            - { name: spiffe-workload-api, mountPath: {{ .Values.spire.socketPath }}, readOnly: true }
+          resources:
+{{ toYaml .Values.resources.mint | nindent 12 }}
+      volumes:
+        - name: mint-secret
+          secret:
+            secretName: {{ .Values.secrets.mint.name }}
+            items:
+              - { key: {{ .Values.secrets.mint.signingKey }}, path: signing-key }
+              - { key: {{ .Values.secrets.mint.introspectionCredential }}, path: introspection-credential }
+        - name: spiffe-workload-api
+          csi: { driver: {{ .Values.spire.csiDriver }}, readOnly: true }
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: steward-default-deny }
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: steward } }
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: steward-dns-egress }
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: steward } }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.dnsNamespace }} } } }]
+      ports: [{ protocol: UDP, port: 53 }, { protocol: TCP, port: 53 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: steward-apiserver-ingress }
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.burbleNamespace }} } }
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.arcNamespace }} } }
+      ports: [{ protocol: TCP, port: 8443 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: steward-webhook-ingress }
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: controller } }
+  policyTypes: [Ingress]
+{{- if .Values.networkPolicy.kubeApiCidrs }}
+  ingress:
+    - from:
+{{- range .Values.networkPolicy.kubeApiCidrs }}
+        - ipBlock: { cidr: {{ . }} }
+{{- end }}
+      ports: [{ protocol: TCP, port: 8443 }]
+{{- else }}
+  ingress: []
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: steward-mint-ingress }
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: mint } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.openshellNamespace }} } }
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.mcpGatewayNamespace }} } }
+      ports: [{ protocol: TCP, port: 8080 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: steward-controller-egress }
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: controller } }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.litellmNamespace }} } } }]
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.litellm }} }]
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.openshellNamespace }} } } }]
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.openshell }} }]
+{{- if .Values.networkPolicy.postgresCidrs }}
+    - to:
+{{- range .Values.networkPolicy.postgresCidrs }}
+        - ipBlock: { cidr: {{ . }} }
+{{- end }}
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.postgres }} }]
+{{- end }}
+{{- if .Values.networkPolicy.kubeApiCidrs }}
+    - to:
+{{- range .Values.networkPolicy.kubeApiCidrs }}
+        - ipBlock: { cidr: {{ . }} }
+{{- end }}
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.kubernetesApi }} }]
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: steward-apiserver-egress }
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
+  policyTypes: [Egress]
+{{- if or .Values.networkPolicy.postgresCidrs .Values.networkPolicy.jiraCidrs .Values.networkPolicy.kubeApiCidrs }}
+  egress:
+{{- if .Values.networkPolicy.postgresCidrs }}
+    - to:
+{{- range .Values.networkPolicy.postgresCidrs }}
+        - ipBlock: { cidr: {{ . }} }
+{{- end }}
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.postgres }} }]
+{{- end }}
+{{- if .Values.networkPolicy.jiraCidrs }}
+    - to:
+{{- range .Values.networkPolicy.jiraCidrs }}
+        - ipBlock: { cidr: {{ . }} }
+{{- end }}
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.jira }} }]
+{{- end }}
+{{- if .Values.networkPolicy.kubeApiCidrs }}
+    - to:
+{{- range .Values.networkPolicy.kubeApiCidrs }}
+        - ipBlock: { cidr: {{ . }} }
+{{- end }}
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.kubernetesApi }} }]
+{{- end }}
+{{- else }}
+  egress: []
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: steward-mint-egress }
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: mint } }
+  policyTypes: [Egress]
+{{- if .Values.networkPolicy.kubeApiCidrs }}
+  egress:
+    - to:
+{{- range .Values.networkPolicy.kubeApiCidrs }}
+        - ipBlock: { cidr: {{ . }} }
+{{- end }}
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.kubernetesApi }} }]
+{{- else }}
+  egress: []
+{{- end }}
+{{- end }}

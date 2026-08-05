@@ -1,0 +1,83 @@
+images:
+  repository: ghcr.io/apelogic-ai/steward
+  pullPolicy: IfNotPresent
+  apiserver:
+    tag: ""
+    digest: ""
+  controller:
+    tag: ""
+    digest: ""
+  mint:
+    tag: ""
+    digest: ""
+secrets:
+  database:
+    name: steward-database
+    key: url
+  jira:
+    name: steward-jira
+    key: token
+  litellm:
+    name: steward-litellm
+    key: master-key
+  mint:
+    name: steward-mint
+    signingKey: signing-key
+    introspectionCredential: introspection-credential
+tls:
+  issuerRef:
+    name: cluster-issuer
+    kind: ClusterIssuer
+config:
+  apiserver:
+    jiraBaseUrl: https://jira.example.com
+    jiraProjectKey: PROJ
+    jiraAccountEmail: alice@example.com
+    tokenAudience: steward-api
+    taskTokenAudience: steward-task-api
+    taskWorkflowsJson: "[]"
+  controller:
+    openshellEndpoint: http://openshell.openshell.svc.cluster.local:50051
+    litellmUrl: http://litellm-litellm.litellm.svc.cluster.local:4000
+  mint:
+    issuer: http://steward-mint.steward.svc.cluster.local:8080
+    audience: steward-mcp
+    allowedScopes: mcp inference
+    svidAudience: steward-mint
+    spiffeTrustDomain: example.test
+    openshellNamespace: openshell
+runtimeNamespaces: []
+networkPolicy:
+  enabled: true
+  dnsNamespace: kube-system
+  kubeApiCidrs: []
+  postgresCidrs: []
+  jiraCidrs: []
+  burbleNamespace: burble
+  arcNamespace: arc-runners
+  mcpGatewayNamespace: mcp-gw
+  openshellNamespace: openshell
+  litellmNamespace: litellm
+  ports:
+    kubernetesApi: 443
+    postgres: 5432
+    jira: 443
+    litellm: 4000
+    openshell: 50051
+spire:
+  csiDriver: csi.spiffe.io
+  socketPath: /run/spire/sockets
+  identityPath: /steward/mint
+services:
+  clusterDomain: cluster.local
+  apiserverPort: 443
+  webhookPort: 443
+  mintPort: 8080
+replicaCount:
+  apiserver: 1
+  controller: 1
+  mint: 1
+resources:
+  apiserver: {}
+  controller: {}
+  mint: {}

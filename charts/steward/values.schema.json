@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "images",
+    "secrets",
+    "tls",
+    "config",
+    "runtimeNamespaces",
+    "networkPolicy",
+    "spire",
+    "services",
+    "replicaCount",
+    "resources"
+  ],
+  "properties": {
+    "images": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "pullPolicy", "apiserver", "controller", "mint"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "pullPolicy": {"enum": ["IfNotPresent", "Always", "Never"]},
+        "apiserver": {"$ref": "#/definitions/image"},
+        "controller": {"$ref": "#/definitions/image"},
+        "mint": {"$ref": "#/definitions/image"}
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["database", "jira", "litellm", "mint"],
+      "properties": {
+        "database": {"$ref": "#/definitions/secretKey"},
+        "jira": {"$ref": "#/definitions/secretKey"},
+        "litellm": {"$ref": "#/definitions/secretKey"},
+        "mint": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "signingKey", "introspectionCredential"],
+          "properties": {
+            "name": {"$ref": "#/definitions/nonempty"},
+            "signingKey": {"$ref": "#/definitions/nonempty"},
+            "introspectionCredential": {"$ref": "#/definitions/nonempty"}
+          }
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["issuerRef"],
+      "properties": {
+        "issuerRef": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "kind"],
+          "properties": {
+            "name": {"$ref": "#/definitions/nonempty"},
+            "kind": {"enum": ["Issuer", "ClusterIssuer"]},
+            "group": {"type": "string", "default": "cert-manager.io"}
+          }
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiserver", "controller", "mint"],
+      "properties": {
+        "apiserver": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "jiraBaseUrl",
+            "jiraProjectKey",
+            "jiraAccountEmail",
+            "tokenAudience",
+            "taskTokenAudience",
+            "taskWorkflowsJson"
+          ],
+          "properties": {
+            "jiraBaseUrl": {"type": "string", "pattern": "^https://", "minLength": 9},
+            "jiraProjectKey": {"$ref": "#/definitions/nonempty"},
+            "jiraAccountEmail": {"type": "string", "minLength": 3},
+            "tokenAudience": {"$ref": "#/definitions/nonempty"},
+            "taskTokenAudience": {"$ref": "#/definitions/nonempty"},
+            "taskWorkflowsJson": {"type": "string", "pattern": "^\\s*\\[", "minLength": 2}
+          }
+        },
+        "controller": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["openshellEndpoint", "litellmUrl"],
+          "properties": {
+            "openshellEndpoint": {"type": "string", "pattern": "^https?://", "minLength": 9},
+            "litellmUrl": {"type": "string", "pattern": "^https?://", "minLength": 9}
+          }
+        },
+        "mint": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "issuer",
+            "audience",
+            "allowedScopes",
+            "svidAudience",
+            "spiffeTrustDomain",
+            "openshellNamespace"
+          ],
+          "properties": {
+            "issuer": {"type": "string", "pattern": "^https?://", "minLength": 9},
+            "audience": {"$ref": "#/definitions/nonempty"},
+            "allowedScopes": {"$ref": "#/definitions/nonempty"},
+            "svidAudience": {"$ref": "#/definitions/nonempty"},
+            "spiffeTrustDomain": {"$ref": "#/definitions/nonempty"},
+            "openshellNamespace": {"$ref": "#/definitions/nonempty"}
+          }
+        }
+      }
+    },
+    "runtimeNamespaces": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "dnsNamespace",
+        "kubeApiCidrs",
+        "postgresCidrs",
+        "jiraCidrs",
+        "burbleNamespace",
+        "arcNamespace",
+        "mcpGatewayNamespace",
+        "openshellNamespace",
+        "litellmNamespace",
+        "ports"
+      ],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "dnsNamespace": {"$ref": "#/definitions/nonempty"},
+        "kubeApiCidrs": {"$ref": "#/definitions/cidrs"},
+        "postgresCidrs": {"$ref": "#/definitions/cidrs"},
+        "jiraCidrs": {"$ref": "#/definitions/cidrs"},
+        "burbleNamespace": {"$ref": "#/definitions/nonempty"},
+        "arcNamespace": {"$ref": "#/definitions/nonempty"},
+        "mcpGatewayNamespace": {"$ref": "#/definitions/nonempty"},
+        "openshellNamespace": {"$ref": "#/definitions/nonempty"},
+        "litellmNamespace": {"$ref": "#/definitions/nonempty"},
+        "ports": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kubernetesApi", "postgres", "jira", "litellm", "openshell"],
+          "properties": {
+            "kubernetesApi": {"$ref": "#/definitions/port"},
+            "postgres": {"$ref": "#/definitions/port"},
+            "jira": {"$ref": "#/definitions/port"},
+            "litellm": {"$ref": "#/definitions/port"},
+            "openshell": {"$ref": "#/definitions/port"}
+          }
+        }
+      }
+    },
+    "spire": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["csiDriver", "socketPath", "identityPath"],
+      "properties": {
+        "csiDriver": {"$ref": "#/definitions/nonempty"},
+        "socketPath": {"type": "string", "pattern": "^/", "minLength": 2},
+        "identityPath": {"type": "string", "pattern": "^/[a-z0-9/_-]+$", "minLength": 2}
+      }
+    },
+    "services": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["clusterDomain", "apiserverPort", "webhookPort", "mintPort"],
+      "properties": {
+        "clusterDomain": {"$ref": "#/definitions/nonempty"},
+        "apiserverPort": {"$ref": "#/definitions/port"},
+        "webhookPort": {"$ref": "#/definitions/port"},
+        "mintPort": {"$ref": "#/definitions/port"}
+      }
+    },
+    "replicaCount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiserver", "controller", "mint"],
+      "properties": {
+        "apiserver": {"type": "integer", "minimum": 1},
+        "controller": {"type": "integer", "minimum": 1},
+        "mint": {"type": "integer", "minimum": 1}
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiserver", "controller", "mint"],
+      "properties": {
+        "apiserver": {"type": "object"},
+        "controller": {"type": "object"},
+        "mint": {"type": "object"}
+      }
+    }
+  },
+  "definitions": {
+    "nonempty": {"type": "string", "minLength": 1},
+    "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "cidrs": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^[0-9a-fA-F:.]+/[0-9]{1,3}$"},
+      "uniqueItems": true
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tag", "digest"],
+      "properties": {
+        "tag": {"type": "string", "minLength": 1},
+        "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+      }
+    },
+    "secretKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "key"],
+      "properties": {
+        "name": {"$ref": "#/definitions/nonempty"},
+        "key": {"$ref": "#/definitions/nonempty"}
+      }
+    }
+  }
+}
