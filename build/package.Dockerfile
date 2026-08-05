@@ -6,8 +6,7 @@ RUN cargo build --locked --release \
     --bin steward-controller-bin \
     --bin steward-mint-bin
 
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
-RUN apt-get update && apt-get install --yes --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
 ARG BINARY
 COPY --from=build "/workspace/target/release/${BINARY}" /usr/local/bin/steward
 USER 65532:65532
