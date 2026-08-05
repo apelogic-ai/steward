@@ -833,6 +833,45 @@ mod tests {
     }
 
     #[test]
+    fn release_candidate_fails_closed_on_critical_component_images() -> Result<(), String> {
+        let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let release_candidate = workflow
+            .split("  release-candidate:")
+            .nth(1)
+            .and_then(|jobs| jobs.split("\n  pinned:").next())
+            .ok_or_else(|| "release-candidate CI job is required".to_owned())?;
+
+        for component in ["apiserver", "controller", "mint"] {
+            assert!(
+                release_candidate.contains(&format!(
+                    "image-ref: steward-{component}:release-validation"
+                )),
+                "release-candidate CI must scan the {component} production image"
+            );
+        }
+        assert_eq!(
+            release_candidate
+                .matches("aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8")
+                .count(),
+            3,
+            "release-candidate CI must use the pinned Trivy action for every component image"
+        );
+        assert_eq!(
+            release_candidate.matches("exit-code: \"1\"").count(),
+            3,
+            "every release-candidate image scan must fail closed"
+        );
+        assert_eq!(
+            release_candidate.matches("severity: CRITICAL").count(),
+            3,
+            "every release-candidate image scan must enforce CRITICAL findings"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn production_release_contract_is_complete_and_fail_closed() -> Result<(), String> {
         let chart = root().join("charts/steward");
         let values = fs::read_to_string(chart.join("values.yaml"))

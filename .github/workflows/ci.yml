@@ -220,6 +220,30 @@ jobs:
       - name: Render the chart and build all component images
         run: scripts/validate-release-artifacts.sh --build-images
 
+      - name: Enforce critical apiserver image policy
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: steward-apiserver:release-validation
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+
+      - name: Enforce critical controller image policy
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: steward-controller:release-validation
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+
+      - name: Enforce critical mint image policy
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: steward-mint:release-validation
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+
   pinned:
     name: pinned
     if: always()
