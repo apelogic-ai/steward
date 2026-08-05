@@ -191,6 +191,27 @@ jobs:
       - name: Verify the complete PoC journey and revocation
         run: cargo xtask e2e-s5
 
+  openshell-adapter:
+    name: integration / OpenShell 0.0.98 adapter
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Install Kubernetes tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+
+      - name: Verify the authenticated OpenShell adapter
+        run: cargo xtask e2e-openshell-adapter
+
   release-candidate:
     name: release / chart and images
     runs-on: ubuntu-latest
@@ -211,6 +232,7 @@ jobs:
         run: |
           actionlint
           shellcheck \
+            scripts/openshell-adapter-e2e.sh \
             scripts/promote-ecr-artifact.sh \
             scripts/resolve-ecr-platform-digest.sh \
             scripts/test-promote-ecr-artifact.sh \
@@ -256,6 +278,7 @@ jobs:
       - e2e-admission
       - e2e-escalation
       - e2e-revocation
+      - openshell-adapter
       - release-candidate
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -271,6 +294,7 @@ jobs:
           ADMISSION: ${{ needs.e2e-admission.result }}
           ESCALATION: ${{ needs.e2e-escalation.result }}
           REVOCATION: ${{ needs.e2e-revocation.result }}
+          OPENSHELL_ADAPTER: ${{ needs.openshell-adapter.result }}
           RELEASE_CANDIDATE: ${{ needs.release-candidate.result }}
         run: |
           set -euo pipefail
@@ -283,6 +307,7 @@ jobs:
             "${ADMISSION}" \
             "${ESCALATION}" \
             "${REVOCATION}" \
+            "${OPENSHELL_ADAPTER}" \
             "${RELEASE_CANDIDATE}"
           do
             if [[ "${result}" != "success" ]]; then

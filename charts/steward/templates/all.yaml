@@ -238,14 +238,31 @@ spec:
             - { name: STEWARD_LITELLM_MASTER_KEY, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.litellm.name }}, key: {{ .Values.secrets.litellm.key }} } } }
             - { name: STEWARD_LITELLM_URL, value: {{ .Values.config.controller.litellmUrl | quote }} }
             - { name: STEWARD_OPENSHELL_ENDPOINT, value: {{ .Values.config.controller.openshellEndpoint | quote }} }
+            - { name: STEWARD_OPENSHELL_SERVER_NAME, value: {{ .Values.config.controller.openshellServerName | quote }} }
+            - { name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME, value: {{ .Values.config.controller.openshellRuntimeClassName | quote }} }
+            - { name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE, value: /run/openshell/ca.crt }
+            - { name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE, value: /run/openshell/tls.crt }
+            - { name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE, value: /run/openshell/tls.key }
+            - { name: STEWARD_OPENSHELL_BEARER_TOKEN_FILE, value: /run/openshell/token }
             - { name: STEWARD_CONTROLLER_USERNAME, value: {{ printf "system:serviceaccount:%s:steward-controller" .Release.Namespace | quote }} }
             - { name: STEWARD_APISERVER_USERNAME, value: {{ printf "system:serviceaccount:%s:steward-apiserver" .Release.Namespace | quote }} }
             - { name: STEWARD_TLS_CERT_DER, value: /run/tls/tls.crt }
             - { name: STEWARD_TLS_KEY_DER, value: /run/tls/tls.key }
-          volumeMounts: [{ name: tls, mountPath: /run/tls, readOnly: true }]
+          volumeMounts:
+            - { name: tls, mountPath: /run/tls, readOnly: true }
+            - { name: openshell-client, mountPath: /run/openshell, readOnly: true }
           resources:
 {{ toYaml .Values.resources.controller | nindent 12 }}
-      volumes: [{ name: tls, secret: { secretName: steward-webhook-tls } }]
+      volumes:
+        - { name: tls, secret: { secretName: steward-webhook-tls } }
+        - name: openshell-client
+          secret:
+            secretName: {{ .Values.secrets.openshellClient.name }}
+            items:
+              - { key: {{ .Values.secrets.openshellClient.caCertificate }}, path: ca.crt }
+              - { key: {{ .Values.secrets.openshellClient.clientCertificate }}, path: tls.crt }
+              - { key: {{ .Values.secrets.openshellClient.clientPrivateKey }}, path: tls.key }
+              - { key: {{ .Values.secrets.openshellClient.bearerToken }}, path: token }
 ---
 apiVersion: apps/v1
 kind: Deployment

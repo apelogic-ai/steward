@@ -42,6 +42,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "e2e-s4" if rest.is_empty() => e2e_s4(),
         "e2e-s5" if rest.is_empty() => e2e_s5(),
         "e2e-task" if rest.is_empty() => e2e_task(),
+        "e2e-openshell-adapter" if rest.is_empty() => e2e_openshell_adapter(),
         "policy-test" if rest.is_empty() => policy_test(),
         "migrate-check" if rest.is_empty() => migrate_check(),
         "generate-manifests" if rest.is_empty() => generate_manifests(),
@@ -74,6 +75,7 @@ fn usage() -> String {
         "  e2e-s4",
         "  e2e-s5",
         "  e2e-task",
+        "  e2e-openshell-adapter",
         "  policy-test",
         "  migrate-check",
         "  generate-manifests",
@@ -168,6 +170,10 @@ fn e2e_s5() -> TaskResult {
 
 fn e2e_task() -> TaskResult {
     run("bash", &["scripts/task-submission-e2e.sh"])
+}
+
+fn e2e_openshell_adapter() -> TaskResult {
+    run("bash", &["scripts/openshell-adapter-e2e.sh"])
 }
 
 fn policy_test() -> TaskResult {
@@ -866,6 +872,121 @@ mod tests {
             release_candidate.matches("severity: CRITICAL").count(),
             3,
             "every release-candidate image scan must enforce CRITICAL findings"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_adapter_does_not_select_a_public_sandbox_image() -> Result<(), String> {
+        let source = fs::read_to_string(root().join("adapters/openshell/src/lib.rs"))
+            .map_err(|error| format!("OpenShell adapter source is required: {error}"))?;
+        let contract =
+            fs::read_to_string(root().join("adapters/openshell/examples/workspace_contract.rs"))
+                .map_err(|error| {
+                    format!("OpenShell adapter contract example is required: {error}")
+                })?;
+
+        for adapter in [source, contract] {
+            assert!(
+                !adapter.contains("ghcr.io/nvidia/openshell-community/sandboxes/"),
+                "the Steward adapter must leave sandbox image selection to the configured OpenShell gateway"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_chart_requires_verified_authenticated_gateway_transport() -> Result<(), String> {
+        let chart = root().join("charts/steward");
+        let values = fs::read_to_string(chart.join("values.yaml"))
+            .map_err(|error| format!("published Steward chart values are required: {error}"))?;
+        let schema = fs::read_to_string(chart.join("values.schema.json"))
+            .map_err(|error| format!("published Steward values schema is required: {error}"))?;
+        let templates = fs::read_to_string(chart.join("templates/all.yaml")).map_err(|error| {
+            format!("published Steward Kubernetes templates are required: {error}")
+        })?;
+
+        for required in [
+            "openshellEndpoint",
+            "openshellServerName",
+            "openshellRuntimeClassName",
+            "openshellClient",
+            "caCertificate",
+            "clientCertificate",
+            "clientPrivateKey",
+            "bearerToken",
+        ] {
+            assert!(
+                values.contains(required),
+                "chart values must expose the required OpenShell setting or Secret reference {required}"
+            );
+            assert!(
+                schema.contains(required),
+                "the values schema must require the OpenShell setting or Secret reference {required}"
+            );
+        }
+        for environment_variable in [
+            "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
+            "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
+            "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
+            "STEWARD_OPENSHELL_BEARER_TOKEN_FILE",
+            "STEWARD_OPENSHELL_SERVER_NAME",
+            "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
+        ] {
+            assert!(
+                templates.contains(environment_variable),
+                "the controller deployment must receive {environment_variable}"
+            );
+        }
+        assert!(
+            !values.contains("openshellEndpoint: http://"),
+            "the published chart must not default OpenShell transport to plaintext gRPC"
+        );
+        assert!(
+            values.contains("openshell: 8080"),
+            "the default NetworkPolicy must permit the OpenShell v0.0.98 gateway TLS service port"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_v0098_adapter_integration_is_a_required_ci_lane() -> Result<(), String> {
+        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let adapter_manifest = fs::read_to_string(root().join("adapters/openshell/Cargo.toml"))
+            .map_err(|error| format!("OpenShell adapter manifest is required: {error}"))?;
+        let harness = fs::read_to_string(root().join("scripts/openshell-adapter-e2e.sh")).map_err(
+            |error| format!("OpenShell adapter integration harness is required: {error}"),
+        )?;
+
+        assert!(
+            ci.contains("cargo xtask e2e-openshell-adapter"),
+            "CI must execute the real OpenShell adapter integration lane"
+        );
+        assert!(
+            adapter_manifest.contains("832841295992f0112f43f27de5d68213376ff3cb"),
+            "the runtime adapter must pin the exact OpenShell v0.0.98 source revision"
+        );
+        for required in [
+            "OPEN_SHELL_RELEASE=\"v0.0.98\"",
+            "server.defaultRuntimeClassName=kata-qemu",
+            "server.oidc.issuer=",
+            "--test openshell_adapter_v0098",
+        ] {
+            assert!(
+                harness.contains(required),
+                "OpenShell adapter integration harness is missing {required}"
+            );
+        }
+
+        let adapter_source = fs::read_to_string(root().join("adapters/openshell/src/lib.rs"))
+            .map_err(|error| format!("OpenShell adapter source is required: {error}"))?;
+        assert!(
+            !adapter_source.contains("driver_config"),
+            "the adapter must not expose per-create OpenShell driver or scheduler overrides"
         );
 
         Ok(())

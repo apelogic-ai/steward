@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::serve::Listener;
 use kube::Client;
 use steward_adapter_litellm::{LiteLlmAdapter, LiteLlmConfig};
-use steward_adapter_openshell::OpenShellRuntime;
+use steward_adapter_openshell::{OpenShellConnectionConfig, OpenShellRuntime};
 use steward_store::PgStore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinError, JoinSet};
@@ -27,9 +27,8 @@ const MAX_PENDING_TLS_HANDSHAKES: usize = 64;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let endpoint = required("STEWARD_OPENSHELL_ENDPOINT")?;
     let client = Client::try_default().await?;
-    let sandbox_runtime = OpenShellRuntime::connect(endpoint)
+    let sandbox_runtime = OpenShellRuntime::connect(openshell_connection_config()?)
         .await
         .map_err(|error| io::Error::other(format!("OpenShell connection failed: {error:?}")))?;
     if env::var("STEWARD_S0_BOOTSTRAP").as_deref() == Ok("1") {
@@ -73,6 +72,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 fn required(name: &str) -> Result<String, io::Error> {
     env::var(name).map_err(|_| io::Error::other(format!("{name} is required")))
+}
+
+fn required_file(name: &str) -> Result<Vec<u8>, io::Error> {
+    let path = required(name)?;
+    fs::read(&path).map_err(|error| io::Error::other(format!("failed to read {name}: {error}")))
+}
+
+fn openshell_connection_config() -> Result<OpenShellConnectionConfig, io::Error> {
+    Ok(OpenShellConnectionConfig {
+        endpoint: required("STEWARD_OPENSHELL_ENDPOINT")?,
+        ca_certificate_pem: required_file("STEWARD_OPENSHELL_CA_CERTIFICATE_FILE")?,
+        client_certificate_pem: required_file("STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE")?,
+        client_private_key_pem: required_file("STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE")?,
+        bearer_token: String::from_utf8(required_file("STEWARD_OPENSHELL_BEARER_TOKEN_FILE")?)
+            .map_err(|_| io::Error::other("OpenShell bearer token must be UTF-8"))?,
+        server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
+        runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
+    })
 }
 
 async fn tls_listener(

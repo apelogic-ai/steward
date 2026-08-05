@@ -1881,6 +1881,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1975,13 +1987,14 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "openshell-core"
 version = "0.0.0"
-source = "git+https://github.com/NVIDIA/OpenShell?rev=1d4ac708f1d2a9ab94204cdce6ca0eee7e792839#1d4ac708f1d2a9ab94204cdce6ca0eee7e792839"
+source = "git+https://github.com/NVIDIA/OpenShell?rev=832841295992f0112f43f27de5d68213376ff3cb#832841295992f0112f43f27de5d68213376ff3cb"
 dependencies = [
  "base64",
  "chrono",
  "glob",
  "ipnet",
  "miette",
+ "nix",
  "prost",
  "prost-types",
  "protobuf-src",
@@ -2000,7 +2013,7 @@ dependencies = [
 [[package]]
 name = "openshell-sdk"
 version = "0.0.0"
-source = "git+https://github.com/NVIDIA/OpenShell?rev=1d4ac708f1d2a9ab94204cdce6ca0eee7e792839#1d4ac708f1d2a9ab94204cdce6ca0eee7e792839"
+source = "git+https://github.com/NVIDIA/OpenShell?rev=832841295992f0112f43f27de5d68213376ff3cb#832841295992f0112f43f27de5d68213376ff3cb"
 dependencies = [
  "async-trait",
  "futures",
@@ -3362,6 +3375,7 @@ dependencies = [
  "steward-ports",
  "steward-types",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

@@ -24,7 +24,7 @@ use openshell_sdk::raw::proto::{
 };
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
-    ClientConfig, ExecOptions, OpenShellClient, SandboxPhase, SandboxSpec, SdkError,
+    EdgeAuthInterceptor, ExecOptions, OpenShellClient, SandboxPhase, SandboxSpec, SdkError,
     WorkspaceScopedClient,
 };
 use sha2::{Digest, Sha256};
@@ -37,13 +37,15 @@ use steward_ports::{
 };
 #[cfg(feature = "runtime")]
 use steward_types::RuntimeRefs;
+#[cfg(feature = "runtime")]
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 pub const IMPLEMENTED_PORTS: [&str; 0] = [];
 const NAME_LENGTH: usize = 19;
 const HASH_CHARACTERS: usize = NAME_LENGTH - 2;
 const LOWER_BASE36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 #[cfg(feature = "runtime")]
-const BASE_SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e";
+const REQUIRED_RUNTIME_CLASS_NAME: &str = "kata-qemu";
 #[cfg(feature = "runtime")]
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
 #[cfg(feature = "runtime")]
@@ -249,7 +251,6 @@ struct OpenShellProjection {
     workspace: String,
     workspace_key: String,
     sandbox: String,
-    image: &'static str,
     providers: Vec<String>,
     runtime_uid: String,
 }
@@ -278,19 +279,18 @@ fn deletion_names(request: &SandboxRequest) -> (String, String) {
 
 #[cfg(feature = "runtime")]
 fn project_request(request: &SandboxRequest) -> Result<OpenShellProjection, PortError> {
-    let image = match request.agent_type.name.as_str() {
-        "base" => BASE_SANDBOX_IMAGE,
+    match request.agent_type.name.as_str() {
+        "base" => {}
         other => {
             return Err(PortError::Rejected {
                 reason: format!("unsupported agent type: {other}"),
             });
         }
-    };
+    }
     Ok(OpenShellProjection {
         workspace: stable_name(NameKind::Workspace, request.workspace_key.as_bytes()),
         workspace_key: request.workspace_key.clone(),
         sandbox: stable_name(NameKind::Sandbox, request.runtime.0.as_bytes()),
-        image,
         providers: [
             (!request.tools.is_empty()).then(|| TOOL_PROVIDER.to_owned()),
             (!request.models.is_empty()).then(|| INFERENCE_PROVIDER.to_owned()),
@@ -303,6 +303,71 @@ fn project_request(request: &SandboxRequest) -> Result<OpenShellProjection, Port
 }
 
 #[cfg(feature = "runtime")]
+fn sandbox_spec(projection: &OpenShellProjection) -> SandboxSpec {
+    let mut labels = HashMap::new();
+    labels.insert(RUNTIME_UID_LABEL.to_owned(), projection.runtime_uid.clone());
+    SandboxSpec {
+        name: Some(projection.sandbox.clone()),
+        image: None,
+        labels,
+        providers: projection.providers.clone(),
+        ..SandboxSpec::default()
+    }
+}
+
+#[cfg(feature = "runtime")]
+#[derive(Clone)]
+pub struct OpenShellConnectionConfig {
+    pub endpoint: String,
+    pub ca_certificate_pem: Vec<u8>,
+    pub client_certificate_pem: Vec<u8>,
+    pub client_private_key_pem: Vec<u8>,
+    pub bearer_token: String,
+    pub server_name: String,
+    pub runtime_class_name: String,
+}
+
+#[cfg(feature = "runtime")]
+impl OpenShellConnectionConfig {
+    fn validate(&self) -> Result<(), PortError> {
+        if !self.endpoint.starts_with("https://") {
+            return Err(PortError::Rejected {
+                reason: "OpenShell gateway endpoint must use verified HTTPS".to_owned(),
+            });
+        }
+        if self.server_name.trim().is_empty() {
+            return Err(PortError::Rejected {
+                reason: "OpenShell gateway TLS server name is required".to_owned(),
+            });
+        }
+        for (description, material) in [
+            ("CA certificate", self.ca_certificate_pem.as_slice()),
+            ("client certificate", self.client_certificate_pem.as_slice()),
+            ("client private key", self.client_private_key_pem.as_slice()),
+        ] {
+            if material.is_empty() {
+                return Err(PortError::Rejected {
+                    reason: format!("OpenShell gateway {description} is required"),
+                });
+            }
+        }
+        if self.bearer_token.trim().is_empty() {
+            return Err(PortError::Rejected {
+                reason: "OpenShell gateway caller bearer token is required".to_owned(),
+            });
+        }
+        if self.runtime_class_name != REQUIRED_RUNTIME_CLASS_NAME {
+            return Err(PortError::Rejected {
+                reason: format!(
+                    "OpenShell gateway runtime class must be {REQUIRED_RUNTIME_CLASS_NAME}"
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "runtime")]
 #[derive(Clone)]
 pub struct OpenShellRuntime {
     client: OpenShellClient,
@@ -310,10 +375,26 @@ pub struct OpenShellRuntime {
 
 #[cfg(feature = "runtime")]
 impl OpenShellRuntime {
-    pub async fn connect(endpoint: impl Into<String>) -> Result<Self, PortError> {
-        let client = OpenShellClient::connect(ClientConfig::new(endpoint.into()))
+    pub async fn connect(config: OpenShellConnectionConfig) -> Result<Self, PortError> {
+        config.validate()?;
+        let interceptor =
+            EdgeAuthInterceptor::new(Some(&config.bearer_token), None).map_err(port_failure)?;
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(config.ca_certificate_pem))
+            .identity(Identity::from_pem(
+                config.client_certificate_pem,
+                config.client_private_key_pem,
+            ))
+            .domain_name(config.server_name);
+        let channel = Endpoint::from_shared(config.endpoint)
+            .map_err(raw_port_failure)?
+            .connect_timeout(StdDuration::from_secs(10))
+            .tls_config(tls)
+            .map_err(raw_port_failure)?
+            .connect()
             .await
-            .map_err(port_failure)?;
+            .map_err(raw_port_failure)?;
+        let client = OpenShellClient::from_parts(channel, interceptor);
         Ok(Self { client })
     }
 
@@ -623,18 +704,7 @@ impl SandboxRuntime for OpenShellRuntime {
         let snapshot = match scoped.get_sandbox(&projection.sandbox).await {
             Ok(snapshot) => snapshot,
             Err(SdkError::NotFound { .. }) => {
-                let mut labels = HashMap::new();
-                labels.insert(RUNTIME_UID_LABEL.to_owned(), projection.runtime_uid.clone());
-                match scoped
-                    .create_sandbox(SandboxSpec {
-                        name: Some(projection.sandbox.clone()),
-                        image: Some(projection.image.to_owned()),
-                        labels,
-                        providers: projection.providers.clone(),
-                        ..SandboxSpec::default()
-                    })
-                    .await
-                {
+                match scoped.create_sandbox(sandbox_spec(&projection)).await {
                     Ok(snapshot) => snapshot,
                     Err(SdkError::AlreadyExists { .. }) => scoped
                         .get_sandbox(&projection.sandbox)
@@ -836,9 +906,66 @@ mod tests {
     use super::{NameKind, stable_name};
     #[cfg(feature = "runtime")]
     use super::{
-        ProviderReconciliation, SandboxDeleteClient, delete_owned_sandbox, deletion_names,
-        project_request, provider_reconciliation,
+        OpenShellConnectionConfig, ProviderReconciliation, SandboxDeleteClient,
+        delete_owned_sandbox, deletion_names, project_request, provider_reconciliation,
+        sandbox_spec,
     };
+
+    #[cfg(feature = "runtime")]
+    fn valid_connection_config() -> OpenShellConnectionConfig {
+        OpenShellConnectionConfig {
+            endpoint: "https://gateway.example.test:8080".to_owned(),
+            ca_certificate_pem: b"test-ca-certificate".to_vec(),
+            client_certificate_pem: b"test-client-certificate".to_vec(),
+            client_private_key_pem: b"test-client-private-key".to_vec(),
+            bearer_token: "test-bearer-token".to_owned(),
+            server_name: "gateway.example.test".to_owned(),
+            runtime_class_name: "kata-qemu".to_owned(),
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn gateway_transport_rejects_plaintext() {
+        let mut config = valid_connection_config();
+        config.endpoint = "http://gateway.example.test:8080".to_owned();
+
+        assert!(
+            matches!(config.validate(), Err(PortError::Rejected { .. })),
+            "the OpenShell adapter must reject plaintext gateway transport"
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn gateway_transport_requires_explicit_trust_and_caller_identity() {
+        for mutate in [
+            |config: &mut OpenShellConnectionConfig| config.ca_certificate_pem.clear(),
+            |config: &mut OpenShellConnectionConfig| config.client_certificate_pem.clear(),
+            |config: &mut OpenShellConnectionConfig| config.client_private_key_pem.clear(),
+            |config: &mut OpenShellConnectionConfig| config.bearer_token.clear(),
+            |config: &mut OpenShellConnectionConfig| config.server_name.clear(),
+        ] {
+            let mut config = valid_connection_config();
+            mutate(&mut config);
+            assert!(
+                matches!(config.validate(), Err(PortError::Rejected { .. })),
+                "the OpenShell adapter must reject missing CA, client identity, or server name material"
+            );
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn gateway_transport_rejects_a_non_kata_runtime_contract() {
+        let mut config = valid_connection_config();
+        config.runtime_class_name = "runc".to_owned();
+
+        assert!(
+            matches!(config.validate(), Err(PortError::Rejected { .. })),
+            "the OpenShell adapter must reject a runtime class other than kata-qemu"
+        );
+    }
 
     #[cfg(feature = "runtime")]
     struct FakeDeleteClient {
@@ -963,9 +1090,9 @@ mod tests {
         assert_eq!(projection.workspace, "w-9086ou4eujpgku8z0");
         assert_eq!(projection.workspace_key, "team-a");
         assert_eq!(projection.sandbox, "s-tmtp1a3s40p1kixv2");
-        assert_eq!(
-            projection.image,
-            "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e"
+        assert!(
+            sandbox_spec(&projection).image.is_none(),
+            "the gateway's configured default sandbox image must remain authoritative"
         );
         assert_eq!(projection.runtime_uid, "runtime-uid-a");
         Ok(())

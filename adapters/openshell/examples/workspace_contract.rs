@@ -1,26 +1,24 @@
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::io;
 use std::time::Duration;
 
 use openshell_sdk::raw::proto::{
     AddWorkspaceMemberRequest, ListWorkspaceMembersRequest, WorkspaceRole,
 };
-use openshell_sdk::{ClientConfig, OpenShellClient, SandboxSpec};
+use openshell_sdk::{EdgeAuthInterceptor, OpenShellClient, SandboxSpec};
 use steward_adapter_openshell::{NameKind, stable_name};
-
-const SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let endpoint = env::var("STEWARD_OPENSHELL_ENDPOINT")
-        .map_err(|_| io::Error::other("STEWARD_OPENSHELL_ENDPOINT is required"))?;
-    let client = OpenShellClient::connect(ClientConfig::new(endpoint)).await?;
+    let client = connect().await?;
     let health = client.health().await?;
-    if health.version != "0.0.90" {
+    if health.version != "0.0.98" {
         return Err(io::Error::other(format!(
-            "expected OpenShell 0.0.90, gateway reported {}",
+            "expected OpenShell 0.0.98, gateway reported {}",
             health.version
         ))
         .into());
@@ -35,9 +33,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
     result?;
 
     println!(
-        "OpenShell 0.0.90 workspace contract confirmed: scoped duplicate names, membership, 19-char cap, and sandbox-before-workspace teardown"
+        "OpenShell 0.0.98 workspace contract confirmed: scoped duplicate names, membership, 19-char cap, and sandbox-before-workspace teardown"
     );
     Ok(())
+}
+
+async fn connect() -> Result<OpenShellClient, Box<dyn Error>> {
+    let required =
+        |name: &str| env::var(name).map_err(|_| io::Error::other(format!("{name} is required")));
+    let read = |name: &str| -> Result<Vec<u8>, io::Error> {
+        let path = required(name)?;
+        fs::read(path).map_err(|error| io::Error::other(format!("failed to read {name}: {error}")))
+    };
+    let endpoint = required("STEWARD_OPENSHELL_ENDPOINT")?;
+    if !endpoint.starts_with("https://") {
+        return Err(io::Error::other("STEWARD_OPENSHELL_ENDPOINT must use HTTPS").into());
+    }
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(read(
+            "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
+        )?))
+        .identity(Identity::from_pem(
+            read("STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE")?,
+            read("STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE")?,
+        ))
+        .domain_name(required("STEWARD_OPENSHELL_SERVER_NAME")?);
+    let channel = Endpoint::from_shared(endpoint)?
+        .tls_config(tls)?
+        .connect()
+        .await?;
+    let bearer_token = required("STEWARD_OPENSHELL_TEST_BEARER_TOKEN")?;
+    let interceptor = EdgeAuthInterceptor::new(Some(&bearer_token), None)?;
+    Ok(OpenShellClient::from_parts(channel, interceptor))
 }
 
 async fn verify_contract(
@@ -86,7 +113,7 @@ async fn verify_contract(
             .workspace(workspace)
             .create_sandbox(SandboxSpec {
                 name: Some(sandbox_name.to_owned()),
-                image: Some(SANDBOX_IMAGE.to_owned()),
+                image: None,
                 ..SandboxSpec::default()
             })
             .await?;
