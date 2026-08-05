@@ -29,7 +29,10 @@ manifests to the configured ECR repositories, verifies that the digests did not
 change, waits for native ECR scanning, rejects critical findings, signs them,
 and publishes a private-registry handoff artifact. Promotion is retry-safe: a
 missing immutable tag is created, a matching tag is reused, and a tag pointing
-to any other digest fails closed.
+to any other digest fails closed. For BuildKit OCI indexes, the workflow scans
+exactly one runnable `linux/amd64` child manifest (excluding SBOM/provenance
+attestations) and records both the release index digest and scanned platform
+digest. A missing or ambiguous runnable child fails closed.
 
 ## Required secrets
 

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 2,
+  "manifests": [
+    {
+      "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "size": 1024,
+      "platform": {"os": "linux", "architecture": "amd64"}
+    },
+    {
+      "digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+      "size": 1024,
+      "platform": {"os": "linux", "architecture": "amd64"}
+    },
+    {
+      "digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+      "size": 512,
+      "platform": {"os": "unknown", "architecture": "unknown"}
+    }
+  ]
+}

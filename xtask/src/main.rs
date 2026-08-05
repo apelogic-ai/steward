@@ -843,6 +843,9 @@ mod tests {
         let promotion_test =
             fs::read_to_string(root().join("scripts/test-promote-ecr-artifact.sh"))
                 .map_err(|error| format!("ECR promotion retry tests are required: {error}"))?;
+        let platform_resolution_test =
+            fs::read_to_string(root().join("scripts/test-resolve-ecr-platform-digest.sh"))
+                .map_err(|error| format!("ECR platform resolution tests are required: {error}"))?;
         let setup_tools = fs::read_to_string(root().join(".github/actions/setup-tools/action.yml"))
             .map_err(|error| format!("Steward CI tool installer is required: {error}"))?;
         let provider_profiles = [
@@ -992,10 +995,24 @@ mod tests {
             "aws ecr describe-image-scan-findings",
             "scripts/promote-ecr-artifact.sh",
             "scripts/test-promote-ecr-artifact.sh",
+            "scripts/resolve-ecr-platform-digest.sh",
+            "scripts/test-resolve-ecr-platform-digest.sh",
+            "ecr-$component-scan-platform.digest",
+            "Scanned linux/amd64 digest",
         ] {
             assert!(
                 workflow.contains(required) || release_validation.contains(required),
                 "release path is missing {required}"
+            );
+        }
+        for required in [
+            "one runnable linux/amd64 manifest plus SBOM and provenance attestations",
+            "missing runnable linux/amd64 manifest fails closed",
+            "ambiguous runnable linux/amd64 manifests fail closed",
+        ] {
+            assert!(
+                platform_resolution_test.contains(required),
+                "ECR platform resolution tests are missing: {required}"
             );
         }
         for required in ["missing target", "matching target", "different digest"] {

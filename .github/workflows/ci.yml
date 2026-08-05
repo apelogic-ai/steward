@@ -212,7 +212,9 @@ jobs:
           actionlint
           shellcheck \
             scripts/promote-ecr-artifact.sh \
+            scripts/resolve-ecr-platform-digest.sh \
             scripts/test-promote-ecr-artifact.sh \
+            scripts/test-resolve-ecr-platform-digest.sh \
             scripts/validate-release-artifacts.sh
 
       - name: Render the chart and build all component images

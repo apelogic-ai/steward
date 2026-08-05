@@ -37,7 +37,9 @@ jobs:
           actionlint
           shellcheck \
             scripts/promote-ecr-artifact.sh \
+            scripts/resolve-ecr-platform-digest.sh \
             scripts/test-promote-ecr-artifact.sh \
+            scripts/test-resolve-ecr-platform-digest.sh \
             scripts/validate-release-artifacts.sh
 
       - name: Run Steward quality gates
@@ -362,22 +364,31 @@ jobs:
           set -euo pipefail
           scan_failed=0
           for component in apiserver controller mint; do
-            digest="$(cat "dist/ecr-$component.digest")"
+            index_digest="$(cat "dist/ecr-$component.digest")"
+            index_ref="$ECR_REGISTRY/$STEWARD_ECR_IMAGE_REPOSITORY@$index_digest"
+            if ! platform_digest="$(scripts/resolve-ecr-platform-digest.sh \
+              "$index_ref" linux amd64)"
+            then
+              echo "runnable linux/amd64 manifest resolution failed for $component@$index_digest" >&2
+              scan_failed=1
+              continue
+            fi
+            printf '%s\n' "$platform_digest" > "dist/ecr-$component-scan-platform.digest"
             report="dist/ecr-$component-scan.json"
             if ! aws ecr wait image-scan-complete \
               --repository-name "$STEWARD_ECR_IMAGE_REPOSITORY" \
-              --image-id "imageDigest=$digest"
+              --image-id "imageDigest=$platform_digest"
             then
-              echo "ECR scan did not complete for $component@$digest" >&2
+              echo "ECR scan did not complete for $component platform $platform_digest (index $index_digest)" >&2
               scan_failed=1
               continue
             fi
             if ! aws ecr describe-image-scan-findings \
               --repository-name "$STEWARD_ECR_IMAGE_REPOSITORY" \
-              --image-id "imageDigest=$digest" \
+              --image-id "imageDigest=$platform_digest" \
               --output json > "$report"
             then
-              echo "ECR scan findings were unavailable for $component@$digest" >&2
+              echo "ECR scan findings were unavailable for $component platform $platform_digest (index $index_digest)" >&2
               scan_failed=1
               continue
             fi
@@ -386,7 +397,7 @@ jobs:
               ([.imageScanFindings.enhancedFindings[]? | select(.severity == "CRITICAL")] | length)
             ] | max' "$report")"
             if [[ "$critical" -ne 0 ]]; then
-              echo "ECR reported $critical critical findings for $component@$digest" >&2
+              echo "ECR reported $critical critical findings for $component platform $platform_digest (index $index_digest)" >&2
               scan_failed=1
             fi
           done
@@ -397,7 +408,7 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: ecr-release-scan-evidence
-          path: dist/ecr-*-scan.json
+          path: dist/ecr-*-scan.*
           if-no-files-found: warn
 
       - name: Sign promoted artifacts
@@ -456,12 +467,14 @@ jobs:
           {
             printf '# Steward private registry handoff %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
-            printf '| Artifact | Immutable reference |\n|---|---|\n'
+            printf '| Artifact | Immutable reference | Scanned linux/amd64 digest |\n|---|---|---|\n'
             for component in apiserver controller mint; do
-              printf '| %s | %s:%s-%s@%s |\n' \
-                "$component" "$IMAGE_REPOSITORY" "$version" "$component" "$(cat "dist/ecr-$component.digest")"
+              printf '| %s | %s:%s-%s@%s | %s |\n' \
+                "$component" "$IMAGE_REPOSITORY" "$version" "$component" \
+                "$(cat "dist/ecr-$component.digest")" \
+                "$(cat "dist/ecr-$component-scan-platform.digest")"
             done
-            printf '| chart | oci://%s@%s |\n' \
+            printf '| chart | oci://%s@%s | n/a |\n' \
               "$CHART_REPOSITORY" "$(cat dist/ecr-helm-chart.digest)"
           } > dist/ecr-release-handoff.md
 

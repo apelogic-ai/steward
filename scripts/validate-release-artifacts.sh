@@ -67,3 +67,4 @@ elif [[ -n "${1:-}" ]]; then
 fi
 
 "${root}/scripts/test-promote-ecr-artifact.sh"
+"${root}/scripts/test-resolve-ecr-platform-digest.sh"
