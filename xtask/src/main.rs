@@ -953,6 +953,159 @@ mod tests {
     }
 
     #[test]
+    fn task_copy_smoke_contract_is_authority_bounded_and_idempotently_bootstrapped()
+    -> Result<(), String> {
+        let workflows_path = root().join("config/task/workflows.example.json");
+        let workflows = serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(&workflows_path)
+                .map_err(|error| format!("Task workflow catalog is required: {error}"))?,
+        )
+        .map_err(|error| format!("Task workflow catalog must be valid JSON: {error}"))?;
+        let copy_smoke = workflows
+            .as_array()
+            .and_then(|workflows| {
+                workflows.iter().find(|workflow| {
+                    workflow.get("name").and_then(serde_json::Value::as_str) == Some("copy-smoke")
+                })
+            })
+            .ok_or_else(|| "production Task catalog must include copy-smoke".to_owned())?;
+        for authority in ["llms", "tools"] {
+            assert!(
+                copy_smoke
+                    .get(authority)
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty),
+                "copy-smoke must not request {authority} authority"
+            );
+        }
+        assert_eq!(
+            copy_smoke
+                .pointer("/budget/monthlyLimit")
+                .and_then(serde_json::Value::as_str),
+            Some("0.00"),
+            "copy-smoke must not reserve inference spend"
+        );
+        let command = copy_smoke
+            .get("command")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "copy-smoke command must be an argv array".to_owned())?
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            command,
+            vec![
+                "/bin/sh",
+                "-c",
+                "set -eu; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; cp in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"",
+            ],
+            "copy-smoke must only copy the declared input to the declared output root"
+        );
+
+        let envelope_path = root().join("config/task/steward-run-service-envelope.example.json");
+        let envelope = serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(&envelope_path)
+                .map_err(|error| format!("copy-smoke service envelope is required: {error}"))?,
+        )
+        .map_err(|error| format!("copy-smoke service envelope must be valid JSON: {error}"))?;
+        for authority in ["llms", "tools"] {
+            assert!(
+                envelope
+                    .pointer(&format!("/spec/{authority}"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(Vec::is_empty),
+                "copy-smoke service envelope must grant no {authority} authority"
+            );
+        }
+        assert_eq!(
+            envelope
+                .pointer("/spec/budget/monthlyLimit")
+                .and_then(serde_json::Value::as_str),
+            Some("0.00"),
+            "copy-smoke service envelope must grant no inference budget"
+        );
+
+        let bootstrap = fs::read_to_string(root().join("scripts/bootstrap-task-copy-smoke.sh"))
+            .map_err(|error| format!("copy-smoke bootstrap procedure is required: {error}"))?;
+        for required in [
+            "STEWARD_APISERVER_URL",
+            "STEWARD_APISERVER_CA_CERTIFICATE_FILE",
+            "STEWARD_SERVICE_ENVELOPE_BOOTSTRAP_TOKEN_FILE",
+            "steward-run-service-envelope.example.json",
+            "/admin/service-envelopes/steward-run",
+            "--cacert",
+            "--config",
+        ] {
+            assert!(
+                bootstrap.contains(required),
+                "copy-smoke bootstrap procedure must use {required}"
+            );
+        }
+        assert!(
+            bootstrap.contains("200|201"),
+            "copy-smoke bootstrap must treat a matching existing envelope as success"
+        );
+        assert!(
+            bootstrap.contains("STEWARD_APISERVER_URL must use HTTPS"),
+            "copy-smoke bootstrap must reject plaintext transport"
+        );
+        assert!(
+            !bootstrap.contains("--header \"Authorization:"),
+            "copy-smoke bootstrap must not expose its bearer token in process arguments"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn task_bootstrap_publishes_its_route_scoped_identity_contract() -> Result<(), String> {
+        let contract = fs::read_to_string(root().join("config/task/README.md"))
+            .map_err(|error| format!("Task production configuration is required: {error}"))?;
+        for required in [
+            "agents.apelogic.ai/service-envelope-bootstrap:steward-run",
+            "steward-task-api",
+            "DEV EKS OIDC identity-provider",
+            "must not be stored in a Kubernetes Secret",
+            "blocked first on this Steward release",
+            "then on Infra",
+        ] {
+            assert!(
+                contract.contains(required),
+                "Task bootstrap authority contract must state `{required}`"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn task_and_bootstrap_share_one_eks_oidc_audience() -> Result<(), String> {
+        let values = fs::read_to_string(root().join("charts/steward/values.yaml"))
+            .map_err(|error| format!("published Steward chart values are required: {error}"))?;
+        let values = serde_saphyr::from_str::<serde_json::Value>(&values).map_err(|error| {
+            format!("published Steward chart values must be valid YAML: {error}")
+        })?;
+        let apiserver = values
+            .pointer("/config/apiserver")
+            .ok_or_else(|| "chart apiserver configuration is required".to_owned())?;
+        let token_audience = apiserver
+            .get("tokenAudience")
+            .and_then(serde_json::Value::as_str);
+        let task_token_audience = apiserver
+            .get("taskTokenAudience")
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(
+            token_audience,
+            Some("steward-task-api"),
+            "route-scoped bootstrap must use the EKS external OIDC provider audience"
+        );
+        assert_eq!(
+            token_audience, task_token_audience,
+            "Task and bootstrap TokenReviews must share the cluster's single external OIDC audience"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn openshell_v0098_adapter_integration_is_a_required_ci_lane() -> Result<(), String> {
         let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;

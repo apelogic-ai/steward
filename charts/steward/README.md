@@ -62,8 +62,19 @@ that allowlist remain inaccessible to both service accounts.
 - `config.apiserver.taskTokenAudience` is the required Kubernetes TokenReview
   audience for the Task API. The Task API is enabled on the apiserver service;
   its internal port is `services.apiserverPort`.
+- `config.apiserver.tokenAudience` is the TokenReview audience for the runtime
+  and administrator API, including route-scoped service-envelope bootstrap. DEV
+  uses the same `steward-task-api` value as Task authentication because EKS has
+  one external OIDC provider client ID per cluster. The bootstrap identity has
+  the exact group `agents.apelogic.ai/service-envelope-bootstrap:steward-run`
+  and can call only `POST /admin/service-envelopes/steward-run`.
 - `config.apiserver.taskWorkflowsJson` is the complete Task workflow catalog as
   a JSON array. Invalid JSON or an empty Task audience stops the apiserver.
+- `config.apiserver.jiraBaseUrl`, `jiraProjectKey`, and `jiraAccountEmail` are
+  mandatory startup inputs. The base URL is the public HTTPS Jira tenant root,
+  the project must already exist, and the account email must correspond to the
+  raw API token in the configured Jira Secret. The chart does not support a
+  dummy credential or an implicit Jira-disabled mode.
 - `config.controller.litellmUrl` and
   `config.controller.openshellEndpoint` are internal service endpoints.
 - The OpenShell endpoint must use HTTPS. `openshellServerName` pins the TLS
@@ -93,6 +104,14 @@ startup, including migration `0011`. They must receive the same database URL.
 The Task workflow's `AgentRuntime` spec must fit an envelope authorized for the
 `steward-run` service principal. That envelope is governance data, not a Helm
 value, and must exist before Task execution is enabled for callers.
+`config/task/workflows.example.json` and its matching service envelope are the
+authority-minimal copy-smoke contract: no LLMs, tools, LiteLLM calls, or MCP
+calls. `scripts/bootstrap-task-copy-smoke.sh` installs that envelope
+idempotently over authenticated HTTPS. It requires an externally issued,
+short-lived route-scoped token; the chart deliberately has no bootstrap-token
+Secret input. DEV bootstrap is blocked first on a release containing this
+authorization contract, then on Infra supplying the credential through its EKS
+OIDC identity-provider association.
 
 Run `cargo xtask e2e-openshell-adapter` to exercise the adapter against the
 exact OpenShell `v0.0.98` chart in an ephemeral kind cluster. The test verifies

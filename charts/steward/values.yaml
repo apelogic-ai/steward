@@ -39,7 +39,7 @@ config:
     jiraBaseUrl: https://jira.example.com
     jiraProjectKey: PROJ
     jiraAccountEmail: alice@example.com
-    tokenAudience: steward-api
+    tokenAudience: steward-task-api
     taskTokenAudience: steward-task-api
     taskWorkflowsJson: "[]"
   controller:

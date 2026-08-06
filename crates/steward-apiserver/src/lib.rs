@@ -16,7 +16,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, patch, post};
@@ -62,7 +62,13 @@ pub struct AuthenticatedCaller {
     pub actor: String,
     pub member_roles: Vec<String>,
     pub is_admin: bool,
+    pub can_bootstrap_steward_run_service_envelope: bool,
 }
+
+pub const STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP: &str =
+    "agents.apelogic.ai/service-envelope-bootstrap:steward-run";
+pub const STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_AUDIENCE: &str = "steward-task-api";
+const STEWARD_RUN_SERVICE_ENVELOPE_PATH: &str = "/admin/service-envelopes/steward-run";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthenticationError {
@@ -135,7 +141,13 @@ fn caller_from_token_review(
         return Err(AuthenticationError::InvalidCredentials);
     }
     let user = status.user.ok_or(AuthenticationError::InvalidCredentials)?;
-    caller_from_kubernetes_user(&user, admin_group)
+    let caller = caller_from_kubernetes_user(&user, admin_group)?;
+    if caller.can_bootstrap_steward_run_service_envelope
+        && requested_audience != Some(STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_AUDIENCE)
+    {
+        return Err(AuthenticationError::InvalidCredentials);
+    }
+    Ok(caller)
 }
 
 fn caller_from_kubernetes_user(
@@ -148,7 +160,14 @@ fn caller_from_kubernetes_user(
         .filter(|username| !username.is_empty())
         .ok_or(AuthenticationError::InvalidCredentials)?;
     let groups = user.groups.as_deref().unwrap_or_default();
-    let member_roles = groups
+    let bootstrap_group_count = groups
+        .iter()
+        .filter(|group| group.as_str() == STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP)
+        .count();
+    if bootstrap_group_count > 1 {
+        return Err(AuthenticationError::InvalidCredentials);
+    }
+    let member_roles: Vec<String> = groups
         .iter()
         .filter_map(|group| group.strip_prefix("agents.apelogic.ai/member-role:"))
         .filter(|role| !role.is_empty())
@@ -156,10 +175,15 @@ fn caller_from_kubernetes_user(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    let is_admin = groups.iter().any(|group| group == admin_group);
+    if bootstrap_group_count == 1 && (is_admin || !member_roles.is_empty()) {
+        return Err(AuthenticationError::InvalidCredentials);
+    }
     Ok(AuthenticatedCaller {
         actor,
         member_roles,
-        is_admin: groups.iter().any(|group| group == admin_group),
+        is_admin,
+        can_bootstrap_steward_run_service_envelope: bootstrap_group_count == 1,
     })
 }
 
@@ -1066,11 +1090,15 @@ async fn authenticate_admin<A: RequestAuthenticator>(
         Ok(caller) => caller,
         Err(response) => return response,
     };
-    if !caller.is_admin {
+    if !(caller.is_admin
+        || caller.can_bootstrap_steward_run_service_envelope
+            && request.method() == Method::POST
+            && request.uri().path() == STEWARD_RUN_SERVICE_ENVELOPE_PATH)
+    {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
-                "error": "administrator authority is required",
+                "error": "authority for this administrator route is required",
             })),
         )
             .into_response();
@@ -1265,6 +1293,11 @@ where
             })),
         )
             .into_response();
+    }
+    match state.ledger.latest_service_envelope(&service).await {
+        Ok(Some(current)) if current == envelope => return StatusCode::OK.into_response(),
+        Ok(_) => {}
+        Err(error) => return ApiError::Store(error).into_response(),
     }
     match state
         .ledger
@@ -2178,14 +2211,17 @@ mod tests {
     use super::{
         AdmissionContext, AdmissionLedger, ApiDoc, ApiError, AuthenticatedCaller,
         AuthenticationError, BoxFuture, BudgetIncrease, CreateRuntimeRequest, RequestAuthenticator,
-        RuntimeCreateError, RuntimeRepository, StaticTaskWorkflowCatalog, SubmissionOutcome,
-        TaskAuthenticationError, TaskIdentity, TaskIdentityResolver, TaskSubmissionLedger,
-        TaskWorkflow, caller_from_kubernetes_user, caller_from_token_review, router, spec_digest,
-        submit_budget_increase, task_router,
+        RuntimeCreateError, RuntimeRepository, STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP,
+        StaticTaskWorkflowCatalog, SubmissionOutcome, TaskAuthenticationError, TaskIdentity,
+        TaskIdentityResolver, TaskSubmissionLedger, TaskWorkflow, caller_from_kubernetes_user,
+        caller_from_token_review, router, spec_digest, submit_budget_increase, task_router,
     };
 
     #[derive(Clone)]
     struct FakeAuthenticator;
+
+    #[derive(Clone)]
+    struct BootstrapAuthenticator;
 
     #[derive(Clone)]
     struct FakeTaskIdentityResolver;
@@ -2260,7 +2296,7 @@ mod tests {
     fn kubernetes_token_audience_must_match_the_configured_api_audience() {
         let status = TokenReviewStatus {
             authenticated: Some(true),
-            audiences: Some(vec!["steward-api".to_owned()]),
+            audiences: Some(vec!["steward-task-api".to_owned()]),
             user: Some(UserInfo {
                 username: Some("alice@example.com".to_owned()),
                 groups: Some(vec!["agents.apelogic.ai/member-role:engineer".to_owned()]),
@@ -2272,7 +2308,7 @@ mod tests {
             caller_from_token_review(
                 Some(status.clone()),
                 "agents.apelogic.ai/admin",
-                Some("steward-api"),
+                Some("steward-task-api"),
             )
             .is_ok()
         );
@@ -2284,14 +2320,118 @@ mod tests {
     }
 
     #[test]
+    fn service_envelope_bootstrap_identity_is_exact_and_audience_bound() -> Result<(), String> {
+        let status = TokenReviewStatus {
+            authenticated: Some(true),
+            audiences: Some(vec!["steward-task-api".to_owned()]),
+            user: Some(UserInfo {
+                username: Some("bootstrap@example.com".to_owned()),
+                groups: Some(vec![
+                    STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP.to_owned(),
+                ]),
+                ..UserInfo::default()
+            }),
+            ..TokenReviewStatus::default()
+        };
+        let caller = caller_from_token_review(
+            Some(status.clone()),
+            "agents.apelogic.ai/admin",
+            Some("steward-task-api"),
+        )
+        .map_err(|error| format!("route-scoped bootstrap identity was rejected: {error:?}"))?;
+        assert_eq!(caller.actor, "bootstrap@example.com");
+        assert!(!caller.is_admin);
+        assert!(caller.can_bootstrap_steward_run_service_envelope);
+
+        assert_eq!(
+            caller_from_token_review(
+                Some(status.clone()),
+                "agents.apelogic.ai/admin",
+                Some("other-api"),
+            ),
+            Err(AuthenticationError::InvalidCredentials),
+            "bootstrap authority issued for another audience must fail closed"
+        );
+        assert_eq!(
+            caller_from_token_review(Some(status.clone()), "agents.apelogic.ai/admin", None,),
+            Err(AuthenticationError::InvalidCredentials),
+            "bootstrap authority without the exact requested audience must fail closed"
+        );
+
+        let mut duplicate = status.clone();
+        duplicate
+            .user
+            .as_mut()
+            .and_then(|user| user.groups.as_mut())
+            .ok_or_else(|| "bootstrap test identity groups are missing".to_owned())?
+            .push(STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP.to_owned());
+        assert_eq!(
+            caller_from_token_review(
+                Some(duplicate),
+                "agents.apelogic.ai/admin",
+                Some("steward-task-api"),
+            ),
+            Err(AuthenticationError::InvalidCredentials),
+            "duplicate bootstrap authority groups must fail closed"
+        );
+
+        for contradictory_group in [
+            "agents.apelogic.ai/admin",
+            "agents.apelogic.ai/member-role:engineer",
+        ] {
+            let mut contradictory = status.clone();
+            contradictory
+                .user
+                .as_mut()
+                .and_then(|user| user.groups.as_mut())
+                .ok_or_else(|| "bootstrap test identity groups are missing".to_owned())?
+                .push(contradictory_group.to_owned());
+            assert_eq!(
+                caller_from_token_review(
+                    Some(contradictory),
+                    "agents.apelogic.ai/admin",
+                    Some("steward-task-api"),
+                ),
+                Err(AuthenticationError::InvalidCredentials),
+                "bootstrap authority combined with {contradictory_group} must fail closed"
+            );
+        }
+
+        for groups in [
+            Vec::new(),
+            vec!["agents.apelogic.ai/service-envelope-bootstrap:other-service".to_owned()],
+        ] {
+            let mut unauthorized = status.clone();
+            unauthorized
+                .user
+                .as_mut()
+                .ok_or_else(|| "bootstrap test identity is missing".to_owned())?
+                .groups = Some(groups);
+            let caller = caller_from_token_review(
+                Some(unauthorized),
+                "agents.apelogic.ai/admin",
+                Some("steward-task-api"),
+            )
+            .map_err(|error| {
+                format!("authenticated unprivileged identity was rejected: {error:?}")
+            })?;
+            assert!(
+                !caller.can_bootstrap_steward_run_service_envelope,
+                "missing or wrong-service bootstrap group must confer no authority"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn task_identity_is_resolved_only_from_authenticated_token_review_attributes()
     -> Result<(), String> {
         let delegated = task_identity_from_token_review(
             Some(TokenReviewStatus {
                 authenticated: Some(true),
-                audiences: Some(vec!["steward-tasks".to_owned()]),
+                audiences: Some(vec!["steward-task-api".to_owned()]),
                 user: Some(UserInfo {
-                    username: Some("github-assertion:job-123".to_owned()),
+                    username: Some("alice@example.com".to_owned()),
                     groups: Some(vec![
                         "agents.apelogic.ai/service-principal:steward-run".to_owned(),
                         "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
@@ -2300,7 +2440,7 @@ mod tests {
                 }),
                 ..TokenReviewStatus::default()
             }),
-            Some("steward-tasks"),
+            Some("steward-task-api"),
         )
         .map_err(|error| format!("server-validated delegated assertion was rejected: {error:?}"))?;
         assert_eq!(delegated.service, "steward-run");
@@ -2350,6 +2490,136 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn task_identity_rejects_duplicate_token_review_groups() {
+        for duplicate_group in [
+            "agents.apelogic.ai/service-principal:steward-run",
+            "agents.apelogic.ai/acting-user:alice@example.com",
+        ] {
+            let identity = task_identity_from_token_review(
+                Some(TokenReviewStatus {
+                    authenticated: Some(true),
+                    audiences: Some(vec!["steward-task-api".to_owned()]),
+                    user: Some(UserInfo {
+                        username: Some("alice@example.com".to_owned()),
+                        groups: Some(vec![
+                            "agents.apelogic.ai/service-principal:steward-run".to_owned(),
+                            "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                            duplicate_group.to_owned(),
+                        ]),
+                        ..UserInfo::default()
+                    }),
+                    ..TokenReviewStatus::default()
+                }),
+                Some("steward-task-api"),
+            );
+            assert_eq!(
+                identity,
+                Err(TaskAuthenticationError::InvalidCredentials),
+                "duplicate identity group {duplicate_group} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn task_identity_binds_acting_user_to_the_verified_username() {
+        for (username, acting_user) in [
+            ("github-assertion:job-123", "alice@example.com"),
+            ("bob@example.org", "alice@example.com"),
+        ] {
+            let identity = task_identity_from_token_review(
+                Some(TokenReviewStatus {
+                    authenticated: Some(true),
+                    audiences: Some(vec!["steward-task-api".to_owned()]),
+                    user: Some(UserInfo {
+                        username: Some(username.to_owned()),
+                        groups: Some(vec![
+                            "agents.apelogic.ai/service-principal:steward-run".to_owned(),
+                            format!("agents.apelogic.ai/acting-user:{acting_user}"),
+                        ]),
+                        ..UserInfo::default()
+                    }),
+                    ..TokenReviewStatus::default()
+                }),
+                Some("steward-task-api"),
+            );
+            assert_eq!(
+                identity,
+                Err(TaskAuthenticationError::InvalidCredentials),
+                "acting-user {acting_user} must equal the verified corporate username {username}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_identity_fails_closed_on_incomplete_or_misdirected_exchange_results() {
+        let cases = [
+            (
+                "wrong audience",
+                vec![
+                    "agents.apelogic.ai/service-principal:steward-run".to_owned(),
+                    "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                ],
+                Some(vec!["other-api".to_owned()]),
+            ),
+            (
+                "missing audience",
+                vec![
+                    "agents.apelogic.ai/service-principal:steward-run".to_owned(),
+                    "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                ],
+                None,
+            ),
+            (
+                "missing service group",
+                vec!["agents.apelogic.ai/acting-user:alice@example.com".to_owned()],
+                Some(vec!["steward-task-api".to_owned()]),
+            ),
+            (
+                "missing acting-user group",
+                vec!["agents.apelogic.ai/service-principal:steward-run".to_owned()],
+                Some(vec!["steward-task-api".to_owned()]),
+            ),
+            (
+                "unrecognized identity groups",
+                vec![
+                    "example.com/service-principal:steward-run".to_owned(),
+                    "example.com/acting-user:alice@example.com".to_owned(),
+                ],
+                Some(vec!["steward-task-api".to_owned()]),
+            ),
+            (
+                "empty service group",
+                vec![
+                    "agents.apelogic.ai/service-principal:".to_owned(),
+                    "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                ],
+                Some(vec!["steward-task-api".to_owned()]),
+            ),
+        ];
+
+        for (case, groups, audiences) in cases {
+            let identity = task_identity_from_token_review(
+                Some(TokenReviewStatus {
+                    authenticated: Some(true),
+                    audiences,
+                    user: Some(UserInfo {
+                        username: Some("alice@example.com".to_owned()),
+                        groups: Some(groups),
+                        ..UserInfo::default()
+                    }),
+                    ..TokenReviewStatus::default()
+                }),
+                Some("steward-task-api"),
+            );
+            assert_eq!(
+                identity,
+                Err(TaskAuthenticationError::InvalidCredentials),
+                "{case} must fail closed"
+            );
+        }
+    }
+
     impl RequestAuthenticator for FakeAuthenticator {
         fn authenticate<'a>(
             &'a self,
@@ -2361,19 +2631,41 @@ mod tests {
                         actor: "alice@example.com".to_owned(),
                         member_roles: vec!["engineer".to_owned()],
                         is_admin: false,
+                        can_bootstrap_steward_run_service_envelope: false,
                     }),
                     "user-duplicate-role-session" => Ok(AuthenticatedCaller {
                         actor: "alice@example.com".to_owned(),
                         member_roles: vec!["engineer".to_owned(), "engineer".to_owned()],
                         is_admin: false,
+                        can_bootstrap_steward_run_service_envelope: false,
                     }),
                     "admin-session" => Ok(AuthenticatedCaller {
                         actor: "admin@example.com".to_owned(),
                         member_roles: Vec::new(),
                         is_admin: true,
+                        can_bootstrap_steward_run_service_envelope: false,
                     }),
                     _ => Err(AuthenticationError::InvalidCredentials),
                 }
+            })
+        }
+    }
+
+    impl RequestAuthenticator for BootstrapAuthenticator {
+        fn authenticate<'a>(
+            &'a self,
+            bearer_token: &'a str,
+        ) -> BoxFuture<'a, Result<AuthenticatedCaller, AuthenticationError>> {
+            Box::pin(async move {
+                if bearer_token != "bootstrap-session" {
+                    return Err(AuthenticationError::InvalidCredentials);
+                }
+                Ok(AuthenticatedCaller {
+                    actor: "bootstrap@example.com".to_owned(),
+                    member_roles: Vec::new(),
+                    is_admin: false,
+                    can_bootstrap_steward_run_service_envelope: true,
+                })
             })
         }
     }
@@ -2933,6 +3225,7 @@ mod tests {
         application_committed_during_park: Arc<Mutex<Option<GrantReversion>>>,
         application_revoked_during_retirement: Arc<Mutex<bool>>,
         tasks: Arc<Mutex<Vec<TaskRecord>>>,
+        service_envelope_authors: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     #[derive(Clone)]
@@ -2964,11 +3257,21 @@ mod tests {
 
         fn insert_service_envelope<'a>(
             &'a self,
-            _service: &'a str,
+            service: &'a str,
             _envelope: &'a Envelope,
-            _authored_by: &'a str,
+            authored_by: &'a str,
         ) -> BoxFuture<'a, Result<(), StoreError>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                self.service_envelope_authors
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake service-envelope author lock was poisoned".to_owned(),
+                        )
+                    })?
+                    .push((service.to_owned(), authored_by.to_owned()));
+                Ok(())
+            })
         }
 
         fn latest_envelope<'a>(
@@ -3625,6 +3928,7 @@ mod tests {
             application_committed_during_park: Arc::new(Mutex::new(None)),
             application_revoked_during_retirement: Arc::new(Mutex::new(false)),
             tasks: Arc::new(Mutex::new(Vec::new())),
+            service_envelope_authors: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -5211,6 +5515,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_envelope_bootstrap_authority_is_denied_every_other_admin_route()
+    -> Result<(), String> {
+        let ledger = ledger();
+        let envelope_body = serde_json::to_vec(
+            &*ledger
+                .envelope
+                .lock()
+                .map_err(|_| "fake envelope lock was poisoned")?,
+        )
+        .map_err(|error| format!("failed to serialize service envelope: {error}"))?;
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger,
+            BootstrapAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+
+        for (method, uri, body) in [
+            ("GET", "/admin/approvals", ""),
+            (
+                "POST",
+                "/admin/envelopes/engineer",
+                std::str::from_utf8(&envelope_body)
+                    .map_err(|error| format!("envelope body was not UTF-8: {error}"))?,
+            ),
+            (
+                "POST",
+                "/admin/service-envelopes/other-service",
+                std::str::from_utf8(&envelope_body)
+                    .map_err(|error| format!("envelope body was not UTF-8: {error}"))?,
+            ),
+            (
+                "PUT",
+                "/admin/service-envelopes/steward-run",
+                std::str::from_utf8(&envelope_body)
+                    .map_err(|error| format!("envelope body was not UTF-8: {error}"))?,
+            ),
+            (
+                "POST",
+                "/admin/approvals/00000000-0000-0000-0000-000000000000/approve",
+                r#"{"rationale":"not authorized","evidenceUrl":"https://jira.example.com/browse/PROJ-123","expiresAt":"2099-01-01T00:00:00Z"}"#,
+            ),
+            (
+                "POST",
+                "/admin/approvals/00000000-0000-0000-0000-000000000000/file",
+                "{}",
+            ),
+            (
+                "POST",
+                "/admin/runtimes/runtime-uid-a/grants/revoke",
+                r#"{"reason":"not authorized"}"#,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("authorization", "Bearer bootstrap-session")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_owned()))
+                        .map_err(|error| format!("failed to build bootstrap request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("bootstrap request failed: {error}"))?;
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "service-envelope bootstrap authority must be denied on {method} {uri}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_envelope_bootstrap_authority_can_write_only_its_envelope_and_audits_username()
+    -> Result<(), String> {
+        let ledger = ledger();
+        let authors = ledger.service_envelope_authors.clone();
+        let mut envelope = ledger
+            .envelope
+            .lock()
+            .map_err(|_| "fake envelope lock was poisoned")?
+            .clone();
+        envelope.revision += 1;
+        let envelope_body = serde_json::to_vec(&envelope)
+            .map_err(|error| format!("failed to serialize service envelope: {error}"))?;
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger,
+            BootstrapAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/service-envelopes/steward-run")
+                    .header("authorization", "Bearer bootstrap-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(envelope_body))
+                    .map_err(|error| format!("failed to build bootstrap request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("bootstrap request failed: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            *authors
+                .lock()
+                .map_err(|_| "fake service-envelope author lock was poisoned")?,
+            vec![("steward-run".to_owned(), "bootstrap@example.com".to_owned())],
+            "the audit record must preserve the TokenReview username"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rest_route_returns_the_parked_shared_counterexample() -> Result<(), String> {
         let runtimes = FakeRuntimeRepository {
             runtime: Arc::new(Mutex::new(runtime())),
@@ -5735,13 +6163,14 @@ mod tests {
     #[tokio::test]
     async fn admin_can_author_a_service_envelope_in_a_distinct_scope() -> Result<(), String> {
         let ledger = ledger();
-        let envelope_body = serde_json::to_vec(
-            &*ledger
-                .envelope
-                .lock()
-                .map_err(|_| "fake envelope lock was poisoned")?,
-        )
-        .map_err(|error| format!("failed to serialize service envelope: {error}"))?;
+        let mut envelope = ledger
+            .envelope
+            .lock()
+            .map_err(|_| "fake envelope lock was poisoned")?
+            .clone();
+        envelope.revision += 1;
+        let envelope_body = serde_json::to_vec(&envelope)
+            .map_err(|error| format!("failed to serialize service envelope: {error}"))?;
         let app = router(
             FakeRuntimeRepository {
                 runtime: Arc::new(Mutex::new(runtime())),
@@ -5770,6 +6199,48 @@ mod tests {
             response.status(),
             StatusCode::CREATED,
             "a service envelope must have an administrator-authored authority path distinct from member roles"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reposting_an_identical_service_envelope_is_idempotent() -> Result<(), String> {
+        let ledger = ledger();
+        let envelope_body = serde_json::to_vec(
+            &*ledger
+                .envelope
+                .lock()
+                .map_err(|_| "fake envelope lock was poisoned")?,
+        )
+        .map_err(|error| format!("failed to serialize service envelope: {error}"))?;
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger,
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/service-envelopes/steward-run")
+                    .header("authorization", "Bearer admin-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(envelope_body))
+                    .map_err(|error| {
+                        format!("failed to build service envelope request: {error}")
+                    })?,
+            )
+            .await
+            .map_err(|error| format!("service envelope retry failed: {error}"))?;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an exact service-envelope retry must succeed without creating a new revision"
         );
         Ok(())
     }

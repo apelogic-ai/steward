@@ -1,21 +1,10 @@
 {
   "revision": 1,
   "spec": {
-    "llms": [
-      {
-        "provider": "provider-a",
-        "model": "model-a"
-      }
-    ],
-    "tools": [
-      {
-        "provider": "github",
-        "resource": "repository",
-        "action": "read"
-      }
-    ],
+    "llms": [],
+    "tools": [],
     "budget": {
-      "monthlyLimit": "10.00",
+      "monthlyLimit": "0.00",
       "currency": "USD"
     },
     "ttl": "1h"

@@ -138,6 +138,7 @@ impl RequestAuthenticator for S4Authenticator {
                     actor: "admin@example.com".to_owned(),
                     member_roles: Vec::new(),
                     is_admin: true,
+                    can_bootstrap_steward_run_service_envelope: false,
                 }),
                 _ => Err(AuthenticationError::InvalidCredentials),
             }
@@ -150,6 +151,7 @@ fn user(actor: &str) -> AuthenticatedCaller {
         actor: actor.to_owned(),
         member_roles: vec!["engineer".to_owned()],
         is_admin: false,
+        can_bootstrap_steward_run_service_envelope: false,
     }
 }
 

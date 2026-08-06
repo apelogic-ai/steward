@@ -100,11 +100,13 @@ impl RequestAuthenticator for S3Authenticator {
                     actor: self.actor.clone(),
                     member_roles: vec![self.member_role.clone()],
                     is_admin: false,
+                    can_bootstrap_steward_run_service_envelope: false,
                 }),
                 "test-admin-session" => Ok(AuthenticatedCaller {
                     actor: self.admin.clone(),
                     member_roles: Vec::new(),
                     is_admin: true,
+                    can_bootstrap_steward_run_service_envelope: false,
                 }),
                 _ => Err(AuthenticationError::InvalidCredentials),
             }
