@@ -1058,6 +1058,46 @@ mod tests {
     }
 
     #[test]
+    fn task_copy_smoke_github_artifact_paths_are_frozen() -> Result<(), String> {
+        let contract = fs::read_to_string(root().join("config/task/README.md"))
+            .map_err(|error| format!("Task production configuration is required: {error}"))?;
+        for required in [
+            "path: in/payload.bin",
+            "sha256sum input/payload.bin",
+            "input/payload.bin",
+            "output/payload.bin",
+        ] {
+            assert!(
+                contract.contains(required),
+                "Task artifact contract must include the exact path `{required}`"
+            );
+        }
+        assert!(
+            !contract.contains("input.sha256"),
+            "the copy-smoke artifact must not include a digest sidecar that changes its common root"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_bootstrap_requires_an_external_short_lived_admin_credential() -> Result<(), String> {
+        let contract = fs::read_to_string(root().join("config/task/README.md"))
+            .map_err(|error| format!("Task production configuration is required: {error}"))?;
+        for required in [
+            "short-lived administrator token",
+            "EKS OIDC identity-provider association",
+            "must not be stored in a Kubernetes Secret",
+            "blocked until Infra",
+        ] {
+            assert!(
+                contract.contains(required),
+                "Task bootstrap authority contract must state `{required}`"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn openshell_v0098_adapter_integration_is_a_required_ci_lane() -> Result<(), String> {
         let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;

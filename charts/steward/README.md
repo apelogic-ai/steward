@@ -101,7 +101,10 @@ value, and must exist before Task execution is enabled for callers.
 `config/task/workflows.example.json` and its matching service envelope are the
 authority-minimal copy-smoke contract: no LLMs, tools, LiteLLM calls, or MCP
 calls. `scripts/bootstrap-task-copy-smoke.sh` installs that envelope
-idempotently over authenticated HTTPS.
+idempotently over authenticated HTTPS. It requires an externally issued,
+short-lived administrator token; the chart deliberately has no administrator
+token Secret input. DEV bootstrap remains blocked until Infra supplies that
+credential through its EKS OIDC identity-provider association.
 
 Run `cargo xtask e2e-openshell-adapter` to exercise the adapter against the
 exact OpenShell `v0.0.98` chart in an ephemeral kind cluster. The test verifies
