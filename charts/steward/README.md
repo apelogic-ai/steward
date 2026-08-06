@@ -62,6 +62,11 @@ that allowlist remain inaccessible to both service accounts.
 - `config.apiserver.taskTokenAudience` is the required Kubernetes TokenReview
   audience for the Task API. The Task API is enabled on the apiserver service;
   its internal port is `services.apiserverPort`.
+- `config.apiserver.tokenAudience` is the TokenReview audience for the runtime
+  and administrator API, including route-scoped service-envelope bootstrap. DEV
+  uses `steward-api`; the bootstrap identity has the exact group
+  `agents.apelogic.ai/service-envelope-bootstrap:steward-run` and can call only
+  `POST /admin/service-envelopes/steward-run`.
 - `config.apiserver.taskWorkflowsJson` is the complete Task workflow catalog as
   a JSON array. Invalid JSON or an empty Task audience stops the apiserver.
 - `config.apiserver.jiraBaseUrl`, `jiraProjectKey`, and `jiraAccountEmail` are
@@ -102,9 +107,10 @@ value, and must exist before Task execution is enabled for callers.
 authority-minimal copy-smoke contract: no LLMs, tools, LiteLLM calls, or MCP
 calls. `scripts/bootstrap-task-copy-smoke.sh` installs that envelope
 idempotently over authenticated HTTPS. It requires an externally issued,
-short-lived administrator token; the chart deliberately has no administrator
-token Secret input. DEV bootstrap remains blocked until Infra supplies that
-credential through its EKS OIDC identity-provider association.
+short-lived route-scoped token; the chart deliberately has no bootstrap-token
+Secret input. DEV bootstrap is blocked first on a release containing this
+authorization contract, then on Infra supplying the credential through its EKS
+OIDC identity-provider association.
 
 Run `cargo xtask e2e-openshell-adapter` to exercise the adapter against the
 exact OpenShell `v0.0.98` chart in an ephemeral kind cluster. The test verifies

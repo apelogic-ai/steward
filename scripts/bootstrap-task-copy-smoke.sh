@@ -7,7 +7,7 @@ ENVELOPE="${ROOT}/config/task/steward-run-service-envelope.example.json"
 for variable in \
   STEWARD_APISERVER_URL \
   STEWARD_APISERVER_CA_CERTIFICATE_FILE \
-  STEWARD_ADMIN_TOKEN_FILE
+  STEWARD_SERVICE_ENVELOPE_BOOTSTRAP_TOKEN_FILE
 do
   if [[ -z "${!variable:-}" ]]; then
     echo "${variable} is required" >&2
@@ -21,7 +21,7 @@ if [[ ! "${STEWARD_APISERVER_URL}" =~ ^https://[^/]+(/.*)?$ ]]; then
 fi
 for file in \
   "${STEWARD_APISERVER_CA_CERTIFICATE_FILE}" \
-  "${STEWARD_ADMIN_TOKEN_FILE}" \
+  "${STEWARD_SERVICE_ENVELOPE_BOOTSTRAP_TOKEN_FILE}" \
   "${ENVELOPE}"
 do
   if [[ ! -s "${file}" ]]; then
@@ -30,9 +30,9 @@ do
   fi
 done
 
-token="$(<"${STEWARD_ADMIN_TOKEN_FILE}")"
+token="$(<"${STEWARD_SERVICE_ENVELOPE_BOOTSTRAP_TOKEN_FILE}")"
 if [[ -z "${token}" || "${token}" == *$'\n'* || "${token}" == *$'\r'* || "${token}" == *'"'* ]]; then
-  echo "STEWARD_ADMIN_TOKEN_FILE must contain one non-empty bearer token" >&2
+  echo "STEWARD_SERVICE_ENVELOPE_BOOTSTRAP_TOKEN_FILE must contain one non-empty bearer token" >&2
   exit 2
 fi
 

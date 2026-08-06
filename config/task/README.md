@@ -55,35 +55,20 @@ MCP call. Inject the JSON through a ConfigMap or equivalent configuration source
 `STEWARD_TASK_WORKFLOWS_JSON`; do not let submitters override its command, namespace, models,
 tools, budget, or TTL.
 
-### GitHub artifact staging
+### API archive contract
 
-The GitOps copy-smoke producer must upload exactly one file so GitHub's artifact common-root
-calculation cannot add another `in/` directory:
+Steward's copy-smoke contract defines only workspace-relative members in the opaque API tar
+archives:
 
-```yaml
-- uses: actions/upload-artifact@<pinned-sha>
-  with:
-    name: steward-copy-input
-    path: in/payload.bin
-```
+- Input tar member: `in/payload.bin`
+- Output tar member: `out/payload.bin`
 
-Do not include a checksum sidecar in that artifact. The reusable workflow downloads the input
-artifact under `input/`, yielding `input/payload.bin`, and stages Steward's returned declared
-output under `output/`, yielding `output/payload.bin`. Verification recomputes both digests from
-the downloaded bytes; it does not trust a producer-supplied digest:
+Artifact upload, download, and runner staging layouts are owned by the API consumer and its
+deployment workflow, not by Steward.
 
-```sh
-input_digest="$(sha256sum input/payload.bin | cut -d ' ' -f 1)"
-output_digest="$(sha256sum output/payload.bin | cut -d ' ' -f 1)"
-test "$input_digest" = "$output_digest"
-```
-
-These are GitHub runner staging paths. The tar members sent to and returned by Steward remain
-`in/payload.bin` and `out/payload.bin`, respectively.
-
-Before enabling `steward-run`, an administrator must author a service envelope for the exact
-service name `steward-run`. `steward-run-service-envelope.example.json` is the matching example
-and can be submitted to:
+Before enabling `steward-run`, a route-scoped bootstrap identity must author a service envelope
+for the exact service name `steward-run`. `steward-run-service-envelope.example.json` is the
+matching example and can be submitted to:
 
 ```text
 POST /admin/service-envelopes/steward-run
@@ -93,13 +78,13 @@ If the workflow exceeds that envelope, submission returns `202` and parks. If no
 envelope exists, submission fails closed.
 
 The checked-in envelope is authority-minimal: empty LLMs and tools, a `0.00 USD` monthly limit,
-and a one-hour TTL. Bootstrap it over authenticated HTTPS with a short-lived administrator token
+and a one-hour TTL. Bootstrap it over authenticated HTTPS with a short-lived route-scoped token
 held only in a temporary file:
 
 ```sh
 STEWARD_APISERVER_URL=https://steward.example.com \
 STEWARD_APISERVER_CA_CERTIFICATE_FILE=/path/to/ca.crt \
-STEWARD_ADMIN_TOKEN_FILE=/path/to/short-lived-admin-token \
+STEWARD_SERVICE_ENVELOPE_BOOTSTRAP_TOKEN_FILE=/path/to/short-lived-bootstrap-token \
 scripts/bootstrap-task-copy-smoke.sh
 ```
 
@@ -108,12 +93,23 @@ The procedure is idempotent. The first exact revision returns `201`; an identica
 reviewed rather than overwritten. The script requires explicit CA trust and HTTPS, keeps the
 bearer token out of command arguments, and fails closed on every other response.
 
-Steward does not issue this bootstrap credential. In DEV, Infra must provide a short-lived token
-through the EKS OIDC identity-provider association whose TokenReview includes the configured
-administrator group (`agents.apelogic.ai/admin` by default) and apiserver audience
-(`steward-api` by default). Bootstrap is blocked until Infra provides that producer. The token
-must not be stored in a Kubernetes Secret or replaced with any other long-lived credential; the
-chart intentionally has no administrator-token Secret input.
+The production TokenReview contract for this credential is exact:
+
+- audience: `steward-api`
+- group, exactly once: `agents.apelogic.ai/service-envelope-bootstrap:steward-run`
+- username: a non-empty identity verified by the cluster identity provider and preserved as the
+  envelope's `authored_by` audit value
+
+This identity can call only `POST /admin/service-envelopes/steward-run`. It is denied approvals,
+grants, member envelopes, other service envelopes, and every other administrator route. Combining
+the bootstrap group with the broad administrator group or a member-role group fails
+authentication.
+
+Bootstrap is blocked first on this Steward release containing the route-scoped authorization
+contract, then on Infra providing a short-lived token through the DEV EKS OIDC identity-provider
+association. Steward does not issue that token. It must not be stored in a Kubernetes Secret or
+replaced with any other long-lived credential; the chart intentionally has no bootstrap-token
+Secret input.
 
 ## Jira startup values
 

@@ -1030,7 +1030,7 @@ mod tests {
         for required in [
             "STEWARD_APISERVER_URL",
             "STEWARD_APISERVER_CA_CERTIFICATE_FILE",
-            "STEWARD_ADMIN_TOKEN_FILE",
+            "STEWARD_SERVICE_ENVELOPE_BOOTSTRAP_TOKEN_FILE",
             "steward-run-service-envelope.example.json",
             "/admin/service-envelopes/steward-run",
             "--cacert",
@@ -1058,36 +1058,16 @@ mod tests {
     }
 
     #[test]
-    fn task_copy_smoke_github_artifact_paths_are_frozen() -> Result<(), String> {
+    fn task_bootstrap_publishes_its_route_scoped_identity_contract() -> Result<(), String> {
         let contract = fs::read_to_string(root().join("config/task/README.md"))
             .map_err(|error| format!("Task production configuration is required: {error}"))?;
         for required in [
-            "path: in/payload.bin",
-            "sha256sum input/payload.bin",
-            "input/payload.bin",
-            "output/payload.bin",
-        ] {
-            assert!(
-                contract.contains(required),
-                "Task artifact contract must include the exact path `{required}`"
-            );
-        }
-        assert!(
-            !contract.contains("input.sha256"),
-            "the copy-smoke artifact must not include a digest sidecar that changes its common root"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn task_bootstrap_requires_an_external_short_lived_admin_credential() -> Result<(), String> {
-        let contract = fs::read_to_string(root().join("config/task/README.md"))
-            .map_err(|error| format!("Task production configuration is required: {error}"))?;
-        for required in [
-            "short-lived administrator token",
-            "EKS OIDC identity-provider association",
+            "agents.apelogic.ai/service-envelope-bootstrap:steward-run",
+            "steward-api",
+            "DEV EKS OIDC identity-provider",
             "must not be stored in a Kubernetes Secret",
-            "blocked until Infra",
+            "blocked first on this Steward release",
+            "then on Infra",
         ] {
             assert!(
                 contract.contains(required),
