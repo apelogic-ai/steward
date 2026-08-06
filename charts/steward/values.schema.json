@@ -30,11 +30,29 @@
     "secrets": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["database", "jira", "litellm", "mint"],
+      "required": ["database", "jira", "litellm", "openshellClient", "mint"],
       "properties": {
         "database": {"$ref": "#/definitions/secretKey"},
         "jira": {"$ref": "#/definitions/secretKey"},
         "litellm": {"$ref": "#/definitions/secretKey"},
+        "openshellClient": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "caCertificate",
+            "clientCertificate",
+            "clientPrivateKey",
+            "bearerToken"
+          ],
+          "properties": {
+            "name": {"$ref": "#/definitions/nonempty"},
+            "caCertificate": {"$ref": "#/definitions/nonempty"},
+            "clientCertificate": {"$ref": "#/definitions/nonempty"},
+            "clientPrivateKey": {"$ref": "#/definitions/nonempty"},
+            "bearerToken": {"$ref": "#/definitions/nonempty"}
+          }
+        },
         "mint": {
           "type": "object",
           "additionalProperties": false,
@@ -92,9 +110,16 @@
         "controller": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["openshellEndpoint", "litellmUrl"],
+          "required": [
+            "openshellEndpoint",
+            "openshellServerName",
+            "openshellRuntimeClassName",
+            "litellmUrl"
+          ],
           "properties": {
-            "openshellEndpoint": {"type": "string", "pattern": "^https?://", "minLength": 9},
+            "openshellEndpoint": {"type": "string", "pattern": "^https://", "minLength": 9},
+            "openshellServerName": {"$ref": "#/definitions/nonempty"},
+            "openshellRuntimeClassName": {"const": "kata-qemu"},
             "litellmUrl": {"type": "string", "pattern": "^https?://", "minLength": 9}
           }
         },

@@ -8,16 +8,17 @@ version.workspace = true
 
 [features]
 identity = ["dep:kube"]
-runtime = ["dep:openshell-sdk"]
+runtime = ["dep:openshell-sdk", "dep:tokio", "dep:tonic"]
 s0-spike = ["dep:openshell-sdk", "dep:tokio"]
 
 [dependencies]
 kube = { workspace = true, features = ["client"], optional = true } # Resolves OpenShell's immutable sandbox UUID inside the vendor adapter.
-openshell-sdk = { git = "https://github.com/NVIDIA/OpenShell", rev = "1d4ac708f1d2a9ab94204cdce6ca0eee7e792839", version = "=0.0.0", optional = true }
+openshell-sdk = { git = "https://github.com/NVIDIA/OpenShell", rev = "832841295992f0112f43f27de5d68213376ff3cb", version = "=0.0.0", optional = true }
 sha2.workspace = true
 steward-ports = { path = "../../crates/steward-ports", version = "=0.0.0" }
 steward-types = { path = "../../crates/steward-types", version = "=0.0.0" }
 tokio = { workspace = true, optional = true }
+tonic = { workspace = true, features = ["tls-ring"], optional = true }
 
 [[example]]
 name = "workspace_contract"

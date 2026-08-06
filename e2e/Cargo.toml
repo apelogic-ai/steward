@@ -48,6 +48,10 @@ path = "s5.rs"
 name = "task"
 path = "task.rs"
 
+[[test]]
+name = "openshell_adapter_v0098"
+path = "openshell_adapter_v0098.rs"
+
 [[bin]]
 name = "s3-server"
 path = "s3_server.rs"
@@ -64,12 +68,15 @@ path = "task_server.rs"
 axum = "0.8"
 kube = { version = "4.2.0", default-features = false, features = ["client", "ring", "rustls-tls"] }
 serde_json = "1"
+sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
 steward-admission = { path = "../crates/steward-admission", version = "=0.0.0" }
 steward-adapter-jira = { path = "../adapters/jira", version = "=0.0.0" } # Exercises the real Jira decision-channel adapter in the S4 full-stack test.
+steward-adapter-openshell = { path = "../adapters/openshell", version = "=0.0.0", features = ["runtime"] }
 steward-apiserver = { path = "../crates/steward-apiserver", version = "=0.0.0" }
 steward-controller = { path = "../crates/steward-controller", version = "=0.0.0" }
 steward-store = { path = "../crates/steward-store", version = "=0.0.0" }
+steward-ports = { path = "../crates/steward-ports", version = "=0.0.0" }
 steward-types = { path = "../crates/steward-types", version = "=0.0.0" }
-tokio = { version = "1.43", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1.43", features = ["macros", "net", "rt-multi-thread", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

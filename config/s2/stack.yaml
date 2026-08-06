@@ -413,7 +413,19 @@ spec:
             - name: STEWARD_LITELLM_URL
               value: http://litellm.steward-system.svc.cluster.local:4000
             - name: STEWARD_OPENSHELL_ENDPOINT
-              value: http://openshell.openshell.svc.cluster.local:8080
+              value: https://openshell.openshell.svc.cluster.local:8080
+            - name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE
+              value: /run/steward/openshell-ca.crt
+            - name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE
+              value: /run/steward/openshell-client.crt
+            - name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE
+              value: /run/steward/openshell-client.key
+            - name: STEWARD_OPENSHELL_BEARER_TOKEN_FILE
+              value: /run/steward/openshell-bearer-token
+            - name: STEWARD_OPENSHELL_SERVER_NAME
+              value: openshell.openshell.svc.cluster.local
+            - name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME
+              value: kata-qemu
             - name: STEWARD_TLS_CERT_DER
               value: /run/steward/tls-cert.der
             - name: STEWARD_TLS_KEY_DER

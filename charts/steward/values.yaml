@@ -20,6 +20,12 @@ secrets:
   litellm:
     name: steward-litellm
     key: master-key
+  openshellClient:
+    name: steward-openshell-client
+    caCertificate: ca.crt
+    clientCertificate: tls.crt
+    clientPrivateKey: tls.key
+    bearerToken: token
   mint:
     name: steward-mint
     signingKey: signing-key
@@ -37,7 +43,9 @@ config:
     taskTokenAudience: steward-task-api
     taskWorkflowsJson: "[]"
   controller:
-    openshellEndpoint: http://openshell.openshell.svc.cluster.local:50051
+    openshellEndpoint: https://gateway.example.test:8080
+    openshellServerName: gateway.example.test
+    openshellRuntimeClassName: kata-qemu
     litellmUrl: http://litellm-litellm.litellm.svc.cluster.local:4000
   mint:
     issuer: http://steward-mint.steward.svc.cluster.local:8080
@@ -63,7 +71,7 @@ networkPolicy:
     postgres: 5432
     jira: 443
     litellm: 4000
-    openshell: 50051
+    openshell: 8080
 spire:
   csiDriver: csi.spiffe.io
   socketPath: /run/spire/sockets

@@ -73,6 +73,30 @@ impl Harness {
                     "STEWARD_OPENSHELL_ENDPOINT",
                     env::var("STEWARD_OPENSHELL_ENDPOINT")?,
                 )
+                .env(
+                    "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
+                    env::var("STEWARD_OPENSHELL_CA_CERTIFICATE_FILE")?,
+                )
+                .env(
+                    "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
+                    env::var("STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE")?,
+                )
+                .env(
+                    "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
+                    env::var("STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE")?,
+                )
+                .env(
+                    "STEWARD_OPENSHELL_BEARER_TOKEN_FILE",
+                    env::var("STEWARD_OPENSHELL_BEARER_TOKEN_FILE")?,
+                )
+                .env(
+                    "STEWARD_OPENSHELL_SERVER_NAME",
+                    env::var("STEWARD_OPENSHELL_SERVER_NAME")?,
+                )
+                .env(
+                    "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
+                    env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
+                )
                 .env("STEWARD_S0_BOOTSTRAP", "1")
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())

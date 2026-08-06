@@ -34,6 +34,14 @@ test "$(grep -c '^  namespace: team-a$' "${rendered}")" -eq 4
 grep -q '^kind: CustomResourceDefinition$' "${rendered}"
 grep -q 'failurePolicy: Fail' "${rendered}"
 grep -q 'driver: csi.spiffe.io' "${rendered}"
+grep -q 'name: STEWARD_OPENSHELL_SERVER_NAME' "${rendered}"
+grep -q 'name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME' "${rendered}"
+grep -Eq 'value: "?kata-qemu"?' "${rendered}"
+grep -q 'name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE' "${rendered}"
+grep -q 'name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE' "${rendered}"
+grep -q 'name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE' "${rendered}"
+grep -q 'name: STEWARD_OPENSHELL_BEARER_TOKEN_FILE' "${rendered}"
+test "$(grep -c 'secretName: steward-openshell-client' "${rendered}")" -eq 1
 if awk '
   /^---$/ { cluster_role = 0 }
   /^kind: ClusterRole$/ { cluster_role = 1 }

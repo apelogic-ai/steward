@@ -36,13 +36,14 @@ digest. A missing or ambiguous runnable child fails closed.
 
 ## Required secrets
 
-The chart references four existing Secrets and never creates their values:
+The chart references five existing Secrets and never creates their values:
 
 | Secret | Key(s) | Mounted by |
 |---|---|---|
 | `steward-database` | `url` | apiserver, controller |
 | `steward-jira` | `token` | apiserver |
 | `steward-litellm` | `master-key` | controller |
+| `steward-openshell-client` | `ca.crt`, `tls.crt`, `tls.key`, `token` | controller |
 | `steward-mint` | `signing-key`, `introspection-credential` | mint |
 
 The mint Secret is not referenced by either the apiserver or controller
@@ -65,6 +66,15 @@ that allowlist remain inaccessible to both service accounts.
   a JSON array. Invalid JSON or an empty Task audience stops the apiserver.
 - `config.controller.litellmUrl` and
   `config.controller.openshellEndpoint` are internal service endpoints.
+- The OpenShell endpoint must use HTTPS. `openshellServerName` pins the TLS
+  identity, while `secrets.openshellClient` supplies the trusted CA, client
+  certificate/private key, and bearer token. Missing transport trust or caller
+  authentication stops the controller; ambient workstation credentials and
+  plaintext gRPC are not supported.
+- `config.controller.openshellRuntimeClassName` must be `kata-qemu`, matching
+  OpenShell's gateway-level `defaultRuntimeClassName`. Steward does not send a
+  sandbox image or expose per-create driver/runtime overrides, so the gateway's
+  configured image and runtime policy remain authoritative.
 - `config.mint.issuer` is the issuer that must also be configured in MCP-GW.
   Steward publishes JWKS at `<issuer>/.well-known/jwks.json` and uses EdDSA.
 - `config.mint.audience` defaults to `steward-mcp` and
@@ -83,6 +93,11 @@ startup, including migration `0011`. They must receive the same database URL.
 The Task workflow's `AgentRuntime` spec must fit an envelope authorized for the
 `steward-run` service principal. That envelope is governance data, not a Helm
 value, and must exist before Task execution is enabled for callers.
+
+Run `cargo xtask e2e-openshell-adapter` to exercise the adapter against the
+exact OpenShell `v0.0.98` chart in an ephemeral kind cluster. The test verifies
+authenticated TLS failures, CA and server-name validation, the `kata-qemu`
+contract, input/output SHA-256 equality, and sandbox-last cleanup.
 
 ## Network policy
 
