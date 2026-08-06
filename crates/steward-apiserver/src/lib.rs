@@ -67,7 +67,7 @@ pub struct AuthenticatedCaller {
 
 pub const STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP: &str =
     "agents.apelogic.ai/service-envelope-bootstrap:steward-run";
-pub const STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_AUDIENCE: &str = "steward-api";
+pub const STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_AUDIENCE: &str = "steward-task-api";
 const STEWARD_RUN_SERVICE_ENVELOPE_PATH: &str = "/admin/service-envelopes/steward-run";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2296,7 +2296,7 @@ mod tests {
     fn kubernetes_token_audience_must_match_the_configured_api_audience() {
         let status = TokenReviewStatus {
             authenticated: Some(true),
-            audiences: Some(vec!["steward-api".to_owned()]),
+            audiences: Some(vec!["steward-task-api".to_owned()]),
             user: Some(UserInfo {
                 username: Some("alice@example.com".to_owned()),
                 groups: Some(vec!["agents.apelogic.ai/member-role:engineer".to_owned()]),
@@ -2308,7 +2308,7 @@ mod tests {
             caller_from_token_review(
                 Some(status.clone()),
                 "agents.apelogic.ai/admin",
-                Some("steward-api"),
+                Some("steward-task-api"),
             )
             .is_ok()
         );
@@ -2323,7 +2323,7 @@ mod tests {
     fn service_envelope_bootstrap_identity_is_exact_and_audience_bound() -> Result<(), String> {
         let status = TokenReviewStatus {
             authenticated: Some(true),
-            audiences: Some(vec!["steward-api".to_owned()]),
+            audiences: Some(vec!["steward-task-api".to_owned()]),
             user: Some(UserInfo {
                 username: Some("bootstrap@example.com".to_owned()),
                 groups: Some(vec![
@@ -2336,7 +2336,7 @@ mod tests {
         let caller = caller_from_token_review(
             Some(status.clone()),
             "agents.apelogic.ai/admin",
-            Some("steward-api"),
+            Some("steward-task-api"),
         )
         .map_err(|error| format!("route-scoped bootstrap identity was rejected: {error:?}"))?;
         assert_eq!(caller.actor, "bootstrap@example.com");
@@ -2369,7 +2369,7 @@ mod tests {
             caller_from_token_review(
                 Some(duplicate),
                 "agents.apelogic.ai/admin",
-                Some("steward-api"),
+                Some("steward-task-api"),
             ),
             Err(AuthenticationError::InvalidCredentials),
             "duplicate bootstrap authority groups must fail closed"
@@ -2390,7 +2390,7 @@ mod tests {
                 caller_from_token_review(
                     Some(contradictory),
                     "agents.apelogic.ai/admin",
-                    Some("steward-api"),
+                    Some("steward-task-api"),
                 ),
                 Err(AuthenticationError::InvalidCredentials),
                 "bootstrap authority combined with {contradictory_group} must fail closed"
@@ -2410,7 +2410,7 @@ mod tests {
             let caller = caller_from_token_review(
                 Some(unauthorized),
                 "agents.apelogic.ai/admin",
-                Some("steward-api"),
+                Some("steward-task-api"),
             )
             .map_err(|error| {
                 format!("authenticated unprivileged identity was rejected: {error:?}")

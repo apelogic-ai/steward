@@ -95,7 +95,8 @@ bearer token out of command arguments, and fails closed on every other response.
 
 The production TokenReview contract for this credential is exact:
 
-- audience: `steward-api`
+- audience: `steward-task-api` (shared with Task authentication because EKS supports one external
+  OIDC provider client ID per cluster)
 - group, exactly once: `agents.apelogic.ai/service-envelope-bootstrap:steward-run`
 - username: a non-empty identity verified by the cluster identity provider and preserved as the
   envelope's `authored_by` audit value

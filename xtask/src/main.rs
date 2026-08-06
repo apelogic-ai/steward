@@ -1063,7 +1063,7 @@ mod tests {
             .map_err(|error| format!("Task production configuration is required: {error}"))?;
         for required in [
             "agents.apelogic.ai/service-envelope-bootstrap:steward-run",
-            "steward-api",
+            "steward-task-api",
             "DEV EKS OIDC identity-provider",
             "must not be stored in a Kubernetes Secret",
             "blocked first on this Steward release",
@@ -1074,6 +1074,34 @@ mod tests {
                 "Task bootstrap authority contract must state `{required}`"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn task_and_bootstrap_share_one_eks_oidc_audience() -> Result<(), String> {
+        let values = fs::read_to_string(root().join("charts/steward/values.yaml"))
+            .map_err(|error| format!("published Steward chart values are required: {error}"))?;
+        let values = serde_saphyr::from_str::<serde_json::Value>(&values).map_err(|error| {
+            format!("published Steward chart values must be valid YAML: {error}")
+        })?;
+        let apiserver = values
+            .pointer("/config/apiserver")
+            .ok_or_else(|| "chart apiserver configuration is required".to_owned())?;
+        let token_audience = apiserver
+            .get("tokenAudience")
+            .and_then(serde_json::Value::as_str);
+        let task_token_audience = apiserver
+            .get("taskTokenAudience")
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(
+            token_audience,
+            Some("steward-task-api"),
+            "route-scoped bootstrap must use the EKS external OIDC provider audience"
+        );
+        assert_eq!(
+            token_audience, task_token_audience,
+            "Task and bootstrap TokenReviews must share the cluster's single external OIDC audience"
+        );
         Ok(())
     }
 

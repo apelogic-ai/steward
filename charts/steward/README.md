@@ -64,9 +64,10 @@ that allowlist remain inaccessible to both service accounts.
   its internal port is `services.apiserverPort`.
 - `config.apiserver.tokenAudience` is the TokenReview audience for the runtime
   and administrator API, including route-scoped service-envelope bootstrap. DEV
-  uses `steward-api`; the bootstrap identity has the exact group
-  `agents.apelogic.ai/service-envelope-bootstrap:steward-run` and can call only
-  `POST /admin/service-envelopes/steward-run`.
+  uses the same `steward-task-api` value as Task authentication because EKS has
+  one external OIDC provider client ID per cluster. The bootstrap identity has
+  the exact group `agents.apelogic.ai/service-envelope-bootstrap:steward-run`
+  and can call only `POST /admin/service-envelopes/steward-run`.
 - `config.apiserver.taskWorkflowsJson` is the complete Task workflow catalog as
   a JSON array. Invalid JSON or an empty Task audience stops the apiserver.
 - `config.apiserver.jiraBaseUrl`, `jiraProjectKey`, and `jiraAccountEmail` are
