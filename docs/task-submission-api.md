@@ -45,30 +45,45 @@ archive accepted from the sandbox is also **64 MiB (67,108,864 bytes)**. An over
 
 ## Production identity boundary
 
-`KubernetesTaskIdentityResolver` sends the bearer assertion unchanged in a Kubernetes
-`authentication.k8s.io/v1 TokenReview`. It requests the one audience configured by
-`STEWARD_TASK_TOKEN_AUDIENCE`, and `task_identity_from_token_review` accepts exactly one
-service group plus either an acting user or a task owner:
+The GitHub token and the Steward token are different credentials. A GitHub Actions job requests
+its GitHub OIDC token with the audience configured by the production exchange service. That
+service validates GitHub's issuer and repository/workflow claims, resolves the actor to a
+verified corporate email, and exchanges the assertion for a bearer token intended for Steward.
+The exchange audience is an identity-infrastructure input; it is not `steward-task-api` and is
+not configured in Steward.
+
+Steward receives only the exchanged bearer token. `KubernetesTaskIdentityResolver` sends it
+unchanged in an `authentication.k8s.io/v1 TokenReview` requesting the audience configured by
+`STEWARD_TASK_TOKEN_AUDIENCE`. The ratified production value is `steward-task-api`.
+
+For a delegated `steward-run` request, the successful TokenReview must return all of the
+following server-verified attributes:
 
 ```text
+status.user.username: <verified-corporate-email>
 agents.apelogic.ai/service-principal:steward-run
-agents.apelogic.ai/acting-user:<corporate-email>
+agents.apelogic.ai/acting-user:<the-same-verified-corporate-email>
+status.audiences: [..., steward-task-api, ...]
 ```
 
-Pure service work uses the service group plus
+The parser requires exactly one non-empty service group and exactly one acting-user group for
+this delegated form. The acting-user value must be a valid email and must equal the authenticated
+TokenReview username. Wrong or missing audiences; missing, duplicate, empty, or contradictory
+identity groups; and a username/group mismatch all fail closed.
+
+Pure service work uses exactly one service group plus
 `agents.apelogic.ai/task-owner:<corporate-email>` instead. Steward rejects missing, duplicate,
 empty, or contradictory identity groups.
 
-The supported production audience is **`steward-task-api`**. GitHub Actions must request its
-OIDC token with `aud=steward-task-api`; the audience-aware TokenReview authenticator must verify
-that claim and return `steward-task-api` in `status.audiences`.
-
 There is currently **no component in this repository** that validates GitHub's OIDC issuer,
 authorizes repository/workflow claims, resolves the GitHub actor to a corporate email, and
-creates the two groups above. The E2E `TestTaskIdentities` resolver is deliberately only a test
-fixture. Production therefore still requires an external Kubernetes structured JWT
-authenticator or authentication webhook implementing that mapping. Kubernetes documents both
-the audience intersection and group-bearing TokenReview response in its
+issues the exchanged token and TokenReview attributes above. The E2E `TestTaskIdentities`
+resolver is deliberately only a test fixture. Production therefore still requires the external
+exchange plus a cluster-supported OIDC/JWT identity-provider association implementing that
+mapping. DEV uses the EKS OIDC identity-provider association owned by Infra; no Kubernetes API
+server webhook authenticator should be introduced. The raw GitHub OIDC token must never be sent
+directly to Steward. Kubernetes documents both the audience intersection and group-bearing
+TokenReview response in its
 [authentication reference](https://kubernetes.io/docs/reference/access-authn-authz/authentication/),
 and GitHub documents custom OIDC audiences in its
 [OIDC reference](https://docs.github.com/en/actions/reference/security/oidc).

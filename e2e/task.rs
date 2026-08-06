@@ -31,6 +31,62 @@ async fn task_submission_real_sandbox_lifecycle() -> Result<(), Box<dyn Error>> 
         "create task input tar",
     )?;
 
+    let copy_smoke = submit(
+        &base_url,
+        "github-assertion",
+        "copy-smoke-123",
+        r#"{"workflow":"copy-smoke","codingAgentRuntime":"base"}"#,
+        &run_dir,
+    )?;
+    assert_eq!(copy_smoke["phase"], "submitted");
+    let copy_task_uid = json_string(&copy_smoke, "taskUid")?;
+    put_archive(
+        &base_url,
+        copy_task_uid,
+        "github-assertion",
+        &input_tar,
+        &run_dir,
+    )?;
+    execute(&base_url, copy_task_uid, "github-assertion", &run_dir)?;
+    wait_for(
+        &base_url,
+        copy_task_uid,
+        "github-assertion",
+        |status| status["phase"] == "succeeded",
+        &run_dir,
+    )?;
+    let copy_output_tar = run_dir.join("copy-output.tar");
+    get_output(
+        &base_url,
+        copy_task_uid,
+        "github-assertion",
+        &copy_output_tar,
+        &run_dir,
+    )?;
+    let copy_output_dir = run_dir.join("copy-output");
+    fs::create_dir_all(&copy_output_dir)?;
+    command(
+        Command::new("tar")
+            .args(["-xf"])
+            .arg(&copy_output_tar)
+            .args(["-C"])
+            .arg(&copy_output_dir),
+        "extract copy-smoke output tar",
+    )?;
+    assert_eq!(
+        fs::read(copy_output_dir.join("out/payload.bin"))?,
+        b"governed task payload\n",
+        "copy-smoke must preserve the input bytes at the declared output path"
+    );
+    delete_task(&base_url, copy_task_uid, "github-assertion", &run_dir)?;
+    wait_for(
+        &base_url,
+        copy_task_uid,
+        "github-assertion",
+        |status| status["finalized"] == true,
+        &run_dir,
+    )?;
+
     let body = r#"{"workflow":"approval-review","codingAgentRuntime":"base"}"#;
     let parked = submit(
         &base_url,

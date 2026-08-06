@@ -127,6 +127,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "if [ \"$attempt\" -ge 60 ]; then exit 1; fi; sleep 1; done",
     );
     let workflows = StaticTaskWorkflowCatalog::new([
+        copy_workflow(),
         workflow("code-review", "1.00", task_command),
         workflow("approval-review", "2.00", task_command),
         workflow("failing-review", "1.00", "exit 23"),
@@ -283,6 +284,30 @@ async fn create_issue(
     let key = format!("PROJ-{}", 122 + data.next_issue);
     data.markers.insert(marker, key.clone());
     (StatusCode::CREATED, Json(json!({"key": key})))
+}
+
+fn copy_workflow() -> TaskWorkflow {
+    TaskWorkflow {
+        name: "copy-smoke".to_owned(),
+        namespace: "team-a".to_owned(),
+        coding_agent_runtime: "base".to_owned(),
+        llms: Vec::new(),
+        tools: Vec::new(),
+        budget: Budget {
+            monthly_limit: "0.00".to_owned(),
+            currency: "USD".to_owned(),
+        },
+        ttl: Duration("1h".to_owned()),
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            concat!(
+                "set -eu; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; ",
+                "cp in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"",
+            )
+            .to_owned(),
+        ],
+    }
 }
 
 fn workflow(name: &str, budget: &str, shell: &str) -> TaskWorkflow {

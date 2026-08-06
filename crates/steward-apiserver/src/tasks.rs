@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -108,13 +108,11 @@ pub(crate) fn task_identity_from_token_review(
     let user = status
         .user
         .ok_or(TaskAuthenticationError::InvalidCredentials)?;
-    if user
+    let username = user
         .username
         .as_deref()
-        .is_none_or(|username| username.is_empty())
-    {
-        return Err(TaskAuthenticationError::InvalidCredentials);
-    }
+        .filter(|username| !username.is_empty())
+        .ok_or(TaskAuthenticationError::InvalidCredentials)?;
     let groups = user.groups.as_deref().unwrap_or_default();
     let services = group_values(groups, SERVICE_GROUP_PREFIX);
     let acting_users = group_values(groups, ACTING_USER_GROUP_PREFIX);
@@ -122,9 +120,16 @@ pub(crate) fn task_identity_from_token_review(
     let [service] = services.as_slice() else {
         return Err(TaskAuthenticationError::InvalidCredentials);
     };
+    if service.is_empty() {
+        return Err(TaskAuthenticationError::InvalidCredentials);
+    }
     let acting_user = match acting_users.as_slice() {
         [] => None,
-        [acting_user] if valid_email(acting_user) => Some(Email(acting_user.clone())),
+        [acting_user]
+            if valid_email(username) && valid_email(acting_user) && username == acting_user =>
+        {
+            Some(Email(acting_user.clone()))
+        }
         _ => return Err(TaskAuthenticationError::InvalidCredentials),
     };
     let owner = if let Some(acting_user) = &acting_user {
@@ -152,10 +157,7 @@ fn group_values(groups: &[String], prefix: &str) -> Vec<String> {
     groups
         .iter()
         .filter_map(|group| group.strip_prefix(prefix))
-        .filter(|value| !value.is_empty())
         .map(str::to_owned)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
         .collect()
 }
 

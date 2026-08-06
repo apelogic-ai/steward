@@ -1266,6 +1266,11 @@ where
         )
             .into_response();
     }
+    match state.ledger.latest_service_envelope(&service).await {
+        Ok(Some(current)) if current == envelope => return StatusCode::OK.into_response(),
+        Ok(_) => {}
+        Err(error) => return ApiError::Store(error).into_response(),
+    }
     match state
         .ledger
         .insert_service_envelope(&service, &envelope, &admin.actor)
@@ -2289,9 +2294,9 @@ mod tests {
         let delegated = task_identity_from_token_review(
             Some(TokenReviewStatus {
                 authenticated: Some(true),
-                audiences: Some(vec!["steward-tasks".to_owned()]),
+                audiences: Some(vec!["steward-task-api".to_owned()]),
                 user: Some(UserInfo {
-                    username: Some("github-assertion:job-123".to_owned()),
+                    username: Some("alice@example.com".to_owned()),
                     groups: Some(vec![
                         "agents.apelogic.ai/service-principal:steward-run".to_owned(),
                         "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
@@ -2300,7 +2305,7 @@ mod tests {
                 }),
                 ..TokenReviewStatus::default()
             }),
-            Some("steward-tasks"),
+            Some("steward-task-api"),
         )
         .map_err(|error| format!("server-validated delegated assertion was rejected: {error:?}"))?;
         assert_eq!(delegated.service, "steward-run");
@@ -2348,6 +2353,136 @@ mod tests {
             "an authenticated username without a server-resolved service binding is not a task principal"
         );
         Ok(())
+    }
+
+    #[test]
+    fn task_identity_rejects_duplicate_token_review_groups() {
+        for duplicate_group in [
+            "agents.apelogic.ai/service-principal:steward-run",
+            "agents.apelogic.ai/acting-user:alice@example.com",
+        ] {
+            let identity = task_identity_from_token_review(
+                Some(TokenReviewStatus {
+                    authenticated: Some(true),
+                    audiences: Some(vec!["steward-task-api".to_owned()]),
+                    user: Some(UserInfo {
+                        username: Some("alice@example.com".to_owned()),
+                        groups: Some(vec![
+                            "agents.apelogic.ai/service-principal:steward-run".to_owned(),
+                            "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                            duplicate_group.to_owned(),
+                        ]),
+                        ..UserInfo::default()
+                    }),
+                    ..TokenReviewStatus::default()
+                }),
+                Some("steward-task-api"),
+            );
+            assert_eq!(
+                identity,
+                Err(TaskAuthenticationError::InvalidCredentials),
+                "duplicate identity group {duplicate_group} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn task_identity_binds_acting_user_to_the_verified_username() {
+        for (username, acting_user) in [
+            ("github-assertion:job-123", "alice@example.com"),
+            ("bob@example.org", "alice@example.com"),
+        ] {
+            let identity = task_identity_from_token_review(
+                Some(TokenReviewStatus {
+                    authenticated: Some(true),
+                    audiences: Some(vec!["steward-task-api".to_owned()]),
+                    user: Some(UserInfo {
+                        username: Some(username.to_owned()),
+                        groups: Some(vec![
+                            "agents.apelogic.ai/service-principal:steward-run".to_owned(),
+                            format!("agents.apelogic.ai/acting-user:{acting_user}"),
+                        ]),
+                        ..UserInfo::default()
+                    }),
+                    ..TokenReviewStatus::default()
+                }),
+                Some("steward-task-api"),
+            );
+            assert_eq!(
+                identity,
+                Err(TaskAuthenticationError::InvalidCredentials),
+                "acting-user {acting_user} must equal the verified corporate username {username}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_identity_fails_closed_on_incomplete_or_misdirected_exchange_results() {
+        let cases = [
+            (
+                "wrong audience",
+                vec![
+                    "agents.apelogic.ai/service-principal:steward-run".to_owned(),
+                    "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                ],
+                Some(vec!["other-api".to_owned()]),
+            ),
+            (
+                "missing audience",
+                vec![
+                    "agents.apelogic.ai/service-principal:steward-run".to_owned(),
+                    "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                ],
+                None,
+            ),
+            (
+                "missing service group",
+                vec!["agents.apelogic.ai/acting-user:alice@example.com".to_owned()],
+                Some(vec!["steward-task-api".to_owned()]),
+            ),
+            (
+                "missing acting-user group",
+                vec!["agents.apelogic.ai/service-principal:steward-run".to_owned()],
+                Some(vec!["steward-task-api".to_owned()]),
+            ),
+            (
+                "unrecognized identity groups",
+                vec![
+                    "example.com/service-principal:steward-run".to_owned(),
+                    "example.com/acting-user:alice@example.com".to_owned(),
+                ],
+                Some(vec!["steward-task-api".to_owned()]),
+            ),
+            (
+                "empty service group",
+                vec![
+                    "agents.apelogic.ai/service-principal:".to_owned(),
+                    "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                ],
+                Some(vec!["steward-task-api".to_owned()]),
+            ),
+        ];
+
+        for (case, groups, audiences) in cases {
+            let identity = task_identity_from_token_review(
+                Some(TokenReviewStatus {
+                    authenticated: Some(true),
+                    audiences,
+                    user: Some(UserInfo {
+                        username: Some("alice@example.com".to_owned()),
+                        groups: Some(groups),
+                        ..UserInfo::default()
+                    }),
+                    ..TokenReviewStatus::default()
+                }),
+                Some("steward-task-api"),
+            );
+            assert_eq!(
+                identity,
+                Err(TaskAuthenticationError::InvalidCredentials),
+                "{case} must fail closed"
+            );
+        }
     }
 
     impl RequestAuthenticator for FakeAuthenticator {
@@ -5735,13 +5870,14 @@ mod tests {
     #[tokio::test]
     async fn admin_can_author_a_service_envelope_in_a_distinct_scope() -> Result<(), String> {
         let ledger = ledger();
-        let envelope_body = serde_json::to_vec(
-            &*ledger
-                .envelope
-                .lock()
-                .map_err(|_| "fake envelope lock was poisoned")?,
-        )
-        .map_err(|error| format!("failed to serialize service envelope: {error}"))?;
+        let mut envelope = ledger
+            .envelope
+            .lock()
+            .map_err(|_| "fake envelope lock was poisoned")?
+            .clone();
+        envelope.revision += 1;
+        let envelope_body = serde_json::to_vec(&envelope)
+            .map_err(|error| format!("failed to serialize service envelope: {error}"))?;
         let app = router(
             FakeRuntimeRepository {
                 runtime: Arc::new(Mutex::new(runtime())),
@@ -5770,6 +5906,48 @@ mod tests {
             response.status(),
             StatusCode::CREATED,
             "a service envelope must have an administrator-authored authority path distinct from member roles"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reposting_an_identical_service_envelope_is_idempotent() -> Result<(), String> {
+        let ledger = ledger();
+        let envelope_body = serde_json::to_vec(
+            &*ledger
+                .envelope
+                .lock()
+                .map_err(|_| "fake envelope lock was poisoned")?,
+        )
+        .map_err(|error| format!("failed to serialize service envelope: {error}"))?;
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger,
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/service-envelopes/steward-run")
+                    .header("authorization", "Bearer admin-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(envelope_body))
+                    .map_err(|error| {
+                        format!("failed to build service envelope request: {error}")
+                    })?,
+            )
+            .await
+            .map_err(|error| format!("service envelope retry failed: {error}"))?;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an exact service-envelope retry must succeed without creating a new revision"
         );
         Ok(())
     }
