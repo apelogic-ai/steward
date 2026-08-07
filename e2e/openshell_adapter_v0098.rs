@@ -23,16 +23,45 @@ fn required_file(name: &str) -> Result<Vec<u8>, String> {
     fs::read(&path).map_err(|error| format!("failed to read {name}: {error}"))
 }
 
+fn required_path(name: &str) -> Result<PathBuf, String> {
+    required(name).map(PathBuf::from)
+}
+
 fn valid_config() -> Result<OpenShellConnectionConfig, String> {
     Ok(OpenShellConnectionConfig {
         endpoint: required("STEWARD_OPENSHELL_ENDPOINT")?,
         ca_certificate_pem: required_file("STEWARD_OPENSHELL_CA_CERTIFICATE_FILE")?,
         client_certificate_pem: required_file("STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE")?,
         client_private_key_pem: required_file("STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE")?,
-        bearer_token: required("STEWARD_OPENSHELL_TEST_BEARER_TOKEN")?,
+        bearer_token_file: required_path("STEWARD_OPENSHELL_TEST_BEARER_TOKEN_FILE")?,
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
         runtime_class_name: "kata-qemu".to_owned(),
     })
+}
+
+fn replace_token_file(token_file: &Path, source_name: &str) -> Result<String, String> {
+    let token = required_file(source_name)?;
+    fs::write(token_file, &token)
+        .map_err(|error| format!("failed to replace projected token fixture: {error}"))?;
+    String::from_utf8(token).map_err(|_| format!("{source_name} must contain UTF-8"))
+}
+
+async fn assert_rotated_token_fails_closed(
+    runtime: &OpenShellRuntime,
+    request: &SandboxRequest,
+    token_file: &Path,
+    source_name: &str,
+    description: &str,
+) -> Result<(), String> {
+    let token = replace_token_file(token_file, source_name)?;
+    let error = runtime.ensure(request).await.expect_err(description);
+    let rendered = format!("{error:?}");
+    if !token.is_empty() && rendered.contains(token.trim()) {
+        return Err(format!(
+            "{description}; adapter error exposed token material"
+        ));
+    }
+    Ok(())
 }
 
 fn run(command: &mut Command, description: &str) -> Result<(), String> {
@@ -191,7 +220,8 @@ async fn adapter_round_trip_is_authenticated_kata_bound_and_cleanup_safe() -> Re
     let config = valid_config()?;
 
     let mut unauthenticated = config.clone();
-    unauthenticated.bearer_token = "not-a-jwt".to_owned();
+    unauthenticated.bearer_token_file =
+        required_path("STEWARD_OPENSHELL_TEST_WRONG_AUDIENCE_TOKEN_FILE")?;
     let unauthenticated_runtime = OpenShellRuntime::connect(unauthenticated)
         .await
         .map_err(|error| format!("unauthenticated test connection failed: {error:?}"))?;
@@ -248,6 +278,38 @@ async fn adapter_round_trip_is_authenticated_kata_bound_and_cleanup_safe() -> Re
         refs: RuntimeRefs::default(),
     };
     let refs = wait_running(&runtime, &request).await?;
+
+    let token_file = required_path("STEWARD_OPENSHELL_TEST_BEARER_TOKEN_FILE")?;
+    fs::write(&token_file, b"")
+        .map_err(|error| format!("failed to empty projected token fixture: {error}"))?;
+    runtime.ensure(&request).await.expect_err(
+        "an empty rotated workload token must fail closed instead of reusing the old token",
+    );
+    assert_rotated_token_fails_closed(
+        &runtime,
+        &request,
+        &token_file,
+        "STEWARD_OPENSHELL_TEST_EXPIRED_TOKEN_FILE",
+        "an expired rotated workload token must fail closed",
+    )
+    .await?;
+    assert_rotated_token_fails_closed(
+        &runtime,
+        &request,
+        &token_file,
+        "STEWARD_OPENSHELL_TEST_WRONG_AUDIENCE_TOKEN_FILE",
+        "a wrong-audience rotated workload token must fail closed",
+    )
+    .await?;
+    replace_token_file(
+        &token_file,
+        "STEWARD_OPENSHELL_TEST_ROTATED_BEARER_TOKEN_FILE",
+    )?;
+    runtime
+        .ensure(&request)
+        .await
+        .map_err(|error| format!("rotated workload token was not observed: {error:?}"))?;
+
     let workspace = refs
         .workspace
         .as_deref()

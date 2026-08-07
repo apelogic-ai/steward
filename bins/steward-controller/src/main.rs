@@ -2,6 +2,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -85,8 +86,7 @@ fn openshell_connection_config() -> Result<OpenShellConnectionConfig, io::Error>
         ca_certificate_pem: required_file("STEWARD_OPENSHELL_CA_CERTIFICATE_FILE")?,
         client_certificate_pem: required_file("STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE")?,
         client_private_key_pem: required_file("STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE")?,
-        bearer_token: String::from_utf8(required_file("STEWARD_OPENSHELL_BEARER_TOKEN_FILE")?)
-            .map_err(|_| io::Error::other("OpenShell bearer token must be UTF-8"))?,
+        bearer_token_file: PathBuf::from(required("STEWARD_OPENSHELL_BEARER_TOKEN_FILE")?),
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
         runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
     })

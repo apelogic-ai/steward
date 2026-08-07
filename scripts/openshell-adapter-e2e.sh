@@ -189,20 +189,35 @@ kubectl \
   rollout status deployment/test-oidc \
   --timeout=300s
 
+jwt_header="$(printf '%s' '{"alg":"RS256","kid":"steward-test","typ":"JWT"}' | base64url)"
+issue_token() {
+  audience="$1"
+  subject="$2"
+  issued_at="$3"
+  expires_at="$4"
+  jwt_payload="$(
+    printf '{"iss":"%s","sub":"%s","preferred_username":"alice","aud":"%s","roles":["openshell-admin","openshell-user"],"iat":%s,"exp":%s}' \
+      "${oidc_issuer}" "${subject}" "${audience}" "${issued_at}" "${expires_at}" |
+      base64url
+  )"
+  jwt_signature="$(
+    printf '%s.%s' "${jwt_header}" "${jwt_payload}" |
+      openssl dgst -sha256 -sign "${oidc_private_key}" |
+      base64url
+  )"
+  printf '%s.%s.%s' "${jwt_header}" "${jwt_payload}" "${jwt_signature}"
+}
+
 issued_at="$(date +%s)"
 expires_at="$((issued_at + 3600))"
-jwt_header="$(printf '%s' '{"alg":"RS256","kid":"steward-test","typ":"JWT"}' | base64url)"
-jwt_payload="$(
-  printf '{"iss":"%s","sub":"adapter-test","preferred_username":"alice","aud":"%s","roles":["openshell-admin","openshell-user"],"iat":%s,"exp":%s}' \
-    "${oidc_issuer}" "${OIDC_AUDIENCE}" "${issued_at}" "${expires_at}" |
-    base64url
-)"
-jwt_signature="$(
-  printf '%s.%s' "${jwt_header}" "${jwt_payload}" |
-    openssl dgst -sha256 -sign "${oidc_private_key}" |
-    base64url
-)"
-oidc_token="${jwt_header}.${jwt_payload}.${jwt_signature}"
+bearer_token_file="${RUN_DIR}/openshell-workload-token"
+rotated_bearer_token_file="${RUN_DIR}/openshell-workload-token-rotated"
+expired_token_file="${RUN_DIR}/openshell-workload-token-expired"
+wrong_audience_token_file="${RUN_DIR}/openshell-workload-token-wrong-audience"
+issue_token "${OIDC_AUDIENCE}" adapter-test "${issued_at}" "${expires_at}" >"${bearer_token_file}"
+issue_token "${OIDC_AUDIENCE}" adapter-test-rotated "${issued_at}" "${expires_at}" >"${rotated_bearer_token_file}"
+issue_token "${OIDC_AUDIENCE}" adapter-test-expired "$((issued_at - 120))" "$((issued_at - 60))" >"${expired_token_file}"
+issue_token wrong-audience adapter-test-wrong-audience "${issued_at}" "${expires_at}" >"${wrong_audience_token_file}"
 
 env \
   HELM_CACHE_HOME="${RUN_DIR}/helm/cache" \
@@ -309,7 +324,10 @@ STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE="${client_certificate}" \
 STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE="${client_private_key}" \
 STEWARD_OPENSHELL_UNTRUSTED_CA_FILE="${invalid_ca}" \
 STEWARD_OPENSHELL_SERVER_NAME=localhost \
-STEWARD_OPENSHELL_TEST_BEARER_TOKEN="${oidc_token}" \
+STEWARD_OPENSHELL_TEST_BEARER_TOKEN_FILE="${bearer_token_file}" \
+STEWARD_OPENSHELL_TEST_ROTATED_BEARER_TOKEN_FILE="${rotated_bearer_token_file}" \
+STEWARD_OPENSHELL_TEST_EXPIRED_TOKEN_FILE="${expired_token_file}" \
+STEWARD_OPENSHELL_TEST_WRONG_AUDIENCE_TOKEN_FILE="${wrong_audience_token_file}" \
 STEWARD_TEST_KUBE_CONTEXT="${KUBE_CONTEXT}" \
 STEWARD_TEST_KUBECONFIG="${KUBECONFIG_PATH}" \
 STEWARD_RUN_DIR="${RUN_DIR}" \

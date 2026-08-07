@@ -916,7 +916,6 @@ mod tests {
             "caCertificate",
             "clientCertificate",
             "clientPrivateKey",
-            "bearerToken",
         ] {
             assert!(
                 values.contains(required),
@@ -925,6 +924,12 @@ mod tests {
             assert!(
                 schema.contains(required),
                 "the values schema must require the OpenShell setting or Secret reference {required}"
+            );
+        }
+        for forbidden in ["bearerToken", "clientBearerToken"] {
+            assert!(
+                !values.contains(forbidden) && !schema.contains(forbidden),
+                "the OpenShell client Secret contract must not contain workload token setting {forbidden}"
             );
         }
         for environment_variable in [
@@ -947,6 +952,23 @@ mod tests {
         assert!(
             values.contains("openshell: 8080"),
             "the default NetworkPolicy must permit the OpenShell v0.0.98 gateway TLS service port"
+        );
+        for projected_token_contract in [
+            "serviceAccountToken:",
+            "audience: openshell-api",
+            "expirationSeconds: 3600",
+            "mountPath: /var/run/secrets/steward/openshell",
+            "value: /var/run/secrets/steward/openshell/token",
+        ] {
+            assert!(
+                templates.contains(projected_token_contract),
+                "the controller must consume the rotating OpenShell workload token contract {projected_token_contract}"
+            );
+        }
+        assert_eq!(
+            templates.matches("path: token").count(),
+            1,
+            "only the projected service-account token volume may provide the OpenShell token path"
         );
 
         Ok(())

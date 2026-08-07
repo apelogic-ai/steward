@@ -42,6 +42,14 @@ grep -q 'name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_BEARER_TOKEN_FILE' "${rendered}"
 test "$(grep -c 'secretName: steward-openshell-client' "${rendered}")" -eq 1
+grep -q 'serviceAccountToken:' "${rendered}"
+grep -q 'audience: openshell-api' "${rendered}"
+grep -q 'expirationSeconds: 3600' "${rendered}"
+grep -q 'mountPath: /var/run/secrets/steward/openshell' "${rendered}"
+if grep -q 'key: token, path: token' "${rendered}"; then
+  echo "OpenShell workload token must not be sourced from a Secret" >&2
+  exit 1
+fi
 if awk '
   /^---$/ { cluster_role = 0 }
   /^kind: ClusterRole$/ { cluster_role = 1 }

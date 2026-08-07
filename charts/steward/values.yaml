@@ -25,7 +25,6 @@ secrets:
     caCertificate: ca.crt
     clientCertificate: tls.crt
     clientPrivateKey: tls.key
-    bearerToken: token
   mint:
     name: steward-mint
     signingKey: signing-key
