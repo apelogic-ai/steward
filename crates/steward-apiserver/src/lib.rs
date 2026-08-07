@@ -67,13 +67,28 @@ pub struct AuthenticatedCaller {
 
 pub const STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP: &str =
     "agents.apelogic.ai/service-envelope-bootstrap:steward-run";
-pub const STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_AUDIENCE: &str = "steward-task-api";
 const STEWARD_RUN_SERVICE_ENVELOPE_PATH: &str = "/admin/service-envelopes/steward-run";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthenticationError {
     InvalidCredentials,
     Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KubernetesTokenReviewAudience(String);
+
+impl KubernetesTokenReviewAudience {
+    pub fn new(value: String) -> Result<Self, &'static str> {
+        if value.trim().is_empty() {
+            return Err("Kubernetes TokenReview audience must be non-empty");
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 pub trait RequestAuthenticator: Clone + Send + Sync + 'static {
@@ -87,11 +102,15 @@ pub trait RequestAuthenticator: Clone + Send + Sync + 'static {
 pub struct KubernetesTokenAuthenticator {
     client: Client,
     admin_group: String,
-    audience: Option<String>,
+    audience: KubernetesTokenReviewAudience,
 }
 
 impl KubernetesTokenAuthenticator {
-    pub fn new(client: Client, admin_group: String, audience: Option<String>) -> Self {
+    pub fn new(
+        client: Client,
+        admin_group: String,
+        audience: KubernetesTokenReviewAudience,
+    ) -> Self {
         Self {
             client,
             admin_group,
@@ -106,47 +125,54 @@ impl RequestAuthenticator for KubernetesTokenAuthenticator {
         bearer_token: &'a str,
     ) -> BoxFuture<'a, Result<AuthenticatedCaller, AuthenticationError>> {
         Box::pin(async move {
-            let review = TokenReview {
-                spec: TokenReviewSpec {
-                    audiences: self.audience.clone().map(|audience| vec![audience]),
-                    token: Some(bearer_token.to_owned()),
-                },
-                ..TokenReview::default()
-            };
+            let review = token_review_request(bearer_token, &self.audience);
             let reviewed = Api::<TokenReview>::all(self.client.clone())
                 .create(&PostParams::default(), &review)
                 .await
                 .map_err(|_| AuthenticationError::Unavailable)?;
-            caller_from_token_review(reviewed.status, &self.admin_group, self.audience.as_deref())
+            let user = authenticated_token_review_user(reviewed.status, self.audience.as_str())
+                .ok_or(AuthenticationError::InvalidCredentials)?;
+            caller_from_kubernetes_user(&user, &self.admin_group)
         })
     }
 }
 
+pub(crate) fn token_review_request(
+    bearer_token: &str,
+    audience: &KubernetesTokenReviewAudience,
+) -> TokenReview {
+    TokenReview {
+        spec: TokenReviewSpec {
+            audiences: Some(vec![audience.as_str().to_owned()]),
+            token: Some(bearer_token.to_owned()),
+        },
+        ..TokenReview::default()
+    }
+}
+
+pub(crate) fn authenticated_token_review_user(
+    status: Option<TokenReviewStatus>,
+    requested_audience: &str,
+) -> Option<UserInfo> {
+    let status = status.filter(|status| status.authenticated == Some(true))?;
+    status
+        .audiences
+        .as_deref()?
+        .iter()
+        .any(|audience| audience == requested_audience)
+        .then_some(())?;
+    status.user
+}
+
+#[cfg(test)]
 fn caller_from_token_review(
     status: Option<TokenReviewStatus>,
     admin_group: &str,
-    requested_audience: Option<&str>,
+    requested_audience: &str,
 ) -> Result<AuthenticatedCaller, AuthenticationError> {
-    let status = status
-        .filter(|status| status.authenticated == Some(true))
+    let user = authenticated_token_review_user(status, requested_audience)
         .ok_or(AuthenticationError::InvalidCredentials)?;
-    if requested_audience.is_some_and(|requested| {
-        !status
-            .audiences
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .any(|audience| audience == requested)
-    }) {
-        return Err(AuthenticationError::InvalidCredentials);
-    }
-    let user = status.user.ok_or(AuthenticationError::InvalidCredentials)?;
     let caller = caller_from_kubernetes_user(&user, admin_group)?;
-    if caller.can_bootstrap_steward_run_service_envelope
-        && requested_audience != Some(STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_AUDIENCE)
-    {
-        return Err(AuthenticationError::InvalidCredentials);
-    }
     Ok(caller)
 }
 
@@ -2210,12 +2236,15 @@ mod tests {
     use super::tasks::task_identity_from_token_review;
     use super::{
         AdmissionContext, AdmissionLedger, ApiDoc, ApiError, AuthenticatedCaller,
-        AuthenticationError, BoxFuture, BudgetIncrease, CreateRuntimeRequest, RequestAuthenticator,
-        RuntimeCreateError, RuntimeRepository, STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP,
-        StaticTaskWorkflowCatalog, SubmissionOutcome, TaskAuthenticationError, TaskIdentity,
-        TaskIdentityResolver, TaskSubmissionLedger, TaskWorkflow, caller_from_kubernetes_user,
-        caller_from_token_review, router, spec_digest, submit_budget_increase, task_router,
+        AuthenticationError, BoxFuture, BudgetIncrease, CreateRuntimeRequest,
+        KubernetesTokenReviewAudience, RequestAuthenticator, RuntimeCreateError, RuntimeRepository,
+        STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP, StaticTaskWorkflowCatalog, SubmissionOutcome,
+        TaskAuthenticationError, TaskIdentity, TaskIdentityResolver, TaskSubmissionLedger,
+        TaskWorkflow, caller_from_kubernetes_user, caller_from_token_review, router, spec_digest,
+        submit_budget_increase, task_router, token_review_request,
     };
+
+    const KUBERNETES_TOKEN_REVIEW_AUDIENCE: &str = "https://kubernetes.default.svc";
 
     #[derive(Clone)]
     struct FakeAuthenticator;
@@ -2296,7 +2325,7 @@ mod tests {
     fn kubernetes_token_audience_must_match_the_configured_api_audience() {
         let status = TokenReviewStatus {
             authenticated: Some(true),
-            audiences: Some(vec!["steward-task-api".to_owned()]),
+            audiences: Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
             user: Some(UserInfo {
                 username: Some("alice@example.com".to_owned()),
                 groups: Some(vec!["agents.apelogic.ai/member-role:engineer".to_owned()]),
@@ -2308,22 +2337,98 @@ mod tests {
             caller_from_token_review(
                 Some(status.clone()),
                 "agents.apelogic.ai/admin",
-                Some("steward-task-api"),
+                KUBERNETES_TOKEN_REVIEW_AUDIENCE,
             )
             .is_ok()
         );
         assert_eq!(
-            caller_from_token_review(Some(status), "agents.apelogic.ai/admin", Some("other-api"),),
+            caller_from_token_review(Some(status), "agents.apelogic.ai/admin", "other-api"),
             Err(AuthenticationError::InvalidCredentials),
             "a valid Kubernetes token for another audience must fail closed"
         );
+
+        for (case, status) in [
+            (
+                "unauthenticated result",
+                Some(TokenReviewStatus {
+                    authenticated: Some(false),
+                    audiences: Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
+                    user: Some(UserInfo {
+                        username: Some("alice@example.com".to_owned()),
+                        ..UserInfo::default()
+                    }),
+                    ..TokenReviewStatus::default()
+                }),
+            ),
+            (
+                "missing audience result",
+                Some(TokenReviewStatus {
+                    authenticated: Some(true),
+                    user: Some(UserInfo {
+                        username: Some("alice@example.com".to_owned()),
+                        ..UserInfo::default()
+                    }),
+                    ..TokenReviewStatus::default()
+                }),
+            ),
+            (
+                "empty audience result",
+                Some(TokenReviewStatus {
+                    authenticated: Some(true),
+                    audiences: Some(Vec::new()),
+                    user: Some(UserInfo {
+                        username: Some("alice@example.com".to_owned()),
+                        ..UserInfo::default()
+                    }),
+                    ..TokenReviewStatus::default()
+                }),
+            ),
+            (
+                "missing user result",
+                Some(TokenReviewStatus {
+                    authenticated: Some(true),
+                    audiences: Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
+                    ..TokenReviewStatus::default()
+                }),
+            ),
+        ] {
+            assert_eq!(
+                caller_from_token_review(
+                    status,
+                    "agents.apelogic.ai/admin",
+                    KUBERNETES_TOKEN_REVIEW_AUDIENCE,
+                ),
+                Err(AuthenticationError::InvalidCredentials),
+                "{case} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn delegated_token_review_request_uses_the_exact_kubernetes_audience() -> Result<(), String> {
+        for invalid in [String::new(), "   ".to_owned()] {
+            assert!(
+                KubernetesTokenReviewAudience::new(invalid).is_err(),
+                "missing delegated audience configuration must fail closed"
+            );
+        }
+        let audience =
+            KubernetesTokenReviewAudience::new(KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned())
+                .map_err(str::to_owned)?;
+        let review = token_review_request("opaque-exchanged-token", &audience);
+        assert_eq!(
+            review.spec.audiences,
+            Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()])
+        );
+        assert_eq!(review.spec.token.as_deref(), Some("opaque-exchanged-token"));
+        Ok(())
     }
 
     #[test]
     fn service_envelope_bootstrap_identity_is_exact_and_audience_bound() -> Result<(), String> {
         let status = TokenReviewStatus {
             authenticated: Some(true),
-            audiences: Some(vec!["steward-task-api".to_owned()]),
+            audiences: Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
             user: Some(UserInfo {
                 username: Some("bootstrap@example.com".to_owned()),
                 groups: Some(vec![
@@ -2336,7 +2441,7 @@ mod tests {
         let caller = caller_from_token_review(
             Some(status.clone()),
             "agents.apelogic.ai/admin",
-            Some("steward-task-api"),
+            KUBERNETES_TOKEN_REVIEW_AUDIENCE,
         )
         .map_err(|error| format!("route-scoped bootstrap identity was rejected: {error:?}"))?;
         assert_eq!(caller.actor, "bootstrap@example.com");
@@ -2347,15 +2452,10 @@ mod tests {
             caller_from_token_review(
                 Some(status.clone()),
                 "agents.apelogic.ai/admin",
-                Some("other-api"),
+                "other-api",
             ),
             Err(AuthenticationError::InvalidCredentials),
             "bootstrap authority issued for another audience must fail closed"
-        );
-        assert_eq!(
-            caller_from_token_review(Some(status.clone()), "agents.apelogic.ai/admin", None,),
-            Err(AuthenticationError::InvalidCredentials),
-            "bootstrap authority without the exact requested audience must fail closed"
         );
 
         let mut duplicate = status.clone();
@@ -2369,7 +2469,7 @@ mod tests {
             caller_from_token_review(
                 Some(duplicate),
                 "agents.apelogic.ai/admin",
-                Some("steward-task-api"),
+                KUBERNETES_TOKEN_REVIEW_AUDIENCE,
             ),
             Err(AuthenticationError::InvalidCredentials),
             "duplicate bootstrap authority groups must fail closed"
@@ -2390,7 +2490,7 @@ mod tests {
                 caller_from_token_review(
                     Some(contradictory),
                     "agents.apelogic.ai/admin",
-                    Some("steward-task-api"),
+                    KUBERNETES_TOKEN_REVIEW_AUDIENCE,
                 ),
                 Err(AuthenticationError::InvalidCredentials),
                 "bootstrap authority combined with {contradictory_group} must fail closed"
@@ -2410,7 +2510,7 @@ mod tests {
             let caller = caller_from_token_review(
                 Some(unauthorized),
                 "agents.apelogic.ai/admin",
-                Some("steward-task-api"),
+                KUBERNETES_TOKEN_REVIEW_AUDIENCE,
             )
             .map_err(|error| {
                 format!("authenticated unprivileged identity was rejected: {error:?}")
@@ -2429,7 +2529,7 @@ mod tests {
         let delegated = task_identity_from_token_review(
             Some(TokenReviewStatus {
                 authenticated: Some(true),
-                audiences: Some(vec!["steward-task-api".to_owned()]),
+                audiences: Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
                 user: Some(UserInfo {
                     username: Some("alice@example.com".to_owned()),
                     groups: Some(vec![
@@ -2440,7 +2540,7 @@ mod tests {
                 }),
                 ..TokenReviewStatus::default()
             }),
-            Some("steward-task-api"),
+            KUBERNETES_TOKEN_REVIEW_AUDIENCE,
         )
         .map_err(|error| format!("server-validated delegated assertion was rejected: {error:?}"))?;
         assert_eq!(delegated.service, "steward-run");
@@ -2453,6 +2553,7 @@ mod tests {
         let scheduled = task_identity_from_token_review(
             Some(TokenReviewStatus {
                 authenticated: Some(true),
+                audiences: Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
                 user: Some(UserInfo {
                     username: Some("scheduler:trigger-123".to_owned()),
                     groups: Some(vec![
@@ -2463,7 +2564,7 @@ mod tests {
                 }),
                 ..TokenReviewStatus::default()
             }),
-            None,
+            KUBERNETES_TOKEN_REVIEW_AUDIENCE,
         )
         .map_err(|error| format!("server-validated scheduled assertion was rejected: {error:?}"))?;
         assert_eq!(scheduled.service, "scheduled-scanner");
@@ -2473,6 +2574,7 @@ mod tests {
         let self_asserted_only = task_identity_from_token_review(
             Some(TokenReviewStatus {
                 authenticated: Some(true),
+                audiences: Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
                 user: Some(UserInfo {
                     username: Some("alice@example.com".to_owned()),
                     groups: Some(Vec::new()),
@@ -2480,7 +2582,7 @@ mod tests {
                 }),
                 ..TokenReviewStatus::default()
             }),
-            None,
+            KUBERNETES_TOKEN_REVIEW_AUDIENCE,
         );
         assert_eq!(
             self_asserted_only,
@@ -2499,7 +2601,7 @@ mod tests {
             let identity = task_identity_from_token_review(
                 Some(TokenReviewStatus {
                     authenticated: Some(true),
-                    audiences: Some(vec!["steward-task-api".to_owned()]),
+                    audiences: Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
                     user: Some(UserInfo {
                         username: Some("alice@example.com".to_owned()),
                         groups: Some(vec![
@@ -2511,7 +2613,7 @@ mod tests {
                     }),
                     ..TokenReviewStatus::default()
                 }),
-                Some("steward-task-api"),
+                KUBERNETES_TOKEN_REVIEW_AUDIENCE,
             );
             assert_eq!(
                 identity,
@@ -2530,7 +2632,7 @@ mod tests {
             let identity = task_identity_from_token_review(
                 Some(TokenReviewStatus {
                     authenticated: Some(true),
-                    audiences: Some(vec!["steward-task-api".to_owned()]),
+                    audiences: Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
                     user: Some(UserInfo {
                         username: Some(username.to_owned()),
                         groups: Some(vec![
@@ -2541,7 +2643,7 @@ mod tests {
                     }),
                     ..TokenReviewStatus::default()
                 }),
-                Some("steward-task-api"),
+                KUBERNETES_TOKEN_REVIEW_AUDIENCE,
             );
             assert_eq!(
                 identity,
@@ -2571,14 +2673,22 @@ mod tests {
                 None,
             ),
             (
+                "empty audience",
+                vec![
+                    "agents.apelogic.ai/service-principal:steward-run".to_owned(),
+                    "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                ],
+                Some(Vec::new()),
+            ),
+            (
                 "missing service group",
                 vec!["agents.apelogic.ai/acting-user:alice@example.com".to_owned()],
-                Some(vec!["steward-task-api".to_owned()]),
+                Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
             ),
             (
                 "missing acting-user group",
                 vec!["agents.apelogic.ai/service-principal:steward-run".to_owned()],
-                Some(vec!["steward-task-api".to_owned()]),
+                Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
             ),
             (
                 "unrecognized identity groups",
@@ -2586,7 +2696,7 @@ mod tests {
                     "example.com/service-principal:steward-run".to_owned(),
                     "example.com/acting-user:alice@example.com".to_owned(),
                 ],
-                Some(vec!["steward-task-api".to_owned()]),
+                Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
             ),
             (
                 "empty service group",
@@ -2594,7 +2704,7 @@ mod tests {
                     "agents.apelogic.ai/service-principal:".to_owned(),
                     "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
                 ],
-                Some(vec!["steward-task-api".to_owned()]),
+                Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
             ),
         ];
 
@@ -2610,7 +2720,7 @@ mod tests {
                     }),
                     ..TokenReviewStatus::default()
                 }),
-                Some("steward-task-api"),
+                KUBERNETES_TOKEN_REVIEW_AUDIENCE,
             );
             assert_eq!(
                 identity,

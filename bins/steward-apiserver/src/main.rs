@@ -9,7 +9,7 @@ use axum::serve::Listener;
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{
     KubeRuntimeRepository, KubernetesTaskIdentityResolver, KubernetesTokenAuthenticator,
-    StaticTaskWorkflowCatalog, router, task_router,
+    KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog, router, task_router,
 };
 use steward_store::PgStore;
 use tokio::net::{TcpListener, TcpStream};
@@ -41,15 +41,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         required("STEWARD_JIRA_TOKEN")?,
     )
     .map_err(|error| io::Error::other(format!("Jira configuration failed: {error:?}")))?;
+    let token_review_audience = kubernetes_token_review_audience(
+        env::var("STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE").ok(),
+    )?;
     let authenticator = KubernetesTokenAuthenticator::new(
         client.clone(),
         env::var("STEWARD_ADMIN_GROUP").unwrap_or_else(|_| "agents.apelogic.ai/admin".to_owned()),
-        env::var("STEWARD_TOKEN_AUDIENCE").ok(),
+        token_review_audience.clone(),
     );
-    let task_identities = KubernetesTaskIdentityResolver::new(
-        client.clone(),
-        task_token_audience(env::var("STEWARD_TASK_TOKEN_AUDIENCE").ok())?,
-    );
+    let task_identities =
+        KubernetesTaskIdentityResolver::new(client.clone(), token_review_audience);
     let task_workflows =
         StaticTaskWorkflowCatalog::from_json(&required("STEWARD_TASK_WORKFLOWS_JSON")?)
             .map_err(io::Error::other)?;
@@ -81,11 +82,15 @@ fn required(name: &str) -> Result<String, io::Error> {
     env::var(name).map_err(|_| io::Error::other(format!("{name} is required")))
 }
 
-fn task_token_audience(value: Option<String>) -> Result<Option<String>, io::Error> {
-    value
-        .filter(|audience| !audience.is_empty())
-        .map(Some)
-        .ok_or_else(|| io::Error::other("STEWARD_TASK_TOKEN_AUDIENCE is required and non-empty"))
+fn kubernetes_token_review_audience(
+    value: Option<String>,
+) -> Result<KubernetesTokenReviewAudience, io::Error> {
+    let value = value.ok_or_else(|| {
+        io::Error::other("STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE is required and non-empty")
+    })?;
+    KubernetesTokenReviewAudience::new(value).map_err(|_| {
+        io::Error::other("STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE is required and non-empty")
+    })
 }
 
 async fn tls_listener(
@@ -208,7 +213,10 @@ mod tests {
     use tokio_rustls::rustls::ServerConfig;
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
-    use super::{TlsListener, decode_tls_material, task_token_audience};
+    use super::{
+        KubernetesTokenReviewAudience, TlsListener, decode_tls_material,
+        kubernetes_token_review_audience,
+    };
 
     #[test]
     fn cert_manager_pem_tls_material_is_decoded() -> Result<(), String> {
@@ -229,22 +237,27 @@ mod tests {
     }
 
     #[test]
-    fn task_api_requires_an_explicit_nonempty_token_audience() {
+    fn apiserver_requires_an_explicit_nonempty_kubernetes_token_review_audience() {
         assert!(
-            task_token_audience(None).is_err(),
-            "production Task authentication must never omit audience validation"
+            kubernetes_token_review_audience(None).is_err(),
+            "production authentication must never omit delegated audience validation"
         );
         assert!(
-            task_token_audience(Some(String::new())).is_err(),
-            "an empty Task audience must not disable audience validation"
+            kubernetes_token_review_audience(Some(String::new())).is_err(),
+            "an empty delegated audience must not disable audience validation"
         );
-        let audience = task_token_audience(Some("steward-task-api".to_owned()));
+        assert!(
+            kubernetes_token_review_audience(Some("   ".to_owned())).is_err(),
+            "a whitespace-only delegated audience must not disable audience validation"
+        );
+        let audience =
+            kubernetes_token_review_audience(Some("https://kubernetes.default.svc".to_owned()));
         assert_eq!(
             audience
                 .as_ref()
                 .ok()
-                .and_then(|configured| configured.as_deref()),
-            Some("steward-task-api")
+                .map(KubernetesTokenReviewAudience::as_str),
+            Some("https://kubernetes.default.svc")
         );
     }
 

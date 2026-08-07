@@ -49,12 +49,16 @@ The GitHub token and the Steward token are different credentials. A GitHub Actio
 its GitHub OIDC token with the audience configured by the production exchange service. That
 service validates GitHub's issuer and repository/workflow claims, resolves the actor to a
 verified corporate email, and exchanges the assertion for a bearer token intended for Steward.
-The exchange audience is an identity-infrastructure input; it is not `steward-task-api` and is
-not configured in Steward.
+The raw GitHub token's custom audience is an identity-infrastructure input. After validating that
+token, the exchange service issues the JWT presented to EKS with `aud=steward-task-api`, matching
+the EKS external OIDC identity-provider client ID. Steward does not configure or reinterpret that
+JWT audience.
 
 Steward receives only the exchanged bearer token. `KubernetesTaskIdentityResolver` sends it
 unchanged in an `authentication.k8s.io/v1 TokenReview` requesting the audience configured by
-`STEWARD_TASK_TOKEN_AUDIENCE`. The ratified production value is `steward-task-api`.
+`STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE`. DEV uses the Kubernetes API server audience
+`https://kubernetes.default.svc`. This delegated TokenReview audience is distinct from the
+exchanged JWT audience and EKS external OIDC client ID.
 
 For a delegated `steward-run` request, the successful TokenReview must return all of the
 following server-verified attributes:
@@ -63,7 +67,7 @@ following server-verified attributes:
 status.user.username: <verified-corporate-email>
 agents.apelogic.ai/service-principal:steward-run
 agents.apelogic.ai/acting-user:<the-same-verified-corporate-email>
-status.audiences: [..., steward-task-api, ...]
+status.audiences: [..., <configured Kubernetes TokenReview audience>, ...]
 ```
 
 The parser requires exactly one non-empty service group and exactly one acting-user group for
@@ -75,7 +79,7 @@ Pure service work uses exactly one service group plus
 `agents.apelogic.ai/task-owner:<corporate-email>` instead. Steward rejects missing, duplicate,
 empty, or contradictory identity groups.
 
-There is currently **no component in this repository** that validates GitHub's OIDC issuer,
+There is **no component in this repository** that validates GitHub's OIDC issuer,
 authorizes repository/workflow claims, resolves the GitHub actor to a corporate email, and
 issues the exchanged token and TokenReview attributes above. The E2E `TestTaskIdentities`
 resolver is deliberately only a test fixture. Production therefore still requires the external
@@ -88,5 +92,5 @@ TokenReview response in its
 and GitHub documents custom OIDC audiences in its
 [OIDC reference](https://docs.github.com/en/actions/reference/security/oidc).
 
-Until that mapper is deployed and tested with a real GitHub token, the GitHub production
-identity path is a blocker; the Task API does not infer identity from unverified JWT claims.
+That mapper remains an external deployment dependency and must be tested with a real GitHub token;
+the Task API does not infer identity from unverified JWT claims.

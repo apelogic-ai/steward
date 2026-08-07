@@ -204,8 +204,7 @@ spec:
             - { name: STEWARD_JIRA_BASE_URL, value: {{ .Values.config.apiserver.jiraBaseUrl | quote }} }
             - { name: STEWARD_JIRA_PROJECT_KEY, value: {{ .Values.config.apiserver.jiraProjectKey | quote }} }
             - { name: STEWARD_JIRA_ACCOUNT_EMAIL, value: {{ .Values.config.apiserver.jiraAccountEmail | quote }} }
-            - { name: STEWARD_TOKEN_AUDIENCE, value: {{ .Values.config.apiserver.tokenAudience | quote }} }
-            - { name: STEWARD_TASK_TOKEN_AUDIENCE, value: {{ .Values.config.apiserver.taskTokenAudience | quote }} }
+            - { name: STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE, value: {{ .Values.config.apiserver.kubernetesTokenReviewAudience | quote }} }
             - { name: STEWARD_TASK_WORKFLOWS_JSON, value: {{ .Values.config.apiserver.taskWorkflowsJson | quote }} }
             - { name: STEWARD_TLS_CERT_DER, value: /run/tls/tls.crt }
             - { name: STEWARD_TLS_KEY_DER, value: /run/tls/tls.key }

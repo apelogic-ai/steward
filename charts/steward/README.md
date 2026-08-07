@@ -59,17 +59,20 @@ that allowlist remain inaccessible to both service accounts.
 
 ## Runtime configuration
 
-- `config.apiserver.taskTokenAudience` is the required Kubernetes TokenReview
-  audience for the Task API. The Task API is enabled on the apiserver service;
-  its internal port is `services.apiserverPort`.
-- `config.apiserver.tokenAudience` is the TokenReview audience for the runtime
-  and administrator API, including route-scoped service-envelope bootstrap. DEV
-  uses the same `steward-task-api` value as Task authentication because EKS has
-  one external OIDC provider client ID per cluster. The bootstrap identity has
-  the exact group `agents.apelogic.ai/service-envelope-bootstrap:steward-run`
-  and can call only `POST /admin/service-envelopes/steward-run`.
+- `config.apiserver.kubernetesTokenReviewAudience` is the required, non-empty
+  Kubernetes API server audience used in every delegated TokenReview, including
+  the Task API and route-scoped service-envelope bootstrap. DEV uses
+  `https://kubernetes.default.svc`. This is distinct from the exchanged JWT's
+  `steward-task-api` audience and the EKS external OIDC client ID. The Task API
+  is enabled on the apiserver service; its internal port is
+  `services.apiserverPort`.
+- The bootstrap identity has the exact group
+  `agents.apelogic.ai/service-envelope-bootstrap:steward-run` and can call only
+  `POST /admin/service-envelopes/steward-run`. Sharing the delegated TokenReview
+  audience does not grant it access to any other administrator route.
 - `config.apiserver.taskWorkflowsJson` is the complete Task workflow catalog as
-  a JSON array. Invalid JSON or an empty Task audience stops the apiserver.
+  a JSON array. Invalid JSON or a missing, empty, or whitespace-only Kubernetes
+  TokenReview audience stops the apiserver.
 - `config.apiserver.jiraBaseUrl`, `jiraProjectKey`, and `jiraAccountEmail` are
   mandatory startup inputs. The base URL is the public HTTPS Jira tenant root,
   the project must already exist, and the account email must correspond to the
@@ -112,8 +115,9 @@ calls. `scripts/bootstrap-task-copy-smoke.sh` installs that envelope
 idempotently over authenticated HTTPS. It requires an externally issued,
 short-lived route-scoped token; the chart deliberately has no bootstrap-token
 Secret input. DEV bootstrap is blocked first on a release containing this
-authorization contract, then on Infra supplying the credential through its EKS
-OIDC identity-provider association.
+authorization contract and the delegated Kubernetes TokenReview audience
+setting, then on Infra supplying the credential through its EKS OIDC
+identity-provider association.
 
 Run `cargo xtask e2e-openshell-adapter` to exercise the adapter against the
 exact OpenShell `v0.0.98` chart in an ephemeral kind cluster. The test verifies

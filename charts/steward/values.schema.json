@@ -92,16 +92,18 @@
             "jiraBaseUrl",
             "jiraProjectKey",
             "jiraAccountEmail",
-            "tokenAudience",
-            "taskTokenAudience",
+            "kubernetesTokenReviewAudience",
             "taskWorkflowsJson"
           ],
           "properties": {
             "jiraBaseUrl": {"type": "string", "pattern": "^https://", "minLength": 9},
             "jiraProjectKey": {"$ref": "#/definitions/nonempty"},
             "jiraAccountEmail": {"type": "string", "minLength": 3},
-            "tokenAudience": {"$ref": "#/definitions/nonempty"},
-            "taskTokenAudience": {"$ref": "#/definitions/nonempty"},
+            "kubernetesTokenReviewAudience": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S"
+            },
             "taskWorkflowsJson": {"type": "string", "pattern": "^\\s*\\[", "minLength": 2}
           }
         },
