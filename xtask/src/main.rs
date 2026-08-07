@@ -43,6 +43,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "e2e-s5" if rest.is_empty() => e2e_s5(),
         "e2e-task" if rest.is_empty() => e2e_task(),
         "e2e-openshell-adapter" if rest.is_empty() => e2e_openshell_adapter(),
+        "e2e-postgres-tls" if rest.is_empty() => e2e_postgres_tls(),
         "policy-test" if rest.is_empty() => policy_test(),
         "migrate-check" if rest.is_empty() => migrate_check(),
         "generate-manifests" if rest.is_empty() => generate_manifests(),
@@ -76,6 +77,7 @@ fn usage() -> String {
         "  e2e-s5",
         "  e2e-task",
         "  e2e-openshell-adapter",
+        "  e2e-postgres-tls",
         "  policy-test",
         "  migrate-check",
         "  generate-manifests",
@@ -174,6 +176,10 @@ fn e2e_task() -> TaskResult {
 
 fn e2e_openshell_adapter() -> TaskResult {
     run("bash", &["scripts/openshell-adapter-e2e.sh"])
+}
+
+fn e2e_postgres_tls() -> TaskResult {
+    run("bash", &["scripts/postgres-tls-e2e.sh"])
 }
 
 fn policy_test() -> TaskResult {
@@ -1163,6 +1169,46 @@ mod tests {
             !adapter_source.contains("driver_config"),
             "the adapter must not expose per-create OpenShell driver or scheduler overrides"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn tls_required_postgres_is_a_ci_and_release_gate() -> Result<(), String> {
+        let workspace = fs::read_to_string(root().join("Cargo.toml"))
+            .map_err(|error| format!("workspace manifest is required: {error}"))?;
+        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let release = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("Steward release workflow is required: {error}"))?;
+        let harness = fs::read_to_string(root().join("scripts/postgres-tls-e2e.sh"))
+            .map_err(|error| format!("PostgreSQL TLS integration harness is required: {error}"))?;
+
+        assert!(
+            workspace.contains("\"tls-rustls-ring-native-roots\""),
+            "production SQLx must include a Rustls TLS provider"
+        );
+        for workflow in [&ci, &release] {
+            assert!(
+                workflow.contains("cargo xtask e2e-postgres-tls"),
+                "CI and release validation must execute the TLS-required PostgreSQL lane"
+            );
+        }
+        for required in [
+            "sslmode=disable",
+            "sslmode=require",
+            "--test postgres_tls",
+            "steward.test/run-id",
+            "docker volume create",
+            "docker volume rm",
+            "chmod 600 /tls-output/server.key",
+            "${TLS_VOLUME}:/tls-input:ro",
+        ] {
+            assert!(
+                harness.contains(required),
+                "PostgreSQL TLS integration harness is missing {required}"
+            );
+        }
 
         Ok(())
     }
