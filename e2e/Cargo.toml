@@ -52,6 +52,10 @@ path = "task.rs"
 name = "openshell_adapter_v0098"
 path = "openshell_adapter_v0098.rs"
 
+[[test]]
+name = "postgres_tls"
+path = "postgres_tls.rs"
+
 [[bin]]
 name = "s3-server"
 path = "s3_server.rs"

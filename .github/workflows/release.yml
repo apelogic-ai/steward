@@ -37,6 +37,8 @@ jobs:
         run: |
           actionlint
           shellcheck \
+            scripts/postgres-tls-e2e.sh \
+            scripts/postgres-tls-init.sh \
             scripts/promote-ecr-artifact.sh \
             scripts/resolve-ecr-platform-digest.sh \
             scripts/test-promote-ecr-artifact.sh \
@@ -47,6 +49,9 @@ jobs:
         env:
           STEWARD_MIGRATION_BASE: ${{ github.sha }}
         run: cargo xtask ci
+
+      - name: Verify encrypted PostgreSQL connection and migrations
+        run: cargo xtask e2e-postgres-tls
 
       - name: Validate Helm chart contract
         run: scripts/validate-release-artifacts.sh
