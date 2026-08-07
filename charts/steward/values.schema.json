@@ -42,15 +42,13 @@
             "name",
             "caCertificate",
             "clientCertificate",
-            "clientPrivateKey",
-            "bearerToken"
+            "clientPrivateKey"
           ],
           "properties": {
             "name": {"$ref": "#/definitions/nonempty"},
             "caCertificate": {"$ref": "#/definitions/nonempty"},
             "clientCertificate": {"$ref": "#/definitions/nonempty"},
-            "clientPrivateKey": {"$ref": "#/definitions/nonempty"},
-            "bearerToken": {"$ref": "#/definitions/nonempty"}
+            "clientPrivateKey": {"$ref": "#/definitions/nonempty"}
           }
         },
         "mint": {

@@ -43,7 +43,7 @@ The chart references five existing Secrets and never creates their values:
 | `steward-database` | `url` | apiserver, controller |
 | `steward-jira` | `token` | apiserver |
 | `steward-litellm` | `master-key` | controller |
-| `steward-openshell-client` | `ca.crt`, `tls.crt`, `tls.key`, `token` | controller |
+| `steward-openshell-client` | `ca.crt`, `tls.crt`, `tls.key` | controller |
 | `steward-mint` | `signing-key`, `introspection-credential` | mint |
 
 The mint Secret is not referenced by either the apiserver or controller
@@ -79,9 +79,11 @@ that allowlist remain inaccessible to both service accounts.
   `config.controller.openshellEndpoint` are internal service endpoints.
 - The OpenShell endpoint must use HTTPS. `openshellServerName` pins the TLS
   identity, while `secrets.openshellClient` supplies the trusted CA, client
-  certificate/private key, and bearer token. Missing transport trust or caller
-  authentication stops the controller; ambient workstation credentials and
-  plaintext gRPC are not supported.
+  certificate, and private key. The controller projects a rotating Kubernetes
+  service-account token with audience `openshell-api` and reads its file before
+  every OpenShell RPC. The workload token is never stored in a Secret. Missing
+  transport trust or caller authentication stops the controller; ambient
+  workstation credentials and plaintext gRPC are not supported.
 - `config.controller.openshellRuntimeClassName` must be `kata-qemu`, matching
   OpenShell's gateway-level `defaultRuntimeClassName`. Steward does not send a
   sandbox image or expose per-create driver/runtime overrides, so the gateway's

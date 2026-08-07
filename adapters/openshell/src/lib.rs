@@ -5,6 +5,8 @@ use std::collections::HashMap;
 #[cfg(feature = "runtime")]
 use std::future::Future;
 #[cfg(feature = "runtime")]
+use std::path::{Path, PathBuf};
+#[cfg(feature = "runtime")]
 use std::time::Duration as StdDuration;
 
 #[cfg(feature = "identity")]
@@ -25,7 +27,6 @@ use openshell_sdk::raw::proto::{
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
     EdgeAuthInterceptor, ExecOptions, OpenShellClient, SandboxPhase, SandboxSpec, SdkError,
-    WorkspaceScopedClient,
 };
 use sha2::{Digest, Sha256};
 #[cfg(feature = "runtime")]
@@ -38,7 +39,7 @@ use steward_ports::{
 #[cfg(feature = "runtime")]
 use steward_types::RuntimeRefs;
 #[cfg(feature = "runtime")]
-use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 pub const IMPLEMENTED_PORTS: [&str; 0] = [];
 const NAME_LENGTH: usize = 19;
@@ -322,7 +323,7 @@ pub struct OpenShellConnectionConfig {
     pub ca_certificate_pem: Vec<u8>,
     pub client_certificate_pem: Vec<u8>,
     pub client_private_key_pem: Vec<u8>,
-    pub bearer_token: String,
+    pub bearer_token_file: PathBuf,
     pub server_name: String,
     pub runtime_class_name: String,
 }
@@ -351,9 +352,9 @@ impl OpenShellConnectionConfig {
                 });
             }
         }
-        if self.bearer_token.trim().is_empty() {
+        if self.bearer_token_file.as_os_str().is_empty() {
             return Err(PortError::Rejected {
-                reason: "OpenShell gateway caller bearer token is required".to_owned(),
+                reason: "OpenShell gateway caller bearer token file is required".to_owned(),
             });
         }
         if self.runtime_class_name != REQUIRED_RUNTIME_CLASS_NAME {
@@ -368,17 +369,30 @@ impl OpenShellConnectionConfig {
 }
 
 #[cfg(feature = "runtime")]
+fn load_caller_token(path: &Path) -> Result<String, PortError> {
+    let token = std::fs::read_to_string(path).map_err(|_| PortError::Rejected {
+        reason: "OpenShell gateway caller token is unavailable".to_owned(),
+    })?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(PortError::Rejected {
+            reason: "OpenShell gateway caller token is empty".to_owned(),
+        });
+    }
+    Ok(token.to_owned())
+}
+
+#[cfg(feature = "runtime")]
 #[derive(Clone)]
 pub struct OpenShellRuntime {
-    client: OpenShellClient,
+    channel: Channel,
+    bearer_token_file: PathBuf,
 }
 
 #[cfg(feature = "runtime")]
 impl OpenShellRuntime {
     pub async fn connect(config: OpenShellConnectionConfig) -> Result<Self, PortError> {
         config.validate()?;
-        let interceptor =
-            EdgeAuthInterceptor::new(Some(&config.bearer_token), None).map_err(port_failure)?;
         let tls = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(config.ca_certificate_pem))
             .identity(Identity::from_pem(
@@ -394,12 +408,34 @@ impl OpenShellRuntime {
             .connect()
             .await
             .map_err(raw_port_failure)?;
-        let client = OpenShellClient::from_parts(channel, interceptor);
-        Ok(Self { client })
+        let runtime = Self {
+            channel,
+            bearer_token_file: config.bearer_token_file,
+        };
+        runtime.authenticated_client().await?;
+        Ok(runtime)
+    }
+
+    async fn authenticated_client(&self) -> Result<OpenShellClient, PortError> {
+        let token_file = self.bearer_token_file.clone();
+        let token = tokio::task::spawn_blocking(move || load_caller_token(&token_file))
+            .await
+            .map_err(|_| PortError::Failed {
+                reason: "OpenShell gateway caller token could not be loaded".to_owned(),
+            })?;
+        let token = token?;
+        let interceptor =
+            EdgeAuthInterceptor::new(Some(&token), None).map_err(|_| PortError::Rejected {
+                reason: "OpenShell gateway caller token is invalid".to_owned(),
+            })?;
+        Ok(OpenShellClient::from_parts(
+            self.channel.clone(),
+            interceptor,
+        ))
     }
 
     async fn ensure_workspace(&self, name: &str, workspace_key: &str) -> Result<(), PortError> {
-        match self.client.get_workspace(name).await {
+        match self.authenticated_client().await?.get_workspace(name).await {
             Ok(workspace) => {
                 if workspace
                     .labels
@@ -420,7 +456,12 @@ impl OpenShellRuntime {
                     "agents.apelogic.ai/workspace-key".to_owned(),
                     workspace_key.to_owned(),
                 );
-                match self.client.create_workspace(name, labels).await {
+                match self
+                    .authenticated_client()
+                    .await?
+                    .create_workspace(name, labels)
+                    .await
+                {
                     Ok(_) | Err(SdkError::AlreadyExists { .. }) => Ok(()),
                     Err(error) => Err(port_failure(error)),
                 }
@@ -434,7 +475,7 @@ impl OpenShellRuntime {
         workspace: &str,
         provider_name: &str,
     ) -> Result<Option<Provider>, PortError> {
-        let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
+        let mut client = self.authenticated_client().await?.raw_grpc();
         match client
             .get_provider(GetProviderRequest {
                 name: provider_name.to_owned(),
@@ -461,7 +502,7 @@ impl OpenShellRuntime {
             return validate_provider(&provider, workspace, provider_name);
         }
 
-        let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
+        let mut client = self.authenticated_client().await?.raw_grpc();
         let response = client
             .create_provider(CreateProviderRequest {
                 provider: Some(Provider {
@@ -508,7 +549,7 @@ impl OpenShellRuntime {
         provider_name: &str,
         resource_version: u64,
     ) -> Result<(), PortError> {
-        let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
+        let mut client = self.authenticated_client().await?.raw_grpc();
         client
             .attach_sandbox_provider(AttachSandboxProviderRequest {
                 sandbox_name: sandbox.to_owned(),
@@ -527,7 +568,7 @@ impl OpenShellRuntime {
         sandbox: &str,
         provider_name: &str,
     ) -> Result<bool, PortError> {
-        let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
+        let mut client = self.authenticated_client().await?.raw_grpc();
         let providers = client
             .list_sandbox_providers(ListSandboxProvidersRequest {
                 sandbox_name: sandbox.to_owned(),
@@ -567,7 +608,7 @@ impl OpenShellRuntime {
         provider_name: &str,
         resource_version: u64,
     ) -> Result<(), PortError> {
-        let mut client = self.client.raw_grpc_fresh().await.map_err(port_failure)?;
+        let mut client = self.authenticated_client().await?.raw_grpc();
         client
             .detach_sandbox_provider(DetachSandboxProviderRequest {
                 sandbox_name: sandbox.to_owned(),
@@ -593,7 +634,8 @@ impl OpenShellRuntime {
         match provider_reconciliation(attached, desired) {
             Some(ProviderReconciliation::Attach) => {
                 let resource_version = self
-                    .client
+                    .authenticated_client()
+                    .await?
                     .workspace(workspace)
                     .get_sandbox(sandbox)
                     .await
@@ -604,7 +646,8 @@ impl OpenShellRuntime {
             }
             Some(ProviderReconciliation::Detach) => {
                 let resource_version = self
-                    .client
+                    .authenticated_client()
+                    .await?
                     .workspace(workspace)
                     .get_sandbox(sandbox)
                     .await
@@ -649,12 +692,25 @@ trait SandboxDeleteClient {
 }
 
 #[cfg(feature = "runtime")]
-impl SandboxDeleteClient for WorkspaceScopedClient {
+struct RuntimeDeleteClient<'a> {
+    runtime: &'a OpenShellRuntime,
+    workspace: &'a str,
+}
+
+#[cfg(feature = "runtime")]
+impl SandboxDeleteClient for RuntimeDeleteClient<'_> {
     async fn sandbox_labels(
         &self,
         name: &str,
     ) -> Result<Option<HashMap<String, String>>, PortError> {
-        match self.get_sandbox(name).await {
+        match self
+            .runtime
+            .authenticated_client()
+            .await?
+            .workspace(self.workspace)
+            .get_sandbox(name)
+            .await
+        {
             Ok(snapshot) => Ok(Some(snapshot.labels)),
             Err(SdkError::NotFound { .. }) => Ok(None),
             Err(error) => Err(port_failure(error)),
@@ -662,7 +718,14 @@ impl SandboxDeleteClient for WorkspaceScopedClient {
     }
 
     async fn delete_sandbox(&self, name: &str) -> Result<bool, PortError> {
-        match WorkspaceScopedClient::delete_sandbox(self, name).await {
+        match self
+            .runtime
+            .authenticated_client()
+            .await?
+            .workspace(self.workspace)
+            .delete_sandbox(name)
+            .await
+        {
             Ok(deleted) => Ok(deleted),
             Err(SdkError::NotFound { .. }) => Ok(false),
             Err(error) => Err(port_failure(error)),
@@ -700,13 +763,27 @@ impl SandboxRuntime for OpenShellRuntime {
             self.ensure_provider(&projection.workspace, provider)
                 .await?;
         }
-        let scoped = self.client.workspace(&projection.workspace);
-        let snapshot = match scoped.get_sandbox(&projection.sandbox).await {
+        let snapshot = match self
+            .authenticated_client()
+            .await?
+            .workspace(&projection.workspace)
+            .get_sandbox(&projection.sandbox)
+            .await
+        {
             Ok(snapshot) => snapshot,
             Err(SdkError::NotFound { .. }) => {
-                match scoped.create_sandbox(sandbox_spec(&projection)).await {
+                match self
+                    .authenticated_client()
+                    .await?
+                    .workspace(&projection.workspace)
+                    .create_sandbox(sandbox_spec(&projection))
+                    .await
+                {
                     Ok(snapshot) => snapshot,
-                    Err(SdkError::AlreadyExists { .. }) => scoped
+                    Err(SdkError::AlreadyExists { .. }) => self
+                        .authenticated_client()
+                        .await?
+                        .workspace(&projection.workspace)
                         .get_sandbox(&projection.sandbox)
                         .await
                         .map_err(port_failure)?,
@@ -744,8 +821,11 @@ impl SandboxRuntime for OpenShellRuntime {
 
     async fn delete(&self, request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
         let (workspace, sandbox) = deletion_names(request);
-        let scoped = self.client.workspace(&workspace);
-        let deleted = delete_owned_sandbox(&scoped, &sandbox, &request.runtime.0).await?;
+        let client = RuntimeDeleteClient {
+            runtime: self,
+            workspace: &workspace,
+        };
+        let deleted = delete_owned_sandbox(&client, &sandbox, &request.runtime.0).await?;
         if deleted {
             Ok(SandboxObservation::Provisioning {
                 refs: RuntimeRefs {
@@ -788,8 +868,13 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 reason: "task command must contain only non-empty arguments".to_owned(),
             });
         }
-        let scoped = self.client.workspace(workspace);
-        let snapshot = scoped.get_sandbox(sandbox).await.map_err(port_failure)?;
+        let snapshot = self
+            .authenticated_client()
+            .await?
+            .workspace(workspace)
+            .get_sandbox(sandbox)
+            .await
+            .map_err(port_failure)?;
         if snapshot.labels.get(RUNTIME_UID_LABEL).map(String::as_str)
             != Some(request.runtime.0.as_str())
         {
@@ -797,7 +882,10 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 reason: "task sandbox is bound to a different runtime UID".to_owned(),
             });
         }
-        let stage = scoped
+        let stage = self
+            .authenticated_client()
+            .await?
+            .workspace(workspace)
             .exec(
                 sandbox,
                 &[
@@ -823,7 +911,10 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             "STEWARD_OUTPUT_DIR".to_owned(),
             "/sandbox/steward-output".to_owned(),
         );
-        let executed = scoped
+        let executed = self
+            .authenticated_client()
+            .await?
+            .workspace(workspace)
             .exec(
                 sandbox,
                 &request.command,
@@ -841,7 +932,10 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 reason: format!("task agent exited with code {}", executed.exit_code),
             });
         }
-        let collected = scoped
+        let collected = self
+            .authenticated_client()
+            .await?
+            .workspace(workspace)
             .exec(
                 sandbox,
                 &[
@@ -890,7 +984,9 @@ mod tests {
     #[cfg(feature = "runtime")]
     use std::future::Future;
     #[cfg(feature = "runtime")]
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::path::PathBuf;
+    #[cfg(feature = "runtime")]
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     #[cfg(feature = "runtime")]
     use std::task::{Context, Poll, Waker};
 
@@ -907,8 +1003,8 @@ mod tests {
     #[cfg(feature = "runtime")]
     use super::{
         OpenShellConnectionConfig, ProviderReconciliation, SandboxDeleteClient,
-        delete_owned_sandbox, deletion_names, project_request, provider_reconciliation,
-        sandbox_spec,
+        delete_owned_sandbox, deletion_names, load_caller_token, project_request,
+        provider_reconciliation, sandbox_spec,
     };
 
     #[cfg(feature = "runtime")]
@@ -918,7 +1014,7 @@ mod tests {
             ca_certificate_pem: b"test-ca-certificate".to_vec(),
             client_certificate_pem: b"test-client-certificate".to_vec(),
             client_private_key_pem: b"test-client-private-key".to_vec(),
-            bearer_token: "test-bearer-token".to_owned(),
+            bearer_token_file: PathBuf::from("/run/openshell-token/token"),
             server_name: "gateway.example.test".to_owned(),
             runtime_class_name: "kata-qemu".to_owned(),
         }
@@ -943,7 +1039,7 @@ mod tests {
             |config: &mut OpenShellConnectionConfig| config.ca_certificate_pem.clear(),
             |config: &mut OpenShellConnectionConfig| config.client_certificate_pem.clear(),
             |config: &mut OpenShellConnectionConfig| config.client_private_key_pem.clear(),
-            |config: &mut OpenShellConnectionConfig| config.bearer_token.clear(),
+            |config: &mut OpenShellConnectionConfig| config.bearer_token_file.clear(),
             |config: &mut OpenShellConnectionConfig| config.server_name.clear(),
         ] {
             let mut config = valid_connection_config();
@@ -965,6 +1061,61 @@ mod tests {
             matches!(config.validate(), Err(PortError::Rejected { .. })),
             "the OpenShell adapter must reject a runtime class other than kata-qemu"
         );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn caller_token_file_observes_rotation_and_fails_closed() -> Result<(), String> {
+        static TOKEN_FILE_ID: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "steward-openshell-token-{}-{}",
+            std::process::id(),
+            TOKEN_FILE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let first = "obviously-fake-first-token";
+        let second = "obviously-fake-rotated-token";
+        std::fs::write(&path, first)
+            .map_err(|error| format!("failed to create token fixture: {error}"))?;
+        assert_eq!(
+            load_caller_token(&path).map_err(|error| format!("{error:?}"))?,
+            first
+        );
+        std::fs::write(&path, second)
+            .map_err(|error| format!("failed to rotate token fixture: {error}"))?;
+        assert_eq!(
+            load_caller_token(&path).map_err(|error| format!("{error:?}"))?,
+            second,
+            "each token load must observe the current file contents"
+        );
+        std::fs::write(&path, b"")
+            .map_err(|error| format!("failed to empty token fixture: {error}"))?;
+        let empty = load_caller_token(&path);
+        assert!(
+            matches!(&empty, Err(PortError::Rejected { .. })),
+            "an empty projected token must fail closed"
+        );
+        std::fs::remove_file(&path)
+            .map_err(|error| format!("failed to remove token fixture: {error}"))?;
+        let missing = load_caller_token(&path);
+        assert!(
+            matches!(&missing, Err(PortError::Rejected { .. })),
+            "a missing projected token must fail closed"
+        );
+        std::fs::create_dir(&path)
+            .map_err(|error| format!("failed to create unreadable token fixture: {error}"))?;
+        let unreadable = load_caller_token(&path);
+        assert!(
+            matches!(&unreadable, Err(PortError::Rejected { .. })),
+            "an unreadable projected token must fail closed"
+        );
+        std::fs::remove_dir(&path)
+            .map_err(|error| format!("failed to remove unreadable token fixture: {error}"))?;
+        let rendered = format!("{empty:?} {missing:?} {unreadable:?}");
+        assert!(
+            !rendered.contains(first) && !rendered.contains(second),
+            "token load failures must not expose token material"
+        );
+        Ok(())
     }
 
     #[cfg(feature = "runtime")]

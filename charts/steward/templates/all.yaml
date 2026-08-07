@@ -243,7 +243,7 @@ spec:
             - { name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE, value: /run/openshell/ca.crt }
             - { name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE, value: /run/openshell/tls.crt }
             - { name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE, value: /run/openshell/tls.key }
-            - { name: STEWARD_OPENSHELL_BEARER_TOKEN_FILE, value: /run/openshell/token }
+            - { name: STEWARD_OPENSHELL_BEARER_TOKEN_FILE, value: /var/run/secrets/steward/openshell/token }
             - { name: STEWARD_CONTROLLER_USERNAME, value: {{ printf "system:serviceaccount:%s:steward-controller" .Release.Namespace | quote }} }
             - { name: STEWARD_APISERVER_USERNAME, value: {{ printf "system:serviceaccount:%s:steward-apiserver" .Release.Namespace | quote }} }
             - { name: STEWARD_TLS_CERT_DER, value: /run/tls/tls.crt }
@@ -251,6 +251,7 @@ spec:
           volumeMounts:
             - { name: tls, mountPath: /run/tls, readOnly: true }
             - { name: openshell-client, mountPath: /run/openshell, readOnly: true }
+            - { name: openshell-workload-token, mountPath: /var/run/secrets/steward/openshell, readOnly: true }
           resources:
 {{ toYaml .Values.resources.controller | nindent 12 }}
       volumes:
@@ -262,7 +263,13 @@ spec:
               - { key: {{ .Values.secrets.openshellClient.caCertificate }}, path: ca.crt }
               - { key: {{ .Values.secrets.openshellClient.clientCertificate }}, path: tls.crt }
               - { key: {{ .Values.secrets.openshellClient.clientPrivateKey }}, path: tls.key }
-              - { key: {{ .Values.secrets.openshellClient.bearerToken }}, path: token }
+        - name: openshell-workload-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: openshell-api
+                  expirationSeconds: 3600
+                  path: token
 ---
 apiVersion: apps/v1
 kind: Deployment
