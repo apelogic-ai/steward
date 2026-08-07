@@ -5,12 +5,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 POSTGRES_IMAGE="postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777"
 RUN_ID="postgres-tls-$(date -u +%Y%m%d%H%M%S)-$$"
 CONTAINER="steward-${RUN_ID}"
+TLS_STAGER="${CONTAINER}-tls-stage"
+TLS_VOLUME="${CONTAINER}-tls"
 RUN_DIR="${ROOT}/.steward-run/${RUN_ID}"
 
 cleanup() {
   status="$1"
   trap - EXIT INT TERM
+  docker rm -f "${TLS_STAGER}" >/dev/null 2>&1 || true
   docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+  docker volume rm -f "${TLS_VOLUME}" >/dev/null 2>&1 || true
   find "${RUN_DIR}" -depth -delete 2>/dev/null || true
   exit "${status}"
 }
@@ -36,6 +40,22 @@ openssl req \
   -keyout "${RUN_DIR}/server.key" \
   -out "${RUN_DIR}/server.crt" >/dev/null 2>&1
 
+docker volume create \
+  --label "steward.test/run-id=${RUN_ID}" \
+  "${TLS_VOLUME}" >/dev/null
+docker run --rm \
+  --name "${TLS_STAGER}" \
+  --label "steward.test/run-id=${RUN_ID}" \
+  --entrypoint sh \
+  -v "${RUN_DIR}:/tls-source:ro" \
+  -v "${TLS_VOLUME}:/tls-output" \
+  "${POSTGRES_IMAGE}" \
+  -c 'cp /tls-source/server.key /tls-output/server.key
+cp /tls-source/server.crt /tls-output/server.crt
+chown postgres:postgres /tls-output/server.key /tls-output/server.crt
+chmod 600 /tls-output/server.key
+chmod 644 /tls-output/server.crt'
+
 docker run -d \
   --name "${CONTAINER}" \
   --label "steward.test/run-id=${RUN_ID}" \
@@ -43,7 +63,7 @@ docker run -d \
   -e POSTGRES_HOST_AUTH_METHOD=trust \
   -e POSTGRES_USER=steward \
   -p 127.0.0.1::5432 \
-  -v "${RUN_DIR}:/tls-input:ro" \
+  -v "${TLS_VOLUME}:/tls-input:ro" \
   -v "${ROOT}/scripts/postgres-tls-init.sh:/docker-entrypoint-initdb.d/001-require-tls.sh:ro" \
   "${POSTGRES_IMAGE}" >/dev/null
 

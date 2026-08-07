@@ -1199,6 +1199,10 @@ mod tests {
             "sslmode=require",
             "--test postgres_tls",
             "steward.test/run-id",
+            "docker volume create",
+            "docker volume rm",
+            "chmod 600 /tls-output/server.key",
+            "${TLS_VOLUME}:/tls-input:ro",
         ] {
             assert!(
                 harness.contains(required),
