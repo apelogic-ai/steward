@@ -884,6 +884,29 @@ mod tests {
     }
 
     #[test]
+    fn revocation_e2e_preserves_observed_runtime_headroom() -> Result<(), String> {
+        let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let revocation = workflow
+            .split("  e2e-revocation:")
+            .nth(1)
+            .and_then(|jobs| jobs.split("\n  openshell-adapter:").next())
+            .ok_or_else(|| "revocation E2E CI job is required".to_owned())?;
+
+        assert!(
+            revocation.contains("timeout-minutes: 40"),
+            "the revocation E2E needs 40 minutes after a 29m05s successful run left less than one minute of the prior budget"
+        );
+        assert_eq!(
+            workflow.matches("timeout-minutes: 40").count(),
+            1,
+            "only the evidence-backed revocation lane may use the 40-minute timeout"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn openshell_adapter_does_not_select_a_public_sandbox_image() -> Result<(), String> {
         let source = fs::read_to_string(root().join("adapters/openshell/src/lib.rs"))
             .map_err(|error| format!("OpenShell adapter source is required: {error}"))?;
