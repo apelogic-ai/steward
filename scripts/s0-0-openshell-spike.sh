@@ -20,8 +20,9 @@ RUN_DIR="${ROOT}/.steward-run/${RUN_ID}"
 KUBECONFIG_PATH="${RUN_DIR}/kubeconfig"
 PORT_FORWARD_LOG="${RUN_DIR}/openshell-port-forward.log"
 PORT_FORWARD_PID=""
+WORKLOAD_EXCHANGE_PID=""
 CLUSTER_CREATED=0
-OIDC_AUDIENCE="steward-test"
+OIDC_AUDIENCE="openshell-api"
 S0_E2E=0
 if [[ "$#" -eq 1 && "$1" == "--s0-e2e" ]]; then
   S0_E2E=1
@@ -47,6 +48,10 @@ cleanup() {
   if [[ -n "${PORT_FORWARD_PID}" ]]; then
     kill "${PORT_FORWARD_PID}" >/dev/null 2>&1 || true
     wait "${PORT_FORWARD_PID}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${WORKLOAD_EXCHANGE_PID}" ]]; then
+    kill "${WORKLOAD_EXCHANGE_PID}" >/dev/null 2>&1 || true
+    wait "${WORKLOAD_EXCHANGE_PID}" >/dev/null 2>&1 || true
   fi
   if [[ "${CLUSTER_CREATED}" == "1" && "${STEWARD_DEV_KEEP:-0}" != "1" ]]; then
     KUBECONFIG="${KUBECONFIG_PATH}" kind delete cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1 || true
@@ -83,7 +88,7 @@ if [[ "$#" -eq 1 && "$1" == "--print-openshell-cli-asset" ]]; then
   exit 0
 fi
 
-for command in kind kubectl helm cargo curl openssl sed tar xxd; do
+for command in kind kubectl helm cargo curl openssl python3 sed tar xxd; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is missing: ${command}" >&2
     exit 2
@@ -375,6 +380,74 @@ extract_secret_key openshell-client-tls tls.key "${client_private_key}"
 printf '%s' "${oidc_token}" >"${bearer_token}"
 chmod 600 "${client_private_key}" "${bearer_token}"
 
+workload_source_file="${RUN_DIR}/workload-source-credential"
+workload_exchange_ca_private_key="${RUN_DIR}/workload-exchange-ca.key"
+workload_exchange_ca_certificate="${RUN_DIR}/workload-exchange-ca.crt"
+workload_exchange_private_key="${RUN_DIR}/workload-exchange.key"
+workload_exchange_certificate_request="${RUN_DIR}/workload-exchange.csr"
+workload_exchange_certificate="${RUN_DIR}/workload-exchange.crt"
+workload_exchange_log="${RUN_DIR}/workload-exchange.log"
+printf '%s' obviously-fake-workload-source >"${workload_source_file}"
+openssl req \
+  -new \
+  -newkey rsa:2048 \
+  -x509 \
+  -nodes \
+  -days 1 \
+  -subj /CN=steward-test-workload-exchange-ca \
+  -addext basicConstraints=critical,CA:TRUE \
+  -addext keyUsage=critical,keyCertSign,cRLSign \
+  -keyout "${workload_exchange_ca_private_key}" \
+  -out "${workload_exchange_ca_certificate}" >/dev/null 2>&1
+openssl req \
+  -new \
+  -newkey rsa:2048 \
+  -nodes \
+  -subj /CN=127.0.0.1 \
+  -addext subjectAltName=IP:127.0.0.1 \
+  -addext basicConstraints=critical,CA:FALSE \
+  -addext keyUsage=critical,digitalSignature,keyEncipherment \
+  -addext extendedKeyUsage=serverAuth \
+  -keyout "${workload_exchange_private_key}" \
+  -out "${workload_exchange_certificate_request}" >/dev/null 2>&1
+openssl x509 \
+  -req \
+  -in "${workload_exchange_certificate_request}" \
+  -CA "${workload_exchange_ca_certificate}" \
+  -CAkey "${workload_exchange_ca_private_key}" \
+  -CAcreateserial \
+  -days 1 \
+  -sha256 \
+  -copy_extensions copy \
+  -out "${workload_exchange_certificate}" >/dev/null 2>&1
+chmod 600 "${workload_exchange_ca_private_key}" "${workload_exchange_private_key}"
+python3 "${ROOT}/scripts/test-workload-exchange.py" \
+  --certificate "${workload_exchange_certificate}" \
+  --private-key "${workload_exchange_private_key}" \
+  --source-file "${workload_source_file}" \
+  --issuer "${oidc_issuer}" \
+  --signing-key "${oidc_private_key}" \
+  >"${workload_exchange_log}" 2>&1 &
+WORKLOAD_EXCHANGE_PID=$!
+for _ in $(seq 1 50); do
+  if grep -q '^LISTENING [0-9][0-9]*$' "${workload_exchange_log}"; then
+    break
+  fi
+  if ! kill -0 "${WORKLOAD_EXCHANGE_PID}" >/dev/null 2>&1; then
+    echo "workload exchange mock exited before becoming ready" >&2
+    cat "${workload_exchange_log}" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+workload_exchange_port="$(sed -nE 's/^LISTENING ([0-9]+)$/\1/p' "${workload_exchange_log}")"
+if [[ -z "${workload_exchange_port}" ]]; then
+  echo "workload exchange mock did not publish its port" >&2
+  cat "${workload_exchange_log}" >&2
+  exit 1
+fi
+workload_exchange_endpoint="https://127.0.0.1:${workload_exchange_port}/v1/workload/exchange"
+
 kubectl \
   --kubeconfig "${KUBECONFIG_PATH}" \
   --context "${KUBE_CONTEXT}" \
@@ -431,7 +504,11 @@ export STEWARD_OPENSHELL_ENDPOINT="${endpoint}"
 export STEWARD_OPENSHELL_CA_CERTIFICATE_FILE="${gateway_ca}"
 export STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE="${client_certificate}"
 export STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE="${client_private_key}"
-export STEWARD_OPENSHELL_BEARER_TOKEN_FILE="${bearer_token}"
+export STEWARD_WORKLOAD_EXCHANGE_ENDPOINT="${workload_exchange_endpoint}"
+export STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME="127.0.0.1"
+export STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE="${workload_exchange_ca_certificate}"
+export STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE="${workload_source_file}"
+export STEWARD_TEST_OPENSHELL_ACCESS_TOKEN_FILE="${bearer_token}"
 export STEWARD_OPENSHELL_SERVER_NAME="localhost"
 export STEWARD_OPENSHELL_RUNTIME_CLASS_NAME="kata-qemu"
 export STEWARD_TEST_KUBE_CONTEXT="${KUBE_CONTEXT}"

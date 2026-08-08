@@ -46,6 +46,10 @@ The chart references five existing Secrets and never creates their values:
 | `steward-openshell-client` | `ca.crt`, `tls.crt`, `tls.key` | controller |
 | `steward-mint` | `signing-key`, `introspection-credential` | mint |
 
+The controller also requires the public workload-exchange CA bundle in the
+ConfigMap selected by `workloadExchangeTrust.name` and
+`workloadExchangeTrust.caCertificate`. It is trust material, not a Secret.
+
 The mint Secret is not referenced by either the apiserver or controller
 Deployment. `steward-apiserver-tls` and `steward-webhook-tls` are issued by
 cert-manager from `tls.issuerRef`; the binaries accept cert-manager's PEM
@@ -82,11 +86,24 @@ that allowlist remain inaccessible to both service accounts.
   `config.controller.openshellEndpoint` are internal service endpoints.
 - The OpenShell endpoint must use HTTPS. `openshellServerName` pins the TLS
   identity, while `secrets.openshellClient` supplies the trusted CA, client
-  certificate, and private key. The controller projects a rotating Kubernetes
-  service-account token with audience `openshell-api` and reads its file before
-  every OpenShell RPC. The workload token is never stored in a Secret. Missing
-  transport trust or caller authentication stops the controller; ambient
-  workstation credentials and plaintext gRPC are not supported.
+  certificate, and private key.
+- The controller projects a rotating, ten-minute Kubernetes service-account
+  source credential with audience `apelogic-workload-exchange`. It sends that
+  credential only as the Bearer authorization on an empty-body
+  `POST /v1/workload/exchange`. The HTTPS endpoint is
+  `config.controller.workloadExchangeEndpoint`; its host must exactly match
+  `workloadExchangeServerName`, and the server certificate must chain to the
+  `workloadExchangeTrust` ConfigMap. The exchange selects the subject,
+  `openshell-api` audience, roles, signing algorithm, and at-most-120-second
+  lifetime. Steward cannot request or override those claims.
+- Only the exchanged access token is sent to OpenShell. It is cached in memory
+  until its refresh margin, never persisted, and refreshed from the current
+  source-credential file. No token is stored in a Kubernetes Secret. Missing
+  source identity, exchange trust, or exchange availability stops OpenShell
+  reconciliation; HTTP, ambient workstation credentials, and direct raw
+  service-account authentication are unsupported. This file-source boundary is
+  deployment-neutral: non-Kubernetes deployments may mount another
+  platform-approved source credential without changing sandbox/runtime code.
 - `config.controller.openshellRuntimeClassName` must be `kata-qemu`, matching
   OpenShell's gateway-level `defaultRuntimeClassName`. Steward does not send a
   sandbox image or expose per-create driver/runtime overrides, so the gateway's
@@ -133,6 +150,7 @@ for all Steward pods, then opens only these paths:
 - configured Kubernetes API/VPC CIDRs to the validating webhook;
 - OpenShell and MCP-GW namespaces to the mint;
 - controller to LiteLLM, OpenShell, Postgres, and the Kubernetes API;
+- controller to the internal workload identity exchange;
 - apiserver to Jira, Postgres, and the Kubernetes API;
 - mint to the Kubernetes API; and
 - all Steward components to cluster DNS.

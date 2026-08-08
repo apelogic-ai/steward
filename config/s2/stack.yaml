@@ -377,6 +377,78 @@ subjects:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  name: workload-exchange
+  namespace: steward-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: steward-test-workload-exchange
+  template:
+    metadata:
+      labels:
+        app: steward-test-workload-exchange
+    spec:
+      containers:
+        - name: exchange
+          image: python:3.13.5-alpine3.22@sha256:37b14db89f587f9eaa890e4a442a3fe55db452b69cca1403cc730bd0fbdc8aaf
+          args:
+            - python3
+            - /srv/test-workload-exchange.py
+            - --certificate
+            - /run/steward/workload-exchange.crt
+            - --private-key
+            - /run/steward/workload-exchange.key
+            - --source-file
+            - /run/steward/workload-source-credential
+            - --access-file
+            - /run/steward/openshell-access-token
+            - --port-file
+            - /tmp/workload-exchange.port
+            - --port
+            - "8443"
+          ports:
+            - name: https
+              containerPort: 8443
+          readinessProbe:
+            tcpSocket:
+              port: https
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+            runAsUser: 65534
+          volumeMounts:
+            - name: script
+              mountPath: /srv
+              readOnly: true
+            - name: secrets
+              mountPath: /run/steward
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: steward-test-workload-exchange
+        - name: secrets
+          secret:
+            secretName: steward-s2-secrets
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: workload-exchange
+  namespace: steward-system
+spec:
+  selector:
+    app: steward-test-workload-exchange
+  ports:
+    - name: https
+      port: 8443
+      targetPort: https
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
   name: steward-controller
   namespace: steward-system
 spec:
@@ -420,8 +492,14 @@ spec:
               value: /run/steward/openshell-client.crt
             - name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE
               value: /run/steward/openshell-client.key
-            - name: STEWARD_OPENSHELL_BEARER_TOKEN_FILE
-              value: /run/steward/openshell-bearer-token
+            - name: STEWARD_WORKLOAD_EXCHANGE_ENDPOINT
+              value: https://workload-exchange.steward-system.svc.cluster.local:8443/v1/workload/exchange
+            - name: STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME
+              value: workload-exchange.steward-system.svc.cluster.local
+            - name: STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE
+              value: /run/steward/workload-exchange-ca.crt
+            - name: STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE
+              value: /run/steward/workload-source-credential
             - name: STEWARD_OPENSHELL_SERVER_NAME
               value: openshell.openshell.svc.cluster.local
             - name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME

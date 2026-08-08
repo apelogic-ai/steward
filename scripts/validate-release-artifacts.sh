@@ -40,7 +40,10 @@ grep -Eq 'value: "?kata-qemu"?' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE' "${rendered}"
-grep -q 'name: STEWARD_OPENSHELL_BEARER_TOKEN_FILE' "${rendered}"
+grep -q 'name: STEWARD_WORKLOAD_EXCHANGE_ENDPOINT' "${rendered}"
+grep -q 'name: STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME' "${rendered}"
+grep -q 'name: STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE' "${rendered}"
+grep -q 'name: STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE' "${rendered}"
 test "$(grep -c 'name: STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE' "${rendered}")" -eq 1
 grep -q 'value: "https://kubernetes.default.svc"' "${rendered}"
 if grep -Eq 'name: STEWARD_(TASK_)?TOKEN_AUDIENCE' "${rendered}"; then
@@ -55,11 +58,16 @@ then
 fi
 test "$(grep -c 'secretName: steward-openshell-client' "${rendered}")" -eq 1
 grep -q 'serviceAccountToken:' "${rendered}"
-grep -q 'audience: openshell-api' "${rendered}"
-grep -q 'expirationSeconds: 3600' "${rendered}"
-grep -q 'mountPath: /var/run/secrets/steward/openshell' "${rendered}"
-if grep -q 'key: token, path: token' "${rendered}"; then
-  echo "OpenShell workload token must not be sourced from a Secret" >&2
+grep -q 'audience: apelogic-workload-exchange' "${rendered}"
+grep -q 'expirationSeconds: 600' "${rendered}"
+grep -q 'mountPath: /var/run/secrets/steward/workload' "${rendered}"
+grep -q 'mountPath: /run/workload-exchange' "${rendered}"
+if grep -q 'name: STEWARD_OPENSHELL_BEARER_TOKEN_FILE' "${rendered}"; then
+  echo "the raw workload credential must not be sent directly to OpenShell" >&2
+  exit 1
+fi
+if grep -q 'key: source-token, path: source-token' "${rendered}"; then
+  echo "workload source credentials must not be sourced from a Secret" >&2
   exit 1
 fi
 if awk '

@@ -29,6 +29,9 @@ secrets:
     name: steward-mint
     signingKey: signing-key
     introspectionCredential: introspection-credential
+workloadExchangeTrust:
+  name: steward-workload-exchange-ca
+  caCertificate: ca.crt
 tls:
   issuerRef:
     name: cluster-issuer
@@ -44,6 +47,8 @@ config:
     openshellEndpoint: https://gateway.example.test:8080
     openshellServerName: gateway.example.test
     openshellRuntimeClassName: kata-qemu
+    workloadExchangeEndpoint: https://identity.example.test/v1/workload/exchange
+    workloadExchangeServerName: identity.example.test
     litellmUrl: http://litellm-litellm.litellm.svc.cluster.local:4000
   mint:
     issuer: http://steward-mint.steward.svc.cluster.local:8080
@@ -63,6 +68,7 @@ networkPolicy:
   arcNamespace: arc-runners
   mcpGatewayNamespace: mcp-gw
   openshellNamespace: openshell
+  identityExchangeNamespace: identity-exchange
   litellmNamespace: litellm
   ports:
     kubernetesApi: 443
@@ -70,6 +76,7 @@ networkPolicy:
     jira: 443
     litellm: 4000
     openshell: 8080
+    identityExchange: 8443
 spire:
   csiDriver: csi.spiffe.io
   socketPath: /run/spire/sockets

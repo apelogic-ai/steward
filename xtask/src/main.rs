@@ -918,6 +918,9 @@ mod tests {
             "openshellEndpoint",
             "openshellServerName",
             "openshellRuntimeClassName",
+            "workloadExchangeEndpoint",
+            "workloadExchangeServerName",
+            "workloadExchangeTrust",
             "openshellClient",
             "caCertificate",
             "clientCertificate",
@@ -942,7 +945,10 @@ mod tests {
             "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
             "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
             "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
-            "STEWARD_OPENSHELL_BEARER_TOKEN_FILE",
+            "STEWARD_WORKLOAD_EXCHANGE_ENDPOINT",
+            "STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME",
+            "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
+            "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
             "STEWARD_OPENSHELL_SERVER_NAME",
             "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
         ] {
@@ -961,10 +967,10 @@ mod tests {
         );
         for projected_token_contract in [
             "serviceAccountToken:",
-            "audience: openshell-api",
-            "expirationSeconds: 3600",
-            "mountPath: /var/run/secrets/steward/openshell",
-            "value: /var/run/secrets/steward/openshell/token",
+            "audience: apelogic-workload-exchange",
+            "expirationSeconds: 600",
+            "mountPath: /var/run/secrets/steward/workload",
+            "value: /var/run/secrets/steward/workload/source-token",
         ] {
             assert!(
                 templates.contains(projected_token_contract),
@@ -972,9 +978,19 @@ mod tests {
             );
         }
         assert_eq!(
-            templates.matches("path: token").count(),
+            templates.matches("path: source-token").count(),
             1,
-            "only the projected service-account token volume may provide the OpenShell token path"
+            "only the projected service-account token volume may provide the workload source credential path"
+        );
+        assert!(
+            !templates.contains("STEWARD_OPENSHELL_BEARER_TOKEN_FILE")
+                && !templates.contains("audience: openshell-api"),
+            "the chart must never send a raw Kubernetes service-account token to OpenShell"
+        );
+        assert!(
+            !values.contains("workloadExchangeRoles")
+                && !values.contains("workloadExchangeAlgorithm"),
+            "the caller must not select exchange roles or a signing algorithm"
         );
 
         Ok(())
@@ -1279,7 +1295,10 @@ mod tests {
             "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
             "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
             "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
-            "STEWARD_OPENSHELL_BEARER_TOKEN_FILE",
+            "STEWARD_WORKLOAD_EXCHANGE_ENDPOINT",
+            "STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME",
+            "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
+            "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
             "STEWARD_OPENSHELL_SERVER_NAME",
             "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
         ] {
@@ -1297,7 +1316,10 @@ mod tests {
                 "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
                 "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
                 "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
-                "STEWARD_OPENSHELL_BEARER_TOKEN_FILE",
+                "STEWARD_WORKLOAD_EXCHANGE_ENDPOINT",
+                "STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME",
+                "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
+                "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
                 "STEWARD_OPENSHELL_SERVER_NAME",
                 "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
             ] {
@@ -1316,7 +1338,10 @@ mod tests {
             "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
             "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
             "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
-            "STEWARD_OPENSHELL_BEARER_TOKEN_FILE",
+            "STEWARD_WORKLOAD_EXCHANGE_ENDPOINT",
+            "STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME",
+            "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
+            "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
             "STEWARD_OPENSHELL_SERVER_NAME",
             "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
         ] {

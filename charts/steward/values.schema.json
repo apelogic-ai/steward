@@ -5,6 +5,7 @@
   "required": [
     "images",
     "secrets",
+    "workloadExchangeTrust",
     "tls",
     "config",
     "runtimeNamespaces",
@@ -63,6 +64,15 @@
         }
       }
     },
+    "workloadExchangeTrust": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "caCertificate"],
+      "properties": {
+        "name": {"$ref": "#/definitions/nonempty"},
+        "caCertificate": {"$ref": "#/definitions/nonempty"}
+      }
+    },
     "tls": {
       "type": "object",
       "additionalProperties": false,
@@ -114,12 +124,20 @@
             "openshellEndpoint",
             "openshellServerName",
             "openshellRuntimeClassName",
+            "workloadExchangeEndpoint",
+            "workloadExchangeServerName",
             "litellmUrl"
           ],
           "properties": {
             "openshellEndpoint": {"type": "string", "pattern": "^https://", "minLength": 9},
             "openshellServerName": {"$ref": "#/definitions/nonempty"},
             "openshellRuntimeClassName": {"const": "kata-qemu"},
+            "workloadExchangeEndpoint": {
+              "type": "string",
+              "pattern": "^https://[^/?#]+(?::[0-9]+)?/v1/workload/exchange$",
+              "minLength": 38
+            },
+            "workloadExchangeServerName": {"$ref": "#/definitions/nonempty"},
             "litellmUrl": {"type": "string", "pattern": "^https?://", "minLength": 9}
           }
         },
@@ -163,6 +181,7 @@
         "arcNamespace",
         "mcpGatewayNamespace",
         "openshellNamespace",
+        "identityExchangeNamespace",
         "litellmNamespace",
         "ports"
       ],
@@ -176,17 +195,19 @@
         "arcNamespace": {"$ref": "#/definitions/nonempty"},
         "mcpGatewayNamespace": {"$ref": "#/definitions/nonempty"},
         "openshellNamespace": {"$ref": "#/definitions/nonempty"},
+        "identityExchangeNamespace": {"$ref": "#/definitions/nonempty"},
         "litellmNamespace": {"$ref": "#/definitions/nonempty"},
         "ports": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kubernetesApi", "postgres", "jira", "litellm", "openshell"],
+          "required": ["kubernetesApi", "postgres", "jira", "litellm", "openshell", "identityExchange"],
           "properties": {
             "kubernetesApi": {"$ref": "#/definitions/port"},
             "postgres": {"$ref": "#/definitions/port"},
             "jira": {"$ref": "#/definitions/port"},
             "litellm": {"$ref": "#/definitions/port"},
-            "openshell": {"$ref": "#/definitions/port"}
+            "openshell": {"$ref": "#/definitions/port"},
+            "identityExchange": {"$ref": "#/definitions/port"}
           }
         }
       }
