@@ -80,6 +80,8 @@ metadata:
   name: kata-qemu
   labels:
     steward.test/run-id: ${RUN_ID}
+# Kind cannot provide Kata isolation. This lane verifies only that the
+# kata-qemu RuntimeClass selection propagates into the Sandbox pod template.
 handler: runc
 YAML
 
@@ -385,6 +387,6 @@ STEWARD_RUN_DIR="${RUN_DIR}" \
 cargo test \
   --manifest-path "${ROOT}/e2e/Cargo.toml" \
   --test openshell_adapter_v0098 \
-  adapter_round_trip_is_authenticated_kata_bound_and_cleanup_safe \
+  adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_cleanup \
   -- \
   --exact

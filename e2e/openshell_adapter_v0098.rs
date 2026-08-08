@@ -104,7 +104,7 @@ fn output_payload(run_dir: &Path, archive: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("declared output out/payload.bin is missing: {error}"))
 }
 
-fn assert_kata_runtime(workspace: &str, sandbox: &str) -> Result<(), String> {
+fn assert_runtime_class_propagation(workspace: &str, sandbox: &str) -> Result<(), String> {
     let kubeconfig = required("STEWARD_TEST_KUBECONFIG")?;
     let context = required("STEWARD_TEST_KUBE_CONTEXT")?;
     let selector =
@@ -191,7 +191,8 @@ async fn delete_sandbox(
 }
 
 #[tokio::test]
-async fn adapter_round_trip_is_authenticated_kata_bound_and_cleanup_safe() -> Result<(), String> {
+async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_cleanup()
+-> Result<(), String> {
     if required("STEWARD_OPEN_SHELL_RELEASE")? != EXPECTED_RELEASE {
         return Err(format!(
             "adapter integration requires OpenShell {EXPECTED_RELEASE}"
@@ -221,11 +222,13 @@ async fn adapter_round_trip_is_authenticated_kata_bound_and_cleanup_safe() -> Re
         "a mismatched OpenShell TLS server name must fail closed"
     );
 
-    let mut non_kata = config.clone();
-    non_kata.runtime_class_name = "runc".to_owned();
+    let mut unsupported_runtime_class = config.clone();
+    unsupported_runtime_class.runtime_class_name = "runc".to_owned();
     assert!(
-        OpenShellRuntime::connect(non_kata).await.is_err(),
-        "a non-Kata runtime contract must fail closed"
+        OpenShellRuntime::connect(unsupported_runtime_class)
+            .await
+            .is_err(),
+        "a runtime class contract other than kata-qemu must fail closed"
     );
 
     let runtime = OpenShellRuntime::connect(config)
@@ -251,7 +254,7 @@ async fn adapter_round_trip_is_authenticated_kata_bound_and_cleanup_safe() -> Re
         .sandbox
         .as_deref()
         .ok_or_else(|| "running sandbox has no sandbox reference".to_owned())?;
-    assert_kata_runtime(workspace, sandbox)?;
+    assert_runtime_class_propagation(workspace, sandbox)?;
     request.refs = refs.clone();
 
     let run_dir = PathBuf::from(required("STEWARD_RUN_DIR")?);

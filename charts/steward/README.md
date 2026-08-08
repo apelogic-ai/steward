@@ -139,7 +139,10 @@ identity-provider association.
 Run `cargo xtask e2e-openshell-adapter` to exercise the adapter against the
 exact OpenShell `v0.0.98` chart in an ephemeral kind cluster. The test verifies
 authenticated TLS failures, CA and server-name validation, the `kata-qemu`
-contract, input/output SHA-256 equality, and sandbox-last cleanup.
+runtime-class selection propagates into the Sandbox pod template, input/output
+SHA-256 equality, and sandbox-last cleanup. Kind maps the test RuntimeClass to
+the `runc` handler, so this lane does not prove Kata isolation. Actual
+`kata-qemu` isolation remains a required live EKS E2E assertion.
 
 ## Network policy
 

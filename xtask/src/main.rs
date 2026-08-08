@@ -1207,6 +1207,10 @@ mod tests {
         let harness = fs::read_to_string(root().join("scripts/openshell-adapter-e2e.sh")).map_err(
             |error| format!("OpenShell adapter integration harness is required: {error}"),
         )?;
+        let e2e_source = fs::read_to_string(root().join("e2e/openshell_adapter_v0098.rs"))
+            .map_err(|error| format!("OpenShell adapter integration test is required: {error}"))?;
+        let chart_readme = fs::read_to_string(root().join("charts/steward/README.md"))
+            .map_err(|error| format!("Steward chart README is required: {error}"))?;
 
         assert!(
             ci.contains("cargo xtask e2e-openshell-adapter"),
@@ -1219,6 +1223,7 @@ mod tests {
         for required in [
             "OPEN_SHELL_RELEASE=\"v0.0.98\"",
             "server.defaultRuntimeClassName=kata-qemu",
+            "handler: runc",
             "server.oidc.issuer=",
             "--test openshell_adapter_v0098",
         ] {
@@ -1227,6 +1232,15 @@ mod tests {
                 "OpenShell adapter integration harness is missing {required}"
             );
         }
+        assert!(
+            e2e_source.contains("assert_runtime_class_propagation")
+                && !e2e_source.contains("kata_bound"),
+            "the kind lane must describe runtime-class propagation, not Kata isolation"
+        );
+        assert!(
+            chart_readme.contains("does not prove Kata isolation"),
+            "the chart documentation must reserve Kata isolation evidence for live EKS"
+        );
 
         let adapter_source = fs::read_to_string(root().join("adapters/openshell/src/lib.rs"))
             .map_err(|error| format!("OpenShell adapter source is required: {error}"))?;
