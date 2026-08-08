@@ -7,7 +7,9 @@ use std::future::Future;
 #[cfg(feature = "runtime")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "runtime")]
-use std::time::Duration as StdDuration;
+use std::sync::Arc;
+#[cfg(feature = "runtime")]
+use std::time::{Duration as StdDuration, Instant};
 
 #[cfg(feature = "identity")]
 use kube::Client;
@@ -28,6 +30,12 @@ use openshell_sdk::raw::proto::{
 use openshell_sdk::{
     EdgeAuthInterceptor, ExecOptions, OpenShellClient, SandboxPhase, SandboxSpec, SdkError,
 };
+#[cfg(feature = "runtime")]
+use reqwest::header::CACHE_CONTROL;
+#[cfg(feature = "runtime")]
+use reqwest::{Certificate as HttpCertificate, Client as HttpClient, StatusCode, Url};
+#[cfg(feature = "runtime")]
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 #[cfg(feature = "runtime")]
 use steward_ports::PortError;
@@ -38,6 +46,8 @@ use steward_ports::{
 };
 #[cfg(feature = "runtime")]
 use steward_types::RuntimeRefs;
+#[cfg(feature = "runtime")]
+use tokio::sync::Mutex;
 #[cfg(feature = "runtime")]
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
@@ -57,6 +67,14 @@ const INFERENCE_PROVIDER: &str = "steward-litellm";
 const GRPC_NOT_FOUND: i32 = 5;
 #[cfg(feature = "runtime")]
 const GRPC_ALREADY_EXISTS: i32 = 6;
+#[cfg(feature = "runtime")]
+const WORKLOAD_EXCHANGE_PATH: &str = "/v1/workload/exchange";
+#[cfg(feature = "runtime")]
+const WORKLOAD_ACCESS_TOKEN_MAX_TTL: StdDuration = StdDuration::from_secs(120);
+#[cfg(feature = "runtime")]
+const WORKLOAD_ACCESS_TOKEN_REFRESH_SKEW: StdDuration = StdDuration::from_secs(30);
+#[cfg(feature = "runtime")]
+const WORKLOAD_EXCHANGE_MAX_RESPONSE_BYTES: u64 = 16 * 1024;
 #[cfg(feature = "runtime")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderReconciliation {
@@ -323,7 +341,10 @@ pub struct OpenShellConnectionConfig {
     pub ca_certificate_pem: Vec<u8>,
     pub client_certificate_pem: Vec<u8>,
     pub client_private_key_pem: Vec<u8>,
-    pub bearer_token_file: PathBuf,
+    pub workload_exchange_endpoint: String,
+    pub workload_exchange_server_name: String,
+    pub workload_exchange_ca_certificate_pem: Vec<u8>,
+    pub workload_source_credential_file: PathBuf,
     pub server_name: String,
     pub runtime_class_name: String,
 }
@@ -352,9 +373,18 @@ impl OpenShellConnectionConfig {
                 });
             }
         }
-        if self.bearer_token_file.as_os_str().is_empty() {
+        if self.workload_source_credential_file.as_os_str().is_empty() {
             return Err(PortError::Rejected {
-                reason: "OpenShell gateway caller bearer token file is required".to_owned(),
+                reason: "workload source credential file is required".to_owned(),
+            });
+        }
+        validate_workload_exchange_endpoint(
+            &self.workload_exchange_endpoint,
+            &self.workload_exchange_server_name,
+        )?;
+        if self.workload_exchange_ca_certificate_pem.is_empty() {
+            return Err(PortError::Rejected {
+                reason: "workload exchange CA certificate is required".to_owned(),
             });
         }
         if self.runtime_class_name != REQUIRED_RUNTIME_CLASS_NAME {
@@ -369,30 +399,238 @@ impl OpenShellConnectionConfig {
 }
 
 #[cfg(feature = "runtime")]
-fn load_caller_token(path: &Path) -> Result<String, PortError> {
+fn load_source_credential(path: &Path) -> Result<OpaqueToken, PortError> {
     let token = std::fs::read_to_string(path).map_err(|_| PortError::Rejected {
-        reason: "OpenShell gateway caller token is unavailable".to_owned(),
+        reason: "workload source credential is unavailable".to_owned(),
     })?;
     let token = token.trim();
     if token.is_empty() {
         return Err(PortError::Rejected {
-            reason: "OpenShell gateway caller token is empty".to_owned(),
+            reason: "workload source credential is empty".to_owned(),
         });
     }
-    Ok(token.to_owned())
+    Ok(OpaqueToken(token.to_owned()))
+}
+
+#[cfg(feature = "runtime")]
+fn validate_workload_exchange_endpoint(
+    endpoint: &str,
+    server_name: &str,
+) -> Result<Url, PortError> {
+    let url = Url::parse(endpoint).map_err(|_| PortError::Rejected {
+        reason: "workload exchange endpoint is invalid".to_owned(),
+    })?;
+    if url.scheme() != "https"
+        || url.path() != WORKLOAD_EXCHANGE_PATH
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(PortError::Rejected {
+            reason: format!(
+                "workload exchange endpoint must be verified HTTPS at {WORKLOAD_EXCHANGE_PATH}"
+            ),
+        });
+    }
+    if server_name.trim().is_empty() || url.host_str() != Some(server_name) {
+        return Err(PortError::Rejected {
+            reason: "workload exchange server name must exactly match the endpoint host".to_owned(),
+        });
+    }
+    Ok(url)
+}
+
+#[cfg(feature = "runtime")]
+struct OpaqueToken(String);
+
+#[cfg(feature = "runtime")]
+impl OpaqueToken {
+    fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(feature = "runtime")]
+impl Clone for OpaqueToken {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+#[cfg(feature = "runtime")]
+struct CachedAccessToken {
+    token: OpaqueToken,
+    refresh_at: Instant,
+}
+
+#[cfg(feature = "runtime")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkloadExchangeResponse {
+    access_token: String,
+    token_type: String,
+    expires_in: u64,
+}
+
+#[cfg(feature = "runtime")]
+#[derive(Clone)]
+struct WorkloadExchangeTokenProvider {
+    cache: Arc<Mutex<Option<CachedAccessToken>>>,
+    client: HttpClient,
+    endpoint: Url,
+    source_credential_file: PathBuf,
+}
+
+#[cfg(feature = "runtime")]
+impl WorkloadExchangeTokenProvider {
+    fn new(config: &OpenShellConnectionConfig) -> Result<Self, PortError> {
+        let endpoint = validate_workload_exchange_endpoint(
+            &config.workload_exchange_endpoint,
+            &config.workload_exchange_server_name,
+        )?;
+        let certificates =
+            HttpCertificate::from_pem_bundle(&config.workload_exchange_ca_certificate_pem)
+                .map_err(|_| PortError::Rejected {
+                    reason: "workload exchange CA certificate is invalid".to_owned(),
+                })?;
+        if certificates.is_empty() {
+            return Err(PortError::Rejected {
+                reason: "workload exchange CA certificate is empty".to_owned(),
+            });
+        }
+        let mut builder = HttpClient::builder()
+            .https_only(true)
+            .tls_built_in_root_certs(false)
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(StdDuration::from_secs(5))
+            .timeout(StdDuration::from_secs(10));
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+        let client = builder.build().map_err(|_| PortError::Rejected {
+            reason: "workload exchange HTTPS client configuration is invalid".to_owned(),
+        })?;
+        Ok(Self {
+            cache: Arc::new(Mutex::new(None)),
+            client,
+            endpoint,
+            source_credential_file: config.workload_source_credential_file.clone(),
+        })
+    }
+
+    async fn access_token(&self) -> Result<OpaqueToken, PortError> {
+        let mut cache = self.cache.lock().await;
+        let now = Instant::now();
+        if let Some(cached) = cache.as_ref().filter(|cached| now < cached.refresh_at) {
+            return Ok(cached.token.clone());
+        }
+        let source_file = self.source_credential_file.clone();
+        let source = tokio::task::spawn_blocking(move || load_source_credential(&source_file))
+            .await
+            .map_err(|_| PortError::Failed {
+                reason: "workload source credential could not be loaded".to_owned(),
+            })??;
+        let mut response = self
+            .client
+            .post(self.endpoint.clone())
+            .bearer_auth(source.expose_secret())
+            .send()
+            .await
+            .map_err(workload_exchange_unavailable)?;
+        if response.status() != StatusCode::OK {
+            return Err(if response.status().is_client_error() {
+                PortError::Rejected {
+                    reason: "workload exchange rejected the source credential".to_owned(),
+                }
+            } else {
+                PortError::Failed {
+                    reason: "workload exchange is unavailable".to_owned(),
+                }
+            });
+        }
+        let cache_control = response
+            .headers()
+            .get(CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !cache_control
+            .split(',')
+            .any(|directive| directive.trim().eq_ignore_ascii_case("no-store"))
+        {
+            return Err(PortError::Rejected {
+                reason: "workload exchange response must forbid storage".to_owned(),
+            });
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > WORKLOAD_EXCHANGE_MAX_RESPONSE_BYTES)
+        {
+            return Err(PortError::Rejected {
+                reason: "workload exchange response is too large".to_owned(),
+            });
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(workload_exchange_unavailable)?
+        {
+            let next_length = body.len().saturating_add(chunk.len());
+            if u64::try_from(next_length).unwrap_or(u64::MAX) > WORKLOAD_EXCHANGE_MAX_RESPONSE_BYTES
+            {
+                return Err(PortError::Rejected {
+                    reason: "workload exchange response is too large".to_owned(),
+                });
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let exchanged =
+            serde_json::from_slice::<WorkloadExchangeResponse>(&body).map_err(|_| {
+                PortError::Rejected {
+                    reason: "workload exchange response is invalid".to_owned(),
+                }
+            })?;
+        if exchanged.token_type != "Bearer"
+            || exchanged.access_token.trim().is_empty()
+            || exchanged.access_token.trim() != exchanged.access_token
+            || exchanged.expires_in == 0
+            || exchanged.expires_in > WORKLOAD_ACCESS_TOKEN_MAX_TTL.as_secs()
+        {
+            return Err(PortError::Rejected {
+                reason: "workload exchange access token contract is invalid".to_owned(),
+            });
+        }
+        let token = OpaqueToken(exchanged.access_token);
+        let ttl = StdDuration::from_secs(exchanged.expires_in);
+        let refresh_at = now + ttl.saturating_sub(WORKLOAD_ACCESS_TOKEN_REFRESH_SKEW);
+        *cache = Some(CachedAccessToken {
+            token: token.clone(),
+            refresh_at,
+        });
+        Ok(token)
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn workload_exchange_unavailable(_: reqwest::Error) -> PortError {
+    PortError::Failed {
+        reason: "workload exchange is unavailable".to_owned(),
+    }
 }
 
 #[cfg(feature = "runtime")]
 #[derive(Clone)]
 pub struct OpenShellRuntime {
     channel: Channel,
-    bearer_token_file: PathBuf,
+    token_provider: WorkloadExchangeTokenProvider,
 }
 
 #[cfg(feature = "runtime")]
 impl OpenShellRuntime {
     pub async fn connect(config: OpenShellConnectionConfig) -> Result<Self, PortError> {
         config.validate()?;
+        let token_provider = WorkloadExchangeTokenProvider::new(&config)?;
         let tls = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(config.ca_certificate_pem))
             .identity(Identity::from_pem(
@@ -410,23 +648,19 @@ impl OpenShellRuntime {
             .map_err(raw_port_failure)?;
         let runtime = Self {
             channel,
-            bearer_token_file: config.bearer_token_file,
+            token_provider,
         };
         runtime.authenticated_client().await?;
         Ok(runtime)
     }
 
     async fn authenticated_client(&self) -> Result<OpenShellClient, PortError> {
-        let token_file = self.bearer_token_file.clone();
-        let token = tokio::task::spawn_blocking(move || load_caller_token(&token_file))
-            .await
-            .map_err(|_| PortError::Failed {
-                reason: "OpenShell gateway caller token could not be loaded".to_owned(),
-            })?;
-        let token = token?;
+        let token = self.token_provider.access_token().await?;
         let interceptor =
-            EdgeAuthInterceptor::new(Some(&token), None).map_err(|_| PortError::Rejected {
-                reason: "OpenShell gateway caller token is invalid".to_owned(),
+            EdgeAuthInterceptor::new(Some(token.expose_secret()), None).map_err(|_| {
+                PortError::Rejected {
+                    reason: "OpenShell gateway caller token is invalid".to_owned(),
+                }
             })?;
         Ok(OpenShellClient::from_parts(
             self.channel.clone(),
@@ -984,11 +1218,28 @@ mod tests {
     #[cfg(feature = "runtime")]
     use std::future::Future;
     #[cfg(feature = "runtime")]
+    use std::io::{Read, Write};
+    #[cfg(feature = "runtime")]
+    use std::net::TcpListener;
+    #[cfg(feature = "runtime")]
     use std::path::PathBuf;
+    #[cfg(feature = "runtime")]
+    use std::sync::Arc;
     #[cfg(feature = "runtime")]
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     #[cfg(feature = "runtime")]
+    use std::sync::mpsc::{self, Receiver};
+    #[cfg(feature = "runtime")]
     use std::task::{Context, Poll, Waker};
+    #[cfg(feature = "runtime")]
+    use std::thread::JoinHandle;
+    #[cfg(feature = "runtime")]
+    use std::time::Duration;
+
+    #[cfg(feature = "runtime")]
+    use reqwest::{Client as HttpClient, Url};
+    #[cfg(feature = "runtime")]
+    use tokio::sync::Mutex;
 
     #[cfg(feature = "runtime")]
     use steward_ports::PortError;
@@ -1003,9 +1254,131 @@ mod tests {
     #[cfg(feature = "runtime")]
     use super::{
         OpenShellConnectionConfig, ProviderReconciliation, SandboxDeleteClient,
-        delete_owned_sandbox, deletion_names, load_caller_token, project_request,
-        provider_reconciliation, sandbox_spec,
+        WorkloadExchangeTokenProvider, delete_owned_sandbox, deletion_names,
+        load_source_credential, project_request, provider_reconciliation, sandbox_spec,
+        validate_workload_exchange_endpoint,
     };
+
+    #[cfg(feature = "runtime")]
+    struct MockExchange {
+        endpoint: Url,
+        handle: JoinHandle<Result<(), String>>,
+        requests: Receiver<String>,
+    }
+
+    #[cfg(feature = "runtime")]
+    impl MockExchange {
+        fn finish(self, expected_requests: usize) -> Result<Vec<String>, String> {
+            let mut requests = Vec::with_capacity(expected_requests);
+            for _ in 0..expected_requests {
+                requests.push(
+                    self.requests
+                        .recv_timeout(Duration::from_secs(2))
+                        .map_err(|error| format!("mock exchange captured no request: {error}"))?,
+                );
+            }
+            self.handle
+                .join()
+                .map_err(|_| "mock exchange server panicked".to_owned())??;
+            Ok(requests)
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    fn mock_exchange(response: String) -> Result<MockExchange, String> {
+        mock_exchange_responses(vec![response])
+    }
+
+    #[cfg(feature = "runtime")]
+    fn mock_exchange_responses(responses: Vec<String>) -> Result<MockExchange, String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("failed to bind mock exchange: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("failed to inspect mock exchange address: {error}"))?;
+        let endpoint = Url::parse(&format!("http://{address}/v1/workload/exchange"))
+            .map_err(|error| format!("failed to build mock exchange URL: {error}"))?;
+        let (sender, requests) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener
+                    .accept()
+                    .map_err(|error| format!("mock exchange accept failed: {error}"))?;
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .map_err(|error| format!("mock exchange timeout setup failed: {error}"))?;
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .map_err(|error| format!("mock exchange request read failed: {error}"))?;
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request)
+                    .map_err(|_| "mock exchange request was not UTF-8".to_owned())?;
+                sender
+                    .send(request)
+                    .map_err(|error| format!("mock exchange capture failed: {error}"))?;
+                stream
+                    .write_all(response.as_bytes())
+                    .map_err(|error| format!("mock exchange response write failed: {error}"))?;
+            }
+            Ok(())
+        });
+        Ok(MockExchange {
+            endpoint,
+            handle,
+            requests,
+        })
+    }
+
+    #[cfg(feature = "runtime")]
+    fn response(status: u16, cache_control: Option<&str>, body: &str) -> String {
+        let cache_control = cache_control
+            .map(|value| format!("Cache-Control: {value}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\n{cache_control}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[cfg(feature = "runtime")]
+    fn source_credential_fixture() -> Result<PathBuf, String> {
+        static TOKEN_FILE_ID: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "steward-workload-source-{}-{}",
+            std::process::id(),
+            TOKEN_FILE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, "obviously-fake-source-credential")
+            .map_err(|error| format!("failed to create source credential fixture: {error}"))?;
+        Ok(path)
+    }
+
+    #[cfg(feature = "runtime")]
+    fn test_token_provider(
+        endpoint: Url,
+        source_credential_file: PathBuf,
+    ) -> Result<WorkloadExchangeTokenProvider, String> {
+        Ok(WorkloadExchangeTokenProvider {
+            cache: Arc::new(Mutex::new(None)),
+            client: HttpClient::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(2))
+                .build()
+                .map_err(|error| format!("failed to build test exchange client: {error}"))?,
+            endpoint,
+            source_credential_file,
+        })
+    }
 
     #[cfg(feature = "runtime")]
     fn valid_connection_config() -> OpenShellConnectionConfig {
@@ -1014,7 +1387,11 @@ mod tests {
             ca_certificate_pem: b"test-ca-certificate".to_vec(),
             client_certificate_pem: b"test-client-certificate".to_vec(),
             client_private_key_pem: b"test-client-private-key".to_vec(),
-            bearer_token_file: PathBuf::from("/run/openshell-token/token"),
+            workload_exchange_endpoint: "https://identity.example.test/v1/workload/exchange"
+                .to_owned(),
+            workload_exchange_server_name: "identity.example.test".to_owned(),
+            workload_exchange_ca_certificate_pem: b"test-exchange-ca-certificate".to_vec(),
+            workload_source_credential_file: PathBuf::from("/run/workload/source-credential"),
             server_name: "gateway.example.test".to_owned(),
             runtime_class_name: "kata-qemu".to_owned(),
         }
@@ -1034,12 +1411,240 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
+    fn workload_exchange_requires_exact_verified_https_endpoint() {
+        for (endpoint, server_name) in [
+            (
+                "http://identity.example.test/v1/workload/exchange",
+                "identity.example.test",
+            ),
+            (
+                "https://identity.example.test/v1/exchange",
+                "identity.example.test",
+            ),
+            (
+                "https://identity.example.test/v1/workload/exchange?roles=admin",
+                "identity.example.test",
+            ),
+            (
+                "https://identity.example.test/v1/workload/exchange",
+                "other.example.test",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    validate_workload_exchange_endpoint(endpoint, server_name),
+                    Err(PortError::Rejected { .. })
+                ),
+                "the workload exchange must reject an inexact or unverified endpoint"
+            );
+        }
+        assert!(
+            validate_workload_exchange_endpoint(
+                "https://identity.example.test/v1/workload/exchange",
+                "identity.example.test",
+            )
+            .is_ok(),
+            "the exact verified workload exchange endpoint must be accepted"
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn workload_exchange_uses_empty_post_and_caches_only_the_access_token()
+    -> Result<(), String> {
+        let body = r#"{"access_token":"obviously-fake-access-token","token_type":"Bearer","expires_in":120}"#;
+        let exchange = mock_exchange(response(200, Some("private, no-store"), body))?;
+        let source_file = source_credential_fixture()?;
+        let provider = test_token_provider(exchange.endpoint.clone(), source_file.clone())?;
+
+        let (first, second, third) = tokio::join!(
+            provider.access_token(),
+            provider.access_token(),
+            provider.access_token()
+        );
+        for token in [first, second, third] {
+            assert_eq!(
+                token
+                    .map_err(|error| format!("exchange failed: {error:?}"))?
+                    .expose_secret(),
+                "obviously-fake-access-token"
+            );
+        }
+        let [request] = exchange
+            .finish(1)?
+            .try_into()
+            .map_err(|_| "mock exchange request count changed".to_owned())?;
+        std::fs::remove_file(source_file)
+            .map_err(|error| format!("failed to remove source credential fixture: {error}"))?;
+        let (headers, body) = request
+            .split_once("\r\n\r\n")
+            .ok_or_else(|| "mock exchange request had no header terminator".to_owned())?;
+        assert!(
+            headers.starts_with("POST /v1/workload/exchange HTTP/1.1\r\n"),
+            "the client must call only the exact workload exchange path"
+        );
+        assert!(
+            headers.lines().any(|line| {
+                line.eq_ignore_ascii_case("authorization: Bearer obviously-fake-source-credential")
+            }),
+            "the current source credential must be carried only as the bearer authorization"
+        );
+        assert!(
+            body.is_empty(),
+            "the workload exchange POST body must be empty"
+        );
+        assert!(
+            !headers.contains("roles")
+                && !headers.contains("algorithm")
+                && !headers.contains("audience"),
+            "the caller must not select output claims or signing behavior"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn workload_exchange_response_contract_fails_closed_without_exposing_tokens()
+    -> Result<(), String> {
+        let cases = [
+            (
+                response(
+                    200,
+                    None,
+                    r#"{"access_token":"obviously-fake-access-token","token_type":"Bearer","expires_in":120}"#,
+                ),
+                "missing no-store",
+            ),
+            (
+                response(
+                    200,
+                    Some("no-store"),
+                    r#"{"access_token":"obviously-fake-access-token","token_type":"bearer","expires_in":120}"#,
+                ),
+                "wrong token type",
+            ),
+            (
+                response(
+                    200,
+                    Some("no-store"),
+                    r#"{"access_token":"obviously-fake-access-token","token_type":"Bearer","expires_in":121}"#,
+                ),
+                "excessive expiry",
+            ),
+            (
+                response(
+                    200,
+                    Some("no-store"),
+                    r#"{"access_token":"obviously-fake-access-token","token_type":"Bearer","expires_in":120,"roles":["admin"]}"#,
+                ),
+                "caller-selected fields",
+            ),
+            (
+                response(401, Some("no-store"), r#"{"error":"invalid_token"}"#),
+                "rejected source",
+            ),
+        ];
+        for (wire_response, description) in cases {
+            let exchange = mock_exchange(wire_response)?;
+            let source_file = source_credential_fixture()?;
+            let provider = test_token_provider(exchange.endpoint.clone(), source_file.clone())?;
+            let result = provider.access_token().await;
+            assert!(
+                matches!(&result, Err(PortError::Rejected { .. })),
+                "the exchange must fail closed for {description}"
+            );
+            let rendered = result
+                .err()
+                .map(|error| format!("{error:?}"))
+                .unwrap_or_default();
+            assert!(
+                !rendered.contains("obviously-fake-source-credential")
+                    && !rendered.contains("obviously-fake-access-token"),
+                "exchange errors must not expose either credential"
+            );
+            let _ = exchange.finish(1)?;
+            std::fs::remove_file(source_file)
+                .map_err(|error| format!("failed to remove source credential fixture: {error}"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn workload_exchange_does_not_follow_redirects() -> Result<(), String> {
+        let exchange = mock_exchange(response(307, None, ""))?;
+        let source_file = source_credential_fixture()?;
+        let provider = test_token_provider(exchange.endpoint.clone(), source_file.clone())?;
+
+        assert!(
+            matches!(provider.access_token().await, Err(PortError::Failed { .. })),
+            "the source credential must never follow a workload exchange redirect"
+        );
+        let _ = exchange.finish(1)?;
+        std::fs::remove_file(source_file)
+            .map_err(|error| format!("failed to remove source credential fixture: {error}"))?;
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn expired_access_token_refreshes_from_the_current_source_credential()
+    -> Result<(), String> {
+        let exchange = mock_exchange_responses(vec![
+            response(
+                200,
+                Some("no-store"),
+                r#"{"access_token":"obviously-fake-first-access","token_type":"Bearer","expires_in":1}"#,
+            ),
+            response(
+                200,
+                Some("no-store"),
+                r#"{"access_token":"obviously-fake-second-access","token_type":"Bearer","expires_in":120}"#,
+            ),
+        ])?;
+        let source_file = source_credential_fixture()?;
+        let provider = test_token_provider(exchange.endpoint.clone(), source_file.clone())?;
+        let first = provider
+            .access_token()
+            .await
+            .map_err(|error| format!("first exchange failed: {error:?}"))?;
+        assert_eq!(first.expose_secret(), "obviously-fake-first-access");
+        std::fs::write(&source_file, "obviously-fake-rotated-source")
+            .map_err(|error| format!("failed to rotate source credential fixture: {error}"))?;
+        let second = provider
+            .access_token()
+            .await
+            .map_err(|error| format!("refresh exchange failed: {error:?}"))?;
+        assert_eq!(second.expose_secret(), "obviously-fake-second-access");
+        let requests = exchange.finish(2)?;
+        assert!(
+            requests[0].lines().any(|line| {
+                line.eq_ignore_ascii_case("authorization: Bearer obviously-fake-source-credential")
+            }),
+            "the first exchange must use the initial source credential"
+        );
+        assert!(
+            requests[1].lines().any(|line| {
+                line.eq_ignore_ascii_case("authorization: Bearer obviously-fake-rotated-source")
+            }),
+            "refresh must load the current source credential"
+        );
+        std::fs::remove_file(source_file)
+            .map_err(|error| format!("failed to remove source credential fixture: {error}"))?;
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
     fn gateway_transport_requires_explicit_trust_and_caller_identity() {
         for mutate in [
             |config: &mut OpenShellConnectionConfig| config.ca_certificate_pem.clear(),
             |config: &mut OpenShellConnectionConfig| config.client_certificate_pem.clear(),
             |config: &mut OpenShellConnectionConfig| config.client_private_key_pem.clear(),
-            |config: &mut OpenShellConnectionConfig| config.bearer_token_file.clear(),
+            |config: &mut OpenShellConnectionConfig| config.workload_source_credential_file.clear(),
+            |config: &mut OpenShellConnectionConfig| {
+                config.workload_exchange_ca_certificate_pem.clear()
+            },
             |config: &mut OpenShellConnectionConfig| config.server_name.clear(),
         ] {
             let mut config = valid_connection_config();
@@ -1065,7 +1670,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn caller_token_file_observes_rotation_and_fails_closed() -> Result<(), String> {
+    fn source_credential_file_observes_rotation_and_fails_closed() -> Result<(), String> {
         static TOKEN_FILE_ID: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "steward-openshell-token-{}-{}",
@@ -1077,40 +1682,49 @@ mod tests {
         std::fs::write(&path, first)
             .map_err(|error| format!("failed to create token fixture: {error}"))?;
         assert_eq!(
-            load_caller_token(&path).map_err(|error| format!("{error:?}"))?,
-            first
+            load_source_credential(&path)
+                .map_err(|error| format!("{error:?}"))?
+                .expose_secret(),
+            first,
         );
         std::fs::write(&path, second)
             .map_err(|error| format!("failed to rotate token fixture: {error}"))?;
         assert_eq!(
-            load_caller_token(&path).map_err(|error| format!("{error:?}"))?,
+            load_source_credential(&path)
+                .map_err(|error| format!("{error:?}"))?
+                .expose_secret(),
             second,
             "each token load must observe the current file contents"
         );
         std::fs::write(&path, b"")
             .map_err(|error| format!("failed to empty token fixture: {error}"))?;
-        let empty = load_caller_token(&path);
+        let empty = load_source_credential(&path);
         assert!(
             matches!(&empty, Err(PortError::Rejected { .. })),
             "an empty projected token must fail closed"
         );
         std::fs::remove_file(&path)
             .map_err(|error| format!("failed to remove token fixture: {error}"))?;
-        let missing = load_caller_token(&path);
+        let missing = load_source_credential(&path);
         assert!(
             matches!(&missing, Err(PortError::Rejected { .. })),
             "a missing projected token must fail closed"
         );
         std::fs::create_dir(&path)
             .map_err(|error| format!("failed to create unreadable token fixture: {error}"))?;
-        let unreadable = load_caller_token(&path);
+        let unreadable = load_source_credential(&path);
         assert!(
             matches!(&unreadable, Err(PortError::Rejected { .. })),
             "an unreadable projected token must fail closed"
         );
         std::fs::remove_dir(&path)
             .map_err(|error| format!("failed to remove unreadable token fixture: {error}"))?;
-        let rendered = format!("{empty:?} {missing:?} {unreadable:?}");
+        let rendered = [empty, missing, unreadable]
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|error| format!("{error:?}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
             !rendered.contains(first) && !rendered.contains(second),
             "token load failures must not expose token material"

@@ -41,7 +41,11 @@ for variable in \
   STEWARD_OPENSHELL_CA_CERTIFICATE_FILE \
   STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE \
   STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE \
-  STEWARD_OPENSHELL_BEARER_TOKEN_FILE \
+  STEWARD_WORKLOAD_EXCHANGE_ENDPOINT \
+  STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME \
+  STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE \
+  STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE \
+  STEWARD_TEST_OPENSHELL_ACCESS_TOKEN_FILE \
   STEWARD_OPENSHELL_SERVER_NAME \
   STEWARD_OPENSHELL_RUNTIME_CLASS_NAME \
   STEWARD_RUN_DIR \
@@ -136,6 +140,11 @@ tls_key="${STEWARD_RUN_DIR}/s2-tls-key.pem"
 tls_cert="${STEWARD_RUN_DIR}/s2-tls-cert.pem"
 tls_key_der="${STEWARD_RUN_DIR}/s2-tls-key.der"
 tls_cert_der="${STEWARD_RUN_DIR}/s2-tls-cert.der"
+workload_exchange_ca_key="${STEWARD_RUN_DIR}/s2-workload-exchange-ca.key"
+workload_exchange_ca_cert="${STEWARD_RUN_DIR}/s2-workload-exchange-ca.crt"
+workload_exchange_key="${STEWARD_RUN_DIR}/s2-workload-exchange.key"
+workload_exchange_csr="${STEWARD_RUN_DIR}/s2-workload-exchange.csr"
+workload_exchange_cert="${STEWARD_RUN_DIR}/s2-workload-exchange.crt"
 openssl rand 32 >"${signing_key}"
 openssl rand -hex 24 | tr -d '\n' >"${introspection_client}"
 openssl rand -hex 32 | tr -d '\n' >"${master_key}"
@@ -148,7 +157,37 @@ openssl req -new -x509 -key "${tls_key}" -out "${tls_cert}" -days 1 \
   -addext "subjectAltName=DNS:steward-controller.steward-system.svc,DNS:steward-poc.test,DNS:steward-poc-api.steward-system.svc" >/dev/null 2>&1
 openssl x509 -in "${tls_cert}" -outform DER -out "${tls_cert_der}"
 openssl pkcs8 -topk8 -nocrypt -in "${tls_key}" -outform DER -out "${tls_key_der}"
-chmod 600 "${signing_key}" "${introspection_client}" "${master_key}" "${tls_key}" "${tls_key_der}"
+openssl req -new -newkey rsa:2048 -x509 -nodes -days 1 \
+  -subj "/CN=steward-s2-workload-exchange-ca" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -keyout "${workload_exchange_ca_key}" \
+  -out "${workload_exchange_ca_cert}" >/dev/null 2>&1
+openssl req -new -newkey rsa:2048 -nodes \
+  -subj "/CN=workload-exchange.steward-system.svc.cluster.local" \
+  -addext "subjectAltName=DNS:workload-exchange.steward-system.svc.cluster.local" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage=serverAuth" \
+  -keyout "${workload_exchange_key}" \
+  -out "${workload_exchange_csr}" >/dev/null 2>&1
+openssl x509 -req \
+  -in "${workload_exchange_csr}" \
+  -CA "${workload_exchange_ca_cert}" \
+  -CAkey "${workload_exchange_ca_key}" \
+  -CAcreateserial \
+  -days 1 \
+  -sha256 \
+  -copy_extensions copy \
+  -out "${workload_exchange_cert}" >/dev/null 2>&1
+chmod 600 \
+  "${signing_key}" \
+  "${introspection_client}" \
+  "${master_key}" \
+  "${tls_key}" \
+  "${tls_key_der}" \
+  "${workload_exchange_ca_key}" \
+  "${workload_exchange_key}"
 if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   chmod 600 "${encryption_key}"
 fi
@@ -167,10 +206,17 @@ done
   --from-file="openshell-ca.crt=${STEWARD_OPENSHELL_CA_CERTIFICATE_FILE}" \
   --from-file="openshell-client.crt=${STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE}" \
   --from-file="openshell-client.key=${STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE}" \
-  --from-file="openshell-bearer-token=${STEWARD_OPENSHELL_BEARER_TOKEN_FILE}" \
+  --from-file="workload-source-credential=${STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE}" \
+  --from-file="openshell-access-token=${STEWARD_TEST_OPENSHELL_ACCESS_TOKEN_FILE}" \
+  --from-file="workload-exchange-ca.crt=${workload_exchange_ca_cert}" \
+  --from-file="workload-exchange.crt=${workload_exchange_cert}" \
+  --from-file="workload-exchange.key=${workload_exchange_key}" \
   --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
 "${KUBECTL[@]}" -n steward-system label secret steward-s2-secrets \
   "steward.test/run-id=${STEWARD_RUN_ID}" --overwrite
+"${KUBECTL[@]}" -n steward-system create configmap steward-test-workload-exchange \
+  --from-file="test-workload-exchange.py=${ROOT}/scripts/test-workload-exchange.py" \
+  --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
 if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   "${KUBECTL[@]}" -n steward-system create configmap steward-s5-policy \
     --from-file="mcp_tools.rego=${ROOT}/policy/mcp_tools.rego" \

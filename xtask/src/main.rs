@@ -884,6 +884,29 @@ mod tests {
     }
 
     #[test]
+    fn revocation_e2e_preserves_observed_runtime_headroom() -> Result<(), String> {
+        let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let revocation = workflow
+            .split("  e2e-revocation:")
+            .nth(1)
+            .and_then(|jobs| jobs.split("\n  openshell-adapter:").next())
+            .ok_or_else(|| "revocation E2E CI job is required".to_owned())?;
+
+        assert!(
+            revocation.contains("timeout-minutes: 40"),
+            "the revocation E2E needs 40 minutes after a 29m05s successful run left less than one minute of the prior budget"
+        );
+        assert_eq!(
+            workflow.matches("timeout-minutes: 40").count(),
+            1,
+            "only the evidence-backed revocation lane may use the 40-minute timeout"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn openshell_adapter_does_not_select_a_public_sandbox_image() -> Result<(), String> {
         let source = fs::read_to_string(root().join("adapters/openshell/src/lib.rs"))
             .map_err(|error| format!("OpenShell adapter source is required: {error}"))?;
@@ -918,6 +941,9 @@ mod tests {
             "openshellEndpoint",
             "openshellServerName",
             "openshellRuntimeClassName",
+            "workloadExchangeEndpoint",
+            "workloadExchangeServerName",
+            "workloadExchangeTrust",
             "openshellClient",
             "caCertificate",
             "clientCertificate",
@@ -942,7 +968,10 @@ mod tests {
             "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
             "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
             "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
-            "STEWARD_OPENSHELL_BEARER_TOKEN_FILE",
+            "STEWARD_WORKLOAD_EXCHANGE_ENDPOINT",
+            "STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME",
+            "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
+            "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
             "STEWARD_OPENSHELL_SERVER_NAME",
             "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
         ] {
@@ -961,10 +990,10 @@ mod tests {
         );
         for projected_token_contract in [
             "serviceAccountToken:",
-            "audience: openshell-api",
-            "expirationSeconds: 3600",
-            "mountPath: /var/run/secrets/steward/openshell",
-            "value: /var/run/secrets/steward/openshell/token",
+            "audience: apelogic-workload-exchange",
+            "expirationSeconds: 600",
+            "mountPath: /var/run/secrets/steward/workload",
+            "value: /var/run/secrets/steward/workload/source-token",
         ] {
             assert!(
                 templates.contains(projected_token_contract),
@@ -972,9 +1001,19 @@ mod tests {
             );
         }
         assert_eq!(
-            templates.matches("path: token").count(),
+            templates.matches("path: source-token").count(),
             1,
-            "only the projected service-account token volume may provide the OpenShell token path"
+            "only the projected service-account token volume may provide the workload source credential path"
+        );
+        assert!(
+            !templates.contains("STEWARD_OPENSHELL_BEARER_TOKEN_FILE")
+                && !templates.contains("audience: openshell-api"),
+            "the chart must never send a raw Kubernetes service-account token to OpenShell"
+        );
+        assert!(
+            !values.contains("workloadExchangeRoles")
+                && !values.contains("workloadExchangeAlgorithm"),
+            "the caller must not select exchange roles or a signing algorithm"
         );
 
         Ok(())
@@ -1191,6 +1230,10 @@ mod tests {
         let harness = fs::read_to_string(root().join("scripts/openshell-adapter-e2e.sh")).map_err(
             |error| format!("OpenShell adapter integration harness is required: {error}"),
         )?;
+        let e2e_source = fs::read_to_string(root().join("e2e/openshell_adapter_v0098.rs"))
+            .map_err(|error| format!("OpenShell adapter integration test is required: {error}"))?;
+        let chart_readme = fs::read_to_string(root().join("charts/steward/README.md"))
+            .map_err(|error| format!("Steward chart README is required: {error}"))?;
 
         assert!(
             ci.contains("cargo xtask e2e-openshell-adapter"),
@@ -1203,6 +1246,7 @@ mod tests {
         for required in [
             "OPEN_SHELL_RELEASE=\"v0.0.98\"",
             "server.defaultRuntimeClassName=kata-qemu",
+            "handler: runc",
             "server.oidc.issuer=",
             "--test openshell_adapter_v0098",
         ] {
@@ -1211,6 +1255,15 @@ mod tests {
                 "OpenShell adapter integration harness is missing {required}"
             );
         }
+        assert!(
+            e2e_source.contains("assert_runtime_class_propagation")
+                && !e2e_source.contains("kata_bound"),
+            "the kind lane must describe runtime-class propagation, not Kata isolation"
+        );
+        assert!(
+            chart_readme.contains("does not prove Kata isolation"),
+            "the chart documentation must reserve Kata isolation evidence for live EKS"
+        );
 
         let adapter_source = fs::read_to_string(root().join("adapters/openshell/src/lib.rs"))
             .map_err(|error| format!("OpenShell adapter source is required: {error}"))?;
@@ -1279,7 +1332,10 @@ mod tests {
             "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
             "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
             "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
-            "STEWARD_OPENSHELL_BEARER_TOKEN_FILE",
+            "STEWARD_WORKLOAD_EXCHANGE_ENDPOINT",
+            "STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME",
+            "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
+            "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
             "STEWARD_OPENSHELL_SERVER_NAME",
             "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
         ] {
@@ -1297,7 +1353,10 @@ mod tests {
                 "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
                 "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
                 "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
-                "STEWARD_OPENSHELL_BEARER_TOKEN_FILE",
+                "STEWARD_WORKLOAD_EXCHANGE_ENDPOINT",
+                "STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME",
+                "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
+                "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
                 "STEWARD_OPENSHELL_SERVER_NAME",
                 "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
             ] {
@@ -1316,7 +1375,10 @@ mod tests {
             "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
             "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
             "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
-            "STEWARD_OPENSHELL_BEARER_TOKEN_FILE",
+            "STEWARD_WORKLOAD_EXCHANGE_ENDPOINT",
+            "STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME",
+            "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
+            "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
             "STEWARD_OPENSHELL_SERVER_NAME",
             "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
         ] {

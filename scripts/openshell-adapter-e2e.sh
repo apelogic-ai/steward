@@ -16,15 +16,24 @@ RUN_DIR="${ROOT}/.steward-run/${RUN_ID}"
 KUBECONFIG_PATH="${RUN_DIR}/kubeconfig"
 PORT_FORWARD_LOG="${RUN_DIR}/openshell-port-forward.log"
 PORT_FORWARD_PID=""
+WORKLOAD_EXCHANGE_PID=""
 CLUSTER_CREATED=0
-OIDC_AUDIENCE="steward-test"
+OIDC_AUDIENCE="openshell-api"
 
 cleanup() {
   status="$1"
   trap - EXIT INT TERM
+  if [[ "${status}" != "0" && -f "${workload_exchange_log:-}" ]]; then
+    echo "workload exchange mock log:" >&2
+    cat "${workload_exchange_log}" >&2
+  fi
   if [[ -n "${PORT_FORWARD_PID}" ]]; then
     kill "${PORT_FORWARD_PID}" >/dev/null 2>&1 || true
     wait "${PORT_FORWARD_PID}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${WORKLOAD_EXCHANGE_PID}" ]]; then
+    kill "${WORKLOAD_EXCHANGE_PID}" >/dev/null 2>&1 || true
+    wait "${WORKLOAD_EXCHANGE_PID}" >/dev/null 2>&1 || true
   fi
   if [[ "${CLUSTER_CREATED}" == "1" && "${STEWARD_DEV_KEEP:-0}" != "1" ]]; then
     KUBECONFIG="${KUBECONFIG_PATH}" kind delete cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1 || true
@@ -40,7 +49,7 @@ trap 'cleanup "$?"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for command in cargo curl docker helm kind kubectl openssl tar xxd; do
+for command in cargo curl docker helm kind kubectl openssl python3 tar xxd; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is missing: ${command}" >&2
     exit 2
@@ -71,6 +80,8 @@ metadata:
   name: kata-qemu
   labels:
     steward.test/run-id: ${RUN_ID}
+# Kind cannot provide Kata isolation. This lane verifies only that the
+# kata-qemu RuntimeClass selection propagates into the Sandbox pod template.
 handler: runc
 YAML
 
@@ -189,35 +200,76 @@ kubectl \
   rollout status deployment/test-oidc \
   --timeout=300s
 
-jwt_header="$(printf '%s' '{"alg":"RS256","kid":"steward-test","typ":"JWT"}' | base64url)"
-issue_token() {
-  audience="$1"
-  subject="$2"
-  issued_at="$3"
-  expires_at="$4"
-  jwt_payload="$(
-    printf '{"iss":"%s","sub":"%s","preferred_username":"alice","aud":"%s","roles":["openshell-admin","openshell-user"],"iat":%s,"exp":%s}' \
-      "${oidc_issuer}" "${subject}" "${audience}" "${issued_at}" "${expires_at}" |
-      base64url
-  )"
-  jwt_signature="$(
-    printf '%s.%s' "${jwt_header}" "${jwt_payload}" |
-      openssl dgst -sha256 -sign "${oidc_private_key}" |
-      base64url
-  )"
-  printf '%s.%s.%s' "${jwt_header}" "${jwt_payload}" "${jwt_signature}"
-}
+workload_source_file="${RUN_DIR}/workload-source-credential"
+workload_invalid_source_file="${RUN_DIR}/workload-source-credential-invalid"
+printf '%s' obviously-fake-workload-source >"${workload_source_file}"
+printf '%s' obviously-fake-unmapped-source >"${workload_invalid_source_file}"
 
-issued_at="$(date +%s)"
-expires_at="$((issued_at + 3600))"
-bearer_token_file="${RUN_DIR}/openshell-workload-token"
-rotated_bearer_token_file="${RUN_DIR}/openshell-workload-token-rotated"
-expired_token_file="${RUN_DIR}/openshell-workload-token-expired"
-wrong_audience_token_file="${RUN_DIR}/openshell-workload-token-wrong-audience"
-issue_token "${OIDC_AUDIENCE}" adapter-test "${issued_at}" "${expires_at}" >"${bearer_token_file}"
-issue_token "${OIDC_AUDIENCE}" adapter-test-rotated "${issued_at}" "${expires_at}" >"${rotated_bearer_token_file}"
-issue_token "${OIDC_AUDIENCE}" adapter-test-expired "$((issued_at - 120))" "$((issued_at - 60))" >"${expired_token_file}"
-issue_token wrong-audience adapter-test-wrong-audience "${issued_at}" "${expires_at}" >"${wrong_audience_token_file}"
+workload_exchange_ca_private_key="${RUN_DIR}/workload-exchange-ca.key"
+workload_exchange_ca_certificate="${RUN_DIR}/workload-exchange-ca.crt"
+workload_exchange_private_key="${RUN_DIR}/workload-exchange.key"
+workload_exchange_certificate_request="${RUN_DIR}/workload-exchange.csr"
+workload_exchange_certificate="${RUN_DIR}/workload-exchange.crt"
+workload_exchange_log="${RUN_DIR}/workload-exchange.log"
+openssl req \
+  -new \
+  -newkey rsa:2048 \
+  -x509 \
+  -nodes \
+  -days 1 \
+  -subj /CN=steward-test-workload-exchange-ca \
+  -addext basicConstraints=critical,CA:TRUE \
+  -addext keyUsage=critical,keyCertSign,cRLSign \
+  -keyout "${workload_exchange_ca_private_key}" \
+  -out "${workload_exchange_ca_certificate}" >/dev/null 2>&1
+openssl req \
+  -new \
+  -newkey rsa:2048 \
+  -nodes \
+  -subj /CN=127.0.0.1 \
+  -addext subjectAltName=IP:127.0.0.1 \
+  -addext basicConstraints=critical,CA:FALSE \
+  -addext keyUsage=critical,digitalSignature,keyEncipherment \
+  -addext extendedKeyUsage=serverAuth \
+  -keyout "${workload_exchange_private_key}" \
+  -out "${workload_exchange_certificate_request}" >/dev/null 2>&1
+openssl x509 \
+  -req \
+  -in "${workload_exchange_certificate_request}" \
+  -CA "${workload_exchange_ca_certificate}" \
+  -CAkey "${workload_exchange_ca_private_key}" \
+  -CAcreateserial \
+  -days 1 \
+  -sha256 \
+  -copy_extensions copy \
+  -out "${workload_exchange_certificate}" >/dev/null 2>&1
+chmod 600 "${workload_exchange_ca_private_key}" "${workload_exchange_private_key}"
+python3 "${ROOT}/scripts/test-workload-exchange.py" \
+  --certificate "${workload_exchange_certificate}" \
+  --private-key "${workload_exchange_private_key}" \
+  --source-file "${workload_source_file}" \
+  --issuer "${oidc_issuer}" \
+  --signing-key "${oidc_private_key}" \
+  >"${workload_exchange_log}" 2>&1 &
+WORKLOAD_EXCHANGE_PID=$!
+for _ in $(seq 1 50); do
+  if grep -q '^LISTENING [0-9][0-9]*$' "${workload_exchange_log}"; then
+    break
+  fi
+  if ! kill -0 "${WORKLOAD_EXCHANGE_PID}" >/dev/null 2>&1; then
+    echo "workload exchange mock exited before becoming ready" >&2
+    cat "${workload_exchange_log}" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+workload_exchange_port="$(sed -nE 's/^LISTENING ([0-9]+)$/\1/p' "${workload_exchange_log}")"
+if [[ -z "${workload_exchange_port}" ]]; then
+  echo "workload exchange mock did not publish its port" >&2
+  cat "${workload_exchange_log}" >&2
+  exit 1
+fi
+workload_exchange_endpoint="https://127.0.0.1:${workload_exchange_port}/v1/workload/exchange"
 
 env \
   HELM_CACHE_HOME="${RUN_DIR}/helm/cache" \
@@ -324,16 +376,17 @@ STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE="${client_certificate}" \
 STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE="${client_private_key}" \
 STEWARD_OPENSHELL_UNTRUSTED_CA_FILE="${invalid_ca}" \
 STEWARD_OPENSHELL_SERVER_NAME=localhost \
-STEWARD_OPENSHELL_TEST_BEARER_TOKEN_FILE="${bearer_token_file}" \
-STEWARD_OPENSHELL_TEST_ROTATED_BEARER_TOKEN_FILE="${rotated_bearer_token_file}" \
-STEWARD_OPENSHELL_TEST_EXPIRED_TOKEN_FILE="${expired_token_file}" \
-STEWARD_OPENSHELL_TEST_WRONG_AUDIENCE_TOKEN_FILE="${wrong_audience_token_file}" \
+STEWARD_WORKLOAD_EXCHANGE_ENDPOINT="${workload_exchange_endpoint}" \
+STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME=127.0.0.1 \
+STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE="${workload_exchange_ca_certificate}" \
+STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE="${workload_source_file}" \
+STEWARD_WORKLOAD_INVALID_SOURCE_CREDENTIAL_FILE="${workload_invalid_source_file}" \
 STEWARD_TEST_KUBE_CONTEXT="${KUBE_CONTEXT}" \
 STEWARD_TEST_KUBECONFIG="${KUBECONFIG_PATH}" \
 STEWARD_RUN_DIR="${RUN_DIR}" \
 cargo test \
   --manifest-path "${ROOT}/e2e/Cargo.toml" \
   --test openshell_adapter_v0098 \
-  adapter_round_trip_is_authenticated_kata_bound_and_cleanup_safe \
+  adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_cleanup \
   -- \
   --exact

@@ -86,7 +86,14 @@ fn openshell_connection_config() -> Result<OpenShellConnectionConfig, io::Error>
         ca_certificate_pem: required_file("STEWARD_OPENSHELL_CA_CERTIFICATE_FILE")?,
         client_certificate_pem: required_file("STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE")?,
         client_private_key_pem: required_file("STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE")?,
-        bearer_token_file: PathBuf::from(required("STEWARD_OPENSHELL_BEARER_TOKEN_FILE")?),
+        workload_exchange_endpoint: required("STEWARD_WORKLOAD_EXCHANGE_ENDPOINT")?,
+        workload_exchange_server_name: required("STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME")?,
+        workload_exchange_ca_certificate_pem: required_file(
+            "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
+        )?,
+        workload_source_credential_file: PathBuf::from(required(
+            "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
+        )?),
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
         runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
     })

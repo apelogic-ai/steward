@@ -80,8 +80,20 @@ impl Harness {
                 env::var("STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE")?,
             )
             .env(
-                "STEWARD_OPENSHELL_BEARER_TOKEN_FILE",
-                env::var("STEWARD_OPENSHELL_BEARER_TOKEN_FILE")?,
+                "STEWARD_WORKLOAD_EXCHANGE_ENDPOINT",
+                env::var("STEWARD_WORKLOAD_EXCHANGE_ENDPOINT")?,
+            )
+            .env(
+                "STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME",
+                env::var("STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME")?,
+            )
+            .env(
+                "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
+                env::var("STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE")?,
+            )
+            .env(
+                "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
+                env::var("STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE")?,
             )
             .env(
                 "STEWARD_OPENSHELL_SERVER_NAME",
