@@ -7,7 +7,7 @@ worker is part of the normal `steward-controller` process.
 
 | Input | Supported production value |
 |---|---|
-| `STEWARD_TASK_TOKEN_AUDIENCE` | Required and non-empty. Use `steward-task-api`. |
+| `STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE` | Required and non-empty. DEV uses `https://kubernetes.default.svc`. |
 | `STEWARD_TASK_WORKFLOWS_JSON` | Required JSON array matching `workflows.example.json`. Commands are server-selected; clients cannot supply them. |
 | `STEWARD_APISERVER_BIND` | HTTPS listener, default `0.0.0.0:8443`. Expose the existing apiserver Service port to this target port. |
 | Task API enablement | Enabled whenever the production apiserver starts. There is no bypass flag; invalid or absent Task configuration fails startup. |
@@ -15,9 +15,10 @@ worker is part of the normal `steward-controller` process.
 
 The caller supplies `Authorization: Bearer <exchanged-token>`. GitHub requests the production
 exchange service's audience; Steward never receives the raw GitHub OIDC token. Steward sends the
-exchanged token to TokenReview with audience `steward-task-api`. See
-`docs/task-submission-api.md` for the required verified username/groups and the external mapper
-boundary.
+exchanged token to TokenReview with the configured Kubernetes API server audience. The exchanged
+JWT still has `aud=steward-task-api`, matching the EKS external OIDC client ID; Steward does not
+parse or reinterpret that JWT. See `docs/task-submission-api.md` for the required verified
+username/groups and the external mapper boundary.
 
 ## Controller inputs
 
@@ -93,10 +94,12 @@ The procedure is idempotent. The first exact revision returns `201`; an identica
 reviewed rather than overwritten. The script requires explicit CA trust and HTTPS, keeps the
 bearer token out of command arguments, and fails closed on every other response.
 
-The production TokenReview contract for this credential is exact:
+The production identity contract for this credential is exact:
 
-- audience: `steward-task-api` (shared with Task authentication because EKS supports one external
-  OIDC provider client ID per cluster)
+- exchanged JWT audience and EKS external OIDC client ID: `steward-task-api`
+- delegated Kubernetes TokenReview audience: the required
+  `STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE`; DEV uses
+  `https://kubernetes.default.svc`
 - group, exactly once: `agents.apelogic.ai/service-envelope-bootstrap:steward-run`
 - username: a non-empty identity verified by the cluster identity provider and preserved as the
   envelope's `authored_by` audit value
@@ -106,11 +109,11 @@ grants, member envelopes, other service envelopes, and every other administrator
 the bootstrap group with the broad administrator group or a member-role group fails
 authentication.
 
-Bootstrap is blocked first on this Steward release containing the route-scoped authorization
-contract, then on Infra providing a short-lived token through the DEV EKS OIDC identity-provider
-association. Steward does not issue that token. It must not be stored in a Kubernetes Secret or
-replaced with any other long-lived credential; the chart intentionally has no bootstrap-token
-Secret input.
+Bootstrap requires a Steward release containing both the route-scoped authorization contract and
+the delegated Kubernetes TokenReview audience setting, plus Infra's short-lived token exchange
+profile through the DEV EKS OIDC identity-provider association. Steward does not issue that token.
+It must not be stored in a Kubernetes Secret or replaced with any other long-lived credential; the
+chart intentionally has no bootstrap-token Secret input.
 
 ## Jira startup values
 
@@ -130,6 +133,6 @@ optional, that requires a separate product/chart change rather than a placeholde
 
 ## Release impact
 
-This contract hardening changes Task identity parsing and makes service-envelope bootstrap
-idempotent in the apiserver. A new signed patch release is therefore required after this change
-merges; reuse of the previous Steward image/chart handoff is not sufficient.
+This contract changes the delegated TokenReview audience used by both Task and administrator
+authentication. A new signed patch release is therefore required after this change merges; reuse
+of the Steward v0.1.5 image/chart handoff is not sufficient.

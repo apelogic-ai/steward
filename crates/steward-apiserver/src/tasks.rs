@@ -9,7 +9,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus};
+#[cfg(test)]
+use k8s_openapi::api::authentication::v1::TokenReviewStatus;
+use k8s_openapi::api::authentication::v1::{TokenReview, UserInfo};
 use kube::api::{Api, PostParams};
 use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
@@ -24,8 +26,9 @@ use steward_types::{
 use uuid::Uuid;
 
 use crate::{
-    AdmissionLedger, ApiError, BoxFuture, DecisionChannel, RuntimeCreateError, RuntimeRepository,
-    file_decision_reference, spec_digest,
+    AdmissionLedger, ApiError, BoxFuture, DecisionChannel, KubernetesTokenReviewAudience,
+    RuntimeCreateError, RuntimeRepository, authenticated_token_review_user,
+    file_decision_reference, spec_digest, token_review_request,
 };
 
 const SERVICE_PRINCIPAL_ANNOTATION: &str = "agents.apelogic.ai/service-principal";
@@ -56,11 +59,11 @@ pub trait TaskIdentityResolver: Clone + Send + Sync + 'static {
 #[derive(Clone)]
 pub struct KubernetesTaskIdentityResolver {
     client: Client,
-    audience: Option<String>,
+    audience: KubernetesTokenReviewAudience,
 }
 
 impl KubernetesTaskIdentityResolver {
-    pub fn new(client: Client, audience: Option<String>) -> Self {
+    pub fn new(client: Client, audience: KubernetesTokenReviewAudience) -> Self {
         Self { client, audience }
     }
 }
@@ -72,42 +75,31 @@ impl TaskIdentityResolver for KubernetesTaskIdentityResolver {
     ) -> Pin<Box<dyn Future<Output = Result<TaskIdentity, TaskAuthenticationError>> + Send + 'a>>
     {
         Box::pin(async move {
-            let review = TokenReview {
-                spec: TokenReviewSpec {
-                    audiences: self.audience.clone().map(|audience| vec![audience]),
-                    token: Some(assertion.to_owned()),
-                },
-                ..TokenReview::default()
-            };
+            let review = token_review_request(assertion, &self.audience);
             let reviewed = Api::<TokenReview>::all(self.client.clone())
                 .create(&PostParams::default(), &review)
                 .await
                 .map_err(|_| TaskAuthenticationError::Unavailable)?;
-            task_identity_from_token_review(reviewed.status, self.audience.as_deref())
+            let user = authenticated_token_review_user(reviewed.status, self.audience.as_str())
+                .ok_or(TaskAuthenticationError::InvalidCredentials)?;
+            task_identity_from_kubernetes_user(&user)
         })
     }
 }
 
+#[cfg(test)]
 pub(crate) fn task_identity_from_token_review(
     status: Option<TokenReviewStatus>,
-    requested_audience: Option<&str>,
+    requested_audience: &str,
 ) -> Result<TaskIdentity, TaskAuthenticationError> {
-    let status = status
-        .filter(|status| status.authenticated == Some(true))
+    let user = authenticated_token_review_user(status, requested_audience)
         .ok_or(TaskAuthenticationError::InvalidCredentials)?;
-    if requested_audience.is_some_and(|requested| {
-        !status
-            .audiences
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .any(|audience| audience == requested)
-    }) {
-        return Err(TaskAuthenticationError::InvalidCredentials);
-    }
-    let user = status
-        .user
-        .ok_or(TaskAuthenticationError::InvalidCredentials)?;
+    task_identity_from_kubernetes_user(&user)
+}
+
+fn task_identity_from_kubernetes_user(
+    user: &UserInfo,
+) -> Result<TaskIdentity, TaskAuthenticationError> {
     let username = user
         .username
         .as_deref()

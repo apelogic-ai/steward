@@ -41,6 +41,18 @@ grep -q 'name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_BEARER_TOKEN_FILE' "${rendered}"
+test "$(grep -c 'name: STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE' "${rendered}")" -eq 1
+grep -q 'value: "https://kubernetes.default.svc"' "${rendered}"
+if grep -Eq 'name: STEWARD_(TASK_)?TOKEN_AUDIENCE' "${rendered}"; then
+  echo "ambiguous legacy TokenReview audience variables must not be rendered" >&2
+  exit 1
+fi
+if helm lint "${root}/charts/steward" "${image_values[@]}" \
+  --set-string config.apiserver.kubernetesTokenReviewAudience= >/dev/null 2>&1
+then
+  echo "an empty Kubernetes TokenReview audience must fail chart validation" >&2
+  exit 1
+fi
 test "$(grep -c 'secretName: steward-openshell-client' "${rendered}")" -eq 1
 grep -q 'serviceAccountToken:' "${rendered}"
 grep -q 'audience: openshell-api' "${rendered}"

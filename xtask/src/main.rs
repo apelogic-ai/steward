@@ -1092,10 +1092,12 @@ mod tests {
         for required in [
             "agents.apelogic.ai/service-envelope-bootstrap:steward-run",
             "steward-task-api",
+            "STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE",
+            "https://kubernetes.default.svc",
             "DEV EKS OIDC identity-provider",
             "must not be stored in a Kubernetes Secret",
-            "blocked first on this Steward release",
-            "then on Infra",
+            "route-scoped authorization contract",
+            "Infra's short-lived token exchange",
         ] {
             assert!(
                 contract.contains(required),
@@ -1106,29 +1108,76 @@ mod tests {
     }
 
     #[test]
-    fn task_and_bootstrap_share_one_eks_oidc_audience() -> Result<(), String> {
-        let values = fs::read_to_string(root().join("charts/steward/values.yaml"))
+    fn task_and_bootstrap_share_one_kubernetes_token_review_audience() -> Result<(), String> {
+        let chart = root().join("charts/steward");
+        let values = fs::read_to_string(chart.join("values.yaml"))
             .map_err(|error| format!("published Steward chart values are required: {error}"))?;
+        let schema = fs::read_to_string(chart.join("values.schema.json"))
+            .map_err(|error| format!("published Steward values schema is required: {error}"))?;
+        let templates = fs::read_to_string(chart.join("templates/all.yaml")).map_err(|error| {
+            format!("published Steward Kubernetes templates are required: {error}")
+        })?;
+        let apiserver_source =
+            fs::read_to_string(root().join("crates/steward-apiserver/src/lib.rs"))
+                .map_err(|error| format!("Steward apiserver source is required: {error}"))?;
+        let tasks = fs::read_to_string(root().join("crates/steward-apiserver/src/tasks.rs"))
+            .map_err(|error| format!("Steward Task source is required: {error}"))?;
         let values = serde_saphyr::from_str::<serde_json::Value>(&values).map_err(|error| {
             format!("published Steward chart values must be valid YAML: {error}")
         })?;
         let apiserver = values
             .pointer("/config/apiserver")
             .ok_or_else(|| "chart apiserver configuration is required".to_owned())?;
-        let token_audience = apiserver
-            .get("tokenAudience")
-            .and_then(serde_json::Value::as_str);
-        let task_token_audience = apiserver
-            .get("taskTokenAudience")
+        let token_review_audience = apiserver
+            .get("kubernetesTokenReviewAudience")
             .and_then(serde_json::Value::as_str);
         assert_eq!(
-            token_audience,
-            Some("steward-task-api"),
-            "route-scoped bootstrap must use the EKS external OIDC provider audience"
+            token_review_audience,
+            Some("https://kubernetes.default.svc"),
+            "all delegated TokenReviews must use the configured Kubernetes API server audience"
         );
-        assert_eq!(
-            token_audience, task_token_audience,
-            "Task and bootstrap TokenReviews must share the cluster's single external OIDC audience"
+        for legacy in ["tokenAudience", "taskTokenAudience"] {
+            assert!(
+                apiserver.get(legacy).is_none(),
+                "ambiguous legacy audience setting {legacy} must not remain in rendered configuration"
+            );
+            assert!(
+                !schema.contains(&format!("\"{legacy}\"")),
+                "ambiguous legacy audience setting {legacy} must not remain in the schema"
+            );
+        }
+        assert!(
+            schema.contains("kubernetesTokenReviewAudience"),
+            "values schema must require the delegated TokenReview audience"
+        );
+        for required in [
+            "STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE",
+            ".Values.config.apiserver.kubernetesTokenReviewAudience",
+        ] {
+            assert!(
+                templates.contains(required),
+                "rendered apiserver configuration is missing {required}"
+            );
+        }
+        for legacy_environment in ["STEWARD_TOKEN_AUDIENCE", "STEWARD_TASK_TOKEN_AUDIENCE"] {
+            assert!(
+                !templates.contains(legacy_environment),
+                "rendered apiserver configuration must not retain {legacy_environment}"
+            );
+        }
+        for source in [&apiserver_source, &tasks] {
+            assert!(
+                source.contains("token_review_request("),
+                "every delegated authentication path must use the shared TokenReview request builder"
+            );
+            assert!(
+                source.contains("authenticated_token_review_user("),
+                "every delegated authentication path must use the shared fail-closed response validator"
+            );
+        }
+        assert!(
+            !tasks.contains("TokenReviewSpec"),
+            "Task authentication must not grow an independent TokenReview request path"
         );
         Ok(())
     }
