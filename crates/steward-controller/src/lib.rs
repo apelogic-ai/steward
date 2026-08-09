@@ -1362,7 +1362,7 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
             .map_err(ControllerError::Reconcile)
     };
     let (inference_result, credential_result, sandbox_result) = futures::join!(
-        revoke_inference_with_timeout(inference, &inference_request),
+        revoke_inference_if_required(runtime, inference, &inference_request),
         delete_credential_secret(client, runtime),
         sandbox_cleanup,
     );
@@ -1383,6 +1383,22 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
 }
 
 const INFERENCE_REVOCATION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
+async fn revoke_inference_if_required<I: InferencePlane>(
+    runtime: &AgentRuntime,
+    inference: &I,
+    request: &InferenceRequest,
+) -> Result<(), ReconcileError> {
+    let has_cached_reference = runtime
+        .status
+        .as_ref()
+        .and_then(|status| status.refs.litellm_key.as_ref())
+        .is_some();
+    if request.models.is_empty() && !has_cached_reference {
+        return Ok(());
+    }
+    revoke_inference_with_timeout(inference, request).await
+}
 
 async fn revoke_inference_with_timeout<I: InferencePlane>(
     inference: &I,
@@ -1430,7 +1446,7 @@ async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferenceP
 ) -> Result<Action, ControllerError> {
     let request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
     let (revoke_result, credential_result, suspension_result) = futures::join!(
-        revoke_inference_with_timeout(inference, &request),
+        revoke_inference_if_required(runtime, inference, &request),
         delete_credential_secret(client, runtime),
         suspend_runtime(runtime, api, sandbox_runtime, spend),
     );
@@ -2685,6 +2701,94 @@ mod tests {
         }
     }
 
+    fn running_model_free_runtime(litellm_key: Option<&str>) -> AgentRuntime {
+        let mut runtime = fixture();
+        runtime.spec.llms.clear();
+        runtime.status = Some(AgentRuntimeStatus {
+            phase: Phase::Running,
+            observed_generation: 3,
+            spec_digest: "fixture-digest".to_owned(),
+            refs: RuntimeRefs {
+                workspace: Some("workspace-a".to_owned()),
+                sandbox: Some("sandbox-a".to_owned()),
+                litellm_key: litellm_key.map(str::to_owned),
+            },
+            conditions: Vec::new(),
+            spend: None,
+        });
+        runtime
+    }
+
+    fn successful_cleanup_client(
+        runtime: &AgentRuntime,
+    ) -> Result<(Client, Arc<AtomicBool>), String> {
+        let serialized_runtime = serde_json::to_vec(runtime)
+            .map_err(|error| format!("fixture runtime must be serializable: {error}"))?;
+        let secret_deleted = Arc::new(AtomicBool::new(false));
+        let secret_deleted_for_service = secret_deleted.clone();
+        let client = Client::new(
+            service_fn(move |request: Request<KubeBody>| {
+                let serialized_runtime = serialized_runtime.clone();
+                if request.method() == Method::DELETE && request.uri().path().contains("/secrets/")
+                {
+                    secret_deleted_for_service.store(true, Ordering::SeqCst);
+                }
+                async move {
+                    let body = if request.method() == Method::PATCH
+                        && request.uri().path().ends_with("/status")
+                    {
+                        serialized_runtime
+                    } else {
+                        br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success","code":200}"#
+                            .to_vec()
+                    };
+                    let mut response = Response::new(Body::from(body));
+                    *response.status_mut() = StatusCode::OK;
+                    Ok::<_, Infallible>(response)
+                }
+            }),
+            "team-a",
+        );
+        Ok((client, secret_deleted))
+    }
+
+    #[tokio::test]
+    async fn authority_suspension_of_model_free_runtime_without_inference_ref_skips_revocation()
+    -> Result<(), String> {
+        let runtime = running_model_free_runtime(None);
+        let (client, secret_deleted) = successful_cleanup_client(&runtime)?;
+        let sandbox_deleted = Arc::new(AtomicBool::new(false));
+        let sandbox = SignallingDeleteRuntime {
+            deleted: sandbox_deleted.clone(),
+        };
+        let api = kube::Api::<AgentRuntime>::namespaced(client.clone(), "team-a");
+
+        suspend_runtime_with_inference_cleanup(
+            &runtime,
+            &api,
+            &sandbox,
+            client,
+            &FailingRevokeInference,
+            None,
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "model-free suspension without an inference reference must not depend on inference revocation: {error}"
+            )
+        })?;
+
+        assert!(
+            sandbox_deleted.load(Ordering::SeqCst),
+            "model-free suspension must still delete the sandbox"
+        );
+        assert!(
+            secret_deleted.load(Ordering::SeqCst),
+            "model-free suspension must still delete any credential Secret"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn authority_suspension_deletes_the_sandbox_during_a_litellm_outage() -> Result<(), String>
     {
@@ -2756,6 +2860,63 @@ mod tests {
         assert_eq!(
             deleted, 1,
             "authority suspension must tear down the sandbox even when LiteLLM is unavailable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn termination_of_model_free_runtime_without_inference_ref_skips_revocation()
+    -> Result<(), String> {
+        let runtime = running_model_free_runtime(None);
+        let (client, secret_deleted) = successful_cleanup_client(&runtime)?;
+        let sandbox_deleted = Arc::new(AtomicBool::new(false));
+        let sandbox = SignallingDeleteRuntime {
+            deleted: sandbox_deleted.clone(),
+        };
+
+        let decision = cleanup_runtime(&runtime, client, &FailingRevokeInference, &sandbox)
+            .await
+            .map_err(|error| {
+                format!(
+                    "model-free termination without an inference reference must not depend on inference revocation: {error}"
+                )
+            })?;
+
+        assert_eq!(decision, ReconcileDecision::Deleted);
+        assert!(
+            sandbox_deleted.load(Ordering::SeqCst),
+            "model-free termination must still delete the sandbox"
+        );
+        assert!(
+            secret_deleted.load(Ordering::SeqCst),
+            "model-free termination must still delete any credential Secret"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn termination_with_removed_models_and_cached_inference_ref_still_revokes()
+    -> Result<(), String> {
+        let runtime = running_model_free_runtime(Some("key-a"));
+        let (client, secret_deleted) = successful_cleanup_client(&runtime)?;
+        let sandbox_deleted = Arc::new(AtomicBool::new(false));
+        let sandbox = SignallingDeleteRuntime {
+            deleted: sandbox_deleted.clone(),
+        };
+
+        let result = cleanup_runtime(&runtime, client, &FailingRevokeInference, &sandbox).await;
+
+        assert!(
+            result.is_err(),
+            "a cached inference reference must keep revocation retryable after models are removed"
+        );
+        assert!(
+            sandbox_deleted.load(Ordering::SeqCst),
+            "inference revocation failure must not prevent sandbox teardown"
+        );
+        assert!(
+            secret_deleted.load(Ordering::SeqCst),
+            "inference revocation failure must not prevent credential Secret deletion"
         );
         Ok(())
     }
