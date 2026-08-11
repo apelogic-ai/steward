@@ -104,10 +104,11 @@ that allowlist remain inaccessible to both service accounts.
   service-account authentication are unsupported. This file-source boundary is
   deployment-neutral: non-Kubernetes deployments may mount another
   platform-approved source credential without changing sandbox/runtime code.
-- `config.controller.openshellRuntimeClassName` must be `kata-qemu`, matching
-  OpenShell's gateway-level `defaultRuntimeClassName`. Steward does not send a
-  sandbox image or expose per-create driver/runtime overrides, so the gateway's
-  configured image and runtime policy remain authoritative.
+- `config.controller.openshellRuntimeClassName` must be a non-empty valid
+  Kubernetes RuntimeClass name matching OpenShell's gateway-level
+  `defaultRuntimeClassName`. Steward does not send a sandbox image or expose
+  per-create driver/runtime overrides, so the gateway's configured image and
+  runtime policy remain authoritative.
 - `config.mint.issuer` is the issuer that must also be configured in MCP-GW.
   Steward publishes JWKS at `<issuer>/.well-known/jwks.json` and uses EdDSA.
 - `config.mint.audience` defaults to `steward-mcp` and
@@ -138,11 +139,11 @@ identity-provider association.
 
 Run `cargo xtask e2e-openshell-adapter` to exercise the adapter against the
 exact OpenShell `v0.0.98` chart in an ephemeral kind cluster. The test verifies
-authenticated TLS failures, CA and server-name validation, the `kata-qemu`
-runtime-class selection propagates into the Sandbox pod template, input/output
-SHA-256 equality, and sandbox-last cleanup. Kind maps the test RuntimeClass to
-the `runc` handler, so this lane does not prove Kata isolation. Actual
-`kata-qemu` isolation remains a required live EKS E2E assertion.
+authenticated TLS failures, CA and server-name validation, the
+`openshell-runc` runtime-class selection propagates into the Sandbox pod
+template, input/output SHA-256 equality, and sandbox-last cleanup. Kind maps
+the test RuntimeClass to the `runc` handler, so this lane proves the generic
+runtime-class contract and propagation. It does not prove a VM isolation boundary.
 
 ## Network policy
 

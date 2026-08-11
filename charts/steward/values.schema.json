@@ -131,7 +131,12 @@
           "properties": {
             "openshellEndpoint": {"type": "string", "pattern": "^https://", "minLength": 9},
             "openshellServerName": {"$ref": "#/definitions/nonempty"},
-            "openshellRuntimeClassName": {"const": "kata-qemu"},
+            "openshellRuntimeClassName": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253,
+              "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$"
+            },
             "workloadExchangeEndpoint": {
               "type": "string",
               "pattern": "^https://[^/?#]+(?::[0-9]+)?/v1/workload/exchange$",

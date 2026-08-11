@@ -964,6 +964,11 @@ mod tests {
                 "the OpenShell client Secret contract must not contain workload token setting {forbidden}"
             );
         }
+        assert!(
+            !schema.contains("\"const\": \"kata-qemu\"")
+                && schema.contains("openshellRuntimeClassName"),
+            "the chart schema must accept valid Kubernetes RuntimeClass names without encoding a Kata-only contract"
+        );
         for environment_variable in [
             "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
             "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
@@ -1245,7 +1250,8 @@ mod tests {
         );
         for required in [
             "OPEN_SHELL_RELEASE=\"v0.0.98\"",
-            "server.defaultRuntimeClassName=kata-qemu",
+            "server.defaultRuntimeClassName=openshell-runc",
+            "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME=openshell-runc",
             "handler: runc",
             "server.oidc.issuer=",
             "--test openshell_adapter_v0098",
@@ -1261,8 +1267,8 @@ mod tests {
             "the kind lane must describe runtime-class propagation, not Kata isolation"
         );
         assert!(
-            chart_readme.contains("does not prove Kata isolation"),
-            "the chart documentation must reserve Kata isolation evidence for live EKS"
+            chart_readme.contains("does not prove a VM isolation boundary"),
+            "the chart documentation must not overstate runtime-class propagation as VM isolation"
         );
 
         let adapter_source = fs::read_to_string(root().join("adapters/openshell/src/lib.rs"))

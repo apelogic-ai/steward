@@ -77,11 +77,11 @@ kubectl \
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass
 metadata:
-  name: kata-qemu
+  name: openshell-runc
   labels:
     steward.test/run-id: ${RUN_ID}
 # Kind cannot provide Kata isolation. This lane verifies only that the
-# kata-qemu RuntimeClass selection propagates into the Sandbox pod template.
+# The generic RuntimeClass contract propagates into the Sandbox pod template.
 handler: runc
 YAML
 
@@ -282,7 +282,7 @@ env \
   --version "${OPEN_SHELL_HELM_VERSION}" \
   --namespace openshell \
   --create-namespace \
-  --set-string server.defaultRuntimeClassName=kata-qemu \
+  --set-string server.defaultRuntimeClassName=openshell-runc \
   --set server.auth.allowUnauthenticatedUsers=false \
   --set-string "server.oidc.issuer=${oidc_issuer}" \
   --set-string "server.oidc.audience=${OIDC_AUDIENCE}" \
@@ -376,6 +376,7 @@ STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE="${client_certificate}" \
 STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE="${client_private_key}" \
 STEWARD_OPENSHELL_UNTRUSTED_CA_FILE="${invalid_ca}" \
 STEWARD_OPENSHELL_SERVER_NAME=localhost \
+STEWARD_OPENSHELL_RUNTIME_CLASS_NAME=openshell-runc \
 STEWARD_WORKLOAD_EXCHANGE_ENDPOINT="${workload_exchange_endpoint}" \
 STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME=127.0.0.1 \
 STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE="${workload_exchange_ca_certificate}" \
