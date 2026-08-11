@@ -56,7 +56,9 @@ const NAME_LENGTH: usize = 19;
 const HASH_CHARACTERS: usize = NAME_LENGTH - 2;
 const LOWER_BASE36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 #[cfg(feature = "runtime")]
-const REQUIRED_RUNTIME_CLASS_NAME: &str = "kata-qemu";
+const KUBERNETES_DNS_SUBDOMAIN_MAX_LENGTH: usize = 253;
+#[cfg(feature = "runtime")]
+const KUBERNETES_DNS_LABEL_MAX_LENGTH: usize = 63;
 #[cfg(feature = "runtime")]
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
 #[cfg(feature = "runtime")]
@@ -335,6 +337,25 @@ fn sandbox_spec(projection: &OpenShellProjection) -> SandboxSpec {
 }
 
 #[cfg(feature = "runtime")]
+fn valid_kubernetes_runtime_class_name(value: &str) -> bool {
+    if value.is_empty() || value.len() > KUBERNETES_DNS_SUBDOMAIN_MAX_LENGTH {
+        return false;
+    }
+    value.split('.').all(|label| {
+        if label.is_empty() || label.len() > KUBERNETES_DNS_LABEL_MAX_LENGTH {
+            return false;
+        }
+        let bytes = label.as_bytes();
+        let valid_boundary = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+        valid_boundary(bytes[0])
+            && valid_boundary(bytes[bytes.len() - 1])
+            && bytes
+                .iter()
+                .all(|byte| valid_boundary(*byte) || *byte == b'-')
+    })
+}
+
+#[cfg(feature = "runtime")]
 #[derive(Clone)]
 pub struct OpenShellConnectionConfig {
     pub endpoint: String,
@@ -387,11 +408,10 @@ impl OpenShellConnectionConfig {
                 reason: "workload exchange CA certificate is required".to_owned(),
             });
         }
-        if self.runtime_class_name != REQUIRED_RUNTIME_CLASS_NAME {
+        if !valid_kubernetes_runtime_class_name(&self.runtime_class_name) {
             return Err(PortError::Rejected {
-                reason: format!(
-                    "OpenShell gateway runtime class must be {REQUIRED_RUNTIME_CLASS_NAME}"
-                ),
+                reason: "OpenShell gateway runtime class must be a valid Kubernetes DNS subdomain"
+                    .to_owned(),
             });
         }
         Ok(())
@@ -1658,14 +1678,42 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn gateway_transport_rejects_a_non_kata_runtime_contract() {
-        let mut config = valid_connection_config();
-        config.runtime_class_name = "runc".to_owned();
+    fn gateway_runtime_class_rejects_invalid_kubernetes_names() {
+        let label_too_long = "a".repeat(64);
+        let name_too_long = vec!["a".repeat(63); 4].join(".");
+        for runtime_class_name in [
+            "".to_owned(),
+            "invalid/runtime".to_owned(),
+            "Invalid".to_owned(),
+            "invalid_name".to_owned(),
+            "-leading".to_owned(),
+            "trailing-".to_owned(),
+            "two..labels".to_owned(),
+            label_too_long,
+            name_too_long,
+        ] {
+            let mut config = valid_connection_config();
+            config.runtime_class_name = runtime_class_name.clone();
 
-        assert!(
-            matches!(config.validate(), Err(PortError::Rejected { .. })),
-            "the OpenShell adapter must reject a runtime class other than kata-qemu"
-        );
+            assert!(
+                matches!(config.validate(), Err(PortError::Rejected { .. })),
+                "the OpenShell adapter must reject invalid Kubernetes RuntimeClass name {runtime_class_name:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn gateway_runtime_class_accepts_reviewed_and_legacy_kubernetes_names() {
+        for runtime_class_name in ["openshell-runc", "kata-qemu"] {
+            let mut config = valid_connection_config();
+            config.runtime_class_name = runtime_class_name.to_owned();
+
+            assert!(
+                config.validate().is_ok(),
+                "the OpenShell adapter must accept valid Kubernetes RuntimeClass name {runtime_class_name}"
+            );
+        }
     }
 
     #[cfg(feature = "runtime")]

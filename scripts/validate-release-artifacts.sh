@@ -16,6 +16,7 @@ image_values=(
   --set images.mint.tag=validation-mint
   --set "images.mint.digest=${digest2}"
   --set 'runtimeNamespaces[0]=team-a'
+  --set-string config.controller.openshellRuntimeClassName=openshell-runc
 )
 
 helm lint "${root}/charts/steward" "${image_values[@]}"
@@ -36,7 +37,7 @@ grep -q 'failurePolicy: Fail' "${rendered}"
 grep -q 'driver: csi.spiffe.io' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_SERVER_NAME' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME' "${rendered}"
-grep -Eq 'value: "?kata-qemu"?' "${rendered}"
+grep -Eq 'value: "?openshell-runc"?' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE' "${rendered}"
@@ -54,6 +55,15 @@ if helm lint "${root}/charts/steward" "${image_values[@]}" \
   --set-string config.apiserver.kubernetesTokenReviewAudience= >/dev/null 2>&1
 then
   echo "an empty Kubernetes TokenReview audience must fail chart validation" >&2
+  exit 1
+fi
+legacy_runtime_values=("${image_values[@]:0:${#image_values[@]}-2}")
+helm lint "${root}/charts/steward" "${legacy_runtime_values[@]}" \
+  --set-string config.controller.openshellRuntimeClassName=kata-qemu >/dev/null
+if helm lint "${root}/charts/steward" "${legacy_runtime_values[@]}" \
+  --set-string config.controller.openshellRuntimeClassName=invalid/runtime >/dev/null 2>&1
+then
+  echo "an invalid Kubernetes RuntimeClass name must fail chart validation" >&2
   exit 1
 fi
 test "$(grep -c 'secretName: steward-openshell-client' "${rendered}")" -eq 1

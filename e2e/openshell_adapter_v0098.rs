@@ -40,7 +40,7 @@ fn valid_config() -> Result<OpenShellConnectionConfig, String> {
         )?,
         workload_source_credential_file: required_path("STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE")?,
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
-        runtime_class_name: "kata-qemu".to_owned(),
+        runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
     })
 }
 
@@ -104,7 +104,11 @@ fn output_payload(run_dir: &Path, archive: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("declared output out/payload.bin is missing: {error}"))
 }
 
-fn assert_runtime_class_propagation(workspace: &str, sandbox: &str) -> Result<(), String> {
+fn assert_runtime_class_propagation(
+    workspace: &str,
+    sandbox: &str,
+    expected_runtime_class: &str,
+) -> Result<(), String> {
     let kubeconfig = required("STEWARD_TEST_KUBECONFIG")?;
     let context = required("STEWARD_TEST_KUBE_CONTEXT")?;
     let selector =
@@ -134,10 +138,10 @@ fn assert_runtime_class_propagation(workspace: &str, sandbox: &str) -> Result<()
     }
     let runtime_class = String::from_utf8(output.stdout)
         .map_err(|_| "sandbox runtime class was not UTF-8".to_owned())?;
-    if runtime_class.trim() != "kata-qemu" {
+    if runtime_class.trim() != expected_runtime_class {
         return Err(format!(
-            "OpenShell created runtime class {:?}, expected kata-qemu",
-            runtime_class.trim()
+            "OpenShell created runtime class {:?}, expected {expected_runtime_class}",
+            runtime_class.trim(),
         ));
     }
     Ok(())
@@ -222,15 +226,16 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
         "a mismatched OpenShell TLS server name must fail closed"
     );
 
-    let mut unsupported_runtime_class = config.clone();
-    unsupported_runtime_class.runtime_class_name = "runc".to_owned();
+    let mut invalid_runtime_class = config.clone();
+    invalid_runtime_class.runtime_class_name = "invalid/runtime".to_owned();
     assert!(
-        OpenShellRuntime::connect(unsupported_runtime_class)
+        OpenShellRuntime::connect(invalid_runtime_class)
             .await
             .is_err(),
-        "a runtime class contract other than kata-qemu must fail closed"
+        "an invalid Kubernetes RuntimeClass contract must fail closed"
     );
 
+    let expected_runtime_class = config.runtime_class_name.clone();
     let runtime = OpenShellRuntime::connect(config)
         .await
         .map_err(|error| format!("authenticated OpenShell connection failed: {error:?}"))?;
@@ -254,7 +259,7 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
         .sandbox
         .as_deref()
         .ok_or_else(|| "running sandbox has no sandbox reference".to_owned())?;
-    assert_runtime_class_propagation(workspace, sandbox)?;
+    assert_runtime_class_propagation(workspace, sandbox, &expected_runtime_class)?;
     request.refs = refs.clone();
 
     let run_dir = PathBuf::from(required("STEWARD_RUN_DIR")?);
