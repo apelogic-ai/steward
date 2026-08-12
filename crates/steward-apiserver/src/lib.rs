@@ -10,11 +10,21 @@ pub mod connections;
 pub mod connections_demo;
 mod connections_ui;
 pub mod google_oidc;
+mod github_actions;
 mod tasks;
 pub mod user_envelopes;
 #[cfg(feature = "admin-demo")]
 pub mod user_envelopes_demo;
 mod user_ui;
+
+pub use github_actions::{
+    GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA, GITHUB_ACTIONS_RENDER_REQUEST_SCHEMA,
+    GITHUB_FILE_READ_TEMPLATE,
+    GeneratedGithubActionsWorkflow, GithubActionsEnvelopeSelection, GithubActionsRenderContext,
+    GithubActionsRenderError, GithubActionsRenderRequest, GithubActionsTaskTemplate,
+    StewardRunRelease, parse_github_actions_render_request, render_github_actions_workflow,
+    validate_generated_github_actions_yaml,
+};
 
 pub use tasks::{
     KubernetesTaskIdentityResolver, StaticTaskWorkflowCatalog, TaskAdmissionDelta, TaskArchive,
