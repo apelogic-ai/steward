@@ -1,0 +1,276 @@
+:root {
+  color-scheme: light;
+  --background: #f5f3ed;
+  --surface: #fbfaf6;
+  --surface-muted: #f0eee7;
+  --border: #d9d6cc;
+  --border-strong: #b8b4a9;
+  --text: #24231f;
+  --text-muted: #716f68;
+  --accent: #235f9c;
+  --danger: #a43d37;
+  --danger-soft: #f8e7e4;
+  --success: #477a34;
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.45;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--text);
+  background: var(--background);
+}
+
+button {
+  font: inherit;
+}
+
+.skip-link {
+  position: fixed;
+  top: 0.75rem;
+  left: 0.75rem;
+  z-index: 10;
+  padding: 0.6rem 0.85rem;
+  color: white;
+  background: var(--accent);
+  border-radius: 0.5rem;
+  transform: translateY(-160%);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
+.topbar,
+.tabs,
+main,
+.fatal {
+  width: min(61rem, calc(100% - 2rem));
+  margin-inline: auto;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-top: 2.2rem;
+  padding-bottom: 1.1rem;
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 0.65rem;
+}
+
+.brand strong {
+  font-size: 1.05rem;
+  letter-spacing: -0.015em;
+}
+
+.brand span,
+.operator,
+.contract,
+.eyebrow {
+  color: var(--text-muted);
+  font-size: 0.76rem;
+}
+
+.operator {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.status-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--border-strong);
+}
+
+.operator[data-ready="true"] .status-dot {
+  background: var(--success);
+}
+
+.tabs {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.35rem;
+  padding-bottom: 0.8rem;
+}
+
+.tabs button {
+  padding: 0.48rem 0.78rem;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 0.55rem;
+  cursor: pointer;
+}
+
+.tabs button:hover {
+  color: var(--text);
+  background: var(--surface-muted);
+}
+
+.tabs button[aria-selected="true"] {
+  color: var(--text);
+  background: var(--surface);
+  border-color: var(--border);
+}
+
+button:focus-visible,
+a:focus-visible,
+main:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--accent), transparent 45%);
+  outline-offset: 2px;
+}
+
+main {
+  min-height: 31rem;
+  padding: 1.2rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.85rem;
+  box-shadow: 0 0.8rem 2.5rem rgb(46 43 35 / 7%);
+}
+
+.section-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.35rem 0.35rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.eyebrow {
+  margin: 0 0 0.18rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+h1,
+h2,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  margin-bottom: 0;
+  font-size: 1.3rem;
+  letter-spacing: -0.025em;
+}
+
+h2 {
+  margin-bottom: 0.35rem;
+  font-size: 0.96rem;
+}
+
+.contract {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.empty-state {
+  display: grid;
+  place-content: center;
+  min-height: 23rem;
+  padding: 2rem;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.empty-state h2 {
+  color: var(--text);
+}
+
+.empty-state p {
+  max-width: 31rem;
+  margin-bottom: 0;
+}
+
+.fatal {
+  display: flex;
+  gap: 0.65rem;
+  margin-top: 1rem;
+  padding: 0.8rem 1rem;
+  color: var(--danger);
+  background: var(--danger-soft);
+  border: 1px solid color-mix(in srgb, var(--danger), transparent 65%);
+  border-radius: 0.65rem;
+  font-size: 0.82rem;
+}
+
+.fatal[hidden] {
+  display: none;
+}
+
+@media (max-width: 38rem) {
+  .topbar,
+  .tabs,
+  main,
+  .fatal {
+    width: min(100% - 1rem, 61rem);
+  }
+
+  .topbar {
+    align-items: flex-start;
+    padding-top: 1rem;
+  }
+
+  .brand {
+    display: grid;
+    gap: 0.05rem;
+  }
+
+  .operator {
+    max-width: 52%;
+    text-align: right;
+  }
+
+  .tabs {
+    justify-content: stretch;
+    overflow-x: auto;
+  }
+
+  .tabs button {
+    flex: 1 0 auto;
+  }
+
+  main {
+    min-height: calc(100vh - 8rem);
+    padding: 0.8rem;
+    border-radius: 0.7rem;
+  }
+
+  .section-heading {
+    align-items: flex-start;
+  }
+
+  .empty-state {
+    min-height: 20rem;
+    padding-inline: 1rem;
+  }
+
+  .fatal {
+    flex-direction: column;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}

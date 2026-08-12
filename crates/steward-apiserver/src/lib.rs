@@ -1,5 +1,6 @@
-//! REST admission path and server-rendered approval queue.
+//! REST admission path and authenticated administrator surface.
 
+mod admin_ui;
 mod tasks;
 
 pub use tasks::{
@@ -250,7 +251,8 @@ pub struct GrantRevocationRequest {
         task_execute_contract,
         task_status_contract,
         task_outputs_contract,
-        task_delete_contract
+        task_delete_contract,
+        admin_ui::bootstrap
     ),
     components(schemas(
         CreateRuntimeRequest,
@@ -259,7 +261,9 @@ pub struct GrantRevocationRequest {
         TaskStatusResponse,
         TaskAdmissionDelta,
         TaskArchive,
-        TaskErrorResponse
+        TaskErrorResponse,
+        admin_ui::AdminBootstrapResponse,
+        admin_ui::AdminSurface
     )),
     modifiers(&TaskSecurity)
 )]
@@ -278,6 +282,15 @@ impl utoipa::Modify for TaskSecurity {
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
                         .bearer_format("OIDC assertion")
+                        .build(),
+                ),
+            );
+            components.add_security_scheme(
+                "adminBearer",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("short-lived OIDC assertion")
                         .build(),
                 ),
             );
@@ -1044,6 +1057,7 @@ where
             authenticate_admission::<A>,
         ));
     let admin = Router::new()
+        .merge(admin_ui::router::<AppState<R, L, D>>())
         .route("/admin/approvals", get(approval_queue_handler::<R, L, D>))
         .route(
             "/admin/envelopes/{member_role}",
@@ -1068,7 +1082,8 @@ where
         .route_layer(middleware::from_fn_with_state(
             authenticator,
             authenticate_admin::<A>,
-        ));
+        ))
+        .route_layer(middleware::from_fn(admin_ui::add_browser_security_headers));
     admission.merge(admin).with_state(AppState {
         runtimes,
         ledger,
@@ -3008,6 +3023,35 @@ mod tests {
                 )
                 .is_some(),
             "Task outputs must publish application/x-tar"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admin_bootstrap_is_published_as_a_versioned_typed_contract() -> Result<(), String> {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("serialize OpenAPI document: {error}"))?;
+        let operation = document
+            .pointer("/paths/~1admin~1api~1v1~1bootstrap/get")
+            .ok_or_else(|| "admin bootstrap operation is absent from OpenAPI".to_owned())?;
+        assert!(
+            operation.pointer("/security/0/adminBearer").is_some(),
+            "the browser bootstrap contract must retain exact bearer authentication"
+        );
+        assert_eq!(
+            operation.pointer("/responses/200/content/application~1json/schema/$ref"),
+            Some(&serde_json::json!(
+                "#/components/schemas/AdminBootstrapResponse"
+            ))
+        );
+        assert_eq!(
+            document
+                .pointer("/components/schemas/AdminBootstrapResponse/properties/apiVersion/type"),
+            Some(&serde_json::json!("string"))
+        );
+        assert_eq!(
+            document.pointer("/components/securitySchemes/adminBearer/type"),
+            Some(&serde_json::json!("http"))
         );
         Ok(())
     }
@@ -6531,5 +6575,243 @@ mod tests {
             "stale approval must preserve the intervening runtime change"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_dashboard_shell_and_versioned_bootstrap_require_exact_admin_authority()
+    -> Result<(), String> {
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+
+        for (authorization, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("Bearer user-session"), StatusCode::FORBIDDEN),
+        ] {
+            for uri in ["/admin", "/admin/api/v1/bootstrap"] {
+                let mut request = Request::builder().uri(uri);
+                if let Some(authorization) = authorization {
+                    request = request.header("authorization", authorization);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).map_err(|error| {
+                        format!("failed to build dashboard authorization request: {error}")
+                    })?)
+                    .await
+                    .map_err(|error| format!("dashboard authorization request failed: {error}"))?;
+                assert_eq!(
+                    response.status(),
+                    expected,
+                    "{uri} must share the existing exact Steward administrator boundary"
+                );
+            }
+        }
+
+        let shell = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin")
+                    .header("authorization", "Bearer admin-session")
+                    .body(Body::empty())
+                    .map_err(|error| format!("failed to build dashboard shell request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("dashboard shell request failed: {error}"))?;
+        assert_eq!(shell.status(), StatusCode::OK);
+        assert_eq!(
+            shell
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        let shell_body = to_bytes(shell.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("failed to read dashboard shell: {error}"))?;
+        let shell_html = String::from_utf8(shell_body.to_vec())
+            .map_err(|error| format!("dashboard shell was not UTF-8: {error}"))?;
+        for surface in ["Approvals", "Envelope", "Fleet"] {
+            assert!(
+                shell_html.contains(surface),
+                "the dashboard shell must expose the {surface} navigation surface"
+            );
+        }
+        for forbidden_fixture in ["leo@", "maya@", "openclaw-a1b2"] {
+            assert!(
+                !shell_html.contains(forbidden_fixture),
+                "the production shell must not embed mock operational data: {forbidden_fixture}"
+            );
+        }
+
+        let bootstrap = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/bootstrap")
+                    .header("authorization", "Bearer admin-session")
+                    .body(Body::empty())
+                    .map_err(|error| {
+                        format!("failed to build dashboard bootstrap request: {error}")
+                    })?,
+            )
+            .await
+            .map_err(|error| format!("dashboard bootstrap request failed: {error}"))?;
+        assert_eq!(bootstrap.status(), StatusCode::OK);
+        let bootstrap_body = to_bytes(bootstrap.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("failed to read dashboard bootstrap: {error}"))?;
+        let bootstrap_json = serde_json::from_slice::<serde_json::Value>(&bootstrap_body)
+            .map_err(|error| format!("dashboard bootstrap was not JSON: {error}"))?;
+        assert_eq!(
+            bootstrap_json,
+            serde_json::json!({
+                "apiVersion": "steward.admin/v1",
+                "actor": "admin@example.com",
+                "surfaces": ["approvals", "envelope", "fleet"]
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_dashboard_responses_set_fail_closed_browser_headers() -> Result<(), String> {
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+
+        for uri in [
+            "/admin",
+            "/admin/assets/admin.css",
+            "/admin/assets/admin.js",
+            "/admin/assets/icon.svg",
+            "/admin/api/v1/bootstrap",
+            "/admin/approvals",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("authorization", "Bearer admin-session")
+                        .body(Body::empty())
+                        .map_err(|error| {
+                            format!("failed to build dashboard header request: {error}")
+                        })?,
+                )
+                .await
+                .map_err(|error| format!("dashboard header request failed: {error}"))?;
+            assert_eq!(response.status(), StatusCode::OK, "dashboard asset {uri}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-content-type-options")
+                    .and_then(|value| value.to_str().ok()),
+                Some("nosniff")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-frame-options")
+                    .and_then(|value| value.to_str().ok()),
+                Some("DENY")
+            );
+            assert!(
+                response.headers().contains_key("content-security-policy"),
+                "dashboard asset {uri} must carry a CSP"
+            );
+        }
+
+        let unauthenticated = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin")
+                    .body(Body::empty())
+                    .map_err(|error| {
+                        format!("failed to build unauthenticated dashboard request: {error}")
+                    })?,
+            )
+            .await
+            .map_err(|error| format!("unauthenticated dashboard request failed: {error}"))?;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            unauthenticated
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "authentication failures on administrator routes must retain browser headers"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admin_dashboard_static_contract_is_accessible_responsive_and_storage_free() {
+        let html = include_str!("../assets/admin/index.html");
+        let css = include_str!("../assets/admin/admin.css");
+        let javascript = include_str!("../assets/admin/admin.js");
+
+        for required in [
+            "lang=\"en\"",
+            "name=\"viewport\"",
+            "rel=\"icon\" href=\"/admin/assets/icon.svg\"",
+            "class=\"skip-link\"",
+            "aria-label=\"Steward administrator surfaces\"",
+            "role=\"tablist\"",
+            "role=\"tab\"",
+            "role=\"tabpanel\"",
+            "aria-controls=\"approvals-panel\"",
+            "aria-selected=\"true\"",
+            "role=\"alert\"",
+        ] {
+            assert!(
+                html.contains(required),
+                "dashboard shell is missing accessible contract {required:?}"
+            );
+        }
+        assert!(
+            css.contains("@media (max-width: 38rem)"),
+            "dashboard shell must define its narrow viewport layout"
+        );
+        assert!(
+            css.contains("prefers-reduced-motion"),
+            "dashboard shell must honor reduced-motion preferences"
+        );
+        for key in ["ArrowLeft", "ArrowRight", "Home", "End"] {
+            assert!(
+                javascript.contains(key),
+                "dashboard tabs must support the {key} keyboard command"
+            );
+        }
+        for forbidden in [
+            "localStorage",
+            "sessionStorage",
+            "document.cookie",
+            "Authorization",
+            "innerHTML",
+            "outerHTML",
+        ] {
+            assert!(
+                !javascript.contains(forbidden),
+                "dashboard JavaScript must not use forbidden credential or HTML sink {forbidden}"
+            );
+        }
     }
 }
