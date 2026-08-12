@@ -26,6 +26,60 @@ implemented and must stay internal until its identity and session lifecycle are
 reviewed. The static shell fails closed when the authenticated bootstrap cannot
 be read.
 
+### Localhost human-acceptance harness
+
+The repository includes an opt-in example for human review of this exact
+browser contract. It is not an authentication mechanism or a deployment
+surface. The example composes the same embedded assets, administrator
+authentication middleware, and browser security headers as the production
+router, but its authenticated mode injects one deterministic RFC 2606 test
+identity inside the separately compiled example process. It does not construct
+the Kubernetes, PostgreSQL, Jira, TLS, or Task collaborators, makes no external
+request, and persists nothing.
+
+The example is excluded from the default feature set and has
+`required-features = ["admin-demo"]`. Production packaging builds only the
+named `steward-apiserver-bin`, controller, and mint binaries; the Helm chart has
+no invocation or configuration for this example. The process rejects every
+non-loopback bind even when one is supplied explicitly.
+
+Start authenticated and unauthenticated modes in separate terminals so the
+human reviewer can inspect both real entry behaviors:
+
+```bash
+cargo run -p steward-apiserver --locked \
+  --features admin-demo --example admin-dashboard-demo -- \
+  --mode authenticated --bind 127.0.0.1:0
+
+cargo run -p steward-apiserver --locked \
+  --features admin-demo --example admin-dashboard-demo -- \
+  --mode unauthenticated --bind 127.0.0.1:0
+```
+
+Each process prints its assigned loopback URL. `Ctrl-C` performs graceful
+shutdown and releases the listener. A safe handoff for a human acceptance test
+must record the exact PR head and both printed URLs, keep both processes alive
+until the decision is recorded, and then stop them.
+
+At desktop and narrow viewport, verify:
+
+- authenticated shell, bootstrap identity, assets, and Approvals / Envelope /
+  Fleet navigation;
+- unauthenticated entry returns the real `401` bearer challenge rather than a
+  fabricated dashboard state;
+- keyboard tab selection and focus, refresh, and browser back/forward;
+- loading, empty, fatal, and unauthorized presentation that the foundation
+  currently implements;
+- readable layout without clipping or unexpected overflow;
+- no console errors in the authenticated flow; in the unauthenticated flow,
+  the expected `401` resource failure and a browser fallback `/favicon.ico`
+  probe may appear, but neither may trigger a non-loopback request;
+- no unexpected non-loopback requests, cookies, `localStorage`, or
+  `sessionStorage` entries.
+
+Automated browser checks and the deterministic test identity do not replace the
+human acceptance decision.
+
 ## Versioned browser API
 
 The browser API prefix is `/admin/api/v1`. Its media type is JSON unless noted.

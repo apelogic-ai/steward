@@ -1,5 +1,7 @@
 //! REST admission path and authenticated administrator surface.
 
+#[cfg(feature = "admin-demo")]
+pub mod admin_demo;
 mod admin_ui;
 mod tasks;
 
@@ -1056,39 +1058,50 @@ where
             authenticator.clone(),
             authenticate_admission::<A>,
         ));
-    let admin = Router::new()
-        .merge(admin_ui::router::<AppState<R, L, D>>())
-        .route("/admin/approvals", get(approval_queue_handler::<R, L, D>))
-        .route(
-            "/admin/envelopes/{member_role}",
-            post(author_envelope_handler::<R, L, D>),
-        )
-        .route(
-            "/admin/service-envelopes/{service}",
-            post(author_service_envelope_handler::<R, L, D>),
-        )
-        .route(
-            "/admin/approvals/{approval_id}/approve",
-            post(approve_handler::<R, L, D>),
-        )
-        .route(
-            "/admin/approvals/{approval_id}/file",
-            post(file_decision_handler::<R, L, D>),
-        )
-        .route(
-            "/admin/runtimes/{runtime_uid}/grants/revoke",
-            post(revoke_grants_handler::<R, L, D>),
-        )
-        .route_layer(middleware::from_fn_with_state(
-            authenticator,
-            authenticate_admin::<A>,
-        ))
-        .route_layer(middleware::from_fn(admin_ui::add_browser_security_headers));
+    let admin = protect_admin_routes(
+        Router::new()
+            .merge(admin_ui::router::<AppState<R, L, D>>())
+            .route("/admin/approvals", get(approval_queue_handler::<R, L, D>))
+            .route(
+                "/admin/envelopes/{member_role}",
+                post(author_envelope_handler::<R, L, D>),
+            )
+            .route(
+                "/admin/service-envelopes/{service}",
+                post(author_service_envelope_handler::<R, L, D>),
+            )
+            .route(
+                "/admin/approvals/{approval_id}/approve",
+                post(approve_handler::<R, L, D>),
+            )
+            .route(
+                "/admin/approvals/{approval_id}/file",
+                post(file_decision_handler::<R, L, D>),
+            )
+            .route(
+                "/admin/runtimes/{runtime_uid}/grants/revoke",
+                post(revoke_grants_handler::<R, L, D>),
+            ),
+        authenticator,
+    );
     admission.merge(admin).with_state(AppState {
         runtimes,
         ledger,
         decisions,
     })
+}
+
+fn protect_admin_routes<S, A>(routes: Router<S>, authenticator: A) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    A: RequestAuthenticator,
+{
+    routes
+        .route_layer(middleware::from_fn_with_state(
+            authenticator,
+            authenticate_admin::<A>,
+        ))
+        .route_layer(middleware::from_fn(admin_ui::add_browser_security_headers))
 }
 
 async fn authenticate_admission<A: RequestAuthenticator>(
