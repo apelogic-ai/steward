@@ -11,6 +11,7 @@ axum.workspace = true
 k8s-openapi.workspace = true
 kube = { workspace = true, features = ["client", "ring", "rustls-tls"] }
 serde.workspace = true
+serde-saphyr.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 steward-admission = { path = "../steward-admission", version = "=0.0.0" }
