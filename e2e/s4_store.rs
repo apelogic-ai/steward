@@ -6,10 +6,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
-use steward_store::{ApproveAdmission, ParkRejection, PgStore, StoreError, TaskReservationRequest};
+use steward_store::{
+    AgentRunQuery, AgentRunTimelineKind, AgentRunTimelineProvenance, ApproveAdmission,
+    ParkRejection, PgStore, StoreError, TaskReservationRequest,
+};
 use steward_types::{
     AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal, RuntimeOwnership,
-    TaskPhase,
+    SpendSummary, TaskPhase,
 };
 
 fn proposed_spec() -> AgentRuntimeSpec {
@@ -68,6 +71,7 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         runtime_ownership: RuntimeOwnership::Provisioned,
         runtime_spec: &spec,
         agent_command: &command,
+        envelope_revision: 1,
     };
     let first = store.reserve_task(&request).await?;
     assert!(first.inserted);
@@ -77,6 +81,18 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
 
     store
         .bind_task_runtime(first.record.task_uid, &runtime_uid, TaskPhase::Submitted)
+        .await?;
+    store
+        .record_spend_observation(
+            &runtime_uid,
+            1,
+            "task-read-model-spec",
+            &SpendSummary {
+                observed_amount: "1.25".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            false,
+        )
         .await?;
     let archive = b"neutral-tar-fixture";
     store
@@ -125,6 +141,53 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
             .await?
             .ok_or_else(|| io::Error::other("finalized task disappeared"))?
             .finalized
+    );
+    let page = store
+        .agent_runs(&AgentRunQuery {
+            limit: 10,
+            cursor: None,
+            phase: Some(TaskPhase::Succeeded),
+            workflow: Some("code-review".to_owned()),
+        })
+        .await?;
+    let read_model = page
+        .records
+        .iter()
+        .find(|record| record.task_uid == first.record.task_uid)
+        .ok_or_else(|| io::Error::other("completed task is absent from Agent Runs"))?;
+    assert_eq!(read_model.envelope_revision, Some(1));
+    assert_eq!(read_model.runtime_spec, spec);
+    assert_eq!(
+        read_model
+            .spend
+            .as_ref()
+            .map(|spend| spend.observed_amount.as_str()),
+        Some("1.25")
+    );
+    assert!(!read_model.history_partial);
+    let timeline = store
+        .agent_run_timeline(first.record.task_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("completed task timeline disappeared"))?;
+    assert!(
+        timeline
+            .iter()
+            .all(|event| { event.provenance == AgentRunTimelineProvenance::Recorded })
+    );
+    assert!(
+        timeline
+            .iter()
+            .any(|event| { event.kind == AgentRunTimelineKind::Phase(TaskPhase::Succeeded) })
+    );
+    assert!(
+        timeline
+            .iter()
+            .any(|event| { event.kind == AgentRunTimelineKind::FinalizationRequested })
+    );
+    assert!(
+        timeline
+            .iter()
+            .any(|event| { event.kind == AgentRunTimelineKind::Finalized })
     );
     Ok(())
 }

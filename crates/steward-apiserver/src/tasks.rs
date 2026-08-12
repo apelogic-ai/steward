@@ -750,6 +750,7 @@ where
                 runtime_ownership: RuntimeOwnership::Adopted,
                 runtime_spec: &spec,
                 agent_command: &workflow.command,
+                envelope_revision: envelope.revision,
             })
             .await
             .map_err(ApiError::Store)?;
@@ -783,6 +784,7 @@ where
             runtime_ownership: RuntimeOwnership::Provisioned,
             runtime_spec: &spec,
             agent_command: &workflow.command,
+            envelope_revision: envelope.revision,
         })
         .await
         .map_err(ApiError::Store)?;
