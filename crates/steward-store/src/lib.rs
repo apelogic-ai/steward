@@ -1689,6 +1689,7 @@ pub struct AgentRunRecord {
     pub failure_reason: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub lifecycle_observed_at: Option<String>,
     pub spend: Option<AgentRunSpend>,
     pub history_partial: bool,
 }
@@ -1989,6 +1990,7 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
             to_char(tasks.updated_at AT TIME ZONE 'UTC', \
                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at, \
+            lifecycle.observed_at AS lifecycle_observed_at, \
             spend.observed_amount, spend.currency, spend.exhausted, spend.observed_at, \
             EXISTS ( \
                 SELECT 1 FROM task_lifecycle_events history \
@@ -1996,6 +1998,14 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
                   AND history.provenance = 'backfilled' \
             ) AS history_partial \
      FROM task_submissions tasks \
+     LEFT JOIN LATERAL ( \
+         SELECT to_char(event.at AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS observed_at \
+         FROM task_lifecycle_events event \
+         WHERE event.task_uid = tasks.task_uid \
+         ORDER BY event.at DESC, event.id DESC \
+         LIMIT 1 \
+     ) lifecycle ON true \
      LEFT JOIN LATERAL ( \
          SELECT observation.observed_amount::text AS observed_amount, \
                 observation.currency, observation.exhausted, \
@@ -2043,6 +2053,9 @@ fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreE
         failure_reason: row.try_get("failure_reason").map_err(database_error)?,
         created_at: row.try_get("created_at").map_err(database_error)?,
         updated_at: row.try_get("updated_at").map_err(database_error)?,
+        lifecycle_observed_at: row
+            .try_get("lifecycle_observed_at")
+            .map_err(database_error)?,
         spend,
         history_partial: row.try_get("history_partial").map_err(database_error)?,
     })

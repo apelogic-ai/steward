@@ -27,7 +27,7 @@ stored free-form failure reason is not returned.
 | Submitter service, acting user and owner | `task_submissions` | Submission snapshot | Available under administrator authority. |
 | Runtime UID and ownership | `task_submissions` | Durable binding | Available after binding; otherwise explicitly unavailable. |
 | Current Task phase and finalization | `task_submissions` | Current durable state | Available with `updatedAt`. |
-| Lifecycle timeline | append-only `task_lifecycle_events` | Recorded transactionally after migration | Complete for newly recorded Tasks. Migrated Tasks are explicitly `partial` because intermediate historical transitions cannot be reconstructed. |
+| Lifecycle timeline | append-only `task_lifecycle_events` | Latest event by deterministic `(at, id)` | Complete for newly recorded Tasks. Migrated Tasks are explicitly `partial` because intermediate historical transitions cannot be reconstructed. An impossible missing event set is `unavailable`; `task_submissions.updated_at` is never substituted as lifecycle freshness. |
 | Envelope revision | nullable submission snapshot | Submission snapshot | Available for Tasks submitted after this contract; migrated Tasks report unavailable. |
 | Configured models and tool grants | immutable `task_submissions.runtime_spec` snapshot | Submission snapshot | Available as configured authority only, never described as calls. |
 | Budget allocation | `task_submissions.runtime_spec.budget` | Submission snapshot | Available. |

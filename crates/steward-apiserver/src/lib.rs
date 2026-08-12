@@ -1432,6 +1432,14 @@ where
 
 fn agent_run_view(record: AgentRunRecord) -> AgentRunView {
     let authority_observed_at = record.created_at.clone();
+    let lifecycle_observed_at = record.lifecycle_observed_at.clone();
+    let lifecycle_reason = if lifecycle_observed_at.is_none() {
+        Some("missingLifecycleHistory".to_owned())
+    } else if record.history_partial {
+        Some("backfilledHistory".to_owned())
+    } else {
+        None
+    };
     let spend_observed_at = record.spend.as_ref().map(|spend| spend.observed_at.clone());
     let observed_spend = record.spend.as_ref().map(|spend| AgentRunSpendView {
         observed_amount: spend.observed_amount.clone(),
@@ -1490,16 +1498,16 @@ fn agent_run_view(record: AgentRunRecord) -> AgentRunView {
                 .then(|| "noSpendObservation".to_owned()),
         },
         lifecycle: AgentRunDataStatus {
-            availability: if record.history_partial {
+            availability: if record.lifecycle_observed_at.is_none() {
+                AgentRunAvailability::Unavailable
+            } else if record.history_partial {
                 AgentRunAvailability::Partial
             } else {
                 AgentRunAvailability::Available
             },
             source: "taskLifecycleEvents".to_owned(),
-            observed_at: Some(record.updated_at),
-            reason: record
-                .history_partial
-                .then(|| "backfilledHistory".to_owned()),
+            observed_at: lifecycle_observed_at,
+            reason: lifecycle_reason,
         },
         tool_activity: unavailable("notPersisted"),
         inference_activity: unavailable("notPersisted"),
@@ -2735,6 +2743,9 @@ mod tests {
     struct BootstrapAuthenticator;
 
     #[derive(Clone)]
+    struct AgentRunIdentityAuthenticator;
+
+    #[derive(Clone)]
     struct FakeTaskIdentityResolver;
 
     impl TaskIdentityResolver for FakeTaskIdentityResolver {
@@ -3258,6 +3269,51 @@ mod tests {
                     is_admin: false,
                     can_bootstrap_steward_run_service_envelope: true,
                 })
+            })
+        }
+    }
+
+    impl RequestAuthenticator for AgentRunIdentityAuthenticator {
+        fn authenticate<'a>(
+            &'a self,
+            bearer_token: &'a str,
+        ) -> BoxFuture<'a, Result<AuthenticatedCaller, AuthenticationError>> {
+            Box::pin(async move {
+                let (username, groups) = match bearer_token {
+                    "task-session" => (
+                        "alice@example.com",
+                        vec![
+                            "agents.apelogic.ai/service-principal:steward-run".to_owned(),
+                            "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                            "agents.apelogic.ai/task-owner:alice@example.com".to_owned(),
+                            "system:authenticated".to_owned(),
+                        ],
+                    ),
+                    "runtime-session" => (
+                        "system:serviceaccount:steward:steward-controller",
+                        vec![
+                            "system:serviceaccounts".to_owned(),
+                            "system:serviceaccounts:steward".to_owned(),
+                            "system:authenticated".to_owned(),
+                        ],
+                    ),
+                    "admin-session" => (
+                        "admin@example.com",
+                        vec![
+                            "agents.apelogic.ai/admin".to_owned(),
+                            "system:authenticated".to_owned(),
+                        ],
+                    ),
+                    _ => return Err(AuthenticationError::InvalidCredentials),
+                };
+                caller_from_kubernetes_user(
+                    &UserInfo {
+                        username: Some(username.to_owned()),
+                        groups: Some(groups),
+                        ..UserInfo::default()
+                    },
+                    "agents.apelogic.ai/admin",
+                )
             })
         }
     }
@@ -7242,6 +7298,80 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn agent_runs_all_routes_deny_task_and_runtime_identities() -> Result<(), String> {
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let ledger = ledger();
+        ledger
+            .agent_runs
+            .lock()
+            .map_err(|_| "fake agent-run lock was poisoned")?
+            .push(sample_agent_run(task_uid, "2026-08-12T12:00:00.000000Z"));
+        ledger
+            .agent_run_events
+            .lock()
+            .map_err(|_| "fake timeline lock was poisoned")?
+            .push((
+                task_uid,
+                vec![AgentRunTimelineEvent {
+                    kind: AgentRunTimelineKind::Phase(TaskPhase::Failed),
+                    provenance: AgentRunTimelineProvenance::Recorded,
+                    at: "2026-08-12T12:01:00.000000Z".to_owned(),
+                }],
+            ));
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger,
+            AgentRunIdentityAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        let routes = [
+            "/admin/api/v1/runs".to_owned(),
+            format!("/admin/api/v1/runs/{task_uid}"),
+            format!("/admin/api/v1/runs/{task_uid}/timeline"),
+        ];
+        for route in &routes {
+            for token in ["task-session", "runtime-session"] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(route)
+                            .header("authorization", format!("Bearer {token}"))
+                            .body(Body::empty())
+                            .map_err(|error| error.to_string())?,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::FORBIDDEN,
+                    "{token} must not read administrator route {route}"
+                );
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(route)
+                        .header("authorization", "Bearer admin-session")
+                        .body(Body::empty())
+                        .map_err(|error| error.to_string())?,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "exact administrator authority must read {route}"
+            );
+        }
+        Ok(())
+    }
+
     fn sample_agent_run(task_uid: Uuid, created_at: &str) -> AgentRunRecord {
         AgentRunRecord {
             task_uid,
@@ -7283,7 +7413,8 @@ mod tests {
             finalized: true,
             failure_reason: Some("provider returned secret diagnostic payload".to_owned()),
             created_at: created_at.to_owned(),
-            updated_at: "2026-08-12T12:01:00.000000Z".to_owned(),
+            updated_at: "2026-08-12T12:02:00.000000Z".to_owned(),
+            lifecycle_observed_at: Some("2026-08-12T12:01:00.000000Z".to_owned()),
             spend: Some(AgentRunSpend {
                 observed_amount: "1.25".to_owned(),
                 currency: "USD".to_owned(),
@@ -7358,6 +7489,10 @@ mod tests {
         assert_eq!(body["apiVersion"], AGENT_RUNS_API_VERSION);
         assert_eq!(body["run"]["errorCategory"], "execution-failed");
         assert_eq!(body["run"]["observedSpend"]["observedAmount"], "1.25");
+        assert_eq!(
+            body["run"]["lifecycle"]["observedAt"], "2026-08-12T12:01:00.000000Z",
+            "a later non-lifecycle Task write must not advance lifecycle freshness"
+        );
         assert_eq!(body["run"]["toolActivity"]["availability"], "unavailable");
         assert_eq!(body["run"]["toolActivity"]["source"], "none");
         assert_eq!(body["run"]["toolActivity"]["reason"], "notPersisted");
@@ -7386,6 +7521,52 @@ mod tests {
         assert_eq!(body["history"]["availability"], "partial");
         assert_eq!(body["events"][0]["provenance"], "backfilled");
         assert_eq!(body["events"][1]["phase"], "failed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_run_missing_lifecycle_history_is_explicitly_unavailable() -> Result<(), String> {
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let ledger = ledger();
+        let mut run = sample_agent_run(task_uid, "2026-08-12T12:00:00.000000Z");
+        run.lifecycle_observed_at = None;
+        ledger
+            .agent_runs
+            .lock()
+            .map_err(|_| "fake agent-run lock was poisoned")?
+            .push(run);
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger,
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/api/v1/runs/{task_uid}"))
+                    .header("authorization", "Bearer admin-session")
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+        assert_eq!(body["run"]["lifecycle"]["availability"], "unavailable");
+        assert_eq!(body["run"]["lifecycle"]["source"], "taskLifecycleEvents");
+        assert_eq!(
+            body["run"]["lifecycle"]["reason"],
+            "missingLifecycleHistory"
+        );
+        assert!(body["run"]["lifecycle"].get("observedAt").is_none());
         Ok(())
     }
 

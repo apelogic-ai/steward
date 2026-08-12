@@ -94,6 +94,13 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
             false,
         )
         .await?;
+    let lifecycle_before_inputs = store
+        .agent_run(first.record.task_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("bound task disappeared from Agent Runs"))?;
+    sqlx::query("SELECT pg_sleep(0.002)")
+        .execute(store.pool())
+        .await?;
     let archive = b"neutral-tar-fixture";
     store
         .put_task_inputs(
@@ -103,6 +110,18 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
             archive,
         )
         .await?;
+    let after_inputs = store
+        .agent_run(first.record.task_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("input-bearing task disappeared from Agent Runs"))?;
+    assert_ne!(
+        after_inputs.updated_at, lifecycle_before_inputs.updated_at,
+        "put_task_inputs must advance current Task freshness"
+    );
+    assert_eq!(
+        after_inputs.lifecycle_observed_at, lifecycle_before_inputs.lifecycle_observed_at,
+        "put_task_inputs must not advance append-only lifecycle freshness"
+    );
     store
         .request_task_execution(
             first.record.task_uid,
@@ -188,6 +207,146 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         timeline
             .iter()
             .any(|event| { event.kind == AgentRunTimelineKind::Finalized })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_runs_filtered_pagination_is_stable_under_concurrent_updates()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Agent Runs Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let workflow = format!("filtered-workflow-{suffix}");
+    let spec = proposed_spec();
+    let command = vec!["agent-v1".to_owned()];
+    let mut matching = Vec::new();
+
+    for index in 0..4 {
+        let idempotency_key = format!("pagination-{suffix}-{index}");
+        let runtime_name = format!("pagination-task-{suffix}-{index}");
+        let runtime_uid = format!("pagination-runtime-{suffix}-{index}");
+        let task_workflow = if index == 3 {
+            format!("other-workflow-{suffix}")
+        } else {
+            workflow.clone()
+        };
+        let reservation = store
+            .reserve_task(&TaskReservationRequest {
+                idempotency_key: &idempotency_key,
+                submitter_service: "steward-run",
+                acting_user: Some("alice@example.com"),
+                owner: "alice@example.com",
+                workflow: &task_workflow,
+                coding_agent_runtime: "agent-v1",
+                runtime_namespace: "team-a",
+                runtime_name: &runtime_name,
+                runtime_ownership: RuntimeOwnership::Provisioned,
+                runtime_spec: &spec,
+                agent_command: &command,
+                envelope_revision: 1,
+            })
+            .await?;
+        store
+            .bind_task_runtime(
+                reservation.record.task_uid,
+                &runtime_uid,
+                TaskPhase::Running,
+            )
+            .await?;
+        let created_at = match index {
+            0 | 1 => "2030-01-02T00:00:00Z",
+            2 => "2030-01-01T00:00:00Z",
+            _ => "2030-01-03T00:00:00Z",
+        };
+        sqlx::query("UPDATE task_submissions SET created_at = $2::timestamptz WHERE task_uid = $1")
+            .bind(reservation.record.task_uid)
+            .bind(created_at)
+            .execute(store.pool())
+            .await?;
+        if index < 3 {
+            matching.push((reservation.record.task_uid, runtime_uid));
+        }
+    }
+    let oldest_uid = matching[2].0;
+    matching.sort_by(|left, right| {
+        let left_boundary = if left.0 == oldest_uid { 0 } else { 1 };
+        let right_boundary = if right.0 == oldest_uid { 0 } else { 1 };
+        right_boundary
+            .cmp(&left_boundary)
+            .then_with(|| right.0.cmp(&left.0))
+    });
+
+    let query = |cursor| AgentRunQuery {
+        limit: 1,
+        cursor,
+        phase: Some(TaskPhase::Running),
+        workflow: Some(workflow.clone()),
+    };
+    let first_page = store.agent_runs(&query(None)).await?;
+    assert_eq!(first_page.records.len(), 1);
+    assert_eq!(first_page.records[0].task_uid, matching[0].0);
+    assert_eq!(first_page.next_cursor, Some(matching[0].0));
+
+    sqlx::query(
+        "UPDATE task_submissions SET phase = 'succeeded', updated_at = now() WHERE task_uid = $1",
+    )
+    .bind(matching[0].0)
+    .execute(store.pool())
+    .await?;
+    for amount in ["1.00", "2.00"] {
+        sqlx::query(
+            "INSERT INTO spend_observations \
+             (runtime_uid, observed_amount, currency, exhausted, at) \
+             VALUES ($1, $2::numeric, 'USD', false, '2030-01-04T00:00:00Z'::timestamptz)",
+        )
+        .bind(&matching[1].1)
+        .bind(amount)
+        .execute(store.pool())
+        .await?;
+    }
+
+    let second_page = store.agent_runs(&query(first_page.next_cursor)).await?;
+    assert_eq!(second_page.records.len(), 1);
+    assert_eq!(second_page.records[0].task_uid, matching[1].0);
+    assert_eq!(second_page.next_cursor, Some(matching[1].0));
+    assert_eq!(
+        second_page.records[0]
+            .spend
+            .as_ref()
+            .map(|spend| spend.observed_amount.as_str()),
+        Some("2.00"),
+        "equal-timestamp spend observations must use the highest append-only id"
+    );
+
+    sqlx::query(
+        "UPDATE task_submissions SET phase = 'succeeded', updated_at = now() WHERE task_uid = $1",
+    )
+    .bind(matching[1].0)
+    .execute(store.pool())
+    .await?;
+    let third_page = store.agent_runs(&query(second_page.next_cursor)).await?;
+    assert_eq!(third_page.records.len(), 1);
+    assert_eq!(third_page.records[0].task_uid, matching[2].0);
+    assert!(third_page.next_cursor.is_none());
+    assert_eq!(
+        vec![
+            first_page.records[0].task_uid,
+            second_page.records[0].task_uid,
+            third_page.records[0].task_uid,
+        ],
+        matching.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+        "phase and spend updates must not duplicate or reorder the immutable cursor walk"
     );
     Ok(())
 }
