@@ -1401,6 +1401,7 @@ where
 {
     match state.ledger.agent_run_timeline(task_uid).await {
         Ok(Some(events)) => {
+            let missing = events.is_empty();
             let partial = events
                 .iter()
                 .any(|event| event.provenance == AgentRunTimelineProvenance::Backfilled);
@@ -1409,14 +1410,20 @@ where
                 api_version: AGENT_RUNS_API_VERSION.to_owned(),
                 task_uid,
                 history: AgentRunDataStatus {
-                    availability: if partial {
+                    availability: if missing {
+                        AgentRunAvailability::Unavailable
+                    } else if partial {
                         AgentRunAvailability::Partial
                     } else {
                         AgentRunAvailability::Available
                     },
                     source: "taskLifecycleEvents".to_owned(),
                     observed_at,
-                    reason: partial.then(|| "backfilledHistory".to_owned()),
+                    reason: if missing {
+                        Some("missingLifecycleHistory".to_owned())
+                    } else {
+                        partial.then(|| "backfilledHistory".to_owned())
+                    },
                 },
                 events: events.into_iter().map(agent_run_timeline_view).collect(),
             })
@@ -7536,6 +7543,11 @@ mod tests {
             .lock()
             .map_err(|_| "fake agent-run lock was poisoned")?
             .push(run);
+        ledger
+            .agent_run_events
+            .lock()
+            .map_err(|_| "fake timeline lock was poisoned")?
+            .push((task_uid, Vec::new()));
         let app = router(
             FakeRuntimeRepository {
                 runtime: Arc::new(Mutex::new(runtime())),
@@ -7545,6 +7557,7 @@ mod tests {
             FakeDecisionChannel::default(),
         );
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/admin/api/v1/runs/{task_uid}"))
@@ -7567,6 +7580,28 @@ mod tests {
             "missingLifecycleHistory"
         );
         assert!(body["run"]["lifecycle"].get("observedAt").is_none());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/api/v1/runs/{task_uid}/timeline"))
+                    .header("authorization", "Bearer admin-session")
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+        assert_eq!(body["history"]["availability"], "unavailable");
+        assert_eq!(body["history"]["source"], "taskLifecycleEvents");
+        assert_eq!(body["history"]["reason"], "missingLifecycleHistory");
+        assert!(body["history"].get("observedAt").is_none());
+        assert_eq!(body["events"], serde_json::json!([]));
         Ok(())
     }
 
