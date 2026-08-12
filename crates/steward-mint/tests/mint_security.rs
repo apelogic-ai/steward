@@ -12,8 +12,9 @@ use serde::Deserialize;
 use steward_mint::{
     AuthorityBinding, AuthorityResolver, AuthorityState, CredentialGrant, CredentialGrantResolver,
     DEFAULT_AUTHORITY_TTL, IntrospectionClientCredential, Mint, MintConfig, MintConfigError,
-    MintError, MintSigningKey, OpaqueAccessToken, SPIFFE_CLIENT_ASSERTION_TYPE, SvidAssertion,
-    SvidValidationError, SvidValidator, TokenGrantRequest, ValidatedWorkload,
+    MintError, MintSigningKey, OpaqueAccessToken, ProviderTokenGrantOutcome,
+    SPIFFE_CLIENT_ASSERTION_TYPE, SvidAssertion, SvidValidationError, SvidValidator,
+    TokenGrantRequest, ValidatedWorkload,
 };
 use steward_types::{Email, Principal, RuntimeId, ToolGrant};
 
@@ -183,6 +184,45 @@ fn valid_config() -> MintConfig {
             "gateway-credential".to_owned(),
         ),
     }
+}
+
+#[test]
+fn provider_token_grant_outcomes_are_finite_and_secret_free() -> Result<(), String> {
+    let cases = [
+        (MintError::InvalidSvid, "mint_invalid_client"),
+        (MintError::SvidValidatorUnavailable, "mint_unavailable"),
+        (MintError::AuthorityUnavailable, "mint_unavailable"),
+        (MintError::WorkloadMismatch, "mint_authority_rejected"),
+        (MintError::AuthorityInactive, "mint_authority_rejected"),
+        (MintError::InvalidAudience, "mint_audience_rejected"),
+        (MintError::InvalidScope, "mint_scope_rejected"),
+        (MintError::CredentialUnavailable, "token_handoff_failed"),
+        (MintError::InvalidRequest, "unexpected"),
+        (MintError::SigningFailed, "unexpected"),
+    ];
+    for (error, expected) in cases {
+        let rendered = serde_json::to_string(&error.provider_token_grant_outcome())
+            .map_err(|error| format!("serialize outcome: {error}"))?;
+        assert_eq!(rendered, format!("\"{expected}\""));
+        for forbidden in [
+            "test-svid",
+            "gateway-credential",
+            "sk-steward-test-runtime-key",
+            "spiffe://",
+            "runtime-uid-a",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "outcome must not contain request or credential material: {forbidden}"
+            );
+        }
+    }
+    assert_eq!(
+        serde_json::to_string(&ProviderTokenGrantOutcome::MintUnreachable)
+            .map_err(|error| format!("serialize caller-owned outcome: {error}"))?,
+        "\"mint_unreachable\""
+    );
+    Ok(())
 }
 
 #[test]
