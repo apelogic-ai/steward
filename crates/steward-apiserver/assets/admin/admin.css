@@ -74,9 +74,7 @@ main,
   letter-spacing: -0.015em;
 }
 
-.brand span,
 .operator,
-.contract,
 .eyebrow {
   color: var(--text-muted);
   font-size: 0.76rem;
@@ -103,29 +101,27 @@ main,
 
 .tabs {
   display: flex;
-  justify-content: flex-end;
-  gap: 0.35rem;
+  justify-content: flex-start;
+  gap: 1.25rem;
   padding-bottom: 0.8rem;
 }
 
-.tabs button {
-  padding: 0.48rem 0.78rem;
+.tabs a {
+  padding: 0.35rem 0;
   color: var(--text-muted);
   background: transparent;
-  border: 1px solid transparent;
-  border-radius: 0.55rem;
-  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  text-decoration: none;
 }
 
-.tabs button:hover {
+.tabs a:hover {
   color: var(--text);
-  background: var(--surface-muted);
+  border-bottom-color: var(--border-strong);
 }
 
-.tabs button[aria-selected="true"] {
+.tabs a[aria-selected="true"] {
   color: var(--text);
-  background: var(--surface);
-  border-color: var(--border);
+  border-bottom-color: var(--text);
 }
 
 button:focus-visible,
@@ -176,10 +172,6 @@ h2 {
   font-size: 0.96rem;
 }
 
-.contract {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-
 .empty-state {
   display: grid;
   place-content: center;
@@ -227,23 +219,18 @@ h2 {
     padding-top: 1rem;
   }
 
-  .brand {
-    display: grid;
-    gap: 0.05rem;
-  }
-
   .operator {
     max-width: 52%;
     text-align: right;
   }
 
   .tabs {
-    justify-content: stretch;
+    justify-content: flex-start;
     overflow-x: auto;
   }
 
-  .tabs button {
-    flex: 1 0 auto;
+  .tabs a {
+    flex: 0 0 auto;
   }
 
   main {

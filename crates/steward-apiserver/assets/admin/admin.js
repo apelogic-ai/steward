@@ -11,6 +11,11 @@ function selectSurface(name) {
     const active = tab.dataset.surface === name;
     tab.setAttribute("aria-selected", String(active));
     tab.setAttribute("tabindex", active ? "0" : "-1");
+    if (active) {
+      tab.setAttribute("aria-current", "page");
+    } else {
+      tab.removeAttribute("aria-current");
+    }
   }
   for (const panel of panels) {
     panel.hidden = panel.dataset.panel !== name;
@@ -34,10 +39,21 @@ for (const tab of tabs) {
     if (target) {
       event.preventDefault();
       selectSurface(target.dataset.surface);
+      window.location.hash = target.dataset.surface;
       target.focus();
     }
   });
 }
+
+function selectSurfaceFromHash() {
+  const requested = window.location.hash.slice(1) || "approvals";
+  if (tabs.some((tab) => tab.dataset.surface === requested)) {
+    selectSurface(requested);
+  }
+}
+
+window.addEventListener("hashchange", selectSurfaceFromHash);
+selectSurfaceFromHash();
 
 async function loadBootstrap() {
   try {

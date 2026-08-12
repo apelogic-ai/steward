@@ -6827,4 +6827,48 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn admin_dashboard_human_review_presents_left_aligned_navigation_links() {
+        let html = include_str!("../assets/admin/index.html");
+        let css = include_str!("../assets/admin/admin.css");
+        let javascript = include_str!("../assets/admin/admin.js");
+
+        for required in [
+            "href=\"#approvals\"",
+            "href=\"#envelope\"",
+            "href=\"#fleet\"",
+            "aria-current=\"page\"",
+            "role=\"tab\"",
+        ] {
+            assert!(
+                html.contains(required),
+                "reviewed navigation link contract is missing {required:?}"
+            );
+        }
+        for removed_presentation in [
+            "<span>administration</span>",
+            "class=\"contract\"",
+            "<button id=\"approvals-tab\"",
+        ] {
+            assert!(
+                !html.contains(removed_presentation),
+                "human-requested presentation must remove {removed_presentation:?}"
+            );
+        }
+        assert!(
+            css.contains("justify-content: flex-start"),
+            "reviewed navigation must remain left aligned"
+        );
+        for required in [
+            "setAttribute(\"aria-current\", \"page\")",
+            "removeAttribute(\"aria-current\")",
+            "window.location.hash.slice(1) || \"approvals\"",
+        ] {
+            assert!(
+                javascript.contains(required),
+                "navigation script must preserve current-page semantics with {required:?}"
+            );
+        }
+    }
 }

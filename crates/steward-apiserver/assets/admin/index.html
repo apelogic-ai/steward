@@ -13,7 +13,6 @@
     <header class="topbar">
       <div class="brand">
         <strong>Steward</strong>
-        <span>administration</span>
       </div>
       <div class="operator" aria-live="polite">
         <span class="status-dot" aria-hidden="true"></span>
@@ -22,12 +21,13 @@
     </header>
 
     <nav class="tabs" aria-label="Steward administrator surfaces" role="tablist">
-      <button id="approvals-tab" type="button" role="tab" data-surface="approvals"
-        aria-controls="approvals-panel" aria-selected="true" tabindex="0">Approvals</button>
-      <button id="envelope-tab" type="button" role="tab" data-surface="envelope"
-        aria-controls="envelope-panel" aria-selected="false" tabindex="-1">Envelope</button>
-      <button id="fleet-tab" type="button" role="tab" data-surface="fleet"
-        aria-controls="fleet-panel" aria-selected="false" tabindex="-1">Fleet</button>
+      <a id="approvals-tab" href="#approvals" role="tab" data-surface="approvals"
+        aria-controls="approvals-panel" aria-selected="true" aria-current="page"
+        tabindex="0">Approvals</a>
+      <a id="envelope-tab" href="#envelope" role="tab" data-surface="envelope"
+        aria-controls="envelope-panel" aria-selected="false" tabindex="-1">Envelope</a>
+      <a id="fleet-tab" href="#fleet" role="tab" data-surface="fleet"
+        aria-controls="fleet-panel" aria-selected="false" tabindex="-1">Fleet</a>
     </nav>
 
     <main id="workspace" tabindex="-1">
@@ -38,7 +38,6 @@
             <p class="eyebrow">Decision queue</p>
             <h1 id="approvals-heading">Approvals</h1>
           </div>
-          <span class="contract">steward.admin/v1</span>
         </div>
         <div class="empty-state" data-state="loading">
           <h2>Loading approval contract</h2>
@@ -53,7 +52,6 @@
             <p class="eyebrow">Role policy</p>
             <h1 id="envelope-heading">Envelope</h1>
           </div>
-          <span class="contract">steward.admin/v1</span>
         </div>
         <div class="empty-state" data-state="loading">
           <h2>Loading envelope contract</h2>
@@ -68,7 +66,6 @@
             <p class="eyebrow">Runtime posture</p>
             <h1 id="fleet-heading">Fleet</h1>
           </div>
-          <span class="contract">steward.admin/v1</span>
         </div>
         <div class="empty-state" data-state="loading">
           <h2>Loading fleet contract</h2>
