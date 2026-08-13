@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         token_review_audience.clone(),
     );
     let task_identities =
-        KubernetesTaskIdentityResolver::new(client.clone(), token_review_audience);
+        KubernetesTaskIdentityResolver::new(client.clone(), token_review_audience, store.clone());
     let task_workflows =
         StaticTaskWorkflowCatalog::from_json(&required("STEWARD_TASK_WORKFLOWS_JSON")?)
             .map_err(io::Error::other)?;

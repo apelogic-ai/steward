@@ -19,7 +19,7 @@ use steward_apiserver::{
     TaskIdentityResolver, TaskWorkflow, router as api_router, task_router,
 };
 use steward_store::PgStore;
-use steward_types::{Budget, Duration, Email, ToolGrant};
+use steward_types::{Budget, CanonicalUserId, Duration, Email, ToolGrant};
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
@@ -56,6 +56,11 @@ impl TaskIdentityResolver for TestTaskIdentities {
                 service: service.to_owned(),
                 acting_user: acting_user.map(|email| Email(email.to_owned())),
                 owner: Email(owner.to_owned()),
+                canonical_user_id: CanonicalUserId::parse(match assertion {
+                    "scheduled-assertion" => "usr_abcdef0123456789abcdef0123456789",
+                    _ => "usr_0123456789abcdef0123456789abcdef",
+                })
+                .map_err(|_| TaskAuthenticationError::InvalidCredentials)?,
             })
         })
     }

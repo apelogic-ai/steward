@@ -6,7 +6,9 @@ use std::fmt;
 use sqlx::types::Json;
 use sqlx::{PgPool, Row};
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
-use steward_types::AgentRuntimeSpec;
+use steward_types::{
+    AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationIdentity,
+};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -35,6 +37,299 @@ impl PgStore {
             .run(&self.pool)
             .await
             .map_err(|error| StoreError::Database(error.to_string()))
+    }
+
+    /// Resolve only an already-reviewed exact issuer/subject/organization mapping.
+    ///
+    /// Email is checked for staleness but is never used to discover or adopt a user.
+    pub async fn resolve_canonical_identity(
+        &self,
+        identity: &OrganizationIdentity,
+    ) -> Result<CanonicalPrincipal, StoreError> {
+        let row = sqlx::query(
+            "SELECT canonical_users.user_id, canonical_users.organization_id, \
+                    canonical_users.display_email, canonical_users.state, \
+                    canonical_identity_subjects.verified_email \
+             FROM canonical_identity_subjects \
+             JOIN canonical_users USING (user_id) \
+             WHERE canonical_identity_subjects.issuer = $1 \
+               AND canonical_identity_subjects.subject = $2 \
+               AND canonical_identity_subjects.organization_claim = $3 \
+               AND canonical_identity_subjects.organization_id = $4",
+        )
+        .bind(&identity.issuer)
+        .bind(&identity.subject)
+        .bind(&identity.organization_claim)
+        .bind(identity.organization_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::CanonicalIdentityNotFound)?;
+
+        canonical_principal_from_row(&row, identity)
+    }
+
+    /// Resolve a trusted canonical-user reference and current display email.
+    ///
+    /// This is the bounded lookup used after a workload identity mapper has emitted
+    /// an opaque user ID. It never accepts issuer claims or discovers a user by email.
+    pub async fn resolve_canonical_principal(
+        &self,
+        user_id: &CanonicalUserId,
+        current_verified_email: &Email,
+    ) -> Result<CanonicalPrincipal, StoreError> {
+        let row = sqlx::query(
+            "SELECT organization_id, display_email, state \
+             FROM canonical_users WHERE user_id = $1",
+        )
+        .bind(user_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::CanonicalIdentityNotFound)?;
+        let state: String = row.try_get("state").map_err(database_error)?;
+        if state != "active" {
+            return Err(StoreError::CanonicalIdentityInactive);
+        }
+        let display_email: String = row.try_get("display_email").map_err(database_error)?;
+        if !display_email.eq_ignore_ascii_case(current_verified_email.as_str()) {
+            return Err(StoreError::CanonicalIdentityStale);
+        }
+        let organization_id = row
+            .try_get::<String, _>("organization_id")
+            .map_err(database_error)
+            .and_then(|value| {
+                steward_types::OrganizationId::parse(value)
+                    .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+            })?;
+        CanonicalPrincipal::new(user_id.clone(), organization_id, Email(display_email))
+            .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+    }
+
+    /// Register a new person and exact external subject in one transaction.
+    ///
+    /// An email match never adopts an existing person. Repeated exact registration is
+    /// idempotent only while every reviewed claim still matches.
+    pub async fn register_canonical_identity(
+        &self,
+        identity: &OrganizationIdentity,
+        actor: &str,
+    ) -> Result<CanonicalPrincipal, StoreError> {
+        if actor.trim().is_empty() {
+            return Err(StoreError::CanonicalIdentityInvalidActor);
+        }
+        match self.resolve_canonical_identity(identity).await {
+            Ok(principal) => return Ok(principal),
+            Err(StoreError::CanonicalIdentityNotFound) => {}
+            Err(error) => return Err(error),
+        }
+
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let email_owner = sqlx::query_scalar::<_, String>(
+            "SELECT user_id FROM canonical_users \
+             WHERE organization_id = $1 AND lower(display_email) = lower($2)",
+        )
+        .bind(identity.organization_id.as_str())
+        .bind(&identity.verified_email.0)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if email_owner.is_some() {
+            return Err(StoreError::CanonicalIdentityAmbiguousEmail);
+        }
+
+        let user_id = CanonicalUserId::parse(format!("usr_{}", Uuid::new_v4().simple()))
+            .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)?;
+        sqlx::query(
+            "INSERT INTO canonical_users (user_id, organization_id, display_email) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(user_id.as_str())
+        .bind(identity.organization_id.as_str())
+        .bind(&identity.verified_email.0)
+        .execute(&mut *transaction)
+        .await
+        .map_err(canonical_identity_database_error)?;
+        sqlx::query(
+            "INSERT INTO canonical_identity_subjects \
+             (issuer, subject, organization_claim, organization_id, user_id, verified_email) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&identity.issuer)
+        .bind(&identity.subject)
+        .bind(&identity.organization_claim)
+        .bind(identity.organization_id.as_str())
+        .bind(user_id.as_str())
+        .bind(&identity.verified_email.0)
+        .execute(&mut *transaction)
+        .await
+        .map_err(canonical_identity_database_error)?;
+        sqlx::query(
+            "INSERT INTO canonical_identity_audit \
+             (id, user_id, action, actor, new_display_email) \
+             VALUES ($1, $2, 'registered', $3, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(user_id.as_str())
+        .bind(actor)
+        .bind(&identity.verified_email.0)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+
+        CanonicalPrincipal::new(
+            user_id,
+            identity.organization_id.clone(),
+            identity.verified_email.clone(),
+        )
+        .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+    }
+
+    /// Attach a newly reviewed external issuer/subject to an existing person.
+    ///
+    /// This is the only issuer-migration path: callers must name the opaque user ID,
+    /// organization and current verified email explicitly. Email is never used to
+    /// discover the target user.
+    pub async fn attach_canonical_identity_subject(
+        &self,
+        user_id: &CanonicalUserId,
+        identity: &OrganizationIdentity,
+        actor: &str,
+    ) -> Result<CanonicalPrincipal, StoreError> {
+        if actor.trim().is_empty() {
+            return Err(StoreError::CanonicalIdentityInvalidActor);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let user = sqlx::query(
+            "SELECT organization_id, display_email, state FROM canonical_users WHERE user_id = $1",
+        )
+        .bind(user_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::CanonicalIdentityNotFound)?;
+        let organization_id: String = user.try_get("organization_id").map_err(database_error)?;
+        let display_email: String = user.try_get("display_email").map_err(database_error)?;
+        let state: String = user.try_get("state").map_err(database_error)?;
+        if state != "active" {
+            return Err(StoreError::CanonicalIdentityInactive);
+        }
+        if organization_id != identity.organization_id.as_str()
+            || !display_email.eq_ignore_ascii_case(identity.verified_email.as_str())
+        {
+            return Err(StoreError::CanonicalIdentityStale);
+        }
+
+        let existing = sqlx::query_scalar::<_, String>(
+            "SELECT user_id FROM canonical_identity_subjects \
+             WHERE issuer = $1 AND subject = $2 AND organization_claim = $3 \
+               AND organization_id = $4",
+        )
+        .bind(&identity.issuer)
+        .bind(&identity.subject)
+        .bind(&identity.organization_claim)
+        .bind(identity.organization_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if let Some(existing_user_id) = existing {
+            if existing_user_id != user_id.as_str() {
+                return Err(StoreError::CanonicalIdentityConflict);
+            }
+            return CanonicalPrincipal::new(
+                user_id.clone(),
+                identity.organization_id.clone(),
+                Email(display_email),
+            )
+            .map_err(|_| StoreError::CanonicalIdentityInvalidRecord);
+        }
+
+        sqlx::query(
+            "INSERT INTO canonical_identity_subjects \
+             (issuer, subject, organization_claim, organization_id, user_id, verified_email) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&identity.issuer)
+        .bind(&identity.subject)
+        .bind(&identity.organization_claim)
+        .bind(identity.organization_id.as_str())
+        .bind(user_id.as_str())
+        .bind(identity.verified_email.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(canonical_identity_database_error)?;
+        sqlx::query(
+            "INSERT INTO canonical_identity_audit (id, user_id, action, actor) \
+             VALUES ($1, $2, 'identity_attached', $3)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(user_id.as_str())
+        .bind(actor)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+
+        CanonicalPrincipal::new(
+            user_id.clone(),
+            identity.organization_id.clone(),
+            Email(display_email),
+        )
+        .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+    }
+
+    /// Apply an explicitly reviewed email rename without changing the immutable user ID.
+    pub async fn change_canonical_identity_email(
+        &self,
+        user_id: &CanonicalUserId,
+        expected_previous_email: &Email,
+        new_verified_email: &Email,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        if actor.trim().is_empty() {
+            return Err(StoreError::CanonicalIdentityInvalidActor);
+        }
+        Email::parse(new_verified_email.0.clone())
+            .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)?;
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let updated = sqlx::query(
+            "UPDATE canonical_users \
+             SET display_email = $1, state = 'active', updated_at = now() \
+             WHERE user_id = $2 AND lower(display_email) = lower($3)",
+        )
+        .bind(&new_verified_email.0)
+        .bind(user_id.as_str())
+        .bind(&expected_previous_email.0)
+        .execute(&mut *transaction)
+        .await
+        .map_err(canonical_identity_database_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::CanonicalIdentityStale);
+        }
+        sqlx::query(
+            "UPDATE canonical_identity_subjects \
+             SET verified_email = $1, updated_at = now() WHERE user_id = $2",
+        )
+        .bind(&new_verified_email.0)
+        .bind(user_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        sqlx::query(
+            "INSERT INTO canonical_identity_audit \
+             (id, user_id, action, actor, previous_display_email, new_display_email) \
+             VALUES ($1, $2, 'email_changed', $3, $4, $5)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(user_id.as_str())
+        .bind(actor)
+        .bind(&expected_previous_email.0)
+        .bind(&new_verified_email.0)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)
     }
 
     pub async fn record_spend_observation(
@@ -1220,17 +1515,21 @@ impl PgStore {
         let task_uid = Uuid::new_v4();
         let inserted = sqlx::query(
             "INSERT INTO task_submissions \
-             (task_uid, idempotency_key, submitter_service, acting_user, owner, workflow, \
+             (task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, \
+              owner, owner_user_id, identity_binding_state, workflow, \
               coding_agent_runtime, runtime_namespace, runtime_name, runtime_ownership, phase, \
               runtime_spec, agent_command) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'submitted', $11, $12) \
-             ON CONFLICT (submitter_service, idempotency_key) DO NOTHING",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, $12, \
+                     'submitted', $13, $14) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(task_uid)
         .bind(request.idempotency_key)
         .bind(request.submitter_service)
         .bind(request.acting_user)
+        .bind(request.acting_user_id)
         .bind(request.owner)
+        .bind(request.owner_user_id)
         .bind(request.workflow)
         .bind(request.coding_agent_runtime)
         .bind(request.runtime_namespace)
@@ -1244,7 +1543,11 @@ impl PgStore {
         .rows_affected()
             == 1;
         let record = self
-            .task_by_idempotency(request.submitter_service, request.idempotency_key)
+            .task_by_idempotency(
+                request.submitter_service,
+                request.owner_user_id,
+                request.idempotency_key,
+            )
             .await?
             .ok_or_else(|| {
                 StoreError::Database(
@@ -1253,7 +1556,9 @@ impl PgStore {
             })?;
         if record.submitter_service != request.submitter_service
             || record.acting_user.as_deref() != request.acting_user
+            || record.acting_user_id.as_deref() != request.acting_user_id
             || record.owner != request.owner
+            || record.owner_user_id.as_deref() != Some(request.owner_user_id)
             || record.workflow != request.workflow
             || record.coding_agent_runtime != request.coding_agent_runtime
             || record.runtime_namespace != request.runtime_namespace
@@ -1306,21 +1611,21 @@ impl PgStore {
         &self,
         task_uid: Uuid,
         submitter_service: &str,
-        acting_user: Option<&str>,
+        owner_user_id: &str,
         archive: &[u8],
     ) -> Result<TaskRecord, StoreError> {
         let result = sqlx::query(
             "UPDATE task_submissions \
              SET input_archive = $4, updated_at = now() \
              WHERE task_uid = $1 AND submitter_service = $2 \
-               AND acting_user IS NOT DISTINCT FROM $3 \
+               AND owner_user_id = $3 AND identity_binding_state = 'bound' \
                AND phase IN ('submitted', 'parked') \
                AND NOT execute_requested \
                AND (input_archive IS NULL OR input_archive = $4)",
         )
         .bind(task_uid)
         .bind(submitter_service)
-        .bind(acting_user)
+        .bind(owner_user_id)
         .bind(archive)
         .execute(&self.pool)
         .await
@@ -1335,7 +1640,7 @@ impl PgStore {
         &self,
         task_uid: Uuid,
         submitter_service: &str,
-        acting_user: Option<&str>,
+        owner_user_id: &str,
     ) -> Result<TaskRecord, StoreError> {
         let result = sqlx::query(
             "UPDATE task_submissions \
@@ -1343,14 +1648,14 @@ impl PgStore {
                  phase = CASE WHEN phase = 'submitted' THEN 'queued' ELSE phase END, \
                  updated_at = now() \
              WHERE task_uid = $1 AND submitter_service = $2 \
-               AND acting_user IS NOT DISTINCT FROM $3 \
+               AND owner_user_id = $3 AND identity_binding_state = 'bound' \
                AND input_archive IS NOT NULL \
                AND phase IN ('submitted', 'parked', 'queued') \
                AND NOT finalize_requested",
         )
         .bind(task_uid)
         .bind(submitter_service)
-        .bind(acting_user)
+        .bind(owner_user_id)
         .execute(&self.pool)
         .await
         .map_err(database_error)?;
@@ -1364,16 +1669,16 @@ impl PgStore {
         &self,
         task_uid: Uuid,
         submitter_service: &str,
-        acting_user: Option<&str>,
+        owner_user_id: &str,
     ) -> Result<Option<TaskRecord>, StoreError> {
         let row = sqlx::query(
             "SELECT * FROM task_submissions \
              WHERE task_uid = $1 AND submitter_service = $2 \
-               AND acting_user IS NOT DISTINCT FROM $3",
+               AND owner_user_id = $3 AND identity_binding_state = 'bound'",
         )
         .bind(task_uid)
         .bind(submitter_service)
-        .bind(acting_user)
+        .bind(owner_user_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(database_error)?;
@@ -1384,7 +1689,7 @@ impl PgStore {
         &self,
         task_uid: Uuid,
         submitter_service: &str,
-        acting_user: Option<&str>,
+        owner_user_id: &str,
     ) -> Result<TaskRecord, StoreError> {
         let result = sqlx::query(
             "UPDATE task_submissions \
@@ -1395,11 +1700,11 @@ impl PgStore {
                  END, \
                  updated_at = now() \
              WHERE task_uid = $1 AND submitter_service = $2 \
-               AND acting_user IS NOT DISTINCT FROM $3",
+               AND owner_user_id = $3 AND identity_binding_state = 'bound'",
         )
         .bind(task_uid)
         .bind(submitter_service)
-        .bind(acting_user)
+        .bind(owner_user_id)
         .execute(&self.pool)
         .await
         .map_err(database_error)?;
@@ -1517,13 +1822,16 @@ impl PgStore {
     async fn task_by_idempotency(
         &self,
         submitter_service: &str,
+        owner_user_id: &str,
         idempotency_key: &str,
     ) -> Result<Option<TaskRecord>, StoreError> {
         let row = sqlx::query(
             "SELECT * FROM task_submissions \
-             WHERE submitter_service = $1 AND idempotency_key = $2",
+             WHERE submitter_service = $1 AND owner_user_id = $2 \
+               AND idempotency_key = $3 AND identity_binding_state = 'bound'",
         )
         .bind(submitter_service)
+        .bind(owner_user_id)
         .bind(idempotency_key)
         .fetch_optional(&self.pool)
         .await
@@ -1536,7 +1844,9 @@ pub struct TaskReservationRequest<'a> {
     pub idempotency_key: &'a str,
     pub submitter_service: &'a str,
     pub acting_user: Option<&'a str>,
+    pub acting_user_id: Option<&'a str>,
     pub owner: &'a str,
+    pub owner_user_id: &'a str,
     pub workflow: &'a str,
     pub coding_agent_runtime: &'a str,
     pub runtime_namespace: &'a str,
@@ -1558,7 +1868,10 @@ pub struct TaskRecord {
     pub idempotency_key: String,
     pub submitter_service: String,
     pub acting_user: Option<String>,
+    pub acting_user_id: Option<String>,
     pub owner: String,
+    pub owner_user_id: Option<String>,
+    pub identity_binding_state: String,
     pub workflow: String,
     pub coding_agent_runtime: String,
     pub runtime_uid: Option<String>,
@@ -1691,6 +2004,13 @@ pub struct ApprovedAdmission {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StoreError {
     Database(String),
+    CanonicalIdentityNotFound,
+    CanonicalIdentityInactive,
+    CanonicalIdentityStale,
+    CanonicalIdentityAmbiguousEmail,
+    CanonicalIdentityConflict,
+    CanonicalIdentityInvalidActor,
+    CanonicalIdentityInvalidRecord,
     ApprovalNotFound,
     ApprovalNotPending,
     MissingDecisionReference,
@@ -1711,6 +2031,35 @@ impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Database(reason) => write!(formatter, "Postgres operation failed: {reason}"),
+            Self::CanonicalIdentityNotFound => write!(formatter, "canonical identity not found"),
+            Self::CanonicalIdentityInactive => write!(formatter, "canonical identity is inactive"),
+            Self::CanonicalIdentityStale => {
+                write!(
+                    formatter,
+                    "canonical identity requires explicit reconnection"
+                )
+            }
+            Self::CanonicalIdentityAmbiguousEmail => {
+                write!(
+                    formatter,
+                    "verified email is already bound in this organization"
+                )
+            }
+            Self::CanonicalIdentityConflict => {
+                write!(
+                    formatter,
+                    "canonical identity mapping conflicts with an existing mapping"
+                )
+            }
+            Self::CanonicalIdentityInvalidActor => {
+                write!(
+                    formatter,
+                    "canonical identity change requires an audited actor"
+                )
+            }
+            Self::CanonicalIdentityInvalidRecord => {
+                write!(formatter, "canonical identity record is invalid")
+            }
             Self::ApprovalNotFound => write!(formatter, "approval does not exist"),
             Self::ApprovalNotPending => write!(formatter, "approval is not pending"),
             Self::MissingDecisionReference => {
@@ -1766,6 +2115,48 @@ fn database_error(error: sqlx::Error) -> StoreError {
     StoreError::Database(error.to_string())
 }
 
+fn canonical_identity_database_error(error: sqlx::Error) -> StoreError {
+    if error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .as_deref()
+        == Some("23505")
+    {
+        StoreError::CanonicalIdentityConflict
+    } else {
+        database_error(error)
+    }
+}
+
+fn canonical_principal_from_row(
+    row: &sqlx::postgres::PgRow,
+    identity: &OrganizationIdentity,
+) -> Result<CanonicalPrincipal, StoreError> {
+    let state: String = row.try_get("state").map_err(database_error)?;
+    if state != "active" {
+        return Err(StoreError::CanonicalIdentityInactive);
+    }
+    let display_email: String = row.try_get("display_email").map_err(database_error)?;
+    let verified_email: String = row.try_get("verified_email").map_err(database_error)?;
+    if !display_email.eq_ignore_ascii_case(&identity.verified_email.0)
+        || !verified_email.eq_ignore_ascii_case(&identity.verified_email.0)
+    {
+        return Err(StoreError::CanonicalIdentityStale);
+    }
+    let user_id = row
+        .try_get::<String, _>("user_id")
+        .map_err(database_error)
+        .and_then(|value| {
+            CanonicalUserId::parse(value).map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+        })?;
+    CanonicalPrincipal::new(
+        user_id,
+        identity.organization_id.clone(),
+        Email(display_email),
+    )
+    .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+}
+
 fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
     let runtime_ownership = match row
         .try_get::<String, _>("runtime_ownership")
@@ -1795,7 +2186,12 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
         idempotency_key: row.try_get("idempotency_key").map_err(database_error)?,
         submitter_service: row.try_get("submitter_service").map_err(database_error)?,
         acting_user: row.try_get("acting_user").map_err(database_error)?,
+        acting_user_id: row.try_get("acting_user_id").map_err(database_error)?,
         owner: row.try_get("owner").map_err(database_error)?,
+        owner_user_id: row.try_get("owner_user_id").map_err(database_error)?,
+        identity_binding_state: row
+            .try_get("identity_binding_state")
+            .map_err(database_error)?,
         workflow: row.try_get("workflow").map_err(database_error)?,
         coding_agent_runtime: row
             .try_get("coding_agent_runtime")
