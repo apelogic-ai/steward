@@ -6,6 +6,9 @@ publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+admin-demo = []
+
 [dependencies]
 axum.workspace = true
 k8s-openapi.workspace = true
@@ -21,8 +24,13 @@ utoipa.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 tower.workspace = true
+
+[[example]]
+name = "admin-dashboard-demo"
+path = "examples/admin-dashboard-demo.rs"
+required-features = ["admin-demo"]
 
 [lints]
 workspace = true

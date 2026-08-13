@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Steward administration</title>
+    <link rel="icon" href="/admin/assets/icon.svg">
+    <link rel="stylesheet" href="/admin/assets/admin.css">
+    <script src="/admin/assets/admin.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">Skip to dashboard</a>
+    <header class="topbar">
+      <div class="brand">
+        <strong>Steward</strong>
+      </div>
+      <div class="operator" aria-live="polite">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="operator">Checking administrator access…</span>
+      </div>
+    </header>
+
+    <nav class="tabs" aria-label="Steward administrator surfaces" role="tablist">
+      <a id="approvals-tab" href="#approvals" role="tab" data-surface="approvals"
+        aria-controls="approvals-panel" aria-selected="true" aria-current="page"
+        tabindex="0">Approvals</a>
+      <a id="envelope-tab" href="#envelope" role="tab" data-surface="envelope"
+        aria-controls="envelope-panel" aria-selected="false" tabindex="-1">Envelope</a>
+      <a id="fleet-tab" href="#fleet" role="tab" data-surface="fleet"
+        aria-controls="fleet-panel" aria-selected="false" tabindex="-1">Fleet</a>
+    </nav>
+
+    <main id="workspace" tabindex="-1">
+      <section id="approvals-panel" role="tabpanel" data-panel="approvals"
+        aria-labelledby="approvals-tab">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Decision queue</p>
+            <h1 id="approvals-heading">Approvals</h1>
+          </div>
+        </div>
+        <div class="empty-state" data-state="loading">
+          <h2>Loading approval contract</h2>
+          <p>Pending decisions will appear here when the approval API is connected.</p>
+        </div>
+      </section>
+
+      <section id="envelope-panel" role="tabpanel" data-panel="envelope"
+        aria-labelledby="envelope-tab" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Role policy</p>
+            <h1 id="envelope-heading">Envelope</h1>
+          </div>
+        </div>
+        <div class="empty-state" data-state="loading">
+          <h2>Loading envelope contract</h2>
+          <p>Current limits and staged revisions will appear here when the envelope API is connected.</p>
+        </div>
+      </section>
+
+      <section id="fleet-panel" role="tabpanel" data-panel="fleet"
+        aria-labelledby="fleet-tab" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Runtime posture</p>
+            <h1 id="fleet-heading">Fleet</h1>
+          </div>
+        </div>
+        <div class="empty-state" data-state="loading">
+          <h2>Loading fleet contract</h2>
+          <p>Runtime status and attention signals will appear here when the fleet API is connected.</p>
+        </div>
+      </section>
+    </main>
+
+    <div class="fatal" id="fatal" role="alert" hidden>
+      <strong>Dashboard unavailable</strong>
+      <span>Administrator access could not be verified. No operational data was loaded.</span>
+    </div>
+  </body>
+</html>
