@@ -395,23 +395,56 @@ async fn alternative_issuer_migration_cannot_allocate_a_canonical_user()
     )?;
     let missing_user =
         steward_types::CanonicalUserId::parse("usr_00000000000000000000000000000000")?;
-    let users_before = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM canonical_users")
-        .fetch_one(store.pool())
-        .await?;
+    let unrelated_identity = google_identity(
+        format!("unrelated-concurrent-subject-{suffix}"),
+        format!("unrelated-concurrent-{suffix}@example.com"),
+    )?;
+    let migration_store = store.clone();
+    let unrelated_store = store.clone();
+    let (migration_result, unrelated_result) = tokio::join!(
+        migration_store.attach_canonical_identity_subject(
+            &missing_user,
+            &migration,
+            "identity-admin",
+        ),
+        unrelated_store.register_canonical_identity(&unrelated_identity, "identity-admin"),
+    );
 
     assert_eq!(
-        store
-            .attach_canonical_identity_subject(&missing_user, &migration, "identity-admin")
-            .await,
+        migration_result,
         Err(StoreError::CanonicalIdentityNotFound),
         "a migration can attach only to an existing canonical user"
     );
-    let users_after = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM canonical_users")
-        .fetch_one(store.pool())
-        .await?;
+    let unrelated_principal = unrelated_result?;
     assert_eq!(
-        users_after, users_before,
-        "migration must not allocate a user"
+        store
+            .resolve_canonical_identity(&unrelated_identity)
+            .await?,
+        unrelated_principal,
+        "the unrelated concurrent registration must complete"
+    );
+    let migration_user_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM canonical_users \
+         WHERE organization_id = $1 AND lower(display_email) = lower($2)",
+    )
+    .bind(migration.organization_id().as_str())
+    .bind(migration.verified_email().as_str())
+    .fetch_one(store.pool())
+    .await?;
+    let migration_subject_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM canonical_identity_subjects WHERE issuer = $1 AND subject = $2",
+    )
+    .bind(migration.issuer())
+    .bind(migration.subject())
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        migration_user_count, 0,
+        "migration must not allocate its requested user"
+    );
+    assert_eq!(
+        migration_subject_count, 0,
+        "migration must not allocate its requested external-subject mapping"
     );
     Ok(())
 }
