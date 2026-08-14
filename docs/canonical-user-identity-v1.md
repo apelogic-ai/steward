@@ -49,11 +49,21 @@ The trusted TokenReview result must contain exactly one
 acting-user/owner groups. The Task request body rejects `canonicalUserId`, `actingUser`, and all
 other unknown fields, so the caller cannot select another person.
 
-New Task rows bind lifecycle ownership and idempotency to `(service, canonical owner ID)`. Display
-email remains immutable historical metadata on the row. An existing Task therefore remains
-accessible after an audited email rename, while a different canonical user in the same service is
-denied. Legacy Task rows are marked `legacy_reconnect_required`; they are not adopted by matching
-email.
+New Task rows bind lifecycle ownership and idempotency to
+`(service, canonical owner ID, idempotency key)`. The stable provisioned AgentRuntime name is
+derived from that same tuple. It therefore stays stable across an audited email rename and exact
+same-owner retry, while two canonical users submitting the same service and idempotency key receive
+different runtime names and cannot observe, claim, or finalize each other's Task. Pure-service
+submissions use the server-resolved accountable canonical owner ID for this naming scope without
+changing their pure-service principal semantics.
+
+Display email remains immutable historical metadata on the row. Legacy Task rows are marked
+`legacy_reconnect_required`; their legacy runtime names are retained for audit but are never adopted
+by matching email or a canonical user. Reconnection creates a new owner-scoped reservation and
+runtime. An existing bound reservation returns its stored runtime binding only when every immutable
+request field, including the owner-scoped runtime name and canonical authority, matches. An injected,
+pre-change unbound, or otherwise mismatched runtime name fails with `TaskIdempotencyConflict` rather
+than being adopted.
 
 Every newly created Task runtime also carries the server-derived
 

@@ -812,7 +812,11 @@ where
         };
         return task_response(record, Vec::new());
     }
-    let runtime_name = stable_task_runtime_name(&identity.service, idempotency_key);
+    let runtime_name = stable_task_runtime_name(
+        &identity.service,
+        identity.canonical_user_id.as_str(),
+        idempotency_key,
+    );
     let reservation = state
         .ledger
         .reserve_task(TaskReservationRequest {
@@ -1011,8 +1015,14 @@ fn status_response(
     })
 }
 
-fn stable_task_runtime_name(service: &str, idempotency_key: &str) -> String {
-    let digest = Sha256::digest(format!("{service}\0{idempotency_key}").as_bytes());
+fn stable_task_runtime_name(
+    service: &str,
+    canonical_owner_user_id: &str,
+    idempotency_key: &str,
+) -> String {
+    let digest = Sha256::digest(
+        format!("{service}\0{canonical_owner_user_id}\0{idempotency_key}").as_bytes(),
+    );
     let suffix = digest[..10]
         .iter()
         .map(|byte| format!("{byte:02x}"))

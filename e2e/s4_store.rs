@@ -596,15 +596,66 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         other.user_id.clone(),
         Some(other.user_id.clone()),
     )?);
+    let other_runtime_name = format!("task-other-{suffix}");
     let other_request = TaskReservationRequest {
         acting_user_id: Some(other.user_id.as_str()),
         owner_user_id: other.user_id.as_str(),
+        runtime_name: &other_runtime_name,
         runtime_spec: &other_spec,
         ..request
     };
     let other_task = store.reserve_task(&other_request).await?;
     assert!(other_task.inserted);
     assert_ne!(other_task.record.task_uid, first.record.task_uid);
+    assert_ne!(other_task.record.runtime_name, first.record.runtime_name);
+    let other_retry = store.reserve_task(&other_request).await?;
+    assert!(!other_retry.inserted);
+    assert_eq!(other_retry.record.task_uid, other_task.record.task_uid);
+
+    let injected_runtime_name = format!("task-injected-{suffix}");
+    let injected_same_owner = TaskReservationRequest {
+        runtime_name: &injected_runtime_name,
+        ..request
+    };
+    assert_eq!(
+        store.reserve_task(&injected_same_owner).await,
+        Err(StoreError::TaskIdempotencyConflict),
+        "a retry cannot adopt an injected or legacy runtime name outside its durable reservation"
+    );
+    assert!(
+        store
+            .task_for_submitter(first.record.task_uid, "steward-run", other.user_id.as_str(),)
+            .await?
+            .is_none(),
+        "a different canonical owner must not observe the first owner's Task"
+    );
+    assert_eq!(
+        store
+            .request_task_finalization(
+                first.record.task_uid,
+                "steward-run",
+                other.user_id.as_str(),
+            )
+            .await,
+        Err(StoreError::TaskNotFound),
+        "a different canonical owner must not delete the first owner's runtime through Task finalization"
+    );
+
+    let legacy_key = format!("legacy-{suffix}");
+    let rebound_runtime_name = format!("task-reconnected-{suffix}");
+    let legacy_reconnect = TaskReservationRequest {
+        idempotency_key: &legacy_key,
+        submitter_service: "legacy-service",
+        runtime_name: &rebound_runtime_name,
+        ..request
+    };
+    let reconnected = store.reserve_task(&legacy_reconnect).await?;
+    assert!(reconnected.inserted);
+    assert_eq!(reconnected.record.runtime_name, rebound_runtime_name);
+    assert_ne!(
+        reconnected.record.identity_binding_state, "legacy_reconnect_required",
+        "a canonical reconnect creates a new bound row instead of adopting the legacy row"
+    );
 
     let mismatched_columns_key = format!("mismatched-columns-{suffix}");
     let mismatched_columns = TaskReservationRequest {

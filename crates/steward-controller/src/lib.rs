@@ -87,11 +87,14 @@ fn task_runtime_action(
     runtime: Option<&AgentRuntime>,
 ) -> TaskRuntimeAction {
     if finalize_requested {
-        return match (ownership, runtime.is_some()) {
-            (RuntimeOwnership::Adopted, _) | (RuntimeOwnership::Provisioned, false) => {
+        return match (ownership, runtime) {
+            (RuntimeOwnership::Adopted, _) | (RuntimeOwnership::Provisioned, None) => {
                 TaskRuntimeAction::MarkFinalized
             }
-            (RuntimeOwnership::Provisioned, true) => TaskRuntimeAction::DeleteRuntime,
+            (RuntimeOwnership::Provisioned, Some(runtime)) if runtime.spec == *runtime_spec => {
+                TaskRuntimeAction::DeleteRuntime
+            }
+            (RuntimeOwnership::Provisioned, Some(_)) => TaskRuntimeAction::Wait,
         };
     }
     let Some(runtime) = runtime else {
@@ -2292,9 +2295,9 @@ mod tests {
     };
     use steward_store::GrantReversion;
     use steward_types::{
-        AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget, Duration, Email,
-        ModelRef, PENDING_APPROVAL_ANNOTATION, Phase, Principal, RuntimeOwnership, RuntimeRefs,
-        TaskPhase,
+        AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
+        CanonicalAuthorityBinding, CanonicalUserId, Duration, Email, ModelRef,
+        PENDING_APPROVAL_ANNOTATION, Phase, Principal, RuntimeOwnership, RuntimeRefs, TaskPhase,
     };
     use tower::service_fn;
 
@@ -2308,7 +2311,8 @@ mod tests {
     };
 
     #[test]
-    fn task_state_table_releases_holds_executes_running_runtimes_and_preserves_ownership() {
+    fn task_state_table_releases_holds_executes_running_runtimes_and_preserves_ownership()
+    -> Result<(), String> {
         let mut runtime = fixture();
         runtime.status = Some(AgentRuntimeStatus {
             phase: Phase::Running,
@@ -2383,6 +2387,42 @@ mod tests {
             ),
             TaskRuntimeAction::MarkFinalized
         );
+
+        let mut other_owner_spec = runtime.spec.clone();
+        other_owner_spec.canonical_authority = Some(
+            CanonicalAuthorityBinding::new(
+                CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
+                    .map_err(|error| error.to_string())?,
+                Some(
+                    CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
+                        .map_err(|error| error.to_string())?,
+                ),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        runtime.spec.canonical_authority = Some(
+            CanonicalAuthorityBinding::new(
+                CanonicalUserId::parse("usr_abcdef0123456789abcdef0123456789")
+                    .map_err(|error| error.to_string())?,
+                Some(
+                    CanonicalUserId::parse("usr_abcdef0123456789abcdef0123456789")
+                        .map_err(|error| error.to_string())?,
+                ),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        assert_eq!(
+            task_runtime_action(
+                TaskPhase::Cancelled,
+                RuntimeOwnership::Provisioned,
+                true,
+                &other_owner_spec,
+                Some(&runtime),
+            ),
+            TaskRuntimeAction::Wait,
+            "a corrupted task record must never delete another canonical owner's runtime"
+        );
+        Ok(())
     }
 
     #[test]

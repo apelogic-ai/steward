@@ -3278,6 +3278,11 @@ mod tests {
         runtime: Arc<Mutex<AgentRuntime>>,
     }
 
+    #[derive(Clone, Default)]
+    struct MultiRuntimeRepository {
+        runtimes: Arc<Mutex<Vec<AgentRuntime>>>,
+    }
+
     #[derive(Clone)]
     struct RejectedCreateRepository {
         runtime: AgentRuntime,
@@ -3486,6 +3491,123 @@ mod tests {
                     .runtime
                     .lock()
                     .map_err(|_| "fake runtime lock was poisoned".to_owned())?;
+                *stored = runtime.clone();
+                Ok(())
+            })
+        }
+    }
+
+    impl RuntimeRepository for MultiRuntimeRepository {
+        fn create<'a>(
+            &'a self,
+            _namespace: &'a str,
+            runtime: &'a AgentRuntime,
+            _context: &'a AdmissionContext,
+        ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+            self.create_as_authority(_namespace, runtime)
+        }
+
+        fn create_as_authority<'a>(
+            &'a self,
+            _namespace: &'a str,
+            runtime: &'a AgentRuntime,
+        ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+            Box::pin(async move {
+                let mut runtimes = self.runtimes.lock().map_err(|_| {
+                    RuntimeCreateError::Unavailable(
+                        "multi-runtime repository lock was poisoned".to_owned(),
+                    )
+                })?;
+                if runtimes
+                    .iter()
+                    .any(|stored| stored.name_any() == runtime.name_any())
+                {
+                    return Err(RuntimeCreateError::Kubernetes {
+                        status: 409,
+                        message: "AgentRuntime already exists".to_owned(),
+                    });
+                }
+                let mut created = runtime.clone();
+                created.metadata.uid = Some(format!("{}-uid", created.name_any()));
+                created.metadata.resource_version = Some("1".to_owned());
+                runtimes.push(created.clone());
+                Ok(created)
+            })
+        }
+
+        fn get<'a>(
+            &'a self,
+            namespace: &'a str,
+            name: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            Box::pin(async move {
+                self.runtimes
+                    .lock()
+                    .map_err(|_| "multi-runtime repository lock was poisoned".to_owned())?
+                    .iter()
+                    .find(|runtime| {
+                        runtime.metadata.namespace.as_deref() == Some(namespace)
+                            && runtime.metadata.name.as_deref() == Some(name)
+                    })
+                    .cloned()
+                    .ok_or_else(|| format!("AgentRuntime {namespace}/{name} does not exist"))
+            })
+        }
+
+        fn get_bound<'a>(
+            &'a self,
+            namespace: &'a str,
+            name: &'a str,
+            runtime_uid: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            Box::pin(async move {
+                let runtime = self.get(namespace, name).await?;
+                if runtime.metadata.uid.as_deref() == Some(runtime_uid) {
+                    Ok(runtime)
+                } else {
+                    Err(format!(
+                        "AgentRuntime {namespace}/{name} is not bound to UID {runtime_uid}"
+                    ))
+                }
+            })
+        }
+
+        fn get_by_uid<'a>(
+            &'a self,
+            runtime_uid: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            Box::pin(async move {
+                self.runtimes
+                    .lock()
+                    .map_err(|_| "multi-runtime repository lock was poisoned".to_owned())?
+                    .iter()
+                    .find(|runtime| runtime.metadata.uid.as_deref() == Some(runtime_uid))
+                    .cloned()
+                    .ok_or_else(|| format!("AgentRuntime UID {runtime_uid} does not exist"))
+            })
+        }
+
+        fn replace<'a>(
+            &'a self,
+            runtime: &'a AgentRuntime,
+            _context: &'a AdmissionContext,
+        ) -> BoxFuture<'a, Result<(), String>> {
+            self.replace_as_authority(runtime)
+        }
+
+        fn replace_as_authority<'a>(
+            &'a self,
+            runtime: &'a AgentRuntime,
+        ) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                let mut runtimes = self
+                    .runtimes
+                    .lock()
+                    .map_err(|_| "multi-runtime repository lock was poisoned".to_owned())?;
+                let stored = runtimes
+                    .iter_mut()
+                    .find(|stored| stored.metadata.uid == runtime.metadata.uid)
+                    .ok_or_else(|| "AgentRuntime replacement target does not exist".to_owned())?;
                 *stored = runtime.clone();
                 Ok(())
             })
@@ -6452,6 +6574,143 @@ mod tests {
             Some(&serde_json::json!("task agent exited with code 23")),
             "a failed Task must expose its safe server-generated reason"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canonical_owners_share_an_idempotency_key_without_sharing_a_runtime()
+    -> Result<(), String> {
+        let runtimes = MultiRuntimeRepository::default();
+        let runtime_state = runtimes.runtimes.clone();
+        let ledger = ledger();
+        let task_rows = ledger.tasks.clone();
+        let app = router(
+            runtimes.clone(),
+            ledger.clone(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        )
+        .merge(task_router(
+            runtimes,
+            ledger,
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+        ));
+        let mut submissions = Vec::new();
+        for bearer in ["github-assertion", "github-bob-assertion"] {
+            let submit = || {
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .header("idempotency-key", "shared-github-job")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"workflow":"code-review","codingAgentRuntime":"agent-v1"}"#,
+                    ))
+                    .map_err(|error| format!("failed to build owner-scoped submission: {error}"))
+            };
+            let response = app
+                .clone()
+                .oneshot(submit()?)
+                .await
+                .map_err(|error| format!("owner-scoped submission failed: {error}"))?;
+            assert_eq!(
+                response.status(),
+                StatusCode::CREATED,
+                "each canonical owner must receive an independent runtime"
+            );
+            let body = to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .map_err(|error| format!("failed to read owner-scoped submission: {error}"))?;
+            let first = serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("owner-scoped submission was not JSON: {error}"))?;
+            let retried = app
+                .clone()
+                .oneshot(submit()?)
+                .await
+                .map_err(|error| format!("owner-scoped retry failed: {error}"))?;
+            assert_eq!(retried.status(), StatusCode::CREATED);
+            let retry_body = to_bytes(retried.into_body(), 1024 * 1024)
+                .await
+                .map_err(|error| format!("failed to read owner-scoped retry: {error}"))?;
+            let retry = serde_json::from_slice::<serde_json::Value>(&retry_body)
+                .map_err(|error| format!("owner-scoped retry was not JSON: {error}"))?;
+            assert_eq!(
+                retry.get("taskUid"),
+                first.get("taskUid"),
+                "an identical retry must converge within its canonical-owner scope"
+            );
+            assert_eq!(
+                retry.get("runtimeUid"),
+                first.get("runtimeUid"),
+                "an identical retry must retain its own runtime"
+            );
+            submissions.push((bearer, first));
+        }
+
+        {
+            let rows = task_rows
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned".to_owned())?;
+            assert_eq!(rows.len(), 2);
+            assert_ne!(rows[0].task_uid, rows[1].task_uid);
+            assert_ne!(rows[0].runtime_name, rows[1].runtime_name);
+            for row in rows.iter() {
+                assert!(row.runtime_name.starts_with("task-"));
+                assert!(row.runtime_name.len() <= 63);
+                assert!(
+                    row.runtime_name.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    }),
+                    "stable runtime names must remain DNS-label safe"
+                );
+            }
+        }
+        assert_eq!(
+            runtime_state
+                .lock()
+                .map_err(|_| "multi-runtime repository lock was poisoned".to_owned())?
+                .len(),
+            2,
+            "both owner-scoped reservations must bind distinct live runtimes"
+        );
+
+        for ((_, task), other_bearer) in submissions
+            .iter()
+            .zip(["github-bob-assertion", "github-assertion"])
+        {
+            let task_uid = task
+                .get("taskUid")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "owner-scoped submission lacked taskUid".to_owned())?;
+            let observed = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/tasks/{task_uid}"))
+                        .header("authorization", format!("Bearer {other_bearer}"))
+                        .body(Body::empty())
+                        .map_err(|error| format!("failed to build cross-owner read: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("cross-owner read failed: {error}"))?;
+            assert_eq!(observed.status(), StatusCode::NOT_FOUND);
+            let deleted = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/v1/tasks/{task_uid}"))
+                        .header("authorization", format!("Bearer {other_bearer}"))
+                        .body(Body::empty())
+                        .map_err(|error| format!("failed to build cross-owner delete: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("cross-owner delete failed: {error}"))?;
+            assert_eq!(deleted.status(), StatusCode::NOT_FOUND);
+        }
         Ok(())
     }
 
