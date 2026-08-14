@@ -124,10 +124,11 @@ bounded subject, verified email, and exact hosted domain. JWKS uses bounded HTTP
 one synchronized refresh on an unknown key, preserves a fresh last-good set across malformed
 rotation responses, and fails closed after expiry if refresh is unavailable.
 
-Unknown-key JWKS refresh is serialized. A failed refresh is remembered for its observed cache
-generation and suppresses duplicate waiter retries for five seconds; a later generation is not
-suppressed. Cache time is recomputed after waiting for the refresh gate and again when storing a
-response, so a key set that expires while queued cannot be returned as fresh.
+Unknown-key JWKS refresh, including any prerequisite discovery refresh, is serialized. A failed
+refresh is remembered for its observed JWKS cache generation and suppresses duplicate waiter
+retries for five seconds; a later generation is not suppressed. Cache time is recomputed after
+waiting for the refresh gate and again when storing a response, so a key set that expires while
+queued cannot be returned as fresh.
 
 `GoogleOidcProvider::new` requires the client secret as a non-debuggable runtime value. The
 non-secret client ID is also runtime configuration; neither value has a source default. No

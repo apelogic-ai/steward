@@ -526,6 +526,10 @@ impl GoogleOidcProvider {
             return Ok(document);
         }
         let _permit = self.refresh_gate.acquire().await?;
+        self.discovery_after_refresh_gate().await
+    }
+
+    async fn discovery_after_refresh_gate(&self) -> Result<DiscoveryDocument, BrowserAuthFailure> {
         let now = (self.now)();
         if let Some(document) = self
             .cache
@@ -582,7 +586,6 @@ impl GoogleOidcProvider {
         {
             return Ok(jwks);
         }
-        let discovery = self.discovery().await?;
         let _permit = self.refresh_gate.acquire().await?;
         let now = (self.now)();
         let attempt_generation = {
@@ -617,6 +620,7 @@ impl GoogleOidcProvider {
         };
 
         let refreshed = async {
+            let discovery = self.discovery_after_refresh_gate().await?;
             let response = self
                 .transport
                 .get(&discovery.jwks_uri, MAX_JWKS_BYTES)
@@ -1365,6 +1369,71 @@ mod tests {
             transport.calls.load(Ordering::SeqCst),
             3,
             "a failure record for one generation must not suppress a later generation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_unknown_kid_discovery_failure_is_backed_off_per_jwks_generation()
+    -> Result<(), String> {
+        let transport = Arc::new(BlockingFailureTransport::new(String::new()));
+        let provider = GoogleOidcProvider::with_transport(
+            fixture_config()?,
+            "fixture-secret".to_owned(),
+            transport.clone(),
+            fixture_now,
+        )?;
+        seed_provider_cache(&provider, 1_100, 2_000, 7)?;
+        provider
+            .cache
+            .lock()
+            .map_err(|_| "expire discovery fixture".to_owned())?
+            .discovery
+            .as_mut()
+            .ok_or_else(|| "missing discovery fixture".to_owned())?
+            .expires_at = 1_100;
+
+        let first_provider = provider.clone();
+        let first = tokio::spawn(async move { first_provider.jwks(Some(7)).await });
+        transport.started.notified().await;
+        let second_provider = provider.clone();
+        let second = tokio::spawn(async move { second_provider.jwks(Some(7)).await });
+        tokio::task::yield_now().await;
+        transport.release.notify_one();
+
+        assert!(matches!(
+            first.await,
+            Ok(Err(BrowserAuthFailure::ProviderUnavailable))
+        ));
+        assert!(matches!(
+            second.await,
+            Ok(Err(BrowserAuthFailure::ProviderUnavailable))
+        ));
+        assert_eq!(
+            transport.calls.load(Ordering::SeqCst),
+            1,
+            "waiters must not repeat a failed prerequisite discovery request"
+        );
+        let failure = provider
+            .cache
+            .lock()
+            .map_err(|_| "read refresh failure".to_owned())?
+            .jwks_refresh_failure
+            .ok_or_else(|| "discovery failure was not recorded".to_owned())?;
+        assert_eq!(failure.observed_generation, 7);
+        assert!(provider.jwks(Some(7)).await.is_err());
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+
+        provider
+            .cache
+            .lock()
+            .map_err(|_| "advance JWKS generation".to_owned())?
+            .jwks_generation = 8;
+        assert!(provider.jwks(Some(8)).await.is_err());
+        assert_eq!(
+            transport.calls.load(Ordering::SeqCst),
+            2,
+            "a discovery failure observed for generation 7 must not suppress generation 8"
         );
         Ok(())
     }
