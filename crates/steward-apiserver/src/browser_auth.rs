@@ -1340,6 +1340,36 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn process_restart_invalidates_opaque_sessions_and_pending_flows() -> Result<(), String> {
+        let before_restart = BrowserSessionRegistry::default();
+        let session = before_restart
+            .issue(principal()?, 100)
+            .map_err(|error| format!("issue pre-restart session: {error:?}"))?;
+        let flow = before_restart
+            .begin("/admin/connections", 100)
+            .map_err(|error| format!("begin pre-restart flow: {error:?}"))?;
+
+        let after_restart = BrowserSessionRegistry::default();
+        assert_eq!(
+            after_restart.resolve(&session.token, 101),
+            Err(BrowserAuthError::InvalidSession),
+            "a fresh process must not accept an opaque handle from the prior process"
+        );
+        assert_eq!(
+            after_restart.consume_flow(&flow.flow_id, &flow.state, 101),
+            Err(BrowserAuthError::InvalidFlow),
+            "a fresh process must not accept an authorization flow from the prior process"
+        );
+
+        let replacement = after_restart
+            .issue(principal()?, 101)
+            .map_err(|error| format!("issue post-restart session: {error:?}"))?;
+        assert_ne!(replacement.token, session.token);
+        assert_ne!(replacement.csrf, session.csrf);
+        Ok(())
+    }
+
     fn cookie_pair(response: &axum::response::Response, name: &str) -> Result<String, String> {
         response
             .headers()

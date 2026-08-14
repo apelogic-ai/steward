@@ -44,6 +44,17 @@ the `__Secure-` prefix so it can remain path-limited to `/admin/auth`, and expir
 minutes. Local HTTP uses clearly local non-`Secure` cookie names because a browser will not return a
 `Secure` cookie over loopback HTTP.
 
+For the initial DEV/E2E activation, the registry is process-local and the Steward apiserver runs
+exactly one replica. A process restart or rollout deliberately drops every session and pending
+authorization flow, so the browser must sign in again. A fresh process cannot accept a cookie or
+flow handle minted by the prior process. There is no browser-session signing or encryption key:
+the cookie is already an opaque lookup handle, and all authority remains in server-side state.
+
+Multi-replica continuity is post-E2E work tracked by LBE-248. It requires a shared server-side
+session store with atomic one-time flow consumption, TTL, revocation, and fixation rotation. A
+signing key or encrypted client-side session would not provide those semantics and is not an
+acceptable substitute.
+
 Every authenticated browser mutation requires all of:
 
 - exact configured `Origin`;
@@ -104,3 +115,17 @@ ignored and not retained. Tokeninfo, UserInfo, unsigned parsing, and offline acc
 The earlier `GoogleAuthorizationOnlyProvider` remains intentionally fail-closed for callers that
 have not supplied the production verifier configuration. Choosing it cannot silently enable a
 partially verified login.
+
+## DEV runtime and secret projection handoff
+
+The production activation consumes the reviewed non-secret Google metadata, including the exact
+client ID, HTTPS browser origin and callback, hosted domain, and organization identifier. The
+Google client credential is projected from `/apelogic/dev/steward-google-oidc` under exactly the
+Kubernetes key `client-secret`. Its value is one provider-issued raw plaintext scalar: no JSON
+wrapper, quoting, Base64 transform, surrounding whitespace, or trailing newline. The raw scalar is
+passed only to `GoogleOidcProvider::new` and is never included in errors or logs.
+
+No `session-key` Kubernetes key, session-key environment variable, or
+`/apelogic/dev/steward-session-key` reference is part of the product contract. The already-created
+DEV container remains empty and unprojected until the separately reviewed Infra cleanup in
+LBE-247. Its absence must not block initial activation.

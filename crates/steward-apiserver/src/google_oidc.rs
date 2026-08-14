@@ -193,7 +193,10 @@ struct GoogleClientSecret(String);
 
 impl GoogleClientSecret {
     pub fn new(value: String) -> Result<Self, String> {
-        if value.is_empty() || value.len() > 4096 {
+        if value.is_empty()
+            || value.len() > 4096
+            || !value.bytes().all(|byte| byte.is_ascii_graphic())
+        {
             return Err("Google OIDC client secret must be configured".to_owned());
         }
         Ok(Self(value))
@@ -1033,11 +1036,21 @@ mod tests {
             Err(BrowserAuthFailure::ProviderUnavailable)
         ));
 
-        assert!(GoogleClientSecret::new(String::new()).is_err());
         assert_eq!(cache_ttl(Some("public, max-age=999999")), 3_600);
         assert_eq!(cache_ttl(Some("no-store, max-age=300")), 0);
         assert_eq!(cache_ttl(Some("public, max-age=invalid")), 300);
         Ok(())
+    }
+
+    #[test]
+    fn client_secret_is_an_exact_bounded_raw_scalar() {
+        assert!(GoogleClientSecret::new(String::new()).is_err());
+        assert!(GoogleClientSecret::new(" fixture-secret".to_owned()).is_err());
+        assert!(GoogleClientSecret::new("fixture-secret ".to_owned()).is_err());
+        assert!(GoogleClientSecret::new("fixture-secret\n".to_owned()).is_err());
+        assert!(GoogleClientSecret::new("fixture\tsecret".to_owned()).is_err());
+        assert!(GoogleClientSecret::new("x".repeat(4_097)).is_err());
+        assert!(GoogleClientSecret::new("fixture-secret".to_owned()).is_ok());
     }
 
     #[tokio::test]
