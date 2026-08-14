@@ -36,11 +36,10 @@ The protected header is `alg=EdDSA`, `typ=JWT`, and a public-key `kid`.
 
 The payload contains the standard `iss`, `sub`, `aud`, `iat`, `exp`, and `jti`
 claims. `azp` is always the validated workload SPIFFE ID. For a user principal,
-`sub` is the opaque Steward canonical user ID and `email` is secondary verified display metadata.
-A delegated service uses the same canonical-user subject while retaining its service name below.
-A pure service keeps `service:<name>` for both `sub` and `email`; this is a service identifier for
-gateway compatibility, not a human acting user. Mint must never use email as the person-bound
-subject or provider-grant key.
+`sub` and `email` are the acting user's email. A delegated service uses the same
+user subject while retaining its service name below. A pure service uses
+`service:<name>` for both `sub` and `email`; this is a service identifier for
+gateway compatibility, not a human acting user.
 
 Steward-specific claims live under `steward`:
 

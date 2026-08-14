@@ -17,15 +17,30 @@ fn google_identity(
     subject: impl AsRef<str>,
     email: impl AsRef<str>,
 ) -> Result<OrganizationIdentity, Box<dyn Error>> {
-    Ok(OrganizationIdentityPolicy::new(
-        "https://accounts.google.com",
+    google_identity_for(
         "example.com",
         OrganizationId::parse("org_example")?,
+        subject,
+        email,
+    )
+}
+
+fn google_identity_for(
+    hosted_domain: impl AsRef<str>,
+    organization_id: OrganizationId,
+    subject: impl AsRef<str>,
+    email: impl AsRef<str>,
+) -> Result<OrganizationIdentity, Box<dyn Error>> {
+    let hosted_domain = hosted_domain.as_ref();
+    Ok(OrganizationIdentityPolicy::new(
+        "https://accounts.google.com",
+        hosted_domain,
+        organization_id,
     )?
     .validate(
         "https://accounts.google.com",
         subject.as_ref(),
-        "example.com",
+        hosted_domain,
         email.as_ref(),
         true,
     )?)
@@ -158,12 +173,200 @@ async fn canonical_identity_requires_exact_subject_mapping_and_explicit_reconnec
     assert_eq!(migrated.user_id, principal.user_id);
     assert_eq!(
         store
+            .attach_canonical_identity_subject(
+                &principal.user_id,
+                &future_issuer,
+                "identity-admin",
+            )
+            .await?,
+        migrated,
+        "retrying an exact attachment to the same canonical user must be idempotent"
+    );
+    assert_eq!(
+        store
             .resolve_canonical_identity(future_issuer.identity())
             .await?
             .user_id,
         principal.user_id,
         "an explicitly reviewed issuer migration must preserve the opaque user ID"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_external_subject_is_globally_unique_across_google_organizations()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the identity Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let shared_subject = format!("google-shared-subject-{suffix}");
+    let first = google_identity_for(
+        "example.com",
+        OrganizationId::parse("org_example")?,
+        &shared_subject,
+        format!("first-{suffix}@example.com"),
+    )?;
+    let other_organization = google_identity_for(
+        "other.example",
+        OrganizationId::parse("org_other")?,
+        &shared_subject,
+        format!("second-{suffix}@other.example"),
+    )?;
+
+    let first_principal = store
+        .register_canonical_identity(&first, "identity-admin")
+        .await?;
+    assert_eq!(
+        store
+            .register_canonical_identity(&other_organization, "identity-admin")
+            .await,
+        Err(StoreError::CanonicalIdentityConflict),
+        "one Google (issuer, subject) pair must not identify people in two organizations"
+    );
+    assert_eq!(
+        store.resolve_canonical_identity(&first).await?,
+        first_principal
+    );
+    assert_eq!(
+        store.resolve_canonical_identity(&other_organization).await,
+        Err(StoreError::CanonicalIdentityNotFound)
+    );
+    let pair_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM canonical_identity_subjects WHERE issuer = $1 AND subject = $2",
+    )
+    .bind(first.issuer())
+    .bind(first.subject())
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        pair_count, 1,
+        "the external pair must have exactly one owner"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_external_subject_cannot_be_attached_to_another_user()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the identity Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let shared_subject = format!("migrated-attach-subject-{suffix}");
+    let first = google_identity_for(
+        "example.com",
+        OrganizationId::parse("org_example")?,
+        format!("google-first-subject-{suffix}"),
+        format!("first-attach-{suffix}@example.com"),
+    )?;
+    let second = google_identity_for(
+        "other.example",
+        OrganizationId::parse("org_other")?,
+        format!("google-second-subject-{suffix}"),
+        format!("second-attach-{suffix}@other.example"),
+    )?;
+    let first_principal = store
+        .register_canonical_identity(&first, "identity-admin")
+        .await?;
+    let first_attachment = OrganizationIdentityMigration::new_reviewed(
+        "https://login.example.test",
+        &shared_subject,
+        "example.com",
+        OrganizationId::parse("org_example")?,
+        Email::parse(format!("first-attach-{suffix}@example.com"))?,
+    )?;
+    store
+        .attach_canonical_identity_subject(
+            &first_principal.user_id,
+            &first_attachment,
+            "identity-admin",
+        )
+        .await?;
+    let second_principal = store
+        .register_canonical_identity(&second, "identity-admin")
+        .await?;
+    let conflicting_attachment = OrganizationIdentityMigration::new_reviewed(
+        "https://login.example.test",
+        &shared_subject,
+        "other.example",
+        OrganizationId::parse("org_other")?,
+        Email::parse(format!("second-attach-{suffix}@other.example"))?,
+    )?;
+
+    assert_eq!(
+        store
+            .attach_canonical_identity_subject(
+                &second_principal.user_id,
+                &conflicting_attachment,
+                "identity-admin",
+            )
+            .await,
+        Err(StoreError::CanonicalIdentityConflict),
+        "an attachment must not move an external pair to another canonical user"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_exact_registration_converges_on_one_canonical_user()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the identity Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let identity = google_identity(
+        format!("google-concurrent-subject-{suffix}"),
+        format!("concurrent-{suffix}@example.com"),
+    )?;
+
+    let left_store = store.clone();
+    let right_store = store.clone();
+    let (left, right) = tokio::join!(
+        left_store.register_canonical_identity(&identity, "identity-admin-left"),
+        right_store.register_canonical_identity(&identity, "identity-admin-right"),
+    );
+    let left = left?;
+    let right = right?;
+    assert_eq!(
+        left, right,
+        "concurrent exact registrations must resolve to one canonical user"
+    );
+    let pair_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM canonical_identity_subjects WHERE issuer = $1 AND subject = $2",
+    )
+    .bind(identity.issuer())
+    .bind(identity.subject())
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(pair_count, 1, "the external pair must be persisted once");
     Ok(())
 }
 

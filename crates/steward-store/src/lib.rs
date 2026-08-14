@@ -126,6 +126,47 @@ impl PgStore {
         }
 
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // Serialize both registration and migration attachment on the external pair. The
+        // database uniqueness constraint remains the final concurrency boundary; this lock
+        // additionally makes concurrent exact retries converge idempotently.
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(\
+                hashtextextended($1::text || chr(31) || $2::text, 0)\
+             )",
+        )
+        .bind(identity.issuer())
+        .bind(identity.subject())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let existing_pair = sqlx::query(
+            "SELECT canonical_users.user_id, canonical_users.display_email, \
+                    canonical_users.state, canonical_identity_subjects.verified_email, \
+                    canonical_identity_subjects.organization_claim, \
+                    canonical_identity_subjects.organization_id AS subject_organization_id \
+             FROM canonical_identity_subjects \
+             JOIN canonical_users USING (user_id) \
+             WHERE canonical_identity_subjects.issuer = $1 \
+               AND canonical_identity_subjects.subject = $2",
+        )
+        .bind(identity.issuer())
+        .bind(identity.subject())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if let Some(row) = existing_pair {
+            let organization_claim: String =
+                row.try_get("organization_claim").map_err(database_error)?;
+            let organization_id: String = row
+                .try_get("subject_organization_id")
+                .map_err(database_error)?;
+            if organization_claim != identity.organization_claim()
+                || organization_id != identity.organization_id().as_str()
+            {
+                return Err(StoreError::CanonicalIdentityConflict);
+            }
+            return canonical_principal_from_row(&row, identity);
+        }
         let email_owner = sqlx::query_scalar::<_, String>(
             "SELECT user_id FROM canonical_users \
              WHERE organization_id = $1 AND lower(display_email) = lower($2)",
@@ -203,6 +244,16 @@ impl PgStore {
             return Err(StoreError::CanonicalIdentityInvalidActor);
         }
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(\
+                hashtextextended($1::text || chr(31) || $2::text, 0)\
+             )",
+        )
+        .bind(identity.issuer())
+        .bind(identity.subject())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
         let user = sqlx::query(
             "SELECT organization_id, display_email, state FROM canonical_users WHERE user_id = $1",
         )
@@ -223,21 +274,33 @@ impl PgStore {
             return Err(StoreError::CanonicalIdentityStale);
         }
 
-        let existing = sqlx::query_scalar::<_, String>(
-            "SELECT user_id FROM canonical_identity_subjects \
-             WHERE issuer = $1 AND subject = $2 AND organization_claim = $3 \
-               AND organization_id = $4",
+        let existing = sqlx::query(
+            "SELECT user_id, organization_claim, organization_id, verified_email \
+             FROM canonical_identity_subjects WHERE issuer = $1 AND subject = $2",
         )
         .bind(identity.issuer())
         .bind(identity.subject())
-        .bind(identity.organization_claim())
-        .bind(identity.organization_id().as_str())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
-        if let Some(existing_user_id) = existing {
-            if existing_user_id != user_id.as_str() {
+        if let Some(existing) = existing {
+            let existing_user_id: String = existing.try_get("user_id").map_err(database_error)?;
+            let existing_organization_claim: String = existing
+                .try_get("organization_claim")
+                .map_err(database_error)?;
+            let existing_organization_id: String = existing
+                .try_get("organization_id")
+                .map_err(database_error)?;
+            let existing_verified_email: String =
+                existing.try_get("verified_email").map_err(database_error)?;
+            if existing_user_id != user_id.as_str()
+                || existing_organization_claim != identity.organization_claim()
+                || existing_organization_id != identity.organization_id().as_str()
+            {
                 return Err(StoreError::CanonicalIdentityConflict);
+            }
+            if !existing_verified_email.eq_ignore_ascii_case(identity.verified_email().as_str()) {
+                return Err(StoreError::CanonicalIdentityStale);
             }
             return CanonicalPrincipal::new(
                 user_id.clone(),

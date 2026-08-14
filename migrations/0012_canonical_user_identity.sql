@@ -24,6 +24,8 @@ CREATE TABLE canonical_identity_subjects (
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (issuer, subject, organization_claim, organization_id),
+    CONSTRAINT canonical_identity_subjects_external_pair_unique
+        UNIQUE (issuer, subject),
     UNIQUE (issuer, organization_id, user_id)
 );
 
