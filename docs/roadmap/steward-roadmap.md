@@ -732,7 +732,7 @@ credential by canonical user ID and executes one tool call.
 never held it.
 
 **Exit.** Positive: the agent lists the user's GitHub repos. Negative, all three must
-fail closed — a forged/expired SVID, a HOP-1 for a different email, and a tool outside
+fail closed — a forged/expired SVID, a HOP-1 for a different canonical subject, and a tool outside
 `spec.tools`. Size: **L** — highest-risk integration in the system, which is why it is
 second and not last.
 
@@ -1037,7 +1037,7 @@ surface during a customer conversation.
 | R3 | Trace context is dropped on every managed inference call | No end-to-end trace correlation until #1758 lands. Correlate on runtime UID in structured audit meanwhile. This is also our own Lane G PR |
 | R4 | LiteLLM key delivery mechanism unverified | Resolved by building S2; spike the provider-credential path first, do not design it on paper |
 | R5 | Unpriced models silently disable budget exhaustion | Admission-time rejection, S2 exit criterion |
-| R6 | Email join key wrong → wrong user's access | The worst failure in the system. Verify that every channel's email ≡ SSO email ≡ `mcp-gw` credential key **before** S1. Every connector inherits this; none of them owns it |
+| R6 | Canonical identity misbinding → wrong user's access | The worst failure in the system. Mint accepts only the typed canonical authority from the live UID-bound runtime; gateways key grants by exact issuer, canonical subject, and provider. Email is display-only and cannot select or recover authority |
 | R7 | #2109 managed maximum policies may replace part of our admission layer | Good outcome. Track deliberately; keep `steward-admission` a separable crate so the containment proof can move upstream and leave envelope authoring, parking, spend, and the portal with us |
 | R8 | Per-agent model allowlist not expressible at Tier 0 | Closed, and now closed in both directions. Enforcement is the LiteLLM per-agent key alone. Routes became workspace-scoped in #2243 but B1 stands — a route pins one model, not a set — so Tier 0 cannot express a per-agent *or* per-team model list. Workspace-per-agent is rejected (D1) |
 | R9 | Postgres becomes a second source of truth for phase | Single-writer discipline, §3. Status is a cache; Postgres never holds current phase |
