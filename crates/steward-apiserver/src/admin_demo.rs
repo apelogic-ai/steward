@@ -11,6 +11,7 @@ use axum::response::Response;
 
 use crate::{
     AuthenticatedCaller, AuthenticationError, BoxFuture, RequestAuthenticator, admin_ui,
+    browser_auth::{LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service},
     protect_admin_routes,
 };
 
@@ -20,6 +21,8 @@ const LOCAL_DEMO_BEARER: &str = "steward-local-demo";
 pub enum AdminDashboardDemoMode {
     Authenticated,
     Unauthenticated,
+    OidcUser,
+    OidcAdmin,
 }
 
 impl FromStr for AdminDashboardDemoMode {
@@ -29,7 +32,12 @@ impl FromStr for AdminDashboardDemoMode {
         match value {
             "authenticated" => Ok(Self::Authenticated),
             "unauthenticated" => Ok(Self::Unauthenticated),
-            _ => Err("demo mode must be authenticated or unauthenticated".to_owned()),
+            "oidc-user" => Ok(Self::OidcUser),
+            "oidc-admin" => Ok(Self::OidcAdmin),
+            _ => Err(
+                "demo mode must be authenticated, unauthenticated, oidc-user, or oidc-admin"
+                    .to_owned(),
+            ),
         }
     }
 }
@@ -87,14 +95,22 @@ async fn inject_local_demo_bearer(mut request: Request, next: Next) -> Response 
     next.run(request).await
 }
 
-pub fn router(mode: AdminDashboardDemoMode) -> Router {
+pub fn router(mode: AdminDashboardDemoMode, origin: &str) -> Result<Router, String> {
     let protected = protect_admin_routes(admin_ui::router::<()>(), DemoAuthenticator);
-    match mode {
+    Ok(match mode {
         AdminDashboardDemoMode::Authenticated => {
             protected.layer(middleware::from_fn(inject_local_demo_bearer))
         }
         AdminDashboardDemoMode::Unauthenticated => protected,
-    }
+        AdminDashboardDemoMode::OidcUser => browser_auth_router(local_fake_browser_auth_service(
+            origin,
+            LocalFakeIdentity::User,
+        )?),
+        AdminDashboardDemoMode::OidcAdmin => browser_auth_router(local_fake_browser_auth_service(
+            origin,
+            LocalFakeIdentity::Admin,
+        )?),
+    })
 }
 
 #[cfg(test)]
@@ -106,6 +122,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{AdminDashboardDemoConfig, AdminDashboardDemoMode, router};
+
+    const TEST_ORIGIN: &str = "http://127.0.0.1:33002";
 
     #[test]
     fn demo_bind_is_loopback_only() {
@@ -134,7 +152,7 @@ mod tests {
     #[tokio::test]
     async fn authenticated_mode_exercises_real_assets_auth_and_security_headers()
     -> Result<(), String> {
-        let shell = router(AdminDashboardDemoMode::Authenticated)
+        let shell = router(AdminDashboardDemoMode::Authenticated, TEST_ORIGIN)?
             .oneshot(
                 Request::builder()
                     .uri("/admin")
@@ -155,7 +173,7 @@ mod tests {
             "the real browser security middleware must wrap the demo shell"
         );
 
-        let bootstrap = router(AdminDashboardDemoMode::Authenticated)
+        let bootstrap = router(AdminDashboardDemoMode::Authenticated, TEST_ORIGIN)?
             .oneshot(
                 Request::builder()
                     .uri("/admin/api/v1/bootstrap")
@@ -177,7 +195,7 @@ mod tests {
             serde_json::json!(["approvals", "envelope", "fleet"])
         );
 
-        let script = router(AdminDashboardDemoMode::Authenticated)
+        let script = router(AdminDashboardDemoMode::Authenticated, TEST_ORIGIN)?
             .oneshot(
                 Request::builder()
                     .uri("/admin/assets/admin.js")
@@ -198,7 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_mode_fails_at_the_real_admin_boundary() -> Result<(), String> {
-        let response = router(AdminDashboardDemoMode::Unauthenticated)
+        let response = router(AdminDashboardDemoMode::Unauthenticated, TEST_ORIGIN)?
             .oneshot(
                 Request::builder()
                     .uri("/admin")
@@ -222,6 +240,31 @@ mod tests {
                 .contains_key(header::CONTENT_SECURITY_POLICY),
             "authentication denials must retain the real browser security headers"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oidc_demo_modes_serve_the_real_sign_in_boundary() -> Result<(), String> {
+        for mode in [
+            AdminDashboardDemoMode::OidcUser,
+            AdminDashboardDemoMode::OidcAdmin,
+        ] {
+            let response = router(mode, TEST_ORIGIN)?
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/sign-in")
+                        .body(Body::empty())
+                        .map_err(|error| format!("build OIDC sign-in request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("request OIDC sign-in: {error}"))?;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response
+                    .headers()
+                    .contains_key(header::CONTENT_SECURITY_POLICY)
+            );
+        }
         Ok(())
     }
 }

@@ -3,6 +3,7 @@
 #[cfg(feature = "admin-demo")]
 pub mod admin_demo;
 mod admin_ui;
+pub mod browser_auth;
 mod tasks;
 
 pub use tasks::{
