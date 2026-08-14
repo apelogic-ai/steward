@@ -144,6 +144,7 @@ fn authority_from_runtimes(
         runtime: RuntimeId(runtime_uid),
         runtime_namespace,
         principal: runtime.spec.principal.clone(),
+        canonical_authority: runtime.spec.canonical_authority.clone(),
         tools: runtime.spec.tools.clone(),
         state,
     })
@@ -275,8 +276,9 @@ mod tests {
     use steward_adapter_openshell::SandboxBinding;
     use steward_mint::{AuthorityBinding, AuthorityState, MintError, ValidatedWorkload};
     use steward_types::{
-        AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget, Duration, Email,
-        Phase, Principal, RuntimeId, RuntimeRefs, ToolGrant,
+        AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
+        CanonicalAuthorityBinding, CanonicalUserId, Duration, Email, Phase, Principal, RuntimeId,
+        RuntimeRefs, ToolGrant,
     };
 
     use super::{
@@ -374,6 +376,7 @@ mod tests {
             principal: Principal::User {
                 acting_user: Email("alice@example.com".to_owned()),
             },
+            canonical_authority: None,
             tools: Vec::new(),
             state: AuthorityState::Active,
         }
@@ -509,12 +512,15 @@ mod tests {
 
     #[test]
     fn authority_resolution_binds_live_runtime_principal_and_tools() -> Result<(), String> {
-        let authority = authority_from_runtimes(
-            &workload(),
-            &binding(),
-            &[runtime("runtime-uid-a", "workspace-a", "sandbox-a")],
-        )
-        .map_err(|error| format!("live runtime authority was rejected: {error:?}"))?;
+        let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
+            .map_err(|_| "canonical-user fixture is invalid".to_owned())?;
+        let canonical_authority =
+            CanonicalAuthorityBinding::new(canonical_user_id.clone(), Some(canonical_user_id))
+                .map_err(|_| "canonical-authority fixture is invalid".to_owned())?;
+        let mut runtime = runtime("runtime-uid-a", "workspace-a", "sandbox-a");
+        runtime.spec.canonical_authority = Some(canonical_authority.clone());
+        let authority = authority_from_runtimes(&workload(), &binding(), &[runtime])
+            .map_err(|error| format!("live runtime authority was rejected: {error:?}"))?;
 
         assert_eq!(authority.workload_id, workload().spiffe_id);
         assert_eq!(authority.runtime.0, "runtime-uid-a");
@@ -525,6 +531,7 @@ mod tests {
                 acting_user: Email("alice@example.com".to_owned())
             }
         );
+        assert_eq!(authority.canonical_authority, Some(canonical_authority));
         assert_eq!(
             authority.tools,
             [ToolGrant {
