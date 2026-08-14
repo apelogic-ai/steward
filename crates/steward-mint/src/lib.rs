@@ -25,7 +25,12 @@ pub use steward_ports::{
 use steward_types::{CanonicalAuthorityBinding, Principal, RuntimeId, ToolGrant};
 use uuid::Uuid;
 
-pub const HOP1_CLAIMS_VERSION: u8 = 3;
+/// MCP-GW compatibility profile used by the non-promotable browser-to-agent preview.
+///
+/// Steward still requires the trusted runtime's canonical authority binding before it mints for a
+/// person.  At the MCP boundary only, the existing standalone gateway contract is preserved by
+/// projecting the current verified email into both `sub` and `email` with its v2 claim version.
+pub const HOP1_CLAIMS_VERSION: u8 = 2;
 pub const DEFAULT_AUTHORITY_TTL: Duration = Duration::from_secs(60);
 pub const SPIFFE_CLIENT_ASSERTION_TYPE: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe";
@@ -313,7 +318,7 @@ fn authority_claim_identity(
                 .canonical_authority
                 .as_ref()
                 .ok_or(MintError::WorkloadMismatch)?;
-            let acting_user_id = canonical
+            canonical
                 .acting_user_id
                 .as_ref()
                 .filter(|acting_user_id| *acting_user_id == &canonical.owner_user_id)
@@ -322,7 +327,7 @@ fn authority_claim_identity(
                 acting_as: "user",
                 email: Some(acting_user.0.clone()),
                 service: None,
-                subject: acting_user_id.as_str().to_owned(),
+                subject: acting_user.0.clone(),
             })
         }
         Principal::Service { name, acting_user } if !name.is_empty() => match acting_user {
@@ -331,7 +336,7 @@ fn authority_claim_identity(
                     .canonical_authority
                     .as_ref()
                     .ok_or(MintError::WorkloadMismatch)?;
-                let acting_user_id = canonical
+                canonical
                     .acting_user_id
                     .as_ref()
                     .filter(|acting_user_id| *acting_user_id == &canonical.owner_user_id)
@@ -340,7 +345,7 @@ fn authority_claim_identity(
                     acting_as: "service_for_user",
                     email: Some(acting_user.0.clone()),
                     service: Some(name.clone()),
-                    subject: acting_user_id.as_str().to_owned(),
+                    subject: acting_user.0.clone(),
                 })
             }
             None => {
@@ -593,7 +598,7 @@ where
                 claims.custom.steward.acting_as == identity.acting_as
                     && claims.custom.steward.service == identity.service
                     && claims.custom.sub == identity.subject
-                    && (identity.acting_as != "service" || claims.custom.email == identity.email)
+                    && claims.custom.email == identity.email
             })
             .unwrap_or(false);
         let active = authority.state == AuthorityState::Active
