@@ -179,6 +179,13 @@ pub struct BrowserPrincipal {
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct BrowserSessionBinding(String);
 
+#[cfg(test)]
+impl BrowserSessionBinding {
+    pub(crate) fn from_test_value(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
 #[derive(Clone)]
 pub struct BrowserSessionContext {
     pub principal: BrowserPrincipal,
@@ -203,6 +210,13 @@ impl BrowserAdminAuthority {
 
 #[derive(Clone, Copy)]
 pub struct BrowserMutationProof(());
+
+#[cfg(test)]
+impl BrowserMutationProof {
+    pub(crate) fn for_test() -> Self {
+        Self(())
+    }
+}
 
 pub struct VerifiedOrganizationClaims {
     pub(crate) issuer: String,

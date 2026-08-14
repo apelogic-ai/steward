@@ -10,6 +10,8 @@ pub mod connections_demo;
 mod connections_ui;
 #[cfg(feature = "admin-demo")]
 pub mod fast_track_connections_bridge;
+#[cfg(feature = "admin-demo")]
+pub mod fast_track_runtime_bootstrap;
 pub mod google_oidc;
 mod tasks;
 

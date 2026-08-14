@@ -8,12 +8,16 @@ use std::time::Duration;
 use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::get;
+use steward_apiserver::KubeRuntimeRepository;
 use steward_apiserver::browser_auth::{
     BrowserAuthService, BrowserSessionBinding, GoogleOidcConfig, browser_auth_router,
 };
 use steward_apiserver::connections;
 use steward_apiserver::fast_track_connections_bridge::{
     FastTrackConnectionsBff, FastTrackIdentityResolver,
+};
+use steward_apiserver::fast_track_runtime_bootstrap::{
+    FastTrackRuntimeBootstrap, protected_router as runtime_bootstrap_router,
 };
 use steward_apiserver::google_oidc::GoogleOidcProvider;
 use steward_types::{CanonicalUserId, OrganizationId};
@@ -30,7 +34,7 @@ fn ttl() -> Result<Duration, io::Error> {
         .map_err(|_| io::Error::other("STEWARD_FAST_TRACK_BRIDGE_TTL_SECONDS must be an integer"))
 }
 
-fn router() -> Result<Router, Box<dyn Error>> {
+async fn router() -> Result<Router, Box<dyn Error>> {
     let browser_origin = required("STEWARD_BROWSER_ORIGIN")?;
     let organization_id = OrganizationId::parse(required("STEWARD_ORGANIZATION_ID")?)?;
     let google = GoogleOidcConfig::new(
@@ -56,10 +60,14 @@ fn router() -> Result<Router, Box<dyn Error>> {
         compatibility_email,
         ttl()?,
     )?;
+    let runtime_bootstrap = FastTrackRuntimeBootstrap::new(KubeRuntimeRepository::new(
+        kube::Client::try_default().await?,
+    ));
     Ok(Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .merge(browser_auth_router(browser_auth.clone()))
-        .merge(connections::protected_router(broker, browser_auth)))
+        .merge(connections::protected_router(broker, browser_auth.clone()))
+        .merge(runtime_bootstrap_router(runtime_bootstrap, browser_auth)))
 }
 
 #[tokio::main]
@@ -72,6 +80,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(bind).await?;
     let address = listener.local_addr()?;
     println!("FAST-TRACK / NON-PROMOTABLE preview listening on {address}/healthz");
-    axum::serve(listener, router()?).await?;
+    axum::serve(listener, router().await?).await?;
     Ok(())
 }
