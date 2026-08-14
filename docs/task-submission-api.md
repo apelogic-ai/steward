@@ -82,6 +82,12 @@ Pure service work uses exactly one service group plus
 `agents.apelogic.ai/task-owner:<corporate-email>` and exactly one canonical-user group instead.
 Steward rejects missing, duplicate, empty, or contradictory identity groups.
 
+The created AgentRuntime persists this resolved identity as
+`spec.canonicalAuthority` using `steward/canonical-authority-binding/v1`. Its owner ID is always
+present. Its acting ID equals the owner ID for delegated person work and is absent for pure-service
+work. This value is server-authored and immutable; legacy runtimes without it are not silently
+adopted.
+
 There is **no component in this repository** that validates GitHub's OIDC issuer,
 authorizes repository/workflow claims, resolves the GitHub actor to the reviewed canonical user
 and current corporate display email, and

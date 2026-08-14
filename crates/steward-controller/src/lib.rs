@@ -1884,6 +1884,21 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
     let Some(username) = request.user_info.username.as_deref() else {
         return response.deny("authenticated Kubernetes username is required");
     };
+    if request.operation == Operation::Create
+        && runtime.spec.canonical_authority.is_some()
+        && !trusted_writer_usernames.contains(username)
+    {
+        return response
+            .deny("canonical runtime authority may be set only by a trusted Steward writer");
+    }
+    if request.operation == Operation::Update {
+        let Some(old_runtime) = request.old_object.as_ref() else {
+            return response.deny("AgentRuntime UPDATE admission request has no old object");
+        };
+        if old_runtime.spec.canonical_authority != runtime.spec.canonical_authority {
+            return response.deny("canonical runtime authority is immutable");
+        }
+    }
     let trusted_service_write = matches!(
         &runtime.spec.principal,
         steward_types::Principal::Service { .. }
@@ -3207,6 +3222,7 @@ mod tests {
                     acting_user: Email("alice@example.com".to_owned()),
                 },
                 owner: Email("alice@example.com".to_owned()),
+                canonical_authority: None,
                 agent_type: AgentType {
                     name: "base".to_owned(),
                 },
@@ -4043,6 +4059,10 @@ mod webhook_tests {
             "name": "scheduled-scanner"
         });
         value["request"]["object"]["spec"]["owner"] = serde_json::json!("alice@example.com");
+        value["request"]["object"]["spec"]["canonicalAuthority"] = serde_json::json!({
+            "schemaVersion": "steward/canonical-authority-binding/v1",
+            "ownerUserId": "usr_0123456789abcdef0123456789abcdef"
+        });
         value["request"]["object"]["metadata"]["annotations"] = serde_json::json!({
             "agents.apelogic.ai/service-principal": "scheduled-scanner"
         });
@@ -4056,7 +4076,11 @@ mod webhook_tests {
         let ordinary = validate_admission(&ordinary_request, &fake_envelopes()).await;
         assert!(
             !ordinary.allowed,
-            "an ordinary user must not self-assert a service principal"
+            "an ordinary user must not self-assert canonical runtime authority"
+        );
+        assert_eq!(
+            ordinary.result.message,
+            "canonical runtime authority may be set only by a trusted Steward writer"
         );
 
         value["request"]["userInfo"] = serde_json::json!({"username": controller_username});
@@ -4075,6 +4099,41 @@ mod webhook_tests {
             trusted.allowed,
             "the trusted Steward writer must admit a service runtime through its service envelope: {}",
             trusted.result.message
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_canonical_authority_mutation_even_by_a_trusted_writer()
+    -> Result<(), String> {
+        let controller_username = "system:serviceaccount:steward-system:steward-controller";
+        let mut value = admission_review_value();
+        value["request"]["userInfo"] = serde_json::json!({"username": controller_username});
+        value["request"]["object"]["spec"]["canonicalAuthority"] = serde_json::json!({
+            "schemaVersion": "steward/canonical-authority-binding/v1",
+            "ownerUserId": "usr_0123456789abcdef0123456789abcdef",
+            "actingUserId": "usr_0123456789abcdef0123456789abcdef"
+        });
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct authority mutation review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read authority mutation request: {error}"))?;
+
+        let response = super::validate_admission_with_trusted_writers(
+            &request,
+            &fake_envelopes(),
+            &BTreeSet::from([controller_username.to_owned()]),
+        )
+        .await;
+
+        assert!(
+            !response.allowed,
+            "canonical authority mutation was admitted"
+        );
+        assert_eq!(
+            response.result.message,
+            "canonical runtime authority is immutable"
         );
         Ok(())
     }

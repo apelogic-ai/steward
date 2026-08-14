@@ -52,6 +52,21 @@ accessible after an audited email rename, while a different canonical user in th
 denied. Legacy Task rows are marked `legacy_reconnect_required`; they are not adopted by matching
 email.
 
+Every newly created Task runtime also carries the server-derived
+
+```text
+spec.canonicalAuthority.schemaVersion = steward/canonical-authority-binding/v1
+spec.canonicalAuthority.ownerUserId = <canonical owner ID>
+spec.canonicalAuthority.actingUserId = <same ID, only when a person is acting>
+```
+
+The binding contains no email, Google subject, hosted domain, or raw assertion. The Task API
+constructs it from the resolved identity; Task request bodies have no identity field. Direct REST
+runtime requests carrying `canonicalAuthority` are rejected, and Kubernetes admission permits its
+initial value only from a configured trusted Steward writer. The complete binding is immutable.
+Legacy runtimes omit it and must reconnect or follow an explicitly reviewed migration; consumers
+must not infer it from `principal`, `owner`, email, annotations, or generic `bindings`.
+
 ## Compatibility and dependent slices
 
 Migration `0012_canonical_user_identity.sql` is append-only. It creates the canonical user,
@@ -64,11 +79,15 @@ The following integrations consume this foundation and must preserve its boundar
 - envelope and approval ownership use that authenticated canonical ID;
 - the GitHub exchange maps its reviewed actor to that same ID and emits the trusted canonical-user
   group; workflow inputs cannot override it;
-- Mint projects the minimum stable canonical reference into runtime credentials while retaining
-  its existing issuer, audience, subject, and runtime-binding checks;
+- Mint reads the typed canonical authority from the live UID-bound AgentRuntime. User and
+  `service_for_user` modes require `actingUserId == ownerUserId` and project that minimum stable
+  person reference while retaining existing issuer, audience, subject, and runtime-binding checks.
+  Pure-service mode has no acting-person claim even when the runtime records an accountable owner;
 - provider brokers look up grants by canonical user ID and never by token issuer plus email.
 
 Mint changes are intentionally isolated in the separately reviewed Mint trust-boundary change.
-The shared type required by that change is `CanonicalUserId`; runtime credentials should carry its
-exact `as_str()` value as a dedicated stable-person claim, not embed `CanonicalPrincipal`, email,
-Google `sub`, hosted domain, or raw organization assertions.
+The shared types required by that change are `CanonicalUserId` and
+`CanonicalAuthorityBinding`; runtime credentials should carry the acting ID's exact `as_str()`
+value as a dedicated stable-person claim, not embed `CanonicalPrincipal`, email, Google `sub`,
+hosted domain, or raw organization assertions. Missing, unknown-version, or internally
+inconsistent authority fails closed for person-bound Mint modes.

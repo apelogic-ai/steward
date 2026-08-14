@@ -1655,6 +1655,9 @@ where
     L: AdmissionLedger,
     D: DecisionChannel,
 {
+    if request.spec.canonical_authority.is_some() {
+        return Err(ApiError::PrincipalMismatch);
+    }
     match &request.spec.principal {
         Principal::User { acting_user } if acting_user.0 == context.actor => {}
         _ => return Err(ApiError::PrincipalMismatch),
@@ -4155,6 +4158,7 @@ mod tests {
                 acting_user: Email("alice@example.com".to_owned()),
             },
             owner: Email("alice@example.com".to_owned()),
+            canonical_authority: None,
             agent_type: AgentType {
                 name: "base".to_owned(),
             },
@@ -4469,6 +4473,71 @@ mod tests {
                 .name_any(),
             "runtime-a",
             "a rejected create must not write desired state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_rejects_caller_supplied_canonical_authority_before_writing()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let app = router(
+            runtimes,
+            ledger(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/namespaces/team-a/runtimes")
+                    .header("authorization", "Bearer user-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "runtime-b",
+                            "spec": {
+                                "principal": {
+                                    "kind": "user",
+                                    "actingUser": "alice@example.com",
+                                },
+                                "owner": "alice@example.com",
+                                "canonicalAuthority": {
+                                    "schemaVersion": "steward/canonical-authority-binding/v1",
+                                    "ownerUserId": "usr_abcdef0123456789abcdef0123456789",
+                                    "actingUserId": "usr_abcdef0123456789abcdef0123456789"
+                                },
+                                "agentType": {"name": "base"},
+                                "llms": [{
+                                    "provider": "provider-a",
+                                    "model": "model-a",
+                                }],
+                                "tools": [],
+                                "budget": {
+                                    "monthlyLimit": "100.00",
+                                    "currency": "USD",
+                                },
+                                "ttl": "24h",
+                            },
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("failed to build canonical injection: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("canonical injection request failed: {error}"))?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?
+                .name_any(),
+            "runtime-a",
+            "caller-supplied canonical authority must not write desired state"
         );
         Ok(())
     }
@@ -6135,6 +6204,7 @@ mod tests {
         let runtimes = FakeRuntimeRepository {
             runtime: Arc::new(Mutex::new(runtime())),
         };
+        let runtime_state = runtimes.runtime.clone();
         let ledger = ledger();
         let task_rows = ledger.tasks.clone();
         let decisions = FakeDecisionChannel::default();
@@ -6168,6 +6238,23 @@ mod tests {
             .await
             .map_err(|error| format!("task submission failed: {error}"))?;
         assert_eq!(submitted.status(), StatusCode::CREATED);
+        {
+            let runtime = runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?;
+            let authority =
+                runtime.spec.canonical_authority.as_ref().ok_or_else(|| {
+                    "delegated Task runtime lacked canonical authority".to_owned()
+                })?;
+            assert_eq!(
+                authority.owner_user_id.as_str(),
+                "usr_0123456789abcdef0123456789abcdef"
+            );
+            assert_eq!(
+                authority.acting_user_id.as_ref(),
+                Some(&authority.owner_user_id)
+            );
+        }
         let body = to_bytes(submitted.into_body(), 1024 * 1024)
             .await
             .map_err(|error| format!("failed to read task submission: {error}"))?;
@@ -6446,6 +6533,16 @@ mod tests {
             .lock()
             .map_err(|_| "fake runtime lock was poisoned")?;
         assert_eq!(runtime.spec.owner, Email("owner@example.org".to_owned()));
+        let authority = runtime
+            .spec
+            .canonical_authority
+            .as_ref()
+            .ok_or_else(|| "pure-service Task runtime lacked owner authority".to_owned())?;
+        assert_eq!(
+            authority.owner_user_id.as_str(),
+            "usr_456789abcdef0123456789abcdef0123"
+        );
+        assert_eq!(authority.acting_user_id, None);
         assert_eq!(
             runtime.spec.principal,
             Principal::Service {

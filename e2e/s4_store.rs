@@ -8,8 +8,8 @@ use sqlx::postgres::PgPoolOptions;
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
 use steward_store::{ApproveAdmission, ParkRejection, PgStore, StoreError, TaskReservationRequest};
 use steward_types::{
-    AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, OrganizationId,
-    OrganizationIdentity, Principal, RuntimeOwnership, TaskPhase,
+    AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding, Duration, Email, ModelRef,
+    OrganizationId, OrganizationIdentity, Principal, RuntimeOwnership, TaskPhase,
 };
 
 fn proposed_spec() -> AgentRuntimeSpec {
@@ -18,6 +18,7 @@ fn proposed_spec() -> AgentRuntimeSpec {
             acting_user: Email("alice@example.com".to_owned()),
         },
         owner: Email("alice@example.com".to_owned()),
+        canonical_authority: None,
         agent_type: AgentType {
             name: "base".to_owned(),
         },
@@ -195,7 +196,11 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
             "test-bootstrap",
         )
         .await?;
-    let spec = proposed_spec();
+    let mut spec = proposed_spec();
+    spec.canonical_authority = Some(CanonicalAuthorityBinding::new(
+        canonical.user_id.clone(),
+        Some(canonical.user_id.clone()),
+    )?);
     let command = vec!["agent-v1".to_owned()];
     let legacy = sqlx::query(
         "INSERT INTO task_submissions \
@@ -205,7 +210,7 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
          VALUES (gen_random_uuid(), $1, 'legacy-service', 'legacy@example.com', \
                  'legacy@example.com', 'legacy-workflow', 'legacy-runtime', 'legacy', $2, \
                  'provisioned', 'submitted', '{}'::jsonb, '[]'::jsonb) \
-         RETURNING identity_binding_state, acting_user_id, owner_user_id",
+         RETURNING identity_binding_state, acting_user_id, owner_user_id, runtime_spec",
     )
     .bind(format!("legacy-{suffix}"))
     .bind(format!("legacy-{suffix}"))
@@ -217,6 +222,13 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
     );
     assert_eq!(legacy.try_get::<Option<String>, _>("acting_user_id")?, None);
     assert_eq!(legacy.try_get::<Option<String>, _>("owner_user_id")?, None);
+    assert_eq!(
+        legacy
+            .try_get::<serde_json::Value, _>("runtime_spec")?
+            .get("canonicalAuthority"),
+        None,
+        "legacy rows must remain explicitly unbound instead of adopting an email-derived ID"
+    );
 
     let request = TaskReservationRequest {
         idempotency_key: &idempotency_key,
@@ -235,6 +247,10 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
     };
     let first = store.reserve_task(&request).await?;
     assert!(first.inserted);
+    assert_eq!(
+        first.record.runtime_spec.canonical_authority, spec.canonical_authority,
+        "the stable authority binding must survive Task persistence"
+    );
     let second = store.reserve_task(&request).await?;
     assert!(!second.inserted);
     assert_eq!(second.record.task_uid, first.record.task_uid);
@@ -854,6 +870,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
             acting_user: Email("alice@example.com".to_owned()),
         },
         owner: Email("alice@example.com".to_owned()),
+        canonical_authority: None,
         agent_type: AgentType {
             name: "base".to_owned(),
         },

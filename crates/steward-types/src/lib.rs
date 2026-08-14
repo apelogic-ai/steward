@@ -57,8 +57,11 @@ impl<'de> Deserialize<'de> for Email {
 /// Version of the stable person-identity contract shared by Steward control-plane surfaces.
 pub const CANONICAL_PRINCIPAL_SCHEMA_VERSION: &str = "steward/canonical-principal/v1";
 
+/// Version of the canonical person binding persisted with runtime authority.
+pub const CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION: &str =
+    "steward/canonical-authority-binding/v1";
+
 /// Opaque, immutable identifier allocated by Steward for one person.
-///
 /// The value deliberately contains no email, identity-provider subject, or organization name.
 #[derive(Clone, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(transparent)]
@@ -93,6 +96,93 @@ impl<'de> Deserialize<'de> for CanonicalUserId {
         D: serde::Deserializer<'de>,
     {
         Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Minimum stable person binding carried by a live AgentRuntime.
+///
+/// This deliberately excludes email and external identity-provider claims. In v1, an acting
+/// person is always the accountable owner; pure services omit `acting_user_id`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanonicalAuthorityBinding {
+    pub schema_version: String,
+    pub owner_user_id: CanonicalUserId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acting_user_id: Option<CanonicalUserId>,
+}
+
+impl CanonicalAuthorityBinding {
+    pub fn new(
+        owner_user_id: CanonicalUserId,
+        acting_user_id: Option<CanonicalUserId>,
+    ) -> Result<Self, String> {
+        if acting_user_id
+            .as_ref()
+            .is_some_and(|acting_user_id| acting_user_id != &owner_user_id)
+        {
+            return Err("canonical acting user must equal the accountable owner in v1".to_owned());
+        }
+        Ok(Self {
+            schema_version: CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION.to_owned(),
+            owner_user_id,
+            acting_user_id,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CanonicalAuthorityBindingWire {
+    schema_version: String,
+    owner_user_id: CanonicalUserId,
+    #[serde(default)]
+    acting_user_id: Option<CanonicalUserId>,
+}
+
+impl<'de> Deserialize<'de> for CanonicalAuthorityBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = CanonicalAuthorityBindingWire::deserialize(deserializer)?;
+        if wire.schema_version != CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION {
+            return Err(serde::de::Error::custom(
+                "unsupported canonical authority binding schema version",
+            ));
+        }
+        Self::new(wire.owner_user_id, wire.acting_user_id).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for CanonicalAuthorityBinding {
+    fn schema_name() -> Cow<'static, str> {
+        "CanonicalAuthorityBinding".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        concat!(module_path!(), "::CanonicalAuthorityBinding").into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let user_id = generator.subschema_for::<CanonicalUserId>();
+        json_schema!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["schemaVersion", "ownerUserId"],
+            "properties": {
+                "schemaVersion": {
+                    "type": "string",
+                    "enum": [CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION]
+                },
+                "ownerUserId": user_id.clone(),
+                "actingUserId": user_id
+            },
+            "x-kubernetes-validations": [{
+                "rule": "!has(self.actingUserId) || self.actingUserId == self.ownerUserId",
+                "message": "canonical acting user must equal the accountable owner in v1"
+            }]
+        })
     }
 }
 
@@ -482,6 +572,9 @@ pub struct BindingRef(pub String);
 pub struct AgentRuntimeSpec {
     pub principal: Principal,
     pub owner: Email,
+    /// Server-derived stable person authority. Missing means legacy/reconnect-required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_authority: Option<CanonicalAuthorityBinding>,
     pub agent_type: AgentType,
     pub llms: Vec<ModelRef>,
     pub tools: Vec<ToolGrant>,
@@ -562,9 +655,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CANONICAL_PRINCIPAL_SCHEMA_VERSION, CanonicalPrincipal, CanonicalUserId, Email,
-        OrganizationId, OrganizationIdentity, OrganizationIdentityPolicy, Principal,
-        agent_runtime_crd,
+        CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION, CANONICAL_PRINCIPAL_SCHEMA_VERSION,
+        CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
+        OrganizationIdentity, OrganizationIdentityPolicy, Principal, agent_runtime_crd,
     };
 
     #[test]
@@ -606,6 +699,67 @@ mod tests {
         for value in ["", "example org", "alice@example.com", "org_/example"] {
             assert!(OrganizationId::parse(value).is_err(), "accepted {value}");
         }
+    }
+
+    #[test]
+    fn canonical_authority_binding_is_versioned_minimal_and_owner_bound() -> Result<(), String> {
+        let owner = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        let delegated = CanonicalAuthorityBinding::new(owner.clone(), Some(owner.clone()))?;
+        assert_eq!(
+            serde_json::to_value(&delegated)
+                .map_err(|error| format!("failed to serialize canonical authority: {error}"))?,
+            json!({
+                "schemaVersion": CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION,
+                "ownerUserId": owner.as_str(),
+                "actingUserId": owner.as_str()
+            })
+        );
+        let pure_service = CanonicalAuthorityBinding::new(owner.clone(), None)?;
+        assert_eq!(
+            serde_json::to_value(&pure_service)
+                .map_err(|error| format!("failed to serialize service authority: {error}"))?,
+            json!({
+                "schemaVersion": CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION,
+                "ownerUserId": owner.as_str()
+            })
+        );
+
+        for invalid in [
+            json!({
+                "schemaVersion": "steward/canonical-authority-binding/v2",
+                "ownerUserId": owner.as_str()
+            }),
+            json!({
+                "schemaVersion": CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION,
+                "ownerUserId": owner.as_str(),
+                "actingUserId": "usr_abcdef0123456789abcdef0123456789"
+            }),
+            json!({
+                "schemaVersion": CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION,
+                "ownerUserId": owner.as_str(),
+                "email": "alice@example.com"
+            }),
+            json!({
+                "schemaVersion": CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION,
+                "ownerUserId": "alice@example.com"
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<CanonicalAuthorityBinding>(invalid).is_err(),
+                "invalid canonical authority binding was accepted"
+            );
+        }
+        let crd = serde_json::to_value(agent_runtime_crd())
+            .map_err(|error| format!("failed to inspect AgentRuntime CRD: {error}"))?;
+        assert_eq!(
+            crd.pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/canonicalAuthority/x-kubernetes-validations/0/rule",
+            )
+            .and_then(serde_json::Value::as_str),
+            Some("!has(self.actingUserId) || self.actingUserId == self.ownerUserId"),
+            "the Kubernetes schema must enforce the v1 acting/owner invariant"
+        );
+        Ok(())
     }
 
     #[test]

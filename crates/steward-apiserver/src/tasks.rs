@@ -20,8 +20,9 @@ use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, evaluate_wi
 use steward_ports::MAX_TASK_INPUT_ARCHIVE_BYTES;
 use steward_store::{ParkRejection, PgStore, StoreError, TaskRecord, TaskReservationRequest};
 use steward_types::{
-    AgentRuntime, AgentRuntimeSpec, Budget, CanonicalUserId, Duration, Email, ModelRef,
-    PENDING_APPROVAL_ANNOTATION, Principal, RuntimeOwnership, TaskPhase, ToolGrant,
+    AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, Duration,
+    Email, ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, RuntimeOwnership, TaskPhase,
+    ToolGrant,
 };
 use uuid::Uuid;
 
@@ -722,6 +723,16 @@ where
             acting_user: identity.acting_user.clone(),
         },
         owner: identity.owner.clone(),
+        canonical_authority: Some(
+            CanonicalAuthorityBinding::new(
+                identity.canonical_user_id.clone(),
+                identity
+                    .acting_user
+                    .as_ref()
+                    .map(|_| identity.canonical_user_id.clone()),
+            )
+            .map_err(ApiError::Admission)?,
+        ),
         agent_type: steward_types::AgentType {
             name: workflow.coding_agent_runtime.clone(),
         },
