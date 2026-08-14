@@ -9,8 +9,27 @@ use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpe
 use steward_store::{ApproveAdmission, ParkRejection, PgStore, StoreError, TaskReservationRequest};
 use steward_types::{
     AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding, Duration, Email, ModelRef,
-    OrganizationId, OrganizationIdentity, Principal, RuntimeOwnership, TaskPhase,
+    OrganizationId, OrganizationIdentity, OrganizationIdentityMigration,
+    OrganizationIdentityPolicy, Principal, RuntimeOwnership, TaskPhase,
 };
+
+fn google_identity(
+    subject: impl AsRef<str>,
+    email: impl AsRef<str>,
+) -> Result<OrganizationIdentity, Box<dyn Error>> {
+    Ok(OrganizationIdentityPolicy::new(
+        "https://accounts.google.com",
+        "example.com",
+        OrganizationId::parse("org_example")?,
+    )?
+    .validate(
+        "https://accounts.google.com",
+        subject.as_ref(),
+        "example.com",
+        email.as_ref(),
+        true,
+    )?)
+}
 
 fn proposed_spec() -> AgentRuntimeSpec {
     AgentRuntimeSpec {
@@ -54,13 +73,7 @@ async fn canonical_identity_requires_exact_subject_mapping_and_explicit_reconnec
         .to_string();
     let organization = OrganizationId::parse("org_example")?;
     let email = Email::parse(format!("identity-{suffix}@example.com"))?;
-    let google = OrganizationIdentity::new(
-        "https://accounts.google.com",
-        format!("google-subject-{suffix}"),
-        "example.com",
-        organization.clone(),
-        email.clone(),
-    )?;
+    let google = google_identity(format!("google-subject-{suffix}"), email.as_str())?;
 
     let principal = store
         .register_canonical_identity(&google, "identity-admin")
@@ -85,13 +98,8 @@ async fn canonical_identity_requires_exact_subject_mapping_and_explicit_reconnec
         "exact repeat registration must be idempotent"
     );
 
-    let changed_subject = OrganizationIdentity::new(
-        "https://accounts.google.com",
-        format!("different-google-subject-{suffix}"),
-        "example.com",
-        organization.clone(),
-        email.clone(),
-    )?;
+    let changed_subject =
+        google_identity(format!("different-google-subject-{suffix}"), email.as_str())?;
     assert_eq!(
         store
             .register_canonical_identity(&changed_subject, "identity-admin")
@@ -101,13 +109,7 @@ async fn canonical_identity_requires_exact_subject_mapping_and_explicit_reconnec
     );
 
     let renamed_email = Email::parse(format!("identity-renamed-{suffix}@example.com"))?;
-    let renamed_google = OrganizationIdentity::new(
-        "https://accounts.google.com",
-        google.subject.clone(),
-        "example.com",
-        organization.clone(),
-        renamed_email.clone(),
-    )?;
+    let renamed_google = google_identity(google.subject(), renamed_email.as_str())?;
     assert_eq!(
         store.resolve_canonical_identity(&renamed_google).await,
         Err(StoreError::CanonicalIdentityStale),
@@ -143,7 +145,7 @@ async fn canonical_identity_requires_exact_subject_mapping_and_explicit_reconnec
         principal.user_id
     );
 
-    let future_issuer = OrganizationIdentity::new(
+    let future_issuer = OrganizationIdentityMigration::new_reviewed(
         "https://login.example.test",
         format!("future-subject-{suffix}"),
         "example.com",
@@ -156,7 +158,7 @@ async fn canonical_identity_requires_exact_subject_mapping_and_explicit_reconnec
     assert_eq!(migrated.user_id, principal.user_id);
     assert_eq!(
         store
-            .resolve_canonical_identity(&future_issuer)
+            .resolve_canonical_identity(future_issuer.identity())
             .await?
             .user_id,
         principal.user_id,
@@ -186,12 +188,9 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
     let runtime_uid = format!("runtime-{suffix}");
     let canonical = store
         .register_canonical_identity(
-            &OrganizationIdentity::new(
-                "https://accounts.google.com",
+            &google_identity(
                 format!("google-subject-{suffix}"),
-                "example.com",
-                OrganizationId::parse("org_example")?,
-                Email::parse(format!("alice-{suffix}@example.com"))?,
+                format!("alice-{suffix}@example.com"),
             )?,
             "test-bootstrap",
         )
@@ -257,24 +256,73 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
 
     let other = store
         .register_canonical_identity(
-            &OrganizationIdentity::new(
-                "https://accounts.google.com",
+            &google_identity(
                 format!("google-other-subject-{suffix}"),
-                "example.com",
-                OrganizationId::parse("org_example")?,
-                Email::parse(format!("bob-{suffix}@example.com"))?,
+                format!("bob-{suffix}@example.com"),
             )?,
             "test-bootstrap",
         )
         .await?;
+    let mut other_spec = proposed_spec();
+    other_spec.canonical_authority = Some(CanonicalAuthorityBinding::new(
+        other.user_id.clone(),
+        Some(other.user_id.clone()),
+    )?);
     let other_request = TaskReservationRequest {
         acting_user_id: Some(other.user_id.as_str()),
         owner_user_id: other.user_id.as_str(),
+        runtime_spec: &other_spec,
         ..request
     };
     let other_task = store.reserve_task(&other_request).await?;
     assert!(other_task.inserted);
     assert_ne!(other_task.record.task_uid, first.record.task_uid);
+
+    let mismatched_columns_key = format!("mismatched-columns-{suffix}");
+    let mismatched_columns = TaskReservationRequest {
+        idempotency_key: &mismatched_columns_key,
+        acting_user_id: Some(other.user_id.as_str()),
+        ..request
+    };
+    assert_eq!(
+        store.reserve_task(&mismatched_columns).await,
+        Err(StoreError::InvalidTaskIdentityBinding),
+        "delegated v1 reservations must reject acting_user_id != owner_user_id"
+    );
+
+    let mismatched_runtime_key = format!("mismatched-runtime-{suffix}");
+    let mismatched_runtime_authority = TaskReservationRequest {
+        idempotency_key: &mismatched_runtime_key,
+        owner_user_id: other.user_id.as_str(),
+        acting_user_id: Some(other.user_id.as_str()),
+        ..request
+    };
+    assert_eq!(
+        store.reserve_task(&mismatched_runtime_authority).await,
+        Err(StoreError::InvalidTaskIdentityBinding),
+        "Task columns must match the server-authored runtime canonical authority"
+    );
+
+    let direct_mismatch = sqlx::query(
+        "INSERT INTO task_submissions \
+         (task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, owner, \
+          owner_user_id, identity_binding_state, workflow, coding_agent_runtime, \
+          runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, agent_command) \
+         VALUES (gen_random_uuid(), $1, 'steward-run', 'alice@example.com', $2, \
+                 'alice@example.com', $3, 'bound', 'code-review', 'agent-v1', 'team-a', $4, \
+                 'provisioned', 'submitted', $5, '[]'::jsonb)",
+    )
+    .bind(format!("direct-mismatch-{suffix}"))
+    .bind(other.user_id.as_str())
+    .bind(canonical.user_id.as_str())
+    .bind(format!("direct-mismatch-{suffix}"))
+    .bind(sqlx::types::Json(&spec))
+    .execute(store.pool())
+    .await;
+    assert!(
+        direct_mismatch.is_err(),
+        "the database must reject delegated acting_user_id != owner_user_id"
+    );
 
     store
         .bind_task_runtime(first.record.task_uid, &runtime_uid, TaskPhase::Submitted)

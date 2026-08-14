@@ -60,6 +60,7 @@ pub const CANONICAL_PRINCIPAL_SCHEMA_VERSION: &str = "steward/canonical-principa
 /// Version of the canonical person binding persisted with runtime authority.
 pub const CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION: &str =
     "steward/canonical-authority-binding/v1";
+pub const GOOGLE_ORGANIZATION_ISSUER: &str = "https://accounts.google.com";
 
 /// Opaque, immutable identifier allocated by Steward for one person.
 /// The value deliberately contains no email, identity-provider subject, or organization name.
@@ -284,16 +285,6 @@ impl<'de> Deserialize<'de> for CanonicalPrincipal {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrganizationIdentity {
-    pub issuer: String,
-    pub subject: String,
-    pub organization_claim: String,
-    pub organization_id: OrganizationId,
-    pub verified_email: Email,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct OrganizationIdentityWire {
     issuer: String,
     subject: String,
     organization_claim: String,
@@ -301,16 +292,23 @@ struct OrganizationIdentityWire {
     verified_email: Email,
 }
 
+/// Explicitly reviewed identity used only to attach an alternative issuer during migration.
+///
+/// This type is intentionally distinct from `OrganizationIdentity`: it cannot enter the normal
+/// registration path, and every store mutation accepting it requires an audited actor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrganizationIdentityMigration(OrganizationIdentity);
+
 /// Exact trust boundary applied after a supported organization OIDC token is verified.
 ///
-/// The current DEV fixture uses Google's exact issuer and `hd` claim. The type remains
-/// provider-neutral so a reviewed issuer migration does not change the canonical person model.
+/// The normal registration path is pinned to Google's exact issuer and `hd` claim. A reviewed
+/// issuer migration uses the distinct `OrganizationIdentityMigration` type instead.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrganizationIdentityPolicy {
-    pub issuer: String,
-    pub organization_claim: String,
-    pub organization_id: OrganizationId,
+    issuer: String,
+    organization_claim: String,
+    organization_id: OrganizationId,
 }
 
 #[derive(Deserialize)]
@@ -329,7 +327,9 @@ impl OrganizationIdentityPolicy {
     ) -> Result<Self, String> {
         let issuer = issuer.into();
         let organization_claim = organization_claim.into();
-        validate_exact_https_issuer(&issuer)?;
+        if issuer != GOOGLE_ORGANIZATION_ISSUER {
+            return Err("organization identity policy requires the exact Google issuer".to_owned());
+        }
         validate_organization_claim(&organization_claim)?;
         Ok(Self {
             issuer,
@@ -360,7 +360,7 @@ impl OrganizationIdentityPolicy {
         if !email_domain.eq_ignore_ascii_case(&self.organization_claim) {
             return Err("organization email is outside the exact hosted domain".to_owned());
         }
-        OrganizationIdentity::new(
+        OrganizationIdentity::new_validated(
             issuer,
             subject,
             organization_claim,
@@ -382,7 +382,7 @@ impl<'de> Deserialize<'de> for OrganizationIdentityPolicy {
 }
 
 impl OrganizationIdentity {
-    pub fn new(
+    fn new_validated(
         issuer: impl Into<String>,
         subject: impl Into<String>,
         organization_claim: impl Into<String>,
@@ -411,22 +411,47 @@ impl OrganizationIdentity {
             verified_email,
         })
     }
+
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    pub fn organization_claim(&self) -> &str {
+        &self.organization_claim
+    }
+
+    pub fn organization_id(&self) -> &OrganizationId {
+        &self.organization_id
+    }
+
+    pub fn verified_email(&self) -> &Email {
+        &self.verified_email
+    }
 }
 
-impl<'de> Deserialize<'de> for OrganizationIdentity {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let wire = OrganizationIdentityWire::deserialize(deserializer)?;
-        Self::new(
-            wire.issuer,
-            wire.subject,
-            wire.organization_claim,
-            wire.organization_id,
-            wire.verified_email,
-        )
-        .map_err(serde::de::Error::custom)
+impl OrganizationIdentityMigration {
+    pub fn new_reviewed(
+        issuer: impl Into<String>,
+        subject: impl Into<String>,
+        organization_claim: impl Into<String>,
+        organization_id: OrganizationId,
+        verified_email: Email,
+    ) -> Result<Self, String> {
+        Ok(Self(OrganizationIdentity::new_validated(
+            issuer,
+            subject,
+            organization_claim,
+            organization_id,
+            verified_email,
+        )?))
+    }
+
+    pub fn identity(&self) -> &OrganizationIdentity {
+        &self.0
     }
 }
 
@@ -657,7 +682,7 @@ mod tests {
     use super::{
         CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION, CANONICAL_PRINCIPAL_SCHEMA_VERSION,
         CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
-        OrganizationIdentity, OrganizationIdentityPolicy, Principal, agent_runtime_crd,
+        OrganizationIdentityPolicy, Principal, agent_runtime_crd,
     };
 
     #[test]
@@ -819,12 +844,17 @@ mod tests {
 
     #[test]
     fn organization_identity_is_exact_and_carries_no_caller_selected_user() -> Result<(), String> {
-        let identity = OrganizationIdentity::new(
+        let identity = OrganizationIdentityPolicy::new(
+            "https://accounts.google.com",
+            "example.com",
+            OrganizationId::parse("org_example")?,
+        )?
+        .validate(
             "https://accounts.google.com",
             "immutable-subject-001",
             "example.com",
-            OrganizationId::parse("org_example")?,
-            Email("alice@example.com".to_owned()),
+            "alice@example.com",
+            true,
         )?;
         let value = serde_json::to_value(identity).map_err(|error| error.to_string())?;
         assert_eq!(value["issuer"], "https://accounts.google.com");
@@ -838,6 +868,11 @@ mod tests {
     #[test]
     fn organization_identity_rejects_wrong_issuer_and_ambiguous_subject() -> Result<(), String> {
         let organization = OrganizationId::parse("org_example")?;
+        let policy = OrganizationIdentityPolicy::new(
+            "https://accounts.google.com",
+            "example.com",
+            organization.clone(),
+        )?;
         for (issuer, subject, hosted_domain) in [
             (
                 "http://accounts.google.com",
@@ -858,34 +893,27 @@ mod tests {
             ("https://accounts.google.com", "subject-001", "other_domain"),
         ] {
             assert!(
-                OrganizationIdentity::new(
-                    issuer,
-                    subject,
-                    hosted_domain,
-                    organization.clone(),
-                    Email("alice@example.com".to_owned()),
-                )
-                .is_err(),
+                policy
+                    .validate(issuer, subject, hosted_domain, "alice@example.com", true,)
+                    .is_err(),
                 "accepted issuer={issuer} subject={subject} organization={hosted_domain}"
             );
         }
-        assert!(
-            serde_json::from_value::<OrganizationIdentity>(json!({
-                "issuer": "http://accounts.google.com",
-                "subject": "immutable-subject-001",
-                "organizationClaim": "example.com",
-                "organizationId": "org_example",
-                "verifiedEmail": "alice@example.com"
-            }))
-            .is_err(),
-            "deserialization bypassed organization identity validation"
-        );
         Ok(())
     }
 
     #[test]
     fn direct_google_policy_requires_exact_issuer_hosted_domain_and_verified_email()
     -> Result<(), String> {
+        assert!(
+            OrganizationIdentityPolicy::new(
+                "https://login.example.test",
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )
+            .is_err(),
+            "an arbitrary HTTPS issuer must not become a registration trust policy"
+        );
         let policy = OrganizationIdentityPolicy::new(
             "https://accounts.google.com",
             "example.com",
@@ -898,8 +926,8 @@ mod tests {
             "alice@example.com",
             true,
         )?;
-        assert_eq!(identity.issuer, "https://accounts.google.com");
-        assert_eq!(identity.organization_claim, "example.com");
+        assert_eq!(identity.issuer(), "https://accounts.google.com");
+        assert_eq!(identity.organization_claim(), "example.com");
 
         for (issuer, hosted_domain, email, verified) in [
             (

@@ -16,9 +16,12 @@ browser/session boundary must require all of these before constructing an `Organ
 - the verified email domain equal to that same hosted domain.
 
 `OrganizationIdentityPolicy` performs the exact issuer, hosted-domain, verification, and email
-boundary checks. `OrganizationIdentity` is the already-validated, provider-neutral input to the
-identity store. Raw ID tokens, authorization codes, cookies, and provider credentials are never
-accepted by or returned from the store contract.
+boundary checks. Its fields are private, its constructor accepts only the exact Google issuer, and
+only successful policy validation can construct the opaque `OrganizationIdentity` accepted by
+normal store registration/resolution. Alternative issuers use the distinct, explicitly reviewed
+`OrganizationIdentityMigration` attachment path and require an audited actor. Raw ID tokens,
+authorization codes, cookies, and provider credentials are never accepted by or returned from the
+store contract.
 
 ## Exact resolution and registration
 
@@ -80,14 +83,16 @@ The following integrations consume this foundation and must preserve its boundar
 - the GitHub exchange maps its reviewed actor to that same ID and emits the trusted canonical-user
   group; workflow inputs cannot override it;
 - Mint reads the typed canonical authority from the live UID-bound AgentRuntime. User and
-  `service_for_user` modes require `actingUserId == ownerUserId` and project that minimum stable
-  person reference while retaining existing issuer, audience, subject, and runtime-binding checks.
-  Pure-service mode has no acting-person claim even when the runtime records an accountable owner;
+  `service_for_user` modes require `actingUserId == ownerUserId`; their HOP-1 `sub` is that exact
+  `CanonicalUserId.as_str()` value, verified email is secondary display metadata, and the workload
+  SPIFFE identity remains `azp`. Pure-service mode keeps `sub=service:<name>` and has no acting-person
+  subject even when the runtime records an accountable owner;
 - provider brokers look up grants by canonical user ID and never by token issuer plus email.
 
 Mint changes are intentionally isolated in the separately reviewed Mint trust-boundary change.
 The shared types required by that change are `CanonicalUserId` and
-`CanonicalAuthorityBinding`; runtime credentials should carry the acting ID's exact `as_str()`
-value as a dedicated stable-person claim, not embed `CanonicalPrincipal`, email, Google `sub`,
-hosted domain, or raw organization assertions. Missing, unknown-version, or internally
-inconsistent authority fails closed for person-bound Mint modes.
+`CanonicalAuthorityBinding`; person-bound runtime credentials must set `sub` to the acting ID's
+exact `as_str()` value. Email remains secondary display metadata; workload `azp` and the existing
+issuer/audience/runtime binding remain unchanged. Credentials must not embed `CanonicalPrincipal`,
+Google `sub`, hosted domain, or raw organization assertions. Missing, unknown-version, or
+internally inconsistent authority fails closed for person-bound Mint modes.

@@ -443,10 +443,11 @@ approved*, and decides.
 #### 2.6.5 Each adapter is authoritative for exactly one fact
 
 Every channel has its own principal namespace — Slack user ID, Jira account ID, GitHub
-login. The email join key is load-bearing (R6), so:
+login. The canonical-user-ID join key is load-bearing (R6), so:
 
-> **A channel adapter resolves its principal to a corporate email, server-side, at bind
-> time, never self-asserted — and is authoritative for nothing else.**
+> **A channel adapter resolves its principal to a canonical Steward user ID, server-side, at
+> bind time, never self-asserted — and treats verified corporate email only as display/contact
+> metadata.**
 
 No exceptions, and no channel is authoritative for anything beyond that one fact.
 
@@ -723,8 +724,9 @@ restart: reconcile is idempotent and converges. Size: **M**.
 
 ### S1 — Identity spine
 **Build.** SPIRE deployed; sandbox gets a JWT-SVID. `steward-mint` exchanges SVID → HOP-1
-carrying the acting user's email and an explicit acting-as marker. `mcp-gw` resolves the
-user's provider credential by email and executes one tool call.
+with the acting canonical user ID as `sub`, workload SPIFFE ID as `azp`, verified email as
+secondary metadata, and an explicit acting-as marker. `mcp-gw` resolves the user's provider
+credential by canonical user ID and executes one tool call.
 
 **Proves.** A tool call executes with **the user's** provider token, by a process that
 never held it.
@@ -806,7 +808,7 @@ The reserved `bindings` field remains schema-only (§5).
 
 Tier 0 is default-deny egress: the sandbox cannot open a connection to Slack or to a
 browser. So an interactive stream must traverse a **Tier-1 stream relay** — a fan-out
-with a per-subscriber entitlement check, resolved on the email join key. It is a Tier 1
+with a per-subscriber entitlement check, resolved on the canonical-user-ID join key. It is a Tier 1
 block by the membership test: state no single sandbox can see, authorization per acting
 user.
 

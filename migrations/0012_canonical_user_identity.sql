@@ -50,12 +50,20 @@ ALTER TABLE task_submissions
         CHECK (
             (identity_binding_state = 'bound'
                 AND owner_user_id IS NOT NULL
+                AND runtime_spec #>> '{canonicalAuthority,schemaVersion}' =
+                    'steward/canonical-authority-binding/v1'
+                AND runtime_spec #>> '{canonicalAuthority,ownerUserId}' = owner_user_id
                 AND ((acting_user IS NULL AND acting_user_id IS NULL)
-                    OR (acting_user IS NOT NULL AND acting_user_id IS NOT NULL)))
+                    OR (acting_user IS NOT NULL
+                        AND acting_user_id = owner_user_id))
+                AND ((acting_user_id IS NULL
+                        AND runtime_spec #> '{canonicalAuthority,actingUserId}' IS NULL)
+                    OR (runtime_spec #>> '{canonicalAuthority,actingUserId}' = acting_user_id)))
             OR
             (identity_binding_state = 'legacy_reconnect_required'
                 AND acting_user_id IS NULL
-                AND owner_user_id IS NULL)
+                AND owner_user_id IS NULL
+                AND runtime_spec #> '{canonicalAuthority}' IS NULL)
         );
 
 DROP INDEX task_submissions_submitter_idempotency;

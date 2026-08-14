@@ -8,6 +8,7 @@ use sqlx::{PgPool, Row};
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
 use steward_types::{
     AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationIdentity,
+    OrganizationIdentityMigration,
 };
 use uuid::Uuid;
 
@@ -57,10 +58,10 @@ impl PgStore {
                AND canonical_identity_subjects.organization_claim = $3 \
                AND canonical_identity_subjects.organization_id = $4",
         )
-        .bind(&identity.issuer)
-        .bind(&identity.subject)
-        .bind(&identity.organization_claim)
-        .bind(identity.organization_id.as_str())
+        .bind(identity.issuer())
+        .bind(identity.subject())
+        .bind(identity.organization_claim())
+        .bind(identity.organization_id().as_str())
         .fetch_optional(&self.pool)
         .await
         .map_err(database_error)?
@@ -129,8 +130,8 @@ impl PgStore {
             "SELECT user_id FROM canonical_users \
              WHERE organization_id = $1 AND lower(display_email) = lower($2)",
         )
-        .bind(identity.organization_id.as_str())
-        .bind(&identity.verified_email.0)
+        .bind(identity.organization_id().as_str())
+        .bind(identity.verified_email().as_str())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -145,8 +146,8 @@ impl PgStore {
              VALUES ($1, $2, $3)",
         )
         .bind(user_id.as_str())
-        .bind(identity.organization_id.as_str())
-        .bind(&identity.verified_email.0)
+        .bind(identity.organization_id().as_str())
+        .bind(identity.verified_email().as_str())
         .execute(&mut *transaction)
         .await
         .map_err(canonical_identity_database_error)?;
@@ -155,12 +156,12 @@ impl PgStore {
              (issuer, subject, organization_claim, organization_id, user_id, verified_email) \
              VALUES ($1, $2, $3, $4, $5, $6)",
         )
-        .bind(&identity.issuer)
-        .bind(&identity.subject)
-        .bind(&identity.organization_claim)
-        .bind(identity.organization_id.as_str())
+        .bind(identity.issuer())
+        .bind(identity.subject())
+        .bind(identity.organization_claim())
+        .bind(identity.organization_id().as_str())
         .bind(user_id.as_str())
-        .bind(&identity.verified_email.0)
+        .bind(identity.verified_email().as_str())
         .execute(&mut *transaction)
         .await
         .map_err(canonical_identity_database_error)?;
@@ -172,7 +173,7 @@ impl PgStore {
         .bind(Uuid::new_v4())
         .bind(user_id.as_str())
         .bind(actor)
-        .bind(&identity.verified_email.0)
+        .bind(identity.verified_email().as_str())
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -180,8 +181,8 @@ impl PgStore {
 
         CanonicalPrincipal::new(
             user_id,
-            identity.organization_id.clone(),
-            identity.verified_email.clone(),
+            identity.organization_id().clone(),
+            identity.verified_email().clone(),
         )
         .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
     }
@@ -194,9 +195,10 @@ impl PgStore {
     pub async fn attach_canonical_identity_subject(
         &self,
         user_id: &CanonicalUserId,
-        identity: &OrganizationIdentity,
+        migration: &OrganizationIdentityMigration,
         actor: &str,
     ) -> Result<CanonicalPrincipal, StoreError> {
+        let identity = migration.identity();
         if actor.trim().is_empty() {
             return Err(StoreError::CanonicalIdentityInvalidActor);
         }
@@ -215,8 +217,8 @@ impl PgStore {
         if state != "active" {
             return Err(StoreError::CanonicalIdentityInactive);
         }
-        if organization_id != identity.organization_id.as_str()
-            || !display_email.eq_ignore_ascii_case(identity.verified_email.as_str())
+        if organization_id != identity.organization_id().as_str()
+            || !display_email.eq_ignore_ascii_case(identity.verified_email().as_str())
         {
             return Err(StoreError::CanonicalIdentityStale);
         }
@@ -226,10 +228,10 @@ impl PgStore {
              WHERE issuer = $1 AND subject = $2 AND organization_claim = $3 \
                AND organization_id = $4",
         )
-        .bind(&identity.issuer)
-        .bind(&identity.subject)
-        .bind(&identity.organization_claim)
-        .bind(identity.organization_id.as_str())
+        .bind(identity.issuer())
+        .bind(identity.subject())
+        .bind(identity.organization_claim())
+        .bind(identity.organization_id().as_str())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -239,7 +241,7 @@ impl PgStore {
             }
             return CanonicalPrincipal::new(
                 user_id.clone(),
-                identity.organization_id.clone(),
+                identity.organization_id().clone(),
                 Email(display_email),
             )
             .map_err(|_| StoreError::CanonicalIdentityInvalidRecord);
@@ -250,12 +252,12 @@ impl PgStore {
              (issuer, subject, organization_claim, organization_id, user_id, verified_email) \
              VALUES ($1, $2, $3, $4, $5, $6)",
         )
-        .bind(&identity.issuer)
-        .bind(&identity.subject)
-        .bind(&identity.organization_claim)
-        .bind(identity.organization_id.as_str())
+        .bind(identity.issuer())
+        .bind(identity.subject())
+        .bind(identity.organization_claim())
+        .bind(identity.organization_id().as_str())
         .bind(user_id.as_str())
-        .bind(identity.verified_email.as_str())
+        .bind(identity.verified_email().as_str())
         .execute(&mut *transaction)
         .await
         .map_err(canonical_identity_database_error)?;
@@ -273,7 +275,7 @@ impl PgStore {
 
         CanonicalPrincipal::new(
             user_id.clone(),
-            identity.organization_id.clone(),
+            identity.organization_id().clone(),
             Email(display_email),
         )
         .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
@@ -1512,6 +1514,7 @@ impl PgStore {
         &self,
         request: &TaskReservationRequest<'_>,
     ) -> Result<TaskReservation, StoreError> {
+        validate_task_identity_binding(request)?;
         let task_uid = Uuid::new_v4();
         let inserted = sqlx::query(
             "INSERT INTO task_submissions \
@@ -1856,6 +1859,32 @@ pub struct TaskReservationRequest<'a> {
     pub agent_command: &'a [String],
 }
 
+fn validate_task_identity_binding(request: &TaskReservationRequest<'_>) -> Result<(), StoreError> {
+    let owner_user_id = CanonicalUserId::parse(request.owner_user_id)
+        .map_err(|_| StoreError::InvalidTaskIdentityBinding)?;
+    let acting_user_id = request
+        .acting_user_id
+        .map(CanonicalUserId::parse)
+        .transpose()
+        .map_err(|_| StoreError::InvalidTaskIdentityBinding)?;
+    if request.acting_user.is_some() != acting_user_id.is_some()
+        || acting_user_id
+            .as_ref()
+            .is_some_and(|acting_user_id| acting_user_id != &owner_user_id)
+    {
+        return Err(StoreError::InvalidTaskIdentityBinding);
+    }
+    let authority = request
+        .runtime_spec
+        .canonical_authority
+        .as_ref()
+        .ok_or(StoreError::InvalidTaskIdentityBinding)?;
+    if authority.owner_user_id != owner_user_id || authority.acting_user_id != acting_user_id {
+        return Err(StoreError::InvalidTaskIdentityBinding);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaskReservation {
     pub inserted: bool,
@@ -2024,6 +2053,7 @@ pub enum StoreError {
     EnvelopeRevisionNotIncreasing,
     TaskNotFound,
     TaskIdempotencyConflict,
+    InvalidTaskIdentityBinding,
     InvalidTaskTransition,
 }
 
@@ -2102,6 +2132,9 @@ impl fmt::Display for StoreError {
                     "idempotency key is already bound to another task request"
                 )
             }
+            Self::InvalidTaskIdentityBinding => {
+                write!(formatter, "task canonical identity binding is invalid")
+            }
             Self::InvalidTaskTransition => {
                 write!(formatter, "task lifecycle transition is invalid")
             }
@@ -2138,8 +2171,8 @@ fn canonical_principal_from_row(
     }
     let display_email: String = row.try_get("display_email").map_err(database_error)?;
     let verified_email: String = row.try_get("verified_email").map_err(database_error)?;
-    if !display_email.eq_ignore_ascii_case(&identity.verified_email.0)
-        || !verified_email.eq_ignore_ascii_case(&identity.verified_email.0)
+    if !display_email.eq_ignore_ascii_case(identity.verified_email().as_str())
+        || !verified_email.eq_ignore_ascii_case(identity.verified_email().as_str())
     {
         return Err(StoreError::CanonicalIdentityStale);
     }
@@ -2151,7 +2184,7 @@ fn canonical_principal_from_row(
         })?;
     CanonicalPrincipal::new(
         user_id,
-        identity.organization_id.clone(),
+        identity.organization_id().clone(),
         Email(display_email),
     )
     .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)

@@ -1519,7 +1519,8 @@ impl IntoResponse for ApiError {
                 StoreError::InvalidGrantExpiry
                 | StoreError::MissingRevocationReason
                 | StoreError::CanonicalIdentityInvalidActor
-                | StoreError::CanonicalIdentityInvalidRecord,
+                | StoreError::CanonicalIdentityInvalidRecord
+                | StoreError::InvalidTaskIdentityBinding,
             ) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RuntimeCreate(RuntimeCreateError::Unavailable(_))
             | Self::Runtime(_)
