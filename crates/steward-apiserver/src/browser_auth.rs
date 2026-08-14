@@ -340,7 +340,7 @@ impl BrowserAuthService {
                 policy: config.identity_policy()?,
                 secure_cookies: true,
                 session_cookie: "__Host-steward-session",
-                flow_cookie: "__Host-steward-oidc-flow",
+                flow_cookie: "__Secure-steward-oidc-flow",
             },
         })
     }
@@ -1196,6 +1196,30 @@ mod tests {
             !url.contains("secret"),
             "authorization URL must never contain a client secret"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn deployed_cookie_prefixes_match_their_required_paths() -> Result<(), String> {
+        let config = google_config()?;
+        let service = super::BrowserAuthService::google(
+            config.clone(),
+            std::sync::Arc::new(super::GoogleAuthorizationOnlyProvider::new(config)),
+            std::sync::Arc::new(super::LocalFakeIdentityResolver),
+        )?;
+        let flow = PendingAuthorization::new("/admin/connections", 100)
+            .map_err(|error| format!("begin deployed cookie flow: {error:?}"))?;
+        let flow_cookie = super::flow_cookie(&service.config, &flow.flow_id);
+        assert!(flow_cookie.starts_with("__Secure-steward-oidc-flow="));
+        assert!(flow_cookie.contains("; Path=/admin/auth;"));
+        assert!(flow_cookie.contains("; Secure"));
+        assert!(flow_cookie.contains("; HttpOnly;"));
+
+        let session_cookie = super::session_cookie(&service.config, "opaque-session");
+        assert!(session_cookie.starts_with("__Host-steward-session="));
+        assert!(session_cookie.contains("; Path=/;"));
+        assert!(session_cookie.contains("; Secure"));
+        assert!(session_cookie.contains("; HttpOnly;"));
         Ok(())
     }
 

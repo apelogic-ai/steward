@@ -38,10 +38,11 @@ path.
 
 The cookie contains only an unguessable opaque server-side lookup value. Identity, role, provider
 claims, CSRF proof, OAuth codes, and tokens are not stored in the cookie, browser storage, or URL.
-Deployed cookies use the `__Host-` prefix, `Secure`, `HttpOnly`, `Path=/`, `SameSite=Lax`, a one-hour
-TTL, and server-side revocation. The OAuth flow cookie is separate, path-limited to `/admin/auth`,
-and expires after five minutes. Local HTTP uses clearly local non-`Secure` cookie names because a
-browser will not return a `Secure` cookie over loopback HTTP.
+The deployed session cookie uses the `__Host-` prefix, `Secure`, `HttpOnly`, `Path=/`,
+`SameSite=Lax`, a one-hour TTL, and server-side revocation. The OAuth flow cookie is separate, uses
+the `__Secure-` prefix so it can remain path-limited to `/admin/auth`, and expires after five
+minutes. Local HTTP uses clearly local non-`Secure` cookie names because a browser will not return a
+`Secure` cookie over loopback HTTP.
 
 Every authenticated browser mutation requires all of:
 
