@@ -166,6 +166,7 @@ pub trait BrowserOidcProvider: Send + Sync + 'static {
         code: &'a str,
         pkce_verifier: &'a str,
         callback_uri: &'a str,
+        expected_nonce: &'a str,
     ) -> BrowserFuture<'a, Result<VerifiedOrganizationClaims, BrowserAuthFailure>>;
 
     fn local_authorize<'a>(
@@ -190,6 +191,7 @@ impl BrowserOidcProvider for GoogleAuthorizationOnlyProvider {
         _code: &'a str,
         _pkce_verifier: &'a str,
         _callback_uri: &'a str,
+        _expected_nonce: &'a str,
     ) -> BrowserFuture<'a, Result<VerifiedOrganizationClaims, BrowserAuthFailure>> {
         // Deliberately fail closed until a reviewed OIDC/JWKS verifier is wired. Redirecting to
         // Google without verifying its signed ID token would be worse than having no login.
@@ -421,16 +423,22 @@ impl BrowserOidcProvider for LocalFakeOidcProvider {
         code: &'a str,
         pkce_verifier: &'a str,
         callback_uri: &'a str,
+        expected_nonce: &'a str,
     ) -> BrowserFuture<'a, Result<VerifiedOrganizationClaims, BrowserAuthFailure>> {
         Box::pin(async move {
             if pkce_verifier.is_empty() || !callback_uri.ends_with(CALLBACK_PATH) {
                 return Err(BrowserAuthFailure::InvalidRequest);
             }
-            self.codes
+            let claims = self
+                .codes
                 .lock()
                 .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?
                 .remove(code)
-                .ok_or(BrowserAuthFailure::InvalidIdentity)
+                .ok_or(BrowserAuthFailure::InvalidIdentity)?;
+            if !secret_eq(&claims.nonce, expected_nonce) {
+                return Err(BrowserAuthFailure::InvalidIdentity);
+            }
+            Ok(claims)
         })
     }
 
@@ -608,13 +616,14 @@ async fn callback(
             &query.code,
             &flow.pkce_verifier,
             &service.config.callback_uri,
+            &flow.nonce,
         )
         .await
     {
         Ok(claims) => claims,
         Err(error) => return error.into_response(),
     };
-    if claims.nonce != flow.nonce {
+    if !secret_eq(&claims.nonce, &flow.nonce) {
         return BrowserAuthFailure::InvalidIdentity.into_response();
     }
     let identity = match service.config.policy.validate(
@@ -998,7 +1007,7 @@ impl BrowserSessionRegistry {
         if flow.expires_at <= now {
             return Err(BrowserAuthError::ExpiredFlow);
         }
-        if flow.state != state {
+        if !secret_eq(&flow.state, state) {
             return Err(BrowserAuthError::InvalidFlow);
         }
         Ok(flow)
@@ -1056,6 +1065,17 @@ fn random_secret() -> String {
     format!("{first}{second}")
 }
 
+fn secret_eq(left: &str, right: &str) -> bool {
+    let left = Sha256::digest(left.as_bytes());
+    let right = Sha256::digest(right.as_bytes());
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
 fn base64_url(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -1099,10 +1119,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        BrowserAuthError, BrowserMutationProof, BrowserPrincipal, BrowserRole,
-        BrowserSessionContext, BrowserSessionRegistry, GoogleOidcConfig, LocalFakeIdentity,
-        PendingAuthorization, browser_auth_router, local_fake_browser_auth_service,
-        protect_browser_routes,
+        BrowserAuthError, BrowserAuthFailure, BrowserMutationProof, BrowserOidcProvider,
+        BrowserPrincipal, BrowserRole, BrowserSessionContext, BrowserSessionRegistry,
+        GoogleOidcConfig, LocalFakeIdentity, LocalFakeOidcProvider, PendingAuthorization,
+        browser_auth_router, local_fake_browser_auth_service, protect_browser_routes,
     };
 
     fn google_config() -> Result<GoogleOidcConfig, String> {
@@ -1356,6 +1376,33 @@ mod tests {
             .ok_or_else(|| "fake authorization omitted callback redirect".to_owned())?
             .to_owned();
         Ok((service, flow_cookie, callback))
+    }
+
+    #[tokio::test]
+    async fn provider_exchange_rejects_a_code_bound_to_another_nonce() -> Result<(), String> {
+        let provider = LocalFakeOidcProvider::new(LocalFakeIdentity::User);
+        let callback = provider
+            .local_authorize("state", "expected-nonce")
+            .await
+            .map_err(|error| format!("authorize fake identity: {error:?}"))?;
+        let code = callback
+            .split("code=")
+            .nth(1)
+            .and_then(|value| value.split('&').next())
+            .ok_or_else(|| "fake authorization omitted code".to_owned())?;
+
+        assert!(matches!(
+            provider
+                .exchange_code(
+                    code,
+                    "pkce-verifier",
+                    "http://127.0.0.1:33001/admin/auth/callback",
+                    "different-nonce",
+                )
+                .await,
+            Err(BrowserAuthFailure::InvalidIdentity)
+        ));
+        Ok(())
     }
 
     #[tokio::test]
