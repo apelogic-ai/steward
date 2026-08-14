@@ -167,9 +167,11 @@ access** — for a month, unattended. That deserves to be modeled deliberately.
   short-lived identity the agent can no longer obtain. A "stopped" agent must not
   still hold live access.
 
-The verified HOP-1 subject is the credential join key. It is a user's email for user
-and delegated-service work, and `service:<name>` for a pure service. Those namespaces
-are deliberately distinct so a service cannot resolve a user's provider credential.
+The verified HOP-1 subject is the credential join key. It is Steward's opaque canonical user ID
+for user and delegated-service work, and `service:<name>` for a pure service. Verified email is
+secondary display/contact metadata and never a credential key. The workload SPIFFE identity
+remains `azp`. These subject namespaces are deliberately distinct so a service cannot resolve a
+user's provider credential.
 
 ## 6. Governance, evidence, and audit
 

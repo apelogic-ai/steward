@@ -277,7 +277,7 @@ critical path of what the workflow charter is betting on.
 **A real gap in Steward, not a wrinkle in the plan.**
 
 Steward's model is that an `AgentRuntime` is a standing delegation of *a person's* access,
-attenuated — never a superset. The email join key, the identity mint, `mcp-gw`'s per-user
+attenuated — never a superset. The canonical-user-ID join key, the identity mint, `mcp-gw`'s per-user
 token resolution, and the teams model all rest on a non-null acting user.
 
 Several of the plan's workflows have no such person:

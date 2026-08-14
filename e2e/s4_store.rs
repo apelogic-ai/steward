@@ -8,9 +8,43 @@ use sqlx::postgres::PgPoolOptions;
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
 use steward_store::{ApproveAdmission, ParkRejection, PgStore, StoreError, TaskReservationRequest};
 use steward_types::{
-    AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal, RuntimeOwnership,
-    TaskPhase,
+    AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding, Duration, Email, ModelRef,
+    OrganizationId, OrganizationIdentity, OrganizationIdentityMigration,
+    OrganizationIdentityPolicy, Principal, RuntimeOwnership, TaskPhase,
 };
+
+fn google_identity(
+    subject: impl AsRef<str>,
+    email: impl AsRef<str>,
+) -> Result<OrganizationIdentity, Box<dyn Error>> {
+    google_identity_for(
+        "example.com",
+        OrganizationId::parse("org_example")?,
+        subject,
+        email,
+    )
+}
+
+fn google_identity_for(
+    hosted_domain: impl AsRef<str>,
+    organization_id: OrganizationId,
+    subject: impl AsRef<str>,
+    email: impl AsRef<str>,
+) -> Result<OrganizationIdentity, Box<dyn Error>> {
+    let hosted_domain = hosted_domain.as_ref();
+    Ok(OrganizationIdentityPolicy::new(
+        "https://accounts.google.com",
+        hosted_domain,
+        organization_id,
+    )?
+    .validate(
+        "https://accounts.google.com",
+        subject.as_ref(),
+        hosted_domain,
+        email.as_ref(),
+        true,
+    )?)
+}
 
 fn proposed_spec() -> AgentRuntimeSpec {
     AgentRuntimeSpec {
@@ -18,6 +52,7 @@ fn proposed_spec() -> AgentRuntimeSpec {
             acting_user: Email("alice@example.com".to_owned()),
         },
         owner: Email("alice@example.com".to_owned()),
+        canonical_authority: None,
         agent_type: AgentType {
             name: "base".to_owned(),
         },
@@ -33,6 +68,431 @@ fn proposed_spec() -> AgentRuntimeSpec {
         ttl: Duration("24h".to_owned()),
         bindings: None,
     }
+}
+
+#[tokio::test]
+async fn canonical_identity_requires_exact_subject_mapping_and_explicit_reconnect()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the identity Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let organization = OrganizationId::parse("org_example")?;
+    let email = Email::parse(format!("identity-{suffix}@example.com"))?;
+    let google = google_identity(format!("google-subject-{suffix}"), email.as_str())?;
+
+    let principal = store
+        .register_canonical_identity(&google, "identity-admin")
+        .await?;
+    assert_eq!(
+        store.resolve_canonical_identity(&google).await?,
+        principal,
+        "an exact reviewed Google issuer/subject/hosted-domain mapping must resolve"
+    );
+    assert_eq!(
+        store
+            .resolve_canonical_principal(&principal.user_id, &email)
+            .await?,
+        principal,
+        "a trusted workload reference must resolve by opaque ID plus current display email"
+    );
+    assert_eq!(
+        store
+            .register_canonical_identity(&google, "identity-admin")
+            .await?,
+        principal,
+        "exact repeat registration must be idempotent"
+    );
+
+    let changed_subject =
+        google_identity(format!("different-google-subject-{suffix}"), email.as_str())?;
+    assert_eq!(
+        store
+            .register_canonical_identity(&changed_subject, "identity-admin")
+            .await,
+        Err(StoreError::CanonicalIdentityAmbiguousEmail),
+        "an email match must never silently adopt a different subject"
+    );
+
+    let renamed_email = Email::parse(format!("identity-renamed-{suffix}@example.com"))?;
+    let renamed_google = google_identity(google.subject(), renamed_email.as_str())?;
+    assert_eq!(
+        store.resolve_canonical_identity(&renamed_google).await,
+        Err(StoreError::CanonicalIdentityStale),
+        "a changed email requires an explicit audited reconnect"
+    );
+    assert_eq!(
+        store
+            .resolve_canonical_principal(&principal.user_id, &renamed_email)
+            .await,
+        Err(StoreError::CanonicalIdentityStale),
+        "a workload mapper cannot pair an existing user ID with an unreviewed email"
+    );
+    store
+        .change_canonical_identity_email(
+            &principal.user_id,
+            &email,
+            &renamed_email,
+            "identity-admin",
+        )
+        .await?;
+    assert_eq!(
+        store
+            .resolve_canonical_identity(&renamed_google)
+            .await?
+            .user_id,
+        principal.user_id
+    );
+    assert_eq!(
+        store
+            .resolve_canonical_principal(&principal.user_id, &renamed_email)
+            .await?
+            .user_id,
+        principal.user_id
+    );
+
+    let future_issuer = OrganizationIdentityMigration::new_reviewed(
+        "https://login.example.test",
+        format!("future-subject-{suffix}"),
+        "example.com",
+        organization,
+        renamed_email,
+    )?;
+    let migrated = store
+        .attach_canonical_identity_subject(&principal.user_id, &future_issuer, "identity-admin")
+        .await?;
+    assert_eq!(migrated.user_id, principal.user_id);
+    assert_eq!(
+        store
+            .attach_canonical_identity_subject(
+                &principal.user_id,
+                &future_issuer,
+                "identity-admin",
+            )
+            .await?,
+        migrated,
+        "retrying an exact attachment to the same canonical user must be idempotent"
+    );
+    assert_eq!(
+        store
+            .resolve_migrated_canonical_identity(&future_issuer)
+            .await?
+            .user_id,
+        principal.user_id,
+        "an explicitly reviewed issuer migration must preserve the opaque user ID"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_external_subject_is_globally_unique_across_google_organizations()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the identity Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let shared_subject = format!("google-shared-subject-{suffix}");
+    let first = google_identity_for(
+        "example.com",
+        OrganizationId::parse("org_example")?,
+        &shared_subject,
+        format!("first-{suffix}@example.com"),
+    )?;
+    let other_organization = google_identity_for(
+        "other.example",
+        OrganizationId::parse("org_other")?,
+        &shared_subject,
+        format!("second-{suffix}@other.example"),
+    )?;
+
+    let first_principal = store
+        .register_canonical_identity(&first, "identity-admin")
+        .await?;
+    assert_eq!(
+        store
+            .register_canonical_identity(&other_organization, "identity-admin")
+            .await,
+        Err(StoreError::CanonicalIdentityConflict),
+        "one Google (issuer, subject) pair must not identify people in two organizations"
+    );
+    assert_eq!(
+        store.resolve_canonical_identity(&first).await?,
+        first_principal
+    );
+    assert_eq!(
+        store.resolve_canonical_identity(&other_organization).await,
+        Err(StoreError::CanonicalIdentityNotFound)
+    );
+    let pair_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM canonical_identity_subjects WHERE issuer = $1 AND subject = $2",
+    )
+    .bind(first.issuer())
+    .bind(first.subject())
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        pair_count, 1,
+        "the external pair must have exactly one owner"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_external_subject_cannot_be_attached_to_another_user()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the identity Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let shared_subject = format!("migrated-attach-subject-{suffix}");
+    let first = google_identity_for(
+        "example.com",
+        OrganizationId::parse("org_example")?,
+        format!("google-first-subject-{suffix}"),
+        format!("first-attach-{suffix}@example.com"),
+    )?;
+    let second = google_identity_for(
+        "other.example",
+        OrganizationId::parse("org_other")?,
+        format!("google-second-subject-{suffix}"),
+        format!("second-attach-{suffix}@other.example"),
+    )?;
+    let first_principal = store
+        .register_canonical_identity(&first, "identity-admin")
+        .await?;
+    let first_attachment = OrganizationIdentityMigration::new_reviewed(
+        "https://login.example.test",
+        &shared_subject,
+        "example.com",
+        OrganizationId::parse("org_example")?,
+        Email::parse(format!("first-attach-{suffix}@example.com"))?,
+    )?;
+    store
+        .attach_canonical_identity_subject(
+            &first_principal.user_id,
+            &first_attachment,
+            "identity-admin",
+        )
+        .await?;
+    let second_principal = store
+        .register_canonical_identity(&second, "identity-admin")
+        .await?;
+    let conflicting_attachment = OrganizationIdentityMigration::new_reviewed(
+        "https://login.example.test",
+        &shared_subject,
+        "other.example",
+        OrganizationId::parse("org_other")?,
+        Email::parse(format!("second-attach-{suffix}@other.example"))?,
+    )?;
+
+    assert_eq!(
+        store
+            .attach_canonical_identity_subject(
+                &second_principal.user_id,
+                &conflicting_attachment,
+                "identity-admin",
+            )
+            .await,
+        Err(StoreError::CanonicalIdentityConflict),
+        "an attachment must not move an external pair to another canonical user"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_exact_registration_converges_on_one_canonical_user()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the identity Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let identity = google_identity(
+        format!("google-concurrent-subject-{suffix}"),
+        format!("concurrent-{suffix}@example.com"),
+    )?;
+
+    let left_store = store.clone();
+    let right_store = store.clone();
+    let (left, right) = tokio::join!(
+        left_store.register_canonical_identity(&identity, "identity-admin-left"),
+        right_store.register_canonical_identity(&identity, "identity-admin-right"),
+    );
+    let left = left?;
+    let right = right?;
+    assert_eq!(
+        left, right,
+        "concurrent exact registrations must resolve to one canonical user"
+    );
+    let pair_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM canonical_identity_subjects WHERE issuer = $1 AND subject = $2",
+    )
+    .bind(identity.issuer())
+    .bind(identity.subject())
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(pair_count, 1, "the external pair must be persisted once");
+    Ok(())
+}
+
+#[tokio::test]
+async fn alternative_issuer_migration_cannot_allocate_a_canonical_user()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the identity Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let migration = OrganizationIdentityMigration::new_reviewed(
+        "https://login.example.test",
+        format!("migration-only-subject-{suffix}"),
+        "example.com",
+        OrganizationId::parse("org_example")?,
+        Email::parse(format!("migration-only-{suffix}@example.com"))?,
+    )?;
+    let missing_user =
+        steward_types::CanonicalUserId::parse("usr_00000000000000000000000000000000")?;
+    let users_before = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM canonical_users")
+        .fetch_one(store.pool())
+        .await?;
+
+    assert_eq!(
+        store
+            .attach_canonical_identity_subject(&missing_user, &migration, "identity-admin")
+            .await,
+        Err(StoreError::CanonicalIdentityNotFound),
+        "a migration can attach only to an existing canonical user"
+    );
+    let users_after = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM canonical_users")
+        .fetch_one(store.pool())
+        .await?;
+    assert_eq!(
+        users_after, users_before,
+        "migration must not allocate a user"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_subject_row_rejects_and_detects_wrong_user_organization()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the identity Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let owner_identity = google_identity(
+        format!("organization-owner-subject-{suffix}"),
+        format!("organization-owner-{suffix}@example.com"),
+    )?;
+    let owner = store
+        .register_canonical_identity(&owner_identity, "identity-admin")
+        .await?;
+    let wrong_organization_identity = google_identity_for(
+        "other.example",
+        OrganizationId::parse("org_other")?,
+        format!("wrong-organization-subject-{suffix}"),
+        format!("wrong-organization-{suffix}@other.example"),
+    )?;
+    let insert_wrong_organization = sqlx::query(
+        "INSERT INTO canonical_identity_subjects \
+         (issuer, subject, organization_claim, organization_id, user_id, verified_email) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(wrong_organization_identity.issuer())
+    .bind(wrong_organization_identity.subject())
+    .bind(wrong_organization_identity.organization_claim())
+    .bind(wrong_organization_identity.organization_id().as_str())
+    .bind(owner.user_id.as_str())
+    .bind(wrong_organization_identity.verified_email().as_str())
+    .execute(store.pool())
+    .await;
+    assert!(
+        insert_wrong_organization.is_err(),
+        "the database must reject a subject row whose organization differs from its user"
+    );
+
+    // Exercise the resolver defense independently of the FK by simulating a pre-constraint
+    // corrupt row. This is test-only superuser state and is restored before the connection is
+    // returned to the pool.
+    let mut corrupt_row = store.pool().begin().await?;
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *corrupt_row)
+        .await?;
+    sqlx::query(
+        "INSERT INTO canonical_identity_subjects \
+         (issuer, subject, organization_claim, organization_id, user_id, verified_email) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(wrong_organization_identity.issuer())
+    .bind(wrong_organization_identity.subject())
+    .bind(wrong_organization_identity.organization_claim())
+    .bind(wrong_organization_identity.organization_id().as_str())
+    .bind(owner.user_id.as_str())
+    .bind(wrong_organization_identity.verified_email().as_str())
+    .execute(&mut *corrupt_row)
+    .await?;
+    corrupt_row.commit().await?;
+
+    assert_eq!(
+        store
+            .resolve_canonical_identity(&wrong_organization_identity)
+            .await,
+        Err(StoreError::CanonicalIdentityInvalidRecord),
+        "resolution must fail closed even if a corrupt row bypassed the schema constraint"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -54,13 +514,56 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
     let idempotency_key = format!("job-{suffix}");
     let runtime_name = format!("task-{suffix}");
     let runtime_uid = format!("runtime-{suffix}");
-    let spec = proposed_spec();
+    let canonical = store
+        .register_canonical_identity(
+            &google_identity(
+                format!("google-subject-{suffix}"),
+                format!("alice-{suffix}@example.com"),
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let mut spec = proposed_spec();
+    spec.canonical_authority = Some(CanonicalAuthorityBinding::new(
+        canonical.user_id.clone(),
+        Some(canonical.user_id.clone()),
+    )?);
     let command = vec!["agent-v1".to_owned()];
+    let legacy = sqlx::query(
+        "INSERT INTO task_submissions \
+         (task_uid, idempotency_key, submitter_service, acting_user, owner, workflow, \
+          coding_agent_runtime, runtime_namespace, runtime_name, runtime_ownership, phase, \
+          runtime_spec, agent_command) \
+         VALUES (gen_random_uuid(), $1, 'legacy-service', 'legacy@example.com', \
+                 'legacy@example.com', 'legacy-workflow', 'legacy-runtime', 'legacy', $2, \
+                 'provisioned', 'submitted', '{}'::jsonb, '[]'::jsonb) \
+         RETURNING identity_binding_state, acting_user_id, owner_user_id, runtime_spec",
+    )
+    .bind(format!("legacy-{suffix}"))
+    .bind(format!("legacy-{suffix}"))
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        legacy.try_get::<String, _>("identity_binding_state")?,
+        "legacy_reconnect_required"
+    );
+    assert_eq!(legacy.try_get::<Option<String>, _>("acting_user_id")?, None);
+    assert_eq!(legacy.try_get::<Option<String>, _>("owner_user_id")?, None);
+    assert_eq!(
+        legacy
+            .try_get::<serde_json::Value, _>("runtime_spec")?
+            .get("canonicalAuthority"),
+        None,
+        "legacy rows must remain explicitly unbound instead of adopting an email-derived ID"
+    );
+
     let request = TaskReservationRequest {
         idempotency_key: &idempotency_key,
         submitter_service: "steward-run",
         acting_user: Some("alice@example.com"),
+        acting_user_id: Some(canonical.user_id.as_str()),
         owner: "alice@example.com",
+        owner_user_id: canonical.user_id.as_str(),
         workflow: "code-review",
         coding_agent_runtime: "agent-v1",
         runtime_namespace: "team-a",
@@ -71,9 +574,134 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
     };
     let first = store.reserve_task(&request).await?;
     assert!(first.inserted);
+    assert_eq!(
+        first.record.runtime_spec.canonical_authority, spec.canonical_authority,
+        "the stable authority binding must survive Task persistence"
+    );
     let second = store.reserve_task(&request).await?;
     assert!(!second.inserted);
     assert_eq!(second.record.task_uid, first.record.task_uid);
+
+    let other = store
+        .register_canonical_identity(
+            &google_identity(
+                format!("google-other-subject-{suffix}"),
+                format!("bob-{suffix}@example.com"),
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let mut other_spec = proposed_spec();
+    other_spec.canonical_authority = Some(CanonicalAuthorityBinding::new(
+        other.user_id.clone(),
+        Some(other.user_id.clone()),
+    )?);
+    let other_runtime_name = format!("task-other-{suffix}");
+    let other_request = TaskReservationRequest {
+        acting_user_id: Some(other.user_id.as_str()),
+        owner_user_id: other.user_id.as_str(),
+        runtime_name: &other_runtime_name,
+        runtime_spec: &other_spec,
+        ..request
+    };
+    let other_task = store.reserve_task(&other_request).await?;
+    assert!(other_task.inserted);
+    assert_ne!(other_task.record.task_uid, first.record.task_uid);
+    assert_ne!(other_task.record.runtime_name, first.record.runtime_name);
+    let other_retry = store.reserve_task(&other_request).await?;
+    assert!(!other_retry.inserted);
+    assert_eq!(other_retry.record.task_uid, other_task.record.task_uid);
+
+    let injected_runtime_name = format!("task-injected-{suffix}");
+    let injected_same_owner = TaskReservationRequest {
+        runtime_name: &injected_runtime_name,
+        ..request
+    };
+    assert_eq!(
+        store.reserve_task(&injected_same_owner).await,
+        Err(StoreError::TaskIdempotencyConflict),
+        "a retry cannot adopt an injected or legacy runtime name outside its durable reservation"
+    );
+    assert!(
+        store
+            .task_for_submitter(first.record.task_uid, "steward-run", other.user_id.as_str(),)
+            .await?
+            .is_none(),
+        "a different canonical owner must not observe the first owner's Task"
+    );
+    assert_eq!(
+        store
+            .request_task_finalization(
+                first.record.task_uid,
+                "steward-run",
+                other.user_id.as_str(),
+            )
+            .await,
+        Err(StoreError::TaskNotFound),
+        "a different canonical owner must not delete the first owner's runtime through Task finalization"
+    );
+
+    let legacy_key = format!("legacy-{suffix}");
+    let rebound_runtime_name = format!("task-reconnected-{suffix}");
+    let legacy_reconnect = TaskReservationRequest {
+        idempotency_key: &legacy_key,
+        submitter_service: "legacy-service",
+        runtime_name: &rebound_runtime_name,
+        ..request
+    };
+    let reconnected = store.reserve_task(&legacy_reconnect).await?;
+    assert!(reconnected.inserted);
+    assert_eq!(reconnected.record.runtime_name, rebound_runtime_name);
+    assert_ne!(
+        reconnected.record.identity_binding_state, "legacy_reconnect_required",
+        "a canonical reconnect creates a new bound row instead of adopting the legacy row"
+    );
+
+    let mismatched_columns_key = format!("mismatched-columns-{suffix}");
+    let mismatched_columns = TaskReservationRequest {
+        idempotency_key: &mismatched_columns_key,
+        acting_user_id: Some(other.user_id.as_str()),
+        ..request
+    };
+    assert_eq!(
+        store.reserve_task(&mismatched_columns).await,
+        Err(StoreError::InvalidTaskIdentityBinding),
+        "delegated v1 reservations must reject acting_user_id != owner_user_id"
+    );
+
+    let mismatched_runtime_key = format!("mismatched-runtime-{suffix}");
+    let mismatched_runtime_authority = TaskReservationRequest {
+        idempotency_key: &mismatched_runtime_key,
+        owner_user_id: other.user_id.as_str(),
+        acting_user_id: Some(other.user_id.as_str()),
+        ..request
+    };
+    assert_eq!(
+        store.reserve_task(&mismatched_runtime_authority).await,
+        Err(StoreError::InvalidTaskIdentityBinding),
+        "Task columns must match the server-authored runtime canonical authority"
+    );
+
+    let direct_mismatch = sqlx::query(
+        "INSERT INTO task_submissions \
+         (task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, owner, \
+          owner_user_id, identity_binding_state, workflow, coding_agent_runtime, \
+          runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, agent_command) \
+         VALUES (gen_random_uuid(), $1, 'steward-run', 'alice@example.com', $2, \
+                 'alice@example.com', $3, 'bound', 'code-review', 'agent-v1', 'team-a', $4, \
+                 'provisioned', 'submitted', $5, '[]'::jsonb)",
+    )
+    .bind(format!("direct-mismatch-{suffix}"))
+    .bind(other.user_id.as_str())
+    .bind(canonical.user_id.as_str())
+    .bind(format!("direct-mismatch-{suffix}"))
+    .bind(sqlx::types::Json(&spec))
+    .execute(store.pool())
+    .await;
+    assert!(
+        direct_mismatch.is_err(),
+        "the database must reject delegated acting_user_id != owner_user_id"
+    );
 
     store
         .bind_task_runtime(first.record.task_uid, &runtime_uid, TaskPhase::Submitted)
@@ -83,7 +711,7 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         .put_task_inputs(
             first.record.task_uid,
             "steward-run",
-            Some("alice@example.com"),
+            canonical.user_id.as_str(),
             archive,
         )
         .await?;
@@ -91,7 +719,7 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         .request_task_execution(
             first.record.task_uid,
             "steward-run",
-            Some("alice@example.com"),
+            canonical.user_id.as_str(),
         )
         .await?;
     assert!(store.claim_task_execution(first.record.task_uid).await?);
@@ -115,7 +743,7 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         .request_task_finalization(
             first.record.task_uid,
             "steward-run",
-            Some("alice@example.com"),
+            canonical.user_id.as_str(),
         )
         .await?;
     store.mark_task_finalized(first.record.task_uid).await?;
@@ -669,6 +1297,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
             acting_user: Email("alice@example.com".to_owned()),
         },
         owner: Email("alice@example.com".to_owned()),
+        canonical_authority: None,
         agent_type: AgentType {
             name: "base".to_owned(),
         },

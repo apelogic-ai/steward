@@ -87,11 +87,14 @@ fn task_runtime_action(
     runtime: Option<&AgentRuntime>,
 ) -> TaskRuntimeAction {
     if finalize_requested {
-        return match (ownership, runtime.is_some()) {
-            (RuntimeOwnership::Adopted, _) | (RuntimeOwnership::Provisioned, false) => {
+        return match (ownership, runtime) {
+            (RuntimeOwnership::Adopted, _) | (RuntimeOwnership::Provisioned, None) => {
                 TaskRuntimeAction::MarkFinalized
             }
-            (RuntimeOwnership::Provisioned, true) => TaskRuntimeAction::DeleteRuntime,
+            (RuntimeOwnership::Provisioned, Some(runtime)) if runtime.spec == *runtime_spec => {
+                TaskRuntimeAction::DeleteRuntime
+            }
+            (RuntimeOwnership::Provisioned, Some(_)) => TaskRuntimeAction::Wait,
         };
     }
     let Some(runtime) = runtime else {
@@ -1884,6 +1887,21 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
     let Some(username) = request.user_info.username.as_deref() else {
         return response.deny("authenticated Kubernetes username is required");
     };
+    if request.operation == Operation::Create
+        && runtime.spec.canonical_authority.is_some()
+        && !trusted_writer_usernames.contains(username)
+    {
+        return response
+            .deny("canonical runtime authority may be set only by a trusted Steward writer");
+    }
+    if request.operation == Operation::Update {
+        let Some(old_runtime) = request.old_object.as_ref() else {
+            return response.deny("AgentRuntime UPDATE admission request has no old object");
+        };
+        if old_runtime.spec.canonical_authority != runtime.spec.canonical_authority {
+            return response.deny("canonical runtime authority is immutable");
+        }
+    }
     let trusted_service_write = matches!(
         &runtime.spec.principal,
         steward_types::Principal::Service { .. }
@@ -2277,9 +2295,9 @@ mod tests {
     };
     use steward_store::GrantReversion;
     use steward_types::{
-        AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget, Duration, Email,
-        ModelRef, PENDING_APPROVAL_ANNOTATION, Phase, Principal, RuntimeOwnership, RuntimeRefs,
-        TaskPhase,
+        AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
+        CanonicalAuthorityBinding, CanonicalUserId, Duration, Email, ModelRef,
+        PENDING_APPROVAL_ANNOTATION, Phase, Principal, RuntimeOwnership, RuntimeRefs, TaskPhase,
     };
     use tower::service_fn;
 
@@ -2293,7 +2311,8 @@ mod tests {
     };
 
     #[test]
-    fn task_state_table_releases_holds_executes_running_runtimes_and_preserves_ownership() {
+    fn task_state_table_releases_holds_executes_running_runtimes_and_preserves_ownership()
+    -> Result<(), String> {
         let mut runtime = fixture();
         runtime.status = Some(AgentRuntimeStatus {
             phase: Phase::Running,
@@ -2368,6 +2387,42 @@ mod tests {
             ),
             TaskRuntimeAction::MarkFinalized
         );
+
+        let mut other_owner_spec = runtime.spec.clone();
+        other_owner_spec.canonical_authority = Some(
+            CanonicalAuthorityBinding::new(
+                CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
+                    .map_err(|error| error.to_string())?,
+                Some(
+                    CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
+                        .map_err(|error| error.to_string())?,
+                ),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        runtime.spec.canonical_authority = Some(
+            CanonicalAuthorityBinding::new(
+                CanonicalUserId::parse("usr_abcdef0123456789abcdef0123456789")
+                    .map_err(|error| error.to_string())?,
+                Some(
+                    CanonicalUserId::parse("usr_abcdef0123456789abcdef0123456789")
+                        .map_err(|error| error.to_string())?,
+                ),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        assert_eq!(
+            task_runtime_action(
+                TaskPhase::Cancelled,
+                RuntimeOwnership::Provisioned,
+                true,
+                &other_owner_spec,
+                Some(&runtime),
+            ),
+            TaskRuntimeAction::Wait,
+            "a corrupted task record must never delete another canonical owner's runtime"
+        );
+        Ok(())
     }
 
     #[test]
@@ -3207,6 +3262,7 @@ mod tests {
                     acting_user: Email("alice@example.com".to_owned()),
                 },
                 owner: Email("alice@example.com".to_owned()),
+                canonical_authority: None,
                 agent_type: AgentType {
                     name: "base".to_owned(),
                 },
@@ -4043,6 +4099,10 @@ mod webhook_tests {
             "name": "scheduled-scanner"
         });
         value["request"]["object"]["spec"]["owner"] = serde_json::json!("alice@example.com");
+        value["request"]["object"]["spec"]["canonicalAuthority"] = serde_json::json!({
+            "schemaVersion": "steward/canonical-authority-binding/v1",
+            "ownerUserId": "usr_0123456789abcdef0123456789abcdef"
+        });
         value["request"]["object"]["metadata"]["annotations"] = serde_json::json!({
             "agents.apelogic.ai/service-principal": "scheduled-scanner"
         });
@@ -4056,7 +4116,11 @@ mod webhook_tests {
         let ordinary = validate_admission(&ordinary_request, &fake_envelopes()).await;
         assert!(
             !ordinary.allowed,
-            "an ordinary user must not self-assert a service principal"
+            "an ordinary user must not self-assert canonical runtime authority"
+        );
+        assert_eq!(
+            ordinary.result.message,
+            "canonical runtime authority may be set only by a trusted Steward writer"
         );
 
         value["request"]["userInfo"] = serde_json::json!({"username": controller_username});
@@ -4075,6 +4139,41 @@ mod webhook_tests {
             trusted.allowed,
             "the trusted Steward writer must admit a service runtime through its service envelope: {}",
             trusted.result.message
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_canonical_authority_mutation_even_by_a_trusted_writer()
+    -> Result<(), String> {
+        let controller_username = "system:serviceaccount:steward-system:steward-controller";
+        let mut value = admission_review_value();
+        value["request"]["userInfo"] = serde_json::json!({"username": controller_username});
+        value["request"]["object"]["spec"]["canonicalAuthority"] = serde_json::json!({
+            "schemaVersion": "steward/canonical-authority-binding/v1",
+            "ownerUserId": "usr_0123456789abcdef0123456789abcdef",
+            "actingUserId": "usr_0123456789abcdef0123456789abcdef"
+        });
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct authority mutation review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read authority mutation request: {error}"))?;
+
+        let response = super::validate_admission_with_trusted_writers(
+            &request,
+            &fake_envelopes(),
+            &BTreeSet::from([controller_username.to_owned()]),
+        )
+        .await;
+
+        assert!(
+            !response.allowed,
+            "canonical authority mutation was admitted"
+        );
+        assert_eq!(
+            response.result.message,
+            "canonical runtime authority is immutable"
         );
         Ok(())
     }

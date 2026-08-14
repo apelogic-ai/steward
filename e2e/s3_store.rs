@@ -92,6 +92,7 @@ async fn s3_postgres_keeps_envelopes_immutable_and_parks_exact_rejections()
             acting_user: Email("alice@example.com".to_owned()),
         },
         owner: Email("alice@example.com".to_owned()),
+        canonical_authority: None,
         agent_type: AgentType {
             name: "base".to_owned(),
         },

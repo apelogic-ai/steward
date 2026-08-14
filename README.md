@@ -14,6 +14,7 @@ instance-bound grants.
 | What Steward is and why | `docs/solution-overview.md` |
 | What we are building, and in what order | `docs/roadmap/steward-roadmap.md` |
 | Task lifecycle, tar, and identity contract | `docs/task-submission-api.md` |
+| Canonical browser / Task person identity | `docs/canonical-user-identity-v1.md` |
 | Deploy the Task API and worker | `config/task/README.md` |
 | The rules for changing this repository | `AGENTS.md` |
 | Run the complete local gate | `cargo xtask ci` |
@@ -62,6 +63,8 @@ docs/
   solution-overview.md        the architecture and the position it takes
   data-plane-spec.md          tiers, gateways, the Tier 1 membership test
   task-submission-api.md      lifecycle REST, tar paths, limits, identity boundary
+  canonical-user-identity-v1.md
+                              immutable user ID, Google OIDC mapping, reconnect contract
   workflow-and-task-spec.md   Plane B object model — Workflow, Task, journal
   steward-ai-workflows-fit.md charter fit; where the gaps are
   guarantee-register-generation.md

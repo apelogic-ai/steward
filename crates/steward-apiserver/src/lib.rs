@@ -1487,9 +1487,11 @@ impl IntoResponse for ApiError {
             Self::PrincipalMismatch => StatusCode::FORBIDDEN,
             Self::TaskAuthentication => StatusCode::UNAUTHORIZED,
             Self::TaskAuthenticationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-            Self::TaskWorkflowNotFound | Self::Store(StoreError::TaskNotFound) => {
+            Self::TaskWorkflowNotFound
+            | Self::Store(StoreError::TaskNotFound | StoreError::CanonicalIdentityNotFound) => {
                 StatusCode::NOT_FOUND
             }
+            Self::Store(StoreError::CanonicalIdentityInactive) => StatusCode::FORBIDDEN,
             Self::TaskNotReady => StatusCode::SERVICE_UNAVAILABLE,
             Self::TaskOutputNotReady => StatusCode::CONFLICT,
             Self::MissingEnvelope | Self::MissingRuntimeUid => StatusCode::UNPROCESSABLE_ENTITY,
@@ -1508,11 +1510,18 @@ impl IntoResponse for ApiError {
                 | StoreError::StaleEnvelope
                 | StoreError::EnvelopeRevisionNotIncreasing
                 | StoreError::TaskIdempotencyConflict
-                | StoreError::InvalidTaskTransition,
+                | StoreError::InvalidTaskTransition
+                | StoreError::CanonicalIdentityStale
+                | StoreError::CanonicalIdentityAmbiguousEmail
+                | StoreError::CanonicalIdentityConflict,
             ) => StatusCode::CONFLICT,
-            Self::Store(StoreError::InvalidGrantExpiry | StoreError::MissingRevocationReason) => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
+            Self::Store(
+                StoreError::InvalidGrantExpiry
+                | StoreError::MissingRevocationReason
+                | StoreError::CanonicalIdentityInvalidActor
+                | StoreError::CanonicalIdentityInvalidRecord
+                | StoreError::InvalidTaskIdentityBinding,
+            ) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RuntimeCreate(RuntimeCreateError::Unavailable(_))
             | Self::Runtime(_)
             | Self::Store(StoreError::Database(_) | StoreError::DecisionFilingClaimLost)
@@ -1647,6 +1656,9 @@ where
     L: AdmissionLedger,
     D: DecisionChannel,
 {
+    if request.spec.canonical_authority.is_some() {
+        return Err(ApiError::PrincipalMismatch);
+    }
     match &request.spec.principal {
         Principal::User { acting_user } if acting_user.0 == context.actor => {}
         _ => return Err(ApiError::PrincipalMismatch),
@@ -2254,8 +2266,8 @@ mod tests {
         PendingApproval, StoreError, TaskRecord, TaskReservation, TaskReservationRequest,
     };
     use steward_types::{
-        AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef,
-        PENDING_APPROVAL_ANNOTATION, Principal, TaskPhase,
+        AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email,
+        ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, TaskPhase,
     };
     use tower::ServiceExt;
     use utoipa::OpenApi;
@@ -2268,8 +2280,8 @@ mod tests {
         KubernetesTokenReviewAudience, RequestAuthenticator, RuntimeCreateError, RuntimeRepository,
         STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP, StaticTaskWorkflowCatalog, SubmissionOutcome,
         TaskAuthenticationError, TaskIdentity, TaskIdentityResolver, TaskSubmissionLedger,
-        TaskWorkflow, caller_from_kubernetes_user, caller_from_token_review, router, spec_digest,
-        submit_budget_increase, task_router, token_review_request,
+        TaskSubmissionRequest, TaskWorkflow, caller_from_kubernetes_user, caller_from_token_review,
+        router, spec_digest, submit_budget_increase, task_router, token_review_request,
     };
 
     const KUBERNETES_TOKEN_REVIEW_AUDIENCE: &str = "https://kubernetes.default.svc";
@@ -2300,16 +2312,37 @@ mod tests {
                         service: "steward-run".to_owned(),
                         acting_user: Some(Email("alice@example.com".to_owned())),
                         owner: Email("alice@example.com".to_owned()),
+                        canonical_user_id: CanonicalUserId::parse(
+                            "usr_0123456789abcdef0123456789abcdef",
+                        )
+                        .map_err(|_| TaskAuthenticationError::InvalidCredentials)?,
                     }),
                     "github-bob-assertion" => Ok(TaskIdentity {
                         service: "steward-run".to_owned(),
                         acting_user: Some(Email("bob@example.org".to_owned())),
                         owner: Email("bob@example.org".to_owned()),
+                        canonical_user_id: CanonicalUserId::parse(
+                            "usr_abcdef0123456789abcdef0123456789",
+                        )
+                        .map_err(|_| TaskAuthenticationError::InvalidCredentials)?,
+                    }),
+                    "github-renamed-assertion" => Ok(TaskIdentity {
+                        service: "steward-run".to_owned(),
+                        acting_user: Some(Email("alice-renamed@example.com".to_owned())),
+                        owner: Email("alice-renamed@example.com".to_owned()),
+                        canonical_user_id: CanonicalUserId::parse(
+                            "usr_0123456789abcdef0123456789abcdef",
+                        )
+                        .map_err(|_| TaskAuthenticationError::InvalidCredentials)?,
                     }),
                     "scheduled-assertion" => Ok(TaskIdentity {
                         service: "scheduled-scanner".to_owned(),
                         acting_user: None,
                         owner: Email("owner@example.org".to_owned()),
+                        canonical_user_id: CanonicalUserId::parse(
+                            "usr_456789abcdef0123456789abcdef0123",
+                        )
+                        .map_err(|_| TaskAuthenticationError::InvalidCredentials)?,
                     }),
                     _ => Err(TaskAuthenticationError::InvalidCredentials),
                 }
@@ -2563,6 +2596,8 @@ mod tests {
                     groups: Some(vec![
                         "agents.apelogic.ai/service-principal:steward-run".to_owned(),
                         "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                        "agents.apelogic.ai/canonical-user:usr_0123456789abcdef0123456789abcdef"
+                            .to_owned(),
                     ]),
                     ..UserInfo::default()
                 }),
@@ -2577,6 +2612,10 @@ mod tests {
             Some(Email("alice@example.com".to_owned()))
         );
         assert_eq!(delegated.owner, Email("alice@example.com".to_owned()));
+        assert_eq!(
+            delegated.canonical_user_id.as_str(),
+            "usr_0123456789abcdef0123456789abcdef"
+        );
 
         let scheduled = task_identity_from_token_review(
             Some(TokenReviewStatus {
@@ -2587,6 +2626,8 @@ mod tests {
                     groups: Some(vec![
                         "agents.apelogic.ai/service-principal:scheduled-scanner".to_owned(),
                         "agents.apelogic.ai/task-owner:owner@example.org".to_owned(),
+                        "agents.apelogic.ai/canonical-user:usr_abcdef0123456789abcdef0123456789"
+                            .to_owned(),
                     ]),
                     ..UserInfo::default()
                 }),
@@ -2598,6 +2639,10 @@ mod tests {
         assert_eq!(scheduled.service, "scheduled-scanner");
         assert_eq!(scheduled.acting_user, None);
         assert_eq!(scheduled.owner, Email("owner@example.org".to_owned()));
+        assert_eq!(
+            scheduled.canonical_user_id.as_str(),
+            "usr_abcdef0123456789abcdef0123456789"
+        );
 
         let self_asserted_only = task_identity_from_token_review(
             Some(TokenReviewStatus {
@@ -2625,6 +2670,7 @@ mod tests {
         for duplicate_group in [
             "agents.apelogic.ai/service-principal:steward-run",
             "agents.apelogic.ai/acting-user:alice@example.com",
+            "agents.apelogic.ai/canonical-user:usr_0123456789abcdef0123456789abcdef",
         ] {
             let identity = task_identity_from_token_review(
                 Some(TokenReviewStatus {
@@ -2635,6 +2681,8 @@ mod tests {
                         groups: Some(vec![
                             "agents.apelogic.ai/service-principal:steward-run".to_owned(),
                             "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                            "agents.apelogic.ai/canonical-user:usr_0123456789abcdef0123456789abcdef"
+                                .to_owned(),
                             duplicate_group.to_owned(),
                         ]),
                         ..UserInfo::default()
@@ -2666,6 +2714,8 @@ mod tests {
                         groups: Some(vec![
                             "agents.apelogic.ai/service-principal:steward-run".to_owned(),
                             format!("agents.apelogic.ai/acting-user:{acting_user}"),
+                            "agents.apelogic.ai/canonical-user:usr_0123456789abcdef0123456789abcdef"
+                                .to_owned(),
                         ]),
                         ..UserInfo::default()
                     }),
@@ -2689,6 +2739,8 @@ mod tests {
                 vec![
                     "agents.apelogic.ai/service-principal:steward-run".to_owned(),
                     "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                    "agents.apelogic.ai/canonical-user:usr_0123456789abcdef0123456789abcdef"
+                        .to_owned(),
                 ],
                 Some(vec!["other-api".to_owned()]),
             ),
@@ -2697,6 +2749,8 @@ mod tests {
                 vec![
                     "agents.apelogic.ai/service-principal:steward-run".to_owned(),
                     "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                    "agents.apelogic.ai/canonical-user:usr_0123456789abcdef0123456789abcdef"
+                        .to_owned(),
                 ],
                 None,
             ),
@@ -2705,17 +2759,27 @@ mod tests {
                 vec![
                     "agents.apelogic.ai/service-principal:steward-run".to_owned(),
                     "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                    "agents.apelogic.ai/canonical-user:usr_0123456789abcdef0123456789abcdef"
+                        .to_owned(),
                 ],
                 Some(Vec::new()),
             ),
             (
                 "missing service group",
-                vec!["agents.apelogic.ai/acting-user:alice@example.com".to_owned()],
+                vec![
+                    "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                    "agents.apelogic.ai/canonical-user:usr_0123456789abcdef0123456789abcdef"
+                        .to_owned(),
+                ],
                 Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
             ),
             (
                 "missing acting-user group",
-                vec!["agents.apelogic.ai/service-principal:steward-run".to_owned()],
+                vec![
+                    "agents.apelogic.ai/service-principal:steward-run".to_owned(),
+                    "agents.apelogic.ai/canonical-user:usr_0123456789abcdef0123456789abcdef"
+                        .to_owned(),
+                ],
                 Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
             ),
             (
@@ -2723,6 +2787,8 @@ mod tests {
                 vec![
                     "example.com/service-principal:steward-run".to_owned(),
                     "example.com/acting-user:alice@example.com".to_owned(),
+                    "agents.apelogic.ai/canonical-user:usr_0123456789abcdef0123456789abcdef"
+                        .to_owned(),
                 ],
                 Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
             ),
@@ -2731,6 +2797,8 @@ mod tests {
                 vec![
                     "agents.apelogic.ai/service-principal:".to_owned(),
                     "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+                    "agents.apelogic.ai/canonical-user:usr_0123456789abcdef0123456789abcdef"
+                        .to_owned(),
                 ],
                 Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
             ),
@@ -2754,6 +2822,51 @@ mod tests {
                 identity,
                 Err(TaskAuthenticationError::InvalidCredentials),
                 "{case} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn task_identity_requires_exactly_one_opaque_canonical_user_group() {
+        for canonical_groups in [
+            Vec::new(),
+            vec!["agents.apelogic.ai/canonical-user:alice@example.com".to_owned()],
+            vec![
+                "agents.apelogic.ai/canonical-user:usr_0123456789abcdef0123456789abcdef".to_owned(),
+                "agents.apelogic.ai/canonical-user:usr_abcdef0123456789abcdef0123456789".to_owned(),
+            ],
+        ] {
+            let mut groups = vec![
+                "agents.apelogic.ai/service-principal:steward-run".to_owned(),
+                "agents.apelogic.ai/acting-user:alice@example.com".to_owned(),
+            ];
+            groups.extend(canonical_groups);
+            let identity = task_identity_from_token_review(
+                Some(TokenReviewStatus {
+                    authenticated: Some(true),
+                    audiences: Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
+                    user: Some(UserInfo {
+                        username: Some("alice@example.com".to_owned()),
+                        groups: Some(groups),
+                        ..UserInfo::default()
+                    }),
+                    ..TokenReviewStatus::default()
+                }),
+                KUBERNETES_TOKEN_REVIEW_AUDIENCE,
+            );
+            assert_eq!(identity, Err(TaskAuthenticationError::InvalidCredentials));
+        }
+    }
+
+    #[test]
+    fn task_submission_body_cannot_select_a_canonical_or_acting_user() {
+        for body in [
+            r#"{"workflow":"code-review","codingAgentRuntime":"base","canonicalUserId":"usr_abcdef0123456789abcdef0123456789"}"#,
+            r#"{"workflow":"code-review","codingAgentRuntime":"base","actingUser":"bob@example.org"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<TaskSubmissionRequest>(body).is_err(),
+                "caller-selected identity field was accepted: {body}"
             );
         }
     }
@@ -3165,6 +3278,11 @@ mod tests {
         runtime: Arc<Mutex<AgentRuntime>>,
     }
 
+    #[derive(Clone, Default)]
+    struct MultiRuntimeRepository {
+        runtimes: Arc<Mutex<Vec<AgentRuntime>>>,
+    }
+
     #[derive(Clone)]
     struct RejectedCreateRepository {
         runtime: AgentRuntime,
@@ -3373,6 +3491,123 @@ mod tests {
                     .runtime
                     .lock()
                     .map_err(|_| "fake runtime lock was poisoned".to_owned())?;
+                *stored = runtime.clone();
+                Ok(())
+            })
+        }
+    }
+
+    impl RuntimeRepository for MultiRuntimeRepository {
+        fn create<'a>(
+            &'a self,
+            _namespace: &'a str,
+            runtime: &'a AgentRuntime,
+            _context: &'a AdmissionContext,
+        ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+            self.create_as_authority(_namespace, runtime)
+        }
+
+        fn create_as_authority<'a>(
+            &'a self,
+            _namespace: &'a str,
+            runtime: &'a AgentRuntime,
+        ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+            Box::pin(async move {
+                let mut runtimes = self.runtimes.lock().map_err(|_| {
+                    RuntimeCreateError::Unavailable(
+                        "multi-runtime repository lock was poisoned".to_owned(),
+                    )
+                })?;
+                if runtimes
+                    .iter()
+                    .any(|stored| stored.name_any() == runtime.name_any())
+                {
+                    return Err(RuntimeCreateError::Kubernetes {
+                        status: 409,
+                        message: "AgentRuntime already exists".to_owned(),
+                    });
+                }
+                let mut created = runtime.clone();
+                created.metadata.uid = Some(format!("{}-uid", created.name_any()));
+                created.metadata.resource_version = Some("1".to_owned());
+                runtimes.push(created.clone());
+                Ok(created)
+            })
+        }
+
+        fn get<'a>(
+            &'a self,
+            namespace: &'a str,
+            name: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            Box::pin(async move {
+                self.runtimes
+                    .lock()
+                    .map_err(|_| "multi-runtime repository lock was poisoned".to_owned())?
+                    .iter()
+                    .find(|runtime| {
+                        runtime.metadata.namespace.as_deref() == Some(namespace)
+                            && runtime.metadata.name.as_deref() == Some(name)
+                    })
+                    .cloned()
+                    .ok_or_else(|| format!("AgentRuntime {namespace}/{name} does not exist"))
+            })
+        }
+
+        fn get_bound<'a>(
+            &'a self,
+            namespace: &'a str,
+            name: &'a str,
+            runtime_uid: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            Box::pin(async move {
+                let runtime = self.get(namespace, name).await?;
+                if runtime.metadata.uid.as_deref() == Some(runtime_uid) {
+                    Ok(runtime)
+                } else {
+                    Err(format!(
+                        "AgentRuntime {namespace}/{name} is not bound to UID {runtime_uid}"
+                    ))
+                }
+            })
+        }
+
+        fn get_by_uid<'a>(
+            &'a self,
+            runtime_uid: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            Box::pin(async move {
+                self.runtimes
+                    .lock()
+                    .map_err(|_| "multi-runtime repository lock was poisoned".to_owned())?
+                    .iter()
+                    .find(|runtime| runtime.metadata.uid.as_deref() == Some(runtime_uid))
+                    .cloned()
+                    .ok_or_else(|| format!("AgentRuntime UID {runtime_uid} does not exist"))
+            })
+        }
+
+        fn replace<'a>(
+            &'a self,
+            runtime: &'a AgentRuntime,
+            _context: &'a AdmissionContext,
+        ) -> BoxFuture<'a, Result<(), String>> {
+            self.replace_as_authority(runtime)
+        }
+
+        fn replace_as_authority<'a>(
+            &'a self,
+            runtime: &'a AgentRuntime,
+        ) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                let mut runtimes = self
+                    .runtimes
+                    .lock()
+                    .map_err(|_| "multi-runtime repository lock was poisoned".to_owned())?;
+                let stored = runtimes
+                    .iter_mut()
+                    .find(|stored| stored.metadata.uid == runtime.metadata.uid)
+                    .ok_or_else(|| "AgentRuntime replacement target does not exist".to_owned())?;
                 *stored = runtime.clone();
                 Ok(())
             })
@@ -3862,6 +4097,7 @@ mod tests {
                 })?;
                 if let Some(existing) = tasks.iter().find(|task| {
                     task.submitter_service == request.submitter_service
+                        && task.owner_user_id.as_deref() == Some(request.owner_user_id)
                         && task.idempotency_key == request.idempotency_key
                 }) {
                     return Ok(TaskReservation {
@@ -3874,7 +4110,10 @@ mod tests {
                     idempotency_key: request.idempotency_key.to_owned(),
                     submitter_service: request.submitter_service.to_owned(),
                     acting_user: request.acting_user.map(str::to_owned),
+                    acting_user_id: request.acting_user_id.map(str::to_owned),
                     owner: request.owner.to_owned(),
+                    owner_user_id: Some(request.owner_user_id.to_owned()),
+                    identity_binding_state: "bound".to_owned(),
                     workflow: request.workflow.to_owned(),
                     coding_agent_runtime: request.coding_agent_runtime.to_owned(),
                     runtime_uid: None,
@@ -3923,7 +4162,7 @@ mod tests {
             &'a self,
             task_uid: Uuid,
             submitter_service: &'a str,
-            acting_user: Option<&'a str>,
+            owner_user_id: &'a str,
             archive: &'a [u8],
         ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
             Box::pin(async move {
@@ -3935,7 +4174,7 @@ mod tests {
                     .find(|task| {
                         task.task_uid == task_uid
                             && task.submitter_service == submitter_service
-                            && task.acting_user.as_deref() == acting_user
+                            && task.owner_user_id.as_deref() == Some(owner_user_id)
                     })
                     .ok_or(StoreError::TaskNotFound)?;
                 if task.execute_requested
@@ -3956,7 +4195,7 @@ mod tests {
             &'a self,
             task_uid: Uuid,
             submitter_service: &'a str,
-            acting_user: Option<&'a str>,
+            owner_user_id: &'a str,
         ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
             Box::pin(async move {
                 let mut tasks = self.tasks.lock().map_err(|_| {
@@ -3967,7 +4206,7 @@ mod tests {
                     .find(|task| {
                         task.task_uid == task_uid
                             && task.submitter_service == submitter_service
-                            && task.acting_user.as_deref() == acting_user
+                            && task.owner_user_id.as_deref() == Some(owner_user_id)
                     })
                     .ok_or(StoreError::TaskNotFound)?;
                 if task.input_archive.is_none() || task.finalize_requested {
@@ -3985,7 +4224,7 @@ mod tests {
             &'a self,
             task_uid: Uuid,
             submitter_service: &'a str,
-            acting_user: Option<&'a str>,
+            owner_user_id: &'a str,
         ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
             Box::pin(async move {
                 self.tasks
@@ -3999,7 +4238,7 @@ mod tests {
                             .find(|task| {
                                 task.task_uid == task_uid
                                     && task.submitter_service == submitter_service
-                                    && task.acting_user.as_deref() == acting_user
+                                    && task.owner_user_id.as_deref() == Some(owner_user_id)
                             })
                             .cloned()
                     })
@@ -4010,7 +4249,7 @@ mod tests {
             &'a self,
             task_uid: Uuid,
             submitter_service: &'a str,
-            acting_user: Option<&'a str>,
+            owner_user_id: &'a str,
         ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
             Box::pin(async move {
                 let mut tasks = self.tasks.lock().map_err(|_| {
@@ -4021,7 +4260,7 @@ mod tests {
                     .find(|task| {
                         task.task_uid == task_uid
                             && task.submitter_service == submitter_service
-                            && task.acting_user.as_deref() == acting_user
+                            && task.owner_user_id.as_deref() == Some(owner_user_id)
                     })
                     .ok_or(StoreError::TaskNotFound)?;
                 task.finalize_requested = true;
@@ -4042,6 +4281,7 @@ mod tests {
                 acting_user: Email("alice@example.com".to_owned()),
             },
             owner: Email("alice@example.com".to_owned()),
+            canonical_authority: None,
             agent_type: AgentType {
                 name: "base".to_owned(),
             },
@@ -4356,6 +4596,71 @@ mod tests {
                 .name_any(),
             "runtime-a",
             "a rejected create must not write desired state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_rejects_caller_supplied_canonical_authority_before_writing()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let app = router(
+            runtimes,
+            ledger(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/namespaces/team-a/runtimes")
+                    .header("authorization", "Bearer user-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "runtime-b",
+                            "spec": {
+                                "principal": {
+                                    "kind": "user",
+                                    "actingUser": "alice@example.com",
+                                },
+                                "owner": "alice@example.com",
+                                "canonicalAuthority": {
+                                    "schemaVersion": "steward/canonical-authority-binding/v1",
+                                    "ownerUserId": "usr_abcdef0123456789abcdef0123456789",
+                                    "actingUserId": "usr_abcdef0123456789abcdef0123456789"
+                                },
+                                "agentType": {"name": "base"},
+                                "llms": [{
+                                    "provider": "provider-a",
+                                    "model": "model-a",
+                                }],
+                                "tools": [],
+                                "budget": {
+                                    "monthlyLimit": "100.00",
+                                    "currency": "USD",
+                                },
+                                "ttl": "24h",
+                            },
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("failed to build canonical injection: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("canonical injection request failed: {error}"))?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?
+                .name_any(),
+            "runtime-a",
+            "caller-supplied canonical authority must not write desired state"
         );
         Ok(())
     }
@@ -6022,6 +6327,7 @@ mod tests {
         let runtimes = FakeRuntimeRepository {
             runtime: Arc::new(Mutex::new(runtime())),
         };
+        let runtime_state = runtimes.runtime.clone();
         let ledger = ledger();
         let task_rows = ledger.tasks.clone();
         let decisions = FakeDecisionChannel::default();
@@ -6055,6 +6361,23 @@ mod tests {
             .await
             .map_err(|error| format!("task submission failed: {error}"))?;
         assert_eq!(submitted.status(), StatusCode::CREATED);
+        {
+            let runtime = runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?;
+            let authority =
+                runtime.spec.canonical_authority.as_ref().ok_or_else(|| {
+                    "delegated Task runtime lacked canonical authority".to_owned()
+                })?;
+            assert_eq!(
+                authority.owner_user_id.as_str(),
+                "usr_0123456789abcdef0123456789abcdef"
+            );
+            assert_eq!(
+                authority.acting_user_id.as_ref(),
+                Some(&authority.owner_user_id)
+            );
+        }
         let body = to_bytes(submitted.into_body(), 1024 * 1024)
             .await
             .map_err(|error| format!("failed to read task submission: {error}"))?;
@@ -6079,6 +6402,22 @@ mod tests {
             cross_user.status(),
             StatusCode::NOT_FOUND,
             "task lookup must bind to the full resolved submitting identity, not only its service"
+        );
+        let renamed_same_user = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/tasks/{task_uid}"))
+                    .header("authorization", "Bearer github-renamed-assertion")
+                    .body(Body::empty())
+                    .map_err(|error| format!("failed to build renamed-user task read: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("renamed-user task read failed: {error}"))?;
+        assert_eq!(
+            renamed_same_user.status(),
+            StatusCode::OK,
+            "task ownership must survive a verified display-email rename for the same canonical user"
         );
         const CONTRACT_MAX_TASK_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
         let oversized = app
@@ -6239,6 +6578,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_owners_share_an_idempotency_key_without_sharing_a_runtime()
+    -> Result<(), String> {
+        let runtimes = MultiRuntimeRepository::default();
+        let runtime_state = runtimes.runtimes.clone();
+        let ledger = ledger();
+        let task_rows = ledger.tasks.clone();
+        let app = router(
+            runtimes.clone(),
+            ledger.clone(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        )
+        .merge(task_router(
+            runtimes,
+            ledger,
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+        ));
+        let mut submissions = Vec::new();
+        for bearer in ["github-assertion", "github-bob-assertion"] {
+            let submit = || {
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .header("idempotency-key", "shared-github-job")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"workflow":"code-review","codingAgentRuntime":"agent-v1"}"#,
+                    ))
+                    .map_err(|error| format!("failed to build owner-scoped submission: {error}"))
+            };
+            let response = app
+                .clone()
+                .oneshot(submit()?)
+                .await
+                .map_err(|error| format!("owner-scoped submission failed: {error}"))?;
+            assert_eq!(
+                response.status(),
+                StatusCode::CREATED,
+                "each canonical owner must receive an independent runtime"
+            );
+            let body = to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .map_err(|error| format!("failed to read owner-scoped submission: {error}"))?;
+            let first = serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("owner-scoped submission was not JSON: {error}"))?;
+            let retried = app
+                .clone()
+                .oneshot(submit()?)
+                .await
+                .map_err(|error| format!("owner-scoped retry failed: {error}"))?;
+            assert_eq!(retried.status(), StatusCode::CREATED);
+            let retry_body = to_bytes(retried.into_body(), 1024 * 1024)
+                .await
+                .map_err(|error| format!("failed to read owner-scoped retry: {error}"))?;
+            let retry = serde_json::from_slice::<serde_json::Value>(&retry_body)
+                .map_err(|error| format!("owner-scoped retry was not JSON: {error}"))?;
+            assert_eq!(
+                retry.get("taskUid"),
+                first.get("taskUid"),
+                "an identical retry must converge within its canonical-owner scope"
+            );
+            assert_eq!(
+                retry.get("runtimeUid"),
+                first.get("runtimeUid"),
+                "an identical retry must retain its own runtime"
+            );
+            submissions.push((bearer, first));
+        }
+
+        {
+            let rows = task_rows
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned".to_owned())?;
+            assert_eq!(rows.len(), 2);
+            assert_ne!(rows[0].task_uid, rows[1].task_uid);
+            assert_ne!(rows[0].runtime_name, rows[1].runtime_name);
+            for row in rows.iter() {
+                assert!(row.runtime_name.starts_with("task-"));
+                assert!(row.runtime_name.len() <= 63);
+                assert!(
+                    row.runtime_name.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    }),
+                    "stable runtime names must remain DNS-label safe"
+                );
+            }
+        }
+        assert_eq!(
+            runtime_state
+                .lock()
+                .map_err(|_| "multi-runtime repository lock was poisoned".to_owned())?
+                .len(),
+            2,
+            "both owner-scoped reservations must bind distinct live runtimes"
+        );
+
+        for ((_, task), other_bearer) in submissions
+            .iter()
+            .zip(["github-bob-assertion", "github-assertion"])
+        {
+            let task_uid = task
+                .get("taskUid")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "owner-scoped submission lacked taskUid".to_owned())?;
+            let observed = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/tasks/{task_uid}"))
+                        .header("authorization", format!("Bearer {other_bearer}"))
+                        .body(Body::empty())
+                        .map_err(|error| format!("failed to build cross-owner read: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("cross-owner read failed: {error}"))?;
+            assert_eq!(observed.status(), StatusCode::NOT_FOUND);
+            let deleted = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/v1/tasks/{task_uid}"))
+                        .header("authorization", format!("Bearer {other_bearer}"))
+                        .body(Body::empty())
+                        .map_err(|error| format!("failed to build cross-owner delete: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("cross-owner delete failed: {error}"))?;
+            assert_eq!(deleted.status(), StatusCode::NOT_FOUND);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn pure_service_task_is_attributed_to_its_server_resolved_owner() -> Result<(), String> {
         let runtimes = FakeRuntimeRepository {
             runtime: Arc::new(Mutex::new(runtime())),
@@ -6317,6 +6793,16 @@ mod tests {
             .lock()
             .map_err(|_| "fake runtime lock was poisoned")?;
         assert_eq!(runtime.spec.owner, Email("owner@example.org".to_owned()));
+        let authority = runtime
+            .spec
+            .canonical_authority
+            .as_ref()
+            .ok_or_else(|| "pure-service Task runtime lacked owner authority".to_owned())?;
+        assert_eq!(
+            authority.owner_user_id.as_str(),
+            "usr_456789abcdef0123456789abcdef0123"
+        );
+        assert_eq!(authority.acting_user_id, None);
         assert_eq!(
             runtime.spec.principal,
             Principal::Service {

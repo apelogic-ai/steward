@@ -67,20 +67,30 @@ following server-verified attributes:
 status.user.username: <verified-corporate-email>
 agents.apelogic.ai/service-principal:steward-run
 agents.apelogic.ai/acting-user:<the-same-verified-corporate-email>
+agents.apelogic.ai/canonical-user:<opaque-steward-user-id>
 status.audiences: [..., <configured Kubernetes TokenReview audience>, ...]
 ```
 
-The parser requires exactly one non-empty service group and exactly one acting-user group for
-this delegated form. The acting-user value must be a valid email and must equal the authenticated
-TokenReview username. Wrong or missing audiences; missing, duplicate, empty, or contradictory
-identity groups; and a username/group mismatch all fail closed.
+The parser requires exactly one non-empty service group, exactly one acting-user group, and exactly
+one opaque canonical-user group for this delegated form. The acting-user value must be a valid
+email and must equal the authenticated TokenReview username. The canonical user ID is the durable
+Task owner; the email is display/audit metadata. Wrong or missing audiences; missing, duplicate,
+empty, caller-shaped, or contradictory identity groups; and a username/group mismatch all fail
+closed.
 
 Pure service work uses exactly one service group plus
-`agents.apelogic.ai/task-owner:<corporate-email>` instead. Steward rejects missing, duplicate,
-empty, or contradictory identity groups.
+`agents.apelogic.ai/task-owner:<corporate-email>` and exactly one canonical-user group instead.
+Steward rejects missing, duplicate, empty, or contradictory identity groups.
+
+The created AgentRuntime persists this resolved identity as
+`spec.canonicalAuthority` using `steward/canonical-authority-binding/v1`. Its owner ID is always
+present. Its acting ID equals the owner ID for delegated person work and is absent for pure-service
+work. This value is server-authored and immutable; legacy runtimes without it are not silently
+adopted.
 
 There is **no component in this repository** that validates GitHub's OIDC issuer,
-authorizes repository/workflow claims, resolves the GitHub actor to a corporate email, and
+authorizes repository/workflow claims, resolves the GitHub actor to the reviewed canonical user
+and current corporate display email, and
 issues the exchanged token and TokenReview attributes above. The E2E `TestTaskIdentities`
 resolver is deliberately only a test fixture. Production therefore still requires the external
 exchange plus a cluster-supported OIDC/JWT identity-provider association implementing that

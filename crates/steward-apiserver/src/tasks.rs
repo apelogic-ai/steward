@@ -20,8 +20,9 @@ use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, evaluate_wi
 use steward_ports::MAX_TASK_INPUT_ARCHIVE_BYTES;
 use steward_store::{ParkRejection, PgStore, StoreError, TaskRecord, TaskReservationRequest};
 use steward_types::{
-    AgentRuntime, AgentRuntimeSpec, Budget, Duration, Email, ModelRef, PENDING_APPROVAL_ANNOTATION,
-    Principal, RuntimeOwnership, TaskPhase, ToolGrant,
+    AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, Duration,
+    Email, ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, RuntimeOwnership, TaskPhase,
+    ToolGrant,
 };
 use uuid::Uuid;
 
@@ -35,6 +36,7 @@ const SERVICE_PRINCIPAL_ANNOTATION: &str = "agents.apelogic.ai/service-principal
 const SERVICE_GROUP_PREFIX: &str = "agents.apelogic.ai/service-principal:";
 const ACTING_USER_GROUP_PREFIX: &str = "agents.apelogic.ai/acting-user:";
 const TASK_OWNER_GROUP_PREFIX: &str = "agents.apelogic.ai/task-owner:";
+const CANONICAL_USER_GROUP_PREFIX: &str = "agents.apelogic.ai/canonical-user:";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskAuthenticationError {
@@ -47,6 +49,7 @@ pub struct TaskIdentity {
     pub service: String,
     pub acting_user: Option<Email>,
     pub owner: Email,
+    pub canonical_user_id: CanonicalUserId,
 }
 
 pub trait TaskIdentityResolver: Clone + Send + Sync + 'static {
@@ -60,11 +63,20 @@ pub trait TaskIdentityResolver: Clone + Send + Sync + 'static {
 pub struct KubernetesTaskIdentityResolver {
     client: Client,
     audience: KubernetesTokenReviewAudience,
+    canonical_identities: PgStore,
 }
 
 impl KubernetesTaskIdentityResolver {
-    pub fn new(client: Client, audience: KubernetesTokenReviewAudience) -> Self {
-        Self { client, audience }
+    pub fn new(
+        client: Client,
+        audience: KubernetesTokenReviewAudience,
+        canonical_identities: PgStore,
+    ) -> Self {
+        Self {
+            client,
+            audience,
+            canonical_identities,
+        }
     }
 }
 
@@ -82,7 +94,15 @@ impl TaskIdentityResolver for KubernetesTaskIdentityResolver {
                 .map_err(|_| TaskAuthenticationError::Unavailable)?;
             let user = authenticated_token_review_user(reviewed.status, self.audience.as_str())
                 .ok_or(TaskAuthenticationError::InvalidCredentials)?;
-            task_identity_from_kubernetes_user(&user)
+            let identity = task_identity_from_kubernetes_user(&user)?;
+            self.canonical_identities
+                .resolve_canonical_principal(&identity.canonical_user_id, &identity.owner)
+                .await
+                .map_err(|error| match error {
+                    StoreError::Database(_) => TaskAuthenticationError::Unavailable,
+                    _ => TaskAuthenticationError::InvalidCredentials,
+                })?;
+            Ok(identity)
         })
     }
 }
@@ -109,9 +129,15 @@ fn task_identity_from_kubernetes_user(
     let services = group_values(groups, SERVICE_GROUP_PREFIX);
     let acting_users = group_values(groups, ACTING_USER_GROUP_PREFIX);
     let owners = group_values(groups, TASK_OWNER_GROUP_PREFIX);
+    let canonical_users = group_values(groups, CANONICAL_USER_GROUP_PREFIX);
     let [service] = services.as_slice() else {
         return Err(TaskAuthenticationError::InvalidCredentials);
     };
+    let [canonical_user] = canonical_users.as_slice() else {
+        return Err(TaskAuthenticationError::InvalidCredentials);
+    };
+    let canonical_user_id = CanonicalUserId::parse(canonical_user.clone())
+        .map_err(|_| TaskAuthenticationError::InvalidCredentials)?;
     if service.is_empty() {
         return Err(TaskAuthenticationError::InvalidCredentials);
     }
@@ -142,6 +168,7 @@ fn task_identity_from_kubernetes_user(
         service: service.clone(),
         acting_user,
         owner,
+        canonical_user_id,
     })
 }
 
@@ -240,7 +267,7 @@ pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
         &'a self,
         task_uid: Uuid,
         submitter_service: &'a str,
-        acting_user: Option<&'a str>,
+        owner_user_id: &'a str,
         archive: &'a [u8],
     ) -> BoxFuture<'a, Result<TaskRecord, StoreError>>;
 
@@ -248,21 +275,21 @@ pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
         &'a self,
         task_uid: Uuid,
         submitter_service: &'a str,
-        acting_user: Option<&'a str>,
+        owner_user_id: &'a str,
     ) -> BoxFuture<'a, Result<TaskRecord, StoreError>>;
 
     fn task_for_submitter<'a>(
         &'a self,
         task_uid: Uuid,
         submitter_service: &'a str,
-        acting_user: Option<&'a str>,
+        owner_user_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>>;
 
     fn request_task_finalization<'a>(
         &'a self,
         task_uid: Uuid,
         submitter_service: &'a str,
-        acting_user: Option<&'a str>,
+        owner_user_id: &'a str,
     ) -> BoxFuture<'a, Result<TaskRecord, StoreError>>;
 }
 
@@ -289,11 +316,12 @@ impl TaskSubmissionLedger for PgStore {
         &'a self,
         task_uid: Uuid,
         submitter_service: &'a str,
-        acting_user: Option<&'a str>,
+        owner_user_id: &'a str,
         archive: &'a [u8],
     ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
         Box::pin(async move {
-            PgStore::put_task_inputs(self, task_uid, submitter_service, acting_user, archive).await
+            PgStore::put_task_inputs(self, task_uid, submitter_service, owner_user_id, archive)
+                .await
         })
     }
 
@@ -301,10 +329,10 @@ impl TaskSubmissionLedger for PgStore {
         &'a self,
         task_uid: Uuid,
         submitter_service: &'a str,
-        acting_user: Option<&'a str>,
+        owner_user_id: &'a str,
     ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
         Box::pin(async move {
-            PgStore::request_task_execution(self, task_uid, submitter_service, acting_user).await
+            PgStore::request_task_execution(self, task_uid, submitter_service, owner_user_id).await
         })
     }
 
@@ -312,10 +340,10 @@ impl TaskSubmissionLedger for PgStore {
         &'a self,
         task_uid: Uuid,
         submitter_service: &'a str,
-        acting_user: Option<&'a str>,
+        owner_user_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
         Box::pin(async move {
-            PgStore::task_for_submitter(self, task_uid, submitter_service, acting_user).await
+            PgStore::task_for_submitter(self, task_uid, submitter_service, owner_user_id).await
         })
     }
 
@@ -323,10 +351,11 @@ impl TaskSubmissionLedger for PgStore {
         &'a self,
         task_uid: Uuid,
         submitter_service: &'a str,
-        acting_user: Option<&'a str>,
+        owner_user_id: &'a str,
     ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
         Box::pin(async move {
-            PgStore::request_task_finalization(self, task_uid, submitter_service, acting_user).await
+            PgStore::request_task_finalization(self, task_uid, submitter_service, owner_user_id)
+                .await
         })
     }
 }
@@ -465,7 +494,7 @@ where
         .task_for_submitter(
             task_uid,
             &identity.service,
-            identity.acting_user.as_ref().map(|email| email.0.as_str()),
+            identity.canonical_user_id.as_str(),
         )
         .await
     {
@@ -508,7 +537,7 @@ where
         .request_task_finalization(
             task_uid,
             &identity.service,
-            identity.acting_user.as_ref().map(|email| email.0.as_str()),
+            identity.canonical_user_id.as_str(),
         )
         .await
     {
@@ -541,7 +570,7 @@ where
         .request_task_execution(
             task_uid,
             &identity.service,
-            identity.acting_user.as_ref().map(|email| email.0.as_str()),
+            identity.canonical_user_id.as_str(),
         )
         .await
     {
@@ -574,7 +603,7 @@ where
         .task_for_submitter(
             task_uid,
             &identity.service,
-            identity.acting_user.as_ref().map(|email| email.0.as_str()),
+            identity.canonical_user_id.as_str(),
         )
         .await
     {
@@ -633,7 +662,7 @@ where
         .put_task_inputs(
             task_uid,
             &identity.service,
-            identity.acting_user.as_ref().map(|email| email.0.as_str()),
+            identity.canonical_user_id.as_str(),
             &archive,
         )
         .await
@@ -694,6 +723,16 @@ where
             acting_user: identity.acting_user.clone(),
         },
         owner: identity.owner.clone(),
+        canonical_authority: Some(
+            CanonicalAuthorityBinding::new(
+                identity.canonical_user_id.clone(),
+                identity
+                    .acting_user
+                    .as_ref()
+                    .map(|_| identity.canonical_user_id.clone()),
+            )
+            .map_err(ApiError::Admission)?,
+        ),
         agent_type: steward_types::AgentType {
             name: workflow.coding_agent_runtime.clone(),
         },
@@ -742,7 +781,12 @@ where
                 idempotency_key,
                 submitter_service: &identity.service,
                 acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
+                acting_user_id: identity
+                    .acting_user
+                    .as_ref()
+                    .map(|_| identity.canonical_user_id.as_str()),
                 owner: &identity.owner.0,
+                owner_user_id: identity.canonical_user_id.as_str(),
                 workflow: &workflow.name,
                 coding_agent_runtime: &workflow.coding_agent_runtime,
                 runtime_namespace: &runtime_namespace,
@@ -768,14 +812,23 @@ where
         };
         return task_response(record, Vec::new());
     }
-    let runtime_name = stable_task_runtime_name(&identity.service, idempotency_key);
+    let runtime_name = stable_task_runtime_name(
+        &identity.service,
+        identity.canonical_user_id.as_str(),
+        idempotency_key,
+    );
     let reservation = state
         .ledger
         .reserve_task(TaskReservationRequest {
             idempotency_key,
             submitter_service: &identity.service,
             acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
+            acting_user_id: identity
+                .acting_user
+                .as_ref()
+                .map(|_| identity.canonical_user_id.as_str()),
             owner: &identity.owner.0,
+            owner_user_id: identity.canonical_user_id.as_str(),
             workflow: &workflow.name,
             coding_agent_runtime: &workflow.coding_agent_runtime,
             runtime_namespace: &workflow.namespace,
@@ -962,8 +1015,14 @@ fn status_response(
     })
 }
 
-fn stable_task_runtime_name(service: &str, idempotency_key: &str) -> String {
-    let digest = Sha256::digest(format!("{service}\0{idempotency_key}").as_bytes());
+fn stable_task_runtime_name(
+    service: &str,
+    canonical_owner_user_id: &str,
+    idempotency_key: &str,
+) -> String {
+    let digest = Sha256::digest(
+        format!("{service}\0{canonical_owner_user_id}\0{idempotency_key}").as_bytes(),
+    );
     let suffix = digest[..10]
         .iter()
         .map(|byte| format!("{byte:02x}"))

@@ -42,6 +42,31 @@ spec:
                 - currency
                 - monthlyLimit
                 type: object
+              canonicalAuthority:
+                description: Server-derived stable person authority. Missing means legacy/reconnect-required.
+                nullable: true
+                properties:
+                  actingUserId:
+                    description: |-
+                      Opaque, immutable identifier allocated by Steward for one person.
+                      The value deliberately contains no email, identity-provider subject, or organization name.
+                    type: string
+                  ownerUserId:
+                    description: |-
+                      Opaque, immutable identifier allocated by Steward for one person.
+                      The value deliberately contains no email, identity-provider subject, or organization name.
+                    type: string
+                  schemaVersion:
+                    enum:
+                    - steward/canonical-authority-binding/v1
+                    type: string
+                required:
+                - ownerUserId
+                - schemaVersion
+                type: object
+                x-kubernetes-validations:
+                - message: canonical acting user must equal the accountable owner in v1
+                  rule: "!has(self.actingUserId) || self.actingUserId == self.ownerUserId"
               llms:
                 items:
                   properties:
