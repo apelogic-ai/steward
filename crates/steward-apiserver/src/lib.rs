@@ -5,10 +5,10 @@ pub mod admin_demo;
 mod admin_ui;
 pub mod browser_auth;
 pub mod connections;
-pub mod google_oidc;
 #[cfg(feature = "admin-demo")]
 pub mod connections_demo;
 mod connections_ui;
+pub mod google_oidc;
 mod tasks;
 
 pub use tasks::{

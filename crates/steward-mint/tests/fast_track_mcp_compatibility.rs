@@ -56,10 +56,7 @@ fn authority() -> Result<AuthorityBinding, String> {
             name: "steward-run".to_owned(),
             acting_user: Some(Email::parse(EMAIL)?),
         },
-        canonical_authority: Some(CanonicalAuthorityBinding::new(
-            user.clone(),
-            Some(user),
-        )?),
+        canonical_authority: Some(CanonicalAuthorityBinding::new(user.clone(), Some(user))?),
         tools: vec![ToolGrant {
             provider: "github".to_owned(),
             resource: "get_file_contents".to_owned(),
@@ -126,4 +123,3 @@ async fn governed_runtime_projects_existing_mcp_gateway_email_subject() -> Resul
     assert!(claims.get("user_id").is_none());
     Ok(())
 }
-
