@@ -24,6 +24,7 @@ const CLOCK_SKEW_SECONDS: u64 = 60;
 const MAX_TOKEN_AGE_SECONDS: u64 = 300;
 const DEFAULT_CACHE_SECONDS: u64 = 300;
 const MAX_CACHE_SECONDS: u64 = 3_600;
+const JWKS_REFRESH_FAILURE_BACKOFF_SECONDS: u64 = 5;
 const GOOGLE_DISCOVERY_ENDPOINT: &str =
     "https://accounts.google.com/.well-known/openid-configuration";
 const GOOGLE_AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -250,11 +251,18 @@ struct Cached<T> {
     expires_at: u64,
 }
 
+#[derive(Clone, Copy)]
+struct JwksRefreshFailure {
+    observed_generation: u64,
+    retry_at: u64,
+}
+
 #[derive(Default)]
 struct ProviderCache {
     discovery: Option<Cached<DiscoveryDocument>>,
     jwks: Option<Cached<JwkSet>>,
     jwks_generation: u64,
+    jwks_refresh_failure: Option<JwksRefreshFailure>,
 }
 
 #[derive(Default)]
@@ -518,6 +526,7 @@ impl GoogleOidcProvider {
             return Ok(document);
         }
         let _permit = self.refresh_gate.acquire().await?;
+        let now = (self.now)();
         if let Some(document) = self
             .cache
             .lock()
@@ -541,12 +550,13 @@ impl GoogleOidcProvider {
         let document: DiscoveryDocument = serde_json::from_slice(&response.body)
             .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?;
         let document = document.validate()?;
+        let stored_at = (self.now)();
         self.cache
             .lock()
             .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?
             .discovery = Some(Cached {
             value: document.clone(),
-            expires_at: now.saturating_add(ttl),
+            expires_at: stored_at.saturating_add(ttl),
         });
         Ok(document)
     }
@@ -556,34 +566,31 @@ impl GoogleOidcProvider {
         force_after_generation: Option<u64>,
     ) -> Result<JwkSet, BrowserAuthFailure> {
         let now = (self.now)();
-        let (cached, generation) = {
+        let cached = {
             let cache = self
                 .cache
                 .lock()
                 .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?;
-            (
-                cache
-                    .jwks
-                    .as_ref()
-                    .filter(|cached| cached.expires_at > now)
-                    .map(|cached| cached.value.clone()),
-                cache.jwks_generation,
-            )
+            cache
+                .jwks
+                .as_ref()
+                .filter(|cached| cached.expires_at > now)
+                .map(|cached| cached.value.clone())
         };
         if force_after_generation.is_none()
             && let Some(jwks) = cached
         {
             return Ok(jwks);
         }
-        let expected_generation = force_after_generation.unwrap_or(generation);
         let discovery = self.discovery().await?;
         let _permit = self.refresh_gate.acquire().await?;
-        {
+        let now = (self.now)();
+        let attempt_generation = {
             let cache = self
                 .cache
                 .lock()
                 .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?;
-            if cache.jwks_generation != expected_generation
+            if force_after_generation.is_some_and(|expected| cache.jwks_generation != expected)
                 && let Some(jwks) = cache
                     .jwks
                     .as_ref()
@@ -601,29 +608,61 @@ impl GoogleOidcProvider {
             {
                 return Ok(jwks);
             }
+            if cache.jwks_refresh_failure.is_some_and(|failure| {
+                failure.observed_generation == cache.jwks_generation && failure.retry_at > now
+            }) {
+                return Err(BrowserAuthFailure::ProviderUnavailable);
+            }
+            cache.jwks_generation
+        };
+
+        let refreshed = async {
+            let response = self
+                .transport
+                .get(&discovery.jwks_uri, MAX_JWKS_BYTES)
+                .await
+                .map_err(map_http_failure)?;
+            if response.body.len() > MAX_JWKS_BYTES {
+                return Err(BrowserAuthFailure::ProviderUnavailable);
+            }
+            let ttl = validate_json_response(&response)?;
+            let jwks: JwkSet = serde_json::from_slice(&response.body)
+                .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?;
+            validate_jwks(&jwks)?;
+            Ok((jwks, ttl))
         }
-        let response = self
-            .transport
-            .get(&discovery.jwks_uri, MAX_JWKS_BYTES)
-            .await
-            .map_err(map_http_failure)?;
-        if response.body.len() > MAX_JWKS_BYTES {
-            return Err(BrowserAuthFailure::ProviderUnavailable);
+        .await;
+
+        match refreshed {
+            Ok((jwks, ttl)) => {
+                let stored_at = (self.now)();
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?;
+                cache.jwks_generation = cache.jwks_generation.saturating_add(1);
+                cache.jwks_refresh_failure = None;
+                cache.jwks = Some(Cached {
+                    value: jwks.clone(),
+                    expires_at: stored_at.saturating_add(ttl),
+                });
+                Ok(jwks)
+            }
+            Err(error) => {
+                let failed_at = (self.now)();
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?;
+                if cache.jwks_generation == attempt_generation {
+                    cache.jwks_refresh_failure = Some(JwksRefreshFailure {
+                        observed_generation: attempt_generation,
+                        retry_at: failed_at.saturating_add(JWKS_REFRESH_FAILURE_BACKOFF_SECONDS),
+                    });
+                }
+                Err(error)
+            }
         }
-        let ttl = validate_json_response(&response)?;
-        let jwks: JwkSet = serde_json::from_slice(&response.body)
-            .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?;
-        validate_jwks(&jwks)?;
-        let mut cache = self
-            .cache
-            .lock()
-            .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?;
-        cache.jwks_generation = cache.jwks_generation.saturating_add(1);
-        cache.jwks = Some(Cached {
-            value: jwks.clone(),
-            expires_at: now.saturating_add(ttl),
-        });
-        Ok(jwks)
     }
 }
 
@@ -774,8 +813,10 @@ fn validate_jwks(jwks: &JwkSet) -> Result<(), BrowserAuthFailure> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    use tokio::sync::Notify;
 
     use jsonwebtoken::jwk::JwkSet;
 
@@ -783,9 +824,10 @@ mod tests {
     use steward_types::OrganizationId;
 
     use super::{
-        Audience, GoogleClientSecret, GoogleHttpTransport, GoogleOidcProvider, HttpFailure,
-        HttpFuture, HttpResponse, IdTokenClaims, IdTokenError, TokenExchangeRequest, cache_ttl,
-        validate_claims, verify_id_token,
+        Audience, Cached, DiscoveryDocument, GoogleClientSecret, GoogleHttpTransport,
+        GoogleOidcProvider, HttpFailure, HttpFuture, HttpResponse, IdTokenClaims, IdTokenError,
+        JWKS_REFRESH_FAILURE_BACKOFF_SECONDS, TokenExchangeRequest, cache_ttl, validate_claims,
+        verify_id_token,
     };
 
     const FIXTURE_HEADER: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImZpeHR1cmUta2V5In0";
@@ -865,6 +907,79 @@ mod tests {
         }
     }
 
+    struct BlockingFailureTransport {
+        calls: AtomicUsize,
+        started: Notify,
+        release: Notify,
+        id_token: String,
+    }
+
+    impl BlockingFailureTransport {
+        fn new(id_token: String) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                started: Notify::new(),
+                release: Notify::new(),
+                id_token,
+            }
+        }
+    }
+
+    impl GoogleHttpTransport for BlockingFailureTransport {
+        fn get<'a>(&'a self, _url: &'a str, _max_body: usize) -> HttpFuture<'a> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                Err(HttpFailure::Unavailable)
+            })
+        }
+
+        fn post_token<'a>(
+            &'a self,
+            _url: &'a str,
+            _request: TokenExchangeRequest<'a>,
+            _max_body: usize,
+        ) -> HttpFuture<'a> {
+            Box::pin(async move {
+                json_response(serde_json::json!({ "id_token": self.id_token.as_str() }))
+                    .map_err(|_| HttpFailure::InvalidResponse)
+            })
+        }
+    }
+
+    struct CountingFailureTransport {
+        calls: AtomicUsize,
+    }
+
+    impl CountingFailureTransport {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl GoogleHttpTransport for CountingFailureTransport {
+        fn get<'a>(&'a self, _url: &'a str, _max_body: usize) -> HttpFuture<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(HttpFailure::Unavailable)
+            })
+        }
+
+        fn post_token<'a>(
+            &'a self,
+            _url: &'a str,
+            _request: TokenExchangeRequest<'a>,
+            _max_body: usize,
+        ) -> HttpFuture<'a> {
+            Box::pin(async { Err(HttpFailure::Unavailable) })
+        }
+    }
+
     fn json_response(value: serde_json::Value) -> Result<HttpResponse, String> {
         Ok(HttpResponse {
             status: 200,
@@ -907,6 +1022,33 @@ mod tests {
 
     fn fixture_now() -> u64 {
         1_100
+    }
+
+    fn seed_provider_cache(
+        provider: &GoogleOidcProvider,
+        now: u64,
+        jwks_expires_at: u64,
+        generation: u64,
+    ) -> Result<(), String> {
+        let discovery: DiscoveryDocument = serde_json::from_value(fixture_discovery())
+            .map_err(|error| format!("parse discovery fixture: {error}"))?;
+        let discovery = discovery
+            .validate()
+            .map_err(|error| format!("validate discovery fixture: {error:?}"))?;
+        let mut cache = provider
+            .cache
+            .lock()
+            .map_err(|_| "lock seeded provider cache".to_owned())?;
+        cache.discovery = Some(Cached {
+            value: discovery,
+            expires_at: now + 3_600,
+        });
+        cache.jwks = Some(Cached {
+            value: fixture_jwks()?,
+            expires_at: jwks_expires_at,
+        });
+        cache.jwks_generation = generation;
+        Ok(())
     }
 
     #[tokio::test]
@@ -1136,6 +1278,140 @@ mod tests {
                 .await,
             Err(BrowserAuthFailure::ProviderUnavailable)
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_unknown_kid_failure_is_serialized_and_backed_off_per_generation()
+    -> Result<(), String> {
+        let clock = Arc::new(AtomicU64::new(1_100));
+        let unknown_key_token =
+            token_with_header(serde_json::json!({"alg":"RS256","typ":"JWT","kid":"rotated-key"}))?;
+        let transport = Arc::new(BlockingFailureTransport::new(unknown_key_token));
+        let provider = GoogleOidcProvider::with_transport(
+            fixture_config()?,
+            "fixture-secret".to_owned(),
+            transport.clone(),
+            {
+                let clock = Arc::clone(&clock);
+                move || clock.load(Ordering::SeqCst)
+            },
+        )?;
+        seed_provider_cache(&provider, 1_100, 2_000, 7)?;
+
+        let first_provider = provider.clone();
+        let first = tokio::spawn(async move {
+            first_provider
+                .exchange_code(
+                    "one-time-code",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "https://steward.example.test/admin/auth/callback",
+                    "fixture-nonce",
+                )
+                .await
+        });
+        transport.started.notified().await;
+        let second_provider = provider.clone();
+        let second = tokio::spawn(async move {
+            second_provider
+                .exchange_code(
+                    "one-time-code",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "https://steward.example.test/admin/auth/callback",
+                    "fixture-nonce",
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        transport.release.notify_one();
+
+        assert!(matches!(
+            first.await,
+            Ok(Err(BrowserAuthFailure::ProviderUnavailable))
+        ));
+        assert!(matches!(
+            second.await,
+            Ok(Err(BrowserAuthFailure::ProviderUnavailable))
+        ));
+        assert_eq!(
+            transport.calls.load(Ordering::SeqCst),
+            1,
+            "waiters observing the same failed generation must not retry serially"
+        );
+        assert!(matches!(
+            provider.jwks(Some(7)).await,
+            Err(BrowserAuthFailure::ProviderUnavailable)
+        ));
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+
+        clock.store(
+            1_100 + JWKS_REFRESH_FAILURE_BACKOFF_SECONDS,
+            Ordering::SeqCst,
+        );
+        assert!(provider.jwks(Some(7)).await.is_err());
+        assert_eq!(
+            transport.calls.load(Ordering::SeqCst),
+            2,
+            "the same generation may retry only after the bounded backoff"
+        );
+
+        provider
+            .cache
+            .lock()
+            .map_err(|_| "lock provider generation".to_owned())?
+            .jwks_generation = 8;
+        assert!(provider.jwks(Some(8)).await.is_err());
+        assert_eq!(
+            transport.calls.load(Ordering::SeqCst),
+            3,
+            "a failure record for one generation must not suppress a later generation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn jwks_waiter_recomputes_time_and_rejects_cache_expired_while_queued()
+    -> Result<(), String> {
+        let clock = Arc::new(AtomicU64::new(1_100));
+        let now_calls = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(CountingFailureTransport::new());
+        let provider = GoogleOidcProvider::with_transport(
+            fixture_config()?,
+            "fixture-secret".to_owned(),
+            transport.clone(),
+            {
+                let clock = Arc::clone(&clock);
+                let now_calls = Arc::clone(&now_calls);
+                move || {
+                    now_calls.fetch_add(1, Ordering::SeqCst);
+                    clock.load(Ordering::SeqCst)
+                }
+            },
+        )?;
+        seed_provider_cache(&provider, 1_100, 1_101, 8)?;
+
+        let permit = provider
+            .refresh_gate
+            .acquire()
+            .await
+            .map_err(|error| format!("acquire fixture refresh gate: {error:?}"))?;
+        let queued_provider = provider.clone();
+        let queued = tokio::spawn(async move { queued_provider.jwks(Some(7)).await });
+        while now_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        clock.store(1_102, Ordering::SeqCst);
+        drop(permit);
+
+        assert!(matches!(
+            queued.await,
+            Ok(Err(BrowserAuthFailure::ProviderUnavailable))
+        ));
+        assert_eq!(
+            transport.calls.load(Ordering::SeqCst),
+            1,
+            "a cache entry that expired while queued must not be returned"
+        );
         Ok(())
     }
 

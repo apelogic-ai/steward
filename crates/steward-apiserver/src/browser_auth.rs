@@ -25,6 +25,8 @@ const GOOGLE_AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth
 const CALLBACK_PATH: &str = "/admin/auth/callback";
 const FLOW_TTL_SECONDS: u64 = 300;
 const SESSION_TTL_SECONDS: u64 = 3_600;
+const MAX_PENDING_AUTHORIZATIONS: usize = 256;
+const MAX_BROWSER_SESSIONS: usize = 4_096;
 const BROWSER_SESSION_API_VERSION: &str = "steward.browser-session/v1";
 const SIGN_IN_HTML: &str = include_str!("../assets/admin/sign-in.html");
 const SESSION_READY_HTML: &str = include_str!("../assets/admin/session-ready.html");
@@ -49,17 +51,11 @@ impl GoogleOidcConfig {
         organization_id: OrganizationId,
     ) -> Result<Self, String> {
         let client_id = client_id.into();
-        let browser_origin = browser_origin.into();
+        let browser_origin = normalize_https_origin(&browser_origin.into())?;
         let callback_uri = callback_uri.into();
         let hosted_domain = hosted_domain.into();
         if client_id.trim().is_empty() {
             return Err("Google OIDC client ID must be configured".to_owned());
-        }
-        if !browser_origin.starts_with("https://")
-            || browser_origin.ends_with('/')
-            || browser_origin.contains(['?', '#'])
-        {
-            return Err("browser origin must be one exact HTTPS origin".to_owned());
         }
         if callback_uri != format!("{browser_origin}{CALLBACK_PATH}") {
             return Err(
@@ -125,6 +121,36 @@ impl GoogleOidcConfig {
     }
 }
 
+fn normalize_https_origin(value: &str) -> Result<String, String> {
+    if value.trim() != value || !value.starts_with("https://") {
+        return Err("browser origin must be one exact HTTPS origin".to_owned());
+    }
+    let authority_and_path = &value["https://".len()..];
+    if authority_and_path
+        .find('/')
+        .is_some_and(|index| &authority_and_path[index..] != "/")
+    {
+        return Err("browser origin must be one exact HTTPS origin".to_owned());
+    }
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| "browser origin must be one exact HTTPS origin".to_owned())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("browser origin must be one exact HTTPS origin".to_owned());
+    }
+    let origin = url.origin().ascii_serialization();
+    if origin == "null" {
+        return Err("browser origin must be one exact HTTPS origin".to_owned());
+    }
+    Ok(origin)
+}
+
 #[derive(Clone)]
 pub struct GoogleAuthorizationOnlyProvider {
     config: GoogleOidcConfig,
@@ -157,6 +183,22 @@ pub struct BrowserSessionBinding(String);
 pub struct BrowserSessionContext {
     pub principal: BrowserPrincipal,
     pub binding: BrowserSessionBinding,
+}
+
+#[derive(Clone)]
+pub struct BrowserAdminAuthority {
+    principal: BrowserPrincipal,
+    binding: BrowserSessionBinding,
+}
+
+impl BrowserAdminAuthority {
+    pub fn principal(&self) -> &BrowserPrincipal {
+        &self.principal
+    }
+
+    pub fn binding(&self) -> &BrowserSessionBinding {
+        &self.binding
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -299,6 +341,7 @@ pub enum BrowserAuthFailure {
     InvalidIdentity,
     InvalidSession,
     InvalidMutation,
+    InsufficientAuthority,
     ProviderUnavailable,
     IdentityUnavailable,
     SessionUnavailable,
@@ -311,7 +354,7 @@ impl BrowserAuthFailure {
                 StatusCode::BAD_REQUEST
             }
             Self::InvalidSession => StatusCode::UNAUTHORIZED,
-            Self::InvalidMutation => StatusCode::FORBIDDEN,
+            Self::InvalidMutation | Self::InsufficientAuthority => StatusCode::FORBIDDEN,
             Self::ProviderUnavailable | Self::IdentityUnavailable | Self::SessionUnavailable => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -559,6 +602,13 @@ pub fn protect_browser_routes(routes: Router, service: BrowserAuthService) -> Ro
     ))
 }
 
+pub fn protect_browser_admin_routes(routes: Router, service: BrowserAuthService) -> Router {
+    routes.route_layer(middleware::from_fn_with_state(
+        service,
+        authenticate_browser_admin,
+    ))
+}
+
 async fn sign_in() -> Html<&'static str> {
     Html(SIGN_IN_HTML)
 }
@@ -780,13 +830,33 @@ async fn local_fake_authorize(
 
 pub async fn authenticate_browser_session(
     State(service): State<BrowserAuthService>,
+    request: Request,
+    next: Next,
+) -> Response {
+    authenticate_browser_request(service, request, next, false).await
+}
+
+pub async fn authenticate_browser_admin(
+    State(service): State<BrowserAuthService>,
+    request: Request,
+    next: Next,
+) -> Response {
+    authenticate_browser_request(service, request, next, true).await
+}
+
+async fn authenticate_browser_request(
+    service: BrowserAuthService,
     mut request: Request,
     next: Next,
+    require_admin: bool,
 ) -> Response {
     let session = match resolve_session(&service, request.headers()) {
         Ok(session) => session,
         Err(error) => return error.into_response(),
     };
+    if require_admin && session.principal.role != BrowserRole::Admin {
+        return BrowserAuthFailure::InsufficientAuthority.into_response();
+    }
     let is_mutation = matches!(
         *request.method(),
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
@@ -802,10 +872,17 @@ pub async fn authenticate_browser_session(
         }
         request.extensions_mut().insert(BrowserMutationProof(()));
     }
-    request.extensions_mut().insert(BrowserSessionContext {
+    let context = BrowserSessionContext {
         principal: session.principal,
         binding: BrowserSessionBinding(session.token),
-    });
+    };
+    if require_admin {
+        request.extensions_mut().insert(BrowserAdminAuthority {
+            principal: context.principal.clone(),
+            binding: context.binding.clone(),
+        });
+    }
+    request.extensions_mut().insert(context);
     next.run(request).await
 }
 
@@ -860,7 +937,9 @@ fn map_registry_error(error: BrowserAuthError) -> BrowserAuthFailure {
         BrowserAuthError::InvalidSession | BrowserAuthError::ExpiredSession => {
             BrowserAuthFailure::InvalidSession
         }
-        BrowserAuthError::StoreUnavailable => BrowserAuthFailure::SessionUnavailable,
+        BrowserAuthError::CapacityExceeded | BrowserAuthError::StoreUnavailable => {
+            BrowserAuthFailure::SessionUnavailable
+        }
     }
 }
 
@@ -982,6 +1061,7 @@ enum BrowserAuthError {
     InvalidRedirect,
     InvalidSession,
     ExpiredSession,
+    CapacityExceeded,
     StoreUnavailable,
 }
 
@@ -999,11 +1079,15 @@ struct BrowserSessionRegistry {
 impl BrowserSessionRegistry {
     fn begin(&self, return_to: &str, now: u64) -> Result<PendingAuthorization, BrowserAuthError> {
         let flow = PendingAuthorization::new(return_to, now)?;
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| BrowserAuthError::StoreUnavailable)?
-            .pending
-            .insert(flow.flow_id.clone(), flow.clone());
+            .map_err(|_| BrowserAuthError::StoreUnavailable)?;
+        state.pending.retain(|_, flow| flow.expires_at > now);
+        if state.pending.len() >= MAX_PENDING_AUTHORIZATIONS {
+            return Err(BrowserAuthError::CapacityExceeded);
+        }
+        state.pending.insert(flow.flow_id.clone(), flow.clone());
         Ok(flow)
     }
 
@@ -1040,9 +1124,15 @@ impl BrowserSessionRegistry {
             principal,
             expires_at: now.saturating_add(SESSION_TTL_SECONDS),
         };
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| BrowserAuthError::StoreUnavailable)?
+            .map_err(|_| BrowserAuthError::StoreUnavailable)?;
+        state.sessions.retain(|_, session| session.expires_at > now);
+        if state.sessions.len() >= MAX_BROWSER_SESSIONS {
+            return Err(BrowserAuthError::CapacityExceeded);
+        }
+        state
             .sessions
             .insert(session.token.clone(), session.clone());
         Ok(session)
@@ -1135,10 +1225,12 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        BrowserAuthError, BrowserAuthFailure, BrowserMutationProof, BrowserOidcProvider,
-        BrowserPrincipal, BrowserRole, BrowserSessionContext, BrowserSessionRegistry,
-        GoogleOidcConfig, LocalFakeIdentity, LocalFakeOidcProvider, PendingAuthorization,
-        browser_auth_router, local_fake_browser_auth_service, protect_browser_routes,
+        BrowserAdminAuthority, BrowserAuthError, BrowserAuthFailure, BrowserMutationProof,
+        BrowserOidcProvider, BrowserPrincipal, BrowserRole, BrowserSessionContext,
+        BrowserSessionRegistry, GoogleOidcConfig, LocalFakeIdentity, LocalFakeOidcProvider,
+        MAX_BROWSER_SESSIONS, MAX_PENDING_AUTHORIZATIONS, PendingAuthorization,
+        browser_auth_router, local_fake_browser_auth_service, protect_browser_admin_routes,
+        protect_browser_routes,
     };
 
     fn google_config() -> Result<GoogleOidcConfig, String> {
@@ -1200,6 +1292,48 @@ mod tests {
             .is_err(),
             "an empty hosted-domain boundary must fail closed"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn production_oidc_origin_is_parsed_normalized_and_has_no_url_components() -> Result<(), String>
+    {
+        let organization_id = OrganizationId::parse("org_example")?;
+        for origin in [
+            "https:steward.example.test",
+            "https://",
+            "https://user@steward.example.test",
+            "https://steward.example.test/admin",
+            "https://steward.example.test/.",
+            "https://steward.example.test/%2e",
+            "https://steward.example.test//",
+            "https://steward.example.test/?query",
+            "https://steward.example.test/#fragment",
+            " https://steward.example.test",
+            "https://steward.example.test ",
+            "https://steward.example.test:invalid",
+        ] {
+            assert!(
+                GoogleOidcConfig::new(
+                    "test-client-id",
+                    origin,
+                    "https://steward.example.test/admin/auth/callback",
+                    "example.com",
+                    organization_id.clone(),
+                )
+                .is_err(),
+                "non-origin value must fail closed: {origin:?}"
+            );
+        }
+
+        let normalized = GoogleOidcConfig::new(
+            "test-client-id",
+            "https://STEWARD.example.test:443/",
+            "https://steward.example.test/admin/auth/callback",
+            "example.com",
+            organization_id,
+        )?;
+        assert_eq!(normalized.browser_origin, "https://steward.example.test");
         Ok(())
     }
 
@@ -1336,6 +1470,166 @@ mod tests {
         assert_eq!(
             registry.resolve(&revoked.token, 201),
             Err(BrowserAuthError::InvalidSession)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn registries_fail_closed_at_capacity_and_reclaim_exact_expiry() -> Result<(), String> {
+        let flows = BrowserSessionRegistry::default();
+        for _ in 0..MAX_PENDING_AUTHORIZATIONS {
+            flows
+                .begin("/admin/connections", 100)
+                .map_err(|error| format!("fill pending registry: {error:?}"))?;
+        }
+        assert_eq!(
+            flows.begin("/admin/connections", 100),
+            Err(BrowserAuthError::CapacityExceeded)
+        );
+        assert_eq!(
+            flows
+                .state
+                .lock()
+                .map_err(|_| "lock pending registry".to_owned())?
+                .pending
+                .len(),
+            MAX_PENDING_AUTHORIZATIONS
+        );
+        flows
+            .begin("/admin/connections", 100 + super::FLOW_TTL_SECONDS)
+            .map_err(|error| format!("reclaim expired pending entries: {error:?}"))?;
+        assert_eq!(
+            flows
+                .state
+                .lock()
+                .map_err(|_| "lock reclaimed pending registry".to_owned())?
+                .pending
+                .len(),
+            1,
+            "entries expiring exactly now must be reclaimed under the insertion lock"
+        );
+
+        let sessions = BrowserSessionRegistry::default();
+        let expected_principal = principal()?;
+        for _ in 0..MAX_BROWSER_SESSIONS {
+            sessions
+                .issue(expected_principal.clone(), 200)
+                .map_err(|error| format!("fill session registry: {error:?}"))?;
+        }
+        assert_eq!(
+            sessions.issue(expected_principal.clone(), 200),
+            Err(BrowserAuthError::CapacityExceeded)
+        );
+        sessions
+            .issue(expected_principal, 200 + super::SESSION_TTL_SECONDS)
+            .map_err(|error| format!("reclaim expired session entries: {error:?}"))?;
+        assert_eq!(
+            sessions
+                .state
+                .lock()
+                .map_err(|_| "lock reclaimed session registry".to_owned())?
+                .sessions
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_flow_insertions_never_exceed_capacity() -> Result<(), String> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let registry = BrowserSessionRegistry::default();
+        let accepted = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let registry = registry.clone();
+                let accepted = &accepted;
+                scope.spawn(move || {
+                    for _ in 0..(MAX_PENDING_AUTHORIZATIONS / 8 + 16) {
+                        if registry.begin("/admin/connections", 100).is_ok() {
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(accepted.load(Ordering::SeqCst), MAX_PENDING_AUTHORIZATIONS);
+        assert_eq!(
+            registry
+                .state
+                .lock()
+                .map_err(|_| "lock concurrent registry".to_owned())?
+                .pending
+                .len(),
+            MAX_PENDING_AUTHORIZATIONS
+        );
+
+        let sessions = BrowserSessionRegistry::default();
+        let accepted = AtomicUsize::new(0);
+        let expected_principal = principal()?;
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let sessions = sessions.clone();
+                let accepted = &accepted;
+                let expected_principal = expected_principal.clone();
+                scope.spawn(move || {
+                    for _ in 0..(MAX_BROWSER_SESSIONS / 8 + 16) {
+                        if sessions.issue(expected_principal.clone(), 100).is_ok() {
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(accepted.load(Ordering::SeqCst), MAX_BROWSER_SESSIONS);
+        assert_eq!(
+            sessions
+                .state
+                .lock()
+                .map_err(|_| "lock concurrent session registry".to_owned())?
+                .sessions
+                .len(),
+            MAX_BROWSER_SESSIONS
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_login_requests_are_bounded_at_the_router() -> Result<(), String> {
+        let service =
+            local_fake_browser_auth_service("http://127.0.0.1:33001", LocalFakeIdentity::User)?;
+        for _ in 0..MAX_PENDING_AUTHORIZATIONS {
+            let response = browser_auth_router(service.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/auth/login")
+                        .body(Body::empty())
+                        .map_err(|error| format!("build bounded login request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("execute bounded login request: {error}"))?;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        }
+        let rejected = browser_auth_router(service.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/auth/login")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build over-capacity login request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute over-capacity login request: {error}"))?;
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            service
+                .registry
+                .state
+                .lock()
+                .map_err(|_| "lock router registry".to_owned())?
+                .pending
+                .len(),
+            MAX_PENDING_AUTHORIZATIONS
         );
         Ok(())
     }
@@ -1705,6 +1999,92 @@ mod tests {
             .map_err(|error| format!("parse protected mutation response: {error}"))?;
         assert_eq!(value["userId"], "usr_0123456789abcdef0123456789abcdef");
         assert_eq!(value["role"], "user");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn typed_browser_admin_guard_denies_user_and_bearer_but_accepts_admin()
+    -> Result<(), String> {
+        async fn admin_probe(
+            Extension(authority): Extension<BrowserAdminAuthority>,
+        ) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "role": authority.principal().role,
+                "userId": authority.principal().canonical_user_id,
+            }))
+        }
+
+        let service =
+            local_fake_browser_auth_service("http://127.0.0.1:33001", LocalFakeIdentity::User)?;
+        let routes = || {
+            protect_browser_admin_routes(
+                Router::new().route("/admin-probe", axum::routing::get(admin_probe)),
+                service.clone(),
+            )
+        };
+        let user = service
+            .registry
+            .issue(principal()?, super::epoch_seconds())
+            .map_err(|error| format!("issue ordinary browser session: {error:?}"))?;
+        let mut admin_principal = principal()?;
+        admin_principal.role = BrowserRole::Admin;
+        let admin = service
+            .registry
+            .issue(admin_principal, super::epoch_seconds())
+            .map_err(|error| format!("issue administrator browser session: {error:?}"))?;
+
+        let unauthenticated = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin-probe")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build unauthenticated admin request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute unauthenticated admin request: {error}"))?;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let token_review_bearer = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin-probe")
+                    .header(header::AUTHORIZATION, "Bearer operator-token")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build bearer-only browser request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute bearer-only browser request: {error}"))?;
+        assert_eq!(token_review_bearer.status(), StatusCode::UNAUTHORIZED);
+
+        let forbidden = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin-probe")
+                    .header(
+                        header::COOKIE,
+                        format!("steward-local-session={}", user.token),
+                    )
+                    .body(Body::empty())
+                    .map_err(|error| format!("build ordinary-user admin request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute ordinary-user admin request: {error}"))?;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let accepted = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin-probe")
+                    .header(
+                        header::COOKIE,
+                        format!("steward-local-session={}", admin.token),
+                    )
+                    .body(Body::empty())
+                    .map_err(|error| format!("build administrator browser request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute administrator browser request: {error}"))?;
+        assert_eq!(accepted.status(), StatusCode::OK);
         Ok(())
     }
 }

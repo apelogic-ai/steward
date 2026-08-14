@@ -24,6 +24,11 @@ The existing Kubernetes TokenReview administrator routes remain unchanged. Brows
 parallel, route-specific frontend boundary and cannot inject a bearer assertion into that operator
 path.
 
+Production browser configuration parses and canonicalizes one real HTTPS origin. Userinfo,
+non-root paths, query strings, fragments, malformed ports, whitespace, scheme-like strings, and
+insecure schemes fail closed. The configured callback must then equal the canonical origin plus
+exactly `/admin/auth/callback`.
+
 ## Routes
 
 - `GET /admin/sign-in` renders a self-hosted sign-in shell.
@@ -55,6 +60,12 @@ session store with atomic one-time flow consumption, TTL, revocation, and fixati
 signing key or encrypted client-side session would not provide those semantics and is not an
 acceptable substitute.
 
+The process-local registry admits at most 256 pending authorization flows and 4,096 browser
+sessions. Before each insertion it prunes entries whose TTL expires at or before the current time
+while holding the same lock used for the capacity check and insertion. A full registry rejects the
+new flow or session with a generic service-unavailable response; it never evicts a live entry or
+grows beyond the cap.
+
 Every authenticated browser mutation requires all of:
 
 - exact configured `Origin`;
@@ -66,6 +77,13 @@ Protected application handlers receive `BrowserSessionContext`. It contains a ca
 and an opaque `BrowserSessionBinding` that is cloneable, comparable, and hashable but is not
 debuggable, displayable, serializable, or exposed as a string. Connections can key one-time provider
 continuations by that binding without putting a session identifier into JSON.
+
+Ordinary user routes use `protect_browser_routes`. Browser administrator routes must instead use
+`protect_browser_admin_routes` and extract the unforgeable `BrowserAdminAuthority` extension.
+Missing browser authentication returns 401, an authenticated ordinary user returns 403, and only a
+session resolved with the administrator role receives the typed authority. A Kubernetes
+TokenReview bearer cannot satisfy this browser guard, and a browser cookie cannot satisfy the
+separate operator TokenReview boundary.
 
 ## Local fake OIDC hand test
 
@@ -105,6 +123,11 @@ singleton client audience, optional exact authorized party, consumed nonce, expi
 bounded subject, verified email, and exact hosted domain. JWKS uses bounded HTTP caching, performs
 one synchronized refresh on an unknown key, preserves a fresh last-good set across malformed
 rotation responses, and fails closed after expiry if refresh is unavailable.
+
+Unknown-key JWKS refresh is serialized. A failed refresh is remembered for its observed cache
+generation and suppresses duplicate waiter retries for five seconds; a later generation is not
+suppressed. Cache time is recomputed after waiting for the refresh gate and again when storing a
+response, so a key set that expires while queued cannot be returned as fresh.
 
 `GoogleOidcProvider::new` requires the client secret as a non-debuggable runtime value. The
 non-secret client ID is also runtime configuration; neither value has a source default. No
