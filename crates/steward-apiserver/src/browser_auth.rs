@@ -143,6 +143,9 @@ pub struct BrowserSessionContext {
     pub binding: BrowserSessionBinding,
 }
 
+#[derive(Clone, Copy)]
+pub struct BrowserMutationProof(());
+
 pub struct VerifiedOrganizationClaims {
     issuer: String,
     subject: String,
@@ -759,16 +762,20 @@ pub async fn authenticate_browser_session(
         Ok(session) => session,
         Err(error) => return error.into_response(),
     };
-    if matches!(
+    let is_mutation = matches!(
         *request.method(),
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    ) && !valid_mutation(
-        &service.config,
-        request.headers(),
-        request.method(),
-        &session.csrf,
-    ) {
-        return BrowserAuthFailure::InvalidMutation.into_response();
+    );
+    if is_mutation {
+        if !valid_mutation(
+            &service.config,
+            request.headers(),
+            request.method(),
+            &session.csrf,
+        ) {
+            return BrowserAuthFailure::InvalidMutation.into_response();
+        }
+        request.extensions_mut().insert(BrowserMutationProof(()));
     }
     request.extensions_mut().insert(BrowserSessionContext {
         principal: session.principal,
@@ -1086,13 +1093,16 @@ fn percent_encode(value: &str) -> String {
 mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
+    use axum::routing::post;
+    use axum::{Extension, Json, Router};
     use steward_types::{CanonicalUserId, Email, OrganizationId};
     use tower::ServiceExt;
 
     use super::{
-        BrowserAuthError, BrowserPrincipal, BrowserRole, BrowserSessionRegistry, GoogleOidcConfig,
-        LocalFakeIdentity, PendingAuthorization, browser_auth_router,
-        local_fake_browser_auth_service,
+        BrowserAuthError, BrowserMutationProof, BrowserPrincipal, BrowserRole,
+        BrowserSessionContext, BrowserSessionRegistry, GoogleOidcConfig, LocalFakeIdentity,
+        PendingAuthorization, browser_auth_router, local_fake_browser_auth_service,
+        protect_browser_routes,
     };
 
     fn google_config() -> Result<GoogleOidcConfig, String> {
@@ -1509,6 +1519,75 @@ mod tests {
             .await
             .map_err(|error| format!("execute revoked session request: {error}"))?;
         assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn protected_mutation_receives_canonical_session_and_validated_proof_extensions()
+    -> Result<(), String> {
+        async fn probe(
+            Extension(session): Extension<BrowserSessionContext>,
+            Extension(_proof): Extension<BrowserMutationProof>,
+        ) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "userId": session.principal.canonical_user_id,
+                "role": session.principal.role,
+            }))
+        }
+
+        let service =
+            local_fake_browser_auth_service("http://127.0.0.1:33001", LocalFakeIdentity::User)?;
+        let issued = service
+            .registry
+            .issue(principal()?, super::epoch_seconds())
+            .map_err(|error| format!("issue protected-route session: {error:?}"))?;
+        let routes =
+            || protect_browser_routes(Router::new().route("/probe", post(probe)), service.clone());
+        let rejected = routes()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/probe")
+                    .header(
+                        header::COOKIE,
+                        format!("steward-local-session={}", issued.token),
+                    )
+                    .header(header::ORIGIN, "http://127.0.0.1:33001")
+                    .header("sec-fetch-site", "same-origin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build missing-proof request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute missing-proof request: {error}"))?;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        let accepted = routes()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/probe")
+                    .header(
+                        header::COOKIE,
+                        format!("steward-local-session={}", issued.token),
+                    )
+                    .header(header::ORIGIN, "http://127.0.0.1:33001")
+                    .header("sec-fetch-site", "same-origin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-steward-csrf", issued.csrf)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build validated mutation request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute validated mutation request: {error}"))?;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let body = to_bytes(accepted.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read protected mutation response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse protected mutation response: {error}"))?;
+        assert_eq!(value["userId"], "usr_0123456789abcdef0123456789abcdef");
+        assert_eq!(value["role"], "user");
         Ok(())
     }
 }
