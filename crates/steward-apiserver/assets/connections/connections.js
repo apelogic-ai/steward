@@ -167,6 +167,9 @@ async function loadConnection() {
     throw new Error("provider connection contract mismatch");
   }
   renderConnection(value.status);
+  if (!callbackStatus.hidden && value.status.phase === "connected") {
+    callbackStatus.textContent = "GitHub connected.";
+  }
 }
 
 async function startConnection() {
@@ -209,6 +212,8 @@ async function disconnectConnection() {
     }
     disconnectDialog.close();
     await loadConnection();
+    callbackStatus.textContent = "";
+    callbackStatus.hidden = true;
   } catch (_error) {
     disconnectDialog.close();
     showError("GitHub could not be disconnected. Refresh the status before retrying.");

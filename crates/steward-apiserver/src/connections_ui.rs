@@ -152,6 +152,8 @@ mod tests {
             "candidate.protocol === \"https:\"",
             "candidate.origin === window.location.origin",
             "candidate.pathname === \"/admin/connections/github/callback\"",
+            "callbackStatus.textContent = \"GitHub connected.\"",
+            "callbackStatus.hidden = true",
         ] {
             assert!(
                 CONNECTIONS_JS.contains(required),
