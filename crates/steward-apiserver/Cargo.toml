@@ -34,5 +34,15 @@ name = "admin-dashboard-demo"
 path = "examples/admin-dashboard-demo.rs"
 required-features = ["admin-demo"]
 
+[[example]]
+name = "fast-track-connections-bridge"
+path = "examples/fast-track-connections-bridge.rs"
+required-features = ["admin-demo"]
+
+[[example]]
+name = "fast-track-steward-preview"
+path = "examples/fast-track-steward-preview.rs"
+required-features = ["admin-demo"]
+
 [lints]
 workspace = true
