@@ -15,9 +15,23 @@ use steward_mint::{
     MintError, MintSigningKey, OpaqueAccessToken, SPIFFE_CLIENT_ASSERTION_TYPE, SvidAssertion,
     SvidValidationError, SvidValidator, TokenGrantRequest, ValidatedWorkload,
 };
-use steward_types::{Email, Principal, RuntimeId, ToolGrant};
+use steward_types::{
+    CanonicalAuthorityBinding, CanonicalUserId, Email, Principal, RuntimeId, ToolGrant,
+};
 
 const EXPECTED_WORKLOAD: &str = "spiffe://example.org/agent/runtime-a";
+const CANONICAL_USER: &str = "usr_0123456789abcdef0123456789abcdef";
+
+fn canonical_user_id() -> Result<CanonicalUserId, String> {
+    CanonicalUserId::parse(CANONICAL_USER)
+        .map_err(|_| "canonical-user fixture must satisfy the reviewed wire format".to_owned())
+}
+
+fn person_authority() -> Result<CanonicalAuthorityBinding, String> {
+    let user_id = canonical_user_id()?;
+    CanonicalAuthorityBinding::new(user_id.clone(), Some(user_id))
+        .map_err(|_| "person-authority fixture must satisfy the reviewed invariant".to_owned())
+}
 
 struct FixedValidator {
     outcome: Result<ValidatedWorkload, SvidValidationError>,
@@ -77,27 +91,28 @@ impl CredentialGrantResolver for FixedCredentialResolver {
     }
 }
 
-fn active_binding() -> AuthorityBinding {
-    AuthorityBinding {
+fn active_binding() -> Result<AuthorityBinding, String> {
+    Ok(AuthorityBinding {
         workload_id: EXPECTED_WORKLOAD.to_owned(),
         runtime: RuntimeId("runtime-uid-a".to_owned()),
         runtime_namespace: "team-a".to_owned(),
         principal: Principal::User {
             acting_user: Email("alice@example.com".to_owned()),
         },
+        canonical_authority: Some(person_authority()?),
         tools: Vec::new(),
         state: AuthorityState::Active,
-    }
+    })
 }
 
-fn binding_with_tool() -> AuthorityBinding {
-    let mut binding = active_binding();
+fn binding_with_tool() -> Result<AuthorityBinding, String> {
+    let mut binding = active_binding()?;
     binding.tools.push(ToolGrant {
         provider: "github".to_owned(),
         resource: "repositories".to_owned(),
         action: "list".to_owned(),
     });
-    binding
+    Ok(binding)
 }
 
 fn request() -> TokenGrantRequest {
@@ -160,7 +175,7 @@ fn mint_for_inference_without_credential_resolver() -> Result<TestMint, String> 
         },
         FixedResolver {
             calls: Arc::new(AtomicUsize::new(0)),
-            outcome: Ok(active_binding()),
+            outcome: Ok(active_binding()?),
         },
     )
     .map_err(|error| format!("test mint config must be valid: {error:?}"))
@@ -252,7 +267,8 @@ fn mint_config_rejects_empty_identity_fields_and_out_of_bounds_ttls() {
 
 #[tokio::test]
 async fn forged_svid_fails_before_authority_lookup() -> Result<(), String> {
-    let (mint, resolver_calls, _) = mint(Err(SvidValidationError::Rejected), Ok(active_binding()))?;
+    let (mint, resolver_calls, _) =
+        mint(Err(SvidValidationError::Rejected), Ok(active_binding()?))?;
 
     let result = mint.exchange(request()).await;
 
@@ -271,7 +287,7 @@ async fn forged_svid_fails_before_authority_lookup() -> Result<(), String> {
 
 #[tokio::test]
 async fn expired_svid_fails_before_authority_lookup() -> Result<(), String> {
-    let (mint, resolver_calls, _) = mint(Err(SvidValidationError::Expired), Ok(active_binding()))?;
+    let (mint, resolver_calls, _) = mint(Err(SvidValidationError::Expired), Ok(active_binding()?))?;
 
     let result = mint.exchange(request()).await;
 
@@ -290,7 +306,7 @@ async fn expired_svid_fails_before_authority_lookup() -> Result<(), String> {
 
 #[tokio::test]
 async fn validated_svid_for_a_different_workload_fails_closed() -> Result<(), String> {
-    let mut binding = active_binding();
+    let mut binding = active_binding()?;
     binding.workload_id = "spiffe://example.org/agent/runtime-b".to_owned();
     let (mint, _, _) = mint(Ok(validated_workload()), Ok(binding))?;
 
@@ -306,7 +322,7 @@ async fn validated_svid_for_a_different_workload_fails_closed() -> Result<(), St
 
 #[tokio::test]
 async fn replay_after_runtime_revocation_fails_closed() -> Result<(), String> {
-    let mut binding = active_binding();
+    let mut binding = active_binding()?;
     binding.state = AuthorityState::Revoked;
     let (mint, _, _) = mint(Ok(validated_workload()), Ok(binding))?;
 
@@ -322,7 +338,7 @@ async fn replay_after_runtime_revocation_fails_closed() -> Result<(), String> {
 
 #[tokio::test]
 async fn terminated_runtime_cannot_obtain_a_token() -> Result<(), String> {
-    let mut binding = active_binding();
+    let mut binding = active_binding()?;
     binding.state = AuthorityState::Terminated;
     let (mint, _, _) = mint(Ok(validated_workload()), Ok(binding))?;
 
@@ -337,12 +353,46 @@ async fn terminated_runtime_cannot_obtain_a_token() -> Result<(), String> {
 }
 
 #[tokio::test]
-async fn pure_service_principal_receives_an_isolated_service_subject() -> Result<(), String> {
-    let mut binding = active_binding();
+async fn person_bound_principal_without_canonical_authority_fails_closed() -> Result<(), String> {
+    let mut binding = active_binding()?;
+    binding.canonical_authority = None;
+    let (mint, _, _) = mint(Ok(validated_workload()), Ok(binding))?;
+
+    let result = mint.exchange(request()).await;
+
+    assert!(
+        result.is_err(),
+        "legacy email-only person authority must reconnect rather than minting HOP-1"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pure_service_cannot_adopt_a_person_bound_canonical_subject() -> Result<(), String> {
+    let mut binding = active_binding()?;
     binding.principal = Principal::Service {
         name: "service-a".to_owned(),
         acting_user: None,
     };
+    let (mint, _, _) = mint(Ok(validated_workload()), Ok(binding))?;
+
+    let result = mint.exchange(request()).await;
+
+    assert!(
+        result.is_err(),
+        "a pure service must fail closed when its authority claims an acting person"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pure_service_principal_receives_an_isolated_service_subject() -> Result<(), String> {
+    let mut binding = active_binding()?;
+    binding.principal = Principal::Service {
+        name: "service-a".to_owned(),
+        acting_user: None,
+    };
+    binding.canonical_authority = None;
     let (mint, _, verifying_key) = mint(Ok(validated_workload()), Ok(binding))?;
 
     let response = mint
@@ -364,14 +414,14 @@ async fn pure_service_principal_receives_an_isolated_service_subject() -> Result
     );
     assert_eq!(claims["steward"]["acting_as"], "service");
     assert_eq!(claims["steward"]["service"], "service-a");
-    assert_eq!(claims["steward"]["version"], 2);
+    assert_eq!(claims["steward"]["version"], 3);
     Ok(())
 }
 
 #[tokio::test]
 async fn delegated_service_preserves_both_service_and_acting_user_attribution() -> Result<(), String>
 {
-    let mut binding = active_binding();
+    let mut binding = active_binding()?;
     binding.principal = Principal::Service {
         name: "steward-run".to_owned(),
         acting_user: Some(Email("alice@example.com".to_owned())),
@@ -390,11 +440,11 @@ async fn delegated_service_preserves_both_service_and_acting_user_attribution() 
         .map_err(|error| format!("mint returned an invalid EdDSA signature: {error}"))?;
     let claims = &token.claims().custom;
 
-    assert_eq!(claims["sub"], "alice@example.com");
+    assert_eq!(claims["sub"], CANONICAL_USER);
     assert_eq!(claims["email"], "alice@example.com");
     assert_eq!(claims["steward"]["acting_as"], "service_for_user");
     assert_eq!(claims["steward"]["service"], "steward-run");
-    assert_eq!(claims["steward"]["version"], 2);
+    assert_eq!(claims["steward"]["version"], 3);
     Ok(())
 }
 
@@ -435,7 +485,7 @@ async fn inference_scope_cannot_fall_back_to_hop1_when_combined_with_another_sco
         },
         FixedResolver {
             calls: Arc::new(AtomicUsize::new(0)),
-            outcome: Ok(active_binding()),
+            outcome: Ok(active_binding()?),
         },
     )
     .map_err(|error| format!("test mint config must be valid: {error:?}"))?;
@@ -472,7 +522,7 @@ async fn inference_scope_returns_only_the_runtime_bound_opaque_credential() -> R
         },
         FixedResolver {
             calls: Arc::new(AtomicUsize::new(0)),
-            outcome: Ok(active_binding()),
+            outcome: Ok(active_binding()?),
         },
         FixedCredentialResolver {
             calls: credential_calls.clone(),
@@ -503,7 +553,7 @@ async fn inference_scope_returns_only_the_runtime_bound_opaque_credential() -> R
 async fn inactive_runtime_fails_before_inference_credential_lookup() -> Result<(), String> {
     let signing_key = SigningKey::generate(&mut OsRng);
     let credential_calls = Arc::new(AtomicUsize::new(0));
-    let mut binding = active_binding();
+    let mut binding = active_binding()?;
     binding.state = AuthorityState::Suspended;
     let mint = Mint::new_with_credential_resolver(
         MintConfig {
@@ -566,7 +616,7 @@ struct TestStewardClaims {
 
 #[tokio::test]
 async fn active_user_receives_a_versioned_sixty_second_eddsa_hop1() -> Result<(), String> {
-    let (mint, _, verifying_key) = mint(Ok(validated_workload()), Ok(binding_with_tool()))?;
+    let (mint, _, verifying_key) = mint(Ok(validated_workload()), Ok(binding_with_tool()?))?;
 
     let response = match mint.exchange(request()).await {
         Ok(response) => response,
@@ -599,21 +649,35 @@ async fn active_user_receives_a_versioned_sixty_second_eddsa_hop1() -> Result<()
     assert_eq!(expiration - issued_at, Duration::seconds(60));
     assert_eq!(claims.custom.iss, "https://mint.example.test");
     assert_eq!(claims.custom.aud, ["mcp-gw.example.test"]);
-    assert_eq!(claims.custom.sub, "alice@example.com");
+    assert_eq!(claims.custom.sub, CANONICAL_USER);
     assert_eq!(claims.custom.email.as_deref(), Some("alice@example.com"));
     assert_eq!(claims.custom.azp, EXPECTED_WORKLOAD);
     assert!(!claims.custom.jti.is_empty(), "HOP-1 must carry a jti");
-    assert_eq!(claims.custom.steward.version, 2);
+    assert_eq!(claims.custom.steward.version, 3);
     assert_eq!(claims.custom.steward.acting_as, "user");
     assert_eq!(claims.custom.steward.service, None);
     assert_eq!(claims.custom.steward.runtime_uid, "runtime-uid-a");
-    assert_eq!(claims.custom.steward.tools, binding_with_tool().tools);
+    assert_eq!(claims.custom.steward.tools, binding_with_tool()?.tools);
+
+    let untrusted = UntrustedToken::new(response.access_token())
+        .map_err(|error| format!("mint returned malformed JWT: {error}"))?;
+    let serialized: Token<serde_json::Value> = Ed25519
+        .validator(&verifying_key)
+        .validate(&untrusted)
+        .map_err(|error| format!("mint returned an invalid EdDSA signature: {error}"))?;
+    let serialized = &serialized.claims().custom;
+    for forbidden in ["organization", "tenant", "provider", "provider_subject"] {
+        assert!(
+            serialized.get(forbidden).is_none(),
+            "HOP-1 must not serialize {forbidden}; consumers isolate grants by issuer, canonical subject, and provider configuration"
+        );
+    }
     Ok::<(), String>(())
 }
 
 #[test]
 fn jwks_contains_only_the_public_eddsa_key() -> Result<(), String> {
-    let (mint, _, _) = mint(Ok(validated_workload()), Ok(active_binding()))?;
+    let (mint, _, _) = mint(Ok(validated_workload()), Ok(active_binding()?))?;
 
     let jwks = mint
         .jwks()
