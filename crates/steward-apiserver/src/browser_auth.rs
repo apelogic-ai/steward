@@ -1233,6 +1233,18 @@ mod tests {
         protect_browser_routes,
     };
 
+    #[test]
+    fn sign_in_journey_lands_on_connections_instead_of_the_session_fixture() {
+        assert!(
+            super::SIGN_IN_HTML.contains("returnTo=%2Fadmin%2Fconnections"),
+            "the user-bound credential journey must continue directly to Connections"
+        );
+        assert!(
+            !super::SIGN_IN_HTML.contains("returnTo=%2Fadmin%2Fsession-ready"),
+            "the sign-in call to action must not strand users on a fixture page"
+        );
+    }
+
     fn google_config() -> Result<GoogleOidcConfig, String> {
         GoogleOidcConfig::new(
             "test-client-id",

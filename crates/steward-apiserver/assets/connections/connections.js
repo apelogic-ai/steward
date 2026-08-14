@@ -47,6 +47,29 @@ function mutationHeaders() {
   };
 }
 
+function isAllowedAuthorizationUrl(value) {
+  let candidate;
+  try {
+    candidate = new URL(value);
+  } catch (_error) {
+    return false;
+  }
+  if (candidate.username || candidate.password) {
+    return false;
+  }
+  if (candidate.protocol === "https:") {
+    return true;
+  }
+  const loopback = window.location.hostname === "127.0.0.1" || window.location.hostname === "[::1]";
+  return (
+    loopback &&
+    candidate.protocol === "http:" &&
+    candidate.origin === window.location.origin &&
+    candidate.pathname === "/admin/connections/github/callback" &&
+    candidate.searchParams.has("continuation")
+  );
+}
+
 async function fetchJson(path, options = {}) {
   const response = await fetch(path, {
     cache: "no-store",
@@ -159,7 +182,7 @@ async function startConnection() {
       value.apiVersion !== CONNECTIONS_VERSION ||
       value.provider !== "github" ||
       typeof value.authorizationUrl !== "string" ||
-      !value.authorizationUrl.startsWith("https://")
+      !isAllowedAuthorizationUrl(value.authorizationUrl)
     ) {
       throw new Error("provider authorization response mismatch");
     }

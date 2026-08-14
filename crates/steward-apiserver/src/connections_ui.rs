@@ -148,6 +148,10 @@ mod tests {
             "/admin/api/v1/connections/github/disconnect",
             "X-Steward-CSRF",
             "textContent",
+            "isAllowedAuthorizationUrl",
+            "candidate.protocol === \"https:\"",
+            "candidate.origin === window.location.origin",
+            "candidate.pathname === \"/admin/connections/github/callback\"",
         ] {
             assert!(
                 CONNECTIONS_JS.contains(required),
