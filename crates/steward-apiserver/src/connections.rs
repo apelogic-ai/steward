@@ -2,8 +2,9 @@
 
 use std::hash::Hash;
 
-use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{Query, Request, State};
+use axum::http::{Method, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -11,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use steward_types::CanonicalUserId;
 
 use crate::BoxFuture;
+use crate::browser_auth::{
+    BrowserAuthService, BrowserMutationProof, BrowserSessionBinding, BrowserSessionContext,
+    protect_browser_routes,
+};
 
 pub const CONNECTIONS_API_VERSION: &str = "steward.connections/v1";
 
@@ -154,7 +159,7 @@ struct ConnectionsState<P> {
     broker: P,
 }
 
-pub fn router<P, B>(broker: P) -> Router
+fn inner_router<P, B>(broker: P) -> Router
 where
     P: ProviderConnectionBroker<B>,
     B: Clone + Eq + Hash + Send + Sync + 'static,
@@ -178,6 +183,48 @@ where
         )
         .merge(crate::connections_ui::router::<B, ConnectionsState<P>>())
         .with_state(ConnectionsState { broker })
+}
+
+/// Mount the Connections surface behind Steward's browser-session boundary.
+///
+/// Keeping the unprotected router private makes it impossible for production callers to
+/// accidentally expose connection state or mutations without the session, origin, fetch-site,
+/// JSON, and per-session CSRF checks enforced by `protect_browser_routes`.
+pub fn protected_router<P>(broker: P, browser_auth: BrowserAuthService) -> Router
+where
+    P: ProviderConnectionBroker<BrowserSessionBinding>,
+{
+    let routes = inner_router(broker).route_layer(middleware::from_fn(adapt_browser_context));
+    protect_browser_routes(routes, browser_auth)
+}
+
+async fn adapt_browser_context(mut request: Request, next: Next) -> Response {
+    if let Some(context) = request.extensions().get::<BrowserSessionContext>().cloned() {
+        request.extensions_mut().insert(ConnectionSession {
+            subject: ConnectionSubject {
+                canonical_user_id: context.principal.canonical_user_id,
+                display_email: context.principal.display_email.as_str().to_owned(),
+            },
+            binding: context.binding,
+        });
+        if matches!(
+            *request.method(),
+            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        ) && request.extensions().get::<BrowserMutationProof>().is_some()
+        {
+            request.extensions_mut().insert(ConnectionMutationProof);
+        }
+    }
+    next.run(request).await
+}
+
+#[cfg(test)]
+fn test_router<P, B>(broker: P) -> Router
+where
+    P: ProviderConnectionBroker<B>,
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    inner_router(broker)
 }
 
 async fn start_connection<P, B>(
@@ -318,6 +365,14 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    fn router<P, B>(broker: P) -> Router
+    where
+        P: ProviderConnectionBroker<B>,
+        B: Clone + Eq + Hash + Send + Sync + 'static,
+    {
+        test_router(broker)
+    }
 
     #[derive(Clone, Eq, Hash, PartialEq)]
     struct TestSessionBinding(&'static str);

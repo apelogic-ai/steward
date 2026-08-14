@@ -11,7 +11,12 @@ use axum::response::Response;
 
 use crate::{
     AuthenticatedCaller, AuthenticationError, BoxFuture, RequestAuthenticator, admin_ui,
-    browser_auth::{LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service},
+    browser_auth::{
+        BrowserSessionBinding, LocalFakeIdentity, browser_auth_router,
+        local_fake_browser_auth_service,
+    },
+    connections,
+    connections_demo::LocalConnectionsBroker,
     protect_admin_routes,
 };
 
@@ -102,15 +107,25 @@ pub fn router(mode: AdminDashboardDemoMode, origin: &str) -> Result<Router, Stri
             protected.layer(middleware::from_fn(inject_local_demo_bearer))
         }
         AdminDashboardDemoMode::Unauthenticated => protected,
-        AdminDashboardDemoMode::OidcUser => browser_auth_router(local_fake_browser_auth_service(
-            origin,
-            LocalFakeIdentity::User,
-        )?),
-        AdminDashboardDemoMode::OidcAdmin => browser_auth_router(local_fake_browser_auth_service(
-            origin,
-            LocalFakeIdentity::Admin,
-        )?),
+        AdminDashboardDemoMode::OidcUser => {
+            oidc_connections_router(origin, LocalFakeIdentity::User)?
+        }
+        AdminDashboardDemoMode::OidcAdmin => {
+            oidc_connections_router(origin, LocalFakeIdentity::Admin)?
+        }
     })
+}
+
+fn oidc_connections_router(origin: &str, identity: LocalFakeIdentity) -> Result<Router, String> {
+    let bind = origin
+        .strip_prefix("http://")
+        .ok_or_else(|| "localhost OIDC demo origin must use explicit loopback HTTP".to_owned())?
+        .parse::<SocketAddr>()
+        .map_err(|_| "localhost OIDC demo origin must contain a socket address".to_owned())?;
+    let browser_auth = local_fake_browser_auth_service(origin, identity)?;
+    let broker = LocalConnectionsBroker::<BrowserSessionBinding>::new(bind)?;
+    Ok(browser_auth_router(browser_auth.clone())
+        .merge(connections::protected_router(broker, browser_auth)))
 }
 
 #[cfg(test)]
@@ -124,6 +139,18 @@ mod tests {
     use super::{AdminDashboardDemoConfig, AdminDashboardDemoMode, router};
 
     const TEST_ORIGIN: &str = "http://127.0.0.1:33002";
+
+    fn cookie_pair(response: &axum::response::Response, name: &str) -> Result<String, String> {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with(&format!("{name}=")))
+            .and_then(|value| value.split(';').next())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("response omitted {name} cookie"))
+    }
 
     #[test]
     fn demo_bind_is_loopback_only() {
@@ -265,6 +292,182 @@ mod tests {
                     .contains_key(header::CONTENT_SECURITY_POLICY)
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oidc_connections_surface_is_wired_behind_the_browser_session() -> Result<(), String> {
+        let response = router(AdminDashboardDemoMode::OidcUser, TEST_ORIGIN)?
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/connections")
+                    .body(Body::empty())
+                    .map_err(|error| {
+                        format!("build unauthenticated Connections request: {error}")
+                    })?,
+            )
+            .await
+            .map_err(|error| format!("request unauthenticated Connections shell: {error}"))?;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "the Connections route must exist but fail closed before a browser session"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oidc_user_can_complete_the_credential_free_connections_loopback_flow()
+    -> Result<(), String> {
+        let app = router(AdminDashboardDemoMode::OidcUser, TEST_ORIGIN)?;
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/auth/login")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build login request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request login: {error}"))?;
+        assert_eq!(login.status(), StatusCode::SEE_OTHER);
+        let flow_cookie = cookie_pair(&login, "steward-local-oidc-flow")?;
+        let authorization = login
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "login omitted authorization redirect".to_owned())?
+            .to_owned();
+
+        let authorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(authorization)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build local authorization request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request local authorization: {error}"))?;
+        let callback = authorized
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "local authorization omitted callback redirect".to_owned())?
+            .to_owned();
+        let signed_in = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(callback)
+                    .header(header::COOKIE, flow_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build OIDC callback request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request OIDC callback: {error}"))?;
+        assert_eq!(signed_in.status(), StatusCode::SEE_OTHER);
+        let session_cookie = cookie_pair(&signed_in, "steward-local-session")?;
+
+        let session = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/session")
+                    .header(header::COOKIE, &session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build browser session request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request browser session: {error}"))?;
+        let body = to_bytes(session.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read browser session: {error}"))?;
+        let session: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse browser session: {error}"))?;
+        let csrf = session["csrf"]
+            .as_str()
+            .ok_or_else(|| "browser session omitted CSRF proof".to_owned())?;
+
+        let missing_csrf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/connections/github/start")
+                    .header(header::COOKIE, &session_cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build unproved connection start: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request unproved connection start: {error}"))?;
+        assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+
+        let started = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/connections/github/start")
+                    .header(header::COOKIE, &session_cookie)
+                    .header(header::ORIGIN, TEST_ORIGIN)
+                    .header("sec-fetch-site", "same-origin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-steward-csrf", csrf)
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build connection start: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request connection start: {error}"))?;
+        assert_eq!(started.status(), StatusCode::OK);
+        let body = to_bytes(started.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read connection start: {error}"))?;
+        let start: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse connection start: {error}"))?;
+        let continuation = start["authorizationUrl"]
+            .as_str()
+            .ok_or_else(|| "connection start omitted one-time URL".to_owned())?;
+        assert!(continuation.starts_with(TEST_ORIGIN));
+        for forbidden in ["token", "secret", "alice@example.com", "usr_"] {
+            assert!(
+                !String::from_utf8_lossy(&body)
+                    .to_lowercase()
+                    .contains(forbidden)
+            );
+        }
+
+        let connected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(continuation)
+                    .header(header::COOKIE, &session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build provider callback: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request provider callback: {error}"))?;
+        assert_eq!(connected.status(), StatusCode::SEE_OTHER);
+
+        let status = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/connections/github")
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build connected status request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request connected status: {error}"))?;
+        let body = to_bytes(status.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read connected status: {error}"))?;
+        let status: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse connected status: {error}"))?;
+        assert_eq!(status["status"]["phase"], "connected");
+        assert_eq!(status["status"]["accountEmail"], "alice@example.com");
         Ok(())
     }
 }
