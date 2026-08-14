@@ -6,6 +6,7 @@ mod admin_ui;
 pub mod browser_auth;
 pub mod connections;
 pub mod google_oidc;
+mod connections_ui;
 mod tasks;
 
 pub use tasks::{

@@ -168,6 +168,7 @@ where
             "/admin/api/v1/connections/github/disconnect",
             post(disconnect_connection::<P, B>),
         )
+        .merge(crate::connections_ui::router::<B, ConnectionsState<P>>())
         .with_state(ConnectionsState { broker })
 }
 
