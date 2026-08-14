@@ -1,8 +1,8 @@
 # Steward browser session contract v1
 
-Status: local callback/session slice. Production Google code exchange and signed ID-token
-verification remain fail-closed until LBE-239 selects and explicitly approves a verifier and
-LBE-235 supplies the Google web-client registration through the secret path.
+Status: local callback/session slice plus production Google code exchange and signed ID-token
+verification. Runtime activation remains fail-closed until LBE-235 supplies the Google web-client
+metadata and client secret through the reviewed configuration and secret paths.
 
 ## Identity boundary
 
@@ -80,11 +80,27 @@ then check that cookies are HttpOnly, browser storage is empty, requests stay on
 preserves the session, and a cross-origin or missing-CSRF logout is rejected. Stop both processes
 after the hand-test decision.
 
-## Deliberate production blocker
+## Production verifier and activation boundary
 
-`GoogleAuthorizationOnlyProvider` constructs the exact Google authorization request but always
-rejects code exchange. It must not be wired as a working production login. A production provider
-must cryptographically verify Google's signed ID token, including signature/JWKS rotation,
-issuer, audience/authorized-party, nonce, expiry/time, verified email, and hosted domain. `reqwest`
-alone, UserInfo-only validation, Google's debugging `tokeninfo` endpoint, or parsing an unsigned JWT
-does not meet this boundary. LBE-239 owns the explicit dependency/adapter decision.
+`GoogleOidcProvider` is the production provider selected by LBE-239. It uses the existing bounded
+rustls `reqwest` client for discovery, authorization-code exchange, and JWKS retrieval, and the
+workspace-pinned `jsonwebtoken 11.0.0` `aws_lc_rs` backend for RS256 verification. Discovery and
+all advertised endpoints are pinned to Google's exact HTTPS issuer/host/path contract. Redirects
+are disabled; connect, total request, and response-body sizes are bounded.
+
+The verifier requires one bounded key ID, rejects embedded/remote key headers and algorithm
+confusion, accepts exactly one compatible RSA verification key, and validates the exact issuer,
+singleton client audience, optional exact authorized party, consumed nonce, expiry and issue time,
+bounded subject, verified email, and exact hosted domain. JWKS uses bounded HTTP caching, performs
+one synchronized refresh on an unknown key, preserves a fresh last-good set across malformed
+rotation responses, and fails closed after expiry if refresh is unavailable.
+
+`GoogleOidcProvider::new` requires the client secret as a non-debuggable runtime value. The
+non-secret client ID is also runtime configuration; neither value has a source default. No
+authorization code, PKCE verifier, client secret, access/refresh/ID token, cookie, raw claim, or
+provider body is included in errors or logs. Access and refresh tokens returned by Google are
+ignored and not retained. Tokeninfo, UserInfo, unsigned parsing, and offline access are not used.
+
+The earlier `GoogleAuthorizationOnlyProvider` remains intentionally fail-closed for callers that
+have not supplied the production verifier configuration. Choosing it cannot silently enable a
+partially verified login.

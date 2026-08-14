@@ -29,7 +29,7 @@ const BROWSER_SESSION_API_VERSION: &str = "steward.browser-session/v1";
 const SIGN_IN_HTML: &str = include_str!("../assets/admin/sign-in.html");
 const SESSION_READY_HTML: &str = include_str!("../assets/admin/session-ready.html");
 
-type BrowserFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(crate) type BrowserFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoogleOidcConfig {
@@ -107,6 +107,22 @@ impl GoogleOidcConfig {
             self.organization_id.clone(),
         )
     }
+
+    pub(crate) fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    pub(crate) fn callback_uri(&self) -> &str {
+        &self.callback_uri
+    }
+
+    pub(crate) fn hosted_domain(&self) -> &str {
+        &self.hosted_domain
+    }
+
+    pub(crate) fn authorization_request_url(&self, flow: &BrowserAuthorizationRequest) -> String {
+        self.authorization_url(&flow.pending)
+    }
 }
 
 #[derive(Clone)]
@@ -147,12 +163,12 @@ pub struct BrowserSessionContext {
 pub struct BrowserMutationProof(());
 
 pub struct VerifiedOrganizationClaims {
-    issuer: String,
-    subject: String,
-    hosted_domain: String,
-    email: String,
-    email_verified: bool,
-    nonce: String,
+    pub(crate) issuer: String,
+    pub(crate) subject: String,
+    pub(crate) hosted_domain: String,
+    pub(crate) email: String,
+    pub(crate) email_verified: bool,
+    pub(crate) nonce: String,
 }
 
 pub trait BrowserOidcProvider: Send + Sync + 'static {
@@ -916,7 +932,7 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn epoch_seconds() -> u64 {
+pub(crate) fn epoch_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
@@ -1065,7 +1081,7 @@ fn random_secret() -> String {
     format!("{first}{second}")
 }
 
-fn secret_eq(left: &str, right: &str) -> bool {
+pub(crate) fn secret_eq(left: &str, right: &str) -> bool {
     let left = Sha256::digest(left.as_bytes());
     let right = Sha256::digest(right.as_bytes());
     left.iter()
@@ -1076,7 +1092,7 @@ fn secret_eq(left: &str, right: &str) -> bool {
         == 0
 }
 
-fn base64_url(bytes: &[u8]) -> String {
+pub(crate) fn base64_url(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {

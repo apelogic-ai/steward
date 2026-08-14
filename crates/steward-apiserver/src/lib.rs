@@ -4,6 +4,7 @@
 pub mod admin_demo;
 mod admin_ui;
 pub mod browser_auth;
+pub mod google_oidc;
 mod tasks;
 
 pub use tasks::{
