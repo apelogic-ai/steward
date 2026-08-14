@@ -184,7 +184,7 @@ async fn canonical_identity_requires_exact_subject_mapping_and_explicit_reconnec
     );
     assert_eq!(
         store
-            .resolve_canonical_identity(future_issuer.identity())
+            .resolve_migrated_canonical_identity(&future_issuer)
             .await?
             .user_id,
         principal.user_id,
@@ -367,6 +367,131 @@ async fn concurrent_exact_registration_converges_on_one_canonical_user()
     .fetch_one(store.pool())
     .await?;
     assert_eq!(pair_count, 1, "the external pair must be persisted once");
+    Ok(())
+}
+
+#[tokio::test]
+async fn alternative_issuer_migration_cannot_allocate_a_canonical_user()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the identity Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let migration = OrganizationIdentityMigration::new_reviewed(
+        "https://login.example.test",
+        format!("migration-only-subject-{suffix}"),
+        "example.com",
+        OrganizationId::parse("org_example")?,
+        Email::parse(format!("migration-only-{suffix}@example.com"))?,
+    )?;
+    let missing_user =
+        steward_types::CanonicalUserId::parse("usr_00000000000000000000000000000000")?;
+    let users_before = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM canonical_users")
+        .fetch_one(store.pool())
+        .await?;
+
+    assert_eq!(
+        store
+            .attach_canonical_identity_subject(&missing_user, &migration, "identity-admin")
+            .await,
+        Err(StoreError::CanonicalIdentityNotFound),
+        "a migration can attach only to an existing canonical user"
+    );
+    let users_after = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM canonical_users")
+        .fetch_one(store.pool())
+        .await?;
+    assert_eq!(
+        users_after, users_before,
+        "migration must not allocate a user"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_subject_row_rejects_and_detects_wrong_user_organization()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the identity Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let owner_identity = google_identity(
+        format!("organization-owner-subject-{suffix}"),
+        format!("organization-owner-{suffix}@example.com"),
+    )?;
+    let owner = store
+        .register_canonical_identity(&owner_identity, "identity-admin")
+        .await?;
+    let wrong_organization_identity = google_identity_for(
+        "other.example",
+        OrganizationId::parse("org_other")?,
+        format!("wrong-organization-subject-{suffix}"),
+        format!("wrong-organization-{suffix}@other.example"),
+    )?;
+    let insert_wrong_organization = sqlx::query(
+        "INSERT INTO canonical_identity_subjects \
+         (issuer, subject, organization_claim, organization_id, user_id, verified_email) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(wrong_organization_identity.issuer())
+    .bind(wrong_organization_identity.subject())
+    .bind(wrong_organization_identity.organization_claim())
+    .bind(wrong_organization_identity.organization_id().as_str())
+    .bind(owner.user_id.as_str())
+    .bind(wrong_organization_identity.verified_email().as_str())
+    .execute(store.pool())
+    .await;
+    assert!(
+        insert_wrong_organization.is_err(),
+        "the database must reject a subject row whose organization differs from its user"
+    );
+
+    // Exercise the resolver defense independently of the FK by simulating a pre-constraint
+    // corrupt row. This is test-only superuser state and is restored before the connection is
+    // returned to the pool.
+    let mut corrupt_row = store.pool().begin().await?;
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *corrupt_row)
+        .await?;
+    sqlx::query(
+        "INSERT INTO canonical_identity_subjects \
+         (issuer, subject, organization_claim, organization_id, user_id, verified_email) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(wrong_organization_identity.issuer())
+    .bind(wrong_organization_identity.subject())
+    .bind(wrong_organization_identity.organization_claim())
+    .bind(wrong_organization_identity.organization_id().as_str())
+    .bind(owner.user_id.as_str())
+    .bind(wrong_organization_identity.verified_email().as_str())
+    .execute(&mut *corrupt_row)
+    .await?;
+    corrupt_row.commit().await?;
+
+    assert_eq!(
+        store
+            .resolve_canonical_identity(&wrong_organization_identity)
+            .await,
+        Err(StoreError::CanonicalIdentityInvalidRecord),
+        "resolution must fail closed even if a corrupt row bypassed the schema constraint"
+    );
     Ok(())
 }
 

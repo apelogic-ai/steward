@@ -7,8 +7,8 @@ use sqlx::types::Json;
 use sqlx::{PgPool, Row};
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
 use steward_types::{
-    AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationIdentity,
-    OrganizationIdentityMigration,
+    AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
+    OrganizationIdentity, OrganizationIdentityMigration,
 };
 use uuid::Uuid;
 
@@ -47,27 +47,65 @@ impl PgStore {
         &self,
         identity: &OrganizationIdentity,
     ) -> Result<CanonicalPrincipal, StoreError> {
+        self.resolve_canonical_identity_fields(
+            identity.issuer(),
+            identity.subject(),
+            identity.organization_claim(),
+            identity.organization_id(),
+            identity.verified_email(),
+        )
+        .await
+    }
+
+    /// Resolve an alternative issuer only through its distinct reviewed migration proof.
+    ///
+    /// This read path does not turn the migration into a normal registration capability.
+    pub async fn resolve_migrated_canonical_identity(
+        &self,
+        migration: &OrganizationIdentityMigration,
+    ) -> Result<CanonicalPrincipal, StoreError> {
+        self.resolve_canonical_identity_fields(
+            migration.issuer(),
+            migration.subject(),
+            migration.organization_claim(),
+            migration.organization_id(),
+            migration.verified_email(),
+        )
+        .await
+    }
+
+    async fn resolve_canonical_identity_fields(
+        &self,
+        issuer: &str,
+        subject: &str,
+        organization_claim: &str,
+        organization_id: &OrganizationId,
+        verified_email: &Email,
+    ) -> Result<CanonicalPrincipal, StoreError> {
         let row = sqlx::query(
-            "SELECT canonical_users.user_id, canonical_users.organization_id, \
+            "SELECT canonical_users.user_id, \
+                    canonical_users.organization_id AS user_organization_id, \
                     canonical_users.display_email, canonical_users.state, \
-                    canonical_identity_subjects.verified_email \
+                    canonical_identity_subjects.verified_email, \
+                    canonical_identity_subjects.organization_id AS subject_organization_id \
              FROM canonical_identity_subjects \
-             JOIN canonical_users USING (user_id) \
+             JOIN canonical_users \
+               ON canonical_users.user_id = canonical_identity_subjects.user_id \
              WHERE canonical_identity_subjects.issuer = $1 \
                AND canonical_identity_subjects.subject = $2 \
                AND canonical_identity_subjects.organization_claim = $3 \
                AND canonical_identity_subjects.organization_id = $4",
         )
-        .bind(identity.issuer())
-        .bind(identity.subject())
-        .bind(identity.organization_claim())
-        .bind(identity.organization_id().as_str())
+        .bind(issuer)
+        .bind(subject)
+        .bind(organization_claim)
+        .bind(organization_id.as_str())
         .fetch_optional(&self.pool)
         .await
         .map_err(database_error)?
         .ok_or(StoreError::CanonicalIdentityNotFound)?;
 
-        canonical_principal_from_row(&row, identity)
+        canonical_principal_from_row(&row, organization_id, verified_email)
     }
 
     /// Resolve a trusted canonical-user reference and current display email.
@@ -111,6 +149,26 @@ impl PgStore {
     ///
     /// An email match never adopts an existing person. Repeated exact registration is
     /// idempotent only while every reviewed claim still matches.
+    ///
+    /// An explicitly reviewed issuer migration is not a normal-registration proof:
+    ///
+    /// ```compile_fail
+    /// # use steward_store::PgStore;
+    /// # use steward_types::{Email, OrganizationId, OrganizationIdentityMigration};
+    /// # async fn cannot_register_migration(store: &PgStore) {
+    /// let migration = OrganizationIdentityMigration::new_reviewed(
+    ///     "https://login.example.test",
+    ///     "immutable-subject",
+    ///     "example.com",
+    ///     OrganizationId::parse("org_example").unwrap(),
+    ///     Email::parse("person@example.com").unwrap(),
+    /// ).unwrap();
+    /// store
+    ///     .register_canonical_identity(migration.identity(), "identity-admin")
+    ///     .await
+    ///     .unwrap();
+    /// # }
+    /// ```
     pub async fn register_canonical_identity(
         &self,
         identity: &OrganizationIdentity,
@@ -141,11 +199,14 @@ impl PgStore {
         .map_err(database_error)?;
         let existing_pair = sqlx::query(
             "SELECT canonical_users.user_id, canonical_users.display_email, \
-                    canonical_users.state, canonical_identity_subjects.verified_email, \
+                    canonical_users.state, \
+                    canonical_users.organization_id AS user_organization_id, \
+                    canonical_identity_subjects.verified_email, \
                     canonical_identity_subjects.organization_claim, \
                     canonical_identity_subjects.organization_id AS subject_organization_id \
              FROM canonical_identity_subjects \
-             JOIN canonical_users USING (user_id) \
+             JOIN canonical_users \
+               ON canonical_users.user_id = canonical_identity_subjects.user_id \
              WHERE canonical_identity_subjects.issuer = $1 \
                AND canonical_identity_subjects.subject = $2",
         )
@@ -165,7 +226,11 @@ impl PgStore {
             {
                 return Err(StoreError::CanonicalIdentityConflict);
             }
-            return canonical_principal_from_row(&row, identity);
+            return canonical_principal_from_row(
+                &row,
+                identity.organization_id(),
+                identity.verified_email(),
+            );
         }
         let email_owner = sqlx::query_scalar::<_, String>(
             "SELECT user_id FROM canonical_users \
@@ -239,7 +304,7 @@ impl PgStore {
         migration: &OrganizationIdentityMigration,
         actor: &str,
     ) -> Result<CanonicalPrincipal, StoreError> {
-        let identity = migration.identity();
+        let identity = migration;
         if actor.trim().is_empty() {
             return Err(StoreError::CanonicalIdentityInvalidActor);
         }
@@ -263,6 +328,8 @@ impl PgStore {
         .map_err(database_error)?
         .ok_or(StoreError::CanonicalIdentityNotFound)?;
         let organization_id: String = user.try_get("organization_id").map_err(database_error)?;
+        let stored_organization_id = OrganizationId::parse(organization_id.clone())
+            .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)?;
         let display_email: String = user.try_get("display_email").map_err(database_error)?;
         let state: String = user.try_get("state").map_err(database_error)?;
         if state != "active" {
@@ -304,7 +371,7 @@ impl PgStore {
             }
             return CanonicalPrincipal::new(
                 user_id.clone(),
-                identity.organization_id().clone(),
+                stored_organization_id,
                 Email(display_email),
             )
             .map_err(|_| StoreError::CanonicalIdentityInvalidRecord);
@@ -338,7 +405,7 @@ impl PgStore {
 
         CanonicalPrincipal::new(
             user_id.clone(),
-            identity.organization_id().clone(),
+            stored_organization_id,
             Email(display_email),
         )
         .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
@@ -2226,16 +2293,34 @@ fn canonical_identity_database_error(error: sqlx::Error) -> StoreError {
 
 fn canonical_principal_from_row(
     row: &sqlx::postgres::PgRow,
-    identity: &OrganizationIdentity,
+    expected_organization_id: &OrganizationId,
+    expected_verified_email: &Email,
 ) -> Result<CanonicalPrincipal, StoreError> {
     let state: String = row.try_get("state").map_err(database_error)?;
     if state != "active" {
         return Err(StoreError::CanonicalIdentityInactive);
     }
+    let user_organization_id = row
+        .try_get::<String, _>("user_organization_id")
+        .map_err(database_error)
+        .and_then(|value| {
+            OrganizationId::parse(value).map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+        })?;
+    let subject_organization_id = row
+        .try_get::<String, _>("subject_organization_id")
+        .map_err(database_error)
+        .and_then(|value| {
+            OrganizationId::parse(value).map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+        })?;
+    if user_organization_id != subject_organization_id
+        || &user_organization_id != expected_organization_id
+    {
+        return Err(StoreError::CanonicalIdentityInvalidRecord);
+    }
     let display_email: String = row.try_get("display_email").map_err(database_error)?;
     let verified_email: String = row.try_get("verified_email").map_err(database_error)?;
-    if !display_email.eq_ignore_ascii_case(identity.verified_email().as_str())
-        || !verified_email.eq_ignore_ascii_case(identity.verified_email().as_str())
+    if !display_email.eq_ignore_ascii_case(expected_verified_email.as_str())
+        || !verified_email.eq_ignore_ascii_case(expected_verified_email.as_str())
     {
         return Err(StoreError::CanonicalIdentityStale);
     }
@@ -2245,12 +2330,8 @@ fn canonical_principal_from_row(
         .and_then(|value| {
             CanonicalUserId::parse(value).map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
         })?;
-    CanonicalPrincipal::new(
-        user_id,
-        identity.organization_id().clone(),
-        Email(display_email),
-    )
-    .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+    CanonicalPrincipal::new(user_id, user_organization_id, Email(display_email))
+        .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
 }
 
 fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {

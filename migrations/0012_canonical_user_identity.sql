@@ -7,7 +7,9 @@ CREATE TABLE canonical_users (
     state text NOT NULL DEFAULT 'active'
         CHECK (state IN ('active', 'reconnect_required', 'disabled')),
     created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now()
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT canonical_users_user_organization_unique
+        UNIQUE (user_id, organization_id)
 );
 
 CREATE UNIQUE INDEX canonical_users_one_display_email_per_organization
@@ -19,14 +21,17 @@ CREATE TABLE canonical_identity_subjects (
     organization_claim text NOT NULL CHECK (organization_claim <> ''),
     organization_id text NOT NULL
         CHECK (organization_id ~ '^org_[a-z0-9_-]{1,60}$'),
-    user_id text NOT NULL REFERENCES canonical_users(user_id),
+    user_id text NOT NULL,
     verified_email text NOT NULL CHECK (verified_email <> ''),
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (issuer, subject, organization_claim, organization_id),
     CONSTRAINT canonical_identity_subjects_external_pair_unique
         UNIQUE (issuer, subject),
-    UNIQUE (issuer, organization_id, user_id)
+    UNIQUE (issuer, organization_id, user_id),
+    CONSTRAINT canonical_identity_subjects_user_organization_fk
+        FOREIGN KEY (user_id, organization_id)
+        REFERENCES canonical_users(user_id, organization_id)
 );
 
 CREATE TABLE canonical_identity_audit (

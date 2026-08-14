@@ -297,7 +297,13 @@ pub struct OrganizationIdentity {
 /// This type is intentionally distinct from `OrganizationIdentity`: it cannot enter the normal
 /// registration path, and every store mutation accepting it requires an audited actor.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OrganizationIdentityMigration(OrganizationIdentity);
+pub struct OrganizationIdentityMigration {
+    issuer: String,
+    subject: String,
+    organization_claim: String,
+    organization_id: OrganizationId,
+    verified_email: Email,
+}
 
 /// Exact trust boundary applied after a supported organization OIDC token is verified.
 ///
@@ -441,17 +447,40 @@ impl OrganizationIdentityMigration {
         organization_id: OrganizationId,
         verified_email: Email,
     ) -> Result<Self, String> {
-        Ok(Self(OrganizationIdentity::new_validated(
+        let identity = OrganizationIdentity::new_validated(
             issuer,
             subject,
             organization_claim,
             organization_id,
             verified_email,
-        )?))
+        )?;
+        Ok(Self {
+            issuer: identity.issuer,
+            subject: identity.subject,
+            organization_claim: identity.organization_claim,
+            organization_id: identity.organization_id,
+            verified_email: identity.verified_email,
+        })
     }
 
-    pub fn identity(&self) -> &OrganizationIdentity {
-        &self.0
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    pub fn organization_claim(&self) -> &str {
+        &self.organization_claim
+    }
+
+    pub fn organization_id(&self) -> &OrganizationId {
+        &self.organization_id
+    }
+
+    pub fn verified_email(&self) -> &Email {
+        &self.verified_email
     }
 }
 
