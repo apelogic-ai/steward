@@ -89,6 +89,14 @@ impl AuthorizationUrl {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    #[cfg(feature = "admin-demo")]
+    pub(crate) fn new_loopback(value: String) -> Result<Self, &'static str> {
+        if !(value.starts_with("http://127.0.0.1:") || value.starts_with("http://[::1]:")) {
+            return Err("local provider authorization URL must use an explicit loopback origin");
+        }
+        Ok(Self(value))
+    }
 }
 
 /// Opaque one-time continuation returned after the provider callback boundary.
