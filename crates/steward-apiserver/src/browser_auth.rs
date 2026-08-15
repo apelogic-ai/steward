@@ -670,7 +670,6 @@ async fn login(
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CallbackQuery {
     code: String,
     state: String,
@@ -1793,7 +1792,6 @@ mod tests {
             "&iss=",
             "&iss=https%3A%2F%2Fissuer.example.test",
             "&iss=https%3A%2F%2Faccounts.google.com&iss=https%3A%2F%2Faccounts.google.com",
-            "&issuer=https%3A%2F%2Faccounts.google.com",
         ] {
             let response = browser_auth_router(service.clone())
                 .oneshot(
@@ -1820,7 +1818,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "{callback_uri}&iss=https%3A%2F%2Faccounts.google.com"
+                        "{callback_uri}&iss=https%3A%2F%2Faccounts.google.com&scope=openid%20email&authuser=0&prompt=consent&hd=example.com"
                     ))
                     .header(header::COOKIE, flow_cookie)
                     .body(Body::empty())
