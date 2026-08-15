@@ -2,7 +2,19 @@
 
 const SESSION_VERSION = "steward.browser-session/v1";
 const CONNECTIONS_VERSION = "steward.connections/v1";
+const FAST_TRACK_RUNTIME_ID = "lbe259-fast-track/connections-bridge";
+const FAST_TRACK_RUNTIME_PHASES = new Set([
+  "pending",
+  "admitted",
+  "provisioning",
+  "running",
+  "suspended",
+  "terminating",
+  "terminated",
+  "failed",
+]);
 
+const fastTrackRuntimeBootstrap = document.body.dataset.fastTrackRuntime === "true";
 const providerCard = document.querySelector(".provider-card");
 const principalEmail = document.querySelector("#principal-email");
 const canonicalUser = document.querySelector("#canonical-user");
@@ -19,6 +31,7 @@ const confirmDisconnect = document.querySelector("#confirm-disconnect");
 const callbackStatus = document.querySelector("#callback-status");
 const connectionError = document.querySelector("#connection-error");
 const connectionErrorMessage = document.querySelector("#connection-error-message");
+const runtimeStatus = document.querySelector("#runtime-status");
 
 let csrf = null;
 
@@ -172,6 +185,30 @@ async function loadConnection() {
   }
 }
 
+async function bootstrapRuntime() {
+  runtimeStatus.hidden = false;
+  runtimeStatus.textContent = "Preparing preview runtime…";
+  try {
+    const value = await fetchJson("/admin/api/v1/fast-track/connections/runtime", {
+      method: "POST",
+      headers: mutationHeaders(),
+      body: "{}",
+    });
+    if (
+      value.runtimeId !== FAST_TRACK_RUNTIME_ID ||
+      typeof value.status !== "string" ||
+      !FAST_TRACK_RUNTIME_PHASES.has(value.status)
+    ) {
+      throw new Error("preview runtime response mismatch");
+    }
+    runtimeStatus.textContent = `Preview runtime ${value.status}.`;
+    return value.status;
+  } catch (_error) {
+    runtimeStatus.textContent = "Preview runtime unavailable.";
+    throw new Error("preview runtime unavailable");
+  }
+}
+
 async function startConnection() {
   setBusy(true);
   clearError();
@@ -252,6 +289,9 @@ async function initialize() {
   announceCallback();
   try {
     await loadSession();
+    if (fastTrackRuntimeBootstrap) {
+      await bootstrapRuntime();
+    }
     await loadConnection();
   } catch (_error) {
     providerCard.dataset.phase = "unavailable";

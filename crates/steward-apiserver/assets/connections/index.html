@@ -8,7 +8,7 @@
     <link rel="stylesheet" href="/admin/assets/connections.css">
     <script src="/admin/assets/connections.js" defer></script>
   </head>
-  <body>
+  <body data-fast-track-runtime="false">
     <a class="skip-link" href="#connections-workspace">Skip to connections</a>
     <header class="topbar">
       <a class="brand" href="/admin">Steward</a>
@@ -23,6 +23,7 @@
       </section>
 
       <div id="callback-status" class="notice" role="status" aria-live="polite" hidden></div>
+      <div id="runtime-status" class="notice" role="status" aria-live="polite" hidden></div>
       <div id="connection-error" class="notice notice-error" role="alert" hidden>
         <strong>Connection unavailable</strong>
         <span id="connection-error-message">Try again when the provider broker is available.</span>

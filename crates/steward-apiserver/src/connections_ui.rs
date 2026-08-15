@@ -1,5 +1,6 @@
 //! Credential-free browser surface for user-bound provider connections.
 
+use std::borrow::Cow;
 use std::hash::Hash;
 
 use axum::http::{StatusCode, header};
@@ -35,7 +36,22 @@ where
     if session.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Html(CONNECTIONS_HTML).into_response()
+    Html(connections_document()).into_response()
+}
+
+fn connections_document() -> Cow<'static, str> {
+    #[cfg(feature = "admin-demo")]
+    {
+        Cow::Owned(CONNECTIONS_HTML.replacen(
+            "data-fast-track-runtime=\"false\"",
+            "data-fast-track-runtime=\"true\"",
+            1,
+        ))
+    }
+    #[cfg(not(feature = "admin-demo"))]
+    {
+        Cow::Borrowed(CONNECTIONS_HTML)
+    }
 }
 
 async fn connections_stylesheet() -> Response {
@@ -117,12 +133,17 @@ mod tests {
         let body = to_bytes(authenticated.into_body(), 32 * 1024)
             .await
             .map_err(|error| format!("read Connections shell: {error}"))?;
-        assert_eq!(body.as_ref(), CONNECTIONS_HTML.as_bytes());
+        assert_eq!(body.as_ref(), connections_document().as_bytes());
         Ok(())
     }
 
     #[test]
     fn connections_assets_are_accessible_responsive_and_never_use_browser_storage_or_html_sinks() {
+        assert!(CONNECTIONS_HTML.contains("data-fast-track-runtime=\"false\""));
+        #[cfg(feature = "admin-demo")]
+        assert!(connections_document().contains("data-fast-track-runtime=\"true\""));
+        #[cfg(not(feature = "admin-demo"))]
+        assert!(connections_document().contains("data-fast-track-runtime=\"false\""));
         for required in [
             "<main",
             "<h1",
@@ -133,6 +154,7 @@ mod tests {
             "<dialog",
             "id=\"scope-status\"",
             "id=\"connection-error\"",
+            "id=\"runtime-status\"",
         ] {
             assert!(
                 CONNECTIONS_HTML.contains(required),
@@ -154,6 +176,10 @@ mod tests {
             "candidate.pathname === \"/admin/connections/github/callback\"",
             "callbackStatus.textContent = \"GitHub connected.\"",
             "callbackStatus.hidden = true",
+            "/admin/api/v1/fast-track/connections/runtime",
+            "async function bootstrapRuntime()",
+            "await loadSession();\n    if (fastTrackRuntimeBootstrap) {\n      await bootstrapRuntime();\n    }\n    await loadConnection();",
+            "runtimeStatus.textContent = \"Preview runtime unavailable.\"",
         ] {
             assert!(
                 CONNECTIONS_JS.contains(required),
@@ -167,11 +193,18 @@ mod tests {
             "innerHTML",
             "outerHTML",
             "insertAdjacentHTML",
+            "actingUser",
+            "canonicalAuthority",
+            "service-principal",
         ] {
             assert!(
                 !CONNECTIONS_JS.contains(forbidden),
                 "Connections script uses forbidden browser sink/storage {forbidden}"
             );
         }
+        assert!(
+            !CONNECTIONS_JS.contains("await startConnection()"),
+            "Connections initialization must not start GitHub OAuth automatically"
+        );
     }
 }
