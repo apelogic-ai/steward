@@ -213,4 +213,35 @@ mod tests {
             "Connections initialization must not start GitHub OAuth automatically"
         );
     }
+
+    #[test]
+    fn preview_readiness_requires_two_running_successes_and_resets_on_oscillation() {
+        for required in [
+            "let consecutiveReadyChecks = 0;",
+            "runtimePhase === \"running\"",
+            "consecutiveReadyChecks += 1;",
+            "consecutiveReadyChecks = 0;",
+            "consecutiveReadyChecks >= 2",
+            "function renderPreviewChecking(runtimePhase, stage)",
+            "connectGithub.disabled = true;",
+            "renderPreviewChecking(runtimePhase, stage);",
+        ] {
+            assert!(
+                CONNECTIONS_JS.contains(required),
+                "preview readiness is missing hysteresis contract {required:?}"
+            );
+        }
+
+        assert!(
+            CONNECTIONS_JS
+                .contains("if (consecutiveReadyChecks >= 2) {\n        renderConnection(status);"),
+            "only the stable-ready branch may render the actionable connection state"
+        );
+        assert!(
+            CONNECTIONS_JS.contains(
+                "renderPreviewChecking(runtimePhase, null);\n    } catch (error) {\n      consecutiveReadyChecks = 0;"
+            ),
+            "an oscillating failure must reset readiness after keeping the UI non-actionable"
+        );
+    }
 }

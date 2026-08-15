@@ -185,7 +185,7 @@ async function loadSession() {
   csrf = value.csrf;
 }
 
-async function loadConnection() {
+async function fetchConnectionStatus() {
   clearError();
   const value = await fetchJson("/admin/api/v1/connections/github");
   if (
@@ -201,10 +201,18 @@ async function loadConnection() {
   ) {
     throw new Error("provider connection contract mismatch");
   }
-  renderConnection(value.status);
-  if (!callbackStatus.hidden && value.status.phase === "connected") {
+  return value.status;
+}
+
+function applyConnectionStatus(status) {
+  renderConnection(status);
+  if (!callbackStatus.hidden && status.phase === "connected") {
     callbackStatus.textContent = "GitHub connected.";
   }
+}
+
+async function loadConnection() {
+  applyConnectionStatus(await fetchConnectionStatus());
 }
 
 async function bootstrapRuntime() {
@@ -238,6 +246,17 @@ function renderBffStage(runtimePhase, stage) {
   runtimeStatus.textContent = `Preview runtime ${runtimePhase}. ${label}.`;
 }
 
+function renderPreviewChecking(runtimePhase, stage) {
+  providerCard.dataset.phase = "loading";
+  githubStatus.textContent = "Checking…";
+  githubSummary.textContent = "Waiting for the governed preview runtime and connection path.";
+  connectGithub.hidden = false;
+  connectGithub.disabled = true;
+  disconnectGithub.hidden = true;
+  retryGithub.hidden = true;
+  renderBffStage(runtimePhase, stage);
+}
+
 function pollDelay() {
   return new Promise((resolve) => window.setTimeout(resolve, FAST_TRACK_STATUS_POLL_INTERVAL_MS));
 }
@@ -245,29 +264,48 @@ function pollDelay() {
 async function loadConnectionWithPreviewPolling(initialRuntimePhase) {
   const deadline = Date.now() + FAST_TRACK_STATUS_POLL_DEADLINE_MS;
   let runtimePhase = initialRuntimePhase;
+  let consecutiveReadyChecks = 0;
   for (;;) {
     try {
-      await loadConnection();
-      runtimeStatus.dataset.bffStage = "ready";
-      runtimeStatus.textContent = `Preview runtime ${runtimePhase}. Connection path ready.`;
-      return;
+      const status = await fetchConnectionStatus();
+      if (runtimePhase === "running") {
+        consecutiveReadyChecks += 1;
+      } else {
+        consecutiveReadyChecks = 0;
+      }
+      if (consecutiveReadyChecks >= 2) {
+        renderConnection(status);
+        if (!callbackStatus.hidden && status.phase === "connected") {
+          callbackStatus.textContent = "GitHub connected.";
+        }
+        runtimeStatus.dataset.bffStage = "ready";
+        runtimeStatus.textContent = `Preview runtime ${runtimePhase}. Connection path ready.`;
+        return;
+      }
+      renderPreviewChecking(runtimePhase, null);
     } catch (error) {
+      consecutiveReadyChecks = 0;
       const requestStatus = error && error.requestStatus;
       const stage = error && error.bffStage;
-      renderBffStage(runtimePhase, stage);
+      renderPreviewChecking(runtimePhase, stage);
       if (
         requestStatus === 401 ||
         requestStatus === 403 ||
         requestStatus !== 503 ||
         !FAST_TRACK_RETRYABLE_BFF_STAGES.has(stage) ||
-        !FAST_TRACK_POLLABLE_RUNTIME_PHASES.has(runtimePhase) ||
-        Date.now() + FAST_TRACK_STATUS_POLL_INTERVAL_MS > deadline
+        !FAST_TRACK_POLLABLE_RUNTIME_PHASES.has(runtimePhase)
       ) {
         throw error;
       }
-      await pollDelay();
-      runtimePhase = await bootstrapRuntime();
     }
+    if (
+      !FAST_TRACK_POLLABLE_RUNTIME_PHASES.has(runtimePhase) ||
+      Date.now() + FAST_TRACK_STATUS_POLL_INTERVAL_MS > deadline
+    ) {
+      throw new Error("preview readiness deadline reached");
+    }
+    await pollDelay();
+    runtimePhase = await bootstrapRuntime();
   }
 }
 
@@ -334,16 +372,25 @@ function announceCallback() {
 }
 
 connectGithub.addEventListener("click", () => void startConnection());
-retryGithub.addEventListener("click", () => void loadConnection().catch(() => {
-  renderConnection({
-    phase: "unavailable",
-    accountEmail: null,
-    expiresAt: null,
-    scopesRequired: [],
-    scopesGranted: [],
-    scopesMissing: [],
-  });
-}));
+retryGithub.addEventListener("click", () => void (async () => {
+  try {
+    if (fastTrackRuntimeBootstrap) {
+      const runtimePhase = await bootstrapRuntime();
+      await loadConnectionWithPreviewPolling(runtimePhase);
+    } else {
+      await loadConnection();
+    }
+  } catch (_error) {
+    renderConnection({
+      phase: "unavailable",
+      accountEmail: null,
+      expiresAt: null,
+      scopesRequired: [],
+      scopesGranted: [],
+      scopesMissing: [],
+    });
+  }
+})());
 disconnectGithub.addEventListener("click", () => disconnectDialog.showModal());
 confirmDisconnect.addEventListener("click", () => void disconnectConnection());
 
