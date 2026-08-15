@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -673,13 +674,25 @@ async fn login(
 struct CallbackQuery {
     code: String,
     state: String,
+    iss: Option<String>,
 }
 
 async fn callback(
     State(service): State<BrowserAuthService>,
-    Query(query): Query<CallbackQuery>,
+    query: Result<Query<CallbackQuery>, QueryRejection>,
     headers: HeaderMap,
 ) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return BrowserAuthFailure::InvalidRequest.into_response(),
+    };
+    if query
+        .iss
+        .as_deref()
+        .is_some_and(|issuer| issuer != GOOGLE_ORGANIZATION_ISSUER)
+    {
+        return BrowserAuthFailure::InvalidIdentity.into_response();
+    }
     let Some(flow_id) = cookie_value(&headers, service.config.flow_cookie) else {
         return BrowserAuthFailure::InvalidFlow.into_response();
     };
@@ -1772,6 +1785,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_accepts_only_the_optional_exact_google_issuer_without_query_leakage()
+    -> Result<(), String> {
+        let (service, flow_cookie, callback_uri) =
+            start_local_flow(LocalFakeIdentity::User).await?;
+        for suffix in [
+            "&iss=",
+            "&iss=https%3A%2F%2Fissuer.example.test",
+            "&iss=https%3A%2F%2Faccounts.google.com&iss=https%3A%2F%2Faccounts.google.com",
+            "&issuer=https%3A%2F%2Faccounts.google.com",
+        ] {
+            let response = browser_auth_router(service.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{callback_uri}{suffix}"))
+                        .header(header::COOKIE, &flow_cookie)
+                        .body(Body::empty())
+                        .map_err(|error| format!("build rejected callback request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("execute rejected callback request: {error}"))?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = to_bytes(response.into_body(), 4096)
+                .await
+                .map_err(|error| format!("read rejected callback response: {error}"))?;
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body)
+                    .map_err(|error| format!("parse rejected callback response: {error}"))?,
+                serde_json::json!({ "error": "browser authentication failed" })
+            );
+        }
+
+        let accepted = browser_auth_router(service)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "{callback_uri}&iss=https%3A%2F%2Faccounts.google.com"
+                    ))
+                    .header(header::COOKIE, flow_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build accepted callback request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute accepted callback request: {error}"))?;
+        assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn local_fake_uses_real_callback_session_router_and_rotates_fixation_cookie()
     -> Result<(), String> {
         let (service, flow_cookie, callback_uri) =
@@ -1780,6 +1841,7 @@ mod tests {
             .registry
             .issue(principal()?, super::epoch_seconds())
             .map_err(|error| format!("issue prior session: {error:?}"))?;
+        let callback_uri = format!("{callback_uri}&iss=https%3A%2F%2Faccounts.google.com");
         let callback = browser_auth_router(service.clone())
             .oneshot(
                 Request::builder()
