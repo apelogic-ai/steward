@@ -13,6 +13,24 @@ const FAST_TRACK_RUNTIME_PHASES = new Set([
   "terminated",
   "failed",
 ]);
+const FAST_TRACK_POLLABLE_RUNTIME_PHASES = new Set([
+  "pending",
+  "admitted",
+  "provisioning",
+  "running",
+]);
+const FAST_TRACK_STATUS_POLL_INTERVAL_MS = 1000;
+const FAST_TRACK_STATUS_POLL_DEADLINE_MS = 90000;
+const FAST_TRACK_RETRYABLE_BFF_STAGES = new Set(["bridge_transport", "bridge_http_status"]);
+const FAST_TRACK_BFF_STAGE_LABELS = new Map([
+  ["lifetime_expired", "preview window expired"],
+  ["session_mismatch", "browser session mismatch"],
+  ["target_url", "bridge target unavailable"],
+  ["bridge_transport", "waiting for bridge"],
+  ["bridge_http_status", "bridge is not ready"],
+  ["response_schema", "bridge response unavailable"],
+  ["response_semantics", "bridge response invalid"],
+]);
 
 const fastTrackRuntimeBootstrap = document.body.dataset.fastTrackRuntime === "true";
 const providerCard = document.querySelector(".provider-card");
@@ -91,7 +109,11 @@ async function fetchJson(path, options = {}) {
     ...options,
   });
   if (!response.ok) {
-    throw new Error(`request rejected with status ${response.status}`);
+    const reportedStage = response.headers.get("x-steward-fast-track-bff-stage");
+    const failure = new Error("request rejected");
+    failure.requestStatus = response.status;
+    failure.bffStage = FAST_TRACK_BFF_STAGE_LABELS.has(reportedStage) ? reportedStage : null;
+    throw failure;
   }
   return response.json();
 }
@@ -209,6 +231,46 @@ async function bootstrapRuntime() {
   }
 }
 
+function renderBffStage(runtimePhase, stage) {
+  const safeStage = FAST_TRACK_BFF_STAGE_LABELS.has(stage) ? stage : "unclassified";
+  const label = FAST_TRACK_BFF_STAGE_LABELS.get(safeStage) || "waiting for connection path";
+  runtimeStatus.dataset.bffStage = safeStage;
+  runtimeStatus.textContent = `Preview runtime ${runtimePhase}. ${label}.`;
+}
+
+function pollDelay() {
+  return new Promise((resolve) => window.setTimeout(resolve, FAST_TRACK_STATUS_POLL_INTERVAL_MS));
+}
+
+async function loadConnectionWithPreviewPolling(initialRuntimePhase) {
+  const deadline = Date.now() + FAST_TRACK_STATUS_POLL_DEADLINE_MS;
+  let runtimePhase = initialRuntimePhase;
+  for (;;) {
+    try {
+      await loadConnection();
+      runtimeStatus.dataset.bffStage = "ready";
+      runtimeStatus.textContent = `Preview runtime ${runtimePhase}. Connection path ready.`;
+      return;
+    } catch (error) {
+      const requestStatus = error && error.requestStatus;
+      const stage = error && error.bffStage;
+      renderBffStage(runtimePhase, stage);
+      if (
+        requestStatus === 401 ||
+        requestStatus === 403 ||
+        requestStatus !== 503 ||
+        !FAST_TRACK_RETRYABLE_BFF_STAGES.has(stage) ||
+        !FAST_TRACK_POLLABLE_RUNTIME_PHASES.has(runtimePhase) ||
+        Date.now() + FAST_TRACK_STATUS_POLL_INTERVAL_MS > deadline
+      ) {
+        throw error;
+      }
+      await pollDelay();
+      runtimePhase = await bootstrapRuntime();
+    }
+  }
+}
+
 async function startConnection() {
   setBusy(true);
   clearError();
@@ -290,9 +352,11 @@ async function initialize() {
   try {
     await loadSession();
     if (fastTrackRuntimeBootstrap) {
-      await bootstrapRuntime();
+      const runtimePhase = await bootstrapRuntime();
+      await loadConnectionWithPreviewPolling(runtimePhase);
+    } else {
+      await loadConnection();
     }
-    await loadConnection();
   } catch (_error) {
     providerCard.dataset.phase = "unavailable";
     githubStatus.textContent = "Unavailable";

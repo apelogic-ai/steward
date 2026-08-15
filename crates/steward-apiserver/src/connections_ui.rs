@@ -178,8 +178,14 @@ mod tests {
             "callbackStatus.hidden = true",
             "/admin/api/v1/fast-track/connections/runtime",
             "async function bootstrapRuntime()",
-            "await loadSession();\n    if (fastTrackRuntimeBootstrap) {\n      await bootstrapRuntime();\n    }\n    await loadConnection();",
+            "await loadSession();\n    if (fastTrackRuntimeBootstrap) {\n      const runtimePhase = await bootstrapRuntime();\n      await loadConnectionWithPreviewPolling(runtimePhase);\n    } else {\n      await loadConnection();\n    }",
             "runtimeStatus.textContent = \"Preview runtime unavailable.\"",
+            "const FAST_TRACK_STATUS_POLL_INTERVAL_MS = 1000;",
+            "const FAST_TRACK_STATUS_POLL_DEADLINE_MS = 90000;",
+            "x-steward-fast-track-bff-stage",
+            "async function loadConnectionWithPreviewPolling",
+            "runtimeStatus.dataset.bffStage",
+            "await loadConnectionWithPreviewPolling(runtimePhase);",
         ] {
             assert!(
                 CONNECTIONS_JS.contains(required),
