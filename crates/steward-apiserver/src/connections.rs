@@ -126,6 +126,32 @@ pub enum ConnectionBrokerError {
     InvalidOrExpiredContinuation,
     SessionMismatch,
     Unavailable,
+    FastTrackUnavailable(FastTrackBffFailureStage),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FastTrackBffFailureStage {
+    LifetimeExpired,
+    SessionMismatch,
+    TargetUrl,
+    BridgeTransport,
+    BridgeHttpStatus,
+    ResponseSchema,
+    ResponseSemantics,
+}
+
+impl FastTrackBffFailureStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LifetimeExpired => "lifetime_expired",
+            Self::SessionMismatch => "session_mismatch",
+            Self::TargetUrl => "target_url",
+            Self::BridgeTransport => "bridge_transport",
+            Self::BridgeHttpStatus => "bridge_http_status",
+            Self::ResponseSchema => "response_schema",
+            Self::ResponseSemantics => "response_semantics",
+        }
+    }
 }
 
 pub trait ProviderConnectionBroker<B>: Clone + Send + Sync + 'static
@@ -250,6 +276,9 @@ where
         }))
         .into_response(),
         Err(ConnectionBrokerError::Unavailable) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(ConnectionBrokerError::FastTrackUnavailable(stage)) => {
+            fast_track_stage_response(StatusCode::SERVICE_UNAVAILABLE.into_response(), stage)
+        }
         Err(
             ConnectionBrokerError::InvalidOrExpiredContinuation
             | ConnectionBrokerError::SessionMismatch,
@@ -283,6 +312,9 @@ where
         }
         Err(ConnectionBrokerError::SessionMismatch) => StatusCode::FORBIDDEN.into_response(),
         Err(ConnectionBrokerError::Unavailable) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(ConnectionBrokerError::FastTrackUnavailable(stage)) => {
+            fast_track_stage_response(StatusCode::SERVICE_UNAVAILABLE.into_response(), stage)
+        }
     }
 }
 
@@ -308,6 +340,9 @@ where
     match state.broker.disconnect(&session).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(ConnectionBrokerError::Unavailable) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(ConnectionBrokerError::FastTrackUnavailable(stage)) => {
+            fast_track_stage_response(StatusCode::SERVICE_UNAVAILABLE.into_response(), stage)
+        }
         Err(
             ConnectionBrokerError::InvalidOrExpiredContinuation
             | ConnectionBrokerError::SessionMismatch,
@@ -333,27 +368,42 @@ where
             status,
         })
         .into_response(),
-        Err(ConnectionBrokerError::Unavailable) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "apiVersion": CONNECTIONS_API_VERSION,
-                "provider": "github",
-                "status": {
-                    "phase": "unavailable",
-                    "accountEmail": null,
-                    "scopesRequired": [],
-                    "scopesGranted": [],
-                    "scopesMissing": [],
-                    "expiresAt": null
-                }
-            })),
-        )
-            .into_response(),
+        Err(ConnectionBrokerError::Unavailable) => unavailable_status_response(),
+        Err(ConnectionBrokerError::FastTrackUnavailable(stage)) => {
+            fast_track_stage_response(unavailable_status_response(), stage)
+        }
         Err(
             ConnectionBrokerError::InvalidOrExpiredContinuation
             | ConnectionBrokerError::SessionMismatch,
         ) => StatusCode::BAD_GATEWAY.into_response(),
     }
+}
+
+fn unavailable_status_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "apiVersion": CONNECTIONS_API_VERSION,
+            "provider": "github",
+            "status": {
+                "phase": "unavailable",
+                "accountEmail": null,
+                "scopesRequired": [],
+                "scopesGranted": [],
+                "scopesMissing": [],
+                "expiresAt": null
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn fast_track_stage_response(mut response: Response, stage: FastTrackBffFailureStage) -> Response {
+    response.headers_mut().insert(
+        "x-steward-fast-track-bff-stage",
+        axum::http::HeaderValue::from_static(stage.as_str()),
+    );
+    response
 }
 
 #[cfg(test)]
@@ -382,6 +432,7 @@ mod tests {
         flow: Option<(CanonicalUserId, TestSessionBinding)>,
         connected_user: Option<CanonicalUserId>,
         unavailable: bool,
+        fast_track_stage: Option<FastTrackBffFailureStage>,
     }
 
     #[derive(Clone, Default)]
@@ -399,6 +450,9 @@ mod tests {
                     .state
                     .lock()
                     .map_err(|_| ConnectionBrokerError::Unavailable)?;
+                if let Some(stage) = state.fast_track_stage {
+                    return Err(ConnectionBrokerError::FastTrackUnavailable(stage));
+                }
                 if state.unavailable {
                     return Err(ConnectionBrokerError::Unavailable);
                 }
@@ -552,6 +606,39 @@ mod tests {
                 "status response exposed forbidden broker/session material: {forbidden}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fast_track_status_failure_exposes_only_a_fixed_stage_header() -> Result<(), String> {
+        let broker = FakeBroker::default();
+        broker
+            .state
+            .lock()
+            .map_err(|_| "lock fake broker")?
+            .fast_track_stage = Some(FastTrackBffFailureStage::BridgeTransport);
+        let response = router(broker)
+            .layer(axum::Extension(session()?))
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/connections/github")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build diagnostic status request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request diagnostic connection status: {error}"))?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get("x-steward-fast-track-bff-stage"),
+            Some(&header::HeaderValue::from_static("bridge_transport"))
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read diagnostic status body: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse diagnostic status body: {error}"))?;
+        assert_eq!(value["status"]["phase"], "unavailable");
+        assert!(!String::from_utf8_lossy(&body).contains("bridge_transport"));
         Ok(())
     }
 

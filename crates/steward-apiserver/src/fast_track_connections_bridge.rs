@@ -25,7 +25,8 @@ use crate::browser_auth::{
 };
 use crate::connections::{
     AuthorizationUrl, ConnectionBrokerError, ConnectionContinuation, ConnectionPhase,
-    ConnectionSession, ProviderConnectionBroker, ProviderConnectionStatus,
+    ConnectionSession, FastTrackBffFailureStage, ProviderConnectionBroker,
+    ProviderConnectionStatus,
 };
 
 pub const BRIDGE_HEALTH_PATH: &str = "/healthz";
@@ -291,10 +292,13 @@ impl<B> FastTrackConnectionsBff<B> {
         path: &'static str,
     ) -> Result<(StatusCode, Vec<u8>), ConnectionBrokerError> {
         if !self.lifetime.is_active() {
-            return Err(ConnectionBrokerError::Unavailable);
+            return Err(ConnectionBrokerError::FastTrackUnavailable(
+                FastTrackBffFailureStage::LifetimeExpired,
+            ));
         }
-        let target =
-            endpoint(&self.bridge_origin, path).map_err(|_| ConnectionBrokerError::Unavailable)?;
+        let target = endpoint(&self.bridge_origin, path).map_err(|_| {
+            ConnectionBrokerError::FastTrackUnavailable(FastTrackBffFailureStage::TargetUrl)
+        })?;
         let response = self
             .client
             .request(method, target)
@@ -308,12 +312,17 @@ impl<B> FastTrackConnectionsBff<B> {
             )
             .send()
             .await
-            .map_err(|_| ConnectionBrokerError::Unavailable)?;
-        let status = StatusCode::from_u16(response.status().as_u16())
-            .map_err(|_| ConnectionBrokerError::Unavailable)?;
-        let body = read_bounded(response)
-            .await
-            .map_err(|_| ConnectionBrokerError::Unavailable)?;
+            .map_err(|_| {
+                ConnectionBrokerError::FastTrackUnavailable(
+                    FastTrackBffFailureStage::BridgeTransport,
+                )
+            })?;
+        let status = StatusCode::from_u16(response.status().as_u16()).map_err(|_| {
+            ConnectionBrokerError::FastTrackUnavailable(FastTrackBffFailureStage::BridgeHttpStatus)
+        })?;
+        let body = read_bounded(response).await.map_err(|_| {
+            ConnectionBrokerError::FastTrackUnavailable(FastTrackBffFailureStage::BridgeTransport)
+        })?;
         Ok((status, body))
     }
 }
@@ -328,16 +337,23 @@ where
     ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>> {
         Box::pin(async move {
             if !self.session_matches(session) {
-                return Err(ConnectionBrokerError::SessionMismatch);
+                return Err(ConnectionBrokerError::FastTrackUnavailable(
+                    FastTrackBffFailureStage::SessionMismatch,
+                ));
             }
             let (status, body) = self
                 .request(reqwest::Method::GET, BRIDGE_STATUS_PATH)
                 .await?;
             if status != StatusCode::OK {
-                return Err(ConnectionBrokerError::Unavailable);
+                return Err(ConnectionBrokerError::FastTrackUnavailable(
+                    FastTrackBffFailureStage::BridgeHttpStatus,
+                ));
             }
-            let status: GithubStatus =
-                serde_json::from_slice(&body).map_err(|_| ConnectionBrokerError::Unavailable)?;
+            let status: GithubStatus = serde_json::from_slice(&body).map_err(|_| {
+                ConnectionBrokerError::FastTrackUnavailable(
+                    FastTrackBffFailureStage::ResponseSchema,
+                )
+            })?;
             status.into_provider_status()
         })
     }
@@ -348,18 +364,28 @@ where
     ) -> BoxFuture<'a, Result<AuthorizationUrl, ConnectionBrokerError>> {
         Box::pin(async move {
             if !self.session_matches(session) {
-                return Err(ConnectionBrokerError::SessionMismatch);
+                return Err(ConnectionBrokerError::FastTrackUnavailable(
+                    FastTrackBffFailureStage::SessionMismatch,
+                ));
             }
             let (status, body) = self
                 .request(reqwest::Method::POST, BRIDGE_START_PATH)
                 .await?;
             if status != StatusCode::OK {
-                return Err(ConnectionBrokerError::Unavailable);
+                return Err(ConnectionBrokerError::FastTrackUnavailable(
+                    FastTrackBffFailureStage::BridgeHttpStatus,
+                ));
             }
-            let started: GithubStart =
-                serde_json::from_slice(&body).map_err(|_| ConnectionBrokerError::Unavailable)?;
-            AuthorizationUrl::new(started.authorization_url)
-                .map_err(|_| ConnectionBrokerError::Unavailable)
+            let started: GithubStart = serde_json::from_slice(&body).map_err(|_| {
+                ConnectionBrokerError::FastTrackUnavailable(
+                    FastTrackBffFailureStage::ResponseSchema,
+                )
+            })?;
+            AuthorizationUrl::new(started.authorization_url).map_err(|_| {
+                ConnectionBrokerError::FastTrackUnavailable(
+                    FastTrackBffFailureStage::ResponseSemantics,
+                )
+            })
         })
     }
 
@@ -377,13 +403,17 @@ where
     ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
         Box::pin(async move {
             if !self.session_matches(session) {
-                return Err(ConnectionBrokerError::SessionMismatch);
+                return Err(ConnectionBrokerError::FastTrackUnavailable(
+                    FastTrackBffFailureStage::SessionMismatch,
+                ));
             }
             let (status, body) = self
                 .request(reqwest::Method::POST, BRIDGE_DISCONNECT_PATH)
                 .await?;
             if status != StatusCode::NO_CONTENT || !body.is_empty() {
-                return Err(ConnectionBrokerError::Unavailable);
+                return Err(ConnectionBrokerError::FastTrackUnavailable(
+                    FastTrackBffFailureStage::BridgeHttpStatus,
+                ));
             }
             Ok(())
         })
@@ -407,7 +437,9 @@ struct GithubStatus {
 impl GithubStatus {
     fn into_provider_status(self) -> Result<ProviderConnectionStatus, ConnectionBrokerError> {
         if self.connected && (self.email.is_none() || !self.missing_scopes.is_empty()) {
-            return Err(ConnectionBrokerError::Unavailable);
+            return Err(ConnectionBrokerError::FastTrackUnavailable(
+                FastTrackBffFailureStage::ResponseSemantics,
+            ));
         }
         let phase = if self.connected {
             ConnectionPhase::Connected

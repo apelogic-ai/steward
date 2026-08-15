@@ -878,7 +878,13 @@ async fn authenticate_browser_request(
 ) -> Response {
     let session = match resolve_session(&service, request.headers()) {
         Ok(session) => session,
-        Err(error) => return error.into_response(),
+        Err(error) => {
+            #[cfg(feature = "admin-demo")]
+            if request.method() == Method::GET && request.uri().path() == "/admin/connections" {
+                return Redirect::to("/admin/sign-in").into_response();
+            }
+            return error.into_response();
+        }
     };
     if require_admin && session.principal.role != BrowserRole::Admin {
         return BrowserAuthFailure::InsufficientAuthority.into_response();

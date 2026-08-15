@@ -310,8 +310,12 @@ mod tests {
             .map_err(|error| format!("request unauthenticated Connections shell: {error}"))?;
         assert_eq!(
             response.status(),
-            StatusCode::UNAUTHORIZED,
-            "the Connections route must exist but fail closed before a browser session"
+            StatusCode::SEE_OTHER,
+            "browser navigation should enter the sign-in journey"
+        );
+        assert_eq!(
+            response.headers().get(header::LOCATION),
+            Some(&header::HeaderValue::from_static("/admin/sign-in"))
         );
         Ok(())
     }
