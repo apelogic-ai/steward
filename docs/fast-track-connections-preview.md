@@ -15,20 +15,27 @@ Neither process accepts a HOP-1 token setting. The bridge has no token-file opti
 transparent substitution at the allowed sandbox egress. MCP-GW remains the only holder of GitHub
 provider credentials.
 
-Before the first connection request, the preview may create the current DEV controller's legacy
-email-bound runtime through `POST /admin/api/v1/fast-track/connections/runtime`. This endpoint is
-behind the normal Google browser-session, same-origin, JSON, and CSRF boundary. It accepts exactly
-`{}` and derives the acting user and owner only from the verified browser principal. The fixed
+At startup, the preview creates or exact-matches the current DEV controller's legacy email-bound
+runtime from its fixed configured compatibility email. The browser later confirms that runtime
+through `POST /admin/api/v1/fast-track/connections/runtime`. This endpoint is behind the normal
+Google browser-session, same-origin, JSON, and CSRF boundary. It accepts exactly `{}` and derives
+the acting user and owner only from the verified browser principal. The fixed
 runtime is `lbe259-fast-track/connections-bridge`, has no `canonicalAuthority`, uses the fixed
-service principal `steward-run` with the verified email as `actingUser`, has a 15-minute TTL and
+service principal `steward-run` with the verified email as `actingUser`, has a one-hour TTL and
 zero model/budget allocation, and grants only
 `github/github_oauth_start/write`. A second call from the same browser session is idempotent; a
 different session or a mismatched pre-existing runtime fails closed. Its response contains only
 the fixed runtime identifier and sanitized phase. This is a temporary Mint v2/DEV CRD
 compatibility seam, not the production identity architecture.
 
-Both processes are bounded by `STEWARD_FAST_TRACK_BRIDGE_TTL_SECONDS`, which must be between 1 and
-3600. The fixed browser email and canonical ID must describe the same currently verified user as
+The preview also prewarms that exact fixed runtime during server startup from the already
+configured compatibility email. This is not a public endpoint and accepts no caller input. The
+trusted preview ServiceAccount uses the same exact-match create-or-get path as the protected
+browser endpoint; a mismatched existing object still fails startup closed.
+
+The runtime, BFF, and governed bridge use one fixed one-hour preview window. Both processes require
+`STEWARD_FAST_TRACK_BRIDGE_TTL_SECONDS=3600`; other values fail startup. The fixed browser email and
+canonical ID must describe the same currently verified user as
 the fixed issuer/email authority configured for the governed bridge sandbox.
 
 ## Build inputs
@@ -54,7 +61,7 @@ Bridge configuration is non-secret:
 - `STEWARD_FAST_TRACK_COMPATIBILITY_EMAIL`: current verified email for the single preview user.
 - `STEWARD_FAST_TRACK_REDIRECT_AFTER`: exact HTTPS `/admin/connections` URL, optionally with the
   `github-connected` fragment.
-- `STEWARD_FAST_TRACK_BRIDGE_TTL_SECONDS`: 1–3600.
+- `STEWARD_FAST_TRACK_BRIDGE_TTL_SECONDS`: exactly `3600` for both preview and bridge processes.
 
 The Steward preview additionally requires:
 
@@ -70,8 +77,14 @@ The preview ServiceAccount additionally needs only namespaced `get` and `create`
 `agentruntimes.agents.apelogic.ai` in `lbe259-fast-track`, and its exact Kubernetes username must
 already be configured as a trusted Steward writer. Runtime creation uses that ServiceAccount
 authority directly; it does not impersonate the browser user or any group. The live `steward-run`
-service envelope must admit exactly the fixed tool, zero budget, and 15-minute TTL. The preview
+service envelope must admit exactly the fixed tool, zero budget, and one-hour TTL. The preview
 does not need list/watch/update/patch/delete, impersonation, or Secret access for this endpoint.
+
+The existing DEV `steward-run` revision 3 ceiling already admits the fixed tool and a one-hour TTL,
+so this preview window requires no envelope or MCP-GW policy widening. An activation watcher may
+wait for the exact fixed runtime to become Running, derive the immutable workspace/sandbox tuple
+from `status.refs`, and narrowly bind the preview Service and launcher to that tuple. It must not
+accept a runtime name, identity, grant, or selector from the browser.
 
 Network policy must allow only the Steward apiserver pod selector to reach bridge port 18080. The
 governed sandbox profile must allow the bridge binary to reach only the configured MCP-GW

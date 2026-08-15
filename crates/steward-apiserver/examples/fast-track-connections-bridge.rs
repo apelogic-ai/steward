@@ -9,6 +9,8 @@ use steward_apiserver::fast_track_connections_bridge::{
 };
 use tokio::net::TcpListener;
 
+const FAST_TRACK_TTL_SECONDS: u64 = 3_600;
+
 fn required(name: &str) -> Result<String, io::Error> {
     env::var(name).map_err(|_| io::Error::other(format!("{name} is required")))
 }
@@ -17,12 +19,18 @@ fn config() -> Result<(SocketAddr, FastTrackConnectionsBridge), Box<dyn Error>> 
     let bind = required("STEWARD_FAST_TRACK_BRIDGE_BIND")?
         .parse::<SocketAddr>()
         .map_err(|_| io::Error::other("STEWARD_FAST_TRACK_BRIDGE_BIND must be a socket address"))?;
-    let ttl = required("STEWARD_FAST_TRACK_BRIDGE_TTL_SECONDS")?
+    let ttl_seconds = required("STEWARD_FAST_TRACK_BRIDGE_TTL_SECONDS")?
         .parse::<u64>()
-        .map(Duration::from_secs)
         .map_err(|_| {
             io::Error::other("STEWARD_FAST_TRACK_BRIDGE_TTL_SECONDS must be an integer")
         })?;
+    if ttl_seconds != FAST_TRACK_TTL_SECONDS {
+        return Err(io::Error::other(
+            "STEWARD_FAST_TRACK_BRIDGE_TTL_SECONDS must be exactly 3600 for the fixed preview",
+        )
+        .into());
+    }
+    let ttl = Duration::from_secs(ttl_seconds);
     let config = FastTrackBridgeConfig::new(
         required("STEWARD_FAST_TRACK_MCP_GW_ORIGIN")?,
         required("STEWARD_FAST_TRACK_COMPATIBILITY_ISSUER")?,

@@ -20,18 +20,27 @@ use steward_apiserver::fast_track_runtime_bootstrap::{
     FastTrackRuntimeBootstrap, protected_router as runtime_bootstrap_router,
 };
 use steward_apiserver::google_oidc::GoogleOidcProvider;
-use steward_types::{CanonicalUserId, OrganizationId};
+use steward_types::{CanonicalUserId, Email, OrganizationId};
 use tokio::net::TcpListener;
+
+const FAST_TRACK_TTL_SECONDS: u64 = 3_600;
 
 fn required(name: &str) -> Result<String, io::Error> {
     env::var(name).map_err(|_| io::Error::other(format!("{name} is required")))
 }
 
 fn ttl() -> Result<Duration, io::Error> {
-    required("STEWARD_FAST_TRACK_BRIDGE_TTL_SECONDS")?
+    let seconds = required("STEWARD_FAST_TRACK_BRIDGE_TTL_SECONDS")?
         .parse::<u64>()
-        .map(Duration::from_secs)
-        .map_err(|_| io::Error::other("STEWARD_FAST_TRACK_BRIDGE_TTL_SECONDS must be an integer"))
+        .map_err(|_| {
+            io::Error::other("STEWARD_FAST_TRACK_BRIDGE_TTL_SECONDS must be an integer")
+        })?;
+    if seconds != FAST_TRACK_TTL_SECONDS {
+        return Err(io::Error::other(
+            "STEWARD_FAST_TRACK_BRIDGE_TTL_SECONDS must be exactly 3600 for the fixed preview",
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 async fn router() -> Result<Router, Box<dyn Error>> {
@@ -45,6 +54,7 @@ async fn router() -> Result<Router, Box<dyn Error>> {
         organization_id,
     )?;
     let compatibility_email = required("STEWARD_FAST_TRACK_COMPATIBILITY_EMAIL")?;
+    let prewarm_email = Email::parse(&compatibility_email)?;
     let canonical_user_id =
         CanonicalUserId::parse(required("STEWARD_FAST_TRACK_CANONICAL_USER_ID")?)?;
     let identity_resolver =
@@ -63,6 +73,7 @@ async fn router() -> Result<Router, Box<dyn Error>> {
     let runtime_bootstrap = FastTrackRuntimeBootstrap::new(KubeRuntimeRepository::new(
         kube::Client::try_default().await?,
     ));
+    runtime_bootstrap.prewarm(prewarm_email).await?;
     Ok(Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         .merge(browser_auth_router(browser_auth.clone()))

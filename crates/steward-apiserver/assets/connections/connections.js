@@ -21,6 +21,7 @@ const FAST_TRACK_POLLABLE_RUNTIME_PHASES = new Set([
 ]);
 const FAST_TRACK_STATUS_POLL_INTERVAL_MS = 1000;
 const FAST_TRACK_STATUS_POLL_DEADLINE_MS = 90000;
+const FAST_TRACK_STATUS_REVALIDATE_MS = 5000;
 const FAST_TRACK_RETRYABLE_BFF_STAGES = new Set(["bridge_transport", "bridge_http_status"]);
 const FAST_TRACK_BFF_STAGE_LABELS = new Map([
   ["lifetime_expired", "preview window expired"],
@@ -33,6 +34,9 @@ const FAST_TRACK_BFF_STAGE_LABELS = new Map([
 ]);
 
 const fastTrackRuntimeBootstrap = document.body.dataset.fastTrackRuntime === "true";
+const previewReadiness = fastTrackRuntimeBootstrap
+  ? new globalThis.StewardPreviewReadiness.PreviewReadinessState()
+  : null;
 const providerCard = document.querySelector(".provider-card");
 const principalEmail = document.querySelector("#principal-email");
 const canonicalUser = document.querySelector("#canonical-user");
@@ -186,7 +190,6 @@ async function loadSession() {
 }
 
 async function fetchConnectionStatus() {
-  clearError();
   const value = await fetchJson("/admin/api/v1/connections/github");
   if (
     value.apiVersion !== CONNECTIONS_VERSION ||
@@ -212,31 +215,24 @@ function applyConnectionStatus(status) {
 }
 
 async function loadConnection() {
+  clearError();
   applyConnectionStatus(await fetchConnectionStatus());
 }
 
-async function bootstrapRuntime() {
-  runtimeStatus.hidden = false;
-  runtimeStatus.textContent = "Preparing preview runtime…";
-  try {
-    const value = await fetchJson("/admin/api/v1/fast-track/connections/runtime", {
-      method: "POST",
-      headers: mutationHeaders(),
-      body: "{}",
-    });
-    if (
-      value.runtimeId !== FAST_TRACK_RUNTIME_ID ||
-      typeof value.status !== "string" ||
-      !FAST_TRACK_RUNTIME_PHASES.has(value.status)
-    ) {
-      throw new Error("preview runtime response mismatch");
-    }
-    runtimeStatus.textContent = `Preview runtime ${value.status}.`;
-    return value.status;
-  } catch (_error) {
-    runtimeStatus.textContent = "Preview runtime unavailable.";
-    throw new Error("preview runtime unavailable");
+async function fetchRuntimePhase() {
+  const value = await fetchJson("/admin/api/v1/fast-track/connections/runtime", {
+    method: "POST",
+    headers: mutationHeaders(),
+    body: "{}",
+  });
+  if (
+    value.runtimeId !== FAST_TRACK_RUNTIME_ID ||
+    typeof value.status !== "string" ||
+    !FAST_TRACK_RUNTIME_PHASES.has(value.status)
+  ) {
+    throw new Error("preview runtime response mismatch");
   }
+  return value.status;
 }
 
 function renderBffStage(runtimePhase, stage) {
@@ -247,6 +243,7 @@ function renderBffStage(runtimePhase, stage) {
 }
 
 function renderPreviewChecking(runtimePhase, stage) {
+  runtimeStatus.hidden = false;
   providerCard.dataset.phase = "loading";
   githubStatus.textContent = "Checking…";
   githubSummary.textContent = "Waiting for the governed preview runtime and connection path.";
@@ -257,59 +254,94 @@ function renderPreviewChecking(runtimePhase, stage) {
   renderBffStage(runtimePhase, stage);
 }
 
-function pollDelay() {
-  return new Promise((resolve) => window.setTimeout(resolve, FAST_TRACK_STATUS_POLL_INTERVAL_MS));
+function renderPreviewUnavailable(runtimePhase, stage) {
+  providerCard.dataset.phase = "unavailable";
+  githubStatus.textContent = "Unavailable";
+  githubSummary.textContent = "The governed preview runtime or connection path is unavailable.";
+  connectGithub.hidden = true;
+  connectGithub.disabled = true;
+  disconnectGithub.hidden = true;
+  retryGithub.hidden = false;
+  renderBffStage(runtimePhase, stage);
 }
 
-async function loadConnectionWithPreviewPolling(initialRuntimePhase) {
+function pollDelay(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function runPreviewReadinessController() {
+  const generation = previewReadiness.begin();
   const deadline = Date.now() + FAST_TRACK_STATUS_POLL_DEADLINE_MS;
-  let runtimePhase = initialRuntimePhase;
-  let consecutiveReadyChecks = 0;
+  let runtimePhase = "pending";
+  let ready = false;
+  clearError();
+  renderPreviewChecking(runtimePhase, null);
+
   for (;;) {
     try {
-      const status = await fetchConnectionStatus();
-      if (runtimePhase === "running") {
-        consecutiveReadyChecks += 1;
-      } else {
-        consecutiveReadyChecks = 0;
-      }
-      if (consecutiveReadyChecks >= 2) {
-        renderConnection(status);
-        if (!callbackStatus.hidden && status.phase === "connected") {
-          callbackStatus.textContent = "GitHub connected.";
-        }
-        runtimeStatus.dataset.bffStage = "ready";
-        runtimeStatus.textContent = `Preview runtime ${runtimePhase}. Connection path ready.`;
+      runtimePhase = await fetchRuntimePhase();
+      if (!previewReadiness.owns(generation)) {
         return;
       }
-      renderPreviewChecking(runtimePhase, null);
+      if (!FAST_TRACK_POLLABLE_RUNTIME_PHASES.has(runtimePhase)) {
+        previewReadiness.acceptTerminal(generation);
+        renderPreviewUnavailable(runtimePhase, "lifetime_expired");
+        return;
+      }
+
+      const status = await fetchConnectionStatus();
+      const action = previewReadiness.acceptSuccess(generation, runtimePhase === "running");
+      if (action === "ignore") {
+        return;
+      }
+      if (action === "ready") {
+        ready = true;
+        applyConnectionStatus(status);
+        runtimeStatus.dataset.bffStage = "ready";
+        runtimeStatus.textContent = `Preview runtime ${runtimePhase}. Connection path ready.`;
+      } else {
+        ready = false;
+        renderPreviewChecking(runtimePhase, null);
+      }
     } catch (error) {
-      consecutiveReadyChecks = 0;
+      if (!previewReadiness.owns(generation)) {
+        return;
+      }
       const requestStatus = error && error.requestStatus;
       const stage = error && error.bffStage;
-      renderPreviewChecking(runtimePhase, stage);
-      if (
-        requestStatus === 401 ||
-        requestStatus === 403 ||
-        requestStatus !== 503 ||
-        !FAST_TRACK_RETRYABLE_BFF_STAGES.has(stage) ||
-        !FAST_TRACK_POLLABLE_RUNTIME_PHASES.has(runtimePhase)
-      ) {
-        throw error;
+      const retryable =
+        requestStatus === 503 && FAST_TRACK_RETRYABLE_BFF_STAGES.has(stage);
+      if (!retryable) {
+        previewReadiness.acceptTerminal(generation);
+        renderPreviewUnavailable(runtimePhase, stage);
+        return;
+      }
+      const action = previewReadiness.acceptRetryableFailure(generation);
+      if (action === "ignore") {
+        return;
+      }
+      if (action !== "hold_ready") {
+        ready = false;
+        renderPreviewChecking(runtimePhase, stage);
       }
     }
-    if (
-      !FAST_TRACK_POLLABLE_RUNTIME_PHASES.has(runtimePhase) ||
-      Date.now() + FAST_TRACK_STATUS_POLL_INTERVAL_MS > deadline
-    ) {
-      throw new Error("preview readiness deadline reached");
+
+    if (!ready && Date.now() + FAST_TRACK_STATUS_POLL_INTERVAL_MS > deadline) {
+      previewReadiness.acceptTerminal(generation);
+      renderPreviewUnavailable(runtimePhase, null);
+      return;
     }
-    await pollDelay();
-    runtimePhase = await bootstrapRuntime();
+    await pollDelay(ready ? FAST_TRACK_STATUS_REVALIDATE_MS : FAST_TRACK_STATUS_POLL_INTERVAL_MS);
+    if (!previewReadiness.owns(generation)) {
+      return;
+    }
   }
 }
 
 async function startConnection() {
+  if (fastTrackRuntimeBootstrap) {
+    previewReadiness.cancel();
+  }
   setBusy(true);
   clearError();
   try {
@@ -330,10 +362,16 @@ async function startConnection() {
   } catch (_error) {
     showError("GitHub consent could not be started. No credential was stored.");
     setBusy(false);
+    if (fastTrackRuntimeBootstrap) {
+      void runPreviewReadinessController();
+    }
   }
 }
 
 async function disconnectConnection() {
+  if (fastTrackRuntimeBootstrap) {
+    previewReadiness.cancel();
+  }
   setBusy(true);
   clearError();
   try {
@@ -348,14 +386,25 @@ async function disconnectConnection() {
       throw new Error("provider disconnect rejected");
     }
     disconnectDialog.close();
-    await loadConnection();
+    if (fastTrackRuntimeBootstrap) {
+      void runPreviewReadinessController();
+    } else {
+      await loadConnection();
+    }
     callbackStatus.textContent = "";
     callbackStatus.hidden = true;
   } catch (_error) {
     disconnectDialog.close();
     showError("GitHub could not be disconnected. Refresh the status before retrying.");
+    if (fastTrackRuntimeBootstrap) {
+      void runPreviewReadinessController();
+    }
   } finally {
-    setBusy(false);
+    if (fastTrackRuntimeBootstrap) {
+      confirmDisconnect.disabled = false;
+    } else {
+      setBusy(false);
+    }
   }
 }
 
@@ -372,25 +421,26 @@ function announceCallback() {
 }
 
 connectGithub.addEventListener("click", () => void startConnection());
-retryGithub.addEventListener("click", () => void (async () => {
-  try {
-    if (fastTrackRuntimeBootstrap) {
-      const runtimePhase = await bootstrapRuntime();
-      await loadConnectionWithPreviewPolling(runtimePhase);
-    } else {
-      await loadConnection();
-    }
-  } catch (_error) {
-    renderConnection({
-      phase: "unavailable",
-      accountEmail: null,
-      expiresAt: null,
-      scopesRequired: [],
-      scopesGranted: [],
-      scopesMissing: [],
-    });
+retryGithub.addEventListener("click", () => {
+  if (fastTrackRuntimeBootstrap) {
+    void runPreviewReadinessController();
+    return;
   }
-})());
+  void (async () => {
+    try {
+      await loadConnection();
+    } catch (_error) {
+      renderConnection({
+        phase: "unavailable",
+        accountEmail: null,
+        expiresAt: null,
+        scopesRequired: [],
+        scopesGranted: [],
+        scopesMissing: [],
+      });
+    }
+  })();
+});
 disconnectGithub.addEventListener("click", () => disconnectDialog.showModal());
 confirmDisconnect.addEventListener("click", () => void disconnectConnection());
 
@@ -398,12 +448,21 @@ async function initialize() {
   announceCallback();
   try {
     await loadSession();
-    if (fastTrackRuntimeBootstrap) {
-      const runtimePhase = await bootstrapRuntime();
-      await loadConnectionWithPreviewPolling(runtimePhase);
-    } else {
-      await loadConnection();
-    }
+  } catch (_error) {
+    providerCard.dataset.phase = "unavailable";
+    githubStatus.textContent = "Unavailable";
+    githubSummary.textContent = "Your session or provider status could not be verified.";
+    retryGithub.hidden = false;
+    connectGithub.hidden = true;
+    showError("Connections could not be loaded. Sign in again or retry the status check.");
+    return;
+  }
+  if (fastTrackRuntimeBootstrap) {
+    await runPreviewReadinessController();
+    return;
+  }
+  try {
+    await loadConnection();
   } catch (_error) {
     providerCard.dataset.phase = "unavailable";
     githubStatus.textContent = "Unavailable";

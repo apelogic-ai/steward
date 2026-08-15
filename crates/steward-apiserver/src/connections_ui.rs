@@ -13,6 +13,8 @@ use crate::connections::ConnectionSession;
 
 const CONNECTIONS_HTML: &str = include_str!("../assets/connections/index.html");
 const CONNECTIONS_CSS: &str = include_str!("../assets/connections/connections.css");
+#[cfg(feature = "admin-demo")]
+const PREVIEW_READINESS_JS: &str = include_str!("../assets/connections/preview-readiness.js");
 const CONNECTIONS_JS: &str = include_str!("../assets/connections/connections.js");
 
 pub(crate) fn router<B, S>() -> Router<S>
@@ -20,13 +22,18 @@ where
     B: Clone + Eq + Hash + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    Router::<S>::new()
+    let router = Router::<S>::new()
         .route("/admin/connections", get(connections_shell::<B>))
         .route("/admin/assets/connections.css", get(connections_stylesheet))
-        .route("/admin/assets/connections.js", get(connections_script))
-        .layer(middleware::from_fn(
-            crate::admin_ui::add_browser_security_headers,
-        ))
+        .route("/admin/assets/connections.js", get(connections_script));
+    #[cfg(feature = "admin-demo")]
+    let router = router.route(
+        "/admin/assets/preview-readiness.js",
+        get(preview_readiness_script),
+    );
+    router.layer(middleware::from_fn(
+        crate::admin_ui::add_browser_security_headers,
+    ))
 }
 
 async fn connections_shell<B>(session: Option<Extension<ConnectionSession<B>>>) -> Response
@@ -42,11 +49,19 @@ where
 fn connections_document() -> Cow<'static, str> {
     #[cfg(feature = "admin-demo")]
     {
-        Cow::Owned(CONNECTIONS_HTML.replacen(
-            "data-fast-track-runtime=\"false\"",
-            "data-fast-track-runtime=\"true\"",
-            1,
-        ))
+        Cow::Owned(
+            CONNECTIONS_HTML
+                .replacen(
+                    "data-fast-track-runtime=\"false\"",
+                    "data-fast-track-runtime=\"true\"",
+                    1,
+                )
+                .replacen(
+                    "<script src=\"/admin/assets/connections.js\" defer></script>",
+                    "<script src=\"/admin/assets/preview-readiness.js\" defer></script>\n    <script src=\"/admin/assets/connections.js\" defer></script>",
+                    1,
+                ),
+        )
     }
     #[cfg(not(feature = "admin-demo"))]
     {
@@ -68,6 +83,16 @@ async fn connections_script() -> Response {
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         CONNECTIONS_JS,
+    )
+        .into_response()
+}
+
+#[cfg(feature = "admin-demo")]
+async fn preview_readiness_script() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        PREVIEW_READINESS_JS,
     )
         .into_response()
 }
@@ -134,16 +159,43 @@ mod tests {
             .await
             .map_err(|error| format!("read Connections shell: {error}"))?;
         assert_eq!(body.as_ref(), connections_document().as_bytes());
+
+        let readiness_asset = router::<TestBinding, ()>()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/assets/preview-readiness.js")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build readiness asset request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request readiness asset: {error}"))?;
+        #[cfg(feature = "admin-demo")]
+        {
+            assert_eq!(readiness_asset.status(), StatusCode::OK);
+            let body = to_bytes(readiness_asset.into_body(), 32 * 1024)
+                .await
+                .map_err(|error| format!("read readiness asset: {error}"))?;
+            assert_eq!(body.as_ref(), PREVIEW_READINESS_JS.as_bytes());
+        }
+        #[cfg(not(feature = "admin-demo"))]
+        assert_eq!(readiness_asset.status(), StatusCode::NOT_FOUND);
         Ok(())
     }
 
     #[test]
     fn connections_assets_are_accessible_responsive_and_never_use_browser_storage_or_html_sinks() {
         assert!(CONNECTIONS_HTML.contains("data-fast-track-runtime=\"false\""));
+        assert!(!CONNECTIONS_HTML.contains("/admin/assets/preview-readiness.js"));
         #[cfg(feature = "admin-demo")]
-        assert!(connections_document().contains("data-fast-track-runtime=\"true\""));
+        {
+            assert!(connections_document().contains("data-fast-track-runtime=\"true\""));
+            assert!(connections_document().contains("/admin/assets/preview-readiness.js"));
+        }
         #[cfg(not(feature = "admin-demo"))]
-        assert!(connections_document().contains("data-fast-track-runtime=\"false\""));
+        {
+            assert!(connections_document().contains("data-fast-track-runtime=\"false\""));
+            assert!(!connections_document().contains("/admin/assets/preview-readiness.js"));
+        }
         for required in [
             "<main",
             "<h1",
@@ -177,15 +229,15 @@ mod tests {
             "callbackStatus.textContent = \"GitHub connected.\"",
             "callbackStatus.hidden = true",
             "/admin/api/v1/fast-track/connections/runtime",
-            "async function bootstrapRuntime()",
-            "await loadSession();\n    if (fastTrackRuntimeBootstrap) {\n      const runtimePhase = await bootstrapRuntime();\n      await loadConnectionWithPreviewPolling(runtimePhase);\n    } else {\n      await loadConnection();\n    }",
-            "runtimeStatus.textContent = \"Preview runtime unavailable.\"",
+            "async function fetchRuntimePhase()",
             "const FAST_TRACK_STATUS_POLL_INTERVAL_MS = 1000;",
             "const FAST_TRACK_STATUS_POLL_DEADLINE_MS = 90000;",
+            "const FAST_TRACK_STATUS_REVALIDATE_MS = 5000;",
             "x-steward-fast-track-bff-stage",
-            "async function loadConnectionWithPreviewPolling",
+            "async function runPreviewReadinessController()",
             "runtimeStatus.dataset.bffStage",
-            "await loadConnectionWithPreviewPolling(runtimePhase);",
+            "previewReadiness.owns(generation)",
+            "previewReadiness.cancel();",
         ] {
             assert!(
                 CONNECTIONS_JS.contains(required),
@@ -215,33 +267,38 @@ mod tests {
     }
 
     #[test]
-    fn preview_readiness_requires_two_running_successes_and_resets_on_oscillation() {
+    #[cfg(feature = "admin-demo")]
+    fn preview_readiness_is_generation_owned_and_revalidates_stable_state() {
         for required in [
-            "let consecutiveReadyChecks = 0;",
-            "runtimePhase === \"running\"",
-            "consecutiveReadyChecks += 1;",
-            "consecutiveReadyChecks = 0;",
-            "consecutiveReadyChecks >= 2",
-            "function renderPreviewChecking(runtimePhase, stage)",
-            "connectGithub.disabled = true;",
-            "renderPreviewChecking(runtimePhase, stage);",
+            "class PreviewReadinessState",
+            "begin()",
+            "cancel()",
+            "owns(generation)",
+            "acceptSuccess(generation, runtimeRunning)",
+            "acceptRetryableFailure(generation)",
+            "acceptTerminal(generation)",
+            "return IGNORE;",
+            "return HOLD_READY;",
         ] {
             assert!(
-                CONNECTIONS_JS.contains(required),
+                PREVIEW_READINESS_JS.contains(required),
                 "preview readiness is missing hysteresis contract {required:?}"
             );
         }
 
         assert!(
-            CONNECTIONS_JS
-                .contains("if (consecutiveReadyChecks >= 2) {\n        renderConnection(status);"),
-            "only the stable-ready branch may render the actionable connection state"
+            CONNECTIONS_JS.contains(
+                "const generation = previewReadiness.begin();\n  const deadline = Date.now()"
+            ),
+            "each readiness controller must own one generation"
         );
         assert!(
             CONNECTIONS_JS.contains(
-                "renderPreviewChecking(runtimePhase, null);\n    } catch (error) {\n      consecutiveReadyChecks = 0;"
+                "await pollDelay(ready ? FAST_TRACK_STATUS_REVALIDATE_MS : FAST_TRACK_STATUS_POLL_INTERVAL_MS);"
             ),
-            "an oscillating failure must reset readiness after keeping the UI non-actionable"
+            "stable readiness must continue bounded expiry revalidation"
         );
+        assert!(CONNECTIONS_JS.contains("if (action !== \"hold_ready\")"));
+        assert!(CONNECTIONS_JS.contains("renderPreviewUnavailable(runtimePhase, stage);"));
     }
 }

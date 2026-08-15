@@ -2,7 +2,7 @@
 //!
 //! This is deliberately a compatibility seam for the current DEV controller and Mint v2. The
 //! browser caller supplies no authority or capability fields: one verified Google session is
-//! bound to one short-lived, server-authored, legacy email AgentRuntime.
+//! bound to one bounded, server-authored, legacy email AgentRuntime.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -31,7 +31,7 @@ pub const FAST_TRACK_RUNTIME_NAME: &str = "connections-bridge";
 pub const FAST_TRACK_SERVICE_PRINCIPAL: &str = "steward-run";
 
 const SERVICE_PRINCIPAL_ANNOTATION: &str = "agents.apelogic.ai/service-principal";
-const FIXED_TTL: &str = "15m";
+const FIXED_TTL: &str = "1h";
 const FIXED_TOOL_PROVIDER: &str = "github";
 const FIXED_TOOL_RESOURCE: &str = "github_oauth_start";
 const FIXED_TOOL_ACTION: &str = "write";
@@ -129,7 +129,15 @@ where
         context: &BrowserSessionContext,
     ) -> Result<(StatusCode, BootstrapResponse), BootstrapError> {
         self.bind_session(context)?;
-        let runtime = fixed_runtime(context.principal.display_email.clone());
+        self.ensure_runtime(context.principal.display_email.clone())
+            .await
+    }
+
+    async fn ensure_runtime(
+        &self,
+        email: Email,
+    ) -> Result<(StatusCode, BootstrapResponse), BootstrapError> {
+        let runtime = fixed_runtime(email);
         enforce_fixed_admission(&runtime.spec)?;
         match self
             .runtimes
@@ -151,6 +159,17 @@ where
             Err(RuntimeCreateError::Kubernetes { .. })
             | Err(RuntimeCreateError::Unavailable(_)) => Err(BootstrapError::Unavailable),
         }
+    }
+
+    /// Prewarms the fixed DEV runtime from the server's configured compatibility identity.
+    ///
+    /// This has no public route and accepts no browser or request fields. The same exact-match
+    /// create-or-get boundary used by the protected endpoint remains authoritative.
+    pub async fn prewarm(&self, compatibility_email: Email) -> Result<(), String> {
+        self.ensure_runtime(compatibility_email)
+            .await
+            .map(|_| ())
+            .map_err(|_| "prewarm fixed fast-track runtime".to_owned())
     }
 }
 
@@ -455,7 +474,7 @@ mod tests {
         assert_eq!(runtime.spec.tools[0].provider, "github");
         assert_eq!(runtime.spec.tools[0].resource, "github_oauth_start");
         assert_eq!(runtime.spec.tools[0].action, "write");
-        assert_eq!(runtime.spec.ttl.0, "15m");
+        assert_eq!(runtime.spec.ttl.0, "1h");
         assert_eq!(runtime.spec.budget.monthly_limit, "0.00");
         assert_eq!(
             runtime
@@ -469,6 +488,32 @@ mod tests {
                 .annotations()
                 .contains_key("agents.apelogic.ai/member-role")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_prewarm_authors_the_fixed_runtime_without_a_browser_request()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimes::default();
+        let bootstrap = FastTrackRuntimeBootstrap::new(runtimes.clone());
+
+        bootstrap
+            .prewarm(Email::parse("alice@example.com")?)
+            .await
+            .map_err(|_| "prewarm failed")?;
+
+        let created = runtimes.created.lock().map_err(|_| "poisoned capture")?;
+        let (namespace, runtime) = created.first().ok_or("runtime was not prewarmed")?;
+        assert_eq!(namespace, FAST_TRACK_RUNTIME_NAMESPACE);
+        assert_eq!(runtime.name_any(), FAST_TRACK_RUNTIME_NAME);
+        assert_eq!(runtime.spec.owner.as_str(), "alice@example.com");
+        assert_eq!(runtime.spec.ttl.0, "1h");
+        assert!(matches!(
+            &runtime.spec.principal,
+            Principal::Service { name, acting_user: Some(acting_user) }
+                if name == FAST_TRACK_SERVICE_PRINCIPAL
+                    && acting_user.as_str() == "alice@example.com"
+        ));
         Ok(())
     }
 
@@ -557,7 +602,7 @@ mod tests {
     #[tokio::test]
     async fn mismatched_existing_runtime_fails_closed() -> Result<(), String> {
         let mut existing = fixed_runtime(Email::parse("alice@example.com")?);
-        existing.spec.ttl = steward_types::Duration("1h".to_owned());
+        existing.spec.ttl = steward_types::Duration("30m".to_owned());
         let repository = ExistingRuntimes {
             existing,
             creates: Arc::new(Mutex::new(0)),
