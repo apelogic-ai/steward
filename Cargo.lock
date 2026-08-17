@@ -3507,6 +3507,7 @@ dependencies = [
  "steward-adapter-jira",
  "steward-apiserver",
  "steward-store",
+ "steward-types",
  "tokio",
  "tokio-rustls",
 ]
