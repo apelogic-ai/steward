@@ -539,13 +539,20 @@ impl PgStore {
             return Err(StoreError::InvalidRunQuery);
         }
         if let Some(cursor) = query.cursor {
-            let exists = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM task_submissions WHERE task_uid = $1)",
-            )
-            .bind(cursor)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(database_error)?;
+            let mut cursor_exists = QueryBuilder::<Postgres>::new(
+                "SELECT EXISTS(SELECT 1 FROM task_submissions WHERE task_uid = ",
+            );
+            cursor_exists.push_bind(cursor);
+            if let Some(owner_user_id) = query.owner_user_id.as_deref() {
+                cursor_exists.push(" AND owner_user_id = ");
+                cursor_exists.push_bind(owner_user_id);
+            }
+            cursor_exists.push(")");
+            let exists = cursor_exists
+                .build_query_scalar::<bool>()
+                .fetch_one(&self.pool)
+                .await
+                .map_err(database_error)?;
             if !exists {
                 return Err(StoreError::InvalidRunCursor);
             }
@@ -568,6 +575,10 @@ impl PgStore {
         if let Some(workflow) = query.workflow.as_deref() {
             statement.push(" AND tasks.workflow = ");
             statement.push_bind(workflow);
+        }
+        if let Some(owner_user_id) = query.owner_user_id.as_deref() {
+            statement.push(" AND tasks.owner_user_id = ");
+            statement.push_bind(owner_user_id);
         }
         statement.push(" ORDER BY tasks.created_at DESC, tasks.task_uid DESC LIMIT ");
         statement.push_bind(i64::from(query.limit) + 1);
@@ -2308,6 +2319,8 @@ pub struct AgentRunQuery {
     pub cursor: Option<Uuid>,
     pub phase: Option<steward_types::TaskPhase>,
     pub workflow: Option<String>,
+    /// Exact server-derived canonical owner scope. `None` is reserved for administrator reads.
+    pub owner_user_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2322,6 +2335,7 @@ pub struct AgentRunRecord {
     pub submitter_service: String,
     pub acting_user: Option<String>,
     pub owner: String,
+    pub owner_user_id: Option<String>,
     pub workflow: String,
     pub coding_agent_runtime: String,
     pub runtime_uid: Option<String>,
@@ -2834,7 +2848,7 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
     })
 }
 
-const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, tasks.acting_user, tasks.owner, \
+const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, tasks.acting_user, tasks.owner, tasks.owner_user_id, \
             tasks.workflow, tasks.coding_agent_runtime, tasks.runtime_uid, \
             tasks.runtime_ownership, tasks.phase, tasks.runtime_spec, \
             tasks.envelope_revision, tasks.finalize_requested, tasks.finalized, \
@@ -2898,6 +2912,7 @@ fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreE
         submitter_service: row.try_get("submitter_service").map_err(database_error)?,
         acting_user: row.try_get("acting_user").map_err(database_error)?,
         owner: row.try_get("owner").map_err(database_error)?,
+        owner_user_id: row.try_get("owner_user_id").map_err(database_error)?,
         workflow: row.try_get("workflow").map_err(database_error)?,
         coding_agent_runtime: row
             .try_get("coding_agent_runtime")

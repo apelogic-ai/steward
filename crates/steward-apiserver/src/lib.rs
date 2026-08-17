@@ -3,6 +3,7 @@
 #[cfg(feature = "admin-demo")]
 pub mod admin_demo;
 mod admin_ui;
+pub mod agent_runs_ui;
 pub mod browser_auth;
 pub mod connections;
 #[cfg(feature = "admin-demo")]
@@ -1377,6 +1378,7 @@ where
         cursor: query.cursor,
         phase: query.phase,
         workflow: query.workflow,
+        owner_user_id: None,
     };
     match state.ledger.agent_runs(&query).await {
         Ok(page) => Json(AgentRunsResponse {
@@ -8050,6 +8052,7 @@ mod tests {
             submitter_service: "steward-run".to_owned(),
             acting_user: Some("alice@example.com".to_owned()),
             owner: "alice@example.com".to_owned(),
+            owner_user_id: Some("usr_0123456789abcdef0123456789abcdef".to_owned()),
             workflow: "code-review".to_owned(),
             coding_agent_runtime: "agent-v1".to_owned(),
             runtime_uid: Some(format!("runtime-{task_uid}")),

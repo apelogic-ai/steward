@@ -809,6 +809,7 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
             cursor: None,
             phase: Some(TaskPhase::Succeeded),
             workflow: Some("code-review".to_owned()),
+            owner_user_id: None,
         })
         .await?;
     let read_model = page
@@ -826,6 +827,35 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         Some("1.25")
     );
     assert!(!read_model.history_partial);
+    let owner_scoped = store
+        .agent_runs(&AgentRunQuery {
+            limit: 10,
+            cursor: None,
+            phase: Some(TaskPhase::Succeeded),
+            workflow: Some("code-review".to_owned()),
+            owner_user_id: Some(canonical.user_id.as_str().to_owned()),
+        })
+        .await?;
+    assert!(
+        owner_scoped
+            .records
+            .iter()
+            .any(|record| record.task_uid == first.record.task_uid),
+        "the canonical owner scope must return the caller's run"
+    );
+    assert_eq!(
+        store
+            .agent_runs(&AgentRunQuery {
+                limit: 10,
+                cursor: Some(first.record.task_uid),
+                phase: None,
+                workflow: None,
+                owner_user_id: Some(other.user_id.as_str().to_owned()),
+            })
+            .await,
+        Err(StoreError::InvalidRunCursor),
+        "an owner-scoped cursor must not reveal another user's run boundary"
+    );
     let timeline = store
         .agent_run_timeline(first.record.task_uid)
         .await?
