@@ -186,7 +186,7 @@ mod tests {
     use axum::routing::{get, post};
     use tower::ServiceExt;
 
-    use super::enforce_browser_mutation_boundary;
+    use super::{ADMIN_CSS, ADMIN_HTML, ADMIN_JS, enforce_browser_mutation_boundary};
 
     fn guarded_probe() -> Router {
         Router::new()
@@ -279,5 +279,55 @@ mod tests {
             "read-only browser API requests do not need mutation headers"
         );
         Ok(())
+    }
+
+    #[test]
+    fn envelope_editor_assets_preserve_authority_and_secret_boundaries() {
+        for required in [
+            "envelope-template-form",
+            "model-ceilings",
+            "tool-ceilings",
+            "budget-ceiling",
+            "ttl-ceiling",
+            "resource-ceilings",
+            "prover-preview",
+            "Stage and prove",
+        ] {
+            assert!(
+                ADMIN_HTML.contains(required),
+                "the Envelope editor must expose {required}"
+            );
+        }
+        for unavailable in [
+            "memory-ceiling",
+            "storage-ceiling",
+            "compute-ceiling",
+            "accelerator-ceiling",
+            "max-runtime-ceiling",
+            "token-budget-ceiling",
+        ] {
+            assert!(
+                ADMIN_HTML.contains(unavailable),
+                "unsupported resource {unavailable} must be rendered explicitly"
+            );
+        }
+        assert!(
+            ADMIN_JS.contains("/admin/api/v1/envelope-templates/engineer")
+                && ADMIN_JS.contains("/prove")
+                && ADMIN_JS.contains("X-Steward-CSRF"),
+            "the editor must load and prove through the versioned authenticated API"
+        );
+        assert!(
+            ADMIN_JS.contains("textContent")
+                && !ADMIN_JS.contains("innerHTML")
+                && !ADMIN_JS.contains("localStorage")
+                && !ADMIN_JS.contains("sessionStorage"),
+            "untrusted values must use text nodes and no browser persistence"
+        );
+        assert!(
+            ADMIN_CSS.contains(".envelope-editor")
+                && ADMIN_CSS.contains("@media (max-width: 38rem)"),
+            "the editor must have an explicit responsive layout"
+        );
     }
 }

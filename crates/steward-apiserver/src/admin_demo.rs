@@ -3,11 +3,19 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+use axum::Json;
 use axum::Router;
-use axum::extract::Request;
-use axum::http::{HeaderValue, header};
+use axum::body::Body;
+use axum::extract::{Path, Request};
+use axum::http::{HeaderValue, Method, StatusCode, header, uri::Authority};
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use serde::Deserialize;
+use steward_admission::{AdmissionDecision, Envelope, evaluate, validate_envelope};
+use steward_types::{
+    AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal, ToolGrant,
+};
 
 use crate::{
     AuthenticatedCaller, AuthenticationError, BoxFuture, RequestAuthenticator, admin_ui,
@@ -100,8 +108,183 @@ async fn inject_local_demo_bearer(mut request: Request, next: Next) -> Response 
     next.run(request).await
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DemoEnvelopeThresholds {
+    budget_monthly_limit: String,
+    ttl: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DemoEnvelopeProofRequest {
+    api_version: String,
+    base_revision: i64,
+    candidate: Envelope,
+    thresholds: DemoEnvelopeThresholds,
+}
+
+fn engineer_template() -> Envelope {
+    Envelope {
+        revision: 3,
+        spec: steward_admission::EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "openai".to_owned(),
+                model: "gpt-5.4".to_owned(),
+            }],
+            tools: vec![ToolGrant {
+                provider: "github".to_owned(),
+                resource: "repository".to_owned(),
+                action: "get_file_contents".to_owned(),
+            }],
+            budget: Budget {
+                monthly_limit: "250.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            ttl: Duration("720h".to_owned()),
+        },
+    }
+}
+
+async fn envelope_template(Path(template_id): Path<String>) -> Response {
+    if template_id != "engineer" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(serde_json::json!({
+        "apiVersion": "steward.admin/v1",
+        "source": "localhost-review-fixture",
+        "template": {
+            "id": "engineer", "displayName": "Engineer", "status": "active", "revision": 3,
+            "envelope": engineer_template(),
+            "thresholds": {"budgetMonthlyLimit": "100.00", "ttl": "168h"},
+            "actionClasses": [
+                {"name": "read", "state": "authoritative", "grantCount": 1},
+                {"name": "write", "state": "unavailable", "grantCount": 0},
+                {"name": "destructive", "state": "unavailable", "grantCount": 0}
+            ],
+            "capabilities": {
+                "memory": {"authoritative": false, "reason": "No end-to-end resource contract"},
+                "storage": {"authoritative": false, "reason": "No end-to-end resource contract"},
+                "compute": {"authoritative": false, "reason": "No end-to-end resource contract"},
+                "accelerator": {"authoritative": false, "reason": "No end-to-end resource contract"},
+                "maxRuntime": {"authoritative": false, "reason": "Only standing-delegation TTL is enforced"},
+                "tokenBudget": {"authoritative": false, "reason": "Spend is authoritative; token ceilings are not"}
+            }
+        }
+    }))
+    .into_response()
+}
+
+async fn prove_envelope_template(
+    Path(template_id): Path<String>,
+    Json(request): Json<DemoEnvelopeProofRequest>,
+) -> Response {
+    let current = engineer_template();
+    if template_id != "engineer"
+        || request.api_version != "steward.admin/v1"
+        || request.base_revision != current.revision
+        || request.candidate.revision != current.revision + 1
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "stale or unsupported template revision"})),
+        )
+            .into_response();
+    }
+    if validate_envelope(&request.candidate).is_err() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "candidate envelope is invalid"})),
+        )
+            .into_response();
+    }
+    let identity = Email("alice@example.com".to_owned());
+    let threshold_request = AgentRuntimeSpec {
+        principal: Principal::User {
+            acting_user: identity.clone(),
+        },
+        owner: identity,
+        canonical_authority: None,
+        agent_type: AgentType {
+            name: "template-proof".to_owned(),
+        },
+        llms: request.candidate.spec.llms.clone(),
+        tools: request.candidate.spec.tools.clone(),
+        budget: Budget {
+            monthly_limit: request.thresholds.budget_monthly_limit,
+            currency: request.candidate.spec.budget.currency.clone(),
+        },
+        ttl: Duration(request.thresholds.ttl),
+        bindings: None,
+    };
+    match evaluate(&threshold_request, &request.candidate) {
+        Ok(AdmissionDecision::Admit) => Json(serde_json::json!({
+            "apiVersion": "steward.admin/v1", "verdict": "unknown",
+            "baseRevision": request.base_revision, "candidateRevision": request.candidate.revision,
+            "supportedAuthorityValid": true, "thresholdsWithinCeilings": true,
+            "blastRadius": {"state": "unavailable", "affectedAgents": null, "reason": "The authoritative runtime impact read model is not available"},
+            "propagation": [
+                {"target": "OpenShell", "state": "not-applied"}, {"target": "MCP-GW", "state": "not-applied"},
+                {"target": "LiteLLM", "state": "not-applied"}, {"target": "Kubernetes", "state": "not-applied"}
+            ], "applyAllowed": false, "reason": "Unknown blast radius fails closed"
+        })).into_response(),
+        Ok(AdmissionDecision::Reject { deltas }) => (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"error": "auto-provision threshold exceeds its hard ceiling", "deltas": deltas}))).into_response(),
+        Err(_) => (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"error": "threshold contract is invalid"}))).into_response(),
+    }
+}
+
+async fn normalize_loopback_demo_origin(mut request: Request<Body>, next: Next) -> Response {
+    if matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok());
+        let origin = request
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok());
+        let loopback = host
+            .and_then(|value| Authority::from_str(value).ok())
+            .is_some_and(|authority| {
+                authority.host() == "localhost"
+                    || authority
+                        .host()
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|address| address.is_loopback())
+            });
+        if loopback && host.is_some_and(|value| origin == Some(format!("http://{value}").as_str()))
+        {
+            if let Some(replacement) = host
+                .and_then(|value| HeaderValue::from_str(format!("https://{value}").as_str()).ok())
+            {
+                request.headers_mut().insert(header::ORIGIN, replacement);
+            }
+        }
+    }
+    next.run(request).await
+}
+
 pub fn router(mode: AdminDashboardDemoMode, origin: &str) -> Result<Router, String> {
-    let protected = protect_admin_routes(admin_ui::router::<()>(), DemoAuthenticator);
+    let template_routes = Router::<()>::new()
+        .route(
+            "/admin/api/v1/envelope-templates/{template_id}",
+            get(envelope_template),
+        )
+        .route(
+            "/admin/api/v1/envelope-templates/{template_id}/prove",
+            post(prove_envelope_template),
+        )
+        .route_layer(middleware::from_fn(
+            admin_ui::enforce_browser_mutation_boundary,
+        ))
+        .layer(middleware::from_fn(normalize_loopback_demo_origin));
+    let protected = protect_admin_routes(
+        admin_ui::router::<()>().merge(template_routes),
+        DemoAuthenticator,
+    );
     Ok(match mode {
         AdminDashboardDemoMode::Authenticated => {
             protected.layer(middleware::from_fn(inject_local_demo_bearer))
@@ -266,6 +449,96 @@ mod tests {
                 .headers()
                 .contains_key(header::CONTENT_SECURITY_POLICY),
             "authentication denials must retain the real browser security headers"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn template_prover_is_admin_scoped_revision_bound_and_fails_closed() -> Result<(), String>
+    {
+        let app = router(AdminDashboardDemoMode::Authenticated, TEST_ORIGIN)?;
+        let template = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/envelope-templates/engineer")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request template: {error}"))?;
+        assert_eq!(template.status(), StatusCode::OK);
+        let template = to_bytes(template.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read template response: {error}"))?;
+        let template: serde_json::Value = serde_json::from_slice(&template)
+            .map_err(|error| format!("parse template response: {error}"))?;
+        assert_eq!(template["template"]["revision"], 3);
+        assert_eq!(
+            template["template"]["capabilities"]["memory"]["authoritative"],
+            false
+        );
+        assert!(
+            !template.to_string().to_lowercase().contains("secret"),
+            "templates must never contain credential-shaped data"
+        );
+
+        let proof = serde_json::json!({
+            "apiVersion": "steward.admin/v1", "baseRevision": 3,
+            "candidate": {
+                "revision": 4,
+                "spec": {
+                    "llms": [{"provider": "openai", "model": "gpt-5.4"}],
+                    "tools": [{"provider": "github", "resource": "repository", "action": "get_file_contents"}],
+                    "budget": {"monthlyLimit": "250.00", "currency": "USD"}, "ttl": "720h"
+                }
+            },
+            "thresholds": {"budgetMonthlyLimit": "100.00", "ttl": "168h"}
+        });
+        let prove = |body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/admin/api/v1/envelope-templates/engineer/prove")
+                .header("host", "127.0.0.1:33002")
+                .header("origin", TEST_ORIGIN)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", "1")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .map_err(|error| format!("build template proof: {error}"))
+        };
+        let response = app
+            .clone()
+            .oneshot(prove(proof.clone())?)
+            .await
+            .map_err(|error| format!("prove template: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read proof response: {error}"))?;
+        let response: serde_json::Value = serde_json::from_slice(&response)
+            .map_err(|error| format!("parse proof response: {error}"))?;
+        assert_eq!(response["verdict"], "unknown");
+        assert_eq!(response["applyAllowed"], false);
+
+        let mut over_ceiling = proof.clone();
+        over_ceiling["thresholds"]["budgetMonthlyLimit"] = serde_json::json!("251.00");
+        assert_eq!(
+            app.clone()
+                .oneshot(prove(over_ceiling)?)
+                .await
+                .map_err(|error| format!("prove over-ceiling template: {error}"))?
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let mut stale = proof;
+        stale["baseRevision"] = serde_json::json!(2);
+        assert_eq!(
+            app.oneshot(prove(stale)?)
+                .await
+                .map_err(|error| format!("prove stale template: {error}"))?
+                .status(),
+            StatusCode::CONFLICT
         );
         Ok(())
     }

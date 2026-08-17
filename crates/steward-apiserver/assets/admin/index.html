@@ -52,10 +52,157 @@
             <p class="eyebrow">Reusable authority</p>
             <h1 id="envelope-heading">Envelope templates</h1>
           </div>
+          <div class="revision-label" aria-live="polite">
+            <span id="template-source">Loading contract…</span>
+            <strong id="template-revision"></strong>
+          </div>
         </div>
-        <div class="empty-state" data-state="loading">
-          <h2>Loading template contract</h2>
-          <p>Current template ceilings and staged revisions will appear here when the template API is connected.</p>
+
+        <div class="envelope-editor" id="envelope-editor" hidden>
+          <form id="envelope-template-form">
+            <div class="editor-column">
+              <section class="editor-card template-identity" aria-labelledby="template-name-heading">
+                <div>
+                  <p class="eyebrow">Current template</p>
+                  <h2 id="template-name-heading">Engineer</h2>
+                </div>
+                <label>
+                  Template
+                  <select id="template-selector" disabled>
+                    <option value="engineer">Engineer</option>
+                  </select>
+                </label>
+              </section>
+
+              <fieldset class="editor-card" id="model-ceilings">
+                <legend>Allowed models</legend>
+                <p class="field-help">Only models present in the authoritative envelope are selectable.</p>
+                <div class="chip-list" id="model-list" aria-live="polite"></div>
+                <button class="quiet-button" type="button" disabled>Add reviewed model</button>
+              </fieldset>
+
+              <fieldset class="editor-card" id="tool-ceilings">
+                <legend>Allowed tools by action class</legend>
+                <p class="field-help">Concrete grants are authority. Unavailable classes cannot be enabled here.</p>
+                <div class="tool-table" id="tool-list" aria-live="polite"></div>
+                <div class="class-summary" id="action-class-list"></div>
+              </fieldset>
+
+              <section class="editor-card" aria-labelledby="limits-heading">
+                <h2 id="limits-heading">Budget and delegation</h2>
+                <p class="field-help">Auto-provision thresholds route requests; hard ceilings remain the admission fence.</p>
+                <div class="limit-grid">
+                  <div class="limit-group">
+                    <label for="budget-threshold">Auto-provision spend</label>
+                    <div class="input-with-unit">
+                      <span>$</span>
+                      <input id="budget-threshold" name="budgetThreshold" inputmode="decimal" required>
+                      <span>/ mo</span>
+                    </div>
+                  </div>
+                  <div class="limit-group">
+                    <label for="budget-ceiling">Hard spend ceiling</label>
+                    <div class="input-with-unit">
+                      <span>$</span>
+                      <input id="budget-ceiling" name="budgetCeiling" inputmode="decimal" required>
+                      <span>/ mo</span>
+                    </div>
+                  </div>
+                  <div class="limit-group">
+                    <label for="ttl-threshold">Auto-provision TTL</label>
+                    <div class="input-with-unit">
+                      <input id="ttl-threshold" name="ttlThreshold" required>
+                      <span>duration</span>
+                    </div>
+                  </div>
+                  <div class="limit-group">
+                    <label for="ttl-ceiling">Standing delegation TTL</label>
+                    <div class="input-with-unit">
+                      <input id="ttl-ceiling" name="ttlCeiling" required>
+                      <span>hard cap</span>
+                    </div>
+                  </div>
+                </div>
+                <p class="inline-error" id="threshold-error" role="alert" hidden></p>
+              </section>
+
+              <fieldset class="editor-card" id="resource-ceilings">
+                <legend>Runtime resource ceilings</legend>
+                <p class="field-help">Controls stay unavailable until Steward can enforce and reconcile them end to end.</p>
+                <div class="resource-grid">
+                  <label class="unavailable-control" id="memory-ceiling">
+                    Pod memory
+                    <input value="Unavailable" disabled>
+                    <small data-capability="memory"></small>
+                  </label>
+                  <label class="unavailable-control" id="storage-ceiling">
+                    Workspace storage
+                    <input value="Unavailable" disabled>
+                    <small data-capability="storage"></small>
+                  </label>
+                  <label class="unavailable-control" id="compute-ceiling">
+                    CPU / compute class
+                    <input value="Unavailable" disabled>
+                    <small data-capability="compute"></small>
+                  </label>
+                  <label class="unavailable-control" id="accelerator-ceiling">
+                    Accelerator class
+                    <input value="Unavailable" disabled>
+                    <small data-capability="accelerator"></small>
+                  </label>
+                  <label class="unavailable-control" id="max-runtime-ceiling">
+                    Maximum run time
+                    <input value="Unavailable" disabled>
+                    <small data-capability="maxRuntime"></small>
+                  </label>
+                  <label class="unavailable-control" id="token-budget-ceiling">
+                    Token budget
+                    <input value="Unavailable" disabled>
+                    <small data-capability="tokenBudget"></small>
+                  </label>
+                </div>
+              </fieldset>
+            </div>
+
+            <aside class="prover-column" id="prover-preview" aria-labelledby="prover-heading">
+              <section class="proof-card proof-unknown" id="proof-card">
+                <p class="eyebrow">Authoritative prover</p>
+                <h2 id="prover-heading">Not staged</h2>
+                <p id="prover-summary">Edit the supported ceilings, then stage a revision-bound proof.</p>
+              </section>
+
+              <section class="proof-card">
+                <h2>Blast radius</h2>
+                <dl class="proof-facts">
+                  <div><dt>Affected agents</dt><dd id="affected-agents">Unknown</dd></div>
+                  <div><dt>Current revision</dt><dd id="proof-base-revision">—</dd></div>
+                  <div><dt>Candidate revision</dt><dd id="proof-candidate-revision">—</dd></div>
+                </dl>
+                <p class="field-help" id="blast-radius-reason">No authoritative impact result yet.</p>
+              </section>
+
+              <section class="proof-card">
+                <h2>On apply</h2>
+                <ul class="propagation-list" id="propagation-list">
+                  <li><span>OpenShell</span><strong>Not applied</strong></li>
+                  <li><span>MCP-GW</span><strong>Not applied</strong></li>
+                  <li><span>LiteLLM</span><strong>Not applied</strong></li>
+                  <li><span>Kubernetes</span><strong>Not applied</strong></li>
+                </ul>
+              </section>
+
+              <div class="editor-actions">
+                <button type="submit" class="primary-button" id="stage-template">Stage and prove</button>
+                <button type="button" class="quiet-button" id="apply-stage" disabled>Apply staged revision</button>
+                <p class="field-help">Apply remains locked while blast radius or downstream state is unknown.</p>
+              </div>
+            </aside>
+          </form>
+        </div>
+
+        <div class="empty-state" id="envelope-loading" data-state="loading">
+          <h2>Loading envelope contract</h2>
+          <p>The editor opens only after an authenticated, versioned template response is verified.</p>
         </div>
       </section>
 
