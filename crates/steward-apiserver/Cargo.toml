@@ -34,5 +34,10 @@ name = "admin-dashboard-demo"
 path = "examples/admin-dashboard-demo.rs"
 required-features = ["admin-demo"]
 
+[[example]]
+name = "user-envelope-demo"
+path = "examples/user-envelope-demo.rs"
+required-features = ["admin-demo"]
+
 [lints]
 workspace = true

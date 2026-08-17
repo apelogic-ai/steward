@@ -26,12 +26,29 @@
         <div class="empty-state"><h2>Choose the next governed step</h2><p>Connect access, request a bounded envelope, then observe only the runs attributed to your canonical identity.</p></div>
       </section>
       <section data-page="/app/envelopes" hidden>
-        <div class="section-heading"><div><p class="eyebrow">User authority</p><h1>My Envelopes</h1></div></div>
-        <div class="empty-state"><h2>Envelope requests are not yet connected</h2><p>This view will render only authoritative instances, their template revision, and pending, approved, rejected, provisioned, stale, or conflict status.</p></div>
+        <div class="section-heading"><div><p class="eyebrow">User authority</p><h1>My Envelopes</h1></div><a class="button" href="/app/envelopes/new">New envelope</a></div>
+        <p id="envelope-list-message" role="status">Loading authoritative envelope requests…</p>
+        <div id="envelope-list" class="stack" aria-live="polite"></div>
       </section>
       <section data-page="/app/envelopes/new" hidden>
         <div class="section-heading"><div><p class="eyebrow">Bounded request</p><h1>New envelope</h1></div></div>
-        <div class="empty-state"><h2>Select a template when the request contract is available</h2><p>The form will permit narrowing only within an administrator-authored ceiling and will show when an approval is required.</p></div>
+        <p id="envelope-form-message" role="status">Loading templates available to your signed-in identity…</p>
+        <form id="envelope-request-form" hidden>
+          <label for="template-select">Template</label>
+          <select id="template-select" name="template" required></select>
+          <div id="template-summary" class="callout" aria-live="polite"></div>
+          <div class="form-grid">
+            <label for="budget-limit">Monthly budget <input id="budget-limit" name="budgetLimit" inputmode="decimal" required></label>
+            <label for="ttl">Maximum runtime <input id="ttl" name="ttl" required></label>
+          </div>
+          <div id="request-delta" class="callout" aria-live="polite"></div>
+          <button class="button" type="submit">Request envelope</button>
+        </form>
+      </section>
+      <section data-page="/app/envelopes/detail" data-detail-route="/app/envelopes/{request_id}" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Envelope request</p><h1>Request detail</h1></div><a class="button secondary" href="/app/envelopes">Back to My Envelopes</a></div>
+        <p id="envelope-detail-message" role="status">Loading authoritative request…</p>
+        <dl id="envelope-detail" class="detail-list" hidden></dl>
       </section>
       <section data-page="/app/runs" hidden>
         <div class="section-heading"><div><p class="eyebrow">Execution history</p><h1>My Runs</h1></div></div>

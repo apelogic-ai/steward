@@ -16,6 +16,7 @@ where
         .route("/app", get(shell))
         .route("/app/envelopes", get(shell))
         .route("/app/envelopes/new", get(shell))
+        .route("/app/envelopes/{request_id}", get(shell))
         .route("/app/runs", get(shell))
         .route("/app/assets/workspace.js", get(script))
 }
@@ -42,6 +43,7 @@ mod tests {
         for route in [
             "/app/envelopes",
             "/app/envelopes/new",
+            "/app/envelopes/{request_id}",
             "/app/runs",
             "/admin/connections",
         ] {

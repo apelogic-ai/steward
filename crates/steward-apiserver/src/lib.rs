@@ -11,6 +11,8 @@ mod connections_ui;
 pub mod google_oidc;
 mod tasks;
 pub mod user_envelopes;
+#[cfg(feature = "admin-demo")]
+pub mod user_envelopes_demo;
 mod user_ui;
 
 pub use tasks::{
