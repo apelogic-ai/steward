@@ -16,6 +16,7 @@ const PRICED_RUNTIME: &str = "runtime-priced";
 const UNPRICED_RUNTIME: &str = "runtime-unpriced";
 const ALICE_CANONICAL_USER: &str = "usr_0123456789abcdef0123456789abcdef";
 const SERVER_AUTHORING_USERNAME: &str = "system:serviceaccount:steward-system:steward-poc-api";
+const POC_SERVICE_PRINCIPAL: &str = "steward-poc-api";
 
 struct Harness {
     context: String,
@@ -96,12 +97,13 @@ impl Harness {
                 "name": name,
                 "namespace": NAMESPACE,
                 "annotations": {
-                    "agents.apelogic.ai/member-role": "engineer"
+                    "agents.apelogic.ai/service-principal": POC_SERVICE_PRINCIPAL
                 }
             },
             "spec": {
                 "principal": {
-                    "kind": "user",
+                    "kind": "service",
+                    "name": POC_SERVICE_PRINCIPAL,
                     "actingUser": "alice@example.com"
                 },
                 "owner": "alice@example.com",
@@ -319,8 +321,8 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
     let store = PgStore::connect(&env::var("STEWARD_TEST_DATABASE_URL")?).await?;
     store.migrate().await?;
     store
-        .insert_envelope(
-            "engineer",
+        .insert_service_envelope(
+            POC_SERVICE_PRINCIPAL,
             &Envelope {
                 revision: 1,
                 spec: EnvelopeSpec {
@@ -431,8 +433,8 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
     harness.wait_phase(PRICED_RUNTIME, "Running", Duration::from_secs(180))?;
 
     store
-        .insert_envelope(
-            "engineer",
+        .insert_service_envelope(
+            POC_SERVICE_PRINCIPAL,
             &Envelope {
                 revision: 2,
                 spec: EnvelopeSpec {

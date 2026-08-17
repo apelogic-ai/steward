@@ -104,9 +104,9 @@ else
 fi
 
 openshell_archive="openshell-${openshell_target}.tar.gz"
-curl -fsSL "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.90/${openshell_archive}" \
+curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.90/${openshell_archive}" \
   -o "${STEWARD_RUN_DIR}/${openshell_archive}"
-curl -fsSL "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.90/openshell-checksums-sha256.txt" \
+curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.90/openshell-checksums-sha256.txt" \
   -o "${STEWARD_RUN_DIR}/openshell-checksums-sha256.txt"
 (
   cd "${STEWARD_RUN_DIR}"
