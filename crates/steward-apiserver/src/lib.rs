@@ -1305,7 +1305,8 @@ where
             authenticator.clone(),
             authenticate_admission::<A>,
         ));
-    let admin = Router::new()
+    let admin = protect_admin_routes(
+        Router::new()
         .merge(admin_ui::router::<AppState<R, L, D>>())
         .route("/admin/api/v1/runs", get(agent_runs_handler::<R, L, D>))
         .route(
@@ -1336,12 +1337,9 @@ where
         .route(
             "/admin/runtimes/{runtime_uid}/grants/revoke",
             post(revoke_grants_handler::<R, L, D>),
-        )
-        .route_layer(middleware::from_fn_with_state(
-            authenticator,
-            authenticate_admin::<A>,
-        ))
-        .route_layer(middleware::from_fn(admin_ui::add_browser_security_headers));
+        ),
+        authenticator,
+    );
     admission.merge(admin).with_state(AppState {
         runtimes,
         ledger,
