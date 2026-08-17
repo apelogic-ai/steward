@@ -41,10 +41,18 @@ where
     Router::<S>::new()
         .route("/admin", get(shell))
         .route("/admin/", get(shell))
+        .merge(asset_router())
+        .merge(browser_api)
+}
+
+pub(crate) fn asset_router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::<S>::new()
         .route("/admin/assets/admin.css", get(stylesheet))
         .route("/admin/assets/admin.js", get(script))
         .route("/admin/assets/icon.svg", get(icon))
-        .merge(browser_api)
 }
 
 async fn shell() -> Html<&'static str> {

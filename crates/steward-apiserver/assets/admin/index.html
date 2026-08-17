@@ -25,9 +25,9 @@
         aria-controls="approvals-panel" aria-selected="true" aria-current="page"
         tabindex="0">Approvals</a>
       <a id="envelope-tab" href="#envelope" role="tab" data-surface="envelope"
-        aria-controls="envelope-panel" aria-selected="false" tabindex="-1">Envelope</a>
+        aria-controls="envelope-panel" aria-selected="false" tabindex="-1">Envelope templates</a>
       <a id="fleet-tab" href="#fleet" role="tab" data-surface="fleet"
-        aria-controls="fleet-panel" aria-selected="false" tabindex="-1">Fleet</a>
+        aria-controls="fleet-panel" aria-selected="false" tabindex="-1">Agent Runs</a>
     </nav>
 
     <main id="workspace" tabindex="-1">
@@ -49,13 +49,13 @@
         aria-labelledby="envelope-tab" hidden>
         <div class="section-heading">
           <div>
-            <p class="eyebrow">Role policy</p>
-            <h1 id="envelope-heading">Envelope</h1>
+            <p class="eyebrow">Reusable authority</p>
+            <h1 id="envelope-heading">Envelope templates</h1>
           </div>
         </div>
         <div class="empty-state" data-state="loading">
-          <h2>Loading envelope contract</h2>
-          <p>Current limits and staged revisions will appear here when the envelope API is connected.</p>
+          <h2>Loading template contract</h2>
+          <p>Current template ceilings and staged revisions will appear here when the template API is connected.</p>
         </div>
       </section>
 
@@ -63,13 +63,13 @@
         aria-labelledby="fleet-tab" hidden>
         <div class="section-heading">
           <div>
-            <p class="eyebrow">Runtime posture</p>
-            <h1 id="fleet-heading">Fleet</h1>
+            <p class="eyebrow">Execution history</p>
+            <h1 id="fleet-heading">Agent Runs</h1>
           </div>
         </div>
         <div class="empty-state" data-state="loading">
-          <h2>Loading fleet contract</h2>
-          <p>Runtime status and attention signals will appear here when the fleet API is connected.</p>
+          <h2>Loading Agent Runs contract</h2>
+          <p>Authoritative run history and attention signals will appear here when the Agent Runs API is connected.</p>
         </div>
       </section>
     </main>

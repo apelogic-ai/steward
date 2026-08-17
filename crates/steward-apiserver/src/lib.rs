@@ -3,6 +3,12 @@
 #[cfg(feature = "admin-demo")]
 pub mod admin_demo;
 mod admin_ui;
+pub mod browser_auth;
+pub mod connections;
+#[cfg(feature = "admin-demo")]
+pub mod connections_demo;
+mod connections_ui;
+pub mod google_oidc;
 mod tasks;
 
 pub use tasks::{
@@ -7136,7 +7142,7 @@ mod tests {
             .map_err(|error| format!("failed to read dashboard shell: {error}"))?;
         let shell_html = String::from_utf8(shell_body.to_vec())
             .map_err(|error| format!("dashboard shell was not UTF-8: {error}"))?;
-        for surface in ["Approvals", "Envelope", "Fleet"] {
+        for surface in ["Approvals", "Envelope templates", "Agent Runs"] {
             assert!(
                 shell_html.contains(surface),
                 "the dashboard shell must expose the {surface} navigation surface"

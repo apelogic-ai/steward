@@ -54,13 +54,14 @@ async fn bind(
 
 async fn serve_until<F>(
     listener: TcpListener,
+    origin: String,
     mode: AdminDashboardDemoMode,
     shutdown: F,
 ) -> Result<(), String>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, router(mode))
+    axum::serve(listener, router(mode, &origin)?)
         .with_graceful_shutdown(shutdown)
         .await
         .map_err(|error| format!("serve localhost dashboard demo: {error}"))
@@ -77,8 +78,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = parse_args(std::env::args().skip(1)).map_err(io::Error::other)?;
     let mode = config.mode();
     let (listener, address) = bind(config).await.map_err(io::Error::other)?;
-    println!("Steward admin localhost demo: http://{address}/admin");
-    serve_until(listener, mode, shutdown_signal())
+    let origin = format!("http://{address}");
+    let entry_path = match mode {
+        AdminDashboardDemoMode::Authenticated | AdminDashboardDemoMode::Unauthenticated => "/admin",
+        AdminDashboardDemoMode::OidcUser | AdminDashboardDemoMode::OidcAdmin => "/admin/sign-in",
+    };
+    println!("Steward localhost demo: {origin}{entry_path}");
+    serve_until(listener, origin, mode, shutdown_signal())
         .await
         .map_err(io::Error::other)?;
     Ok(())
@@ -134,7 +140,13 @@ mod tests {
         let config = parse_args(["--mode".to_owned(), "authenticated".to_owned()])?;
         let mode = config.mode();
         let (listener, address) = bind(config).await?;
-        serve_until(listener, mode, future::ready(())).await?;
+        serve_until(
+            listener,
+            format!("http://{address}"),
+            mode,
+            future::ready(()),
+        )
+        .await?;
         let rebound = TcpListener::bind(address)
             .await
             .map_err(|error| format!("rebind released demo listener: {error}"))?;
