@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep the local push boundary identical to the CI quality job. In particular,
+# the root formatter does not cover the nested e2e Cargo project.
+cargo xtask quality

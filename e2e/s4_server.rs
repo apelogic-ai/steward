@@ -132,14 +132,12 @@ impl RequestAuthenticator for S4Authenticator {
     ) -> BoxFuture<'a, Result<AuthenticatedCaller, AuthenticationError>> {
         Box::pin(async move {
             match bearer_token {
-                "test-alice-session" => user(
-                    "alice@example.com",
-                    "usr_0123456789abcdef0123456789abcdef",
-                ),
-                "test-bob-session" => user(
-                    "bob@example.org",
-                    "usr_abcdef0123456789abcdef0123456789",
-                ),
+                "test-alice-session" => {
+                    user("alice@example.com", "usr_0123456789abcdef0123456789abcdef")
+                }
+                "test-bob-session" => {
+                    user("bob@example.org", "usr_abcdef0123456789abcdef0123456789")
+                }
                 "test-admin-session" => Ok(AuthenticatedCaller {
                     actor: "admin@example.com".to_owned(),
                     member_roles: Vec::new(),
