@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fmt;
 
 use sqlx::types::Json;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
 use steward_types::{
     AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
@@ -525,6 +525,115 @@ impl PgStore {
             })
         })
         .transpose()
+    }
+
+    pub async fn agent_runs(&self, query: &AgentRunQuery) -> Result<AgentRunPage, StoreError> {
+        if query.limit == 0 || query.limit > 100 {
+            return Err(StoreError::InvalidRunQuery);
+        }
+        if query
+            .workflow
+            .as_deref()
+            .is_some_and(|workflow| workflow.is_empty())
+        {
+            return Err(StoreError::InvalidRunQuery);
+        }
+        if let Some(cursor) = query.cursor {
+            let exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM task_submissions WHERE task_uid = $1)",
+            )
+            .bind(cursor)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(database_error)?;
+            if !exists {
+                return Err(StoreError::InvalidRunCursor);
+            }
+        }
+
+        let mut statement = QueryBuilder::<Postgres>::new(AGENT_RUN_SELECT);
+        statement.push(" WHERE true");
+        if let Some(cursor) = query.cursor {
+            statement.push(
+                " AND (tasks.created_at, tasks.task_uid) < \
+                 (SELECT created_at, task_uid FROM task_submissions WHERE task_uid = ",
+            );
+            statement.push_bind(cursor);
+            statement.push(")");
+        }
+        if let Some(phase) = query.phase {
+            statement.push(" AND tasks.phase = ");
+            statement.push_bind(task_phase_text(phase));
+        }
+        if let Some(workflow) = query.workflow.as_deref() {
+            statement.push(" AND tasks.workflow = ");
+            statement.push_bind(workflow);
+        }
+        statement.push(" ORDER BY tasks.created_at DESC, tasks.task_uid DESC LIMIT ");
+        statement.push_bind(i64::from(query.limit) + 1);
+
+        let mut records = statement
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .map(agent_run_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_cursor = if records.len() > query.limit as usize {
+            records.truncate(query.limit as usize);
+            records.last().map(|record| record.task_uid)
+        } else {
+            None
+        };
+        Ok(AgentRunPage {
+            records,
+            next_cursor,
+        })
+    }
+
+    pub async fn agent_run(&self, task_uid: Uuid) -> Result<Option<AgentRunRecord>, StoreError> {
+        let mut statement = QueryBuilder::<Postgres>::new(AGENT_RUN_SELECT);
+        statement.push(" WHERE tasks.task_uid = ");
+        statement.push_bind(task_uid);
+        statement
+            .build()
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?
+            .map(agent_run_record)
+            .transpose()
+    }
+
+    pub async fn agent_run_timeline(
+        &self,
+        task_uid: Uuid,
+    ) -> Result<Option<Vec<AgentRunTimelineEvent>>, StoreError> {
+        if !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM task_submissions WHERE task_uid = $1)",
+        )
+        .bind(task_uid)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?
+        {
+            return Ok(None);
+        }
+        sqlx::query(
+            "SELECT event_kind, phase, provenance, \
+                    to_char(at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS at \
+             FROM task_lifecycle_events \
+             WHERE task_uid = $1 \
+             ORDER BY at, id",
+        )
+        .bind(task_uid)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(agent_run_timeline_event)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
     }
 
     pub async fn insert_envelope(
@@ -1651,9 +1760,9 @@ impl PgStore {
              (task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, \
               owner, owner_user_id, identity_binding_state, workflow, \
               coding_agent_runtime, runtime_namespace, runtime_name, runtime_ownership, phase, \
-              runtime_spec, agent_command) \
+              runtime_spec, agent_command, envelope_revision) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, $12, \
-                     'submitted', $13, $14) \
+                     'submitted', $13, $14, $15) \
              ON CONFLICT DO NOTHING",
         )
         .bind(task_uid)
@@ -1670,6 +1779,7 @@ impl PgStore {
         .bind(ownership_text(request.runtime_ownership))
         .bind(Json(request.runtime_spec))
         .bind(Json(request.agent_command))
+        .bind(request.envelope_revision)
         .execute(&self.pool)
         .await
         .map_err(database_error)?
@@ -1987,6 +2097,71 @@ pub struct TaskReservationRequest<'a> {
     pub runtime_ownership: steward_types::RuntimeOwnership,
     pub runtime_spec: &'a AgentRuntimeSpec,
     pub agent_command: &'a [String],
+    pub envelope_revision: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRunQuery {
+    pub limit: u16,
+    pub cursor: Option<Uuid>,
+    pub phase: Option<steward_types::TaskPhase>,
+    pub workflow: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentRunPage {
+    pub records: Vec<AgentRunRecord>,
+    pub next_cursor: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentRunRecord {
+    pub task_uid: Uuid,
+    pub submitter_service: String,
+    pub acting_user: Option<String>,
+    pub owner: String,
+    pub workflow: String,
+    pub coding_agent_runtime: String,
+    pub runtime_uid: Option<String>,
+    pub runtime_ownership: steward_types::RuntimeOwnership,
+    pub phase: steward_types::TaskPhase,
+    pub runtime_spec: AgentRuntimeSpec,
+    pub envelope_revision: Option<i64>,
+    pub finalize_requested: bool,
+    pub finalized: bool,
+    pub failure_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub spend: Option<AgentRunSpend>,
+    pub history_partial: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRunSpend {
+    pub observed_amount: String,
+    pub currency: String,
+    pub exhausted: bool,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentRunTimelineKind {
+    Phase(steward_types::TaskPhase),
+    FinalizationRequested,
+    Finalized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentRunTimelineProvenance {
+    Recorded,
+    Backfilled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRunTimelineEvent {
+    pub kind: AgentRunTimelineKind,
+    pub provenance: AgentRunTimelineProvenance,
+    pub at: String,
 }
 
 fn validate_task_identity_binding(request: &TaskReservationRequest<'_>) -> Result<(), StoreError> {
@@ -2185,6 +2360,8 @@ pub enum StoreError {
     TaskIdempotencyConflict,
     InvalidTaskIdentityBinding,
     InvalidTaskTransition,
+    InvalidRunQuery,
+    InvalidRunCursor,
 }
 
 impl fmt::Display for StoreError {
@@ -2268,6 +2445,8 @@ impl fmt::Display for StoreError {
             Self::InvalidTaskTransition => {
                 write!(formatter, "task lifecycle transition is invalid")
             }
+            Self::InvalidRunQuery => write!(formatter, "agent-run query is invalid"),
+            Self::InvalidRunCursor => write!(formatter, "agent-run cursor is invalid"),
         }
     }
 }
@@ -2335,29 +2514,8 @@ fn canonical_principal_from_row(
 }
 
 fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
-    let runtime_ownership = match row
-        .try_get::<String, _>("runtime_ownership")
-        .map_err(database_error)?
-        .as_str()
-    {
-        "provisioned" => steward_types::RuntimeOwnership::Provisioned,
-        "adopted" => steward_types::RuntimeOwnership::Adopted,
-        _ => return Err(StoreError::InvalidTaskTransition),
-    };
-    let phase = match row
-        .try_get::<String, _>("phase")
-        .map_err(database_error)?
-        .as_str()
-    {
-        "submitted" => steward_types::TaskPhase::Submitted,
-        "parked" => steward_types::TaskPhase::Parked,
-        "queued" => steward_types::TaskPhase::Queued,
-        "running" => steward_types::TaskPhase::Running,
-        "succeeded" => steward_types::TaskPhase::Succeeded,
-        "failed" => steward_types::TaskPhase::Failed,
-        "cancelled" => steward_types::TaskPhase::Cancelled,
-        _ => return Err(StoreError::InvalidTaskTransition),
-    };
+    let runtime_ownership = runtime_ownership_from_row(&row)?;
+    let phase = task_phase_from_row(&row, "phase")?;
     Ok(TaskRecord {
         task_uid: row.try_get("task_uid").map_err(database_error)?,
         idempotency_key: row.try_get("idempotency_key").map_err(database_error)?,
@@ -2393,6 +2551,137 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
         finalized: row.try_get("finalized").map_err(database_error)?,
         failure_reason: row.try_get("failure_reason").map_err(database_error)?,
     })
+}
+
+const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, tasks.acting_user, tasks.owner, \
+            tasks.workflow, tasks.coding_agent_runtime, tasks.runtime_uid, \
+            tasks.runtime_ownership, tasks.phase, tasks.runtime_spec, \
+            tasks.envelope_revision, tasks.finalize_requested, tasks.finalized, \
+            tasks.failure_reason, \
+            to_char(tasks.created_at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+            to_char(tasks.updated_at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at, \
+            spend.observed_amount, spend.currency, spend.exhausted, spend.observed_at, \
+            EXISTS ( \
+                SELECT 1 FROM task_lifecycle_events history \
+                WHERE history.task_uid = tasks.task_uid \
+                  AND history.provenance = 'backfilled' \
+            ) AS history_partial \
+     FROM task_submissions tasks \
+     LEFT JOIN LATERAL ( \
+         SELECT observation.observed_amount::text AS observed_amount, \
+                observation.currency, observation.exhausted, \
+                to_char(observation.at AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS observed_at \
+         FROM spend_observations observation \
+         WHERE observation.runtime_uid = tasks.runtime_uid \
+         ORDER BY observation.at DESC, observation.id DESC \
+         LIMIT 1 \
+     ) spend ON true";
+
+fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreError> {
+    let observed_amount = row
+        .try_get::<Option<String>, _>("observed_amount")
+        .map_err(database_error)?;
+    let spend = observed_amount
+        .map(|observed_amount| {
+            Ok(AgentRunSpend {
+                observed_amount,
+                currency: row.try_get("currency").map_err(database_error)?,
+                exhausted: row.try_get("exhausted").map_err(database_error)?,
+                observed_at: row.try_get("observed_at").map_err(database_error)?,
+            })
+        })
+        .transpose()?;
+    Ok(AgentRunRecord {
+        task_uid: row.try_get("task_uid").map_err(database_error)?,
+        submitter_service: row.try_get("submitter_service").map_err(database_error)?,
+        acting_user: row.try_get("acting_user").map_err(database_error)?,
+        owner: row.try_get("owner").map_err(database_error)?,
+        workflow: row.try_get("workflow").map_err(database_error)?,
+        coding_agent_runtime: row
+            .try_get("coding_agent_runtime")
+            .map_err(database_error)?,
+        runtime_uid: row.try_get("runtime_uid").map_err(database_error)?,
+        runtime_ownership: runtime_ownership_from_row(&row)?,
+        phase: task_phase_from_row(&row, "phase")?,
+        runtime_spec: row
+            .try_get::<Json<AgentRuntimeSpec>, _>("runtime_spec")
+            .map_err(database_error)?
+            .0,
+        envelope_revision: row.try_get("envelope_revision").map_err(database_error)?,
+        finalize_requested: row.try_get("finalize_requested").map_err(database_error)?,
+        finalized: row.try_get("finalized").map_err(database_error)?,
+        failure_reason: row.try_get("failure_reason").map_err(database_error)?,
+        created_at: row.try_get("created_at").map_err(database_error)?,
+        updated_at: row.try_get("updated_at").map_err(database_error)?,
+        spend,
+        history_partial: row.try_get("history_partial").map_err(database_error)?,
+    })
+}
+
+fn agent_run_timeline_event(
+    row: sqlx::postgres::PgRow,
+) -> Result<AgentRunTimelineEvent, StoreError> {
+    let kind = match row
+        .try_get::<String, _>("event_kind")
+        .map_err(database_error)?
+        .as_str()
+    {
+        "phase" => AgentRunTimelineKind::Phase(task_phase_from_row(&row, "phase")?),
+        "finalization_requested" => AgentRunTimelineKind::FinalizationRequested,
+        "finalized" => AgentRunTimelineKind::Finalized,
+        _ => return Err(StoreError::InvalidTaskTransition),
+    };
+    let provenance = match row
+        .try_get::<String, _>("provenance")
+        .map_err(database_error)?
+        .as_str()
+    {
+        "recorded" => AgentRunTimelineProvenance::Recorded,
+        "backfilled" => AgentRunTimelineProvenance::Backfilled,
+        _ => return Err(StoreError::InvalidTaskTransition),
+    };
+    Ok(AgentRunTimelineEvent {
+        kind,
+        provenance,
+        at: row.try_get("at").map_err(database_error)?,
+    })
+}
+
+fn runtime_ownership_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<steward_types::RuntimeOwnership, StoreError> {
+    match row
+        .try_get::<String, _>("runtime_ownership")
+        .map_err(database_error)?
+        .as_str()
+    {
+        "provisioned" => Ok(steward_types::RuntimeOwnership::Provisioned),
+        "adopted" => Ok(steward_types::RuntimeOwnership::Adopted),
+        _ => Err(StoreError::InvalidTaskTransition),
+    }
+}
+
+fn task_phase_from_row(
+    row: &sqlx::postgres::PgRow,
+    column: &str,
+) -> Result<steward_types::TaskPhase, StoreError> {
+    match row
+        .try_get::<String, _>(column)
+        .map_err(database_error)?
+        .as_str()
+    {
+        "submitted" => Ok(steward_types::TaskPhase::Submitted),
+        "parked" => Ok(steward_types::TaskPhase::Parked),
+        "queued" => Ok(steward_types::TaskPhase::Queued),
+        "running" => Ok(steward_types::TaskPhase::Running),
+        "succeeded" => Ok(steward_types::TaskPhase::Succeeded),
+        "failed" => Ok(steward_types::TaskPhase::Failed),
+        "cancelled" => Ok(steward_types::TaskPhase::Cancelled),
+        _ => Err(StoreError::InvalidTaskTransition),
+    }
 }
 
 const fn ownership_text(ownership: steward_types::RuntimeOwnership) -> &'static str {
