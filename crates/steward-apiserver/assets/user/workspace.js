@@ -62,6 +62,8 @@ async function loadIdentity() {
   try {
     const session = await sessionInfo();
     text(target, session.principal.displayEmail);
+    const canonicalUserId = document.querySelector("#canonical-user-id");
+    if (canonicalUserId) text(canonicalUserId, session.principal.userId);
   } catch (_) { text(target, "Session unavailable"); }
 }
 

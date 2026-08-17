@@ -110,6 +110,8 @@ mod tests {
             "Runner memory",
             "Runner compute",
             "Runner storage",
+            "Canonical Steward user ID",
+            "canonical-user-id",
         ] {
             assert!(
                 USER_WORKSPACE_HTML.contains(required),
