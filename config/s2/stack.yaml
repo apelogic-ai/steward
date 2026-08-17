@@ -31,6 +31,18 @@ subjects:
   - kind: Group
     name: agents.apelogic.ai/member-role:engineer
     apiGroup: rbac.authorization.k8s.io
+  # S2 uses the same server-authoring identity as the attended PoC.  It is
+  # deliberately distinct from the member-role subject above: only this
+  # identity may submit the fixture's canonical authority binding.
+  - kind: ServiceAccount
+    name: steward-poc-api
+    namespace: steward-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: steward-poc-api
+  namespace: steward-system
 ---
 apiVersion: v1
 kind: ConfigMap

@@ -14,6 +14,8 @@ use steward_types::{Budget, Duration as RuntimeDuration, ModelRef};
 const NAMESPACE: &str = "team-a";
 const PRICED_RUNTIME: &str = "runtime-priced";
 const UNPRICED_RUNTIME: &str = "runtime-unpriced";
+const ALICE_CANONICAL_USER: &str = "usr_0123456789abcdef0123456789abcdef";
+const SERVER_AUTHORING_USERNAME: &str = "system:serviceaccount:steward-system:steward-poc-api";
 
 struct Harness {
     context: String,
@@ -69,6 +71,16 @@ impl Harness {
             .output()?)
     }
 
+    fn kubectl_as_server_authority(&self, arguments: &[&str]) -> Result<Output, Box<dyn Error>> {
+        Ok(Command::new("kubectl")
+            .args(["--kubeconfig"])
+            .arg(&self.kubeconfig)
+            .args(["--context", &self.context])
+            .args(["--as", SERVER_AUTHORING_USERNAME])
+            .args(arguments)
+            .output()?)
+    }
+
     fn write_runtime(
         &self,
         name: &str,
@@ -93,6 +105,11 @@ impl Harness {
                     "actingUser": "alice@example.com"
                 },
                 "owner": "alice@example.com",
+                "canonicalAuthority": {
+                    "schemaVersion": "steward/canonical-authority-binding/v1",
+                    "ownerUserId": ALICE_CANONICAL_USER,
+                    "actingUserId": ALICE_CANONICAL_USER,
+                },
                 "agentType": {"name": "base"},
                 "llms": [{
                     "provider": "openai",
@@ -111,7 +128,10 @@ impl Harness {
     }
 
     fn apply_runtime(&self, path: &Path) -> Result<Output, Box<dyn Error>> {
-        self.kubectl_as_actor(&["apply", "-f", path_text(path)?])
+        // The user-facing API server derives this binding before creating a
+        // runtime.  S2 exercises the same trusted-writer admission path;
+        // an ordinary member-role identity remains unable to self-assert it.
+        self.kubectl_as_server_authority(&["apply", "-f", path_text(path)?])
     }
 
     fn wait_phase(

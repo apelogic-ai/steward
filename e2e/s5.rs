@@ -13,6 +13,8 @@ use steward_types::{Budget, Duration as RuntimeDuration, ModelRef, ToolGrant};
 
 const NAMESPACE: &str = "team-a";
 const RUNTIME_NAME: &str = "runtime-revocation";
+const ALICE_CANONICAL_USER: &str = "usr_0123456789abcdef0123456789abcdef";
+const SERVER_AUTHORING_USERNAME: &str = "system:serviceaccount:steward-system:steward-poc-api";
 
 #[derive(Clone, Copy)]
 enum Caller {
@@ -91,6 +93,16 @@ impl Harness {
                 "--as-group",
                 "agents.apelogic.ai/member-role:engineer",
             ])
+            .args(arguments)
+            .output()?)
+    }
+
+    fn kubectl_as_server_authority(&self, arguments: &[&str]) -> Result<Output, Box<dyn Error>> {
+        Ok(Command::new("kubectl")
+            .args(["--kubeconfig"])
+            .arg(&self.kubeconfig)
+            .args(["--context", &self.context])
+            .args(["--as", SERVER_AUTHORING_USERNAME])
             .args(arguments)
             .output()?)
     }
@@ -178,6 +190,11 @@ impl Harness {
                     "actingUser": "alice@example.com"
                 },
                 "owner": "alice@example.com",
+                "canonicalAuthority": {
+                    "schemaVersion": "steward/canonical-authority-binding/v1",
+                    "ownerUserId": ALICE_CANONICAL_USER,
+                    "actingUserId": ALICE_CANONICAL_USER,
+                },
                 "agentType": {"name": "base"},
                 "llms": [{
                     "provider": "openai",
@@ -487,7 +504,7 @@ async fn e2e_s5_terminated_runtime_holds_nothing() -> Result<(), Box<dyn Error>>
         .await?;
 
     let manifest = harness.write_runtime()?;
-    let applied = harness.kubectl_as_actor(&["apply", "-f", path_text(&manifest)?])?;
+    let applied = harness.kubectl_as_server_authority(&["apply", "-f", path_text(&manifest)?])?;
     if !applied.status.success() {
         return Err(io::Error::other(format!(
             "S5 runtime admission failed: {}",

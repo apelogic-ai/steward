@@ -12,6 +12,7 @@ const ALICE_RUNTIME: &str = "runtime-alice";
 const ALICE_CANONICAL_USER: &str = "usr_0123456789abcdef0123456789abcdef";
 const BOB_NAMESPACE: &str = "team-b";
 const BOB_RUNTIME: &str = "runtime-bob";
+const BOB_CANONICAL_USER: &str = "usr_abcdef0123456789abcdef0123456789";
 const DELEGATED_SERVICE_RUNTIME: &str = "runtime-steward-run";
 const PURE_SERVICE_RUNTIME: &str = "runtime-scheduled-scanner";
 const MCP_URL: &str = "http://mcp-gw.steward-system.svc.cluster.local:8080/mcp";
@@ -149,6 +150,7 @@ impl Harness {
                     "actingUser": acting_user,
                 },
                 "owner": acting_user,
+                "canonicalAuthority": canonical_authority(acting_user)?,
                 "agentType": { "name": "base" },
                 "llms": [],
                 "tools": tools,
@@ -179,6 +181,7 @@ impl Harness {
         if let Some(acting_user) = acting_user {
             principal["actingUser"] = serde_json::json!(acting_user);
         }
+        let canonical_authority = acting_user.map(canonical_authority).transpose()?;
         let manifest = serde_json::json!({
             "apiVersion": env::var("STEWARD_AGENTRUNTIME_API_VERSION")?,
             "kind": "AgentRuntime",
@@ -192,6 +195,7 @@ impl Harness {
             "spec": {
                 "principal": principal,
                 "owner": "alice@example.com",
+                "canonicalAuthority": canonical_authority,
                 "agentType": { "name": "base" },
                 "llms": [],
                 "tools": [{
@@ -511,6 +515,23 @@ fn parse_forwarded_port(log: &str) -> Option<u16> {
     })
 }
 
+fn canonical_authority(acting_user: &str) -> Result<serde_json::Value, io::Error> {
+    let canonical_user = match acting_user {
+        "alice@example.com" => ALICE_CANONICAL_USER,
+        "bob@example.org" => BOB_CANONICAL_USER,
+        _ => {
+            return Err(io::Error::other(format!(
+                "S1 fixture has no canonical authority for acting user {acting_user}"
+            )));
+        }
+    };
+    Ok(serde_json::json!({
+        "schemaVersion": "steward/canonical-authority-binding/v1",
+        "ownerUserId": canonical_user,
+        "actingUserId": canonical_user,
+    }))
+}
+
 #[test]
 fn s1_provider_seed_uses_alices_canonical_hop1_subject() {
     let seed = include_str!("../config/s1/seed-mcp-gw.ts");
@@ -518,6 +539,18 @@ fn s1_provider_seed_uses_alices_canonical_hop1_subject() {
         seed.contains(&format!(r#"hop1Subject: "{ALICE_CANONICAL_USER}""#)),
         "the S1 GitHub fixture must use the canonical HOP-1 subject, not Alice's mutable email"
     );
+}
+
+#[test]
+fn s1_ephemeral_runtimes_use_the_same_canonical_authority_as_hop1() -> Result<(), Box<dyn Error>> {
+    let alice = canonical_authority("alice@example.com")?;
+    assert_eq!(alice["ownerUserId"], ALICE_CANONICAL_USER);
+    assert_eq!(alice["actingUserId"], ALICE_CANONICAL_USER);
+    let bob = canonical_authority("bob@example.org")?;
+    assert_eq!(bob["ownerUserId"], BOB_CANONICAL_USER);
+    assert_eq!(bob["actingUserId"], BOB_CANONICAL_USER);
+    assert!(canonical_authority("unknown@example.org").is_err());
+    Ok(())
 }
 
 #[test]
