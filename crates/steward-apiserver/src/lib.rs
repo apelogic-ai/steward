@@ -10,6 +10,7 @@ pub mod connections_demo;
 mod connections_ui;
 pub mod google_oidc;
 mod tasks;
+mod user_ui;
 
 pub use tasks::{
     KubernetesTaskIdentityResolver, StaticTaskWorkflowCatalog, TaskAdmissionDelta, TaskArchive,

@@ -580,7 +580,7 @@ pub fn local_fake_browser_auth_service(
 }
 
 pub fn browser_auth_router(service: BrowserAuthService) -> Router {
-    Router::new()
+    let auth = Router::new()
         .route("/admin/sign-in", get(sign_in))
         .route("/admin/session-ready", get(session_ready))
         .route("/admin/auth/login", get(login))
@@ -592,7 +592,11 @@ pub fn browser_auth_router(service: BrowserAuthService) -> Router {
         .route_layer(middleware::from_fn(
             crate::admin_ui::add_browser_security_headers,
         ))
-        .with_state(service)
+        .with_state(service.clone());
+    auth.merge(protect_browser_routes(
+        crate::user_ui::router::<()>(),
+        service,
+    ))
 }
 
 pub fn protect_browser_routes(routes: Router, service: BrowserAuthService) -> Router {
@@ -1030,7 +1034,15 @@ struct PendingAuthorization {
 
 impl PendingAuthorization {
     fn new(return_to: &str, now: u64) -> Result<Self, BrowserAuthError> {
-        if !matches!(return_to, "/admin/connections" | "/admin/session-ready") {
+        if !matches!(
+            return_to,
+            "/admin/connections"
+                | "/admin/session-ready"
+                | "/app"
+                | "/app/envelopes"
+                | "/app/envelopes/new"
+                | "/app/runs"
+        ) {
             return Err(BrowserAuthError::InvalidRedirect);
         }
         let pkce_verifier = random_secret();
@@ -1243,6 +1255,23 @@ mod tests {
             !super::SIGN_IN_HTML.contains("returnTo=%2Fadmin%2Fsession-ready"),
             "the sign-in call to action must not strand users on a fixture page"
         );
+    }
+
+    #[test]
+    fn user_workspace_return_paths_are_exactly_allowlisted() {
+        for path in ["/app", "/app/envelopes", "/app/envelopes/new", "/app/runs"] {
+            assert!(
+                PendingAuthorization::new(path, 100).is_ok(),
+                "the authenticated user workspace destination {path} must be a valid login return"
+            );
+        }
+        for path in ["/admin", "/app/unknown", "/app/runs?user=other"] {
+            assert_eq!(
+                PendingAuthorization::new(path, 100),
+                Err(BrowserAuthError::InvalidRedirect),
+                "only exact user workspace routes may be accepted as login returns"
+            );
+        }
     }
 
     fn google_config() -> Result<GoogleOidcConfig, String> {

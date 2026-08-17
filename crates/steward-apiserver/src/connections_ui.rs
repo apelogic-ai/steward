@@ -133,6 +133,11 @@ mod tests {
             "<dialog",
             "id=\"scope-status\"",
             "id=\"connection-error\"",
+            "aria-label=\"Steward user workspace\"",
+            "href=\"/app/envelopes\"",
+            "href=\"/app/envelopes/new\"",
+            "href=\"/app/runs\"",
+            "href=\"/app\"",
         ] {
             assert!(
                 CONNECTIONS_HTML.contains(required),

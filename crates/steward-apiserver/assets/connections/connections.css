@@ -58,6 +58,7 @@ main:focus-visible {
 }
 
 .topbar,
+.user-nav,
 main {
   width: min(58rem, calc(100% - 2rem));
   margin-inline: auto;
@@ -69,6 +70,26 @@ main {
   justify-content: space-between;
   gap: 1rem;
   padding: 2rem 0 1rem;
+}
+
+.user-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  padding-bottom: 0.8rem;
+}
+
+.user-nav a {
+  padding: 0.2rem 0;
+  color: var(--muted);
+  border-bottom: 2px solid transparent;
+  text-decoration: none;
+}
+
+.user-nav a:hover,
+.user-nav a[aria-current="page"] {
+  color: var(--text);
+  border-bottom-color: currentcolor;
 }
 
 .brand {
