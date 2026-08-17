@@ -1307,37 +1307,37 @@ where
         ));
     let admin = protect_admin_routes(
         Router::new()
-        .merge(admin_ui::router::<AppState<R, L, D>>())
-        .route("/admin/api/v1/runs", get(agent_runs_handler::<R, L, D>))
-        .route(
-            "/admin/api/v1/runs/{taskUid}",
-            get(agent_run_handler::<R, L, D>),
-        )
-        .route(
-            "/admin/api/v1/runs/{taskUid}/timeline",
-            get(agent_run_timeline_handler::<R, L, D>),
-        )
-        .route("/admin/approvals", get(approval_queue_handler::<R, L, D>))
-        .route(
-            "/admin/envelopes/{member_role}",
-            post(author_envelope_handler::<R, L, D>),
-        )
-        .route(
-            "/admin/service-envelopes/{service}",
-            post(author_service_envelope_handler::<R, L, D>),
-        )
-        .route(
-            "/admin/approvals/{approval_id}/approve",
-            post(approve_handler::<R, L, D>),
-        )
-        .route(
-            "/admin/approvals/{approval_id}/file",
-            post(file_decision_handler::<R, L, D>),
-        )
-        .route(
-            "/admin/runtimes/{runtime_uid}/grants/revoke",
-            post(revoke_grants_handler::<R, L, D>),
-        ),
+            .merge(admin_ui::router::<AppState<R, L, D>>())
+            .route("/admin/api/v1/runs", get(agent_runs_handler::<R, L, D>))
+            .route(
+                "/admin/api/v1/runs/{taskUid}",
+                get(agent_run_handler::<R, L, D>),
+            )
+            .route(
+                "/admin/api/v1/runs/{taskUid}/timeline",
+                get(agent_run_timeline_handler::<R, L, D>),
+            )
+            .route("/admin/approvals", get(approval_queue_handler::<R, L, D>))
+            .route(
+                "/admin/envelopes/{member_role}",
+                post(author_envelope_handler::<R, L, D>),
+            )
+            .route(
+                "/admin/service-envelopes/{service}",
+                post(author_service_envelope_handler::<R, L, D>),
+            )
+            .route(
+                "/admin/approvals/{approval_id}/approve",
+                post(approve_handler::<R, L, D>),
+            )
+            .route(
+                "/admin/approvals/{approval_id}/file",
+                post(file_decision_handler::<R, L, D>),
+            )
+            .route(
+                "/admin/runtimes/{runtime_uid}/grants/revoke",
+                post(revoke_grants_handler::<R, L, D>),
+            ),
         authenticator,
     );
     admission.merge(admin).with_state(AppState {
@@ -1962,7 +1962,11 @@ impl IntoResponse for ApiError {
             Self::TaskAuthentication => StatusCode::UNAUTHORIZED,
             Self::TaskAuthenticationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::TaskWorkflowNotFound
-            | Self::Store(StoreError::TaskNotFound | StoreError::CanonicalIdentityNotFound) => {
+            | Self::Store(
+                StoreError::TaskNotFound
+                | StoreError::CanonicalIdentityNotFound
+                | StoreError::EnvelopeRequestNotFound,
+            ) => {
                 StatusCode::NOT_FOUND
             }
             Self::Store(StoreError::CanonicalIdentityInactive) => StatusCode::FORBIDDEN,
@@ -1984,7 +1988,9 @@ impl IntoResponse for ApiError {
                 | StoreError::StaleEnvelope
                 | StoreError::EnvelopeRevisionNotIncreasing
                 | StoreError::TaskIdempotencyConflict
+                | StoreError::EnvelopeRequestIdempotencyConflict
                 | StoreError::InvalidTaskTransition
+                | StoreError::InvalidEnvelopeRequestTransition
                 | StoreError::CanonicalIdentityStale
                 | StoreError::CanonicalIdentityAmbiguousEmail
                 | StoreError::CanonicalIdentityConflict,
@@ -1994,7 +2000,8 @@ impl IntoResponse for ApiError {
                 | StoreError::MissingRevocationReason
                 | StoreError::CanonicalIdentityInvalidActor
                 | StoreError::CanonicalIdentityInvalidRecord
-                | StoreError::InvalidTaskIdentityBinding,
+                | StoreError::InvalidTaskIdentityBinding
+                | StoreError::InvalidEnvelopeRequest,
             ) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Store(StoreError::InvalidRunQuery | StoreError::InvalidRunCursor) => {
                 StatusCode::BAD_REQUEST
@@ -2738,10 +2745,11 @@ mod tests {
         DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
     };
     use steward_store::{
-        AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent, ApprovalCandidate,
-        ApproveAdmission, ApprovedAdmission, DecisionFiling, DecisionFilingClaim,
-        GrantApplication, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval,
-        StoreError, TaskRecord, TaskReservation, TaskReservationRequest,
+        AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunSpend, AgentRunTimelineEvent,
+        AgentRunTimelineKind, AgentRunTimelineProvenance, ApprovalCandidate, ApproveAdmission,
+        ApprovedAdmission, DecisionFiling, DecisionFilingClaim, GrantApplication, GrantReversion,
+        ParkRejection, ParkedAdmission, PendingApproval, StoreError, TaskRecord, TaskReservation,
+        TaskReservationRequest,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email,
@@ -2753,8 +2761,8 @@ mod tests {
 
     use super::tasks::task_identity_from_token_review;
     use super::{
-        AdmissionContext, AdmissionLedger, AgentRunLedger, ApiDoc, ApiError, AuthenticatedCaller,
-        AuthenticationError, BoxFuture, BudgetIncrease,
+        AGENT_RUNS_API_VERSION, AdmissionContext, AdmissionLedger, AgentRunLedger, ApiDoc,
+        ApiError, AuthenticatedCaller, AuthenticationError, BoxFuture, BudgetIncrease,
         CreateRuntimeRequest, KubernetesTokenReviewAudience, RequestAuthenticator,
         RuntimeCreateError, RuntimeRepository, STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP,
         StaticTaskWorkflowCatalog, SubmissionOutcome, TaskAuthenticationError, TaskIdentity,
@@ -7670,13 +7678,9 @@ mod tests {
         Ok(())
     }
 
-/* Conflict-resolved test coverage is restored in focused Agent Runs tests below. */
-/*
+    #[tokio::test]
     async fn admin_dashboard_shell_and_versioned_bootstrap_require_exact_admin_authority()
     -> Result<(), String> {
--- SPLIT ARM --
-    async fn agent_runs_list_is_versioned_empty_and_admin_only() -> Result<(), String> {
--- INTEGRATED AGENT RUNS ARM --
         let app = router(
             FakeRuntimeRepository {
                 runtime: Arc::new(Mutex::new(runtime())),
@@ -7690,7 +7694,6 @@ mod tests {
             (None, StatusCode::UNAUTHORIZED),
             (Some("Bearer user-session"), StatusCode::FORBIDDEN),
         ] {
--- DASHBOARD ARM --
             for uri in ["/admin", "/admin/api/v1/bootstrap"] {
                 let mut request = Request::builder().uri(uri);
                 if let Some(authorization) = authorization {
@@ -7780,171 +7783,14 @@ mod tests {
     #[tokio::test]
     async fn admin_dashboard_responses_set_fail_closed_browser_headers() -> Result<(), String> {
         let app = router(
--- SPLIT ARM --
-            let mut request = Request::builder().uri("/admin/api/v1/runs");
-            if let Some(authorization) = authorization {
-                request = request.header("authorization", authorization);
-            }
-            let response = app
-                .clone()
-                .oneshot(request.body(Body::empty()).map_err(|error| {
-                    format!("failed to build Agent Runs authorization request: {error}")
-                })?)
-                .await
-                .map_err(|error| format!("Agent Runs authorization request failed: {error}"))?;
-            assert_eq!(
-                response.status(),
-                expected,
-                "ordinary identities must not read the administrator run ledger"
-            );
-        }
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/admin/api/v1/runs")
-                    .header("authorization", "Bearer admin-session")
-                    .body(Body::empty())
-                    .map_err(|error| format!("failed to build Agent Runs request: {error}"))?,
-            )
-            .await
-            .map_err(|error| format!("Agent Runs request failed: {error}"))?;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .map_err(|error| format!("failed to read Agent Runs response: {error}"))?;
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body)
-                .map_err(|error| format!("Agent Runs response was not JSON: {error}"))?,
-            serde_json::json!({
-                "apiVersion": "steward.admin/runs/v1",
-                "runs": [],
-                "nextCursor": null
-            })
-        );
-
-        let bootstrap_only = router(
--- INTEGRATED AGENT RUNS ARM --
             FakeRuntimeRepository {
                 runtime: Arc::new(Mutex::new(runtime())),
             },
             ledger(),
--- DASHBOARD ARM --
--- SPLIT ARM --
-            BootstrapAuthenticator,
-            FakeDecisionChannel::default(),
-        );
-        let response = bootstrap_only
-            .oneshot(
-                Request::builder()
-                    .uri("/admin/api/v1/runs")
-                    .header("authorization", "Bearer bootstrap-session")
-                    .body(Body::empty())
-                    .map_err(|error| error.to_string())?,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(
-            response.status(),
-            StatusCode::FORBIDDEN,
-            "route-scoped envelope bootstrap authority must not read Agent Runs"
-        );
-        Ok(())
-    }
-
-    fn sample_agent_run(task_uid: Uuid, created_at: &str) -> AgentRunRecord {
-        AgentRunRecord {
-            task_uid,
-            submitter_service: "steward-run".to_owned(),
-            acting_user: Some("alice@example.com".to_owned()),
-            owner: "alice@example.com".to_owned(),
-            workflow: "code-review".to_owned(),
-            coding_agent_runtime: "agent-v1".to_owned(),
-            runtime_uid: Some(format!("runtime-{task_uid}")),
-            runtime_ownership: steward_types::RuntimeOwnership::Provisioned,
-            phase: TaskPhase::Failed,
-            runtime_spec: AgentRuntimeSpec {
-                principal: Principal::Service {
-                    name: "steward-run".to_owned(),
-                    acting_user: Some(Email("alice@example.com".to_owned())),
-                },
-                owner: Email("alice@example.com".to_owned()),
-                agent_type: AgentType {
-                    name: "agent-v1".to_owned(),
-                },
-                llms: vec![ModelRef {
-                    provider: "provider-a".to_owned(),
-                    model: "model-a".to_owned(),
-                }],
-                tools: vec![steward_types::ToolGrant {
-                    provider: "github".to_owned(),
-                    resource: "issues".to_owned(),
-                    action: "read".to_owned(),
-                }],
-                budget: Budget {
-                    monthly_limit: "100.00".to_owned(),
-                    currency: "USD".to_owned(),
-                },
-                ttl: Duration("24h".to_owned()),
-                bindings: None,
-            },
-            envelope_revision: Some(7),
-            finalize_requested: true,
-            finalized: true,
-            failure_reason: Some("provider returned secret diagnostic payload".to_owned()),
-            created_at: created_at.to_owned(),
-            updated_at: "2026-08-12T12:01:00.000000Z".to_owned(),
-            spend: Some(AgentRunSpend {
-                observed_amount: "1.25".to_owned(),
-                currency: "USD".to_owned(),
-                exhausted: false,
-                observed_at: "2026-08-12T12:00:30.000000Z".to_owned(),
-            }),
-            history_partial: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn agent_run_detail_and_timeline_are_source_bounded_and_privacy_safe()
-    -> Result<(), String> {
-        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
-            .map_err(|error| error.to_string())?;
-        let ledger = ledger();
-        ledger
-            .agent_runs
-            .lock()
-            .map_err(|_| "fake agent-run lock was poisoned")?
-            .push(sample_agent_run(task_uid, "2026-08-12T12:00:00.000000Z"));
-        ledger
-            .agent_run_events
-            .lock()
-            .map_err(|_| "fake timeline lock was poisoned")?
-            .push((
-                task_uid,
-                vec![
-                    AgentRunTimelineEvent {
-                        kind: AgentRunTimelineKind::Phase(TaskPhase::Submitted),
-                        provenance: AgentRunTimelineProvenance::Backfilled,
-                        at: "2026-08-12T12:00:00.000000Z".to_owned(),
-                    },
-                    AgentRunTimelineEvent {
-                        kind: AgentRunTimelineKind::Phase(TaskPhase::Failed),
-                        provenance: AgentRunTimelineProvenance::Recorded,
-                        at: "2026-08-12T12:01:00.000000Z".to_owned(),
-                    },
-                ],
-            ));
-        let app = router(
-            FakeRuntimeRepository {
-                runtime: Arc::new(Mutex::new(runtime())),
-            },
-            ledger,
--- INTEGRATED AGENT RUNS ARM --
             FakeAuthenticator,
             FakeDecisionChannel::default(),
         );
 
--- DASHBOARD ARM --
         for uri in [
             "/admin",
             "/admin/assets/admin.css",
@@ -7952,134 +7798,6 @@ mod tests {
             "/admin/assets/icon.svg",
             "/admin/api/v1/bootstrap",
             "/admin/approvals",
--- SPLIT ARM --
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/admin/api/v1/runs/{task_uid}"))
-                    .header("authorization", "Bearer admin-session")
-                    .body(Body::empty())
-                    .map_err(|error| error.to_string())?,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .map_err(|error| error.to_string())?;
-        let body_text = String::from_utf8(body.to_vec()).map_err(|error| error.to_string())?;
-        assert!(
-            !body_text.contains("secret diagnostic payload"),
-            "raw failure text must never cross the administrator read-model boundary"
-        );
-        let body: serde_json::Value =
-            serde_json::from_str(&body_text).map_err(|error| error.to_string())?;
-        assert_eq!(body["apiVersion"], AGENT_RUNS_API_VERSION);
-        assert_eq!(body["run"]["errorCategory"], "execution-failed");
-        assert_eq!(body["run"]["observedSpend"]["observedAmount"], "1.25");
-        assert_eq!(body["run"]["toolActivity"]["availability"], "unavailable");
-        assert_eq!(body["run"]["toolActivity"]["source"], "none");
-        assert_eq!(body["run"]["toolActivity"]["reason"], "notPersisted");
-        assert_eq!(
-            body["run"]["inferenceActivity"]["availability"],
-            "unavailable"
-        );
-        assert_eq!(body["run"]["githubRun"]["reason"], "notRecorded");
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/admin/api/v1/runs/{task_uid}/timeline"))
-                    .header("authorization", "Bearer admin-session")
-                    .body(Body::empty())
-                    .map_err(|error| error.to_string())?,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .map_err(|error| error.to_string())?;
-        let body: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|error| error.to_string())?;
-        assert_eq!(body["history"]["availability"], "partial");
-        assert_eq!(body["events"][0]["provenance"], "backfilled");
-        assert_eq!(body["events"][1]["phase"], "failed");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn agent_runs_pagination_filters_and_query_validation_fail_closed() -> Result<(), String>
-    {
-        let newer_uid = Uuid::parse_str("22222222-2222-4222-8222-222222222222")
-            .map_err(|error| error.to_string())?;
-        let older_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
-            .map_err(|error| error.to_string())?;
-        let ledger = ledger();
-        {
-            let mut runs = ledger
-                .agent_runs
-                .lock()
-                .map_err(|_| "fake agent-run lock was poisoned")?;
-            runs.push(sample_agent_run(older_uid, "2026-08-12T11:00:00.000000Z"));
-            let mut newer = sample_agent_run(newer_uid, "2026-08-12T12:00:00.000000Z");
-            newer.workflow = "incident-response".to_owned();
-            newer.phase = TaskPhase::Running;
-            runs.push(newer);
-        }
-        let app = router(
-            FakeRuntimeRepository {
-                runtime: Arc::new(Mutex::new(runtime())),
-            },
-            ledger,
-            FakeAuthenticator,
-            FakeDecisionChannel::default(),
-        );
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/admin/api/v1/runs?limit=1")
-                    .header("authorization", "Bearer admin-session")
-                    .body(Body::empty())
-                    .map_err(|error| error.to_string())?,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .map_err(|error| error.to_string())?;
-        let body: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|error| error.to_string())?;
-        assert_eq!(body["runs"][0]["taskUid"], newer_uid.to_string());
-        assert_eq!(body["nextCursor"], newer_uid.to_string());
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/admin/api/v1/runs?cursor={newer_uid}&limit=1"))
-                    .header("authorization", "Bearer admin-session")
-                    .body(Body::empty())
-                    .map_err(|error| error.to_string())?,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let body = to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .map_err(|error| error.to_string())?;
-        let body: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|error| error.to_string())?;
-        assert_eq!(body["runs"][0]["taskUid"], older_uid.to_string());
-        assert!(body["nextCursor"].is_null());
-
-        for uri in [
-            "/admin/api/v1/runs?limit=0".to_owned(),
-            "/admin/api/v1/runs?unexpected=true".to_owned(),
-            "/admin/api/v1/runs?cursor=33333333-3333-4333-8333-333333333333".to_owned(),
--- INTEGRATED AGENT RUNS ARM --
         ] {
             let response = app
                 .clone()
@@ -8088,7 +7806,6 @@ mod tests {
                         .uri(uri)
                         .header("authorization", "Bearer admin-session")
                         .body(Body::empty())
--- DASHBOARD ARM --
                         .map_err(|error| {
                             format!("failed to build dashboard header request: {error}")
                         })?,
@@ -8242,7 +7959,316 @@ mod tests {
             );
         }
     }
--- SPLIT ARM --
+
+    #[tokio::test]
+    async fn agent_runs_list_is_versioned_empty_and_admin_only() -> Result<(), String> {
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+
+        for (authorization, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("Bearer user-session"), StatusCode::FORBIDDEN),
+        ] {
+            let mut request = Request::builder().uri("/admin/api/v1/runs");
+            if let Some(authorization) = authorization {
+                request = request.header("authorization", authorization);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).map_err(|error| {
+                    format!("failed to build Agent Runs authorization request: {error}")
+                })?)
+                .await
+                .map_err(|error| format!("Agent Runs authorization request failed: {error}"))?;
+            assert_eq!(
+                response.status(),
+                expected,
+                "ordinary identities must not read the administrator run ledger"
+            );
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/runs")
+                    .header("authorization", "Bearer admin-session")
+                    .body(Body::empty())
+                    .map_err(|error| format!("failed to build Agent Runs request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("Agent Runs request failed: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("failed to read Agent Runs response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("Agent Runs response was not JSON: {error}"))?,
+            serde_json::json!({
+                "apiVersion": "steward.admin/runs/v1",
+                "runs": [],
+                "nextCursor": null
+            })
+        );
+
+        let bootstrap_only = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger(),
+            BootstrapAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        let response = bootstrap_only
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/runs")
+                    .header("authorization", "Bearer bootstrap-session")
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "route-scoped envelope bootstrap authority must not read Agent Runs"
+        );
+        Ok(())
+    }
+
+    fn sample_agent_run(task_uid: Uuid, created_at: &str) -> AgentRunRecord {
+        AgentRunRecord {
+            task_uid,
+            submitter_service: "steward-run".to_owned(),
+            acting_user: Some("alice@example.com".to_owned()),
+            owner: "alice@example.com".to_owned(),
+            workflow: "code-review".to_owned(),
+            coding_agent_runtime: "agent-v1".to_owned(),
+            runtime_uid: Some(format!("runtime-{task_uid}")),
+            runtime_ownership: steward_types::RuntimeOwnership::Provisioned,
+            phase: TaskPhase::Failed,
+            runtime_spec: AgentRuntimeSpec {
+                principal: Principal::Service {
+                    name: "steward-run".to_owned(),
+                    acting_user: Some(Email("alice@example.com".to_owned())),
+                },
+                owner: Email("alice@example.com".to_owned()),
+                agent_type: AgentType {
+                    name: "agent-v1".to_owned(),
+                },
+                llms: vec![ModelRef {
+                    provider: "provider-a".to_owned(),
+                    model: "model-a".to_owned(),
+                }],
+                tools: vec![steward_types::ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "issues".to_owned(),
+                    action: "read".to_owned(),
+                }],
+                budget: Budget {
+                    monthly_limit: "100.00".to_owned(),
+                    currency: "USD".to_owned(),
+                },
+                ttl: Duration("24h".to_owned()),
+                canonical_authority: None,
+                bindings: None,
+            },
+            envelope_revision: Some(7),
+            finalize_requested: true,
+            finalized: true,
+            failure_reason: Some("provider returned secret diagnostic payload".to_owned()),
+            created_at: created_at.to_owned(),
+            updated_at: "2026-08-12T12:01:00.000000Z".to_owned(),
+            spend: Some(AgentRunSpend {
+                observed_amount: "1.25".to_owned(),
+                currency: "USD".to_owned(),
+                exhausted: false,
+                observed_at: "2026-08-12T12:00:30.000000Z".to_owned(),
+            }),
+            history_partial: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_run_detail_and_timeline_are_source_bounded_and_privacy_safe()
+    -> Result<(), String> {
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let ledger = ledger();
+        ledger
+            .agent_runs
+            .lock()
+            .map_err(|_| "fake agent-run lock was poisoned")?
+            .push(sample_agent_run(task_uid, "2026-08-12T12:00:00.000000Z"));
+        ledger
+            .agent_run_events
+            .lock()
+            .map_err(|_| "fake timeline lock was poisoned")?
+            .push((
+                task_uid,
+                vec![
+                    AgentRunTimelineEvent {
+                        kind: AgentRunTimelineKind::Phase(TaskPhase::Submitted),
+                        provenance: AgentRunTimelineProvenance::Backfilled,
+                        at: "2026-08-12T12:00:00.000000Z".to_owned(),
+                    },
+                    AgentRunTimelineEvent {
+                        kind: AgentRunTimelineKind::Phase(TaskPhase::Failed),
+                        provenance: AgentRunTimelineProvenance::Recorded,
+                        at: "2026-08-12T12:01:00.000000Z".to_owned(),
+                    },
+                ],
+            ));
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger,
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/api/v1/runs/{task_uid}"))
+                    .header("authorization", "Bearer admin-session")
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let body_text = String::from_utf8(body.to_vec()).map_err(|error| error.to_string())?;
+        assert!(
+            !body_text.contains("secret diagnostic payload"),
+            "raw failure text must never cross the administrator read-model boundary"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&body_text).map_err(|error| error.to_string())?;
+        assert_eq!(body["apiVersion"], AGENT_RUNS_API_VERSION);
+        assert_eq!(body["run"]["errorCategory"], "execution-failed");
+        assert_eq!(body["run"]["observedSpend"]["observedAmount"], "1.25");
+        assert_eq!(body["run"]["toolActivity"]["availability"], "unavailable");
+        assert_eq!(body["run"]["toolActivity"]["source"], "none");
+        assert_eq!(body["run"]["toolActivity"]["reason"], "notPersisted");
+        assert_eq!(
+            body["run"]["inferenceActivity"]["availability"],
+            "unavailable"
+        );
+        assert_eq!(body["run"]["githubRun"]["reason"], "notRecorded");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/api/v1/runs/{task_uid}/timeline"))
+                    .header("authorization", "Bearer admin-session")
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+        assert_eq!(body["history"]["availability"], "partial");
+        assert_eq!(body["events"][0]["provenance"], "backfilled");
+        assert_eq!(body["events"][1]["phase"], "failed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_runs_pagination_filters_and_query_validation_fail_closed() -> Result<(), String>
+    {
+        let newer_uid = Uuid::parse_str("22222222-2222-4222-8222-222222222222")
+            .map_err(|error| error.to_string())?;
+        let older_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let ledger = ledger();
+        {
+            let mut runs = ledger
+                .agent_runs
+                .lock()
+                .map_err(|_| "fake agent-run lock was poisoned")?;
+            runs.push(sample_agent_run(older_uid, "2026-08-12T11:00:00.000000Z"));
+            let mut newer = sample_agent_run(newer_uid, "2026-08-12T12:00:00.000000Z");
+            newer.workflow = "incident-response".to_owned();
+            newer.phase = TaskPhase::Running;
+            runs.push(newer);
+        }
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger,
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/runs?limit=1")
+                    .header("authorization", "Bearer admin-session")
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+        assert_eq!(body["runs"][0]["taskUid"], newer_uid.to_string());
+        assert_eq!(body["nextCursor"], newer_uid.to_string());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/api/v1/runs?cursor={newer_uid}&limit=1"))
+                    .header("authorization", "Bearer admin-session")
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+        assert_eq!(body["runs"][0]["taskUid"], older_uid.to_string());
+        assert!(body["nextCursor"].is_null());
+
+        for uri in [
+            "/admin/api/v1/runs?limit=0".to_owned(),
+            "/admin/api/v1/runs?unexpected=true".to_owned(),
+            "/admin/api/v1/runs?cursor=33333333-3333-4333-8333-333333333333".to_owned(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("authorization", "Bearer admin-session")
+                        .body(Body::empty())
                         .map_err(|error| error.to_string())?,
                 )
                 .await
@@ -8251,5 +8277,4 @@ mod tests {
         }
         Ok(())
     }
-*/
 }

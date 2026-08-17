@@ -32,3 +32,7 @@ kubeconfig.*
 *.swp
 .idea/
 .vscode/
+node_modules/
+playwright-report/
+test-results/
+output/playwright/

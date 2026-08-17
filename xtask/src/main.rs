@@ -44,6 +44,8 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "e2e-task" if rest.is_empty() => e2e_task(),
         "e2e-openshell-adapter" if rest.is_empty() => e2e_openshell_adapter(),
         "e2e-postgres-tls" if rest.is_empty() => e2e_postgres_tls(),
+        "browser-e2e" if rest.is_empty() => browser_e2e(false),
+        "browser-e2e" if rest == ["--browser-ready"] => browser_e2e(true),
         "policy-test" if rest.is_empty() => policy_test(),
         "migrate-check" if rest.is_empty() => migrate_check(),
         "generate-manifests" if rest.is_empty() => generate_manifests(),
@@ -78,6 +80,7 @@ fn usage() -> String {
         "  e2e-task",
         "  e2e-openshell-adapter",
         "  e2e-postgres-tls",
+        "  browser-e2e [--browser-ready]",
         "  policy-test",
         "  migrate-check",
         "  generate-manifests",
@@ -180,6 +183,29 @@ fn e2e_openshell_adapter() -> TaskResult {
 
 fn e2e_postgres_tls() -> TaskResult {
     run("bash", &["scripts/postgres-tls-e2e.sh"])
+}
+
+fn browser_e2e(browser_ready: bool) -> TaskResult {
+    let browser_e2e_directory = root().join("target/browser-e2e");
+    let cache = browser_e2e_directory.join("npm-cache");
+    let browsers = browser_e2e_directory.join("browsers");
+    fs::create_dir_all(&cache)
+        .map_err(|error| format!("failed to create browser E2E npm cache: {error}"))?;
+    fs::create_dir_all(&browsers)
+        .map_err(|error| format!("failed to create browser E2E browser directory: {error}"))?;
+    let npm_environment = [
+        ("npm_config_cache", cache.as_os_str()),
+        ("PLAYWRIGHT_BROWSERS_PATH", browsers.as_os_str()),
+    ];
+    if !browser_ready {
+        run_with_env("npm", &["ci"], &npm_environment)?;
+        run_with_env(
+            "npm",
+            &["exec", "playwright", "install", "chromium"],
+            &npm_environment,
+        )?;
+    }
+    run_with_env("npm", &["run", "test:browser-e2e"], &npm_environment)
 }
 
 fn policy_test() -> TaskResult {
@@ -697,6 +723,21 @@ fn run(program: &str, arguments: &[&str]) -> TaskResult {
     run_in(&root(), program, arguments)
 }
 
+fn run_with_env(program: &str, arguments: &[&str], environment: &[(&str, &OsStr)]) -> TaskResult {
+    println!("+ {program} {}", arguments.join(" "));
+    let status = Command::new(program)
+        .args(arguments)
+        .envs(environment.iter().copied())
+        .current_dir(root())
+        .status()
+        .map_err(|error| format!("failed to run {program}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program} exited with {status}"))
+    }
+}
+
 fn run_in(directory: &Path, program: &str, arguments: &[&str]) -> TaskResult {
     println!("+ {program} {}", arguments.join(" "));
     let status = Command::new(program)
@@ -840,6 +881,62 @@ mod tests {
             workflow.contains("supervisor-tools: \"true\""),
             "release validation must install Zig and cargo-zigbuild before pinned conformance"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn browser_e2e_ci_uses_the_pinned_loopback_gate() -> Result<(), String> {
+        let repository = root();
+        let workflow = fs::read_to_string(repository.join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let package = fs::read_to_string(repository.join("package.json"))
+            .map_err(|error| format!("pinned browser test package is required: {error}"))?;
+        let node_version = fs::read_to_string(repository.join(".node-version"))
+            .map_err(|error| format!("pinned Node version is required: {error}"))?;
+        let journey = fs::read_to_string(repository.join("tests/browser/steward-ui.spec.mjs"))
+            .map_err(|error| format!("loopback browser journey is required: {error}"))?;
+
+        let browser_job = workflow
+            .split("  browser-e2e:")
+            .nth(1)
+            .and_then(|jobs| jobs.split("\n  pinned:").next())
+            .ok_or_else(|| "browser E2E CI job is required".to_owned())?;
+
+        assert!(
+            browser_job.contains("node-version-file: .node-version"),
+            "browser E2E CI must use the repository-pinned Node runtime"
+        );
+        assert!(
+            browser_job.contains("npm exec playwright install --with-deps chromium"),
+            "browser E2E CI must install Playwright's pinned Chromium image"
+        );
+        assert!(
+            browser_job.contains("PLAYWRIGHT_BROWSERS_PATH"),
+            "browser E2E CI must use its ephemeral pinned browser image directory"
+        );
+        assert!(
+            browser_job.contains("cargo xtask browser-e2e --browser-ready"),
+            "browser E2E CI must use the cargo xtask gate"
+        );
+        assert!(
+            package.contains("\"@playwright/test\": \"1.62.1\""),
+            "the browser runner must be exact-version pinned in the source manifest"
+        );
+        assert_eq!(node_version.trim(), "26.5.0");
+        for required in [
+            "127.0.0.1",
+            "Storage.prototype",
+            "consoleErrors",
+            "Connect GitHub",
+            "Disconnect GitHub",
+            "viewport",
+        ] {
+            assert!(
+                journey.contains(required),
+                "the loopback browser journey must cover {required}"
+            );
+        }
 
         Ok(())
     }

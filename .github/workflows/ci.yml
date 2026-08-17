@@ -228,6 +228,36 @@ jobs:
       - name: Verify encrypted PostgreSQL connection and migrations
         run: cargo xtask e2e-postgres-tls
 
+  browser-e2e:
+    name: e2e / browser user journeys
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/target/browser-e2e/browsers
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Install pinned Node runtime
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install pinned browser runner and Chromium image
+        run: |
+          npm ci
+          npm exec playwright install --with-deps chromium
+
+      - name: Verify loopback browser journeys
+        run: cargo xtask browser-e2e --browser-ready
+
   release-candidate:
     name: release / chart and images
     runs-on: ubuntu-latest
@@ -296,6 +326,7 @@ jobs:
       - e2e-revocation
       - openshell-adapter
       - postgres-tls
+      - browser-e2e
       - release-candidate
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -313,6 +344,7 @@ jobs:
           REVOCATION: ${{ needs.e2e-revocation.result }}
           OPENSHELL_ADAPTER: ${{ needs.openshell-adapter.result }}
           POSTGRES_TLS: ${{ needs.postgres-tls.result }}
+          BROWSER_E2E: ${{ needs.browser-e2e.result }}
           RELEASE_CANDIDATE: ${{ needs.release-candidate.result }}
         run: |
           set -euo pipefail
@@ -327,6 +359,7 @@ jobs:
             "${REVOCATION}" \
             "${OPENSHELL_ADAPTER}" \
             "${POSTGRES_TLS}" \
+            "${BROWSER_E2E}" \
             "${RELEASE_CANDIDATE}"
           do
             if [[ "${result}" != "success" ]]; then
