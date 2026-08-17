@@ -9,7 +9,7 @@ use jwt_compact::{AlgorithmExt, Token};
 use rand_core::OsRng;
 use steward_mint::{
     AuthorityBinding, AuthorityResolver, AuthorityState, DEFAULT_AUTHORITY_TTL,
-    HOP1_CLAIMS_VERSION, IntrospectionClientCredential, Mint, MintConfig, MintError,
+    HOP1_CLAIMS_VERSION, Hop1Token, IntrospectionClientCredential, Mint, MintConfig, MintError,
     MintSigningKey, SPIFFE_CLIENT_ASSERTION_TYPE, SvidAssertion, SvidValidationError,
     SvidValidator, TokenGrantRequest, ValidatedWorkload,
 };
@@ -144,7 +144,7 @@ async fn governed_runtime_projects_canonical_subject_and_verified_email() -> Res
 }
 
 #[tokio::test]
-async fn s5_hop1_v3_authority_mints_the_required_mcp_grant() -> Result<(), String> {
+async fn s5_hop1_v3_authority_mints_and_introspects_the_required_mcp_grant() -> Result<(), String> {
     assert_eq!(
         HOP1_CLAIMS_VERSION, 3,
         "S5 requires the current HOP-1 v3 contract"
@@ -201,6 +201,25 @@ async fn s5_hop1_v3_authority_mints_the_required_mcp_grant() -> Result<(), Strin
             "resource": "search_repositories",
             "action": "read"
         })
+    );
+
+    // The S5 runtime does not consume the exchange response directly: its MCP
+    // gateway sends the resulting HOP-1 token back to Mint for introspection.
+    // Keep that exact second half of the path in this cheap preflight so a
+    // grant/authority mismatch cannot first surface after sandbox provisioning.
+    let hop1: Hop1Token = serde_json::from_value(serde_json::Value::String(
+        response.access_token().to_owned(),
+    ))
+    .map_err(|error| format!("deserialize S5 token for introspection: {error}"))?;
+    let introspection = mint
+        .introspect(&hop1)
+        .await
+        .map_err(|error| format!("introspect S5 token: {error:?}"))?;
+    let introspection = serde_json::to_value(introspection)
+        .map_err(|error| format!("serialize S5 introspection response: {error}"))?;
+    assert_eq!(
+        introspection["active"], true,
+        "the exact S5 HOP-1 grant must remain active through Mint introspection"
     );
     Ok(())
 }

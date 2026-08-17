@@ -33,12 +33,12 @@ for command in bash cargo docker kind; do
   fi
 done
 
-echo "Running S5 HOP-1 v3 token-grant preflight"
+echo "Running S5 HOP-1 v3 token-grant and introspection preflight"
 cargo test \
   --locked \
   --package steward-mint \
   --test fast_track_mcp_compatibility \
-  s5_hop1_v3_authority_mints_the_required_mcp_grant \
+  s5_hop1_v3_authority_mints_and_introspects_the_required_mcp_grant \
   -- --exact
 
 "${ROOT}/scripts/build-patched-mcp-gw.sh"
