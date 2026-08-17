@@ -7,6 +7,8 @@ use axum::routing::get;
 
 const USER_WORKSPACE_HTML: &str = include_str!("../assets/user/workspace.html");
 const USER_WORKSPACE_JS: &str = include_str!("../assets/user/workspace.js");
+#[cfg(test)]
+const USER_WORKSPACE_CSS: &str = include_str!("../assets/user/workspace.css");
 
 pub(crate) fn router<S>() -> Router<S>
 where
@@ -58,7 +60,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    use super::{USER_WORKSPACE_HTML, USER_WORKSPACE_JS};
+    use super::{USER_WORKSPACE_CSS, USER_WORKSPACE_HTML, USER_WORKSPACE_JS};
 
     #[test]
     fn workspace_navigation_has_exact_user_routes_and_limited_preference_storage() {
@@ -85,6 +87,10 @@ mod tests {
         assert!(
             USER_WORKSPACE_JS.contains("document.title = PAGE_TITLES[activePage()]"),
             "each workspace route must expose its own document title"
+        );
+        assert!(
+            USER_WORKSPACE_JS.contains("function primaryNavigationRoute()"),
+            "nested envelope routes must resolve to the Envelopes primary navigation item"
         );
     }
 
@@ -118,10 +124,79 @@ mod tests {
                 "shared envelope UI is missing {required}"
             );
         }
+        for non_compact in [
+            "id=\"model-select\" name=\"models\" multiple",
+            "id=\"tool-select\" name=\"tools\" multiple",
+        ] {
+            assert!(
+                !USER_WORKSPACE_HTML.contains(non_compact),
+                "single-choice template controls must remain compact dropdowns: {non_compact}"
+            );
+        }
         assert!(
             !USER_WORKSPACE_HTML.contains("data-accordion=\"templates\" open"),
             "envelope groups must default to collapsed"
         );
+        for required in [
+            ".envelope-group > summary::before",
+            "content: \"›\"",
+            ".envelope-group[open] > summary::before",
+            "content: \"⌄\"",
+        ] {
+            assert!(
+                USER_WORKSPACE_CSS.contains(required),
+                "envelope accordion is missing the visible disclosure state {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_workspace_uses_neutral_groups_buttons_and_selectable_requested_authority() {
+        for removed in ["Admin editable", "User only", "User and admin"] {
+            assert!(
+                !USER_WORKSPACE_HTML.contains(removed),
+                "group visibility labels must not be rendered: {removed}"
+            );
+        }
+        for required in [
+            "class=\"button\" href=\"/envelopes/new\"",
+            "id=\"model-select\"",
+            "id=\"tool-select\"",
+            "for=\"model-select\"",
+            "for=\"tool-select\"",
+        ] {
+            assert!(
+                USER_WORKSPACE_HTML.contains(required),
+                "workspace is missing its requested-authority control {required}"
+            );
+        }
+        for removed in [
+            "No saved drafts are exposed by the authoritative envelope API.",
+            "No approved envelopes.",
+            "No envelopes require review.",
+            "No runs are recorded for your identity.",
+            "No recent runs are recorded for this envelope instance.",
+        ] {
+            assert!(
+                !USER_WORKSPACE_JS.contains(removed),
+                "empty state must be standardized instead of rendering {removed}"
+            );
+        }
+        assert!(
+            USER_WORKSPACE_JS.contains("No entries."),
+            "all empty collections must use the same explicit empty state"
+        );
+        let new_envelope = USER_WORKSPACE_HTML
+            .split("<section data-page=\"/envelopes/new\"")
+            .nth(1)
+            .and_then(|section| section.split("</section>").next())
+            .expect("new-envelope section must exist");
+        for removed in ["Bounded request", "Back to Envelopes"] {
+            assert!(
+                !new_envelope.contains(removed),
+                "new-envelope form must not render unnecessary chrome: {removed}"
+            );
+        }
     }
 
     #[tokio::test]

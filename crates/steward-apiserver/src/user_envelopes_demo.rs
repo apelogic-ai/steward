@@ -2,11 +2,10 @@
 //! deliberately separate from the production PgStore-backed broker contract.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use axum::response::Redirect;
-use axum::routing::get;
 use sha2::{Digest, Sha256};
 use steward_admission::{Envelope, EnvelopeSpec};
 use steward_store::{
@@ -21,8 +20,9 @@ use uuid::Uuid;
 use crate::agent_runs_ui::protected_router as protected_agent_runs_router;
 use crate::browser_auth::{
     BrowserSessionBinding, LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service,
-    protect_browser_routes,
 };
+use crate::connections;
+use crate::connections_demo::LocalConnectionsBroker;
 use crate::user_envelopes::{
     AvailableEnvelopeTemplate, ConnectionReadiness, EnvelopeRequestBroker,
     EnvelopeRequestBrokerError, EnvelopeRequestStatus, UserEnvelopeRequest, UserEnvelopeSession,
@@ -271,18 +271,110 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for LocalEnvelopeRequestBroker
 /// envelope broker. It is valid only on an explicit loopback origin.
 pub fn router(origin: &str) -> Result<Router, String> {
     let auth = local_fake_browser_auth_service(origin, LocalFakeIdentity::User)?;
-    let post_sign_in = protect_browser_routes(
-        Router::new().route(
-            "/admin/connections",
-            get(|| async { Redirect::to("/envelopes") }),
-        ),
-        auth.clone(),
-    );
     Ok(browser_auth_router(auth.clone())
-        .merge(post_sign_in)
+        .merge(connections::protected_router(
+            LocalConnectionsBroker::<BrowserSessionBinding>::new(loopback_bind(origin)?)?,
+            auth.clone(),
+        ))
         .merge(protected_envelope_router(
             LocalEnvelopeRequestBroker::new(),
             auth.clone(),
         ))
         .merge(protected_agent_runs_router(LocalEmptyAgentRunLedger, auth)))
+}
+
+fn loopback_bind(origin: &str) -> Result<SocketAddr, String> {
+    origin
+        .strip_prefix("http://")
+        .ok_or_else(|| "localhost envelope demo origin must use explicit loopback HTTP".to_owned())?
+        .parse::<SocketAddr>()
+        .map_err(|_| "localhost envelope demo origin must contain a socket address".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use tower::ServiceExt;
+
+    use super::router;
+
+    const TEST_ORIGIN: &str = "http://127.0.0.1:33003";
+
+    fn cookie_pair(response: &axum::response::Response, name: &str) -> Result<String, String> {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with(&format!("{name}=")))
+            .and_then(|value| value.split(';').next())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("response omitted {name} cookie"))
+    }
+
+    #[tokio::test]
+    async fn signed_in_local_envelope_demo_serves_connections_from_shared_navigation()
+    -> Result<(), String> {
+        let app = router(TEST_ORIGIN)?;
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/auth/login")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build login request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request login: {error}"))?;
+        let flow_cookie = cookie_pair(&login, "steward-local-oidc-flow")?;
+        let authorization = login
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "login omitted authorization redirect".to_owned())?;
+        let authorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(authorization)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build authorization request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request authorization: {error}"))?;
+        let callback = authorized
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "authorization omitted callback redirect".to_owned())?;
+        let signed_in = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(callback)
+                    .header(header::COOKIE, flow_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build callback request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request callback: {error}"))?;
+        let session_cookie = cookie_pair(&signed_in, "steward-local-session")?;
+        let connections = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/connections")
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build Connections request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request Connections: {error}"))?;
+        assert_eq!(
+            connections.status(),
+            StatusCode::OK,
+            "the shared Connections navigation must reach its own protected page"
+        );
+        Ok(())
+    }
 }

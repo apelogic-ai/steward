@@ -28,8 +28,14 @@ const PAGE_TITLES = {
 document.title = PAGE_TITLES[activePage()] ?? "Steward";
 
 for (const page of pages) page.hidden = page.dataset.page !== activePage();
+function primaryNavigationRoute() {
+  const page = activePage();
+  if (page.startsWith("/envelopes")) return "/envelopes";
+  if (page.startsWith("/runs")) return "/runs";
+  return page;
+}
 for (const link of document.querySelectorAll("[data-route]")) {
-  if (link.dataset.route === activePage()) link.setAttribute("aria-current", "page");
+  if (link.dataset.route === primaryNavigationRoute()) link.setAttribute("aria-current", "page");
 }
 
 function text(element, value) { element.textContent = value; }
@@ -111,6 +117,7 @@ function renderTemplateSummary(template) {
   const heading = create("h2", `${template.displayName} · revision ${template.revision}`);
   const start = create("a", "Request from this template");
   start.href = `/envelopes/new?template=${encodeURIComponent(template.id)}`;
+  start.className = "button";
   card.append(heading, create("p", `Hard budget ceiling: ${template.ceiling.spec.budget.monthlyLimit} ${template.ceiling.spec.budget.currency}.`), start);
   return card;
 }
@@ -129,11 +136,11 @@ async function loadEnvelopeGroups() {
     const [templateResponse, requestResponse] = await Promise.all([
       api("/envelope-templates"), api("/envelope-requests"),
     ]);
-    templates.replaceChildren(...(templateResponse.templates.length ? templateResponse.templates.map(renderTemplateSummary) : [create("p", "No templates are authorized for your identity.")]));
-    text(drafts, "No saved drafts are exposed by the authoritative envelope API.");
+    templates.replaceChildren(...(templateResponse.templates.length ? templateResponse.templates.map(renderTemplateSummary) : [create("p", "No entries.")]));
+    text(drafts, "No entries.");
     const records = requestResponse.requests;
-    renderGroup(approved, records.filter((record) => ["approved", "provisioned"].includes(record.status)), "No approved envelopes.");
-    renderGroup(review, records.filter((record) => !["approved", "provisioned"].includes(record.status)), "No envelopes require review.");
+    renderGroup(approved, records.filter((record) => ["approved", "provisioned"].includes(record.status)), "No entries.");
+    renderGroup(review, records.filter((record) => !["approved", "provisioned"].includes(record.status)), "No entries.");
     text(message, "");
   } catch (error) { text(message, error.message); }
 }
@@ -141,31 +148,55 @@ async function loadEnvelopeGroups() {
 function selectedTemplate(templates, select) { return templates.find((template) => template.id === select.value); }
 function decimal(value) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : null; }
 function templateBaseline(template) { return template.autoProvisionThreshold || template.ceiling; }
+function distinct(values) { return [...new Set(values.filter((value) => value))]; }
+function modelLabel(model) { return `${model.provider}/${model.model}`; }
+function toolLabel(tool) { return `${tool.provider}:${tool.resource}:${tool.action}`; }
+
+function setChoiceOptions(select, values, selectedValues) {
+  const selected = new Set(selectedValues);
+  select.replaceChildren(...values.map((value) => {
+    const option = create("option", value);
+    option.value = value;
+    option.selected = selected.has(value);
+    return option;
+  }));
+}
+
+function selectedChoiceValues(select) {
+  return Array.from(select.selectedOptions).map((option) => option.value);
+}
 
 function renderTemplate(template) {
   const summary = document.querySelector("#template-summary");
   summary.replaceChildren();
   summary.append(create("strong", `${template.displayName} · revision ${template.revision}`));
-  summary.append(create("p", `Models: ${template.ceiling.spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ")}.`));
-  summary.append(create("p", `Tools: ${template.ceiling.spec.tools.map((tool) => `${tool.provider}:${tool.resource}:${tool.action}`).join(", ")}.`));
+  summary.append(create("p", "Select only authority and capacity bounded by this template."));
   const hardRunner = template.ceiling.spec.runner || {};
-  summary.append(create("p", `Runner ceiling: ${runnerValue(hardRunner, "platform", "no platform bound")}; memory ${runnerValue(hardRunner, "memory", "not bounded")}; compute ${runnerValue(hardRunner, "compute", "not bounded")}; storage ${runnerValue(hardRunner, "storage", "not bounded")}.`));
-  summary.append(create("p", `GitHub connection: ${template.githubConnection}.`));
   const baseline = templateBaseline(template);
+  setChoiceOptions(
+    document.querySelector("#model-select"),
+    template.ceiling.spec.llms.map(modelLabel),
+    baseline.spec.llms.map(modelLabel),
+  );
+  setChoiceOptions(
+    document.querySelector("#tool-select"),
+    template.ceiling.spec.tools.map(toolLabel),
+    baseline.spec.tools.map(toolLabel),
+  );
+  setChoiceOptions(
+    document.querySelector("#connection-select"),
+    [`GitHub · ${template.githubConnection}`],
+    [`GitHub · ${template.githubConnection}`],
+  );
   document.querySelector("#budget-limit").value = baseline.spec.budget.monthlyLimit;
   document.querySelector("#ttl").value = baseline.spec.ttl;
   const thresholdRunner = baseline.spec.runner || {};
   const platform = document.querySelector("#runner-platform");
   const platforms = hardRunner.platforms || [];
-  platform.replaceChildren(...platforms.map((value) => {
-    const option = create("option", value);
-    option.value = value;
-    return option;
-  }));
-  platform.value = thresholdRunner.platforms?.[0] || platforms[0] || "";
-  document.querySelector("#runner-memory").value = thresholdRunner.memory || "";
-  document.querySelector("#runner-compute").value = thresholdRunner.compute || "";
-  document.querySelector("#runner-storage").value = thresholdRunner.storage || "";
+  setChoiceOptions(platform, platforms, [thresholdRunner.platforms?.[0] || platforms[0] || ""]);
+  setChoiceOptions(document.querySelector("#runner-memory"), distinct([thresholdRunner.memory, hardRunner.memory]), [thresholdRunner.memory || hardRunner.memory || ""]);
+  setChoiceOptions(document.querySelector("#runner-compute"), distinct([thresholdRunner.compute, hardRunner.compute]), [thresholdRunner.compute || hardRunner.compute || ""]);
+  setChoiceOptions(document.querySelector("#runner-storage"), distinct([thresholdRunner.storage, hardRunner.storage]), [thresholdRunner.storage || hardRunner.storage || ""]);
   renderDelta(template);
 }
 
@@ -235,13 +266,13 @@ async function loadNewEnvelope() {
     select.replaceChildren(...templates.map((template) => { const option = create("option", `${template.displayName} · revision ${template.revision}`); option.value = template.id; return option; }));
     const selected = new URLSearchParams(window.location.search).get("template");
     if (selected && templates.some((template) => template.id === selected)) select.value = selected;
-    if (!templates.length) { text(message, "No envelope templates are available to your identity."); return; }
+    if (!templates.length) { text(message, "No entries."); return; }
     form.hidden = false;
     text(message, "");
     const update = () => renderTemplate(selectedTemplate(templates, select));
     select.addEventListener("change", update);
     document.querySelector("#budget-limit").addEventListener("input", () => renderDelta(selectedTemplate(templates, select)));
-    for (const selector of ["#ttl", "#runner-platform", "#runner-memory", "#runner-compute", "#runner-storage"]) {
+    for (const selector of ["#model-select", "#tool-select", "#connection-select", "#ttl", "#runner-platform", "#runner-memory", "#runner-compute", "#runner-storage"]) {
       document.querySelector(selector).addEventListener("input", () => renderDelta(selectedTemplate(templates, select)));
       document.querySelector(selector).addEventListener("change", () => renderDelta(selectedTemplate(templates, select)));
     }
@@ -251,6 +282,10 @@ async function loadNewEnvelope() {
       const template = selectedTemplate(templates, select);
       const requestedEnvelope = structuredClone(templateBaseline(template));
       requestedEnvelope.revision = template.revision;
+      const selectedModels = new Set(selectedChoiceValues(document.querySelector("#model-select")));
+      const selectedTools = new Set(selectedChoiceValues(document.querySelector("#tool-select")));
+      requestedEnvelope.spec.llms = template.ceiling.spec.llms.filter((model) => selectedModels.has(modelLabel(model)));
+      requestedEnvelope.spec.tools = template.ceiling.spec.tools.filter((tool) => selectedTools.has(toolLabel(tool)));
       requestedEnvelope.spec.budget.monthlyLimit = document.querySelector("#budget-limit").value;
       requestedEnvelope.spec.ttl = document.querySelector("#ttl").value;
       requestedEnvelope.spec.runner = {
@@ -305,7 +340,7 @@ async function loadEnvelopeRuns() {
       ? await runsApi("", { runtimeUid: request.envelopeInstanceId })
       : { runs: [] };
     const runs = runsResponse.runs;
-    list.replaceChildren(...(runs.length ? runs.map(renderRun) : [create("p", request.envelopeInstanceId ? "No recent runs are recorded for this envelope instance." : "This envelope is not provisioned, so it has no runs.")]));
+    list.replaceChildren(...(runs.length ? runs.map(renderRun) : [create("p", "No entries.")]));
     text(message, "");
   } catch (error) { text(message, error.message); }
 }
@@ -315,7 +350,7 @@ async function loadRuns() {
   const list = document.querySelector("#runs-list");
   try {
     const response = await runsApi();
-    list.replaceChildren(...(response.runs.length ? response.runs.map(renderRun) : [create("p", "No runs are recorded for your identity.")]));
+    list.replaceChildren(...(response.runs.length ? response.runs.map(renderRun) : [create("p", "No entries.")]));
     text(message, "");
   } catch (error) { text(message, error.message); }
 }
@@ -349,7 +384,7 @@ async function loadRunDetail() {
       when.dateTime = event.at;
       item.append(when);
       return item;
-    }) : [create("li", "No lifecycle events are recorded.")]));
+    }) : [create("li", "No entries.")]));
     container.hidden = false;
     text(message, "");
   } catch (error) { text(message, error.message); }

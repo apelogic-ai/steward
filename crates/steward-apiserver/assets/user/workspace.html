@@ -27,30 +27,36 @@
         <p id="envelope-list-message" role="status">Loading authoritative envelope data…</p>
         <div class="envelope-groups">
           <details class="envelope-group" data-accordion="templates">
-            <summary>Templates <span class="eyebrow">Admin editable</span></summary>
+            <summary>Templates</summary>
             <div id="template-list" class="group-list"><p class="group-note">Loading templates available to your signed-in identity…</p></div>
           </details>
           <details class="envelope-group" data-accordion="drafts">
-            <summary>Drafts <span class="eyebrow">User only</span></summary>
-            <div id="draft-list" class="group-list"><p class="group-note">No saved drafts are exposed by the authoritative envelope API.</p></div>
+            <summary>Drafts</summary>
+            <div id="draft-list" class="group-list"><p class="group-note">No entries.</p></div>
           </details>
           <details class="envelope-group" data-accordion="approved">
-            <summary>Approved <span class="eyebrow">User and admin</span></summary>
+            <summary>Approved</summary>
             <div id="approved-list" class="group-list"><p class="group-note">Loading authoritative approved envelopes…</p></div>
           </details>
           <details class="envelope-group" data-accordion="in-review">
-            <summary>In Review <span class="eyebrow">User and admin</span></summary>
+            <summary>In Review</summary>
             <div id="review-list" class="group-list"><p class="group-note">Loading authoritative review status…</p></div>
           </details>
         </div>
       </section>
       <section data-page="/envelopes/new" hidden>
-        <div class="section-heading"><div><p class="eyebrow">Bounded request</p><h1>New envelope</h1></div><a class="button secondary" href="/envelopes">Back to Envelopes</a></div>
+        <div class="section-heading"><h1>New envelope</h1></div>
         <p id="envelope-form-message" role="status">Loading templates available to your signed-in identity…</p>
         <form id="envelope-request-form" class="request-form-layout" hidden>
           <label for="template-select">Template</label>
           <select id="template-select" name="template" required></select>
           <div id="template-summary" class="callout" aria-live="polite"></div>
+          <fieldset class="form-grid">
+            <legend>Requested authority</legend>
+            <label for="model-select">Models <select id="model-select" name="models" required></select></label>
+            <label for="tool-select">Tools <select id="tool-select" name="tools" required></select></label>
+            <label for="connection-select">Required connection <select id="connection-select" name="connection" required></select></label>
+          </fieldset>
           <div class="form-grid">
             <label for="budget-limit">Monthly budget <input id="budget-limit" name="budgetLimit" inputmode="decimal" required></label>
             <label for="ttl">Maximum runtime <input id="ttl" name="ttl" required></label>
@@ -58,9 +64,9 @@
           <fieldset class="form-grid">
             <legend>Advanced runner properties</legend>
             <label for="runner-platform">Runner platform <select id="runner-platform" name="runnerPlatform"></select></label>
-            <label for="runner-memory">Runner memory <input id="runner-memory" name="runnerMemory" placeholder="for example, 1Gi"></label>
-            <label for="runner-compute">Runner compute <input id="runner-compute" name="runnerCompute" placeholder="for example, 500m"></label>
-            <label for="runner-storage">Runner storage <input id="runner-storage" name="runnerStorage" placeholder="for example, 5Gi"></label>
+            <label for="runner-memory">Runner memory <select id="runner-memory" name="runnerMemory"></select></label>
+            <label for="runner-compute">Runner compute <select id="runner-compute" name="runnerCompute"></select></label>
+            <label for="runner-storage">Runner storage <select id="runner-storage" name="runnerStorage"></select></label>
           </fieldset>
           <div id="request-delta" class="callout" aria-live="polite"></div>
           <button class="button" type="submit">Request envelope</button>

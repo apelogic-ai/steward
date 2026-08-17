@@ -21,10 +21,8 @@ function startLoopbackDemo() {
         "--features",
         "admin-demo",
         "--example",
-        "admin-dashboard-demo",
+        "user-envelope-demo",
         "--",
-        "--mode",
-        "oidc-user",
         "--bind",
         "127.0.0.1:0",
       ],
@@ -41,7 +39,7 @@ function startLoopbackDemo() {
     }, 30_000);
     const inspect = (chunk) => {
       output = `${output}${chunk}`.slice(-16_384);
-      const match = output.match(/Steward localhost demo: (http:\/\/127\.0\.0\.1:\d+)/);
+      const match = output.match(/Steward envelope localhost demo: (http:\/\/127\.0\.0\.1:\d+)/);
       if (match && !settled) {
         settled = true;
         clearTimeout(timeout);
@@ -122,6 +120,12 @@ async function closeGuardedPage(session) {
   }
 }
 
+async function accordionIndicator(details) {
+  return details.locator("summary").evaluate(
+    (summary) => getComputedStyle(summary, "::before").content.replaceAll('"', ""),
+  );
+}
+
 async function signIn(page) {
   await page.goto(`${origin}/admin/sign-in`);
   await expect(page.getByRole("heading", { name: "Sign in to Steward" })).toBeVisible();
@@ -171,25 +175,36 @@ test("user can sign in, navigate shared top navigation, and connect then disconn
     await expect(page).toHaveURL(`${origin}/runs`);
     await expect(page).toHaveTitle("Runs · Steward");
     await expect(page.getByRole("heading", { name: "Runs" })).toBeVisible();
-    await expect(page.locator("#runs-list")).toContainText("No runs are recorded for your identity.");
+    await expect(page.locator("#runs-list")).toContainText("No entries.");
     await navigation.getByRole("link", { name: "Envelopes", exact: true }).click();
     await expect(page).toHaveURL(`${origin}/envelopes`);
     for (const name of ["Templates", "Drafts", "Approved", "In Review"]) {
       await expect(page.locator(`details[data-accordion=${name.toLowerCase().replace(" ", "-")}]`)).toHaveJSProperty("open", false);
     }
     const templates = page.locator("details[data-accordion=templates]");
+    await expect(templates.locator("summary")).toHaveCSS("list-style-type", "none");
+    await expect.poll(() => accordionIndicator(templates)).toBe("›");
+    await expect(page.getByText("Admin editable")).toHaveCount(0);
+    await expect(page.getByText("User only")).toHaveCount(0);
+    await expect(page.getByText("User and admin")).toHaveCount(0);
     await templates.locator("summary").click();
     await expect(templates).toHaveJSProperty("open", true);
+    await expect.poll(() => accordionIndicator(templates)).toBe("⌄");
     await expect(templates).toContainText("Engineer · revision 3");
     await page.reload();
     await expect(templates).toHaveJSProperty("open", true);
     await page.goto(`${origin}/envelopes/new`);
     await expect(page.getByRole("heading", { name: "New envelope" })).toBeVisible();
+    await expect(navigation.getByRole("link", { name: "Envelopes", exact: true })).toHaveAttribute("aria-current", "page");
+    await expect(page.getByRole("link", { name: "New envelope" })).toHaveCSS("text-decoration-line", "none");
     await expect(page.getByRole("combobox", { name: "Template" })).toHaveValue("engineer");
+    await expect(page.getByRole("combobox", { name: "Models" })).toHaveValue("openai/gpt-5.4");
+    await expect(page.getByRole("combobox", { name: "Tools" })).toHaveValue("github:repository:get_file_contents");
+    await expect(page.getByRole("combobox", { name: "Required connection" })).toHaveValue("GitHub · connected");
     await expect(page.getByRole("combobox", { name: "Runner platform" })).toHaveValue("linux");
-    await expect(page.getByRole("textbox", { name: "Runner memory" })).toHaveValue("1Gi");
-    await expect(page.getByRole("textbox", { name: "Runner compute" })).toHaveValue("500m");
-    await expect(page.getByRole("textbox", { name: "Runner storage" })).toHaveValue("5Gi");
+    await expect(page.getByRole("combobox", { name: "Runner memory" })).toHaveValue("1Gi");
+    await expect(page.getByRole("combobox", { name: "Runner compute" })).toHaveValue("500m");
+    await expect(page.getByRole("combobox", { name: "Runner storage" })).toHaveValue("5Gi");
     await page.getByRole("button", { name: "Request envelope" }).click();
     await expect(page).toHaveURL(/\/envelopes\/[0-9a-f-]{36}$/);
     await expect(page.getByRole("heading", { name: "Envelope form" })).toBeVisible();
@@ -203,7 +218,7 @@ test("user can sign in, navigate shared top navigation, and connect then disconn
     await expect(page.locator("#approved-memory")).toContainText("1Gi");
     await page.getByRole("link", { name: "Recent runs" }).click();
     await expect(page.getByRole("heading", { name: "Recent runs" })).toBeVisible();
-    await expect(page.locator("#envelope-runs-list")).toContainText("No recent runs are recorded for this envelope instance.");
+    await expect(page.locator("#envelope-runs-list")).toContainText("No entries.");
     await page.getByRole("link", { name: "Settings", exact: true }).click();
     await expect(page).toHaveURL(`${origin}/settings`);
     await expect(page).toHaveTitle("Settings · Steward");
