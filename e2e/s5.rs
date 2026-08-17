@@ -277,18 +277,13 @@ impl Harness {
         sandbox: &str,
         request: &str,
     ) -> Result<String, Box<dyn Error>> {
-        self.wait_authorized_tool_call(
-            workspace,
-            sandbox,
-            request,
-            Duration::from_secs(5),
-        )
-        .map_err(|error| {
-            io::Error::other(format!(
-                "S5 dynamic token-grant preflight failed before revocation assertions: {error}"
-            ))
-            .into()
-        })
+        self.wait_authorized_tool_call(workspace, sandbox, request, Duration::from_secs(5))
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "S5 dynamic token-grant preflight failed before revocation assertions: {error}"
+                ))
+                .into()
+            })
     }
 
     fn replay_status(&self, path: &str) -> Result<u16, Box<dyn Error>> {
@@ -530,7 +525,8 @@ async fn e2e_s5_terminated_runtime_holds_nothing() -> Result<(), Box<dyn Error>>
         }
     })
     .to_string();
-    let tool_response = harness.preflight_authorized_tool_call(&workspace, &sandbox, &tool_request)?;
+    let tool_response =
+        harness.preflight_authorized_tool_call(&workspace, &sandbox, &tool_request)?;
     assert!(
         tool_response.contains("example-org/fixture-repository"),
         "the pre-termination HOP-1 did not authorize the expected tool: {tool_response}"
