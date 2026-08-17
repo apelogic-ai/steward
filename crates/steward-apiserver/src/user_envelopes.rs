@@ -10,6 +10,9 @@ use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_admission::{AdmissionDecision, Envelope, evaluate, validate_envelope};
+use steward_store::{
+    EnvelopeRequestRecord, EnvelopeRequestReservationRequest, PgStore, StoreError,
+};
 use steward_types::{AgentRuntimeSpec, AgentType, CanonicalUserId, Email, Principal};
 use uuid::Uuid;
 
@@ -62,7 +65,7 @@ pub struct AvailableEnvelopeTemplate {
     pub display_name: String,
     pub revision: i64,
     pub ceiling: Envelope,
-    pub auto_provision_threshold: Envelope,
+    pub auto_provision_threshold: Option<Envelope>,
     pub github_connection: ConnectionReadiness,
 }
 
@@ -117,6 +120,134 @@ pub enum EnvelopeRequestBrokerError {
     NotFound,
     Conflict,
     Unavailable,
+}
+
+/// Production request broker backed by the authoritative envelope and request ledgers.
+///
+/// A template becomes visible only through a local-RBAC member-role assignment. Its current
+/// envelope is the hard ceiling. Automatic provisioning remains absent until an independently
+/// persisted threshold and reconciler are supplied; this broker never infers either one.
+#[derive(Clone)]
+pub struct PgEnvelopeRequestBroker {
+    store: PgStore,
+}
+
+impl PgEnvelopeRequestBroker {
+    pub fn new(store: PgStore) -> Self {
+        Self { store }
+    }
+}
+
+impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
+    fn templates<'a>(
+        &'a self,
+        session: &'a UserEnvelopeSession<BrowserSessionBinding>,
+    ) -> BoxFuture<'a, Result<Vec<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>> {
+        Box::pin(async move {
+            let mut templates = Vec::new();
+            for member_role in &session.subject.member_roles {
+                if let Some(ceiling) = self
+                    .store
+                    .latest_envelope(member_role)
+                    .await
+                    .map_err(map_store_broker_error)?
+                {
+                    templates.push(AvailableEnvelopeTemplate {
+                        id: member_role.clone(),
+                        display_name: member_role.clone(),
+                        revision: ceiling.revision,
+                        ceiling,
+                        auto_provision_threshold: None,
+                        github_connection: ConnectionReadiness::Missing,
+                    });
+                }
+            }
+            templates.sort_by(|left, right| left.id.cmp(&right.id));
+            Ok(templates)
+        })
+    }
+
+    fn list<'a>(
+        &'a self,
+        session: &'a UserEnvelopeSession<BrowserSessionBinding>,
+    ) -> BoxFuture<'a, Result<Vec<UserEnvelopeRequest>, EnvelopeRequestBrokerError>> {
+        Box::pin(async move {
+            self.store
+                .envelope_requests(&session.subject.canonical_user_id)
+                .await
+                .map(|records| records.into_iter().map(user_envelope_request).collect())
+                .map_err(map_store_broker_error)
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        session: &'a UserEnvelopeSession<BrowserSessionBinding>,
+        request_id: Uuid,
+    ) -> BoxFuture<'a, Result<Option<UserEnvelopeRequest>, EnvelopeRequestBrokerError>> {
+        Box::pin(async move {
+            self.store
+                .envelope_request(&session.subject.canonical_user_id, request_id)
+                .await
+                .map(|record| record.map(user_envelope_request))
+                .map_err(map_store_broker_error)
+        })
+    }
+
+    fn create<'a>(
+        &'a self,
+        session: &'a UserEnvelopeSession<BrowserSessionBinding>,
+        request: ValidatedEnvelopeRequest<'a>,
+    ) -> BoxFuture<'a, Result<UserEnvelopeRequest, EnvelopeRequestBrokerError>> {
+        Box::pin(async move {
+            let reservation = self
+                .store
+                .reserve_envelope_request(EnvelopeRequestReservationRequest {
+                    owner_user_id: &session.subject.canonical_user_id,
+                    template_id: &request.template.id,
+                    template_revision: request.template.revision,
+                    requested_envelope: request.requested_envelope,
+                    idempotency_key: request.idempotency_key,
+                })
+                .await
+                .map_err(map_store_broker_error)?;
+            Ok(user_envelope_request(reservation.record))
+        })
+    }
+}
+
+fn user_envelope_request(record: EnvelopeRequestRecord) -> UserEnvelopeRequest {
+    UserEnvelopeRequest {
+        id: record.id,
+        template_id: record.template_id,
+        template_revision: record.template_revision,
+        requested_envelope: record.requested_envelope,
+        approved_envelope: record.approved_envelope,
+        status: match record.status {
+            steward_store::EnvelopeRequestStatus::Pending => EnvelopeRequestStatus::Pending,
+            steward_store::EnvelopeRequestStatus::Approved => EnvelopeRequestStatus::Approved,
+            steward_store::EnvelopeRequestStatus::Rejected => EnvelopeRequestStatus::Rejected,
+            steward_store::EnvelopeRequestStatus::Provisioned => EnvelopeRequestStatus::Provisioned,
+            steward_store::EnvelopeRequestStatus::Stale => EnvelopeRequestStatus::Stale,
+            steward_store::EnvelopeRequestStatus::Conflict => EnvelopeRequestStatus::Conflict,
+        },
+        approval_id: record.approval_id,
+        envelope_instance_id: record.envelope_instance_id,
+        envelope_digest: record.envelope_digest,
+        reason: record.reason,
+        created_at: record.created_at,
+        status_at: record.status_at,
+    }
+}
+
+fn map_store_broker_error(error: StoreError) -> EnvelopeRequestBrokerError {
+    match error {
+        StoreError::EnvelopeRequestNotFound => EnvelopeRequestBrokerError::NotFound,
+        StoreError::EnvelopeRequestIdempotencyConflict
+        | StoreError::InvalidEnvelopeRequest
+        | StoreError::InvalidEnvelopeRequestTransition => EnvelopeRequestBrokerError::Conflict,
+        _ => EnvelopeRequestBrokerError::Unavailable,
+    }
 }
 
 /// Server-side request broker. Every method receives the canonical browser subject derived by
@@ -316,10 +447,15 @@ where
     if !inside_ceiling {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    let auto_provision = matches!(
-        evaluate(&request_spec, &template.auto_provision_threshold),
-        Ok(AdmissionDecision::Admit)
-    );
+    let auto_provision = template
+        .auto_provision_threshold
+        .as_ref()
+        .is_some_and(|threshold| {
+            matches!(
+                evaluate(&request_spec, threshold),
+                Ok(AdmissionDecision::Admit)
+            )
+        });
     match state
         .broker
         .create(
@@ -490,7 +626,7 @@ mod tests {
             id: "engineer".to_owned(),
             display_name: "Engineer".to_owned(),
             revision: 3,
-            auto_provision_threshold: Envelope {
+            auto_provision_threshold: Some(Envelope {
                 revision: 3,
                 spec: EnvelopeSpec {
                     budget: Budget {
@@ -501,7 +637,7 @@ mod tests {
                     runner: steward_types::RunnerRequirements::default(),
                     ..ceiling.spec.clone()
                 },
-            },
+            }),
             ceiling,
             github_connection: ConnectionReadiness::Connected,
         }
@@ -601,6 +737,98 @@ mod tests {
                 .status(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_automatic_threshold_never_invents_provisioning_authority() -> Result<(), String>
+    {
+        #[derive(Clone)]
+        struct ReviewOnlyBroker;
+
+        impl EnvelopeRequestBroker<()> for ReviewOnlyBroker {
+            fn templates<'a>(
+                &'a self,
+                _session: &'a UserEnvelopeSession<()>,
+            ) -> BoxFuture<'a, Result<Vec<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>>
+            {
+                let mut review_only = template();
+                review_only.auto_provision_threshold = None;
+                Box::pin(async move { Ok(vec![review_only]) })
+            }
+
+            fn list<'a>(
+                &'a self,
+                _session: &'a UserEnvelopeSession<()>,
+            ) -> BoxFuture<'a, Result<Vec<UserEnvelopeRequest>, EnvelopeRequestBrokerError>>
+            {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+
+            fn get<'a>(
+                &'a self,
+                _session: &'a UserEnvelopeSession<()>,
+                _request_id: Uuid,
+            ) -> BoxFuture<'a, Result<Option<UserEnvelopeRequest>, EnvelopeRequestBrokerError>>
+            {
+                Box::pin(async { Ok(None) })
+            }
+
+            fn create<'a>(
+                &'a self,
+                _session: &'a UserEnvelopeSession<()>,
+                request: ValidatedEnvelopeRequest<'a>,
+            ) -> BoxFuture<'a, Result<UserEnvelopeRequest, EnvelopeRequestBrokerError>>
+            {
+                let requested_envelope = request.requested_envelope.clone();
+                Box::pin(async move {
+                    Ok(UserEnvelopeRequest {
+                        id: Uuid::nil(),
+                        template_id: "engineer".to_owned(),
+                        template_revision: 3,
+                        requested_envelope,
+                        approved_envelope: None,
+                        status: EnvelopeRequestStatus::Pending,
+                        approval_id: None,
+                        envelope_instance_id: None,
+                        envelope_digest: None,
+                        reason: None,
+                        created_at: "2026-08-17T00:00:00Z".to_owned(),
+                        status_at: "2026-08-17T00:00:00Z".to_owned(),
+                    })
+                })
+            }
+        }
+
+        let review_only = template();
+        let app = inner_router(ReviewOnlyBroker);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/app/api/v1/envelope-requests")
+            .header("content-type", "application/json")
+            .extension(session()?)
+            .extension(UserEnvelopeMutationProof)
+            .body(Body::from(
+                serde_json::json!({
+                    "templateId": review_only.id,
+                    "templateRevision": review_only.revision,
+                    "requestedEnvelope": review_only.ceiling,
+                    "idempotencyKey": "review-only-request",
+                })
+                .to_string(),
+            ))
+            .map_err(|error| format!("build review-only request: {error}"))?;
+        let response = app
+            .oneshot(request)
+            .await
+            .map_err(|error| format!("submit review-only request: {error}"))?;
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read review-only response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse review-only response: {error}"))?;
+        assert_eq!(value["request"]["status"], "pending");
+        assert!(value["request"]["approvedEnvelope"].is_null());
         Ok(())
     }
 }

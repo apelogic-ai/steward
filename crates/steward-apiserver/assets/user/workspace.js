@@ -138,6 +138,7 @@ async function loadEnvelopeGroups() {
 
 function selectedTemplate(templates, select) { return templates.find((template) => template.id === select.value); }
 function decimal(value) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : null; }
+function templateBaseline(template) { return template.autoProvisionThreshold || template.ceiling; }
 
 function renderTemplate(template) {
   const summary = document.querySelector("#template-summary");
@@ -148,9 +149,10 @@ function renderTemplate(template) {
   const hardRunner = template.ceiling.spec.runner || {};
   summary.append(create("p", `Runner ceiling: ${runnerValue(hardRunner, "platform", "no platform bound")}; memory ${runnerValue(hardRunner, "memory", "not bounded")}; compute ${runnerValue(hardRunner, "compute", "not bounded")}; storage ${runnerValue(hardRunner, "storage", "not bounded")}.`));
   summary.append(create("p", `GitHub connection: ${template.githubConnection}.`));
-  document.querySelector("#budget-limit").value = template.autoProvisionThreshold.spec.budget.monthlyLimit;
-  document.querySelector("#ttl").value = template.autoProvisionThreshold.spec.ttl;
-  const thresholdRunner = template.autoProvisionThreshold.spec.runner || {};
+  const baseline = templateBaseline(template);
+  document.querySelector("#budget-limit").value = baseline.spec.budget.monthlyLimit;
+  document.querySelector("#ttl").value = baseline.spec.ttl;
+  const thresholdRunner = baseline.spec.runner || {};
   const platform = document.querySelector("#runner-platform");
   const platforms = hardRunner.platforms || [];
   platform.replaceChildren(...platforms.map((value) => {
@@ -168,9 +170,9 @@ function renderTemplate(template) {
 function renderDelta(template) {
   const budget = decimal(document.querySelector("#budget-limit").value);
   const ceiling = decimal(template.ceiling.spec.budget.monthlyLimit);
-  const threshold = decimal(template.autoProvisionThreshold.spec.budget.monthlyLimit);
+  const threshold = decimal(template.autoProvisionThreshold?.spec.budget.monthlyLimit);
   const ttl = document.querySelector("#ttl").value;
-  const thresholdRunner = template.autoProvisionThreshold.spec.runner || {};
+  const thresholdRunner = templateBaseline(template).spec.runner || {};
   const runnerChanged = [
     ["#runner-platform", thresholdRunner.platforms?.[0] || ""],
     ["#runner-memory", thresholdRunner.memory || ""],
@@ -179,8 +181,9 @@ function renderDelta(template) {
   ].some(([selector, value]) => document.querySelector(selector).value !== value);
   const delta = document.querySelector("#request-delta");
   delta.replaceChildren();
-  if (budget === null || ceiling === null || threshold === null) text(delta, "Enter a valid budget to preview the bounded request.");
+  if (budget === null || ceiling === null) text(delta, "Enter a valid budget to preview the bounded request.");
   else if (budget > ceiling) text(delta, `Outside the hard ceiling of ${template.ceiling.spec.budget.monthlyLimit} ${template.ceiling.spec.budget.currency}; Steward will reject this request.`);
+  else if (threshold === null) text(delta, "No automatic provisioning authority is recorded. This bounded request will be routed for review.");
   else if (budget > threshold || ttl !== template.autoProvisionThreshold.spec.ttl || runnerChanged) text(delta, "Within the hard ceiling but outside the automatic threshold; server-side validation will determine whether this request is pending approval.");
   else text(delta, "Within the automatic threshold. Steward will attempt provisioning after server-side validation.");
 }
@@ -244,7 +247,7 @@ async function loadNewEnvelope() {
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const template = selectedTemplate(templates, select);
-      const requestedEnvelope = structuredClone(template.autoProvisionThreshold);
+      const requestedEnvelope = structuredClone(templateBaseline(template));
       requestedEnvelope.revision = template.revision;
       requestedEnvelope.spec.budget.monthlyLimit = document.querySelector("#budget-limit").value;
       requestedEnvelope.spec.ttl = document.querySelector("#ttl").value;

@@ -116,7 +116,7 @@ fn demo_template() -> AvailableEnvelopeTemplate {
         id: "engineer".to_owned(),
         display_name: "Engineer".to_owned(),
         revision: 3,
-        auto_provision_threshold: Envelope {
+        auto_provision_threshold: Some(Envelope {
             revision: 3,
             spec: EnvelopeSpec {
                 budget: Budget {
@@ -132,7 +132,7 @@ fn demo_template() -> AvailableEnvelopeTemplate {
                 },
                 ..ceiling.spec.clone()
             },
-        },
+        }),
         ceiling,
         // This describes the credential-free local broker's explicit readiness fixture; it
         // neither stores nor mints a provider credential.
