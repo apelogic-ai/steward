@@ -1349,6 +1349,19 @@ where
     })
 }
 
+pub(crate) fn protect_admin_routes<S, A>(routes: Router<S>, authenticator: A) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    A: RequestAuthenticator,
+{
+    routes
+        .route_layer(middleware::from_fn_with_state(
+            authenticator,
+            authenticate_admin::<A>,
+        ))
+        .route_layer(middleware::from_fn(admin_ui::add_browser_security_headers))
+}
+
 async fn agent_runs_handler<R, L, D>(
     State(state): State<AppState<R, L, D>>,
     Query(query): Query<AgentRunsQuery>,
