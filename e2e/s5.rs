@@ -279,11 +279,32 @@ impl Harness {
     ) -> Result<String, Box<dyn Error>> {
         self.wait_authorized_tool_call(workspace, sandbox, request, Duration::from_secs(5))
             .map_err(|error| {
+                let diagnostic = self
+                    .token_grant_diagnostic()
+                    .unwrap_or_else(|diagnostic_error| {
+                        format!("token-grant diagnostic unavailable: {diagnostic_error}")
+                    });
                 io::Error::other(format!(
-                    "S5 dynamic token-grant preflight failed before revocation assertions: {error}"
+                    "S5 dynamic token-grant preflight failed before revocation assertions: {error}; \
+                     captured Mint response: {diagnostic}"
                 ))
                 .into()
             })
+    }
+
+    fn token_grant_diagnostic(&self) -> Result<String, Box<dyn Error>> {
+        let output = Command::new("curl")
+            .args(["-fsS", "--max-time", "5"])
+            .arg(format!("{}/token-grant", self.capture_url))
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "capture token-grant diagnostic failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+            .into());
+        }
+        Ok(String::from_utf8(output.stdout)?)
     }
 
     fn replay_status(&self, path: &str) -> Result<u16, Box<dyn Error>> {

@@ -99,12 +99,14 @@ impl RequestAuthenticator for S3Authenticator {
                 "test-user-session" => Ok(AuthenticatedCaller {
                     actor: self.actor.clone(),
                     member_roles: vec![self.member_role.clone()],
+                    canonical_user_id: None,
                     is_admin: false,
                     can_bootstrap_steward_run_service_envelope: false,
                 }),
                 "test-admin-session" => Ok(AuthenticatedCaller {
                     actor: self.admin.clone(),
                     member_roles: Vec::new(),
+                    canonical_user_id: None,
                     is_admin: true,
                     can_bootstrap_steward_run_service_envelope: false,
                 }),

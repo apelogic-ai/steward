@@ -81,6 +81,7 @@ impl RequestAuthenticator for TestAdminAuthenticator {
             Ok(AuthenticatedCaller {
                 actor: "admin@example.com".to_owned(),
                 member_roles: Vec::new(),
+                canonical_user_id: None,
                 is_admin: true,
                 can_bootstrap_steward_run_service_envelope: false,
             })

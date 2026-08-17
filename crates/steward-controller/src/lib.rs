@@ -1906,6 +1906,11 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
         &runtime.spec.principal,
         steward_types::Principal::Service { .. }
     ) && trusted_writer_usernames.contains(username);
+    let trusted_canonical_user_write = matches!(
+        &runtime.spec.principal,
+        steward_types::Principal::User { .. }
+    ) && runtime.spec.canonical_authority.is_some()
+        && trusted_writer_usernames.contains(username);
     let pending = runtime
         .annotations()
         .get(PENDING_APPROVAL_ANNOTATION)
@@ -1948,7 +1953,7 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
                 .deny("pending AgentRuntime spec may be changed only by a trusted Steward writer");
         }
         trusted_pending_transition |= trusted_pending_writer;
-        if !trusted_pending_transition && !trusted_service_write {
+        if !trusted_pending_transition && !trusted_service_write && !trusted_canonical_user_write {
             match &old_runtime.spec.principal {
                 steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
                 _ => {
@@ -1959,7 +1964,7 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
             }
         }
     }
-    if !trusted_pending_transition && !trusted_service_write {
+    if !trusted_pending_transition && !trusted_service_write && !trusted_canonical_user_write {
         match &runtime.spec.principal {
             steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
             _ => {
@@ -1983,7 +1988,7 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
                 return response
                     .deny("user AgentRuntime must not carry a service-principal annotation");
             }
-            let member_role = if trusted_pending_transition {
+            let member_role = if trusted_pending_transition || trusted_canonical_user_write {
                 let Some(member_role) = bound_role.filter(|role| !role.is_empty()) else {
                     return response.deny("AgentRuntime member-role annotation is required");
                 };
@@ -4139,6 +4144,40 @@ mod webhook_tests {
             trusted.allowed,
             "the trusted Steward writer must admit a service runtime through its service envelope: {}",
             trusted.result.message
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_allows_a_trusted_writer_to_author_a_canonical_user_runtime()
+    -> Result<(), String> {
+        let writer_username = "system:serviceaccount:steward-system:steward-poc-api";
+        let mut value = admission_review_value();
+        value["request"]["operation"] = serde_json::json!("CREATE");
+        value["request"]["oldObject"] = serde_json::Value::Null;
+        value["request"]["userInfo"] = serde_json::json!({"username": writer_username});
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
+        value["request"]["object"]["spec"]["canonicalAuthority"] = serde_json::json!({
+            "schemaVersion": "steward/canonical-authority-binding/v1",
+            "ownerUserId": "usr_0123456789abcdef0123456789abcdef",
+            "actingUserId": "usr_0123456789abcdef0123456789abcdef"
+        });
+
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct trusted user CREATE review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read trusted user CREATE request: {error}"))?;
+        let response = super::validate_admission_with_trusted_writers(
+            &request,
+            &fake_envelopes(),
+            &BTreeSet::from([writer_username.to_owned()]),
+        )
+        .await;
+        assert!(
+            response.allowed,
+            "the trusted API writer must be able to author the server-derived canonical user binding: {}",
+            response.result.message
         );
         Ok(())
     }

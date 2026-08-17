@@ -54,7 +54,10 @@ use steward_store::{
     GrantApplication, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval, PgStore,
     StoreError,
 };
-use steward_types::{AgentRuntime, AgentRuntimeSpec, PENDING_APPROVAL_ANNOTATION, Principal};
+use steward_types::{
+    AgentRuntime, AgentRuntimeSpec, CanonicalAuthorityBinding, CanonicalUserId,
+    PENDING_APPROVAL_ANNOTATION, Principal,
+};
 use uuid::Uuid;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -63,6 +66,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub struct AdmissionContext {
     pub actor: String,
     pub member_role: String,
+    /// Immutable person identity resolved by the trusted authentication boundary.
+    pub canonical_user_id: Option<CanonicalUserId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,6 +79,8 @@ pub struct AdminContext {
 pub struct AuthenticatedCaller {
     pub actor: String,
     pub member_roles: Vec<String>,
+    /// Immutable person identity. Callers never supply this in a runtime request.
+    pub canonical_user_id: Option<CanonicalUserId>,
     pub is_admin: bool,
     pub can_bootstrap_steward_run_service_envelope: bool,
 }
@@ -221,6 +228,7 @@ fn caller_from_kubernetes_user(
     Ok(AuthenticatedCaller {
         actor,
         member_roles,
+        canonical_user_id: None,
         is_admin,
         can_bootstrap_steward_run_service_envelope: bootstrap_group_count == 1,
     })
@@ -1141,6 +1149,7 @@ async fn authenticate_admission<A: RequestAuthenticator>(
     request.extensions_mut().insert(AdmissionContext {
         actor: caller.actor,
         member_role: member_role.clone(),
+        canonical_user_id: caller.canonical_user_id,
     });
     next.run(request).await
 }
@@ -1673,14 +1682,21 @@ where
         Principal::User { acting_user } if acting_user.0 == context.actor => {}
         _ => return Err(ApiError::PrincipalMismatch),
     }
+    let mut proposed_spec = request.spec.clone();
+    if let Some(canonical_user_id) = context.canonical_user_id.clone() {
+        proposed_spec.canonical_authority = Some(
+            CanonicalAuthorityBinding::new(canonical_user_id.clone(), Some(canonical_user_id))
+                .map_err(ApiError::Admission)?,
+        );
+    }
     let envelope = ledger
         .latest_envelope(&context.member_role)
         .await
         .map_err(ApiError::Store)?
         .ok_or(ApiError::MissingEnvelope)?;
-    let decision = evaluate_with_grants(&request.spec, &envelope, &[])
+    let decision = evaluate_with_grants(&proposed_spec, &envelope, &[])
         .map_err(|error| ApiError::Admission(format!("{error:?}")))?;
-    let mut runtime = AgentRuntime::new(&request.name, request.spec.clone());
+    let mut runtime = AgentRuntime::new(&request.name, proposed_spec.clone());
     runtime.metadata.namespace = Some(namespace.to_owned());
     runtime.metadata.annotations = Some(std::collections::BTreeMap::from([(
         "agents.apelogic.ai/member-role".to_owned(),
@@ -1688,7 +1704,12 @@ where
     )]));
     match decision {
         AdmissionDecision::Admit => {
-            match runtimes.create(namespace, &runtime, context).await {
+            let created = if runtime.spec.canonical_authority.is_some() {
+                runtimes.create_as_authority(namespace, &runtime).await
+            } else {
+                runtimes.create(namespace, &runtime, context).await
+            };
+            match created {
                 Ok(_) => {}
                 Err(RuntimeCreateError::Kubernetes { status: 409, .. }) => {
                     let existing = runtimes
@@ -2079,7 +2100,9 @@ where
         .remove(PENDING_APPROVAL_ANNOTATION)
         .is_some();
     if !already_applied || pending_annotation_removed {
+        let canonical_authority = runtime.spec.canonical_authority.clone();
         runtime.spec = approved.proposed_spec.clone();
+        runtime.spec.canonical_authority = canonical_authority;
         if pending_annotation_removed
             || matches!(&approved.proposed_spec.principal, Principal::Service { .. })
         {
@@ -2094,6 +2117,7 @@ where
                     &AdmissionContext {
                         actor: approved.actor.clone(),
                         member_role: approved.member_role.clone(),
+                        canonical_user_id: None,
                     },
                 )
                 .await
@@ -2236,6 +2260,7 @@ where
                     &AdmissionContext {
                         actor: reversion.actor,
                         member_role: reversion.member_role,
+                        canonical_user_id: None,
                     },
                 )
                 .await
@@ -2291,7 +2316,8 @@ mod tests {
         STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP, StaticTaskWorkflowCatalog, SubmissionOutcome,
         TaskAuthenticationError, TaskIdentity, TaskIdentityResolver, TaskSubmissionLedger,
         TaskSubmissionRequest, TaskWorkflow, caller_from_kubernetes_user, caller_from_token_review,
-        router, spec_digest, submit_budget_increase, task_router, token_review_request,
+        router, spec_digest, submit_budget_increase, submit_runtime_request, task_router,
+        token_review_request,
     };
 
     const KUBERNETES_TOKEN_REVIEW_AUDIENCE: &str = "https://kubernetes.default.svc";
@@ -2891,18 +2917,21 @@ mod tests {
                     "user-session" => Ok(AuthenticatedCaller {
                         actor: "alice@example.com".to_owned(),
                         member_roles: vec!["engineer".to_owned()],
+                        canonical_user_id: None,
                         is_admin: false,
                         can_bootstrap_steward_run_service_envelope: false,
                     }),
                     "user-duplicate-role-session" => Ok(AuthenticatedCaller {
                         actor: "alice@example.com".to_owned(),
                         member_roles: vec!["engineer".to_owned(), "engineer".to_owned()],
+                        canonical_user_id: None,
                         is_admin: false,
                         can_bootstrap_steward_run_service_envelope: false,
                     }),
                     "admin-session" => Ok(AuthenticatedCaller {
                         actor: "admin@example.com".to_owned(),
                         member_roles: Vec::new(),
+                        canonical_user_id: None,
                         is_admin: true,
                         can_bootstrap_steward_run_service_envelope: false,
                     }),
@@ -2924,6 +2953,7 @@ mod tests {
                 Ok(AuthenticatedCaller {
                     actor: "bootstrap@example.com".to_owned(),
                     member_roles: Vec::new(),
+                    canonical_user_id: None,
                     is_admin: false,
                     can_bootstrap_steward_run_service_envelope: true,
                 })
@@ -4412,6 +4442,7 @@ mod tests {
         let context = AdmissionContext {
             actor: "alice@example.com".to_owned(),
             member_role: "engineer".to_owned(),
+            canonical_user_id: None,
         };
         let edit = BudgetIncrease {
             amount: "60.00".to_owned(),
@@ -4531,6 +4562,7 @@ mod tests {
             &AdmissionContext {
                 actor: "alice@example.com".to_owned(),
                 member_role: "engineer".to_owned(),
+                canonical_user_id: None,
             },
             "team-a",
             "runtime-a",
@@ -4671,6 +4703,49 @@ mod tests {
                 .name_any(),
             "runtime-a",
             "caller-supplied canonical authority must not write desired state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_creation_derives_canonical_authority_from_authenticated_identity()
+    -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: runtime().spec,
+        };
+
+        let outcome = submit_runtime_request(
+            &runtimes,
+            &ledger(),
+            &FakeDecisionChannel::default(),
+            &AdmissionContext {
+                actor: "alice@example.com".to_owned(),
+                member_role: "engineer".to_owned(),
+                canonical_user_id: Some(canonical_user_id.clone()),
+            },
+            "team-a",
+            &request,
+        )
+        .await
+        .map_err(|error| format!("derive canonical runtime authority: {error:?}"))?;
+
+        assert!(matches!(outcome, SubmissionOutcome::Applied { .. }));
+        let created = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        let authority = created.spec.canonical_authority.as_ref().ok_or_else(|| {
+            "trusted identity did not author the canonical runtime binding".to_owned()
+        })?;
+        assert_eq!(authority.owner_user_id, canonical_user_id);
+        assert_eq!(
+            authority.acting_user_id.as_ref(),
+            Some(&authority.owner_user_id)
         );
         Ok(())
     }
@@ -4935,6 +5010,7 @@ mod tests {
         let context = AdmissionContext {
             actor: "alice@example.com".to_owned(),
             member_role: "engineer".to_owned(),
+            canonical_user_id: None,
         };
         let mut proposed_spec = runtime().spec;
         proposed_spec.budget.monthly_limit = "201.00".to_owned();
@@ -5021,6 +5097,7 @@ mod tests {
         let context = AdmissionContext {
             actor: "alice@example.com".to_owned(),
             member_role: "engineer".to_owned(),
+            canonical_user_id: None,
         };
         let mut proposed_spec = runtime().spec;
         proposed_spec.budget.monthly_limit = "201.00".to_owned();
@@ -5094,6 +5171,7 @@ mod tests {
         let context = AdmissionContext {
             actor: "alice@example.com".to_owned(),
             member_role: "engineer".to_owned(),
+            canonical_user_id: None,
         };
         let mut proposed_spec = runtime().spec;
         proposed_spec.budget.monthly_limit = "201.00".to_owned();
@@ -5157,6 +5235,7 @@ mod tests {
         let context = AdmissionContext {
             actor: "alice@example.com".to_owned(),
             member_role: "engineer".to_owned(),
+            canonical_user_id: None,
         };
         let mut proposed_spec = runtime().spec;
         proposed_spec.budget.monthly_limit = "201.00".to_owned();
@@ -5232,6 +5311,7 @@ mod tests {
         let context = AdmissionContext {
             actor: "alice@example.com".to_owned(),
             member_role: "engineer".to_owned(),
+            canonical_user_id: None,
         };
         let mut proposed_spec = runtime().spec;
         proposed_spec.budget.monthly_limit = "201.00".to_owned();
@@ -5313,6 +5393,7 @@ mod tests {
             &AdmissionContext {
                 actor: "alice@example.com".to_owned(),
                 member_role: "engineer".to_owned(),
+                canonical_user_id: None,
             },
             "team-a",
             &CreateRuntimeRequest {
@@ -5373,6 +5454,7 @@ mod tests {
             &AdmissionContext {
                 actor: "alice@example.com".to_owned(),
                 member_role: "engineer".to_owned(),
+                canonical_user_id: None,
             },
             "team-a",
             &CreateRuntimeRequest {
@@ -5437,6 +5519,7 @@ mod tests {
         let context = AdmissionContext {
             actor: "alice@example.com".to_owned(),
             member_role: "engineer".to_owned(),
+            canonical_user_id: None,
         };
         let mut proposed_spec = runtime().spec;
         proposed_spec.budget.monthly_limit = "201.00".to_owned();
@@ -5533,6 +5616,7 @@ mod tests {
         let context = AdmissionContext {
             actor: "alice@example.com".to_owned(),
             member_role: "engineer".to_owned(),
+            canonical_user_id: None,
         };
         let edit = BudgetIncrease {
             amount: "120.00".to_owned(),
@@ -5672,6 +5756,7 @@ mod tests {
             &AdmissionContext {
                 actor: "alice@example.com".to_owned(),
                 member_role: "engineer".to_owned(),
+                canonical_user_id: None,
             },
             "team-a",
             "runtime-a",
@@ -5712,6 +5797,7 @@ mod tests {
             &AdmissionContext {
                 actor: "alice@example.com".to_owned(),
                 member_role: "engineer".to_owned(),
+                canonical_user_id: None,
             },
             "team-a",
             "runtime-a",

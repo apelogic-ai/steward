@@ -24,7 +24,7 @@ use steward_controller::{
     webhook_router_for_controller,
 };
 use steward_store::PgStore;
-use steward_types::RuntimeRefs;
+use steward_types::{CanonicalUserId, RuntimeRefs};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 use tokio_rustls::TlsAcceptor;
@@ -132,11 +132,18 @@ impl RequestAuthenticator for S4Authenticator {
     ) -> BoxFuture<'a, Result<AuthenticatedCaller, AuthenticationError>> {
         Box::pin(async move {
             match bearer_token {
-                "test-alice-session" => Ok(user("alice@example.com")),
-                "test-bob-session" => Ok(user("bob@example.org")),
+                "test-alice-session" => user(
+                    "alice@example.com",
+                    "usr_0123456789abcdef0123456789abcdef",
+                ),
+                "test-bob-session" => user(
+                    "bob@example.org",
+                    "usr_abcdef0123456789abcdef0123456789",
+                ),
                 "test-admin-session" => Ok(AuthenticatedCaller {
                     actor: "admin@example.com".to_owned(),
                     member_roles: Vec::new(),
+                    canonical_user_id: None,
                     is_admin: true,
                     can_bootstrap_steward_run_service_envelope: false,
                 }),
@@ -146,13 +153,17 @@ impl RequestAuthenticator for S4Authenticator {
     }
 }
 
-fn user(actor: &str) -> AuthenticatedCaller {
-    AuthenticatedCaller {
+fn user(actor: &str, canonical_user_id: &str) -> Result<AuthenticatedCaller, AuthenticationError> {
+    Ok(AuthenticatedCaller {
         actor: actor.to_owned(),
         member_roles: vec!["engineer".to_owned()],
+        canonical_user_id: Some(
+            CanonicalUserId::parse(canonical_user_id)
+                .map_err(|_| AuthenticationError::InvalidCredentials)?,
+        ),
         is_admin: false,
         can_bootstrap_steward_run_service_envelope: false,
-    }
+    })
 }
 
 #[derive(Clone, Default)]
