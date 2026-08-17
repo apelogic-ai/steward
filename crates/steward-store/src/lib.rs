@@ -20,6 +20,101 @@ pub struct PgStore {
     pool: PgPool,
 }
 
+/// The current Steward-local browser authorization for one opaque canonical user.
+///
+/// Google proves who a person is. This record proves only which Steward privileges an
+/// operator has explicitly granted to that canonical user; it deliberately has no email,
+/// issuer, provider-token, or cloud-provider input.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BrowserRbacAssignments {
+    pub is_admin: bool,
+    pub member_roles: Vec<String>,
+}
+
+impl BrowserRbacAssignments {
+    fn from_active_assignments(
+        assignments: impl IntoIterator<Item = BrowserRbacAssignment>,
+    ) -> Self {
+        let mut result = Self::default();
+        for assignment in assignments {
+            match assignment {
+                BrowserRbacAssignment::Administrator => result.is_admin = true,
+                BrowserRbacAssignment::MemberRole(member_role) => {
+                    result.member_roles.push(member_role)
+                }
+            }
+        }
+        result.member_roles.sort();
+        result.member_roles.dedup();
+        result
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrowserRbacAssignment {
+    Administrator,
+    MemberRole(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserRbacAssignmentAction {
+    Grant,
+    Revoke,
+}
+
+impl BrowserRbacAssignmentAction {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Grant => "grant",
+            Self::Revoke => "revoke",
+        }
+    }
+}
+
+pub struct BrowserRbacAssignmentChange<'a> {
+    pub user_id: &'a CanonicalUserId,
+    pub assignment: &'a BrowserRbacAssignment,
+    pub action: BrowserRbacAssignmentAction,
+    pub actor: &'a str,
+}
+
+fn is_valid_member_role(member_role: &str) -> bool {
+    let bytes = member_role.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+}
+
+#[cfg(test)]
+mod browser_rbac_tests {
+    use super::{BrowserRbacAssignment, BrowserRbacAssignments};
+
+    #[test]
+    fn unassigned_canonical_user_has_no_implicit_steward_authority() {
+        let assignments = BrowserRbacAssignments::from_active_assignments([]);
+        assert_eq!(assignments.member_roles, Vec::<String>::new());
+        assert!(
+            !assignments.is_admin,
+            "Google identity alone must not silently bootstrap a Steward administrator"
+        );
+    }
+
+    #[test]
+    fn active_assignments_are_explicit_and_member_roles_are_deduplicated() {
+        let assignments = BrowserRbacAssignments::from_active_assignments([
+            BrowserRbacAssignment::MemberRole("engineer".to_owned()),
+            BrowserRbacAssignment::Administrator,
+            BrowserRbacAssignment::MemberRole("engineer".to_owned()),
+            BrowserRbacAssignment::MemberRole("analyst".to_owned()),
+        ]);
+        assert!(assignments.is_admin);
+        assert_eq!(assignments.member_roles, ["analyst", "engineer"]);
+    }
+}
+
 impl PgStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -41,6 +136,83 @@ impl PgStore {
             .run(&self.pool)
             .await
             .map_err(|error| StoreError::Database(error.to_string()))
+    }
+
+    /// Read the latest append-only local RBAC decisions for this exact canonical user.
+    ///
+    /// Missing rows deliberately mean no elevated authority. The database query is keyed only by
+    /// the opaque canonical ID; email and external-provider claims are never authorization keys.
+    pub async fn browser_rbac_assignments(
+        &self,
+        user_id: &CanonicalUserId,
+    ) -> Result<BrowserRbacAssignments, StoreError> {
+        let rows = sqlx::query(
+            "WITH latest AS ( \
+                SELECT DISTINCT ON (assignment_kind, member_role) \
+                       assignment_kind, member_role, action \
+                FROM browser_rbac_assignment_events \
+                WHERE user_id = $1 \
+                ORDER BY assignment_kind, member_role, at DESC, id DESC \
+             ) \
+             SELECT assignment_kind, member_role \
+             FROM latest \
+             WHERE action = 'grant'",
+        )
+        .bind(user_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        let mut assignments = Vec::with_capacity(rows.len());
+        for row in rows {
+            let assignment_kind: String = row.try_get("assignment_kind").map_err(database_error)?;
+            match assignment_kind.as_str() {
+                "administrator" => assignments.push(BrowserRbacAssignment::Administrator),
+                "member_role" => {
+                    let member_role: String = row.try_get("member_role").map_err(database_error)?;
+                    if !is_valid_member_role(&member_role) {
+                        return Err(StoreError::InvalidBrowserRbacRecord);
+                    }
+                    assignments.push(BrowserRbacAssignment::MemberRole(member_role));
+                }
+                _ => return Err(StoreError::InvalidBrowserRbacRecord),
+            }
+        }
+        Ok(BrowserRbacAssignments::from_active_assignments(assignments))
+    }
+
+    /// Append an audited local RBAC grant or revocation. Existing events are immutable; an
+    /// operator revokes authority by appending a new revocation event instead of editing history.
+    pub async fn append_browser_rbac_assignment(
+        &self,
+        change: BrowserRbacAssignmentChange<'_>,
+    ) -> Result<(), StoreError> {
+        if change.actor.trim().is_empty() {
+            return Err(StoreError::InvalidBrowserRbacActor);
+        }
+        let (assignment_kind, member_role) = match change.assignment {
+            BrowserRbacAssignment::Administrator => ("administrator", None),
+            BrowserRbacAssignment::MemberRole(member_role) if is_valid_member_role(member_role) => {
+                ("member_role", Some(member_role))
+            }
+            BrowserRbacAssignment::MemberRole(_) => {
+                return Err(StoreError::InvalidBrowserRbacAssignment);
+            }
+        };
+        sqlx::query(
+            "INSERT INTO browser_rbac_assignment_events \
+             (id, user_id, assignment_kind, member_role, action, actor) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(change.user_id.as_str())
+        .bind(assignment_kind)
+        .bind(member_role)
+        .bind(change.action.as_str())
+        .bind(change.actor)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(())
     }
 
     /// Resolve only an already-reviewed exact issuer/subject/organization mapping.
@@ -2673,6 +2845,9 @@ pub enum StoreError {
     CanonicalIdentityConflict,
     CanonicalIdentityInvalidActor,
     CanonicalIdentityInvalidRecord,
+    InvalidBrowserRbacActor,
+    InvalidBrowserRbacAssignment,
+    InvalidBrowserRbacRecord,
     ApprovalNotFound,
     ApprovalNotPending,
     MissingDecisionReference,
@@ -2728,6 +2903,15 @@ impl fmt::Display for StoreError {
             }
             Self::CanonicalIdentityInvalidRecord => {
                 write!(formatter, "canonical identity record is invalid")
+            }
+            Self::InvalidBrowserRbacActor => {
+                write!(formatter, "browser RBAC actor is required")
+            }
+            Self::InvalidBrowserRbacAssignment => {
+                write!(formatter, "browser RBAC assignment is invalid")
+            }
+            Self::InvalidBrowserRbacRecord => {
+                write!(formatter, "browser RBAC record is invalid")
             }
             Self::ApprovalNotFound => write!(formatter, "approval does not exist"),
             Self::ApprovalNotPending => write!(formatter, "approval is not pending"),

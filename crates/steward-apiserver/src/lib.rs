@@ -2005,6 +2005,9 @@ impl IntoResponse for ApiError {
                 | StoreError::MissingRevocationReason
                 | StoreError::CanonicalIdentityInvalidActor
                 | StoreError::CanonicalIdentityInvalidRecord
+                | StoreError::InvalidBrowserRbacActor
+                | StoreError::InvalidBrowserRbacAssignment
+                | StoreError::InvalidBrowserRbacRecord
                 | StoreError::InvalidTaskIdentityBinding
                 | StoreError::InvalidEnvelopeRequest,
             ) => StatusCode::UNPROCESSABLE_ENTITY,

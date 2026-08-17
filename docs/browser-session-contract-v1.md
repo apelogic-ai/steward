@@ -16,9 +16,12 @@ The browser boundary is direct Google organization OIDC. Production configuratio
   `OrganizationIdentityPolicy`.
 
 The resolver maps that validated external subject to Steward's opaque `CanonicalUserId`. Email is
-display metadata and never a session, ownership, or provider-grant key. Ordinary users receive the
-user role by default. Administrator role assignment is an explicit allowlist of canonical user IDs;
-Google email or hosted-domain membership does not imply administrator authority.
+display metadata and never a session, ownership, or provider-grant key. Steward then reads its
+append-only local RBAC assignment ledger by that exact opaque ID. An unassigned person receives
+the ordinary user role with no member-role access; administrator and member-role grants require
+explicit local grant events, and revocation appends a new event. Google email or hosted-domain
+membership does not imply any Steward authority. This boundary has no AWS or Kubernetes identity
+dependency.
 
 The existing Kubernetes TokenReview administrator routes remain unchanged. Browser sessions are a
 parallel, route-specific frontend boundary and cannot inject a bearer assertion into that operator
@@ -38,7 +41,8 @@ exactly `/admin/auth/callback`.
   returned nonce and organization identity, resolves a canonical principal, rotates any supplied
   session cookie, and redirects to the allowlisted path.
 - `GET /admin/api/v1/session` returns `steward.browser-session/v1`: bounded canonical principal,
-  `user` or `admin` role, allowed surfaces, and the current per-session CSRF proof.
+  `user` or `admin` role, the caller's locally assigned member roles, allowed surfaces, and the
+  current per-session CSRF proof.
 - `POST /admin/auth/logout` revokes the server-side session and expires its cookie.
 
 The cookie contains only an unguessable opaque server-side lookup value. Identity, role, provider

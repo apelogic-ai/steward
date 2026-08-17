@@ -8,6 +8,7 @@ use sqlx::postgres::PgPoolOptions;
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
 use steward_store::{
     AgentRunQuery, AgentRunTimelineKind, AgentRunTimelineProvenance, ApproveAdmission,
+    BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
     ParkRejection, PgStore, StoreError, TaskReservationRequest,
 };
 use steward_types::{
@@ -194,6 +195,89 @@ async fn canonical_identity_requires_exact_subject_mapping_and_explicit_reconnec
             .user_id,
         principal.user_id,
         "an explicitly reviewed issuer migration must preserve the opaque user ID"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn browser_rbac_is_canonical_user_scoped_append_only_and_revocable() -> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the browser RBAC Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let user = store
+        .register_canonical_identity(
+            &google_identity(
+                format!("browser-rbac-user-{suffix}"),
+                format!("browser-rbac-user-{suffix}@example.com"),
+            )?,
+            "identity-admin",
+        )
+        .await?
+        .user_id;
+    let other_user = store
+        .register_canonical_identity(
+            &google_identity(
+                format!("browser-rbac-other-{suffix}"),
+                format!("browser-rbac-other-{suffix}@example.com"),
+            )?,
+            "identity-admin",
+        )
+        .await?
+        .user_id;
+    let administrator = BrowserRbacAssignment::Administrator;
+    let engineer = BrowserRbacAssignment::MemberRole("engineer".to_owned());
+    for assignment in [&administrator, &engineer] {
+        store
+            .append_browser_rbac_assignment(BrowserRbacAssignmentChange {
+                user_id: &user,
+                assignment,
+                action: BrowserRbacAssignmentAction::Grant,
+                actor: "rbac-operator",
+            })
+            .await?;
+    }
+    assert_eq!(
+        store.browser_rbac_assignments(&user).await?.member_roles,
+        ["engineer"],
+        "the canonical user receives only their explicit member-role assignment"
+    );
+    assert!(store.browser_rbac_assignments(&user).await?.is_admin);
+    assert_eq!(
+        store.browser_rbac_assignments(&other_user).await?,
+        Default::default(),
+        "a role event for one canonical user cannot grant another user authority"
+    );
+
+    store
+        .append_browser_rbac_assignment(BrowserRbacAssignmentChange {
+            user_id: &user,
+            assignment: &engineer,
+            action: BrowserRbacAssignmentAction::Revoke,
+            actor: "rbac-operator",
+        })
+        .await?;
+    let after_revoke = store.browser_rbac_assignments(&user).await?;
+    assert!(after_revoke.is_admin, "an unrelated administrator grant remains active");
+    assert!(after_revoke.member_roles.is_empty());
+    let mutation = sqlx::query(
+        "UPDATE browser_rbac_assignment_events SET actor = 'mutation-attempt' WHERE user_id = $1",
+    )
+    .bind(user.as_str())
+    .execute(store.pool())
+    .await;
+    assert!(
+        mutation.is_err(),
+        "RBAC history must be revoked by an appended event, never modified in place"
     );
     Ok(())
 }

@@ -89,6 +89,8 @@ reconnect; no migration infers identity from email.
 The following integrations consume this foundation and must preserve its boundary:
 
 - browser sessions validate Google OIDC and retain the canonical user ID, never an email key;
+- browser authorization is an append-only local Steward RBAC ledger keyed by that exact canonical
+  user ID; Google claims authenticate but never grant administrator or member-role authority;
 - envelope and approval ownership use that authenticated canonical ID;
 - the GitHub exchange maps its reviewed actor to that same ID and emits the trusted canonical-user
   group; workflow inputs cannot override it;

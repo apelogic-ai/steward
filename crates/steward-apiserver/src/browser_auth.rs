@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
@@ -14,7 +14,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use steward_store::{PgStore, StoreError};
+use steward_store::{BrowserRbacAssignments, PgStore, StoreError};
 use steward_types::{
     CanonicalUserId, Email, GOOGLE_ORGANIZATION_ISSUER, OrganizationId, OrganizationIdentity,
     OrganizationIdentityPolicy,
@@ -174,6 +174,7 @@ pub struct BrowserPrincipal {
     pub canonical_user_id: CanonicalUserId,
     pub display_email: Email,
     pub role: BrowserRole,
+    pub member_roles: Vec<String>,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -267,15 +268,11 @@ pub trait BrowserIdentityResolver: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct PgBrowserIdentityResolver {
     store: PgStore,
-    admin_user_ids: HashSet<CanonicalUserId>,
 }
 
 impl PgBrowserIdentityResolver {
-    pub fn new(store: PgStore, admin_user_ids: HashSet<CanonicalUserId>) -> Self {
-        Self {
-            store,
-            admin_user_ids,
-        }
+    pub fn new(store: PgStore) -> Self {
+        Self { store }
     }
 }
 
@@ -294,17 +291,29 @@ impl BrowserIdentityResolver for PgBrowserIdentityResolver {
                     .map_err(map_store_error)?,
                 Err(error) => return Err(map_store_error(error)),
             };
-            let role = if self.admin_user_ids.contains(&principal.user_id) {
-                BrowserRole::Admin
-            } else {
-                BrowserRole::User
-            };
-            Ok(BrowserPrincipal {
-                canonical_user_id: principal.user_id,
-                display_email: principal.display_email,
-                role,
-            })
+            let assignments = self
+                .store
+                .browser_rbac_assignments(&principal.user_id)
+                .await
+                .map_err(map_store_error)?;
+            Ok(browser_principal_from_assignments(principal, assignments))
         })
+    }
+}
+
+fn browser_principal_from_assignments(
+    principal: steward_types::CanonicalPrincipal,
+    assignments: BrowserRbacAssignments,
+) -> BrowserPrincipal {
+    BrowserPrincipal {
+        canonical_user_id: principal.user_id,
+        display_email: principal.display_email,
+        role: if assignments.is_admin {
+            BrowserRole::Admin
+        } else {
+            BrowserRole::User
+        },
+        member_roles: assignments.member_roles,
     }
 }
 
@@ -562,6 +571,7 @@ impl BrowserIdentityResolver for LocalFakeIdentityResolver {
                     .map_err(|_| BrowserAuthFailure::IdentityUnavailable)?,
                 display_email: identity.verified_email().clone(),
                 role,
+                member_roles: Vec::new(),
             })
         })
     }
@@ -748,6 +758,7 @@ struct SessionResponse<'a> {
     api_version: &'static str,
     principal: SessionPrincipalResponse<'a>,
     role: BrowserRole,
+    member_roles: &'a [String],
     surfaces: &'static [&'static str],
     csrf: &'a str,
 }
@@ -775,6 +786,7 @@ async fn session(State(service): State<BrowserAuthService>, headers: HeaderMap) 
             display_email: &session.principal.display_email,
         },
         role: session.principal.role,
+        member_roles: &session.principal.member_roles,
         surfaces,
         csrf: &session.csrf,
     })
@@ -1237,6 +1249,7 @@ mod tests {
     use axum::http::{Request, StatusCode, header};
     use axum::routing::post;
     use axum::{Extension, Json, Router};
+    use steward_store::BrowserRbacAssignments;
     use steward_types::{CanonicalUserId, Email, OrganizationId};
     use tower::ServiceExt;
 
@@ -1302,7 +1315,22 @@ mod tests {
             canonical_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
             display_email: Email::parse("alice@example.com")?,
             role: BrowserRole::User,
+            member_roles: Vec::new(),
         })
+    }
+
+    #[test]
+    fn local_rbac_default_does_not_turn_a_google_identity_into_an_admin() -> Result<(), String> {
+        let canonical = steward_types::CanonicalPrincipal::new(
+            CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
+            OrganizationId::parse("org_example")?,
+            Email::parse("alice@example.com")?,
+        )?;
+        let principal =
+            super::browser_principal_from_assignments(canonical, BrowserRbacAssignments::default());
+        assert_eq!(principal.role, BrowserRole::User);
+        assert!(principal.member_roles.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -1870,6 +1898,7 @@ mod tests {
         assert_eq!(value["apiVersion"], "steward.browser-session/v1");
         assert_eq!(value["principal"]["displayEmail"], "alice@example.com");
         assert_eq!(value["role"], "user");
+        assert_eq!(value["memberRoles"], serde_json::json!([]));
         assert_eq!(value["surfaces"][0], "connections");
         assert!(
             value["csrf"]

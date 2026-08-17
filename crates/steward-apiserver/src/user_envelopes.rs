@@ -25,6 +25,7 @@ pub const ENVELOPE_REQUESTS_API_VERSION: &str = "steward.envelope-requests/v1";
 pub struct UserEnvelopeSubject {
     pub canonical_user_id: CanonicalUserId,
     pub display_email: Email,
+    pub member_roles: Vec<String>,
 }
 
 /// The session binding is opaque to the request domain. It is only used by a broker to bind
@@ -42,6 +43,7 @@ fn subject_from_browser_session(context: &BrowserSessionContext) -> UserEnvelope
     UserEnvelopeSubject {
         canonical_user_id: context.principal.canonical_user_id.clone(),
         display_email: context.principal.display_email.clone(),
+        member_roles: context.principal.member_roles.clone(),
     }
 }
 
@@ -510,6 +512,7 @@ mod tests {
             subject: UserEnvelopeSubject {
                 canonical_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
                 display_email: Email::parse("alice@example.com")?,
+                member_roles: Vec::new(),
             },
             binding: (),
         })
