@@ -181,4 +181,32 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn connections_uses_the_shared_workspace_shell_and_button_contract() {
+        for required in [
+            "<section class=\"section-heading\"",
+            "class=\"connection-copy\"",
+            "class=\"button\"",
+            "class=\"button secondary danger\"",
+        ] {
+            assert!(
+                CONNECTIONS_HTML.contains(required),
+                "Connections shell is missing shared workspace markup {required:?}"
+            );
+        }
+        for required in [
+            "main {\n  width: min(68rem, calc(100% - 2rem));",
+            "min-height: 31rem;",
+            "background: var(--surface);",
+            ".section-heading {",
+            ".button {",
+            ".button.secondary {",
+        ] {
+            assert!(
+                CONNECTIONS_CSS.contains(required),
+                "Connections stylesheet is missing shared workspace treatment {required:?}"
+            );
+        }
+    }
 }
