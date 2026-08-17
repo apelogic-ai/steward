@@ -109,6 +109,10 @@ async fn governed_runtime_projects_existing_mcp_gateway_email_subject() -> Resul
     assert_eq!(claims["sub"], EMAIL);
     assert_eq!(claims["email"], EMAIL);
     assert_eq!(claims["steward"]["acting_as"], "service_for_user");
+    assert_eq!(
+        claims["steward"]["canonical_user_id"],
+        "usr_0123456789abcdef0123456789abcdef"
+    );
     assert_eq!(claims["steward"]["service"], "steward-run");
     assert_eq!(claims["steward"]["version"], 2);
     assert_eq!(
