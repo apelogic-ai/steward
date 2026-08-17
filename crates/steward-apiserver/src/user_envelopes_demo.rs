@@ -9,10 +9,13 @@ use axum::response::Redirect;
 use axum::routing::get;
 use sha2::{Digest, Sha256};
 use steward_admission::{Envelope, EnvelopeSpec};
+use steward_store::{
+    AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent, StoreError,
+};
 use steward_types::{Budget, CanonicalUserId, Duration, ModelRef, ToolGrant};
 use uuid::Uuid;
 
-use crate::BoxFuture;
+use crate::agent_runs_ui::protected_router as protected_agent_runs_router;
 use crate::browser_auth::{
     BrowserSessionBinding, LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service,
     protect_browser_routes,
@@ -20,8 +23,9 @@ use crate::browser_auth::{
 use crate::user_envelopes::{
     AvailableEnvelopeTemplate, ConnectionReadiness, EnvelopeRequestBroker,
     EnvelopeRequestBrokerError, EnvelopeRequestStatus, UserEnvelopeRequest, UserEnvelopeSession,
-    ValidatedEnvelopeRequest, protected_router,
+    ValidatedEnvelopeRequest, protected_router as protected_envelope_router,
 };
+use crate::{AgentRunLedger, BoxFuture};
 
 #[derive(Clone, Default)]
 pub struct LocalEnvelopeRequestBroker {
@@ -42,6 +46,40 @@ struct LocalEnvelopeRequest {
 impl LocalEnvelopeRequestBroker {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// The loopback request journey exposes the same scoped Runs read endpoint with an empty,
+/// credential-free ledger. It demonstrates an authoritative absence of runs without inventing
+/// any records and keeps the envelope UI on the browser-session-bound API contract.
+#[derive(Clone, Default)]
+struct LocalEmptyAgentRunLedger;
+
+impl AgentRunLedger for LocalEmptyAgentRunLedger {
+    fn agent_runs<'a>(
+        &'a self,
+        _query: &'a AgentRunQuery,
+    ) -> BoxFuture<'a, Result<AgentRunPage, StoreError>> {
+        Box::pin(async {
+            Ok(AgentRunPage {
+                records: Vec::new(),
+                next_cursor: None,
+            })
+        })
+    }
+
+    fn agent_run(
+        &self,
+        _task_uid: Uuid,
+    ) -> BoxFuture<'_, Result<Option<AgentRunRecord>, StoreError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn agent_run_timeline(
+        &self,
+        _task_uid: Uuid,
+    ) -> BoxFuture<'_, Result<Option<Vec<AgentRunTimelineEvent>>, StoreError>> {
+        Box::pin(async { Ok(None) })
     }
 }
 
@@ -220,11 +258,15 @@ pub fn router(origin: &str) -> Result<Router, String> {
     let post_sign_in = protect_browser_routes(
         Router::new().route(
             "/admin/connections",
-            get(|| async { Redirect::to("/app/envelopes") }),
+            get(|| async { Redirect::to("/envelopes") }),
         ),
         auth.clone(),
     );
     Ok(browser_auth_router(auth.clone())
         .merge(post_sign_in)
-        .merge(protected_router(LocalEnvelopeRequestBroker::new(), auth)))
+        .merge(protected_envelope_router(
+            LocalEnvelopeRequestBroker::new(),
+            auth.clone(),
+        ))
+        .merge(protected_agent_runs_router(LocalEmptyAgentRunLedger, auth)))
 }

@@ -1,25 +1,55 @@
 "use strict";
 
 const API = "/app/api/v1";
+const ACCORDION_PREFIX = "steward.ui.envelope-accordion.";
+const ACCORDIONS = new Set(["templates", "drafts", "approved", "in-review"]);
 const path = window.location.pathname;
 const pages = Array.from(document.querySelectorAll("[data-page]"));
-const links = Array.from(document.querySelectorAll("[data-route]"));
 
 function activePage() {
-  if (/^\/app\/envelopes\/[0-9a-f-]{36}$/i.test(path)) return "/app/envelopes/detail";
+  if (/^\/envelopes\/[^/]+\/runs$/i.test(path)) return "/envelopes/runs";
+  if (/^\/envelopes\/[^/]+$/i.test(path)) return path.endsWith("/new") ? "/envelopes/new" : "/envelopes/detail";
+  if (path === "/app/envelopes") return "/envelopes";
+  if (path === "/app/envelopes/new") return "/envelopes/new";
+  if (/^\/app\/envelopes\/[0-9a-f-]{36}$/i.test(path)) return "/envelopes/detail";
   return path;
 }
 
 for (const page of pages) page.hidden = page.dataset.page !== activePage();
-for (const link of links) if (link.dataset.route === path) link.setAttribute("aria-current", "page");
+for (const link of document.querySelectorAll("[data-route]")) {
+  if (link.dataset.route === activePage()) link.setAttribute("aria-current", "page");
+}
 
 function text(element, value) { element.textContent = value; }
 function create(tag, value) { const element = document.createElement(tag); if (value) text(element, value); return element; }
+function requestId() { return path.split("/").filter(Boolean).at(-1); }
+function envelopeIdForRuns() { return path.split("/").filter(Boolean).at(-2); }
+
+function setupAccordions() {
+  for (const details of document.querySelectorAll("details[data-accordion]")) {
+    const name = details.dataset.accordion;
+    if (!ACCORDIONS.has(name)) continue;
+    try { details.open = localStorage.getItem(`${ACCORDION_PREFIX}${name}`) === "open"; } catch (_) { /* Preferences are optional. */ }
+    details.addEventListener("toggle", () => {
+      try { localStorage.setItem(`${ACCORDION_PREFIX}${name}`, details.open ? "open" : "closed"); } catch (_) { /* Preferences are optional. */ }
+    });
+  }
+}
 
 async function api(pathname, options) {
   const response = await fetch(`${API}${pathname}`, options);
   if (!response.ok) throw new Error(`The authoritative request failed (${response.status}).`);
   return response.json();
+}
+
+async function loadIdentity() {
+  const target = document.querySelector("#signed-in-email");
+  try {
+    const response = await fetch("/admin/api/v1/session");
+    if (!response.ok) throw new Error("session unavailable");
+    const session = await response.json();
+    text(target, session.principal.displayEmail);
+  } catch (_) { text(target, "Session unavailable"); }
 }
 
 function renderStatus(request) {
@@ -33,25 +63,47 @@ function renderRequestSummary(request) {
   card.className = "card";
   const heading = create("h2");
   const link = create("a", `${request.templateId} · revision ${request.templateRevision}`);
-  link.href = `/app/envelopes/${request.id}`;
+  link.href = `/envelopes/${request.id}`;
   heading.append(link);
   card.append(heading, renderStatus(request));
   card.append(create("p", `Requested ${request.createdAt}. Current status recorded ${request.statusAt}.`));
   return card;
 }
 
-async function loadList() {
+function renderTemplateSummary(template) {
+  const card = create("article");
+  card.className = "card";
+  const heading = create("h2", `${template.displayName} · revision ${template.revision}`);
+  const start = create("a", "Request from this template");
+  start.href = `/envelopes/new?template=${encodeURIComponent(template.id)}`;
+  card.append(heading, create("p", `Hard budget ceiling: ${template.ceiling.spec.budget.monthlyLimit} ${template.ceiling.spec.budget.currency}.`), start);
+  return card;
+}
+
+function renderGroup(target, records, empty) {
+  target.replaceChildren(...(records.length ? records.map(renderRequestSummary) : [create("p", empty)]));
+}
+
+async function loadEnvelopeGroups() {
   const message = document.querySelector("#envelope-list-message");
-  const list = document.querySelector("#envelope-list");
+  const templates = document.querySelector("#template-list");
+  const drafts = document.querySelector("#draft-list");
+  const approved = document.querySelector("#approved-list");
+  const review = document.querySelector("#review-list");
   try {
-    const response = await api("/envelope-requests");
-    list.replaceChildren(...response.requests.map(renderRequestSummary));
-    text(message, response.requests.length ? "" : "No envelope requests yet.");
+    const [templateResponse, requestResponse] = await Promise.all([
+      api("/envelope-templates"), api("/envelope-requests"),
+    ]);
+    templates.replaceChildren(...(templateResponse.templates.length ? templateResponse.templates.map(renderTemplateSummary) : [create("p", "No templates are authorized for your identity.")]));
+    text(drafts, "No saved drafts are exposed by the authoritative envelope API.");
+    const records = requestResponse.requests;
+    renderGroup(approved, records.filter((record) => ["approved", "provisioned"].includes(record.status)), "No approved envelopes.");
+    renderGroup(review, records.filter((record) => !["approved", "provisioned"].includes(record.status)), "No envelopes require review.");
+    text(message, "");
   } catch (error) { text(message, error.message); }
 }
 
 function selectedTemplate(templates, select) { return templates.find((template) => template.id === select.value); }
-
 function decimal(value) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : null; }
 
 function renderTemplate(template) {
@@ -73,15 +125,10 @@ function renderDelta(template) {
   const ttl = document.querySelector("#ttl").value;
   const delta = document.querySelector("#request-delta");
   delta.replaceChildren();
-  if (budget === null || ceiling === null || threshold === null) {
-    text(delta, "Enter a valid budget to preview the bounded request.");
-  } else if (budget > ceiling) {
-    text(delta, `Outside the hard ceiling of ${template.ceiling.spec.budget.monthlyLimit} ${template.ceiling.spec.budget.currency}; Steward will reject this request.`);
-  } else if (budget > threshold || ttl !== template.autoProvisionThreshold.spec.ttl) {
-    text(delta, "Within the hard ceiling but outside the automatic threshold; this request will be pending approval.");
-  } else {
-    text(delta, "Within the automatic threshold. Steward will attempt provisioning after server-side validation.");
-  }
+  if (budget === null || ceiling === null || threshold === null) text(delta, "Enter a valid budget to preview the bounded request.");
+  else if (budget > ceiling) text(delta, `Outside the hard ceiling of ${template.ceiling.spec.budget.monthlyLimit} ${template.ceiling.spec.budget.currency}; Steward will reject this request.`);
+  else if (budget > threshold || ttl !== template.autoProvisionThreshold.spec.ttl) text(delta, "Within the hard ceiling but outside the automatic threshold; this request will be pending approval.");
+  else text(delta, "Within the automatic threshold. Steward will attempt provisioning after server-side validation.");
 }
 
 async function csrf() { return (await fetch("/admin/api/v1/session")).json(); }
@@ -93,11 +140,9 @@ async function loadNewEnvelope() {
   try {
     const response = await api("/envelope-templates");
     const templates = response.templates;
-    select.replaceChildren(...templates.map((template) => {
-      const option = create("option", `${template.displayName} · revision ${template.revision}`);
-      option.value = template.id;
-      return option;
-    }));
+    select.replaceChildren(...templates.map((template) => { const option = create("option", `${template.displayName} · revision ${template.revision}`); option.value = template.id; return option; }));
+    const selected = new URLSearchParams(window.location.search).get("template");
+    if (selected && templates.some((template) => template.id === selected)) select.value = selected;
     if (!templates.length) { text(message, "No envelope templates are available to your identity."); return; }
     form.hidden = false;
     text(message, "");
@@ -114,37 +159,53 @@ async function loadNewEnvelope() {
       requestedEnvelope.spec.budget.monthlyLimit = document.querySelector("#budget-limit").value;
       requestedEnvelope.spec.ttl = document.querySelector("#ttl").value;
       const session = await csrf();
-      const response = await fetch(`${API}/envelope-requests`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-steward-csrf": session.csrf },
-        body: JSON.stringify({ templateId: template.id, templateRevision: template.revision, requestedEnvelope, idempotencyKey: crypto.randomUUID() }),
-      });
+      const response = await fetch(`${API}/envelope-requests`, { method: "POST", headers: { "content-type": "application/json", "x-steward-csrf": session.csrf }, body: JSON.stringify({ templateId: template.id, templateRevision: template.revision, requestedEnvelope, idempotencyKey: crypto.randomUUID() }) });
       if (!response.ok) { text(message, `Request was not accepted (${response.status}). Review the bounded request and connection readiness.`); return; }
       const created = await response.json();
-      window.location.assign(`/app/envelopes/${created.request.id}`);
+      window.location.assign(`/envelopes/${created.request.id}`);
     });
   } catch (error) { text(message, error.message); }
 }
 
 async function loadDetail() {
-  const id = path.split("/").at(-1);
   const message = document.querySelector("#envelope-detail-message");
-  const details = document.querySelector("#envelope-detail");
+  const container = document.querySelector("#envelope-detail");
+  const details = container.querySelector("dl");
   try {
-    const response = await api(`/envelope-requests/${id}`);
+    const response = await api(`/envelope-requests/${requestId()}`);
     const request = response.request;
-    const rows = [
-      ["Status", request.status], ["Template", `${request.templateId} · revision ${request.templateRevision}`],
-      ["Requested", request.createdAt], ["Status recorded", request.statusAt],
-      ["Envelope instance", request.envelopeInstanceId || "Not provisioned"],
-      ["Digest", request.envelopeDigest || "Not provisioned"], ["Reason", request.reason || "None recorded"],
-    ];
+    const rows = [["Status", request.status], ["Template", `${request.templateId} · revision ${request.templateRevision}`], ["Requested", request.createdAt], ["Status recorded", request.statusAt], ["Envelope instance", request.envelopeInstanceId || "Not provisioned"], ["Digest", request.envelopeDigest || "Not provisioned"], ["Reason", request.reason || "None recorded"]];
     details.replaceChildren(...rows.flatMap(([term, value]) => [create("dt", term), create("dd", value)]));
-    details.hidden = false;
+    container.querySelector("#envelope-runs-link").href = `/envelopes/${request.id}/runs`;
+    container.hidden = false;
     text(message, "");
   } catch (error) { text(message, error.message); }
 }
 
-if (path === "/app/envelopes") loadList();
-if (path === "/app/envelopes/new") loadNewEnvelope();
-if (/^\/app\/envelopes\/[0-9a-f-]{36}$/i.test(path)) loadDetail();
+function renderRun(run) {
+  const card = create("article");
+  card.className = "card";
+  card.append(create("h2", run.workflow), create("p", `Phase: ${run.phase}. Updated ${run.updatedAt}.`));
+  return card;
+}
+
+async function loadEnvelopeRuns() {
+  const message = document.querySelector("#envelope-runs-message");
+  const list = document.querySelector("#envelope-runs-list");
+  try {
+    const [requestResponse, runsResponse] = await Promise.all([
+      api(`/envelope-requests/${envelopeIdForRuns()}`), api("/runs"),
+    ]);
+    const request = requestResponse.request;
+    const runs = runsResponse.runs.filter((run) => request.envelopeInstanceId && run.runtimeUid === request.envelopeInstanceId);
+    list.replaceChildren(...(runs.length ? runs.map(renderRun) : [create("p", request.envelopeInstanceId ? "No recent runs are recorded for this envelope instance." : "This envelope is not provisioned, so it has no runs.")]));
+    text(message, "");
+  } catch (error) { text(message, error.message); }
+}
+
+setupAccordions();
+loadIdentity();
+if (activePage() === "/envelopes") loadEnvelopeGroups();
+if (activePage() === "/envelopes/new") loadNewEnvelope();
+if (activePage() === "/envelopes/detail") loadDetail();
+if (activePage() === "/envelopes/runs") loadEnvelopeRuns();

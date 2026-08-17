@@ -3,37 +3,51 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Steward workspace</title>
+    <title>Envelopes · Steward</title>
     <link rel="icon" href="/admin/assets/icon.svg">
     <link rel="stylesheet" href="/admin/assets/admin.css">
-    <script src="/app/assets/workspace.js" defer></script>
+    <link rel="stylesheet" href="/envelopes/assets/workspace.css">
+    <script src="/envelopes/assets/workspace.js" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#workspace">Skip to workspace</a>
-    <header class="topbar">
-      <a class="brand" href="/app"><strong>Steward</strong></a>
-      <span class="operator">Your governed work</span>
+    <header class="shared-topbar">
+      <a class="brand" href="/envelopes"><strong>Steward</strong></a>
+      <nav aria-label="Steward primary navigation">
+        <a href="/envelopes" data-route="/envelopes">Envelopes</a>
+        <a href="/runs">Runs</a>
+        <a href="/admin/connections">Connections</a>
+        <a href="/settings">Settings</a>
+      </nav>
+      <span id="signed-in-email" class="signed-in-email" aria-live="polite">Loading session…</span>
     </header>
-    <nav class="tabs" aria-label="Steward user workspace">
-      <a href="/app/envelopes" data-route="/app/envelopes">My Envelopes</a>
-      <a href="/app/envelopes/new" data-route="/app/envelopes/new">New envelope</a>
-      <a href="/app/runs" data-route="/app/runs">My Runs</a>
-      <a href="/admin/connections" data-route="/admin/connections">Connections</a>
-    </nav>
     <main id="workspace" tabindex="-1">
-      <section data-page="/app">
-        <div class="section-heading"><div><p class="eyebrow">Your governed work</p><h1>Steward workspace</h1></div></div>
-        <div class="empty-state"><h2>Choose the next governed step</h2><p>Connect access, request a bounded envelope, then observe only the runs attributed to your canonical identity.</p></div>
+      <section data-page="/envelopes">
+        <div class="section-heading"><div><p class="eyebrow">Governed authority</p><h1>Envelopes</h1></div><a class="button" href="/envelopes/new">New envelope</a></div>
+        <p id="envelope-list-message" role="status">Loading authoritative envelope data…</p>
+        <div class="envelope-groups">
+          <details class="envelope-group" data-accordion="templates">
+            <summary>Templates <span class="eyebrow">Admin editable</span></summary>
+            <div id="template-list" class="group-list"><p class="group-note">Loading templates available to your signed-in identity…</p></div>
+          </details>
+          <details class="envelope-group" data-accordion="drafts">
+            <summary>Drafts <span class="eyebrow">User only</span></summary>
+            <div id="draft-list" class="group-list"><p class="group-note">No saved drafts are exposed by the authoritative envelope API.</p></div>
+          </details>
+          <details class="envelope-group" data-accordion="approved">
+            <summary>Approved <span class="eyebrow">User and admin</span></summary>
+            <div id="approved-list" class="group-list"><p class="group-note">Loading authoritative approved envelopes…</p></div>
+          </details>
+          <details class="envelope-group" data-accordion="in-review">
+            <summary>In Review <span class="eyebrow">User and admin</span></summary>
+            <div id="review-list" class="group-list"><p class="group-note">Loading authoritative review status…</p></div>
+          </details>
+        </div>
       </section>
-      <section data-page="/app/envelopes" hidden>
-        <div class="section-heading"><div><p class="eyebrow">User authority</p><h1>My Envelopes</h1></div><a class="button" href="/app/envelopes/new">New envelope</a></div>
-        <p id="envelope-list-message" role="status">Loading authoritative envelope requests…</p>
-        <div id="envelope-list" class="stack" aria-live="polite"></div>
-      </section>
-      <section data-page="/app/envelopes/new" hidden>
-        <div class="section-heading"><div><p class="eyebrow">Bounded request</p><h1>New envelope</h1></div></div>
+      <section data-page="/envelopes/new" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Bounded request</p><h1>New envelope</h1></div><a class="button secondary" href="/envelopes">Back to Envelopes</a></div>
         <p id="envelope-form-message" role="status">Loading templates available to your signed-in identity…</p>
-        <form id="envelope-request-form" hidden>
+        <form id="envelope-request-form" class="request-form-layout" hidden>
           <label for="template-select">Template</label>
           <select id="template-select" name="template" required></select>
           <div id="template-summary" class="callout" aria-live="polite"></div>
@@ -45,14 +59,18 @@
           <button class="button" type="submit">Request envelope</button>
         </form>
       </section>
-      <section data-page="/app/envelopes/detail" data-detail-route="/app/envelopes/{request_id}" hidden>
-        <div class="section-heading"><div><p class="eyebrow">Envelope request</p><h1>Request detail</h1></div><a class="button secondary" href="/app/envelopes">Back to My Envelopes</a></div>
+      <section data-page="/envelopes/detail" data-route-pattern="/envelopes/{request_id}" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Envelope request</p><h1>Envelope form</h1></div><a class="button secondary" href="/envelopes">Back to Envelopes</a></div>
         <p id="envelope-detail-message" role="status">Loading authoritative request…</p>
-        <dl id="envelope-detail" class="detail-list" hidden></dl>
+        <div id="envelope-detail" class="request-form-layout" hidden>
+          <dl class="detail-list"></dl>
+          <div class="detail-actions"><a id="envelope-runs-link" class="button secondary" href="#">Recent runs</a></div>
+        </div>
       </section>
-      <section data-page="/app/runs" hidden>
-        <div class="section-heading"><div><p class="eyebrow">Execution history</p><h1>My Runs</h1></div></div>
-        <div class="empty-state"><h2>Agent Runs are not yet connected</h2><p>This view will show only your authoritative execution history, freshness, costs, and bounded diagnostic summaries.</p></div>
+      <section data-page="/envelopes/runs" data-route-pattern="/envelopes/{request_id}/runs" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Envelope execution</p><h1>Recent runs</h1></div><a class="button secondary" href="/envelopes">Back to Envelopes</a></div>
+        <p id="envelope-runs-message" role="status">Loading your authoritative runs…</p>
+        <div id="envelope-runs-list" class="group-list" aria-live="polite"></div>
       </section>
     </main>
   </body>
