@@ -2,7 +2,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,8 +13,6 @@ use steward_types::{Budget, Duration as RuntimeDuration, ModelRef, ToolGrant};
 
 const NAMESPACE: &str = "team-a";
 const RUNTIME_NAME: &str = "runtime-revocation";
-const ALICE_CANONICAL_USER: &str = "usr_0123456789abcdef0123456789abcdef";
-const SERVER_AUTHORING_USERNAME: &str = "system:serviceaccount:steward-system:steward-poc-api";
 
 #[derive(Clone, Copy)]
 enum Caller {
@@ -97,16 +95,6 @@ impl Harness {
             .output()?)
     }
 
-    fn kubectl_as_server_authority(&self, arguments: &[&str]) -> Result<Output, Box<dyn Error>> {
-        Ok(Command::new("kubectl")
-            .args(["--kubeconfig"])
-            .arg(&self.kubeconfig)
-            .args(["--context", &self.context])
-            .args(["--as", SERVER_AUTHORING_USERNAME])
-            .args(arguments)
-            .output()?)
-    }
-
     fn kubectl_ok(&self, arguments: &[&str]) -> Result<String, Box<dyn Error>> {
         let output = self.kubectl(arguments)?;
         if !output.status.success() {
@@ -170,50 +158,6 @@ impl Harness {
             .into());
         }
         Ok(serde_json::from_slice(&output.stdout)?)
-    }
-
-    fn write_runtime(&self) -> Result<PathBuf, Box<dyn Error>> {
-        let path = self.run_dir.join("e2e-s5-runtime.json");
-        let manifest = serde_json::json!({
-            "apiVersion": "agents.apelogic.ai/v1alpha1",
-            "kind": "AgentRuntime",
-            "metadata": {
-                "name": RUNTIME_NAME,
-                "namespace": NAMESPACE,
-                "annotations": {
-                    "agents.apelogic.ai/member-role": "engineer"
-                }
-            },
-            "spec": {
-                "principal": {
-                    "kind": "user",
-                    "actingUser": "alice@example.com"
-                },
-                "owner": "alice@example.com",
-                "canonicalAuthority": {
-                    "schemaVersion": "steward/canonical-authority-binding/v1",
-                    "ownerUserId": ALICE_CANONICAL_USER,
-                    "actingUserId": ALICE_CANONICAL_USER,
-                },
-                "agentType": {"name": "base"},
-                "llms": [{
-                    "provider": "openai",
-                    "model": "priced-model"
-                }],
-                "tools": [{
-                    "provider": "github",
-                    "resource": "search_repositories",
-                    "action": "read"
-                }],
-                "budget": {
-                    "monthlyLimit": "10.00",
-                    "currency": "USD"
-                },
-                "ttl": "1h"
-            }
-        });
-        fs::write(&path, serde_json::to_vec_pretty(&manifest)?)?;
-        Ok(path)
     }
 
     fn wait_phase(&self, expected: &str, timeout: Duration) -> Result<(), Box<dyn Error>> {
@@ -503,15 +447,42 @@ async fn e2e_s5_terminated_runtime_holds_nothing() -> Result<(), Box<dyn Error>>
         )
         .await?;
 
-    let manifest = harness.write_runtime()?;
-    let applied = harness.kubectl_as_server_authority(&["apply", "-f", path_text(&manifest)?])?;
-    if !applied.status.success() {
-        return Err(io::Error::other(format!(
-            "S5 runtime admission failed: {}",
-            String::from_utf8_lossy(&applied.stderr).trim()
-        ))
-        .into());
-    }
+    let create = serde_json::json!({
+        "name": RUNTIME_NAME,
+        "spec": {
+            "principal": {
+                "kind": "user",
+                "actingUser": "alice@example.com"
+            },
+            "owner": "alice@example.com",
+            "agentType": {"name": "base"},
+            "llms": [{
+                "provider": "openai",
+                "model": "priced-model"
+            }],
+            "tools": [{
+                "provider": "github",
+                "resource": "search_repositories",
+                "action": "read"
+            }],
+            "budget": {
+                "monthlyLimit": "10.00",
+                "currency": "USD"
+            },
+            "ttl": "1h"
+        }
+    });
+    let (create_status, create_body) = harness.steward(
+        "POST",
+        "/v1/namespaces/team-a/runtimes",
+        Some(&create.to_string()),
+        "s5-revocation-create.json",
+        Caller::Alice,
+    )?;
+    assert_eq!(
+        create_status, 201,
+        "an in-envelope runtime request must be admitted through Steward: {create_body}"
+    );
     harness.wait_phase("Running", Duration::from_secs(600))?;
 
     let runtime_uid = harness.runtime_value("jsonpath={.metadata.uid}")?;
@@ -776,9 +747,4 @@ fn required_json_string(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| io::Error::other(format!("response is missing {pointer}")).into())
-}
-
-fn path_text(path: &Path) -> Result<&str, Box<dyn Error>> {
-    path.to_str()
-        .ok_or_else(|| io::Error::other("run path is not valid UTF-8").into())
 }

@@ -9,7 +9,10 @@ allowed_input := {
 	"args": {},
 	"tokenClaims": {
 		"email": "alice@example.com",
-		"sub": "alice@example.com",
+		# HOP-1 subjects are immutable canonical IDs. The wrapper supplies the
+		# verified email as the request principal and resolves the provider
+		# connection separately by (issuer, subject).
+		"sub": "usr_0123456789abcdef0123456789abcdef",
 		"steward": {
 			"acting_as": "user",
 			"runtime_uid": "runtime-uid-a",
@@ -111,11 +114,8 @@ test_gateway_contract_explains_a_missing_request_principal if {
 	object.get(decision, "reason", "") == "authenticated request principal is unavailable"
 }
 
-test_gateway_contract_explains_a_subject_mismatch if {
-	claims := object.union(allowed_input.tokenClaims, {"sub": "bob@example.org"})
-	request := object.union(allowed_input, {"tokenClaims": claims})
-	decision := data.steward.mcp.decision with input as request
-	object.get(decision, "reason", "") == "verified token subject does not match the request"
+test_gateway_contract_accepts_a_canonical_subject_with_matching_email if {
+	data.steward.mcp.decision == {"allow": true} with input as allowed_input
 }
 
 test_runtime_tool_grant_rejects_a_tool_outside_the_token if {
