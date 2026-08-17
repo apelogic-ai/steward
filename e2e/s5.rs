@@ -706,7 +706,8 @@ async fn e2e_poc_golden_journey() -> Result<(), Box<dyn Error>> {
     // This is deliberately the short same contract preflight used by S5.  A
     // rejected dynamic Mint grant is a prerequisite failure, not something
     // worth discovering after a minute of sandbox polling.
-    let tool_response = harness.preflight_authorized_tool_call(&workspace, &sandbox, &tool_request)?;
+    let tool_response =
+        harness.preflight_authorized_tool_call(&workspace, &sandbox, &tool_request)?;
     assert!(
         tool_response.contains("example-org/fixture-repository"),
         "the acting user's runtime could not call its authorized tool: {tool_response}"
