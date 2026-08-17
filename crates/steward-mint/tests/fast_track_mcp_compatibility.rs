@@ -67,7 +67,7 @@ fn authority() -> Result<AuthorityBinding, String> {
 }
 
 #[tokio::test]
-async fn governed_runtime_projects_existing_mcp_gateway_email_subject() -> Result<(), String> {
+async fn governed_runtime_projects_canonical_subject_and_verified_email() -> Result<(), String> {
     let signing_key = SigningKey::generate(&mut OsRng);
     let verifier = signing_key.verifying_key();
     let mint = Mint::new(
@@ -106,15 +106,11 @@ async fn governed_runtime_projects_existing_mcp_gateway_email_subject() -> Resul
 
     assert_eq!(claims["iss"], "https://steward-mint.preview.example");
     assert_eq!(claims["aud"], serde_json::json!(["steward-mcp"]));
-    assert_eq!(claims["sub"], EMAIL);
+    assert_eq!(claims["sub"], "usr_0123456789abcdef0123456789abcdef");
     assert_eq!(claims["email"], EMAIL);
     assert_eq!(claims["steward"]["acting_as"], "service_for_user");
-    assert_eq!(
-        claims["steward"]["canonical_user_id"],
-        "usr_0123456789abcdef0123456789abcdef"
-    );
     assert_eq!(claims["steward"]["service"], "steward-run");
-    assert_eq!(claims["steward"]["version"], 2);
+    assert_eq!(claims["steward"]["version"], 3);
     assert_eq!(
         claims["steward"]["tools"][0],
         serde_json::json!({

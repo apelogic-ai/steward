@@ -25,12 +25,9 @@ pub use steward_ports::{
 use steward_types::{CanonicalAuthorityBinding, Principal, RuntimeId, ToolGrant};
 use uuid::Uuid;
 
-/// MCP-GW compatibility profile used by the non-promotable browser-to-agent preview.
-///
-/// Steward still requires the trusted runtime's canonical authority binding before it mints for a
-/// person.  At the MCP boundary only, the existing standalone gateway contract is preserved by
-/// projecting the current verified email into both `sub` and `email` with its v2 claim version.
-pub const HOP1_CLAIMS_VERSION: u8 = 2;
+/// HOP-1 v3 binds a person to their stable canonical subject while exposing the currently
+/// verified email as a separate compatibility claim for downstream provider boundaries.
+pub const HOP1_CLAIMS_VERSION: u8 = 3;
 pub const DEFAULT_AUTHORITY_TTL: Duration = Duration::from_secs(60);
 pub const SPIFFE_CLIENT_ASSERTION_TYPE: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe";
@@ -295,8 +292,6 @@ struct Hop1Claims {
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 struct StewardClaims {
     acting_as: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    canonical_user_id: Option<String>,
     runtime_uid: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     service: Option<String>,
@@ -306,7 +301,6 @@ struct StewardClaims {
 
 struct AuthorityClaimIdentity {
     acting_as: &'static str,
-    canonical_user_id: Option<String>,
     email: Option<String>,
     service: Option<String>,
     subject: String,
@@ -328,10 +322,9 @@ fn authority_claim_identity(
                 .ok_or(MintError::WorkloadMismatch)?;
             Ok(AuthorityClaimIdentity {
                 acting_as: "user",
-                canonical_user_id: Some(canonical.owner_user_id.as_str().to_owned()),
                 email: Some(acting_user.0.clone()),
                 service: None,
-                subject: acting_user.0.clone(),
+                subject: canonical.owner_user_id.as_str().to_owned(),
             })
         }
         Principal::Service { name, acting_user } if !name.is_empty() => match acting_user {
@@ -347,10 +340,9 @@ fn authority_claim_identity(
                     .ok_or(MintError::WorkloadMismatch)?;
                 Ok(AuthorityClaimIdentity {
                     acting_as: "service_for_user",
-                    canonical_user_id: Some(canonical.owner_user_id.as_str().to_owned()),
                     email: Some(acting_user.0.clone()),
                     service: Some(name.clone()),
-                    subject: acting_user.0.clone(),
+                    subject: canonical.owner_user_id.as_str().to_owned(),
                 })
             }
             None => {
@@ -364,7 +356,6 @@ fn authority_claim_identity(
                 let subject = format!("service:{name}");
                 Ok(AuthorityClaimIdentity {
                     acting_as: "service",
-                    canonical_user_id: None,
                     email: Some(subject.clone()),
                     service: Some(name.clone()),
                     subject,
@@ -526,7 +517,6 @@ where
             jti: Uuid::new_v4().to_string(),
             steward: StewardClaims {
                 acting_as: identity.acting_as.to_owned(),
-                canonical_user_id: identity.canonical_user_id,
                 runtime_uid: authority.runtime.0,
                 service: identity.service,
                 tools: authority.tools,
@@ -600,18 +590,15 @@ where
             Err(MintError::AuthorityUnavailable) => return Err(MintError::AuthorityUnavailable),
             Err(_) => return Ok(TokenIntrospectionResponse::inactive()),
         };
-        // A person-bound HOP-1 carries the email that was verified at issuance for the
-        // standalone MCP-GW compatibility boundary.  Email is deliberately mutable, whereas
-        // `canonical_authority` is the stable authority that must remain valid at
-        // introspection.  Do not compare an issued email subject to the resolver's current
-        // email here: a verified rename must not revoke an otherwise valid canonical binding.
+        // A person-bound HOP-1 carries the email that was verified at issuance as a downstream
+        // compatibility claim.  Email is deliberately mutable, whereas `sub` is the stable
+        // canonical authority that must remain valid at introspection.
         let principal_matches = match &authority.principal {
             Principal::User { .. } => authority_claim_identity(&authority)
                 .map(|identity| {
                     claims.custom.steward.acting_as == identity.acting_as
                         && claims.custom.steward.service.is_none()
-                        && claims.custom.steward.canonical_user_id == identity.canonical_user_id
-                        && claims.custom.email.as_deref() == Some(claims.custom.sub.as_str())
+                        && claims.custom.sub == identity.subject
                 })
                 .unwrap_or(false),
             Principal::Service {
@@ -621,8 +608,7 @@ where
                 .map(|identity| {
                     claims.custom.steward.acting_as == identity.acting_as
                         && claims.custom.steward.service.as_deref() == Some(name)
-                        && claims.custom.steward.canonical_user_id == identity.canonical_user_id
-                        && claims.custom.email.as_deref() == Some(claims.custom.sub.as_str())
+                        && claims.custom.sub == identity.subject
                 })
                 .unwrap_or(false),
             Principal::Service {
@@ -632,7 +618,6 @@ where
                 .map(|identity| {
                     claims.custom.steward.acting_as == identity.acting_as
                         && claims.custom.steward.service == identity.service
-                        && claims.custom.steward.canonical_user_id == identity.canonical_user_id
                         && claims.custom.sub == identity.subject
                         && claims.custom.email == identity.email
                 })
