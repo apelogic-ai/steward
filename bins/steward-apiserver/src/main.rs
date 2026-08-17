@@ -11,7 +11,10 @@ use steward_apiserver::{
     KubeRuntimeRepository, KubernetesTaskIdentityResolver, KubernetesTokenAuthenticator,
     KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog, router, task_router,
 };
-use steward_store::PgStore;
+use steward_store::{
+    BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
+};
+use steward_types::CanonicalUserId;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{sleep, timeout};
@@ -29,6 +32,9 @@ const MAX_PENDING_TLS_HANDSHAKES: usize = 64;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    if env::args().nth(1).as_deref() == Some("bootstrap-rbac") {
+        return bootstrap_rbac(env::args().skip(2).collect()).await;
+    }
     let client = kube::Client::try_default().await?;
     let store = PgStore::connect(&required("STEWARD_DATABASE_URL")?).await?;
     store.migrate().await?;
@@ -76,6 +82,57 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn bootstrap_rbac(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let (user_id, assignment, actor) = bootstrap_rbac_arguments(arguments)?;
+    let store = PgStore::connect(&required("STEWARD_DATABASE_URL")?).await?;
+    store.migrate().await?;
+    store
+        .append_browser_rbac_assignment(BrowserRbacAssignmentChange {
+            user_id: &user_id,
+            assignment: &assignment,
+            action: BrowserRbacAssignmentAction::Grant,
+            actor: &actor,
+        })
+        .await?;
+    println!("local browser RBAC grant recorded");
+    Ok(())
+}
+
+fn bootstrap_rbac_arguments(
+    arguments: Vec<String>,
+) -> Result<(CanonicalUserId, BrowserRbacAssignment, String), io::Error> {
+    let mut user_id = None;
+    let mut grant = None;
+    let mut actor = None;
+    let mut values = arguments.into_iter();
+    while let Some(flag) = values.next() {
+        let value = values.next().ok_or_else(bootstrap_rbac_usage)?;
+        match flag.as_str() {
+            "--user-id" if user_id.is_none() => {
+                user_id = Some(CanonicalUserId::parse(value).map_err(|_| bootstrap_rbac_usage())?)
+            }
+            "--grant" if grant.is_none() => {
+                grant = Some(match value.as_str() {
+                    "administrator" => BrowserRbacAssignment::Administrator,
+                    _ => BrowserRbacAssignment::MemberRole(value),
+                })
+            }
+            "--actor" if actor.is_none() && !value.trim().is_empty() => actor = Some(value),
+            _ => return Err(bootstrap_rbac_usage()),
+        }
+    }
+    match (user_id, grant, actor) {
+        (Some(user_id), Some(grant), Some(actor)) => Ok((user_id, grant, actor)),
+        _ => Err(bootstrap_rbac_usage()),
+    }
+}
+
+fn bootstrap_rbac_usage() -> io::Error {
+    io::Error::other(
+        "usage: steward-apiserver-bin bootstrap-rbac --user-id usr_<opaque-id> --grant administrator|<member-role> --actor <audited-operator>",
+    )
 }
 
 fn required(name: &str) -> Result<String, io::Error> {
@@ -206,6 +263,7 @@ mod tests {
     use std::time::Duration;
 
     use axum::serve::Listener;
+    use steward_store::BrowserRbacAssignment;
     use tokio::io::AsyncReadExt;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::timeout;
@@ -214,7 +272,7 @@ mod tests {
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
     use super::{
-        KubernetesTokenReviewAudience, TlsListener, decode_tls_material,
+        KubernetesTokenReviewAudience, TlsListener, bootstrap_rbac_arguments, decode_tls_material,
         kubernetes_token_review_audience,
     };
 
@@ -259,6 +317,32 @@ mod tests {
                 .map(KubernetesTokenReviewAudience::as_str),
             Some("https://kubernetes.default.svc")
         );
+    }
+
+    #[test]
+    fn rbac_bootstrap_requires_an_explicit_opaque_user_and_audited_actor() -> Result<(), String> {
+        assert!(
+            bootstrap_rbac_arguments(vec![
+                "--user-id".to_owned(),
+                "usr_0123456789abcdef0123456789abcdef".to_owned(),
+                "--grant".to_owned(),
+                "administrator".to_owned(),
+            ])
+            .is_err()
+        );
+        let (user_id, assignment, actor) = bootstrap_rbac_arguments(vec![
+            "--user-id".to_owned(),
+            "usr_0123456789abcdef0123456789abcdef".to_owned(),
+            "--grant".to_owned(),
+            "administrator".to_owned(),
+            "--actor".to_owned(),
+            "bootstrap-operator".to_owned(),
+        ])
+        .map_err(|error| error.to_string())?;
+        assert_eq!(user_id.as_str(), "usr_0123456789abcdef0123456789abcdef");
+        assert_eq!(assignment, BrowserRbacAssignment::Administrator);
+        assert_eq!(actor, "bootstrap-operator");
+        Ok(())
     }
 
     #[tokio::test]
