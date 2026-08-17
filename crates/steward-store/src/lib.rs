@@ -636,6 +636,208 @@ impl PgStore {
         .map(Some)
     }
 
+    /// Reserve an immutable user-envelope request under the server-resolved canonical owner.
+    ///
+    /// The initial `pending` event is written in the same transaction as the request. Callers
+    /// may only advance the request through `append_envelope_request_status`; neither the
+    /// browser nor this table ever overwrites a current status.
+    pub async fn reserve_envelope_request(
+        &self,
+        request: EnvelopeRequestReservationRequest<'_>,
+    ) -> Result<EnvelopeRequestReservation, StoreError> {
+        if request.template_id.trim().is_empty() || request.idempotency_key.trim().is_empty() {
+            return Err(StoreError::InvalidEnvelopeRequest);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "envelope-request:{}:{}",
+                request.owner_user_id.as_str(),
+                request.idempotency_key
+            ))
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let existing = sqlx::query(
+            "SELECT id, template_id, template_revision, requested_envelope \
+             FROM envelope_requests \
+             WHERE owner_user_id = $1 AND idempotency_key = $2",
+        )
+        .bind(request.owner_user_id.as_str())
+        .bind(request.idempotency_key)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if let Some(row) = existing {
+            let id: Uuid = row.try_get("id").map_err(database_error)?;
+            let template_id: String = row.try_get("template_id").map_err(database_error)?;
+            let template_revision: i64 =
+                row.try_get("template_revision").map_err(database_error)?;
+            let requested_envelope = row
+                .try_get::<Json<Envelope>, _>("requested_envelope")
+                .map_err(database_error)?
+                .0;
+            if template_id != request.template_id
+                || template_revision != request.template_revision
+                || requested_envelope != *request.requested_envelope
+            {
+                return Err(StoreError::EnvelopeRequestIdempotencyConflict);
+            }
+            transaction.commit().await.map_err(database_error)?;
+            let record = self
+                .envelope_request(request.owner_user_id, id)
+                .await?
+                .ok_or(StoreError::EnvelopeRequestNotFound)?;
+            return Ok(EnvelopeRequestReservation {
+                inserted: false,
+                record,
+            });
+        }
+
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO envelope_requests \
+             (id, owner_user_id, template_id, template_revision, requested_envelope, idempotency_key) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id)
+        .bind(request.owner_user_id.as_str())
+        .bind(request.template_id)
+        .bind(request.template_revision)
+        .bind(Json(request.requested_envelope))
+        .bind(request.idempotency_key)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        sqlx::query(
+            "INSERT INTO envelope_request_events (request_id, status) VALUES ($1, 'pending')",
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        let record = self
+            .envelope_request(request.owner_user_id, id)
+            .await?
+            .ok_or(StoreError::EnvelopeRequestNotFound)?;
+        Ok(EnvelopeRequestReservation {
+            inserted: true,
+            record,
+        })
+    }
+
+    /// Read the current authoritative status derived from the latest immutable event, scoped to
+    /// one canonical owner. An absent/mismatched owner is deliberately indistinguishable.
+    pub async fn envelope_request(
+        &self,
+        owner_user_id: &CanonicalUserId,
+        request_id: Uuid,
+    ) -> Result<Option<EnvelopeRequestRecord>, StoreError> {
+        let mut statement = QueryBuilder::<Postgres>::new(ENVELOPE_REQUEST_COLUMNS);
+        statement.push("WHERE requests.owner_user_id = ");
+        statement.push_bind(owner_user_id.as_str());
+        statement.push(" AND requests.id = ");
+        statement.push_bind(request_id);
+        statement
+            .build()
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?
+            .map(envelope_request_record)
+            .transpose()
+    }
+
+    /// List only the authenticated canonical owner's envelope requests.
+    pub async fn envelope_requests(
+        &self,
+        owner_user_id: &CanonicalUserId,
+    ) -> Result<Vec<EnvelopeRequestRecord>, StoreError> {
+        let mut statement = QueryBuilder::<Postgres>::new(ENVELOPE_REQUEST_COLUMNS);
+        statement.push("WHERE requests.owner_user_id = ");
+        statement.push_bind(owner_user_id.as_str());
+        statement.push(" ORDER BY requests.created_at DESC, requests.id DESC");
+        statement
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .map(envelope_request_record)
+            .collect()
+    }
+
+    /// Append a server-side lifecycle transition after the approval/provisioning authority has
+    /// made its decision. This API never accepts a browser session or caller-supplied owner.
+    pub async fn append_envelope_request_status(
+        &self,
+        request_id: Uuid,
+        update: EnvelopeRequestStatusUpdate<'_>,
+    ) -> Result<EnvelopeRequestRecord, StoreError> {
+        if !valid_envelope_request_transition(update.from, update.to) {
+            return Err(StoreError::InvalidEnvelopeRequestTransition);
+        }
+        if update.to == EnvelopeRequestStatus::Provisioned
+            && (update.envelope_instance_id.is_none() || update.envelope_digest.is_none())
+        {
+            return Err(StoreError::InvalidEnvelopeRequest);
+        }
+        if update.to != EnvelopeRequestStatus::Provisioned
+            && (update.envelope_instance_id.is_some() || update.envelope_digest.is_some())
+        {
+            return Err(StoreError::InvalidEnvelopeRequest);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let latest = sqlx::query(
+            "SELECT status FROM envelope_request_events \
+             WHERE request_id = $1 ORDER BY at DESC, id DESC LIMIT 1 FOR UPDATE",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::EnvelopeRequestNotFound)?;
+        let current = envelope_request_status_from_text(
+            &latest
+                .try_get::<String, _>("status")
+                .map_err(database_error)?,
+        )?;
+        if current != update.from {
+            return Err(StoreError::InvalidEnvelopeRequestTransition);
+        }
+        sqlx::query(
+            "INSERT INTO envelope_request_events \
+             (request_id, status, approval_id, envelope_instance_id, envelope_digest, reason) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(request_id)
+        .bind(update.to.as_str())
+        .bind(update.approval_id)
+        .bind(update.envelope_instance_id)
+        .bind(update.envelope_digest)
+        .bind(update.reason)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        let row = sqlx::query("SELECT owner_user_id FROM envelope_requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?
+            .ok_or(StoreError::EnvelopeRequestNotFound)?;
+        let owner_user_id = row
+            .try_get::<String, _>("owner_user_id")
+            .map_err(database_error)
+            .and_then(|value| {
+                CanonicalUserId::parse(value)
+                    .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+            })?;
+        self.envelope_request(&owner_user_id, request_id)
+            .await?
+            .ok_or(StoreError::EnvelopeRequestNotFound)
+    }
+
     pub async fn insert_envelope(
         &self,
         member_role: &str,
@@ -2164,6 +2366,70 @@ pub struct AgentRunTimelineEvent {
     pub at: String,
 }
 
+/// User-visible status derived from the latest append-only request event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnvelopeRequestStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Provisioned,
+    Stale,
+    Conflict,
+}
+
+impl EnvelopeRequestStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Provisioned => "provisioned",
+            Self::Stale => "stale",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
+/// Immutable request fact plus its latest server-authoritative status event.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvelopeRequestRecord {
+    pub id: Uuid,
+    pub owner_user_id: CanonicalUserId,
+    pub template_id: String,
+    pub template_revision: i64,
+    pub requested_envelope: Envelope,
+    pub status: EnvelopeRequestStatus,
+    pub approval_id: Option<Uuid>,
+    pub envelope_instance_id: Option<String>,
+    pub envelope_digest: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub status_at: String,
+}
+
+pub struct EnvelopeRequestReservationRequest<'a> {
+    pub owner_user_id: &'a CanonicalUserId,
+    pub template_id: &'a str,
+    pub template_revision: i64,
+    pub requested_envelope: &'a Envelope,
+    pub idempotency_key: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvelopeRequestReservation {
+    pub inserted: bool,
+    pub record: EnvelopeRequestRecord,
+}
+
+pub struct EnvelopeRequestStatusUpdate<'a> {
+    pub from: EnvelopeRequestStatus,
+    pub to: EnvelopeRequestStatus,
+    pub approval_id: Option<Uuid>,
+    pub envelope_instance_id: Option<&'a str>,
+    pub envelope_digest: Option<&'a str>,
+    pub reason: Option<&'a str>,
+}
+
 fn validate_task_identity_binding(request: &TaskReservationRequest<'_>) -> Result<(), StoreError> {
     let owner_user_id = CanonicalUserId::parse(request.owner_user_id)
         .map_err(|_| StoreError::InvalidTaskIdentityBinding)?;
@@ -2362,6 +2628,10 @@ pub enum StoreError {
     InvalidTaskTransition,
     InvalidRunQuery,
     InvalidRunCursor,
+    EnvelopeRequestNotFound,
+    EnvelopeRequestIdempotencyConflict,
+    InvalidEnvelopeRequest,
+    InvalidEnvelopeRequestTransition,
 }
 
 impl fmt::Display for StoreError {
@@ -2447,6 +2717,17 @@ impl fmt::Display for StoreError {
             }
             Self::InvalidRunQuery => write!(formatter, "agent-run query is invalid"),
             Self::InvalidRunCursor => write!(formatter, "agent-run cursor is invalid"),
+            Self::EnvelopeRequestNotFound => write!(formatter, "envelope request does not exist"),
+            Self::EnvelopeRequestIdempotencyConflict => {
+                write!(
+                    formatter,
+                    "idempotency key is already bound to another envelope request"
+                )
+            }
+            Self::InvalidEnvelopeRequest => write!(formatter, "envelope request is invalid"),
+            Self::InvalidEnvelopeRequestTransition => {
+                write!(formatter, "envelope request transition is invalid")
+            }
         }
     }
 }
@@ -2580,6 +2861,24 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
          LIMIT 1 \
      ) spend ON true";
 
+const ENVELOPE_REQUEST_COLUMNS: &str = "SELECT requests.id, requests.owner_user_id, requests.template_id, \
+            requests.template_revision, requests.requested_envelope, \
+            status.status, status.approval_id, status.envelope_instance_id, \
+            status.envelope_digest, status.reason, \
+            to_char(requests.created_at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+            to_char(status.at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS status_at \
+     FROM envelope_requests requests \
+     JOIN LATERAL ( \
+         SELECT events.status, events.approval_id, events.envelope_instance_id, \
+                events.envelope_digest, events.reason, events.at \
+         FROM envelope_request_events events \
+         WHERE events.request_id = requests.id \
+         ORDER BY events.at DESC, events.id DESC \
+         LIMIT 1 \
+     ) status ON true ";
+
 fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreError> {
     let observed_amount = row
         .try_get::<Option<String>, _>("observed_amount")
@@ -2648,6 +2947,86 @@ fn agent_run_timeline_event(
         provenance,
         at: row.try_get("at").map_err(database_error)?,
     })
+}
+
+fn envelope_request_record(
+    row: sqlx::postgres::PgRow,
+) -> Result<EnvelopeRequestRecord, StoreError> {
+    let owner_user_id = row
+        .try_get::<String, _>("owner_user_id")
+        .map_err(database_error)
+        .and_then(|value| {
+            CanonicalUserId::parse(value).map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+        })?;
+    let status = envelope_request_status_from_text(
+        &row.try_get::<String, _>("status").map_err(database_error)?,
+    )?;
+    Ok(EnvelopeRequestRecord {
+        id: row.try_get("id").map_err(database_error)?,
+        owner_user_id,
+        template_id: row.try_get("template_id").map_err(database_error)?,
+        template_revision: row.try_get("template_revision").map_err(database_error)?,
+        requested_envelope: row
+            .try_get::<Json<Envelope>, _>("requested_envelope")
+            .map_err(database_error)?
+            .0,
+        status,
+        approval_id: row.try_get("approval_id").map_err(database_error)?,
+        envelope_instance_id: row
+            .try_get("envelope_instance_id")
+            .map_err(database_error)?,
+        envelope_digest: row.try_get("envelope_digest").map_err(database_error)?,
+        reason: row.try_get("reason").map_err(database_error)?,
+        created_at: row.try_get("created_at").map_err(database_error)?,
+        status_at: row.try_get("status_at").map_err(database_error)?,
+    })
+}
+
+fn envelope_request_status_from_text(value: &str) -> Result<EnvelopeRequestStatus, StoreError> {
+    match value {
+        "pending" => Ok(EnvelopeRequestStatus::Pending),
+        "approved" => Ok(EnvelopeRequestStatus::Approved),
+        "rejected" => Ok(EnvelopeRequestStatus::Rejected),
+        "provisioned" => Ok(EnvelopeRequestStatus::Provisioned),
+        "stale" => Ok(EnvelopeRequestStatus::Stale),
+        "conflict" => Ok(EnvelopeRequestStatus::Conflict),
+        _ => Err(StoreError::InvalidEnvelopeRequestTransition),
+    }
+}
+
+const fn valid_envelope_request_transition(
+    from: EnvelopeRequestStatus,
+    to: EnvelopeRequestStatus,
+) -> bool {
+    matches!(
+        (from, to),
+        (
+            EnvelopeRequestStatus::Pending,
+            EnvelopeRequestStatus::Approved
+        ) | (
+            EnvelopeRequestStatus::Pending,
+            EnvelopeRequestStatus::Rejected
+        ) | (
+            EnvelopeRequestStatus::Pending,
+            EnvelopeRequestStatus::Provisioned
+        ) | (EnvelopeRequestStatus::Pending, EnvelopeRequestStatus::Stale)
+            | (
+                EnvelopeRequestStatus::Pending,
+                EnvelopeRequestStatus::Conflict
+            )
+            | (
+                EnvelopeRequestStatus::Approved,
+                EnvelopeRequestStatus::Provisioned
+            )
+            | (
+                EnvelopeRequestStatus::Approved,
+                EnvelopeRequestStatus::Stale
+            )
+            | (
+                EnvelopeRequestStatus::Approved,
+                EnvelopeRequestStatus::Conflict
+            )
+    )
 }
 
 fn runtime_ownership_from_row(

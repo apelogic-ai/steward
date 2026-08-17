@@ -10,6 +10,7 @@ pub mod connections_demo;
 mod connections_ui;
 pub mod google_oidc;
 mod tasks;
+pub mod user_envelopes;
 mod user_ui;
 
 pub use tasks::{
@@ -1966,9 +1967,7 @@ impl IntoResponse for ApiError {
                 StoreError::TaskNotFound
                 | StoreError::CanonicalIdentityNotFound
                 | StoreError::EnvelopeRequestNotFound,
-            ) => {
-                StatusCode::NOT_FOUND
-            }
+            ) => StatusCode::NOT_FOUND,
             Self::Store(StoreError::CanonicalIdentityInactive) => StatusCode::FORBIDDEN,
             Self::TaskNotReady => StatusCode::SERVICE_UNAVAILABLE,
             Self::TaskOutputNotReady => StatusCode::CONFLICT,
