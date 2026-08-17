@@ -175,3 +175,13 @@ No `session-key` Kubernetes key, session-key environment variable, or
 `/apelogic/dev/steward-session-key` reference is part of the product contract. The already-created
 DEV container remains empty and unprojected until the separately reviewed Infra cleanup in
 LBE-247. Its absence must not block initial activation.
+
+The apiserver activates the Google browser surface only when
+`STEWARD_GOOGLE_OIDC_CLIENT_ID` is present. It then requires
+`STEWARD_BROWSER_ORIGIN`, `STEWARD_GOOGLE_WORKSPACE_DOMAIN`,
+`STEWARD_ORGANIZATION_ID`, and `STEWARD_GOOGLE_OIDC_CLIENT_SECRET`; incomplete configuration
+stops rather than exposing an unverifiable sign-in route. The approved DEV values are origin
+`https://steward.dev.apelogic.io`, callback
+`https://steward.dev.apelogic.io/admin/auth/callback`, Workspace domain `apelogic.ai`, and opaque
+organization ID `org_aelogic`. Client ID and the origin/domain/organization values are non-secret
+runtime configuration; the client secret remains secret-projected only.

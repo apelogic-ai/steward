@@ -9,12 +9,13 @@ use axum::serve::Listener;
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{
     KubeRuntimeRepository, KubernetesTaskIdentityResolver, KubernetesTokenAuthenticator,
-    KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog, router, task_router,
+    KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog, agent_runs_ui, browser_auth,
+    google_oidc, router, task_router, user_envelopes,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
 };
-use steward_types::CanonicalUserId;
+use steward_types::{CanonicalUserId, OrganizationId};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{sleep, timeout};
@@ -69,11 +70,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .merge(task_router(
         runtimes,
-        store,
+        store.clone(),
         decisions,
         task_identities,
         task_workflows,
     ));
+    let app = match browser_application_router(store)? {
+        Some(browser) => app.merge(browser),
+        None => app,
+    };
     let listener = tls_listener(
         &env::var("STEWARD_APISERVER_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_owned()),
         &required("STEWARD_TLS_CERT_DER")?,
@@ -82,6 +87,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn browser_application_router(store: PgStore) -> Result<Option<axum::Router>, Box<dyn Error>> {
+    let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
+        return Ok(None);
+    };
+    let origin = required("STEWARD_BROWSER_ORIGIN")?;
+    let config = browser_auth::GoogleOidcConfig::new(
+        client_id,
+        &origin,
+        format!("{origin}/admin/auth/callback"),
+        required("STEWARD_GOOGLE_WORKSPACE_DOMAIN")?,
+        OrganizationId::parse(required("STEWARD_ORGANIZATION_ID")?)?,
+    )
+    .map_err(io::Error::other)?;
+    let provider = google_oidc::GoogleOidcProvider::new(
+        config.clone(),
+        required("STEWARD_GOOGLE_OIDC_CLIENT_SECRET")?,
+    )
+    .map_err(io::Error::other)?;
+    let auth = browser_auth::BrowserAuthService::google(
+        config,
+        Arc::new(provider),
+        Arc::new(browser_auth::PgBrowserIdentityResolver::new(store.clone())),
+    )
+    .map_err(io::Error::other)?;
+    Ok(Some(
+        browser_auth::browser_auth_router(auth.clone())
+            .merge(user_envelopes::protected_router(
+                user_envelopes::PgEnvelopeRequestBroker::new(store.clone()),
+                auth.clone(),
+            ))
+            .merge(agent_runs_ui::protected_router(store, auth)),
+    ))
 }
 
 async fn bootstrap_rbac(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
