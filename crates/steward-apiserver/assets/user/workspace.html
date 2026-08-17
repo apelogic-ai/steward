@@ -64,6 +64,30 @@
         <p id="envelope-detail-message" role="status">Loading authoritative request…</p>
         <div id="envelope-detail" class="request-form-layout" hidden>
           <dl class="detail-list"></dl>
+          <section aria-labelledby="envelope-authority-heading">
+            <h2 id="envelope-authority-heading">Requested and approved authority</h2>
+            <dl class="detail-list">
+              <dt>Requested tools</dt><dd id="requested-tools">Loading…</dd>
+              <dt>Approved tools</dt><dd id="approved-tools">Loading…</dd>
+              <dt>Requested models</dt><dd id="requested-models">Loading…</dd>
+              <dt>Approved models</dt><dd id="approved-models">Loading…</dd>
+              <dt>Requested inference budget</dt><dd id="requested-budget">Loading…</dd>
+              <dt>Approved inference budget</dt><dd id="approved-budget">Loading…</dd>
+              <dt>Requested max run time</dt><dd id="requested-runtime">Loading…</dd>
+              <dt>Approved max run time</dt><dd id="approved-runtime">Loading…</dd>
+            </dl>
+            <h3>Advanced properties</h3>
+            <dl class="detail-list">
+              <dt>Requested runner platform</dt><dd id="requested-platform">Loading…</dd>
+              <dt>Approved runner platform</dt><dd id="approved-platform">Loading…</dd>
+              <dt>Requested runner memory</dt><dd id="requested-memory">Loading…</dd>
+              <dt>Approved runner memory</dt><dd id="approved-memory">Loading…</dd>
+              <dt>Requested runner compute</dt><dd id="requested-compute">Loading…</dd>
+              <dt>Approved runner compute</dt><dd id="approved-compute">Loading…</dd>
+              <dt>Requested runner storage</dt><dd id="requested-storage">Loading…</dd>
+              <dt>Approved runner storage</dt><dd id="approved-storage">Loading…</dd>
+            </dl>
+          </section>
           <div class="detail-actions"><a id="envelope-runs-link" class="button secondary" href="#">Recent runs</a></div>
         </div>
       </section>
@@ -87,6 +111,10 @@
             <ol id="run-timeline" class="run-timeline" aria-live="polite"></ol>
           </section>
         </div>
+      </section>
+      <section data-page="/settings" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Organization access</p><h1>Settings</h1></div></div>
+        <div class="callout"><p>Your signed-in organization identity is shown in the navigation. Account and access administration remains with your SSO provider.</p></div>
       </section>
     </main>
   </body>

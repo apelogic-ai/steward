@@ -16,6 +16,17 @@ function activePage() {
   return path;
 }
 
+const PAGE_TITLES = {
+  "/envelopes": "Envelopes · Steward",
+  "/envelopes/new": "New envelope · Steward",
+  "/envelopes/detail": "Envelope · Steward",
+  "/envelopes/runs": "Envelope runs · Steward",
+  "/runs": "Runs · Steward",
+  "/runs/detail": "Run · Steward",
+  "/settings": "Settings · Steward",
+};
+document.title = PAGE_TITLES[activePage()] ?? "Steward";
+
 for (const page of pages) page.hidden = page.dataset.page !== activePage();
 for (const link of document.querySelectorAll("[data-route]")) {
   if (link.dataset.route === activePage()) link.setAttribute("aria-current", "page");
@@ -31,7 +42,9 @@ function setupAccordions() {
   for (const details of document.querySelectorAll("details[data-accordion]")) {
     const name = details.dataset.accordion;
     if (!ACCORDIONS.has(name)) continue;
-    try { details.open = localStorage.getItem(`${ACCORDION_PREFIX}${name}`) === "open"; } catch (_) { /* Preferences are optional. */ }
+    try {
+      if (localStorage.getItem(`${ACCORDION_PREFIX}${name}`) === "open") details.open = true;
+    } catch (_) { /* Preferences are optional. */ }
     details.addEventListener("toggle", () => {
       try { localStorage.setItem(`${ACCORDION_PREFIX}${name}`, details.open ? "open" : "closed"); } catch (_) { /* Preferences are optional. */ }
     });
@@ -151,6 +164,28 @@ function renderDelta(template) {
   else text(delta, "Within the automatic threshold. Steward will attempt provisioning after server-side validation.");
 }
 
+function detailValue(id, value) {
+  text(document.querySelector(`#${id}`), value);
+}
+
+function renderEnvelopeAuthority(request) {
+  const spec = request.requestedEnvelope?.spec;
+  const unknownApproval = "Not recorded by the current approval authority.";
+  const unknownRunner = "Not recorded by the current envelope authority.";
+  detailValue("requested-tools", spec?.tools?.length ? spec.tools.map((tool) => `${tool.provider}:${tool.resource}:${tool.action}`).join(", ") : "None requested.");
+  detailValue("approved-tools", unknownApproval);
+  detailValue("requested-models", spec?.llms?.length ? spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ") : "None requested.");
+  detailValue("approved-models", unknownApproval);
+  detailValue("requested-budget", spec?.budget ? `${spec.budget.monthlyLimit} ${spec.budget.currency}` : "Not recorded.");
+  detailValue("approved-budget", unknownApproval);
+  detailValue("requested-runtime", spec?.ttl ?? "Not recorded.");
+  detailValue("approved-runtime", unknownApproval);
+  for (const field of ["platform", "memory", "compute", "storage"]) {
+    detailValue(`requested-${field}`, unknownRunner);
+    detailValue(`approved-${field}`, unknownApproval);
+  }
+}
+
 async function csrf() { return (await fetch("/admin/api/v1/session")).json(); }
 
 async function loadNewEnvelope() {
@@ -196,6 +231,7 @@ async function loadDetail() {
     const request = response.request;
     const rows = [["Status", request.status], ["Template", `${request.templateId} · revision ${request.templateRevision}`], ["Requested", request.createdAt], ["Status recorded", request.statusAt], ["Envelope instance", request.envelopeInstanceId || "Not provisioned"], ["Digest", request.envelopeDigest || "Not provisioned"], ["Reason", request.reason || "None recorded"]];
     details.replaceChildren(...rows.flatMap(([term, value]) => [create("dt", term), create("dd", value)]));
+    renderEnvelopeAuthority(request);
     container.querySelector("#envelope-runs-link").href = `/envelopes/${request.id}/runs`;
     container.hidden = false;
     text(message, "");

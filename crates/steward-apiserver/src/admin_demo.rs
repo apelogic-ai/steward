@@ -27,7 +27,8 @@ use crate::{
     connections,
     connections_demo::LocalConnectionsBroker,
     protect_admin_routes,
-    user_envelopes_demo::LocalEmptyAgentRunLedger,
+    user_envelopes::protected_router as protected_envelope_router,
+    user_envelopes_demo::{LocalEmptyAgentRunLedger, LocalEnvelopeRequestBroker},
 };
 
 const LOCAL_DEMO_BEARER: &str = "steward-local-demo";
@@ -257,13 +258,12 @@ async fn normalize_loopback_demo_origin(mut request: Request<Body>, next: Next) 
                         .parse::<std::net::IpAddr>()
                         .is_ok_and(|address| address.is_loopback())
             });
-        if loopback && host.is_some_and(|value| origin == Some(format!("http://{value}").as_str()))
-        {
-            if let Some(replacement) = host
+        if loopback
+            && host.is_some_and(|value| origin == Some(format!("http://{value}").as_str()))
+            && let Some(replacement) = host
                 .and_then(|value| HeaderValue::from_str(format!("https://{value}").as_str()).ok())
-            {
-                request.headers_mut().insert(header::ORIGIN, replacement);
-            }
+        {
+            request.headers_mut().insert(header::ORIGIN, replacement);
         }
     }
     next.run(request).await
@@ -311,6 +311,10 @@ fn oidc_connections_router(origin: &str, identity: LocalFakeIdentity) -> Result<
     let broker = LocalConnectionsBroker::<BrowserSessionBinding>::new(bind)?;
     Ok(browser_auth_router(browser_auth.clone())
         .merge(connections::protected_router(broker, browser_auth.clone()))
+        .merge(protected_envelope_router(
+            LocalEnvelopeRequestBroker::new(),
+            browser_auth.clone(),
+        ))
         .merge(protected_agent_runs_router(
             LocalEmptyAgentRunLedger,
             browser_auth,
@@ -647,6 +651,32 @@ mod tests {
             .map_err(|error| format!("request OIDC callback: {error}"))?;
         assert_eq!(signed_in.status(), StatusCode::SEE_OTHER);
         let session_cookie = cookie_pair(&signed_in, "steward-local-session")?;
+
+        for path in [
+            "/envelopes",
+            "/runs",
+            "/settings",
+            "/app/api/v1/envelope-templates",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::COOKIE, &session_cookie)
+                        .body(Body::empty())
+                        .map_err(|error| {
+                            format!("build signed-in workspace request {path}: {error}")
+                        })?,
+                )
+                .await
+                .map_err(|error| format!("request signed-in workspace route {path}: {error}"))?;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "the signed-in localhost demo must compose the workspace route {path}"
+            );
+        }
 
         let session = app
             .clone()

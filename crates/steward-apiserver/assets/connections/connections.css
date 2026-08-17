@@ -64,6 +64,39 @@ main {
   margin-inline: auto;
 }
 
+.shared-topbar {
+  width: min(68rem, calc(100% - 2rem));
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  margin: 0 auto;
+  padding: 1.2rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.shared-topbar nav {
+  display: flex;
+  flex: 1;
+  gap: 1rem;
+}
+
+.shared-topbar a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.shared-topbar a[aria-current="page"] {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.signed-in-email {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
 .topbar {
   display: flex;
   align-items: baseline;
@@ -353,6 +386,22 @@ dialog::backdrop {
 }
 
 @media (max-width: 38rem) {
+  .shared-topbar {
+    width: min(100% - 1rem, 68rem);
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .shared-topbar nav {
+    order: 3;
+    flex-basis: 100%;
+    flex-wrap: wrap;
+  }
+
+  .signed-in-email {
+    margin-left: 0;
+  }
+
   .topbar,
   main {
     width: min(100% - 1rem, 58rem);

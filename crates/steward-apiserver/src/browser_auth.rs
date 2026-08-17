@@ -632,7 +632,7 @@ struct LoginQuery {
 }
 
 fn default_return_to() -> String {
-    "/admin/connections".to_owned()
+    "/envelopes".to_owned()
 }
 
 async fn login(
@@ -1038,11 +1038,14 @@ impl PendingAuthorization {
             return_to,
             "/admin/connections"
                 | "/admin/session-ready"
+                | "/envelopes"
+                | "/envelopes/new"
                 | "/app"
                 | "/app/envelopes"
                 | "/app/envelopes/new"
                 | "/app/runs"
                 | "/runs"
+                | "/settings"
         ) {
             return Err(BrowserAuthError::InvalidRedirect);
         }
@@ -1247,10 +1250,10 @@ mod tests {
     };
 
     #[test]
-    fn sign_in_journey_lands_on_connections_instead_of_the_session_fixture() {
+    fn sign_in_journey_lands_on_the_envelope_workspace_instead_of_a_fixture() {
         assert!(
-            super::SIGN_IN_HTML.contains("returnTo=%2Fadmin%2Fconnections"),
-            "the user-bound credential journey must continue directly to Connections"
+            super::SIGN_IN_HTML.contains("returnTo=%2Fenvelopes"),
+            "the user-bound journey must continue directly to Envelopes"
         );
         assert!(
             !super::SIGN_IN_HTML.contains("returnTo=%2Fadmin%2Fsession-ready"),
@@ -1261,11 +1264,14 @@ mod tests {
     #[test]
     fn user_workspace_return_paths_are_exactly_allowlisted() {
         for path in [
+            "/envelopes",
+            "/envelopes/new",
             "/app",
             "/app/envelopes",
             "/app/envelopes/new",
             "/app/runs",
             "/runs",
+            "/settings",
         ] {
             assert!(
                 PendingAuthorization::new(path, 100).is_ok(),
@@ -1818,7 +1824,7 @@ mod tests {
         assert_eq!(callback.status(), StatusCode::SEE_OTHER);
         assert_eq!(
             callback.headers().get(header::LOCATION),
-            Some(&header::HeaderValue::from_static("/admin/connections"))
+            Some(&header::HeaderValue::from_static("/envelopes"))
         );
         let session_cookie = cookie_pair(&callback, "steward-local-session")?;
         assert!(!session_cookie.ends_with(&prior.token));

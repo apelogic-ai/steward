@@ -10,16 +10,16 @@
   </head>
   <body>
     <a class="skip-link" href="#connections-workspace">Skip to connections</a>
-    <header class="topbar">
-      <a class="brand" href="/app">Steward</a>
-      <span class="surface-label">Connections</span>
+    <header class="shared-topbar">
+      <a class="brand" href="/envelopes">Steward</a>
+      <nav aria-label="Steward primary navigation">
+        <a href="/envelopes">Envelopes</a>
+        <a href="/runs">Runs</a>
+        <a href="/admin/connections" aria-current="page">Connections</a>
+        <a href="/settings">Settings</a>
+      </nav>
+      <span id="signed-in-email" class="signed-in-email" aria-live="polite">Loading session…</span>
     </header>
-    <nav class="user-nav" aria-label="Steward user workspace">
-      <a href="/app/envelopes">My Envelopes</a>
-      <a href="/app/envelopes/new">New envelope</a>
-      <a href="/app/runs">My Runs</a>
-      <a href="/admin/connections" aria-current="page">Connections</a>
-    </nav>
 
     <main id="connections-workspace" tabindex="-1">
       <section class="intro" aria-labelledby="connections-heading">

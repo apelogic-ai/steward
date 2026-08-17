@@ -6,6 +6,7 @@ const CONNECTIONS_VERSION = "steward.connections/v1";
 const providerCard = document.querySelector(".provider-card");
 const principalEmail = document.querySelector("#principal-email");
 const canonicalUser = document.querySelector("#canonical-user");
+const signedInEmail = document.querySelector("#signed-in-email");
 const githubStatus = document.querySelector("#github-status");
 const githubSummary = document.querySelector("#github-summary");
 const githubAccount = document.querySelector("#github-account");
@@ -147,6 +148,7 @@ async function loadSession() {
   }
   principalEmail.textContent = value.principal.displayEmail;
   canonicalUser.textContent = value.principal.userId;
+  signedInEmail.textContent = value.principal.displayEmail;
   csrf = value.csrf;
 }
 

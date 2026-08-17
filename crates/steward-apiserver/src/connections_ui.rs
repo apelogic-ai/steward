@@ -133,11 +133,12 @@ mod tests {
             "<dialog",
             "id=\"scope-status\"",
             "id=\"connection-error\"",
-            "aria-label=\"Steward user workspace\"",
-            "href=\"/app/envelopes\"",
-            "href=\"/app/envelopes/new\"",
-            "href=\"/app/runs\"",
-            "href=\"/app\"",
+            "aria-label=\"Steward primary navigation\"",
+            "href=\"/envelopes\"",
+            "href=\"/runs\"",
+            "href=\"/admin/connections\" aria-current=\"page\"",
+            "href=\"/settings\"",
+            "id=\"signed-in-email\"",
         ] {
             assert!(
                 CONNECTIONS_HTML.contains(required),
@@ -159,6 +160,7 @@ mod tests {
             "candidate.pathname === \"/admin/connections/github/callback\"",
             "callbackStatus.textContent = \"GitHub connected.\"",
             "callbackStatus.hidden = true",
+            "signedInEmail.textContent = value.principal.displayEmail",
         ] {
             assert!(
                 CONNECTIONS_JS.contains(required),

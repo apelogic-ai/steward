@@ -19,6 +19,7 @@ where
         .route("/envelopes/{request_id}/runs", get(shell))
         .route("/runs", get(shell))
         .route("/runs/{task_uid}", get(shell))
+        .route("/settings", get(shell))
         .route("/app", get(shell))
         .route("/app/envelopes", get(shell))
         .route("/app/envelopes/new", get(shell))
@@ -53,6 +54,10 @@ async fn stylesheet() -> Response {
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
     use super::{USER_WORKSPACE_HTML, USER_WORKSPACE_JS};
 
     #[test]
@@ -64,6 +69,7 @@ mod tests {
             "/envelopes/{request_id}/runs",
             "/runs",
             "/runs/{task_uid}",
+            "/settings",
             "/admin/connections",
         ] {
             assert!(USER_WORKSPACE_HTML.contains(route));
@@ -75,6 +81,10 @@ mod tests {
         assert!(
             USER_WORKSPACE_JS.contains("steward.ui.envelope-accordion."),
             "only the envelope accordion visibility preference may use local storage"
+        );
+        assert!(
+            USER_WORKSPACE_JS.contains("document.title = PAGE_TITLES[activePage()]"),
+            "each workspace route must expose its own document title"
         );
     }
 
@@ -93,6 +103,10 @@ mod tests {
             "data-accordion=\"approved\"",
             "data-accordion=\"in-review\"",
             "Recent runs",
+            "Requested tools",
+            "Approved tools",
+            "Requested runner platform",
+            "Approved runner platform",
         ] {
             assert!(
                 USER_WORKSPACE_HTML.contains(required),
@@ -103,5 +117,20 @@ mod tests {
             !USER_WORKSPACE_HTML.contains("data-accordion=\"templates\" open"),
             "envelope groups must default to collapsed"
         );
+    }
+
+    #[tokio::test]
+    async fn settings_is_a_protected_workspace_destination() -> Result<(), String> {
+        let response = super::router::<()>()
+            .oneshot(
+                Request::builder()
+                    .uri("/settings")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build Settings request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request Settings workspace: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
     }
 }

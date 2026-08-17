@@ -8,8 +8,6 @@ import { expect, test } from "@playwright/test";
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 let demo;
 let origin;
-let envelopeDemo;
-let envelopeOrigin;
 
 function startLoopbackDemo() {
   return new Promise((resolve, reject) => {
@@ -84,50 +82,6 @@ async function stopLoopbackDemo(child) {
   }
 }
 
-function startEnvelopeDemo() {
-  return new Promise((resolve, reject) => {
-    const child = spawn(
-      "cargo",
-      ["run", "-p", "steward-apiserver", "--locked", "--features", "admin-demo", "--example", "user-envelope-demo", "--", "--bind", "127.0.0.1:0"],
-      { cwd: repository, stdio: ["ignore", "pipe", "pipe"] },
-    );
-    let output = "";
-    let settled = false;
-    const timeout = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        child.kill("SIGINT");
-        reject(new Error(`loopback envelope demo did not become ready:\n${output}`));
-      }
-    }, 30_000);
-    const inspect = (chunk) => {
-      output = `${output}${chunk}`.slice(-16_384);
-      const match = output.match(/Steward envelope localhost demo: (http:\/\/127\.0\.0\.1:\d+)/);
-      if (match && !settled) {
-        settled = true;
-        clearTimeout(timeout);
-        resolve({ child, origin: match[1], output });
-      }
-    };
-    child.stdout.on("data", inspect);
-    child.stderr.on("data", inspect);
-    child.once("error", (error) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timeout);
-        reject(error);
-      }
-    });
-    child.once("exit", (code, signal) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timeout);
-        reject(new Error(`loopback envelope demo exited before readiness (${code ?? signal}):\n${output}`));
-      }
-    });
-  });
-}
-
 async function guardedPage(browser, viewport) {
   const context = await browser.newContext({ viewport });
   await context.addInitScript(() => {
@@ -172,28 +126,16 @@ async function signIn(page) {
   await page.goto(`${origin}/admin/sign-in`);
   await expect(page.getByRole("heading", { name: "Sign in to Steward" })).toBeVisible();
   await page.getByRole("link", { name: "Continue with Google" }).click();
-  await expect(page).toHaveURL(`${origin}/admin/connections`);
-  await expect(page.getByRole("heading", { name: "Connections" })).toBeVisible();
-}
-
-async function signInEnvelope(page) {
-  await page.context().clearCookies();
-  await page.goto(`${envelopeOrigin}/admin/sign-in`);
-  await expect(page.getByRole("heading", { name: "Sign in to Steward" })).toBeVisible();
-  await page.getByRole("link", { name: "Continue with Google" }).click();
-  await expect(page).toHaveURL(`${envelopeOrigin}/envelopes`);
+  await expect(page).toHaveURL(`${origin}/envelopes`);
 }
 
 test.beforeAll(async () => {
   demo = await startLoopbackDemo();
   origin = demo.origin;
-  envelopeDemo = await startEnvelopeDemo();
-  envelopeOrigin = envelopeDemo.origin;
 });
 
 test.afterAll(async () => {
   await stopLoopbackDemo(demo?.child);
-  await stopLoopbackDemo(envelopeDemo?.child);
 });
 
 test("user can sign in, navigate shared top navigation, and connect then disconnect GitHub", async ({ browser }) => {
@@ -201,6 +143,17 @@ test("user can sign in, navigate shared top navigation, and connect then disconn
   try {
     const { page } = session;
     await signIn(page);
+
+    const navigation = page.getByRole("navigation", { name: "Steward primary navigation" });
+    for (const label of ["Envelopes", "Runs", "Connections", "Settings"]) {
+      await expect(navigation.getByRole("link", { name: label, exact: true })).toBeVisible();
+    }
+    await expect(page.locator("#signed-in-email")).toHaveText("alice@example.com");
+
+    await navigation.getByRole("link", { name: "Connections", exact: true }).click();
+    await expect(page).toHaveURL(`${origin}/admin/connections`);
+    await expect(page.getByRole("heading", { name: "Connections" })).toBeVisible();
+    await expect(page.locator("#signed-in-email")).toHaveText("alice@example.com");
 
     await expect(page.locator("#github-status")).toHaveText("Not connected");
     await page.getByRole("button", { name: "Connect GitHub" }).click();
@@ -212,18 +165,15 @@ test("user can sign in, navigate shared top navigation, and connect then disconn
     await disconnectDialog.getByRole("button", { name: "Disconnect GitHub", exact: true }).click();
     await expect(page.locator("#github-status")).toHaveText("Not connected");
 
-    await signInEnvelope(page);
-    const navigation = page.getByRole("navigation", { name: "Steward primary navigation" });
-    for (const label of ["Envelopes", "Runs", "Connections", "Settings"]) {
-      await expect(navigation.getByRole("link", { name: label, exact: true })).toBeVisible();
-    }
-    await expect(page.locator("#signed-in-email")).toHaveText("alice@example.com");
+    await navigation.getByRole("link", { name: "Envelopes", exact: true }).click();
+    await expect(page).toHaveURL(`${origin}/envelopes`);
     await navigation.getByRole("link", { name: "Runs", exact: true }).click();
-    await expect(page).toHaveURL(`${envelopeOrigin}/runs`);
+    await expect(page).toHaveURL(`${origin}/runs`);
+    await expect(page).toHaveTitle("Runs · Steward");
     await expect(page.getByRole("heading", { name: "Runs" })).toBeVisible();
     await expect(page.locator("#runs-list")).toContainText("No runs are recorded for your identity.");
     await navigation.getByRole("link", { name: "Envelopes", exact: true }).click();
-    await expect(page).toHaveURL(`${envelopeOrigin}/envelopes`);
+    await expect(page).toHaveURL(`${origin}/envelopes`);
     for (const name of ["Templates", "Drafts", "Approved", "In Review"]) {
       await expect(page.locator(`details[data-accordion=\"${name.toLowerCase().replace(" ", "-")}\"]`)).toHaveJSProperty("open", false);
     }
@@ -233,16 +183,24 @@ test("user can sign in, navigate shared top navigation, and connect then disconn
     await expect(templates).toContainText("Engineer · revision 3");
     await page.reload();
     await expect(templates).toHaveJSProperty("open", true);
-    await page.goto(`${envelopeOrigin}/envelopes/new`);
+    await page.goto(`${origin}/envelopes/new`);
     await expect(page.getByRole("heading", { name: "New envelope" })).toBeVisible();
     await expect(page.getByRole("combobox", { name: "Template" })).toHaveValue("engineer");
     await page.getByRole("button", { name: "Request envelope" }).click();
     await expect(page).toHaveURL(/\/envelopes\/[0-9a-f-]{36}$/);
     await expect(page.getByRole("heading", { name: "Envelope form" })).toBeVisible();
     await expect(page.locator("#envelope-detail")).toContainText("provisioned");
+    await expect(page.locator("#requested-tools")).toContainText("github:repository:get_file_contents");
+    await expect(page.locator("#requested-models")).toContainText("openai/gpt-5.4");
+    await expect(page.locator("#approved-tools")).toContainText("Not recorded by the current approval authority.");
+    await expect(page.locator("#requested-platform")).toContainText("Not recorded by the current envelope authority.");
     await page.getByRole("link", { name: "Recent runs" }).click();
     await expect(page.getByRole("heading", { name: "Recent runs" })).toBeVisible();
     await expect(page.locator("#envelope-runs-list")).toContainText("No recent runs are recorded for this envelope instance.");
+    await page.getByRole("link", { name: "Settings", exact: true }).click();
+    await expect(page).toHaveURL(`${origin}/settings`);
+    await expect(page).toHaveTitle("Settings · Steward");
+    await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
   } finally {
     await closeGuardedPage(session);
   }
@@ -253,7 +211,6 @@ test("narrow user navigation remains available without horizontal overflow", asy
   try {
     const { page } = session;
     await signIn(page);
-    await signInEnvelope(page);
     const navigation = page.getByRole("navigation", { name: "Steward primary navigation" });
     await expect(navigation).toBeVisible();
     await expect
