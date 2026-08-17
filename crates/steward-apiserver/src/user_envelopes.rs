@@ -6,7 +6,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_admission::{AdmissionDecision, Envelope, evaluate, validate_envelope};
@@ -16,10 +16,14 @@ use steward_store::{
 use steward_types::{AgentRuntimeSpec, AgentType, CanonicalUserId, Email, Principal};
 use uuid::Uuid;
 
-use crate::BoxFuture;
 use crate::browser_auth::{
     BrowserAuthService, BrowserMutationProof, BrowserSessionBinding, BrowserSessionContext,
     protect_browser_routes,
+};
+use crate::{
+    BoxFuture, GITHUB_ACTIONS_RENDER_REQUEST_SCHEMA, GITHUB_FILE_READ_TEMPLATE,
+    GithubActionsEnvelopeSelection, GithubActionsRenderContext, GithubActionsRenderRequest,
+    GithubActionsTaskTemplate, render_github_actions_workflow, reviewed_steward_run_release_v1,
 };
 
 pub const ENVELOPE_REQUESTS_API_VERSION: &str = "steward.envelope-requests/v1";
@@ -104,6 +108,14 @@ struct CreateEnvelopeRequestBody {
     template_revision: i64,
     requested_envelope: Envelope,
     idempotency_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RenderGithubActionsWorkflowBody {
+    repository: String,
+    revision: String,
+    path: String,
 }
 
 /// Submission passed only after the HTTP boundary has derived its canonical owner, required an
@@ -302,6 +314,10 @@ where
             "/app/api/v1/envelope-requests/{request_id}",
             get(get_request::<P, B>),
         )
+        .route(
+            "/app/api/v1/envelope-requests/{request_id}/github-actions-workflow",
+            post(render_github_actions_for_envelope::<P, B>),
+        )
         .with_state(UserEnvelopeState { broker })
 }
 
@@ -481,6 +497,83 @@ where
     }
 }
 
+async fn render_github_actions_for_envelope<P, B>(
+    session: Option<Extension<UserEnvelopeSession<B>>>,
+    proof: Option<Extension<UserEnvelopeMutationProof>>,
+    State(state): State<UserEnvelopeState<P>>,
+    Path(request_id): Path<Uuid>,
+    Json(body): Json<RenderGithubActionsWorkflowBody>,
+) -> Response
+where
+    P: EnvelopeRequestBroker<B>,
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if proof.is_none() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let request = match state.broker.get(&session, request_id).await {
+        Ok(Some(request)) => request,
+        Ok(None) | Err(EnvelopeRequestBrokerError::NotFound) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(error) => return broker_error_response(error),
+    };
+    let Some(context) = github_actions_context(&request) else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let render_request = GithubActionsRenderRequest {
+        schema_version: GITHUB_ACTIONS_RENDER_REQUEST_SCHEMA.to_owned(),
+        envelope: context.current_envelope.clone(),
+        release: context.reviewed_release.clone(),
+        task_template: GithubActionsTaskTemplate {
+            id: GITHUB_FILE_READ_TEMPLATE.to_owned(),
+            repository: body.repository,
+            revision: body.revision,
+            path: body.path,
+        },
+    };
+    match render_github_actions_workflow(&render_request, &context) {
+        Ok(workflow) => Json(serde_json::json!({
+            "apiVersion": ENVELOPE_REQUESTS_API_VERSION,
+            "workflow": workflow,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    }
+}
+
+fn github_actions_context(request: &UserEnvelopeRequest) -> Option<GithubActionsRenderContext> {
+    if request.status != EnvelopeRequestStatus::Provisioned {
+        return None;
+    }
+    let approved_envelope = request.approved_envelope.as_ref()?;
+    let envelope_id = request.envelope_instance_id.as_ref()?;
+    let envelope_digest = request.envelope_digest.as_ref()?;
+    let revision = u64::try_from(request.template_revision).ok()?;
+    let has_github_file_read_authority = approved_envelope.spec.tools.iter().any(|tool| {
+        tool.provider == "github"
+            && tool.resource == "repository"
+            && tool.action == "get_file_contents"
+    });
+    let allowed_task_templates = if has_github_file_read_authority {
+        vec![GITHUB_FILE_READ_TEMPLATE.to_owned()]
+    } else {
+        Vec::new()
+    };
+    Some(GithubActionsRenderContext {
+        current_envelope: GithubActionsEnvelopeSelection {
+            id: envelope_id.clone(),
+            revision,
+            digest: envelope_digest.clone(),
+        },
+        reviewed_release: reviewed_steward_run_release_v1(),
+        allowed_task_templates,
+    })
+}
+
 fn envelope_as_user_runtime(
     envelope: &Envelope,
     subject: &UserEnvelopeSubject,
@@ -555,10 +648,32 @@ mod tests {
         fn get<'a>(
             &'a self,
             _session: &'a UserEnvelopeSession<()>,
-            _request_id: Uuid,
+            request_id: Uuid,
         ) -> BoxFuture<'a, Result<Option<UserEnvelopeRequest>, EnvelopeRequestBrokerError>>
         {
-            Box::pin(async { Ok(None) })
+            let approved_envelope = template()
+                .auto_provision_threshold
+                .ok_or(EnvelopeRequestBrokerError::Unavailable);
+            Box::pin(async move {
+                let approved_envelope = approved_envelope?;
+                Ok(Some(UserEnvelopeRequest {
+                    id: request_id,
+                    template_id: "engineer".to_owned(),
+                    template_revision: 3,
+                    requested_envelope: approved_envelope.clone(),
+                    approved_envelope: Some(approved_envelope),
+                    status: EnvelopeRequestStatus::Provisioned,
+                    approval_id: None,
+                    envelope_instance_id: Some("env_local_test".to_owned()),
+                    envelope_digest: Some(
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_owned(),
+                    ),
+                    reason: None,
+                    created_at: "2026-08-17T00:00:00Z".to_owned(),
+                    status_at: "2026-08-17T00:00:00Z".to_owned(),
+                }))
+            })
         }
 
         fn create<'a>(
@@ -693,6 +808,49 @@ mod tests {
             .map_err(|_| "read broker owners".to_owned())?;
         assert_eq!(owners.len(), 1);
         assert_eq!(owners[0].as_str(), "usr_0123456789abcdef0123456789abcdef");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provisioned_envelope_renders_only_the_server_bound_pinned_workflow()
+    -> Result<(), String> {
+        let app = inner_router(TestBroker::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests/00000000-0000-0000-0000-000000000001/github-actions-workflow")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "repository": "example-org/example-repository",
+                            "revision": "0123456789abcdef0123456789abcdef01234567",
+                            "path": "README.md",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build render request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("render request: {error}"))?;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a provisioned envelope must yield only server-bound, pinned workflow YAML"
+        );
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read render response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse render response: {error}"))?;
+        let yaml = value["workflow"]["yaml"]
+            .as_str()
+            .ok_or_else(|| "render response omitted YAML".to_owned())?;
+        assert!(yaml.contains("# envelope-id: env_local_test"));
+        assert!(yaml.contains("uses: apelogic-ai/steward-run/.github/workflows/steward-task.yml@"));
+        assert!(!yaml.contains("contents: write"));
         Ok(())
     }
 

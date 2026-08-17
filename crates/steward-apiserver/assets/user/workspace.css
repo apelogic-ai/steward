@@ -120,6 +120,42 @@
   gap: 0.75rem;
 }
 
+.github-actions-workflow {
+  display: grid;
+  gap: 1rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--border);
+}
+
+.github-actions-workflow > p {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.generated-workflow {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.generated-workflow textarea {
+  min-height: 20rem;
+  padding: 0.8rem;
+  resize: vertical;
+  color: var(--text);
+  background: var(--surface-muted);
+  border: 1px solid var(--border-strong);
+  border-radius: 0.5rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.generated-workflow p {
+  margin: 0;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
 .run-timeline {
   display: grid;
   gap: 0.75rem;

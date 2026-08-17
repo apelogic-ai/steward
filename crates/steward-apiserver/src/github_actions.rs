@@ -8,6 +8,10 @@ pub const GITHUB_ACTIONS_RENDER_REQUEST_SCHEMA: &str = "steward/github-actions-r
 pub const GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA: &str = "steward/github-actions-rendered-workflow/v1";
 pub const GITHUB_FILE_READ_TEMPLATE: &str = "github-file-read/v1";
 
+const REVIEWED_STEWARD_RUN_WORKFLOW_COMMIT: &str = "9c7487bd18d5e90b24b3e4b296bfdd232a3f4f5a";
+const REVIEWED_STEWARD_RUN_ACTION_COMMIT: &str = "b26790e29ce9c243c6a7aa00450a2a1a98fbd250";
+const REVIEWED_STEWARD_RUN_JOB_CONTAINER: &str = "663383948333.dkr.ecr.us-east-1.amazonaws.com/steward-run@sha256:27235891b596debb1d8bba5f7763e14a56ce4435e2fc82f3de80122b19ff8c61";
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GithubActionsEnvelopeSelection {
@@ -59,6 +63,18 @@ pub struct GeneratedGithubActionsWorkflow {
     pub content_type: String,
     pub sha256: String,
     pub yaml: String,
+}
+
+/// The reviewed, immutable steward-run release used by the v1 generator contract.
+/// Any release change must be an explicit renderer-contract update with a new golden fixture.
+pub fn reviewed_steward_run_release_v1() -> StewardRunRelease {
+    StewardRunRelease {
+        manifest_schema_version: 4,
+        version: "0.3.7".to_owned(),
+        workflow_commit: REVIEWED_STEWARD_RUN_WORKFLOW_COMMIT.to_owned(),
+        action_commit: REVIEWED_STEWARD_RUN_ACTION_COMMIT.to_owned(),
+        governed_job_container_image: REVIEWED_STEWARD_RUN_JOB_CONTAINER.to_owned(),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

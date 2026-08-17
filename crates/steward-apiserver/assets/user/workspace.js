@@ -254,6 +254,64 @@ function renderEnvelopeAuthority(request) {
   }
 }
 
+function workflowPanelFor(request) {
+  const panel = document.querySelector("#github-actions-workflow");
+  const message = document.querySelector("#github-actions-workflow-message");
+  const canRender = request.status === "provisioned"
+    && request.approvedEnvelope
+    && request.envelopeInstanceId
+    && request.envelopeDigest;
+  panel.hidden = !canRender;
+  if (!canRender) text(message, "");
+  return canRender ? panel : null;
+}
+
+async function generateGithubActionsWorkflow(event) {
+  event.preventDefault();
+  const form = document.querySelector("#github-actions-workflow-form");
+  const message = document.querySelector("#github-actions-workflow-message");
+  const button = document.querySelector("#generate-github-actions-workflow");
+  const requestId = form.dataset.requestId;
+  button.disabled = true;
+  text(message, "Generating exact YAML…");
+  try {
+    const session = await csrf();
+    const response = await fetch(`${API}/envelope-requests/${requestId}/github-actions-workflow`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-steward-csrf": session.csrf },
+      body: JSON.stringify({
+        repository: document.querySelector("#github-repository").value.trim(),
+        revision: document.querySelector("#github-revision").value.trim(),
+        path: document.querySelector("#github-path").value.trim(),
+      }),
+    });
+    if (!response.ok) throw new Error(`Workflow could not be generated (${response.status}).`);
+    const payload = await response.json();
+    const workflow = payload.workflow;
+    if (workflow?.contentType !== "application/yaml" || typeof workflow.yaml !== "string" || typeof workflow.sha256 !== "string") {
+      throw new Error("The generated workflow did not match the reviewed contract.");
+    }
+    document.querySelector("#generated-github-actions-yaml").value = workflow.yaml;
+    text(document.querySelector("#generated-github-actions-digest"), workflow.sha256);
+    document.querySelector("#generated-github-actions-workflow").hidden = false;
+    text(message, "Exact workflow YAML is ready to copy.");
+  } catch (error) { text(message, error.message); }
+  finally { button.disabled = false; }
+}
+
+async function copyGithubActionsWorkflow() {
+  const yaml = document.querySelector("#generated-github-actions-yaml");
+  const message = document.querySelector("#github-actions-workflow-message");
+  try {
+    await navigator.clipboard.writeText(yaml.value);
+    text(message, "Copied exact workflow YAML to the clipboard.");
+  } catch (_) {
+    yaml.focus();
+    yaml.select();
+    text(message, "Clipboard access was denied. Select and copy the YAML manually.");
+  }
+}
+
 async function csrf() { return (await fetch("/admin/api/v1/session")).json(); }
 
 async function loadNewEnvelope() {
@@ -313,6 +371,8 @@ async function loadDetail() {
     const rows = [["Status", request.status], ["Template", `${request.templateId} · revision ${request.templateRevision}`], ["Requested", request.createdAt], ["Status recorded", request.statusAt], ["Envelope instance", request.envelopeInstanceId || "Not provisioned"], ["Digest", request.envelopeDigest || "Not provisioned"], ["Reason", request.reason || "None recorded"]];
     details.replaceChildren(...rows.flatMap(([term, value]) => [create("dt", term), create("dd", value)]));
     renderEnvelopeAuthority(request);
+    const workflowPanel = workflowPanelFor(request);
+    if (workflowPanel) workflowPanel.querySelector("#github-actions-workflow-form").dataset.requestId = request.id;
     container.querySelector("#envelope-runs-link").href = `/envelopes/${request.id}/runs`;
     container.hidden = false;
     text(message, "");
@@ -391,6 +451,8 @@ async function loadRunDetail() {
 }
 
 setupAccordions();
+document.querySelector("#github-actions-workflow-form")?.addEventListener("submit", generateGithubActionsWorkflow);
+document.querySelector("#copy-github-actions-workflow")?.addEventListener("click", copyGithubActionsWorkflow);
 loadIdentity();
 if (activePage() === "/envelopes") loadEnvelopeGroups();
 if (activePage() === "/envelopes/new") loadNewEnvelope();

@@ -101,6 +101,23 @@
               <dt>Approved runner storage</dt><dd id="approved-storage">Loading…</dd>
             </dl>
           </section>
+          <section id="github-actions-workflow" class="github-actions-workflow" aria-labelledby="github-actions-workflow-heading" hidden>
+            <h2 id="github-actions-workflow-heading">GitHub Actions workflow</h2>
+            <p>Generate a pinned workflow for this provisioned envelope. Steward never writes to your repository.</p>
+            <form id="github-actions-workflow-form" class="form-grid">
+              <label for="github-repository">Repository <input id="github-repository" name="repository" autocomplete="off" value="example-org/example-repository" required></label>
+              <label for="github-revision">Pinned commit <input id="github-revision" name="revision" autocomplete="off" value="0123456789abcdef0123456789abcdef01234567" required></label>
+              <label for="github-path">File path <input id="github-path" name="path" autocomplete="off" value="README.md" required></label>
+              <div class="detail-actions"><button id="generate-github-actions-workflow" class="button" type="submit">Generate YAML</button></div>
+            </form>
+            <p id="github-actions-workflow-message" role="status" aria-live="polite"></p>
+            <div id="generated-github-actions-workflow" class="generated-workflow" hidden>
+              <label for="generated-github-actions-yaml">Copyable GitHub Actions YAML</label>
+              <textarea id="generated-github-actions-yaml" readonly spellcheck="false"></textarea>
+              <p>Exact bytes: <code id="generated-github-actions-digest"></code></p>
+              <button id="copy-github-actions-workflow" class="button secondary" type="button">Copy YAML</button>
+            </div>
+          </section>
           <div class="detail-actions"><a id="envelope-runs-link" class="button secondary" href="#">Recent runs</a></div>
         </div>
       </section>

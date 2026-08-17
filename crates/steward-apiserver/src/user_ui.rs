@@ -190,11 +190,41 @@ mod tests {
             .split("<section data-page=\"/envelopes/new\"")
             .nth(1)
             .and_then(|section| section.split("</section>").next())
-            .expect("new-envelope section must exist");
+            .unwrap_or("");
+        assert!(!new_envelope.is_empty(), "new-envelope section must exist");
         for removed in ["Bounded request", "Back to Envelopes"] {
             assert!(
                 !new_envelope.contains(removed),
                 "new-envelope form must not render unnecessary chrome: {removed}"
+            );
+        }
+    }
+
+    #[test]
+    fn provisioned_envelopes_expose_a_copyable_governed_github_actions_workflow() {
+        for required in [
+            "id=\"github-actions-workflow\"",
+            "id=\"github-repository\"",
+            "id=\"github-revision\"",
+            "id=\"github-path\"",
+            "id=\"generate-github-actions-workflow\"",
+            "id=\"generated-github-actions-yaml\"",
+            "id=\"copy-github-actions-workflow\"",
+        ] {
+            assert!(
+                USER_WORKSPACE_HTML.contains(required),
+                "the provisioned envelope detail page is missing {required}"
+            );
+        }
+        for required in [
+            "github-actions-workflow",
+            "github-actions-workflow-form",
+            "/github-actions-workflow",
+            "navigator.clipboard.writeText",
+        ] {
+            assert!(
+                USER_WORKSPACE_JS.contains(required),
+                "the provisioned envelope workflow controller is missing {required}"
             );
         }
     }
