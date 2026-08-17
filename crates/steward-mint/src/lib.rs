@@ -22,7 +22,9 @@ use sha2::{Digest as _, Sha256};
 pub use steward_ports::{
     SvidAssertion, SvidValidationError, ValidatedWorkload, WorkloadIdentity as SvidValidator,
 };
-use steward_types::{CanonicalAuthorityBinding, Principal, RuntimeId, ToolGrant};
+use steward_types::{
+    AgentRuntime, CanonicalAuthorityBinding, Phase, Principal, RuntimeId, ToolGrant,
+};
 use uuid::Uuid;
 
 /// HOP-1 v3 binds a person to their stable canonical subject while exposing the currently
@@ -69,6 +71,70 @@ pub struct AuthorityBinding {
     pub canonical_authority: Option<CanonicalAuthorityBinding>,
     pub tools: Vec<ToolGrant>,
     pub state: AuthorityState,
+}
+
+/// Resolve one active authority from the runtime that owns an OpenShell workspace/sandbox pair.
+///
+/// The runtime's Kubernetes UID—not its mutable resource name—is the authority identifier used
+/// by credential grants. Keeping this mapping in the Mint library lets inexpensive contract tests
+/// exercise the same binding rule as the deployed Kubernetes resolver.
+pub fn authority_from_runtime_refs(
+    workload: &ValidatedWorkload,
+    workspace: &str,
+    sandbox: &str,
+    runtimes: &[AgentRuntime],
+) -> Result<AuthorityBinding, MintError> {
+    let mut matches = runtimes.iter().filter(|runtime| {
+        runtime.status.as_ref().is_some_and(|status| {
+            status.refs.workspace.as_deref() == Some(workspace)
+                && status.refs.sandbox.as_deref() == Some(sandbox)
+        })
+    });
+    let runtime = matches.next().ok_or(MintError::WorkloadMismatch)?;
+    if matches.next().is_some() {
+        return Err(MintError::WorkloadMismatch);
+    }
+    let runtime_uid = runtime
+        .metadata
+        .uid
+        .clone()
+        .filter(|uid| !uid.is_empty())
+        .ok_or(MintError::WorkloadMismatch)?;
+    let runtime_namespace = runtime
+        .metadata
+        .namespace
+        .clone()
+        .filter(|namespace| !namespace.is_empty())
+        .ok_or(MintError::WorkloadMismatch)?;
+    let phase = runtime
+        .status
+        .as_ref()
+        .map(|status| status.phase)
+        .ok_or(MintError::WorkloadMismatch)?;
+    Ok(AuthorityBinding {
+        workload_id: workload.spiffe_id.clone(),
+        runtime: RuntimeId(runtime_uid),
+        runtime_namespace,
+        principal: runtime.spec.principal.clone(),
+        canonical_authority: runtime.spec.canonical_authority.clone(),
+        tools: runtime.spec.tools.clone(),
+        state: authority_state(runtime.metadata.deletion_timestamp.is_some(), phase),
+    })
+}
+
+pub fn authority_state(deleting: bool, phase: Phase) -> AuthorityState {
+    if deleting {
+        return AuthorityState::Revoked;
+    }
+    match phase {
+        Phase::Running => AuthorityState::Active,
+        Phase::Suspended => AuthorityState::Suspended,
+        Phase::Terminating => AuthorityState::Revoked,
+        Phase::Terminated => AuthorityState::Terminated,
+        Phase::Pending | Phase::Admitted | Phase::Provisioning | Phase::Failed => {
+            AuthorityState::Revoked
+        }
+    }
 }
 
 pub trait AuthorityResolver: Send + Sync + 'static {
