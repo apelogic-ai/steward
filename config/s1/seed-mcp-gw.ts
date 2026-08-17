@@ -22,7 +22,9 @@ const now = new Date();
 await store.saveAccount({
   provider: "github",
   hop1Issuer: issuer,
-  hop1Subject: "alice@example.com",
+  // User HOP-1 subjects are canonical IDs; the verified email stays separate
+  // so an email rename cannot orphan the provider connection.
+  hop1Subject: "usr_0123456789abcdef0123456789abcdef",
   email: "alice@example.com",
   scopesGranted: ["repo"],
   encryptedRefreshToken: encryptSecret("fixture-provider-token", encryptionKey),

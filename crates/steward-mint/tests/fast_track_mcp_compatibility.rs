@@ -1,4 +1,4 @@
-//! FAST-TRACK / NON-PROMOTABLE proof for the existing standalone MCP-GW identity contract.
+//! Proof for the existing standalone MCP-GW identity contract.
 
 use std::future::{Future, ready};
 
@@ -18,7 +18,7 @@ use steward_types::{
 };
 
 const EMAIL: &str = "alice@example.com";
-const WORKLOAD: &str = "spiffe://example.org/agent/runtime-fast-track";
+const WORKLOAD: &str = "spiffe://example.org/agent/runtime-canonical-subject";
 
 struct Validator;
 
@@ -50,7 +50,7 @@ fn authority() -> Result<AuthorityBinding, String> {
     let user = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
     Ok(AuthorityBinding {
         workload_id: WORKLOAD.to_owned(),
-        runtime: RuntimeId("runtime-fast-track".to_owned()),
+        runtime: RuntimeId("runtime-canonical-subject".to_owned()),
         runtime_namespace: "steward-preview".to_owned(),
         principal: Principal::Service {
             name: "steward-run".to_owned(),
@@ -72,7 +72,7 @@ async fn governed_runtime_projects_canonical_subject_and_verified_email() -> Res
     let verifier = signing_key.verifying_key();
     let mint = Mint::new(
         MintConfig {
-            issuer: "https://steward-mint.preview.example".to_owned(),
+            issuer: "https://steward-mint.example.org".to_owned(),
             audience: "steward-mcp".to_owned(),
             allowed_scopes: vec!["mcp".to_owned()],
             svid_audience: "steward-mint".to_owned(),
@@ -104,7 +104,7 @@ async fn governed_runtime_projects_canonical_subject_and_verified_email() -> Res
         .map_err(|error| format!("verify preview token: {error}"))?;
     let claims = &token.claims().custom;
 
-    assert_eq!(claims["iss"], "https://steward-mint.preview.example");
+    assert_eq!(claims["iss"], "https://steward-mint.example.org");
     assert_eq!(claims["aud"], serde_json::json!(["steward-mcp"]));
     assert_eq!(claims["sub"], "usr_0123456789abcdef0123456789abcdef");
     assert_eq!(claims["email"], EMAIL);

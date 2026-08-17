@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 const ALICE_NAMESPACE: &str = "team-a";
 const ALICE_RUNTIME: &str = "runtime-alice";
+const ALICE_CANONICAL_USER: &str = "usr_0123456789abcdef0123456789abcdef";
 const BOB_NAMESPACE: &str = "team-b";
 const BOB_RUNTIME: &str = "runtime-bob";
 const DELEGATED_SERVICE_RUNTIME: &str = "runtime-steward-run";
@@ -508,6 +509,15 @@ fn parse_forwarded_port(log: &str) -> Option<u16> {
         let (_, suffix) = line.split_once("127.0.0.1:")?;
         suffix.split(" ->").next()?.parse().ok()
     })
+}
+
+#[test]
+fn s1_provider_seed_uses_alices_canonical_hop1_subject() {
+    let seed = include_str!("../config/s1/seed-mcp-gw.ts");
+    assert!(
+        seed.contains(&format!(r#"hop1Subject: "{ALICE_CANONICAL_USER}""#)),
+        "the S1 GitHub fixture must use the canonical HOP-1 subject, not Alice's mutable email"
+    );
 }
 
 #[test]
