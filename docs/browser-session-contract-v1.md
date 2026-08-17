@@ -23,6 +23,24 @@ explicit local grant events, and revocation appends a new event. Google email or
 membership does not imply any Steward authority. This boundary has no AWS or Kubernetes identity
 dependency.
 
+## First local RBAC grant
+
+There is no first-login administrator shortcut. An organization user signs in once, opens
+`/settings`, and supplies the displayed opaque canonical user ID to an authorized Steward
+operator. In the same protected runtime where `STEWARD_DATABASE_URL` is already projected, that
+operator records the initial local grant with:
+
+```text
+steward-apiserver-bin bootstrap-rbac \
+  --user-id usr_<opaque-id> \
+  --grant administrator \
+  --actor <audited-operator>
+```
+
+The command requires all three values, validates the opaque user-ID shape, and appends a grant
+event. It never accepts an email, Google subject, token, or unreviewed provider claim as authority;
+revocation likewise appends a distinct local RBAC event.
+
 The existing Kubernetes TokenReview administrator routes remain unchanged. Browser sessions are a
 parallel, route-specific frontend boundary and cannot inject a bearer assertion into that operator
 path.
