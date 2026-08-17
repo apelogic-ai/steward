@@ -6,7 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::postgres::PgPoolOptions;
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
 use steward_store::{ParkRejection, PgStore};
-use steward_types::{AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal};
+use steward_types::{
+    AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal, RunnerRequirements,
+};
 
 #[tokio::test]
 async fn s3_postgres_migrations_apply_from_empty() -> Result<(), Box<dyn Error>> {
@@ -103,6 +105,7 @@ async fn s3_postgres_keeps_envelopes_immutable_and_parks_exact_rejections()
             currency: "USD".to_owned(),
         },
         ttl: Duration("24h".to_owned()),
+        runner: RunnerRequirements::default(),
         bindings: None,
     };
     let deltas = vec![AdmissionDelta::Budget {

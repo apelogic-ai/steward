@@ -107,6 +107,9 @@ mod tests {
             "Approved tools",
             "Requested runner platform",
             "Approved runner platform",
+            "Runner memory",
+            "Runner compute",
+            "Runner storage",
         ] {
             assert!(
                 USER_WORKSPACE_HTML.contains(required),

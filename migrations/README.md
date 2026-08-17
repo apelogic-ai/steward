@@ -14,6 +14,10 @@ Migration 0012 introduces opaque canonical person identities. Existing Task
 rows remain explicitly `legacy_reconnect_required`; the migration never derives
 a person ID from email, issuer, or another mutable claim.
 
+Migration 0015 appends an immutable, separately-recorded approved Envelope
+snapshot to user-request lifecycle events. Older events intentionally have no
+snapshot rather than inferring one from the original request.
+
 `cargo xtask migrate-check` rejects edits or renames of migrations already
 present on the comparison base. The S3 and S4 store integration tests apply the
 full set to empty ephemeral Postgres databases.

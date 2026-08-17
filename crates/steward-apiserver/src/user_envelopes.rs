@@ -82,6 +82,7 @@ pub struct UserEnvelopeRequest {
     pub template_id: String,
     pub template_revision: i64,
     pub requested_envelope: Envelope,
+    pub approved_envelope: Option<Envelope>,
     pub status: EnvelopeRequestStatus,
     pub approval_id: Option<Uuid>,
     pub envelope_instance_id: Option<String>,
@@ -359,6 +360,7 @@ fn envelope_as_user_runtime(
         tools: envelope.spec.tools.clone(),
         budget: envelope.spec.budget.clone(),
         ttl: envelope.spec.ttl.clone(),
+        runner: envelope.spec.runner.clone(),
         bindings: None,
     }
 }
@@ -431,7 +433,9 @@ mod tests {
             let template_id = request.template.id.clone();
             let template_revision = request.template.revision;
             let requested_envelope = request.requested_envelope.clone();
-            let status = if request.auto_provision {
+            let auto_provision = request.auto_provision;
+            let approved_envelope = auto_provision.then(|| requested_envelope.clone());
+            let status = if auto_provision {
                 EnvelopeRequestStatus::Provisioned
             } else {
                 EnvelopeRequestStatus::Pending
@@ -446,6 +450,7 @@ mod tests {
                     template_id,
                     template_revision,
                     requested_envelope,
+                    approved_envelope,
                     status,
                     approval_id: None,
                     envelope_instance_id: Some("env_local_test".to_owned()),
@@ -476,6 +481,7 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("72h".to_owned()),
+                runner: steward_types::RunnerRequirements::default(),
             },
         };
         AvailableEnvelopeTemplate {
@@ -490,6 +496,7 @@ mod tests {
                         currency: "USD".to_owned(),
                     },
                     ttl: Duration("24h".to_owned()),
+                    runner: steward_types::RunnerRequirements::default(),
                     ..ceiling.spec.clone()
                 },
             },

@@ -14,7 +14,8 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 use steward_admission::{AdmissionDecision, Envelope, evaluate, validate_envelope};
 use steward_types::{
-    AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal, ToolGrant,
+    AgentRuntimeSpec, AgentType, Budget, Duration, Email, KubernetesQuantity, ModelRef, Principal,
+    RunnerPlatform, RunnerRequirements, ToolGrant,
 };
 
 use crate::{
@@ -145,6 +146,12 @@ fn engineer_template() -> Envelope {
                 currency: "USD".to_owned(),
             },
             ttl: Duration("720h".to_owned()),
+            runner: RunnerRequirements {
+                platforms: vec![RunnerPlatform::Linux],
+                memory: Some(KubernetesQuantity("2Gi".to_owned())),
+                compute: Some(KubernetesQuantity("1".to_owned())),
+                storage: Some(KubernetesQuantity("10Gi".to_owned())),
+            },
         },
     }
 }
@@ -218,6 +225,7 @@ async fn prove_envelope_template(
             currency: request.candidate.spec.budget.currency.clone(),
         },
         ttl: Duration(request.thresholds.ttl),
+        runner: request.candidate.spec.runner.clone(),
         bindings: None,
     };
     match evaluate(&threshold_request, &request.candidate) {

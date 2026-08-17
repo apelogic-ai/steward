@@ -12,7 +12,10 @@ use steward_admission::{Envelope, EnvelopeSpec};
 use steward_store::{
     AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent, StoreError,
 };
-use steward_types::{Budget, CanonicalUserId, Duration, ModelRef, ToolGrant};
+use steward_types::{
+    Budget, CanonicalUserId, Duration, KubernetesQuantity, ModelRef, RunnerPlatform,
+    RunnerRequirements, ToolGrant,
+};
 use uuid::Uuid;
 
 use crate::agent_runs_ui::protected_router as protected_agent_runs_router;
@@ -101,6 +104,12 @@ fn demo_template() -> AvailableEnvelopeTemplate {
                 currency: "USD".to_owned(),
             },
             ttl: Duration("720h".to_owned()),
+            runner: RunnerRequirements {
+                platforms: vec![RunnerPlatform::Linux],
+                memory: Some(KubernetesQuantity("2Gi".to_owned())),
+                compute: Some(KubernetesQuantity("1".to_owned())),
+                storage: Some(KubernetesQuantity("10Gi".to_owned())),
+            },
         },
     };
     AvailableEnvelopeTemplate {
@@ -115,6 +124,12 @@ fn demo_template() -> AvailableEnvelopeTemplate {
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("168h".to_owned()),
+                runner: RunnerRequirements {
+                    platforms: vec![RunnerPlatform::Linux],
+                    memory: Some(KubernetesQuantity("1Gi".to_owned())),
+                    compute: Some(KubernetesQuantity("500m".to_owned())),
+                    storage: Some(KubernetesQuantity("5Gi".to_owned())),
+                },
                 ..ceiling.spec.clone()
             },
         },
@@ -233,6 +248,7 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for LocalEnvelopeRequestBroker
                 id,
                 template_id,
                 template_revision,
+                approved_envelope: auto_provision.then(|| requested_envelope.clone()),
                 requested_envelope,
                 status,
                 approval_id,

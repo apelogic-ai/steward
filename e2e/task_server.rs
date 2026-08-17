@@ -19,7 +19,7 @@ use steward_apiserver::{
     TaskIdentityResolver, TaskWorkflow, router as api_router, task_router,
 };
 use steward_store::PgStore;
-use steward_types::{Budget, CanonicalUserId, Duration, Email, ToolGrant};
+use steward_types::{Budget, CanonicalUserId, Duration, Email, RunnerRequirements, ToolGrant};
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
@@ -104,6 +104,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 currency: "USD".to_owned(),
             },
             ttl: Duration("1h".to_owned()),
+            runner: RunnerRequirements::default(),
         },
     };
     for service in [

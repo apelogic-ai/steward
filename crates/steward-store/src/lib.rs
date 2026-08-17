@@ -5,7 +5,10 @@ use std::fmt;
 
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
-use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
+use steward_admission::{
+    AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec,
+    envelope_is_within,
+};
 use steward_types::{
     AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
     OrganizationIdentity, OrganizationIdentityMigration,
@@ -831,10 +834,33 @@ impl PgStore {
         if current != update.from {
             return Err(StoreError::InvalidEnvelopeRequestTransition);
         }
+        let requested_envelope =
+            sqlx::query("SELECT requested_envelope FROM envelope_requests WHERE id = $1")
+                .bind(request_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(database_error)?
+                .ok_or(StoreError::EnvelopeRequestNotFound)?
+                .try_get::<Json<Envelope>, _>("requested_envelope")
+                .map_err(database_error)?
+                .0;
+        let needs_snapshot = matches!(
+            update.to,
+            EnvelopeRequestStatus::Approved | EnvelopeRequestStatus::Provisioned
+        );
+        match (needs_snapshot, update.approved_envelope) {
+            (true, Some(approved_envelope))
+                if matches!(
+                    envelope_is_within(approved_envelope, &requested_envelope),
+                    Ok(AdmissionDecision::Admit)
+                ) => {}
+            (false, None) => {}
+            _ => return Err(StoreError::InvalidEnvelopeRequest),
+        }
         sqlx::query(
             "INSERT INTO envelope_request_events \
-             (request_id, status, approval_id, envelope_instance_id, envelope_digest, reason) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             (request_id, status, approval_id, envelope_instance_id, envelope_digest, reason, approved_envelope) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(request_id)
         .bind(update.to.as_str())
@@ -842,6 +868,7 @@ impl PgStore {
         .bind(update.envelope_instance_id)
         .bind(update.envelope_digest)
         .bind(update.reason)
+        .bind(update.approved_envelope.map(Json))
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -2431,6 +2458,7 @@ pub struct EnvelopeRequestRecord {
     pub template_id: String,
     pub template_revision: i64,
     pub requested_envelope: Envelope,
+    pub approved_envelope: Option<Envelope>,
     pub status: EnvelopeRequestStatus,
     pub approval_id: Option<Uuid>,
     pub envelope_instance_id: Option<String>,
@@ -2461,6 +2489,7 @@ pub struct EnvelopeRequestStatusUpdate<'a> {
     pub envelope_instance_id: Option<&'a str>,
     pub envelope_digest: Option<&'a str>,
     pub reason: Option<&'a str>,
+    pub approved_envelope: Option<&'a Envelope>,
 }
 
 fn validate_task_identity_binding(request: &TaskReservationRequest<'_>) -> Result<(), StoreError> {
@@ -2897,7 +2926,7 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
 const ENVELOPE_REQUEST_COLUMNS: &str = "SELECT requests.id, requests.owner_user_id, requests.template_id, \
             requests.template_revision, requests.requested_envelope, \
             status.status, status.approval_id, status.envelope_instance_id, \
-            status.envelope_digest, status.reason, \
+            status.envelope_digest, status.reason, status.approved_envelope, \
             to_char(requests.created_at AT TIME ZONE 'UTC', \
                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
             to_char(status.at AT TIME ZONE 'UTC', \
@@ -2905,7 +2934,7 @@ const ENVELOPE_REQUEST_COLUMNS: &str = "SELECT requests.id, requests.owner_user_
      FROM envelope_requests requests \
      JOIN LATERAL ( \
          SELECT events.status, events.approval_id, events.envelope_instance_id, \
-                events.envelope_digest, events.reason, events.at \
+                events.envelope_digest, events.reason, events.approved_envelope, events.at \
          FROM envelope_request_events events \
          WHERE events.request_id = requests.id \
          ORDER BY events.at DESC, events.id DESC \
@@ -3004,6 +3033,10 @@ fn envelope_request_record(
             .try_get::<Json<Envelope>, _>("requested_envelope")
             .map_err(database_error)?
             .0,
+        approved_envelope: row
+            .try_get::<Option<Json<Envelope>>, _>("approved_envelope")
+            .map_err(database_error)?
+            .map(|value| value.0),
         status,
         approval_id: row.try_get("approval_id").map_err(database_error)?,
         envelope_instance_id: row
@@ -3155,5 +3188,9 @@ fn grant_dimension(delta: &AdmissionDelta) -> &'static str {
         AdmissionDelta::Ttl { .. } => "ttl",
         AdmissionDelta::Models { .. } => "models",
         AdmissionDelta::Tools { .. } => "tools",
+        AdmissionDelta::RunnerPlatforms { .. } => "runner-platforms",
+        AdmissionDelta::RunnerMemory { .. } => "runner-memory",
+        AdmissionDelta::RunnerCompute { .. } => "runner-compute",
+        AdmissionDelta::RunnerStorage { .. } => "runner-storage",
     }
 }

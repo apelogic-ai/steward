@@ -3276,6 +3276,7 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("1h".to_owned()),
+                runner: steward_types::RunnerRequirements::default(),
                 bindings: None,
             },
         );
@@ -3303,6 +3304,7 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("1h".to_owned()),
+                runner: steward_types::RunnerRequirements::default(),
             },
         }
     }
@@ -3872,6 +3874,7 @@ mod webhook_tests {
                         currency: "USD".to_owned(),
                     },
                     ttl: Duration("24h".to_owned()),
+                    runner: steward_types::RunnerRequirements::default(),
                 },
             },
             grants: BTreeMap::new(),

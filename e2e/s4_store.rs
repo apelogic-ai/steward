@@ -13,7 +13,8 @@ use steward_store::{
 use steward_types::{
     AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding, Duration, Email, ModelRef,
     OrganizationId, OrganizationIdentity, OrganizationIdentityMigration,
-    OrganizationIdentityPolicy, Principal, RuntimeOwnership, SpendSummary, TaskPhase,
+    OrganizationIdentityPolicy, Principal, RunnerRequirements, RuntimeOwnership, SpendSummary,
+    TaskPhase,
 };
 
 fn google_identity(
@@ -69,6 +70,7 @@ fn proposed_spec() -> AgentRuntimeSpec {
             currency: "USD".to_owned(),
         },
         ttl: Duration("24h".to_owned()),
+        runner: RunnerRequirements::default(),
         bindings: None,
     }
 }
@@ -915,6 +917,7 @@ fn envelope(member_limit: &str, revision: i64) -> Envelope {
                 currency: spec.budget.currency,
             },
             ttl: spec.ttl,
+            runner: RunnerRequirements::default(),
         },
     }
 }
@@ -1443,6 +1446,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
             currency: "USD".to_owned(),
         },
         ttl: Duration("24h".to_owned()),
+        runner: RunnerRequirements::default(),
         bindings: None,
     };
     let deltas = vec![AdmissionDelta::Budget {

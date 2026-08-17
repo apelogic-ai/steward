@@ -3,7 +3,10 @@
 use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
-use steward_types::{AgentRuntimeSpec, Budget, Duration, ModelRef, SpendSummary, ToolGrant};
+use steward_types::{
+    AgentRuntimeSpec, Budget, Duration, KubernetesQuantity, ModelRef, RunnerPlatform,
+    RunnerRequirements, SpendSummary, ToolGrant,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +38,8 @@ pub struct EnvelopeSpec {
     pub tools: Vec<ToolGrant>,
     pub budget: Budget,
     pub ttl: Duration,
+    #[serde(default)]
+    pub runner: RunnerRequirements,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -78,6 +83,22 @@ pub enum AdmissionDelta {
         requested: Vec<ToolGrant>,
         ceiling: Vec<ToolGrant>,
     },
+    RunnerPlatforms {
+        requested: Vec<RunnerPlatform>,
+        ceiling: Vec<RunnerPlatform>,
+    },
+    RunnerMemory {
+        requested: KubernetesQuantity,
+        ceiling: Option<KubernetesQuantity>,
+    },
+    RunnerCompute {
+        requested: KubernetesQuantity,
+        ceiling: Option<KubernetesQuantity>,
+    },
+    RunnerStorage {
+        requested: KubernetesQuantity,
+        ceiling: Option<KubernetesQuantity>,
+    },
 }
 
 impl AdmissionDelta {
@@ -119,6 +140,25 @@ impl AdmissionDelta {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Self::RunnerPlatforms { requested, ceiling } => format!(
+                "runner.platforms requested {:?}, ceiling {:?}",
+                requested, ceiling
+            ),
+            Self::RunnerMemory { requested, ceiling } => format!(
+                "runner.memory requested {}, ceiling {}",
+                requested.0,
+                ceiling.as_ref().map_or("none", |value| value.0.as_str())
+            ),
+            Self::RunnerCompute { requested, ceiling } => format!(
+                "runner.compute requested {}, ceiling {}",
+                requested.0,
+                ceiling.as_ref().map_or("none", |value| value.0.as_str())
+            ),
+            Self::RunnerStorage { requested, ceiling } => format!(
+                "runner.storage requested {}, ceiling {}",
+                requested.0,
+                ceiling.as_ref().map_or("none", |value| value.0.as_str())
+            ),
         }
     }
 }
@@ -130,6 +170,8 @@ pub enum AdmissionError {
     InvalidCurrency { value: String },
     CurrencyMismatch { requested: String, ceiling: String },
     InvalidTtl { value: String },
+    InvalidRunnerQuantity { resource: String, value: String },
+    DuplicateRunnerPlatform { platform: RunnerPlatform },
     UnsupportedBindings,
 }
 
@@ -148,6 +190,7 @@ pub fn validate_envelope(envelope: &Envelope) -> Result<(), AdmissionError> {
         });
     }
     duration_seconds(&envelope.spec.ttl)?;
+    validate_runner(&envelope.spec.runner)?;
     Ok(())
 }
 
@@ -167,10 +210,38 @@ pub fn evaluate(
     request: &AgentRuntimeSpec,
     envelope: &Envelope,
 ) -> Result<AdmissionDecision, AdmissionError> {
-    validate_envelope(envelope)?;
+    validate_runner(&request.runner)?;
     if request.bindings.is_some() {
         return Err(AdmissionError::UnsupportedBindings);
     }
+    evaluate_envelope_spec(
+        &EnvelopeSpec {
+            llms: request.llms.clone(),
+            tools: request.tools.clone(),
+            budget: request.budget.clone(),
+            ttl: request.ttl.clone(),
+            runner: request.runner.clone(),
+        },
+        envelope,
+    )
+}
+
+/// Compare an approved envelope snapshot with the immutable user request. Approval may only
+/// narrow authority; a widening is returned as the same structured admission counterexample.
+pub fn envelope_is_within(
+    candidate: &Envelope,
+    ceiling: &Envelope,
+) -> Result<AdmissionDecision, AdmissionError> {
+    validate_envelope(candidate)?;
+    evaluate_envelope_spec(&candidate.spec, ceiling)
+}
+
+fn evaluate_envelope_spec(
+    request: &EnvelopeSpec,
+    envelope: &Envelope,
+) -> Result<AdmissionDecision, AdmissionError> {
+    validate_envelope(envelope)?;
+    validate_runner(&request.runner)?;
     if request.budget.currency != envelope.spec.budget.currency {
         return Err(AdmissionError::CurrencyMismatch {
             requested: request.budget.currency.clone(),
@@ -219,10 +290,156 @@ pub fn evaluate(
             ceiling: envelope.spec.tools.clone(),
         });
     }
+    let outside_platforms = request
+        .runner
+        .platforms
+        .iter()
+        .filter(|platform| !envelope.spec.runner.platforms.contains(platform))
+        .copied()
+        .collect::<Vec<_>>();
+    if !outside_platforms.is_empty() {
+        deltas.push(AdmissionDelta::RunnerPlatforms {
+            requested: outside_platforms,
+            ceiling: envelope.spec.runner.platforms.clone(),
+        });
+    }
+    if let Some(requested) = request.runner.memory.clone()
+        && runner_quantity_exceeds(
+            Some(&requested),
+            envelope.spec.runner.memory.as_ref(),
+            RunnerResource::Memory,
+        )?
+    {
+        deltas.push(AdmissionDelta::RunnerMemory {
+            requested,
+            ceiling: envelope.spec.runner.memory.clone(),
+        });
+    }
+    if let Some(requested) = request.runner.compute.clone()
+        && runner_quantity_exceeds(
+            Some(&requested),
+            envelope.spec.runner.compute.as_ref(),
+            RunnerResource::Compute,
+        )?
+    {
+        deltas.push(AdmissionDelta::RunnerCompute {
+            requested,
+            ceiling: envelope.spec.runner.compute.clone(),
+        });
+    }
+    if let Some(requested) = request.runner.storage.clone()
+        && runner_quantity_exceeds(
+            Some(&requested),
+            envelope.spec.runner.storage.as_ref(),
+            RunnerResource::Storage,
+        )?
+    {
+        deltas.push(AdmissionDelta::RunnerStorage {
+            requested,
+            ceiling: envelope.spec.runner.storage.clone(),
+        });
+    }
     if deltas.is_empty() {
         Ok(AdmissionDecision::Admit)
     } else {
         Ok(AdmissionDecision::Reject { deltas })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RunnerResource {
+    Memory,
+    Compute,
+    Storage,
+}
+
+impl RunnerResource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Compute => "compute",
+            Self::Storage => "storage",
+        }
+    }
+}
+
+fn validate_runner(runner: &RunnerRequirements) -> Result<(), AdmissionError> {
+    for (index, platform) in runner.platforms.iter().enumerate() {
+        if runner.platforms[..index].contains(platform) {
+            return Err(AdmissionError::DuplicateRunnerPlatform {
+                platform: *platform,
+            });
+        }
+    }
+    for (value, resource) in [
+        (runner.memory.as_ref(), RunnerResource::Memory),
+        (runner.compute.as_ref(), RunnerResource::Compute),
+        (runner.storage.as_ref(), RunnerResource::Storage),
+    ] {
+        if let Some(value) = value {
+            runner_quantity(value, resource)?;
+        }
+    }
+    Ok(())
+}
+
+fn runner_quantity_exceeds(
+    requested: Option<&KubernetesQuantity>,
+    ceiling: Option<&KubernetesQuantity>,
+    resource: RunnerResource,
+) -> Result<bool, AdmissionError> {
+    let Some(requested) = requested else {
+        return Ok(false);
+    };
+    let requested = runner_quantity(requested, resource)?;
+    let Some(ceiling) = ceiling else {
+        return Ok(true);
+    };
+    Ok(requested > runner_quantity(ceiling, resource)?)
+}
+
+fn runner_quantity(
+    value: &KubernetesQuantity,
+    resource: RunnerResource,
+) -> Result<u128, AdmissionError> {
+    let invalid = || AdmissionError::InvalidRunnerQuantity {
+        resource: resource.as_str().to_owned(),
+        value: value.0.clone(),
+    };
+    match resource {
+        RunnerResource::Memory | RunnerResource::Storage => {
+            let units = [("Ki", 1_u32), ("Mi", 2), ("Gi", 3), ("Ti", 4)];
+            let Some((digits, power)) = units
+                .iter()
+                .find_map(|(unit, power)| value.0.strip_suffix(unit).map(|digits| (digits, power)))
+            else {
+                return Err(invalid());
+            };
+            let digits = digits.parse::<u128>().map_err(|_| invalid())?;
+            if digits == 0 {
+                return Err(invalid());
+            }
+            digits
+                .checked_mul(1024_u128.pow(*power))
+                .ok_or_else(invalid)
+        }
+        RunnerResource::Compute => {
+            let millicores = if let Some(digits) = value.0.strip_suffix('m') {
+                digits.parse::<u128>().map_err(|_| invalid())?
+            } else {
+                value
+                    .0
+                    .parse::<u128>()
+                    .map_err(|_| invalid())?
+                    .checked_mul(1000)
+                    .ok_or_else(invalid)?
+            };
+            if millicores == 0 {
+                Err(invalid())
+            } else {
+                Ok(millicores)
+            }
+        }
     }
 }
 
@@ -465,6 +682,36 @@ fn grant_covers(
             },
             AdmissionDelta::Tools { requested, .. },
         ) => Ok(requested.iter().all(|tool| granted.contains(tool))),
+        (
+            AdmissionDelta::RunnerPlatforms {
+                requested: granted, ..
+            },
+            AdmissionDelta::RunnerPlatforms { requested, .. },
+        ) => Ok(requested.iter().all(|platform| granted.contains(platform))),
+        (
+            AdmissionDelta::RunnerMemory {
+                requested: granted, ..
+            },
+            AdmissionDelta::RunnerMemory { requested, .. },
+        ) => runner_quantity(requested, RunnerResource::Memory).and_then(|requested| {
+            runner_quantity(granted, RunnerResource::Memory).map(|granted| requested <= granted)
+        }),
+        (
+            AdmissionDelta::RunnerCompute {
+                requested: granted, ..
+            },
+            AdmissionDelta::RunnerCompute { requested, .. },
+        ) => runner_quantity(requested, RunnerResource::Compute).and_then(|requested| {
+            runner_quantity(granted, RunnerResource::Compute).map(|granted| requested <= granted)
+        }),
+        (
+            AdmissionDelta::RunnerStorage {
+                requested: granted, ..
+            },
+            AdmissionDelta::RunnerStorage { requested, .. },
+        ) => runner_quantity(requested, RunnerResource::Storage).and_then(|requested| {
+            runner_quantity(granted, RunnerResource::Storage).map(|granted| requested <= granted)
+        }),
         _ => Ok(false),
     }
 }
@@ -472,13 +719,13 @@ fn grant_covers(
 #[cfg(test)]
 mod tests {
     use steward_types::{
-        AgentRuntimeSpec, AgentType, BindingRef, Budget, Duration, Email, ModelRef, Principal,
-        ToolGrant,
+        AgentRuntimeSpec, AgentType, BindingRef, Budget, Duration, Email, KubernetesQuantity,
+        ModelRef, Principal, RunnerPlatform, RunnerRequirements, ToolGrant,
     };
 
     use super::{
         AdmissionDecision, AdmissionDelta, AdmissionError, Envelope, EnvelopeSpec,
-        add_budget_amount, evaluate, evaluate_with_grants, validate_envelope,
+        add_budget_amount, envelope_is_within, evaluate, evaluate_with_grants, validate_envelope,
     };
 
     #[test]
@@ -498,6 +745,7 @@ mod tests {
                         currency: currency.to_owned(),
                     },
                     ttl: Duration(ttl.to_owned()),
+                    runner: RunnerRequirements::default(),
                 },
             };
             assert!(
@@ -527,6 +775,7 @@ mod tests {
                 currency: "USD".to_owned(),
             },
             ttl: Duration("24h".to_owned()),
+            runner: RunnerRequirements::default(),
             bindings: None,
         }
     }
@@ -545,8 +794,49 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("24h".to_owned()),
+                runner: RunnerRequirements::default(),
             },
         }
+    }
+
+    #[test]
+    fn runner_authority_rejects_platform_and_resource_expansion() {
+        let mut request = request_with_budget("100.00");
+        request.runner = RunnerRequirements {
+            platforms: vec![RunnerPlatform::Windows],
+            memory: Some(KubernetesQuantity("3Gi".to_owned())),
+            compute: Some(KubernetesQuantity("1500m".to_owned())),
+            storage: Some(KubernetesQuantity("11Gi".to_owned())),
+        };
+        let mut envelope = envelope_with_budget("200.00");
+        envelope.spec.runner = RunnerRequirements {
+            platforms: vec![RunnerPlatform::Linux],
+            memory: Some(KubernetesQuantity("2Gi".to_owned())),
+            compute: Some(KubernetesQuantity("1".to_owned())),
+            storage: Some(KubernetesQuantity("10Gi".to_owned())),
+        };
+
+        assert!(matches!(
+            evaluate(&request, &envelope),
+            Ok(AdmissionDecision::Reject { deltas })
+                if deltas.iter().any(|delta| matches!(delta, AdmissionDelta::RunnerPlatforms { .. }))
+                    && deltas.iter().any(|delta| matches!(delta, AdmissionDelta::RunnerMemory { .. }))
+                    && deltas.iter().any(|delta| matches!(delta, AdmissionDelta::RunnerCompute { .. }))
+                    && deltas.iter().any(|delta| matches!(delta, AdmissionDelta::RunnerStorage { .. }))
+        ));
+    }
+
+    #[test]
+    fn approved_snapshot_cannot_widen_the_immutable_user_request() {
+        let requested = envelope_with_budget("100.00");
+        let mut approved = requested.clone();
+        approved.spec.budget.monthly_limit = "101.00".to_owned();
+
+        assert!(matches!(
+            envelope_is_within(&approved, &requested),
+            Ok(AdmissionDecision::Reject { deltas })
+                if matches!(deltas.as_slice(), [AdmissionDelta::Budget { .. }])
+        ));
     }
 
     #[test]
@@ -725,6 +1015,55 @@ mod tests {
             }),
             "a grant must not authorize a value beyond the approved absolute ceiling"
         );
+    }
+
+    #[test]
+    fn runner_grant_covers_only_the_approved_absolute_limit() {
+        let mut requested = request_with_budget("100.00");
+        requested.runner = RunnerRequirements {
+            platforms: vec![RunnerPlatform::Windows],
+            memory: Some(KubernetesQuantity("3Gi".to_owned())),
+            compute: Some(KubernetesQuantity("1500m".to_owned())),
+            storage: Some(KubernetesQuantity("11Gi".to_owned())),
+        };
+        let mut ceiling = envelope_with_budget("200.00");
+        ceiling.spec.runner = RunnerRequirements {
+            platforms: vec![RunnerPlatform::Linux],
+            memory: Some(KubernetesQuantity("2Gi".to_owned())),
+            compute: Some(KubernetesQuantity("1".to_owned())),
+            storage: Some(KubernetesQuantity("10Gi".to_owned())),
+        };
+        let grants = vec![
+            AdmissionDelta::RunnerPlatforms {
+                requested: vec![RunnerPlatform::Windows],
+                ceiling: vec![RunnerPlatform::Linux],
+            },
+            AdmissionDelta::RunnerMemory {
+                requested: KubernetesQuantity("3Gi".to_owned()),
+                ceiling: Some(KubernetesQuantity("2Gi".to_owned())),
+            },
+            AdmissionDelta::RunnerCompute {
+                requested: KubernetesQuantity("1500m".to_owned()),
+                ceiling: Some(KubernetesQuantity("1".to_owned())),
+            },
+            AdmissionDelta::RunnerStorage {
+                requested: KubernetesQuantity("11Gi".to_owned()),
+                ceiling: Some(KubernetesQuantity("10Gi".to_owned())),
+            },
+        ];
+
+        assert_eq!(
+            evaluate_with_grants(&requested, &ceiling, &grants),
+            Ok(AdmissionDecision::Admit),
+            "each runner exception must be scoped to the exact approved platform or resource value"
+        );
+
+        requested.runner.memory = Some(KubernetesQuantity("4Gi".to_owned()));
+        assert!(matches!(
+            evaluate_with_grants(&requested, &ceiling, &grants),
+            Ok(AdmissionDecision::Reject { deltas })
+                if matches!(deltas.as_slice(), [AdmissionDelta::RunnerMemory { .. }])
+        ));
     }
 
     #[test]

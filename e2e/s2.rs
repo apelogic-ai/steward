@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use steward_admission::{Envelope, EnvelopeSpec};
 use steward_store::PgStore;
-use steward_types::{Budget, Duration as RuntimeDuration, ModelRef};
+use steward_types::{Budget, Duration as RuntimeDuration, ModelRef, RunnerRequirements};
 
 const NAMESPACE: &str = "team-a";
 const PRICED_RUNTIME: &str = "runtime-priced";
@@ -320,6 +320,7 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
                         currency: "USD".to_owned(),
                     },
                     ttl: RuntimeDuration("1h".to_owned()),
+                    runner: RunnerRequirements::default(),
                 },
             },
             "admin@example.com",
@@ -427,6 +428,7 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
                         currency: "USD".to_owned(),
                     },
                     ttl: RuntimeDuration("1h".to_owned()),
+                    runner: RunnerRequirements::default(),
                 },
             },
             "admin@example.com",

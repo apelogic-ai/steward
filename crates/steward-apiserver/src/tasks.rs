@@ -740,6 +740,7 @@ where
         tools: workflow.tools.clone(),
         budget: workflow.budget.clone(),
         ttl: workflow.ttl.clone(),
+        runner: steward_types::RunnerRequirements::default(),
         bindings: None,
     };
     let envelope = state

@@ -4900,6 +4900,7 @@ mod tests {
                 currency: "USD".to_owned(),
             },
             ttl: Duration("24h".to_owned()),
+            runner: steward_types::RunnerRequirements::default(),
             bindings: None,
         };
         let mut runtime = AgentRuntime::new("runtime-a", spec);
@@ -4928,6 +4929,7 @@ mod tests {
                         currency: "USD".to_owned(),
                     },
                     ttl: Duration("24h".to_owned()),
+                    runner: steward_types::RunnerRequirements::default(),
                 },
             })),
             grants: Vec::new(),
@@ -8083,6 +8085,7 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("24h".to_owned()),
+                runner: steward_types::RunnerRequirements::default(),
                 canonical_authority: None,
                 bindings: None,
             },

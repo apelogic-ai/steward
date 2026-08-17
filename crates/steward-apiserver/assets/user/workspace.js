@@ -145,9 +145,23 @@ function renderTemplate(template) {
   summary.append(create("strong", `${template.displayName} · revision ${template.revision}`));
   summary.append(create("p", `Models: ${template.ceiling.spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ")}.`));
   summary.append(create("p", `Tools: ${template.ceiling.spec.tools.map((tool) => `${tool.provider}:${tool.resource}:${tool.action}`).join(", ")}.`));
+  const hardRunner = template.ceiling.spec.runner || {};
+  summary.append(create("p", `Runner ceiling: ${runnerValue(hardRunner, "platform", "no platform bound")}; memory ${runnerValue(hardRunner, "memory", "not bounded")}; compute ${runnerValue(hardRunner, "compute", "not bounded")}; storage ${runnerValue(hardRunner, "storage", "not bounded")}.`));
   summary.append(create("p", `GitHub connection: ${template.githubConnection}.`));
   document.querySelector("#budget-limit").value = template.autoProvisionThreshold.spec.budget.monthlyLimit;
   document.querySelector("#ttl").value = template.autoProvisionThreshold.spec.ttl;
+  const thresholdRunner = template.autoProvisionThreshold.spec.runner || {};
+  const platform = document.querySelector("#runner-platform");
+  const platforms = hardRunner.platforms || [];
+  platform.replaceChildren(...platforms.map((value) => {
+    const option = create("option", value);
+    option.value = value;
+    return option;
+  }));
+  platform.value = thresholdRunner.platforms?.[0] || platforms[0] || "";
+  document.querySelector("#runner-memory").value = thresholdRunner.memory || "";
+  document.querySelector("#runner-compute").value = thresholdRunner.compute || "";
+  document.querySelector("#runner-storage").value = thresholdRunner.storage || "";
   renderDelta(template);
 }
 
@@ -156,11 +170,18 @@ function renderDelta(template) {
   const ceiling = decimal(template.ceiling.spec.budget.monthlyLimit);
   const threshold = decimal(template.autoProvisionThreshold.spec.budget.monthlyLimit);
   const ttl = document.querySelector("#ttl").value;
+  const thresholdRunner = template.autoProvisionThreshold.spec.runner || {};
+  const runnerChanged = [
+    ["#runner-platform", thresholdRunner.platforms?.[0] || ""],
+    ["#runner-memory", thresholdRunner.memory || ""],
+    ["#runner-compute", thresholdRunner.compute || ""],
+    ["#runner-storage", thresholdRunner.storage || ""],
+  ].some(([selector, value]) => document.querySelector(selector).value !== value);
   const delta = document.querySelector("#request-delta");
   delta.replaceChildren();
   if (budget === null || ceiling === null || threshold === null) text(delta, "Enter a valid budget to preview the bounded request.");
   else if (budget > ceiling) text(delta, `Outside the hard ceiling of ${template.ceiling.spec.budget.monthlyLimit} ${template.ceiling.spec.budget.currency}; Steward will reject this request.`);
-  else if (budget > threshold || ttl !== template.autoProvisionThreshold.spec.ttl) text(delta, "Within the hard ceiling but outside the automatic threshold; this request will be pending approval.");
+  else if (budget > threshold || ttl !== template.autoProvisionThreshold.spec.ttl || runnerChanged) text(delta, "Within the hard ceiling but outside the automatic threshold; server-side validation will determine whether this request is pending approval.");
   else text(delta, "Within the automatic threshold. Steward will attempt provisioning after server-side validation.");
 }
 
@@ -168,21 +189,32 @@ function detailValue(id, value) {
   text(document.querySelector(`#${id}`), value);
 }
 
+function listAuthority(values, render, unavailable) {
+  return values?.length ? values.map(render).join(", ") : unavailable;
+}
+
+function runnerValue(runner, field, unavailable) {
+  if (!runner) return unavailable;
+  if (field === "platform") return runner.platforms?.length ? runner.platforms.join(", ") : unavailable;
+  return runner[field] || unavailable;
+}
+
 function renderEnvelopeAuthority(request) {
-  const spec = request.requestedEnvelope?.spec;
+  const requested = request.requestedEnvelope?.spec;
+  const approved = request.approvedEnvelope?.spec;
   const unknownApproval = "Not recorded by the current approval authority.";
   const unknownRunner = "Not recorded by the current envelope authority.";
-  detailValue("requested-tools", spec?.tools?.length ? spec.tools.map((tool) => `${tool.provider}:${tool.resource}:${tool.action}`).join(", ") : "None requested.");
-  detailValue("approved-tools", unknownApproval);
-  detailValue("requested-models", spec?.llms?.length ? spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ") : "None requested.");
-  detailValue("approved-models", unknownApproval);
-  detailValue("requested-budget", spec?.budget ? `${spec.budget.monthlyLimit} ${spec.budget.currency}` : "Not recorded.");
-  detailValue("approved-budget", unknownApproval);
-  detailValue("requested-runtime", spec?.ttl ?? "Not recorded.");
-  detailValue("approved-runtime", unknownApproval);
+  detailValue("requested-tools", listAuthority(requested?.tools, (tool) => `${tool.provider}:${tool.resource}:${tool.action}`, "None requested."));
+  detailValue("approved-tools", listAuthority(approved?.tools, (tool) => `${tool.provider}:${tool.resource}:${tool.action}`, unknownApproval));
+  detailValue("requested-models", listAuthority(requested?.llms, (model) => `${model.provider}/${model.model}`, "None requested."));
+  detailValue("approved-models", listAuthority(approved?.llms, (model) => `${model.provider}/${model.model}`, unknownApproval));
+  detailValue("requested-budget", requested?.budget ? `${requested.budget.monthlyLimit} ${requested.budget.currency}` : "Not recorded.");
+  detailValue("approved-budget", approved?.budget ? `${approved.budget.monthlyLimit} ${approved.budget.currency}` : unknownApproval);
+  detailValue("requested-runtime", requested?.ttl ?? "Not recorded.");
+  detailValue("approved-runtime", approved?.ttl ?? unknownApproval);
   for (const field of ["platform", "memory", "compute", "storage"]) {
-    detailValue(`requested-${field}`, unknownRunner);
-    detailValue(`approved-${field}`, unknownApproval);
+    detailValue(`requested-${field}`, runnerValue(requested?.runner, field, unknownRunner));
+    detailValue(`approved-${field}`, runnerValue(approved?.runner, field, unknownApproval));
   }
 }
 
@@ -204,15 +236,24 @@ async function loadNewEnvelope() {
     const update = () => renderTemplate(selectedTemplate(templates, select));
     select.addEventListener("change", update);
     document.querySelector("#budget-limit").addEventListener("input", () => renderDelta(selectedTemplate(templates, select)));
-    document.querySelector("#ttl").addEventListener("input", () => renderDelta(selectedTemplate(templates, select)));
+    for (const selector of ["#ttl", "#runner-platform", "#runner-memory", "#runner-compute", "#runner-storage"]) {
+      document.querySelector(selector).addEventListener("input", () => renderDelta(selectedTemplate(templates, select)));
+      document.querySelector(selector).addEventListener("change", () => renderDelta(selectedTemplate(templates, select)));
+    }
     update();
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const template = selectedTemplate(templates, select);
-      const requestedEnvelope = structuredClone(template.ceiling);
+      const requestedEnvelope = structuredClone(template.autoProvisionThreshold);
       requestedEnvelope.revision = template.revision;
       requestedEnvelope.spec.budget.monthlyLimit = document.querySelector("#budget-limit").value;
       requestedEnvelope.spec.ttl = document.querySelector("#ttl").value;
+      requestedEnvelope.spec.runner = {
+        platforms: document.querySelector("#runner-platform").value ? [document.querySelector("#runner-platform").value] : [],
+        memory: document.querySelector("#runner-memory").value || null,
+        compute: document.querySelector("#runner-compute").value || null,
+        storage: document.querySelector("#runner-storage").value || null,
+      };
       const session = await csrf();
       const response = await fetch(`${API}/envelope-requests`, { method: "POST", headers: { "content-type": "application/json", "x-steward-csrf": session.csrf }, body: JSON.stringify({ templateId: template.id, templateRevision: template.revision, requestedEnvelope, idempotencyKey: crypto.randomUUID() }) });
       if (!response.ok) { text(message, `Request was not accepted (${response.status}). Review the bounded request and connection readiness.`); return; }

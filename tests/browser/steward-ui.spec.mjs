@@ -175,7 +175,7 @@ test("user can sign in, navigate shared top navigation, and connect then disconn
     await navigation.getByRole("link", { name: "Envelopes", exact: true }).click();
     await expect(page).toHaveURL(`${origin}/envelopes`);
     for (const name of ["Templates", "Drafts", "Approved", "In Review"]) {
-      await expect(page.locator(`details[data-accordion=\"${name.toLowerCase().replace(" ", "-")}\"]`)).toHaveJSProperty("open", false);
+      await expect(page.locator(`details[data-accordion=${name.toLowerCase().replace(" ", "-")}]`)).toHaveJSProperty("open", false);
     }
     const templates = page.locator("details[data-accordion=templates]");
     await templates.locator("summary").click();
@@ -186,14 +186,21 @@ test("user can sign in, navigate shared top navigation, and connect then disconn
     await page.goto(`${origin}/envelopes/new`);
     await expect(page.getByRole("heading", { name: "New envelope" })).toBeVisible();
     await expect(page.getByRole("combobox", { name: "Template" })).toHaveValue("engineer");
+    await expect(page.getByRole("combobox", { name: "Runner platform" })).toHaveValue("linux");
+    await expect(page.getByRole("textbox", { name: "Runner memory" })).toHaveValue("1Gi");
+    await expect(page.getByRole("textbox", { name: "Runner compute" })).toHaveValue("500m");
+    await expect(page.getByRole("textbox", { name: "Runner storage" })).toHaveValue("5Gi");
     await page.getByRole("button", { name: "Request envelope" }).click();
     await expect(page).toHaveURL(/\/envelopes\/[0-9a-f-]{36}$/);
     await expect(page.getByRole("heading", { name: "Envelope form" })).toBeVisible();
     await expect(page.locator("#envelope-detail")).toContainText("provisioned");
     await expect(page.locator("#requested-tools")).toContainText("github:repository:get_file_contents");
     await expect(page.locator("#requested-models")).toContainText("openai/gpt-5.4");
-    await expect(page.locator("#approved-tools")).toContainText("Not recorded by the current approval authority.");
-    await expect(page.locator("#requested-platform")).toContainText("Not recorded by the current envelope authority.");
+    await expect(page.locator("#approved-tools")).toContainText("github:repository:get_file_contents");
+    await expect(page.locator("#requested-platform")).toContainText("linux");
+    await expect(page.locator("#approved-platform")).toContainText("linux");
+    await expect(page.locator("#requested-memory")).toContainText("1Gi");
+    await expect(page.locator("#approved-memory")).toContainText("1Gi");
     await page.getByRole("link", { name: "Recent runs" }).click();
     await expect(page.getByRole("heading", { name: "Recent runs" })).toBeVisible();
     await expect(page.locator("#envelope-runs-list")).toContainText("No recent runs are recorded for this envelope instance.");

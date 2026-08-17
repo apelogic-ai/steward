@@ -276,7 +276,7 @@ mod tests {
     use steward_mint::{AuthorityBinding, AuthorityState, MintError, ValidatedWorkload};
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget, Duration, Email,
-        Phase, Principal, RuntimeId, RuntimeRefs, ToolGrant,
+        Phase, Principal, RunnerRequirements, RuntimeId, RuntimeRefs, ToolGrant,
     };
 
     use super::{
@@ -307,6 +307,7 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("1h".to_owned()),
+                runner: RunnerRequirements::default(),
                 bindings: None,
             },
         );

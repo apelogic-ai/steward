@@ -554,6 +554,7 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("24h".to_owned()),
+                runner: steward_types::RunnerRequirements::default(),
                 bindings: None,
             },
             envelope_revision: Some(1),

@@ -55,6 +55,13 @@
             <label for="budget-limit">Monthly budget <input id="budget-limit" name="budgetLimit" inputmode="decimal" required></label>
             <label for="ttl">Maximum runtime <input id="ttl" name="ttl" required></label>
           </div>
+          <fieldset class="form-grid">
+            <legend>Advanced runner properties</legend>
+            <label for="runner-platform">Runner platform <select id="runner-platform" name="runnerPlatform"></select></label>
+            <label for="runner-memory">Runner memory <input id="runner-memory" name="runnerMemory" placeholder="for example, 1Gi"></label>
+            <label for="runner-compute">Runner compute <input id="runner-compute" name="runnerCompute" placeholder="for example, 500m"></label>
+            <label for="runner-storage">Runner storage <input id="runner-storage" name="runnerStorage" placeholder="for example, 5Gi"></label>
+          </fieldset>
           <div id="request-delta" class="callout" aria-live="polite"></div>
           <button class="button" type="submit">Request envelope</button>
         </form>
