@@ -19,6 +19,7 @@ use steward_types::{
 
 use crate::{
     AuthenticatedCaller, AuthenticationError, BoxFuture, RequestAuthenticator, admin_ui,
+    agent_runs_ui::protected_router as protected_agent_runs_router,
     browser_auth::{
         BrowserSessionBinding, LocalFakeIdentity, browser_auth_router,
         local_fake_browser_auth_service,
@@ -26,6 +27,7 @@ use crate::{
     connections,
     connections_demo::LocalConnectionsBroker,
     protect_admin_routes,
+    user_envelopes_demo::LocalEmptyAgentRunLedger,
 };
 
 const LOCAL_DEMO_BEARER: &str = "steward-local-demo";
@@ -308,7 +310,11 @@ fn oidc_connections_router(origin: &str, identity: LocalFakeIdentity) -> Result<
     let browser_auth = local_fake_browser_auth_service(origin, identity)?;
     let broker = LocalConnectionsBroker::<BrowserSessionBinding>::new(bind)?;
     Ok(browser_auth_router(browser_auth.clone())
-        .merge(connections::protected_router(broker, browser_auth)))
+        .merge(connections::protected_router(broker, browser_auth.clone()))
+        .merge(protected_agent_runs_router(
+            LocalEmptyAgentRunLedger,
+            browser_auth,
+        )))
 }
 
 #[cfg(test)]

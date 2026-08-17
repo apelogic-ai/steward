@@ -15,7 +15,7 @@
       <a class="brand" href="/envelopes"><strong>Steward</strong></a>
       <nav aria-label="Steward primary navigation">
         <a href="/envelopes" data-route="/envelopes">Envelopes</a>
-        <a href="/runs">Runs</a>
+        <a href="/runs" data-route="/runs">Runs</a>
         <a href="/admin/connections">Connections</a>
         <a href="/settings">Settings</a>
       </nav>
@@ -71,6 +71,22 @@
         <div class="section-heading"><div><p class="eyebrow">Envelope execution</p><h1>Recent runs</h1></div><a class="button secondary" href="/envelopes">Back to Envelopes</a></div>
         <p id="envelope-runs-message" role="status">Loading your authoritative runs…</p>
         <div id="envelope-runs-list" class="group-list" aria-live="polite"></div>
+      </section>
+      <section data-page="/runs" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Governed execution</p><h1>Runs</h1></div></div>
+        <p id="runs-message" role="status">Loading authoritative runs…</p>
+        <div id="runs-list" class="group-list" aria-live="polite"></div>
+      </section>
+      <section data-page="/runs/detail" data-route-pattern="/runs/{task_uid}" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Governed execution</p><h1>Run detail</h1></div><a class="button secondary" href="/runs">Back to Runs</a></div>
+        <p id="run-detail-message" role="status">Loading authoritative run details…</p>
+        <div id="run-detail" class="request-form-layout" hidden>
+          <dl class="detail-list"></dl>
+          <section aria-labelledby="run-timeline-heading">
+            <h2 id="run-timeline-heading">Timeline</h2>
+            <ol id="run-timeline" class="run-timeline" aria-live="polite"></ol>
+          </section>
+        </div>
       </section>
     </main>
   </body>

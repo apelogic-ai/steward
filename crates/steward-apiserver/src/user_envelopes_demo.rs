@@ -53,7 +53,7 @@ impl LocalEnvelopeRequestBroker {
 /// credential-free ledger. It demonstrates an authoritative absence of runs without inventing
 /// any records and keeps the envelope UI on the browser-session-bound API contract.
 #[derive(Clone, Default)]
-struct LocalEmptyAgentRunLedger;
+pub(crate) struct LocalEmptyAgentRunLedger;
 
 impl AgentRunLedger for LocalEmptyAgentRunLedger {
     fn agent_runs<'a>(

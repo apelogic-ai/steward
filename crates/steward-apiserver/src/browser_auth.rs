@@ -1042,6 +1042,7 @@ impl PendingAuthorization {
                 | "/app/envelopes"
                 | "/app/envelopes/new"
                 | "/app/runs"
+                | "/runs"
         ) {
             return Err(BrowserAuthError::InvalidRedirect);
         }
@@ -1259,7 +1260,13 @@ mod tests {
 
     #[test]
     fn user_workspace_return_paths_are_exactly_allowlisted() {
-        for path in ["/app", "/app/envelopes", "/app/envelopes/new", "/app/runs"] {
+        for path in [
+            "/app",
+            "/app/envelopes",
+            "/app/envelopes/new",
+            "/app/runs",
+            "/runs",
+        ] {
             assert!(
                 PendingAuthorization::new(path, 100).is_ok(),
                 "the authenticated user workspace destination {path} must be a valid login return"

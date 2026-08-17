@@ -810,6 +810,8 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
             phase: Some(TaskPhase::Succeeded),
             workflow: Some("code-review".to_owned()),
             owner_user_id: None,
+            runtime_uid: None,
+            task_uid: None,
         })
         .await?;
     let read_model = page
@@ -834,6 +836,8 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
             phase: Some(TaskPhase::Succeeded),
             workflow: Some("code-review".to_owned()),
             owner_user_id: Some(canonical.user_id.as_str().to_owned()),
+            runtime_uid: None,
+            task_uid: None,
         })
         .await?;
     assert!(
@@ -851,6 +855,8 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
                 phase: None,
                 workflow: None,
                 owner_user_id: Some(other.user_id.as_str().to_owned()),
+                runtime_uid: None,
+                task_uid: None,
             })
             .await,
         Err(StoreError::InvalidRunCursor),

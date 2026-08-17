@@ -17,6 +17,8 @@ where
         .route("/envelopes/new", get(shell))
         .route("/envelopes/{request_id}", get(shell))
         .route("/envelopes/{request_id}/runs", get(shell))
+        .route("/runs", get(shell))
+        .route("/runs/{task_uid}", get(shell))
         .route("/app", get(shell))
         .route("/app/envelopes", get(shell))
         .route("/app/envelopes/new", get(shell))
@@ -60,6 +62,8 @@ mod tests {
             "/envelopes/new",
             "/envelopes/{request_id}",
             "/envelopes/{request_id}/runs",
+            "/runs",
+            "/runs/{task_uid}",
             "/admin/connections",
         ] {
             assert!(USER_WORKSPACE_HTML.contains(route));
@@ -83,6 +87,7 @@ mod tests {
             "Settings",
             "signed-in-email",
             "href=\"/envelopes\"",
+            "href=\"/runs\"",
             "data-accordion=\"templates\"",
             "data-accordion=\"drafts\"",
             "data-accordion=\"approved\"",

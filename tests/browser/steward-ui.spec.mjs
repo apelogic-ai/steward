@@ -218,6 +218,12 @@ test("user can sign in, navigate shared top navigation, and connect then disconn
       await expect(navigation.getByRole("link", { name: label, exact: true })).toBeVisible();
     }
     await expect(page.locator("#signed-in-email")).toHaveText("alice@example.com");
+    await navigation.getByRole("link", { name: "Runs", exact: true }).click();
+    await expect(page).toHaveURL(`${envelopeOrigin}/runs`);
+    await expect(page.getByRole("heading", { name: "Runs" })).toBeVisible();
+    await expect(page.locator("#runs-list")).toContainText("No runs are recorded for your identity.");
+    await navigation.getByRole("link", { name: "Envelopes", exact: true }).click();
+    await expect(page).toHaveURL(`${envelopeOrigin}/envelopes`);
     for (const name of ["Templates", "Drafts", "Approved", "In Review"]) {
       await expect(page.locator(`details[data-accordion=\"${name.toLowerCase().replace(" ", "-")}\"]`)).toHaveJSProperty("open", false);
     }

@@ -538,6 +538,13 @@ impl PgStore {
         {
             return Err(StoreError::InvalidRunQuery);
         }
+        if query
+            .runtime_uid
+            .as_deref()
+            .is_some_and(|runtime_uid| runtime_uid.is_empty())
+        {
+            return Err(StoreError::InvalidRunQuery);
+        }
         if let Some(cursor) = query.cursor {
             let mut cursor_exists = QueryBuilder::<Postgres>::new(
                 "SELECT EXISTS(SELECT 1 FROM task_submissions WHERE task_uid = ",
@@ -579,6 +586,14 @@ impl PgStore {
         if let Some(owner_user_id) = query.owner_user_id.as_deref() {
             statement.push(" AND tasks.owner_user_id = ");
             statement.push_bind(owner_user_id);
+        }
+        if let Some(runtime_uid) = query.runtime_uid.as_deref() {
+            statement.push(" AND tasks.runtime_uid = ");
+            statement.push_bind(runtime_uid);
+        }
+        if let Some(task_uid) = query.task_uid {
+            statement.push(" AND tasks.task_uid = ");
+            statement.push_bind(task_uid);
         }
         statement.push(" ORDER BY tasks.created_at DESC, tasks.task_uid DESC LIMIT ");
         statement.push_bind(i64::from(query.limit) + 1);
@@ -2321,6 +2336,10 @@ pub struct AgentRunQuery {
     pub workflow: Option<String>,
     /// Exact server-derived canonical owner scope. `None` is reserved for administrator reads.
     pub owner_user_id: Option<String>,
+    /// Exact runtime binding, used for an envelope's run history.
+    pub runtime_uid: Option<String>,
+    /// Exact durable task identity, used for a single run detail read.
+    pub task_uid: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

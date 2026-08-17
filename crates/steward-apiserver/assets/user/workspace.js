@@ -7,6 +7,7 @@ const path = window.location.pathname;
 const pages = Array.from(document.querySelectorAll("[data-page]"));
 
 function activePage() {
+  if (/^\/runs\/[0-9a-f-]{36}$/i.test(path)) return "/runs/detail";
   if (/^\/envelopes\/[^/]+\/runs$/i.test(path)) return "/envelopes/runs";
   if (/^\/envelopes\/[^/]+$/i.test(path)) return path.endsWith("/new") ? "/envelopes/new" : "/envelopes/detail";
   if (path === "/app/envelopes") return "/envelopes";
@@ -24,6 +25,7 @@ function text(element, value) { element.textContent = value; }
 function create(tag, value) { const element = document.createElement(tag); if (value) text(element, value); return element; }
 function requestId() { return path.split("/").filter(Boolean).at(-1); }
 function envelopeIdForRuns() { return path.split("/").filter(Boolean).at(-2); }
+function runId() { return path.split("/").filter(Boolean).at(-1); }
 
 function setupAccordions() {
   for (const details of document.querySelectorAll("details[data-accordion]")) {
@@ -45,11 +47,29 @@ async function api(pathname, options) {
 async function loadIdentity() {
   const target = document.querySelector("#signed-in-email");
   try {
-    const response = await fetch("/admin/api/v1/session");
-    if (!response.ok) throw new Error("session unavailable");
-    const session = await response.json();
+    const session = await sessionInfo();
     text(target, session.principal.displayEmail);
   } catch (_) { text(target, "Session unavailable"); }
+}
+
+let sessionPromise;
+async function sessionInfo() {
+  if (!sessionPromise) {
+    sessionPromise = fetch("/admin/api/v1/session").then((response) => {
+      if (!response.ok) throw new Error("session unavailable");
+      return response.json();
+    });
+  }
+  return sessionPromise;
+}
+
+async function runsApi(suffix = "", query = {}) {
+  const session = await sessionInfo();
+  const endpoint = session.role === "admin" ? "/admin/api/v1/all-runs" : `${API}/runs`;
+  const params = new URLSearchParams(Object.entries(query).filter(([, value]) => value !== null && value !== undefined && value !== ""));
+  const response = await fetch(`${endpoint}${suffix}${params.size ? `?${params}` : ""}`);
+  if (!response.ok) throw new Error(`The authoritative run request failed (${response.status}).`);
+  return response.json();
 }
 
 function renderStatus(request) {
@@ -185,7 +205,11 @@ async function loadDetail() {
 function renderRun(run) {
   const card = create("article");
   card.className = "card";
-  card.append(create("h2", run.workflow), create("p", `Phase: ${run.phase}. Updated ${run.updatedAt}.`));
+  const heading = create("h2");
+  const link = create("a", run.workflow);
+  link.href = `/runs/${run.taskUid}`;
+  heading.append(link);
+  card.append(heading, create("p", `Phase: ${run.phase}. Updated ${run.updatedAt}.`));
   return card;
 }
 
@@ -193,12 +217,58 @@ async function loadEnvelopeRuns() {
   const message = document.querySelector("#envelope-runs-message");
   const list = document.querySelector("#envelope-runs-list");
   try {
-    const [requestResponse, runsResponse] = await Promise.all([
-      api(`/envelope-requests/${envelopeIdForRuns()}`), api("/runs"),
-    ]);
+    const requestResponse = await api(`/envelope-requests/${envelopeIdForRuns()}`);
     const request = requestResponse.request;
-    const runs = runsResponse.runs.filter((run) => request.envelopeInstanceId && run.runtimeUid === request.envelopeInstanceId);
+    const runsResponse = request.envelopeInstanceId
+      ? await runsApi("", { runtimeUid: request.envelopeInstanceId })
+      : { runs: [] };
+    const runs = runsResponse.runs;
     list.replaceChildren(...(runs.length ? runs.map(renderRun) : [create("p", request.envelopeInstanceId ? "No recent runs are recorded for this envelope instance." : "This envelope is not provisioned, so it has no runs.")]));
+    text(message, "");
+  } catch (error) { text(message, error.message); }
+}
+
+async function loadRuns() {
+  const message = document.querySelector("#runs-message");
+  const list = document.querySelector("#runs-list");
+  try {
+    const response = await runsApi();
+    list.replaceChildren(...(response.runs.length ? response.runs.map(renderRun) : [create("p", "No runs are recorded for your identity.")]));
+    text(message, "");
+  } catch (error) { text(message, error.message); }
+}
+
+function timelineLabel(event) {
+  if (event.kind === "phase") return `Phase changed to ${event.phase}.`;
+  if (event.kind === "finalizationRequested") return "Finalization requested.";
+  return "Finalized.";
+}
+
+async function loadRunDetail() {
+  const message = document.querySelector("#run-detail-message");
+  const container = document.querySelector("#run-detail");
+  const details = container.querySelector("dl");
+  const timeline = container.querySelector("#run-timeline");
+  try {
+    const [detailResponse, timelineResponse] = await Promise.all([
+      runsApi(`/${runId()}`), runsApi(`/${runId()}/timeline`),
+    ]);
+    const run = detailResponse.run;
+    const rows = [
+      ["Workflow", run.workflow], ["Phase", run.phase], ["Agent runtime", run.codingAgentRuntime],
+      ["Runtime", run.runtimeUid || "Not bound"], ["Created", run.createdAt], ["Updated", run.updatedAt],
+      ["Envelope revision", run.envelopeRevision ?? "Not recorded"], ["Observed spend", run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "Not observed"],
+      ["Failure category", run.errorCategory || "None recorded"],
+    ];
+    details.replaceChildren(...rows.flatMap(([term, value]) => [create("dt", term), create("dd", String(value))]));
+    timeline.replaceChildren(...(timelineResponse.events.length ? timelineResponse.events.map((event) => {
+      const item = create("li", timelineLabel(event));
+      const when = create("time", event.at);
+      when.dateTime = event.at;
+      item.append(when);
+      return item;
+    }) : [create("li", "No lifecycle events are recorded.")]));
+    container.hidden = false;
     text(message, "");
   } catch (error) { text(message, error.message); }
 }
@@ -209,3 +279,5 @@ if (activePage() === "/envelopes") loadEnvelopeGroups();
 if (activePage() === "/envelopes/new") loadNewEnvelope();
 if (activePage() === "/envelopes/detail") loadDetail();
 if (activePage() === "/envelopes/runs") loadEnvelopeRuns();
+if (activePage() === "/runs") loadRuns();
+if (activePage() === "/runs/detail") loadRunDetail();

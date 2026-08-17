@@ -5,13 +5,16 @@
 //! All Runs route requires a browser-admin session; the existing bearer administrator API remains
 //! independent at `/admin/api/v1/runs`.
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
-use steward_store::{AgentRunPage, AgentRunQuery, AgentRunRecord, StoreError};
+use steward_store::{
+    AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent, AgentRunTimelineKind,
+    StoreError,
+};
 use steward_types::{CanonicalUserId, RuntimeOwnership, TaskPhase};
 use uuid::Uuid;
 
@@ -36,6 +39,7 @@ struct BrowserRunsQuery {
     cursor: Option<Uuid>,
     phase: Option<TaskPhase>,
     workflow: Option<String>,
+    runtime_uid: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -47,6 +51,7 @@ struct AllRunsQuery {
     phase: Option<TaskPhase>,
     workflow: Option<String>,
     owner_user_id: Option<CanonicalUserId>,
+    runtime_uid: Option<String>,
 }
 
 const fn default_limit() -> u16 {
@@ -96,12 +101,40 @@ struct AllRunsResponse {
     next_cursor: Option<Uuid>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRunResponse {
+    api_version: &'static str,
+    run: BrowserRunView,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+enum BrowserRunTimelineEvent {
+    Phase { phase: TaskPhase, at: String },
+    FinalizationRequested { at: String },
+    Finalized { at: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserRunTimelineResponse {
+    api_version: &'static str,
+    task_uid: Uuid,
+    events: Vec<BrowserRunTimelineEvent>,
+}
+
 fn my_runs_router<L>(ledger: L) -> Router
 where
     L: AgentRunLedger,
 {
     Router::new()
         .route("/app/api/v1/runs", get(my_runs::<L>))
+        .route("/app/api/v1/runs/{task_uid}", get(my_run::<L>))
+        .route(
+            "/app/api/v1/runs/{task_uid}/timeline",
+            get(my_run_timeline::<L>),
+        )
         .with_state(BrowserRunsState { ledger })
 }
 
@@ -111,15 +144,20 @@ where
 {
     Router::new()
         .route("/admin/api/v1/all-runs", get(all_runs::<L>))
+        .route("/admin/api/v1/all-runs/{task_uid}", get(all_run::<L>))
+        .route(
+            "/admin/api/v1/all-runs/{task_uid}/timeline",
+            get(all_run_timeline::<L>),
+        )
         .with_state(BrowserRunsState { ledger })
 }
 
 /// Mount browser-session-bound Runs APIs.
 ///
-/// `GET /app/api/v1/runs` is exact-identity scoped to the browser principal. `GET
-/// /admin/api/v1/all-runs` is browser-admin only and may optionally filter an opaque canonical
-/// owner identifier. Neither response exposes emails, provider credentials, commands, prompts or
-/// raw failure data.
+/// `GET /app/api/v1/runs` and its detail/timeline descendants are exact-identity scoped to the
+/// browser principal. `GET /admin/api/v1/all-runs` and its descendants are browser-admin only
+/// and may optionally filter an opaque canonical owner identifier. Neither response exposes
+/// emails, provider credentials, commands, prompts or raw failure data.
 pub fn protected_router<L>(ledger: L, browser_auth: BrowserAuthService) -> Router
 where
     L: AgentRunLedger,
@@ -146,6 +184,8 @@ where
         phase: query.phase,
         workflow: query.workflow,
         owner_user_id: Some(session.principal.canonical_user_id.as_str().to_owned()),
+        runtime_uid: query.runtime_uid,
+        task_uid: None,
     };
     match state.ledger.agent_runs(&query).await {
         Ok(page) => Json(MyRunsResponse {
@@ -178,6 +218,8 @@ where
         phase: query.phase,
         workflow: query.workflow,
         owner_user_id: query.owner_user_id.map(|id| id.as_str().to_owned()),
+        runtime_uid: query.runtime_uid,
+        task_uid: None,
     };
     match state.ledger.agent_runs(&query).await {
         Ok(AgentRunPage {
@@ -202,6 +244,147 @@ where
     }
 }
 
+async fn my_run<L>(
+    session: Option<Extension<BrowserSessionContext>>,
+    State(state): State<BrowserRunsState<L>>,
+    Path(task_uid): Path<Uuid>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    single_run_response(
+        &state.ledger,
+        task_uid,
+        Some(session.principal.canonical_user_id.as_str().to_owned()),
+    )
+    .await
+}
+
+async fn all_run<L>(
+    authority: Option<Extension<BrowserAdminAuthority>>,
+    State(state): State<BrowserRunsState<L>>,
+    Path(task_uid): Path<Uuid>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    if authority.is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    single_run_response(&state.ledger, task_uid, None).await
+}
+
+async fn my_run_timeline<L>(
+    session: Option<Extension<BrowserSessionContext>>,
+    State(state): State<BrowserRunsState<L>>,
+    Path(task_uid): Path<Uuid>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    scoped_timeline_response(
+        &state.ledger,
+        task_uid,
+        Some(session.principal.canonical_user_id.as_str().to_owned()),
+    )
+    .await
+}
+
+async fn all_run_timeline<L>(
+    authority: Option<Extension<BrowserAdminAuthority>>,
+    State(state): State<BrowserRunsState<L>>,
+    Path(task_uid): Path<Uuid>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    if authority.is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    scoped_timeline_response(&state.ledger, task_uid, None).await
+}
+
+async fn single_run_response<L>(
+    ledger: &L,
+    task_uid: Uuid,
+    owner_user_id: Option<String>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    match scoped_run(ledger, task_uid, owner_user_id).await {
+        Ok(Some(record)) => Json(BrowserRunResponse {
+            api_version: BROWSER_AGENT_RUNS_API_VERSION,
+            run: browser_run_view(record),
+        })
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(StoreError::InvalidRunQuery | StoreError::InvalidRunCursor) => {
+            browser_runs_error(StatusCode::BAD_REQUEST)
+        }
+        Err(_) => browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+async fn scoped_timeline_response<L>(
+    ledger: &L,
+    task_uid: Uuid,
+    owner_user_id: Option<String>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    match scoped_run(ledger, task_uid, owner_user_id).await {
+        Ok(Some(_)) => match ledger.agent_run_timeline(task_uid).await {
+            Ok(Some(events)) => Json(BrowserRunTimelineResponse {
+                api_version: BROWSER_AGENT_RUNS_API_VERSION,
+                task_uid,
+                events: events
+                    .into_iter()
+                    .rev()
+                    .map(browser_timeline_event)
+                    .collect(),
+            })
+            .into_response(),
+            Ok(None) => StatusCode::NOT_FOUND.into_response(),
+            Err(_) => browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+        },
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(StoreError::InvalidRunQuery | StoreError::InvalidRunCursor) => {
+            browser_runs_error(StatusCode::BAD_REQUEST)
+        }
+        Err(_) => browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+async fn scoped_run<L>(
+    ledger: &L,
+    task_uid: Uuid,
+    owner_user_id: Option<String>,
+) -> Result<Option<AgentRunRecord>, StoreError>
+where
+    L: AgentRunLedger,
+{
+    let page = ledger
+        .agent_runs(&AgentRunQuery {
+            limit: 1,
+            cursor: None,
+            phase: None,
+            workflow: None,
+            owner_user_id,
+            runtime_uid: None,
+            task_uid: Some(task_uid),
+        })
+        .await?;
+    Ok(page.records.into_iter().next())
+}
+
 fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
     BrowserRunView {
         task_uid: record.task_uid,
@@ -222,6 +405,19 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         }),
         error_category: bounded_task_error_category(record.failure_reason.as_deref())
             .map(str::to_owned),
+    }
+}
+
+fn browser_timeline_event(event: AgentRunTimelineEvent) -> BrowserRunTimelineEvent {
+    match event.kind {
+        AgentRunTimelineKind::Phase(phase) => BrowserRunTimelineEvent::Phase {
+            phase,
+            at: event.at,
+        },
+        AgentRunTimelineKind::FinalizationRequested => {
+            BrowserRunTimelineEvent::FinalizationRequested { at: event.at }
+        }
+        AgentRunTimelineKind::Finalized => BrowserRunTimelineEvent::Finalized { at: event.at },
     }
 }
 
@@ -275,7 +471,11 @@ mod tests {
                     .filter(|record| {
                         query.owner_user_id.as_ref().is_none_or(|owner| {
                             record.owner_user_id.as_deref() == Some(owner.as_str())
-                        })
+                        }) && query.runtime_uid.as_ref().is_none_or(|runtime_uid| {
+                            record.runtime_uid.as_deref() == Some(runtime_uid.as_str())
+                        }) && query
+                            .task_uid
+                            .is_none_or(|task_uid| record.task_uid == task_uid)
                     })
                     .cloned()
                     .collect();
@@ -295,9 +495,30 @@ mod tests {
 
         fn agent_run_timeline<'a>(
             &'a self,
-            _task_uid: Uuid,
+            task_uid: Uuid,
         ) -> BoxFuture<'a, Result<Option<Vec<AgentRunTimelineEvent>>, StoreError>> {
-            Box::pin(async { Ok(None) })
+            Box::pin(async move {
+                let known = self
+                    .records
+                    .lock()
+                    .map_err(|_| StoreError::InvalidRunQuery)?
+                    .iter()
+                    .any(|record| record.task_uid == task_uid);
+                Ok(known.then(|| {
+                    vec![
+                        AgentRunTimelineEvent {
+                            kind: AgentRunTimelineKind::Phase(TaskPhase::Running),
+                            provenance: steward_store::AgentRunTimelineProvenance::Recorded,
+                            at: "2026-08-17T00:00:00.000000Z".to_owned(),
+                        },
+                        AgentRunTimelineEvent {
+                            kind: AgentRunTimelineKind::Finalized,
+                            provenance: steward_store::AgentRunTimelineProvenance::Recorded,
+                            at: "2026-08-17T00:01:00.000000Z".to_owned(),
+                        },
+                    ]
+                }))
+            })
         }
     }
 
@@ -527,6 +748,66 @@ mod tests {
                 .owner_user_id
                 .as_deref(),
             Some(owner)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn my_run_detail_and_timeline_are_owner_scoped_and_reverse_chronological()
+    -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let other_owner = "usr_abcdefabcdefabcdefabcdefabcdefab";
+        let own_task = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let other_task = Uuid::parse_str("22222222-2222-4222-8222-222222222222")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .extend([run(own_task, owner), run(other_task, other_owner)]);
+
+        let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
+        let absent = protected_router(ledger.clone(), service)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{other_task}"))
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build cross-owner detail request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute cross-owner detail request: {error}"))?;
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+
+        let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
+        let timeline = protected_router(ledger.clone(), service)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{own_task}/timeline"))
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build scoped timeline request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute scoped timeline request: {error}"))?;
+        assert_eq!(timeline.status(), StatusCode::OK);
+        let body = to_bytes(timeline.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read scoped timeline response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse scoped timeline response: {error}"))?;
+        assert_eq!(value["events"][0]["kind"], "finalized");
+        assert_eq!(
+            ledger.queries.lock().map_err(|_| "lock queries")?[1]
+                .owner_user_id
+                .as_deref(),
+            Some(owner)
+        );
+        assert_eq!(
+            ledger.queries.lock().map_err(|_| "lock queries")?[1].task_uid,
+            Some(own_task)
         );
         Ok(())
     }

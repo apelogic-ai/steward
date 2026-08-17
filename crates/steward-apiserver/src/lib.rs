@@ -1379,6 +1379,8 @@ where
         phase: query.phase,
         workflow: query.workflow,
         owner_user_id: None,
+        runtime_uid: None,
+        task_uid: None,
     };
     match state.ledger.agent_runs(&query).await {
         Ok(page) => Json(AgentRunsResponse {
