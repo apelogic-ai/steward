@@ -180,7 +180,7 @@ pub struct BrowserPrincipal {
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct BrowserSessionBinding(String);
 
-#[cfg(test)]
+#[cfg(all(test, feature = "admin-demo"))]
 impl BrowserSessionBinding {
     pub(crate) fn from_test_value(value: &str) -> Self {
         Self(value.to_owned())
@@ -212,7 +212,7 @@ impl BrowserAdminAuthority {
 #[derive(Clone, Copy)]
 pub struct BrowserMutationProof(());
 
-#[cfg(test)]
+#[cfg(all(test, feature = "admin-demo"))]
 impl BrowserMutationProof {
     pub(crate) fn for_test() -> Self {
         Self(())
