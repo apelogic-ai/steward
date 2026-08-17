@@ -9,9 +9,9 @@ use jwt_compact::{AlgorithmExt, Token};
 use rand_core::OsRng;
 use steward_mint::{
     AuthorityBinding, AuthorityResolver, AuthorityState, DEFAULT_AUTHORITY_TTL,
-    IntrospectionClientCredential, Mint, MintConfig, MintError, MintSigningKey,
-    SPIFFE_CLIENT_ASSERTION_TYPE, SvidAssertion, SvidValidationError, SvidValidator,
-    TokenGrantRequest, ValidatedWorkload,
+    HOP1_CLAIMS_VERSION, IntrospectionClientCredential, Mint, MintConfig, MintError,
+    MintSigningKey, SPIFFE_CLIENT_ASSERTION_TYPE, SvidAssertion, SvidValidationError,
+    SvidValidator, TokenGrantRequest, ValidatedWorkload,
 };
 use steward_types::{
     CanonicalAuthorityBinding, CanonicalUserId, Email, Principal, RuntimeId, ToolGrant,
@@ -60,6 +60,25 @@ fn authority() -> Result<AuthorityBinding, String> {
         tools: vec![ToolGrant {
             provider: "github".to_owned(),
             resource: "get_file_contents".to_owned(),
+            action: "read".to_owned(),
+        }],
+        state: AuthorityState::Active,
+    })
+}
+
+fn s5_authority() -> Result<AuthorityBinding, String> {
+    let user = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+    Ok(AuthorityBinding {
+        workload_id: WORKLOAD.to_owned(),
+        runtime: RuntimeId("runtime-revocation".to_owned()),
+        runtime_namespace: "team-a".to_owned(),
+        principal: Principal::User {
+            acting_user: Email::parse(EMAIL)?,
+        },
+        canonical_authority: Some(CanonicalAuthorityBinding::new(user.clone(), Some(user))?),
+        tools: vec![ToolGrant {
+            provider: "github".to_owned(),
+            resource: "search_repositories".to_owned(),
             action: "read".to_owned(),
         }],
         state: AuthorityState::Active,
@@ -121,5 +140,67 @@ async fn governed_runtime_projects_canonical_subject_and_verified_email() -> Res
     );
     assert!(claims.get("canonical_user_id").is_none());
     assert!(claims.get("user_id").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn s5_hop1_v3_authority_mints_the_required_mcp_grant() -> Result<(), String> {
+    assert_eq!(
+        HOP1_CLAIMS_VERSION, 3,
+        "S5 requires the current HOP-1 v3 contract"
+    );
+
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let verifier = signing_key.verifying_key();
+    let mint = Mint::new(
+        MintConfig {
+            issuer: "https://steward-mint.example.org".to_owned(),
+            audience: "steward-mcp".to_owned(),
+            allowed_scopes: vec!["mcp".to_owned()],
+            svid_audience: "steward-mint".to_owned(),
+            authority_ttl: DEFAULT_AUTHORITY_TTL,
+            introspection_client_credential: IntrospectionClientCredential::new(
+                "preview-introspection".to_owned(),
+            ),
+        },
+        MintSigningKey::from_bytes(&signing_key.to_bytes()),
+        Validator,
+        Resolver(s5_authority()?),
+    )
+    .map_err(|error| format!("create S5 mint: {error:?}"))?;
+    let response = mint
+        .exchange(TokenGrantRequest {
+            grant_type: "client_credentials".to_owned(),
+            client_assertion_type: SPIFFE_CLIENT_ASSERTION_TYPE.to_owned(),
+            client_assertion: SvidAssertion::new("fixture-svid".to_owned()),
+            audience: "steward-mcp".to_owned(),
+            scope: vec!["mcp".to_owned()],
+        })
+        .await
+        .map_err(|error| format!("mint S5 token: {error:?}"))?;
+    let untrusted = UntrustedToken::new(response.access_token())
+        .map_err(|error| format!("parse S5 token: {error}"))?;
+    let token: Token<serde_json::Value> = Ed25519
+        .validator(&verifier)
+        .validate(&untrusted)
+        .map_err(|error| format!("verify S5 token: {error}"))?;
+    let claims = &token.claims().custom;
+
+    assert_eq!(claims["iss"], "https://steward-mint.example.org");
+    assert_eq!(claims["aud"], serde_json::json!(["steward-mcp"]));
+    assert_eq!(claims["sub"], "usr_0123456789abcdef0123456789abcdef");
+    assert_eq!(claims["email"], EMAIL);
+    assert_eq!(claims["steward"]["acting_as"], "user");
+    assert!(claims["steward"].get("service").is_none());
+    assert_eq!(claims["steward"]["runtime_uid"], "runtime-revocation");
+    assert_eq!(claims["steward"]["version"], HOP1_CLAIMS_VERSION);
+    assert_eq!(
+        claims["steward"]["tools"][0],
+        serde_json::json!({
+            "provider": "github",
+            "resource": "search_repositories",
+            "action": "read"
+        })
+    );
     Ok(())
 }
