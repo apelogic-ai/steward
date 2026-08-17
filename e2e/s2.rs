@@ -348,13 +348,18 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
 
     let unpriced = harness.write_runtime(UNPRICED_RUNTIME, "unpriced-model", "1.00", "1h")?;
     let rejected = harness.apply_runtime(&unpriced)?;
-    assert!(
-        !rejected.status.success(),
-        "a model with no registered positive cost must be rejected at admission"
+    let rejection_output = format!(
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rejected.stdout).trim(),
+        String::from_utf8_lossy(&rejected.stderr).trim(),
     );
     assert!(
-        String::from_utf8_lossy(&rejected.stderr).contains("priced inference catalog"),
-        "unpriced-model rejection must identify the priced-catalog control"
+        !rejected.status.success(),
+        "a model with no registered positive cost must be rejected at admission: {rejection_output}"
+    );
+    assert!(
+        rejection_output.contains("priced inference catalog"),
+        "unpriced-model rejection must identify the priced-catalog control: {rejection_output}"
     );
 
     let priced = harness.write_runtime(PRICED_RUNTIME, "priced-model", "1.00", "1h")?;

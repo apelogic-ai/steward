@@ -55,7 +55,8 @@ authority_claims_match if {
 	authority := claims.steward
 	authority.acting_as == "user"
 	not authority.service
-	authority.version == 2
+	# Keep this aligned with steward-mint's HOP1_CLAIMS_VERSION.
+	authority.version == 3
 	is_string(authority.runtime_uid)
 	authority.runtime_uid != ""
 }
@@ -66,7 +67,8 @@ authority_claims_match if {
 	authority.acting_as in {"service", "service_for_user"}
 	is_string(authority.service)
 	authority.service != ""
-	authority.version == 2
+	# Keep this aligned with steward-mint's HOP1_CLAIMS_VERSION.
+	authority.version == 3
 	is_string(authority.runtime_uid)
 	authority.runtime_uid != ""
 }

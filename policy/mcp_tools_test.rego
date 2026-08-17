@@ -21,7 +21,7 @@ allowed_input := {
 				"resource": "search_repositories",
 				"action": "read",
 			}],
-			"version": 2,
+			"version": 3,
 		},
 	},
 }
@@ -54,7 +54,7 @@ pure_service_input := {
 				"resource": "search_repositories",
 				"action": "read",
 			}],
-			"version": 2,
+			"version": 3,
 		},
 	},
 }
