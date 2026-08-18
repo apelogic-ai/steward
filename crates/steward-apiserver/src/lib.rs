@@ -1737,7 +1737,7 @@ where
                         ));
                     }
                     let mut released = existing;
-                    released.spec = request.spec.clone();
+                    released.spec = proposed_spec.clone();
                     released
                         .metadata
                         .annotations
@@ -2236,8 +2236,12 @@ where
         )
         .await
         .map_err(ApiError::Runtime)?;
-    if runtime.spec == reversion.proposed_spec {
+    if matches_stored_authority_spec(&runtime.spec, &reversion.proposed_spec) {
+        let canonical_authority = runtime.spec.canonical_authority.clone();
         runtime.spec = reversion.base_spec;
+        if canonical_authority.is_some() {
+            runtime.spec.canonical_authority = canonical_authority;
+        }
         if let Some(pending_digest) = reversion.base_pending_approval_digest {
             runtime
                 .metadata
@@ -2268,6 +2272,23 @@ where
         }
     }
     Ok(())
+}
+
+fn matches_stored_authority_spec(
+    runtime_spec: &AgentRuntimeSpec,
+    stored_spec: &AgentRuntimeSpec,
+) -> bool {
+    let runtime_authority = runtime_spec.canonical_authority.as_ref();
+    if let Some(stored_authority) = stored_spec.canonical_authority.as_ref()
+        && runtime_authority != Some(stored_authority)
+    {
+        return false;
+    }
+    let mut runtime_without_authority = runtime_spec.clone();
+    runtime_without_authority.canonical_authority = None;
+    let mut stored_without_authority = stored_spec.clone();
+    stored_without_authority.canonical_authority = None;
+    runtime_without_authority == stored_without_authority
 }
 
 fn spec_digest(spec: &AgentRuntimeSpec) -> Result<String, ApiError> {
@@ -2301,8 +2322,9 @@ mod tests {
         PendingApproval, StoreError, TaskRecord, TaskReservation, TaskReservationRequest,
     };
     use steward_types::{
-        AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email,
-        ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, TaskPhase,
+        AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding,
+        CanonicalUserId, Duration, Email, ModelRef, PENDING_APPROVAL_ANNOTATION, Principal,
+        TaskPhase,
     };
     use tower::ServiceExt;
     use utoipa::OpenApi;
@@ -5576,6 +5598,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_envelope_expansion_retry_retains_its_authority() -> Result<(), String> {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+            canonical_user_id: Some(canonical_user_id.clone()),
+        };
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: proposed_spec,
+        };
+
+        let parked = super::submit_runtime_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &context,
+            "team-a",
+            &request,
+        )
+        .await
+        .map_err(|error| format!("canonical initial create did not park: {error:?}"))?;
+        assert!(matches!(parked, SubmissionOutcome::Parked { .. }));
+        {
+            let mut envelope = ledger
+                .envelope
+                .lock()
+                .map_err(|_| "fake envelope lock was poisoned")?;
+            envelope.revision += 1;
+            envelope.spec.budget.monthly_limit = "300.00".to_owned();
+        }
+
+        let retry = super::submit_runtime_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &context,
+            "team-a",
+            &request,
+        )
+        .await;
+
+        assert!(
+            matches!(retry, Ok(SubmissionOutcome::Applied { .. })),
+            "a canonical expanded envelope must release its matching hold: {retry:?}"
+        );
+        let restored = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        let authority = restored.spec.canonical_authority.as_ref().ok_or_else(|| {
+            "envelope expansion must retain the server-authored canonical authority".to_owned()
+        })?;
+        assert_eq!(authority.owner_user_id, canonical_user_id);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_repeated_member_role_group_is_one_authenticated_role() -> Result<(), String> {
         let app = router(
             FakeRuntimeRepository {
@@ -5986,6 +6072,53 @@ mod tests {
                 .map(String::as_str),
             Some("request-digest"),
             "API recovery must restore the durable pending marker verbatim"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canonical_initial_create_revocation_restores_its_pending_marker() -> Result<(), String>
+    {
+        let mut base = runtime();
+        let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        base.spec.canonical_authority = Some(
+            CanonicalAuthorityBinding::new(canonical_user_id.clone(), Some(canonical_user_id))
+                .map_err(|error| format!("failed to construct canonical authority: {error}"))?,
+        );
+        let mut applied = base.clone();
+        applied.spec.budget.monthly_limit = "220.00".to_owned();
+        let mut stored_proposed_spec = applied.spec.clone();
+        stored_proposed_spec.canonical_authority = None;
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(applied)),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let mut ledger = ledger();
+        ledger.reversion = Some(GrantReversion {
+            runtime_uid: "runtime-uid-a".to_owned(),
+            runtime_namespace: "team-a".to_owned(),
+            runtime_name: "runtime-a".to_owned(),
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+            base_spec: base.spec.clone(),
+            proposed_spec: stored_proposed_spec,
+            base_pending_approval_digest: Some("request-digest".to_owned()),
+        });
+
+        super::reconcile_grant_reversion(&runtimes, &ledger, "runtime-uid-a")
+            .await
+            .map_err(|error| format!("canonical initial-create reversion failed: {error:?}"))?;
+
+        let restored = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert_eq!(restored.spec, base.spec);
+        assert_eq!(
+            restored
+                .annotations()
+                .get(PENDING_APPROVAL_ANNOTATION)
+                .map(String::as_str),
+            Some("request-digest"),
         );
         Ok(())
     }
