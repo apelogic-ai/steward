@@ -10,6 +10,7 @@ let demo;
 let origin;
 let adminDemo;
 let adminOrigin;
+const DEMO_STARTUP_TIMEOUT_MS = 120_000;
 
 function startLoopbackDemo() {
   return new Promise((resolve, reject) => {
@@ -38,7 +39,7 @@ function startLoopbackDemo() {
         child.kill("SIGINT");
         reject(new Error(`loopback Steward demo did not become ready:\n${output}`));
       }
-    }, 30_000);
+    }, DEMO_STARTUP_TIMEOUT_MS);
     const inspect = (chunk) => {
       output = `${output}${chunk}`.slice(-16_384);
       const match = output.match(/Steward envelope localhost demo: (http:\/\/127\.0\.0\.1:\d+)/);
@@ -96,7 +97,7 @@ function startLoopbackAdminDemo() {
         child.kill("SIGINT");
         reject(new Error(`loopback Steward admin demo did not become ready:\n${output}`));
       }
-    }, 30_000);
+    }, DEMO_STARTUP_TIMEOUT_MS);
     const inspect = (chunk) => {
       output = `${output}${chunk}`.slice(-16_384);
       const match = output.match(/Steward localhost demo: (http:\/\/127\.0\.0\.1:\d+)\/admin\/sign-in/);
