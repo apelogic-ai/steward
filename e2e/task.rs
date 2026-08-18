@@ -3,12 +3,78 @@ use std::error::Error;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use kube::api::{Api, ListParams};
 use steward_store::{AgentRunTimelineKind, PgStore};
 use steward_types::{AgentRuntime, Phase, Principal, TaskPhase};
+
+const HTTP_STATUS_MARKER: &str = "__STEWARD_HTTP_STATUS:";
+
+struct HttpResponse {
+    body: String,
+    status: u16,
+}
+
+fn retryable_provider_grant_status(status: u16) -> bool {
+    status == 502
+}
+
+fn parse_http_response(output: Output, context: &str) -> Result<HttpResponse, Box<dyn Error>> {
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "{context} did not complete: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+        .into());
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    let (body, status) = stdout.rsplit_once(HTTP_STATUS_MARKER).ok_or_else(|| {
+        io::Error::other(format!("{context} did not return an HTTP status marker"))
+    })?;
+    let status = status.trim().parse::<u16>().map_err(|error| {
+        io::Error::other(format!("{context} returned an invalid HTTP status: {error}"))
+    })?;
+    Ok(HttpResponse {
+        body: body.trim_end_matches('\n').to_owned(),
+        status,
+    })
+}
+
+#[test]
+fn only_the_transparent_provider_grant_failure_is_retried() {
+    assert!(
+        retryable_provider_grant_status(502),
+        "the OpenShell transparent relay uses 502 for an in-progress dynamic provider grant"
+    );
+    for status in [200, 400, 401, 403, 404, 500, 503] {
+        assert!(
+            !retryable_provider_grant_status(status),
+            "status {status} must fail closed rather than hide a non-grant failure"
+        );
+    }
+}
+
+#[test]
+fn http_probe_retains_the_safe_body_and_status() -> Result<(), Box<dyn Error>> {
+    let response = parse_http_response(
+        Output {
+            status: success_status()?,
+            stdout: b"{\"error\":\"grant pending\"}\n__STEWARD_HTTP_STATUS:502\n".to_vec(),
+            stderr: Vec::new(),
+        },
+        "provider probe",
+    )?;
+    assert_eq!(response.status, 502);
+    assert_eq!(response.body, r#"{"error":"grant pending"}"#);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn success_status() -> Result<std::process::ExitStatus, Box<dyn Error>> {
+    Ok(std::os::unix::process::ExitStatusExt::from_raw(0))
+}
 
 #[tokio::test]
 async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Error>> {
@@ -243,13 +309,13 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     assert_eq!(retried["runtimeUid"], parked["runtimeUid"]);
     put_archive(
         &base_url,
-        &task_uid,
+        task_uid,
         "github-assertion",
         &input_tar,
         &run_dir,
     )?;
-    execute(&base_url, &task_uid, "github-assertion", &run_dir)?;
-    execute(&base_url, &task_uid, "github-assertion", &run_dir)?;
+    execute(&base_url, task_uid, "github-assertion", &run_dir)?;
+    execute(&base_url, task_uid, "github-assertion", &run_dir)?;
 
     let pending = store
         .pending_approvals()
@@ -267,7 +333,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
 
     let succeeded = wait_for(
         &base_url,
-        &task_uid,
+        task_uid,
         "github-assertion",
         |status| status["phase"] == "succeeded",
         &run_dir,
@@ -276,7 +342,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     let output_tar = run_dir.join("output.tar");
     get_output(
         &base_url,
-        &task_uid,
+        task_uid,
         "github-assertion",
         &output_tar,
         &run_dir,
@@ -300,10 +366,10 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
             .contains("example-org/fixture-repository"),
         "the Task output must contain the governed tool result"
     );
-    delete_task(&base_url, &task_uid, "github-assertion", &run_dir)?;
+    delete_task(&base_url, task_uid, "github-assertion", &run_dir)?;
     wait_for(
         &base_url,
-        &task_uid,
+        task_uid,
         "github-assertion",
         |status| status["finalized"] == true,
         &run_dir,
@@ -590,35 +656,58 @@ async fn assert_controller_runtime_tool_ready(
         "controller-created runtime must attach the governed tool provider before execution"
     );
 
-    let tool_call = Command::new(&openshell)
-        .args(["--gateway-endpoint", &endpoint, "--workspace", workspace])
-        .args(["sandbox", "exec", "--name", sandbox, "--no-tty", "--"])
-        .args([
-            "curl",
-            "-fsS",
-            "--max-time",
-            "20",
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            "MCP-Protocol-Version: 2025-06-18",
-            "-d",
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_repositories","arguments":{}}}"#,
-            "http://hop1-capture-tools.steward-system.svc.cluster.local:8085/mcp",
-        ])
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let terminal_response = loop {
+        let tool_call = Command::new(&openshell)
+            .args(["--gateway-endpoint", &endpoint, "--workspace", workspace])
+            .args(["sandbox", "exec", "--name", sandbox, "--no-tty", "--"])
+            .args([
+                "curl",
+                "-sS",
+                "--max-time",
+                "20",
+                "-w",
+                "\n__STEWARD_HTTP_STATUS:%{http_code}\n",
+                "-H",
+                "Content-Type: application/json",
+                "-H",
+                "MCP-Protocol-Version: 2025-06-18",
+                "-d",
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_repositories","arguments":{}}}"#,
+                "http://hop1-capture-tools.steward-system.svc.cluster.local:8085/mcp",
+            ])
+            .output()?;
+        let response = parse_http_response(tool_call, "exact OpenShell ExecSandbox tool call")?;
+        if response.status == 200 && response.body.contains("example-org/fixture-repository") {
+            return Ok(());
+        }
+        if !retryable_provider_grant_status(response.status) || Instant::now() >= deadline {
+            break response;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    let diagnostic = provider_grant_diagnostic()?;
+    Err(io::Error::other(format!(
+        "controller-created runtime did not obtain a dynamic tool grant: status {}; body {}; captured Mint response: {diagnostic}",
+        terminal_response.status, terminal_response.body
+    ))
+    .into())
+}
+
+fn provider_grant_diagnostic() -> Result<String, Box<dyn Error>> {
+    let capture_url = required("STEWARD_TEST_CAPTURE_URL")?;
+    let output = Command::new("curl")
+        .args(["-fsS", "--max-time", "5"])
+        .arg(format!("{capture_url}/token-grant"))
         .output()?;
-    if !tool_call.status.success() {
+    if !output.status.success() {
         return Err(io::Error::other(format!(
-            "exact OpenShell ExecSandbox tool call failed after provider attachment: {}",
-            String::from_utf8_lossy(&tool_call.stderr).trim()
+            "capture token-grant diagnostic failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
         ))
         .into());
     }
-    assert!(
-        String::from_utf8_lossy(&tool_call.stdout).contains("example-org/fixture-repository"),
-        "the supervisor must inject a dynamic provider credential for the controller-created runtime"
-    );
-    Ok(())
+    Ok(String::from_utf8(output.stdout)?)
 }
 
 fn submit(

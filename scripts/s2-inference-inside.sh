@@ -341,10 +341,12 @@ LITELLM_FORWARD_PID=$!
 postgres_log="${STEWARD_RUN_DIR}/s2-postgres-forward.log"
 "${KUBECTL[@]}" -n steward-system port-forward service/postgres :5432 >"${postgres_log}" 2>&1 &
 POSTGRES_FORWARD_PID=$!
-if [[ "${SLICE}" == "s5" ]]; then
+if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   capture_log="${STEWARD_RUN_DIR}/s5-capture-forward.log"
   "${KUBECTL[@]}" -n steward-system port-forward service/hop1-capture :8085 >"${capture_log}" 2>&1 &
   CAPTURE_FORWARD_PID=$!
+fi
+if [[ "${SLICE}" == "s5" ]]; then
   poc_api_log="${STEWARD_RUN_DIR}/poc-api-forward.log"
   "${KUBECTL[@]}" -n steward-system port-forward service/steward-poc-api :443 >"${poc_api_log}" 2>&1 &
   POC_API_FORWARD_PID=$!
@@ -379,11 +381,13 @@ forwarded_port() {
 
 litellm_port="$(forwarded_port "${litellm_log}" "${LITELLM_FORWARD_PID}")"
 postgres_port="$(forwarded_port "${postgres_log}" "${POSTGRES_FORWARD_PID}")"
-if [[ "${SLICE}" == "s5" ]]; then
+if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   capture_port="$(forwarded_port "${capture_log}" "${CAPTURE_FORWARD_PID}")"
+  export STEWARD_TEST_CAPTURE_URL="http://127.0.0.1:${capture_port}"
+fi
+if [[ "${SLICE}" == "s5" ]]; then
   poc_api_port="$(forwarded_port "${poc_api_log}" "${POC_API_FORWARD_PID}")"
   jira_port="$(forwarded_port "${jira_log}" "${JIRA_FORWARD_PID}")"
-  export STEWARD_TEST_CAPTURE_URL="http://127.0.0.1:${capture_port}"
   export STEWARD_POC_RESOLVE="steward-poc.test:${poc_api_port}:127.0.0.1"
   export STEWARD_POC_URL="https://steward-poc.test:${poc_api_port}"
   export STEWARD_TEST_JIRA_URL="http://127.0.0.1:${jira_port}"
