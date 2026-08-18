@@ -1480,10 +1480,10 @@ fn authority_action(
                 reason: format!("{error:?}"),
             },
         )? == AdmissionDecision::Admit;
-    if runtime.spec == reversion.base_spec && base_is_admitted {
+    if matches_stored_authority_spec(&runtime.spec, &reversion.base_spec) && base_is_admitted {
         return Ok(AuthorityAction::Continue);
     }
-    if runtime.spec == reversion.proposed_spec && base_is_admitted {
+    if matches_stored_authority_spec(&runtime.spec, &reversion.proposed_spec) && base_is_admitted {
         if runtime
             .annotations()
             .contains_key(PENDING_APPROVAL_ANNOTATION)
@@ -1519,17 +1519,39 @@ fn authority_application_action(
         .annotations()
         .get(PENDING_APPROVAL_ANNOTATION)
         .map(String::as_str);
-    if runtime.spec == application.base_spec {
+    if matches_stored_authority_spec(&runtime.spec, &application.base_spec) {
         validate_pending_application_provenance(pending_digest, application)?;
         let mut proposed = runtime.clone();
         proposed.spec = application.proposed_spec.clone();
+        if let Some(canonical_authority) = runtime.spec.canonical_authority.clone() {
+            proposed.spec.canonical_authority = Some(canonical_authority);
+        }
         Ok(AuthorityAction::Restore(Box::new(proposed)))
-    } else if runtime.spec == application.proposed_spec && pending_digest.is_some() {
+    } else if matches_stored_authority_spec(&runtime.spec, &application.proposed_spec)
+        && pending_digest.is_some()
+    {
         validate_pending_application_provenance(pending_digest, application)?;
         Ok(AuthorityAction::Restore(Box::new(runtime.clone())))
     } else {
         Ok(AuthorityAction::Continue)
     }
+}
+
+fn matches_stored_authority_spec(
+    runtime_spec: &AgentRuntimeSpec,
+    stored_spec: &AgentRuntimeSpec,
+) -> bool {
+    let runtime_authority = runtime_spec.canonical_authority.as_ref();
+    if let Some(stored_authority) = stored_spec.canonical_authority.as_ref()
+        && runtime_authority != Some(stored_authority)
+    {
+        return false;
+    }
+    let mut runtime_without_authority = runtime_spec.clone();
+    runtime_without_authority.canonical_authority = None;
+    let mut stored_without_authority = stored_spec.clone();
+    stored_without_authority.canonical_authority = None;
+    runtime_without_authority == stored_without_authority
 }
 
 fn validate_pending_application_provenance(
@@ -1906,6 +1928,11 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
         &runtime.spec.principal,
         steward_types::Principal::Service { .. }
     ) && trusted_writer_usernames.contains(username);
+    let trusted_canonical_user_write = matches!(
+        &runtime.spec.principal,
+        steward_types::Principal::User { .. }
+    ) && runtime.spec.canonical_authority.is_some()
+        && trusted_writer_usernames.contains(username);
     let pending = runtime
         .annotations()
         .get(PENDING_APPROVAL_ANNOTATION)
@@ -1948,7 +1975,7 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
                 .deny("pending AgentRuntime spec may be changed only by a trusted Steward writer");
         }
         trusted_pending_transition |= trusted_pending_writer;
-        if !trusted_pending_transition && !trusted_service_write {
+        if !trusted_pending_transition && !trusted_service_write && !trusted_canonical_user_write {
             match &old_runtime.spec.principal {
                 steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
                 _ => {
@@ -1959,7 +1986,7 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
             }
         }
     }
-    if !trusted_pending_transition && !trusted_service_write {
+    if !trusted_pending_transition && !trusted_service_write && !trusted_canonical_user_write {
         match &runtime.spec.principal {
             steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
             _ => {
@@ -1983,7 +2010,7 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
                 return response
                     .deny("user AgentRuntime must not carry a service-principal annotation");
             }
-            let member_role = if trusted_pending_transition {
+            let member_role = if trusted_pending_transition || trusted_canonical_user_write {
                 let Some(member_role) = bound_role.filter(|role| !role.is_empty()) else {
                     return response.deny("AgentRuntime member-role annotation is required");
                 };
@@ -3433,6 +3460,36 @@ mod tests {
     }
 
     #[test]
+    fn expired_canonical_initial_create_restores_its_pending_marker() -> Result<(), String> {
+        let mut runtime = fixture();
+        let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        runtime.spec.canonical_authority = Some(
+            CanonicalAuthorityBinding::new(canonical_user_id.clone(), Some(canonical_user_id))
+                .map_err(|error| format!("failed to construct canonical authority: {error}"))?,
+        );
+        let mut reversion = grant_reversion(&runtime);
+        reversion.proposed_spec.canonical_authority = None;
+        reversion.base_pending_approval_digest = Some("request-digest".to_owned());
+        runtime.spec = reversion.proposed_spec.clone();
+        runtime.spec.canonical_authority = reversion.base_spec.canonical_authority.clone();
+
+        let action = authority_action(&runtime, &reversion, &envelope("1.00"), &[])
+            .map_err(|error| format!("canonical authority reversion failed: {error:?}"))?;
+        let AuthorityAction::Restore(restored) = action else {
+            return Err("expired canonical initial create must restore its hold".to_owned());
+        };
+        assert_eq!(restored.spec, reversion.base_spec);
+        assert_eq!(
+            restored
+                .annotations()
+                .get("agents.apelogic.ai/pending-approval")
+                .map(String::as_str),
+            Some("request-digest"),
+        );
+        Ok(())
+    }
+
+    #[test]
     fn approved_grant_converges_after_a_transient_apply_failure() -> Result<(), String> {
         let runtime = fixture();
         let application = grant_reversion(&runtime);
@@ -3463,6 +3520,36 @@ mod tests {
             return Err("matching initial-create authority did not converge".to_owned());
         };
         assert_eq!(proposed.spec, application.proposed_spec);
+        Ok(())
+    }
+
+    #[test]
+    fn approved_canonical_initial_create_retains_its_immutable_authority() -> Result<(), String> {
+        let mut runtime = fixture();
+        let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        runtime.spec.canonical_authority = Some(
+            CanonicalAuthorityBinding::new(canonical_user_id.clone(), Some(canonical_user_id))
+                .map_err(|error| format!("failed to construct canonical authority: {error}"))?,
+        );
+        let mut application = grant_reversion(&runtime);
+        application.proposed_spec.canonical_authority = None;
+        let digest = super::spec_digest(&application.proposed_spec)
+            .map_err(|error| format!("failed to digest proposed canonical spec: {error:?}"))?;
+        runtime.metadata.annotations.get_or_insert_default().insert(
+            "agents.apelogic.ai/pending-approval".to_owned(),
+            digest.clone(),
+        );
+        application.base_pending_approval_digest = Some(digest);
+
+        let action = authority_application_action(&runtime, &application)
+            .map_err(|error| format!("canonical authority application failed: {error:?}"))?;
+        let AuthorityAction::Restore(proposed) = action else {
+            return Err("approved canonical initial create did not converge".to_owned());
+        };
+        assert_eq!(
+            proposed.spec.canonical_authority,
+            runtime.spec.canonical_authority
+        );
         Ok(())
     }
 
@@ -4139,6 +4226,40 @@ mod webhook_tests {
             trusted.allowed,
             "the trusted Steward writer must admit a service runtime through its service envelope: {}",
             trusted.result.message
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_allows_a_trusted_writer_to_author_a_canonical_user_runtime()
+    -> Result<(), String> {
+        let writer_username = "system:serviceaccount:steward-system:steward-poc-api";
+        let mut value = admission_review_value();
+        value["request"]["operation"] = serde_json::json!("CREATE");
+        value["request"]["oldObject"] = serde_json::Value::Null;
+        value["request"]["userInfo"] = serde_json::json!({"username": writer_username});
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
+        value["request"]["object"]["spec"]["canonicalAuthority"] = serde_json::json!({
+            "schemaVersion": "steward/canonical-authority-binding/v1",
+            "ownerUserId": "usr_0123456789abcdef0123456789abcdef",
+            "actingUserId": "usr_0123456789abcdef0123456789abcdef"
+        });
+
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct trusted user CREATE review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read trusted user CREATE request: {error}"))?;
+        let response = super::validate_admission_with_trusted_writers(
+            &request,
+            &fake_envelopes(),
+            &BTreeSet::from([writer_username.to_owned()]),
+        )
+        .await;
+        assert!(
+            response.allowed,
+            "the trusted API writer must be able to author the server-derived canonical user binding: {}",
+            response.result.message
         );
         Ok(())
     }

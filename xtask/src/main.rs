@@ -209,9 +209,28 @@ fn migrate_check() -> TaskResult {
     Ok(())
 }
 
+fn git_command_in_repository(repository: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(repository);
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_QUARANTINE_PATH",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+    ] {
+        command.env_remove(variable);
+    }
+    command
+}
+
 fn migration_changes(repository: &Path, base: &str) -> Result<String, String> {
     let range = format!("{base}...HEAD");
-    let output = Command::new("git")
+    let output = git_command_in_repository(repository)
         .args([
             "diff",
             "--name-status",
@@ -220,7 +239,6 @@ fn migration_changes(repository: &Path, base: &str) -> Result<String, String> {
             "--",
             ":(glob)migrations/*.sql",
         ])
-        .current_dir(repository)
         .output()
         .map_err(|error| format!("failed to inspect migration history: {error}"))?;
     if !output.status.success() {
@@ -817,7 +835,9 @@ impl Drop for TemporaryTree {
 
 #[cfg(test)]
 mod tests {
-    use super::{migration_changes, root, validate_conformance_test_result};
+    use super::{
+        git_command_in_repository, migration_changes, root, validate_conformance_test_result,
+    };
     use std::fs;
     use std::io::ErrorKind;
     use std::os::unix::fs::PermissionsExt;
@@ -884,23 +904,38 @@ mod tests {
     }
 
     #[test]
-    fn revocation_e2e_preserves_observed_runtime_headroom() -> Result<(), String> {
+    fn runtime_e2e_reuses_builds_and_preserves_observed_runtime_headroom() -> Result<(), String> {
         let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
-        let revocation = workflow
-            .split("  e2e-revocation:")
+        let runtime = workflow
+            .split("  e2e-runtime:")
             .nth(1)
-            .and_then(|jobs| jobs.split("\n  openshell-adapter:").next())
-            .ok_or_else(|| "revocation E2E CI job is required".to_owned())?;
+            .and_then(|jobs| jobs.split("\n  e2e-admission:").next())
+            .ok_or_else(|| "shared runtime E2E CI job is required".to_owned())?;
 
         assert!(
-            revocation.contains("timeout-minutes: 40"),
-            "the revocation E2E needs 40 minutes after a 29m05s successful run left less than one minute of the prior budget"
+            runtime.contains("timeout-minutes: 105"),
+            "the shared runtime E2E must preserve headroom for the observed 29m05s revocation lane while reusing one Rust build"
         );
         assert_eq!(
-            workflow.matches("timeout-minutes: 40").count(),
+            runtime.matches("Restore shared Rust build cache").count(),
             1,
-            "only the evidence-backed revocation lane may use the 40-minute timeout"
+            "the shared runtime E2E must restore one cache for S1, S2, and S5"
+        );
+        assert_eq!(
+            runtime.matches("cargo xtask e2e-s1").count(),
+            1,
+            "the shared runtime E2E must run the S1 lane exactly once"
+        );
+        assert_eq!(
+            runtime.matches("cargo xtask e2e-s2").count(),
+            1,
+            "the shared runtime E2E must run the S2 lane exactly once"
+        );
+        assert_eq!(
+            runtime.matches("cargo xtask e2e-s5").count(),
+            1,
+            "the shared runtime E2E must run the S5 lane exactly once"
         );
 
         Ok(())
@@ -1694,13 +1729,12 @@ mod tests {
     }
 
     fn test_git_command(repository: &Path, arguments: &[&str]) -> Command {
-        let mut command = Command::new("git");
+        let mut command = git_command_in_repository(repository);
         command
             .args(["-c", "commit.gpgsign=false"])
             .args(arguments)
             .env("GIT_CONFIG_GLOBAL", repository.join(".gitconfig-disabled"))
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .current_dir(repository);
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         command
     }
 
@@ -1763,6 +1797,27 @@ mod tests {
             Some(std::ffi::OsStr::new("1")),
             "fixture Git commands must not inherit system configuration"
         );
+        for variable in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_QUARANTINE_PATH",
+            "GIT_NAMESPACE",
+            "GIT_PREFIX",
+        ] {
+            let value = command
+                .get_envs()
+                .find(|(key, _value)| *key == variable)
+                .map(|(_key, value)| value);
+            assert_eq!(
+                value,
+                Some(None),
+                "fixture Git commands must clear inherited {variable}"
+            );
+        }
         Ok(())
     }
 

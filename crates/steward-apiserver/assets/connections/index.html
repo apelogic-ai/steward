@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Connections · Steward</title>
+    <link rel="icon" href="/admin/assets/icon.svg">
+    <link rel="stylesheet" href="/admin/assets/connections.css">
+    <script src="/admin/assets/connections.js" defer></script>
+  </head>
+  <body data-fast-track-runtime="false">
+    <a class="skip-link" href="#connections-workspace">Skip to connections</a>
+    <header class="topbar">
+      <a class="brand" href="/admin">Steward</a>
+      <span class="surface-label">Connections</span>
+    </header>
+
+    <main id="connections-workspace" tabindex="-1">
+      <section class="intro" aria-labelledby="connections-heading">
+        <p class="eyebrow">Your access</p>
+        <h1 id="connections-heading">Connections</h1>
+        <p>Connect accounts that Steward may use for governed runs. Credentials stay in the provider broker and are never placed in an envelope or workflow.</p>
+      </section>
+
+      <div id="callback-status" class="notice" role="status" aria-live="polite" hidden></div>
+      <div id="runtime-status" class="notice" role="status" aria-live="polite" hidden></div>
+      <div id="connection-error" class="notice notice-error" role="alert" hidden>
+        <strong>Connection unavailable</strong>
+        <span id="connection-error-message">Try again when the provider broker is available.</span>
+      </div>
+
+      <section class="identity-card" aria-labelledby="identity-heading">
+        <div>
+          <p class="eyebrow">Signed-in organization principal</p>
+          <h2 id="identity-heading">Your Steward identity</h2>
+        </div>
+        <dl>
+          <div>
+            <dt>Email</dt>
+            <dd id="principal-email">Loading…</dd>
+          </div>
+          <div>
+            <dt>Canonical user</dt>
+            <dd><code id="canonical-user">Loading…</code></dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="provider-card" aria-labelledby="github-heading" data-phase="loading">
+        <div class="provider-heading">
+          <div class="provider-mark" aria-hidden="true">GH</div>
+          <div>
+            <p class="eyebrow">Developer tools</p>
+            <h2 id="github-heading">GitHub</h2>
+          </div>
+          <span id="github-status" class="status-pill" role="status" aria-live="polite">Checking…</span>
+        </div>
+
+        <p id="github-summary" class="provider-summary">Checking the authoritative provider connection status.</p>
+
+        <dl class="connection-details">
+          <div>
+            <dt>Connected account</dt>
+            <dd id="github-account">Not connected</dd>
+          </div>
+          <div>
+            <dt>Credential expiry</dt>
+            <dd id="github-expiry">Not reported by provider</dd>
+          </div>
+        </dl>
+
+        <div id="scope-status" class="scope-status">
+          <h3>Required capabilities</h3>
+          <ul id="github-scopes" aria-live="polite">
+            <li>Loading scope status…</li>
+          </ul>
+        </div>
+
+        <div class="actions">
+          <button id="connect-github" class="primary" type="button" disabled>Connect GitHub</button>
+          <button id="disconnect-github" class="secondary danger" type="button" hidden>Disconnect</button>
+          <button id="retry-github" class="secondary" type="button" hidden>Retry status</button>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="disconnect-dialog" aria-labelledby="disconnect-heading">
+      <form method="dialog">
+        <h2 id="disconnect-heading">Disconnect GitHub?</h2>
+        <p>Future governed runs will not be able to use your GitHub connection until you reconnect.</p>
+        <div class="dialog-actions">
+          <button value="cancel" class="secondary">Cancel</button>
+          <button id="confirm-disconnect" value="confirm" class="danger" type="button">Disconnect GitHub</button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>

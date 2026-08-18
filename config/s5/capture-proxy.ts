@@ -19,7 +19,14 @@ type CapturedRequest = {
 
 let inferenceRequest: CapturedRequest | undefined;
 let toolRequest: CapturedRequest | undefined;
-let tokenGrant: { body: string; contentType: string } | undefined;
+type TokenGrant = {
+  body: string;
+  contentType: string;
+  error?: string;
+  status: number;
+};
+
+let tokenGrant: TokenGrant | undefined;
 
 const forwardedResponse = async (response: Response): Promise<Response> =>
   new Response(await response.arrayBuffer(), {
@@ -101,14 +108,27 @@ Bun.serve({
       const contentType =
         request.headers.get("content-type") ??
         "application/x-www-form-urlencoded";
-      tokenGrant = { body, contentType };
-      return forwardedResponse(
+      const response = await forwardedResponse(
         await fetch(toolsMintUrl, {
           method: "POST",
           headers: { "content-type": contentType },
           body,
         }),
       );
+      let error: string | undefined;
+      if (!response.ok) {
+        const payload = await response.clone().json().catch(() => undefined);
+        if (
+          typeof payload === "object" &&
+          payload !== null &&
+          "error" in payload &&
+          typeof payload.error === "string"
+        ) {
+          error = payload.error;
+        }
+      }
+      tokenGrant = { body, contentType, error, status: response.status };
+      return response;
     }
     if (path === "/mcp" && request.method === "POST") {
       return captureBearerRequest(request, mcpUrl, (captured) => {
@@ -134,6 +154,18 @@ Bun.serve({
       });
       return Response.json(
         { upstreamStatus: upstream.status },
+        { headers: { "cache-control": "no-store" } },
+      );
+    }
+    if (path === "/token-grant" && request.method === "GET") {
+      if (!tokenGrant) {
+        return Response.json(
+          { error: "no token grant was captured" },
+          { status: 409, headers: { "cache-control": "no-store" } },
+        );
+      }
+      return Response.json(
+        { error: tokenGrant.error, status: tokenGrant.status },
         { headers: { "cache-control": "no-store" } },
       );
     }

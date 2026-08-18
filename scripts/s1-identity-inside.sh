@@ -66,10 +66,10 @@ fi
 openshell_archive="openshell-${openshell_target}.tar.gz"
 cli_archive="${STEWARD_RUN_DIR}/${openshell_archive}"
 cli_checksums="${STEWARD_RUN_DIR}/openshell-checksums-sha256.txt"
-curl -fsSL \
+curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
   "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.90/${openshell_archive}" \
   -o "${cli_archive}"
-curl -fsSL \
+curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
   "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.90/openshell-checksums-sha256.txt" \
   -o "${cli_checksums}"
 (

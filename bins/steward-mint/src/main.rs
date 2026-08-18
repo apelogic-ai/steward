@@ -8,16 +8,14 @@ use std::time::Duration;
 use k8s_openapi::api::core::v1::Secret;
 use kube::Client;
 use kube::api::{Api, ListParams};
-use steward_adapter_openshell::{
-    IdentityResolutionError, OpenShellIdentityResolver, SandboxBinding,
-};
+use steward_adapter_openshell::{IdentityResolutionError, OpenShellIdentityResolver};
 use steward_adapter_spire::SpireSvidValidator;
 use steward_mint::{
-    AuthorityBinding, AuthorityResolver, AuthorityState, CredentialGrant, CredentialGrantResolver,
+    AuthorityBinding, AuthorityResolver, CredentialGrant, CredentialGrantResolver,
     DEFAULT_AUTHORITY_TTL, IntrospectionClientCredential, Mint, MintConfig, MintError,
-    MintSigningKey, OpaqueAccessToken, ValidatedWorkload, router,
+    MintSigningKey, OpaqueAccessToken, ValidatedWorkload, authority_from_runtime_refs, router,
 };
-use steward_types::{AgentRuntime, Phase, RuntimeId};
+use steward_types::{AgentRuntime, RuntimeId};
 use tokio::net::TcpListener;
 
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
@@ -106,64 +104,6 @@ impl CredentialGrantResolver for KubernetesCredentialGrantResolver {
     }
 }
 
-fn authority_from_runtimes(
-    workload: &ValidatedWorkload,
-    binding: &SandboxBinding,
-    runtimes: &[AgentRuntime],
-) -> Result<AuthorityBinding, MintError> {
-    let mut matches = runtimes.iter().filter(|runtime| {
-        runtime.status.as_ref().is_some_and(|status| {
-            status.refs.workspace.as_deref() == Some(binding.workspace.as_str())
-                && status.refs.sandbox.as_deref() == Some(binding.sandbox.as_str())
-        })
-    });
-    let runtime = matches.next().ok_or(MintError::WorkloadMismatch)?;
-    if matches.next().is_some() {
-        return Err(MintError::WorkloadMismatch);
-    }
-    let runtime_uid = runtime
-        .metadata
-        .uid
-        .clone()
-        .filter(|uid| !uid.is_empty())
-        .ok_or(MintError::WorkloadMismatch)?;
-    let runtime_namespace = runtime
-        .metadata
-        .namespace
-        .clone()
-        .filter(|namespace| !namespace.is_empty())
-        .ok_or(MintError::WorkloadMismatch)?;
-    let phase = runtime
-        .status
-        .as_ref()
-        .map(|status| status.phase)
-        .ok_or(MintError::WorkloadMismatch)?;
-    let state = authority_state(runtime.metadata.deletion_timestamp.is_some(), phase);
-    Ok(AuthorityBinding {
-        workload_id: workload.spiffe_id.clone(),
-        runtime: RuntimeId(runtime_uid),
-        runtime_namespace,
-        principal: runtime.spec.principal.clone(),
-        tools: runtime.spec.tools.clone(),
-        state,
-    })
-}
-
-fn authority_state(deleting: bool, phase: Phase) -> AuthorityState {
-    if deleting {
-        return AuthorityState::Revoked;
-    }
-    match phase {
-        Phase::Running => AuthorityState::Active,
-        Phase::Suspended => AuthorityState::Suspended,
-        Phase::Terminating => AuthorityState::Revoked,
-        Phase::Terminated => AuthorityState::Terminated,
-        Phase::Pending | Phase::Admitted | Phase::Provisioning | Phase::Failed => {
-            AuthorityState::Revoked
-        }
-    }
-}
-
 #[derive(Clone)]
 struct KubernetesAuthorityResolver {
     identity: OpenShellIdentityResolver,
@@ -186,7 +126,12 @@ impl AuthorityResolver for KubernetesAuthorityResolver {
             .list(&ListParams::default())
             .await
             .map_err(|_| MintError::AuthorityUnavailable)?;
-        authority_from_runtimes(workload, &binding, &runtimes.items)
+        authority_from_runtime_refs(
+            workload,
+            binding.workspace.as_str(),
+            binding.sandbox.as_str(),
+            &runtimes.items,
+        )
     }
 }
 
@@ -273,15 +218,19 @@ mod tests {
     use k8s_openapi::api::core::v1::Secret;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
     use steward_adapter_openshell::SandboxBinding;
-    use steward_mint::{AuthorityBinding, AuthorityState, MintError, ValidatedWorkload};
+    use steward_mint::{
+        AuthorityBinding, AuthorityState, MintError, ValidatedWorkload,
+        authority_from_runtime_refs, authority_state,
+    };
     use steward_types::{
-        AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget, Duration, Email,
-        Phase, Principal, RuntimeId, RuntimeRefs, ToolGrant,
+        AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
+        CanonicalAuthorityBinding, CanonicalUserId, Duration, Email, Phase, Principal, RuntimeId,
+        RuntimeRefs, ToolGrant,
     };
 
     use super::{
-        INFERENCE_CREDENTIAL_DATA_KEY, RUNTIME_UID_LABEL, authority_from_runtimes, authority_state,
-        credential_from_secret, credential_secret_name,
+        INFERENCE_CREDENTIAL_DATA_KEY, RUNTIME_UID_LABEL, credential_from_secret,
+        credential_secret_name,
     };
 
     fn runtime(uid: &str, workspace: &str, sandbox: &str) -> AgentRuntime {
@@ -374,6 +323,7 @@ mod tests {
             principal: Principal::User {
                 acting_user: Email("alice@example.com".to_owned()),
             },
+            canonical_authority: None,
             tools: Vec::new(),
             state: AuthorityState::Active,
         }
@@ -396,9 +346,11 @@ mod tests {
 
     #[test]
     fn authority_resolution_rejects_an_ambiguous_runtime_binding() {
-        let result = authority_from_runtimes(
+        let binding = binding();
+        let result = authority_from_runtime_refs(
             &workload(),
-            &binding(),
+            binding.workspace.as_str(),
+            binding.sandbox.as_str(),
             &[
                 runtime("runtime-uid-a", "workspace-a", "sandbox-a"),
                 runtime("runtime-uid-b", "workspace-a", "sandbox-a"),
@@ -509,10 +461,19 @@ mod tests {
 
     #[test]
     fn authority_resolution_binds_live_runtime_principal_and_tools() -> Result<(), String> {
-        let authority = authority_from_runtimes(
+        let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
+            .map_err(|_| "canonical-user fixture is invalid".to_owned())?;
+        let canonical_authority =
+            CanonicalAuthorityBinding::new(canonical_user_id.clone(), Some(canonical_user_id))
+                .map_err(|_| "canonical-authority fixture is invalid".to_owned())?;
+        let mut runtime = runtime("runtime-uid-a", "workspace-a", "sandbox-a");
+        runtime.spec.canonical_authority = Some(canonical_authority.clone());
+        let binding = binding();
+        let authority = authority_from_runtime_refs(
             &workload(),
-            &binding(),
-            &[runtime("runtime-uid-a", "workspace-a", "sandbox-a")],
+            binding.workspace.as_str(),
+            binding.sandbox.as_str(),
+            &[runtime],
         )
         .map_err(|error| format!("live runtime authority was rejected: {error:?}"))?;
 
@@ -525,6 +486,7 @@ mod tests {
                 acting_user: Email("alice@example.com".to_owned())
             }
         );
+        assert_eq!(authority.canonical_authority, Some(canonical_authority));
         assert_eq!(
             authority.tools,
             [ToolGrant {

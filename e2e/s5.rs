@@ -2,7 +2,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -160,45 +160,6 @@ impl Harness {
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
-    fn write_runtime(&self) -> Result<PathBuf, Box<dyn Error>> {
-        let path = self.run_dir.join("e2e-s5-runtime.json");
-        let manifest = serde_json::json!({
-            "apiVersion": "agents.apelogic.ai/v1alpha1",
-            "kind": "AgentRuntime",
-            "metadata": {
-                "name": RUNTIME_NAME,
-                "namespace": NAMESPACE,
-                "annotations": {
-                    "agents.apelogic.ai/member-role": "engineer"
-                }
-            },
-            "spec": {
-                "principal": {
-                    "kind": "user",
-                    "actingUser": "alice@example.com"
-                },
-                "owner": "alice@example.com",
-                "agentType": {"name": "base"},
-                "llms": [{
-                    "provider": "openai",
-                    "model": "priced-model"
-                }],
-                "tools": [{
-                    "provider": "github",
-                    "resource": "search_repositories",
-                    "action": "read"
-                }],
-                "budget": {
-                    "monthlyLimit": "10.00",
-                    "currency": "USD"
-                },
-                "ttl": "1h"
-            }
-        });
-        fs::write(&path, serde_json::to_vec_pretty(&manifest)?)?;
-        Ok(path)
-    }
-
     fn wait_phase(&self, expected: &str, timeout: Duration) -> Result<(), Box<dyn Error>> {
         let deadline = Instant::now() + timeout;
         let mut last = String::new();
@@ -308,6 +269,42 @@ impl Harness {
             "the acting user's runtime could not call its authorized tool: {last_response}"
         ))
         .into())
+    }
+
+    fn preflight_authorized_tool_call(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        request: &str,
+    ) -> Result<String, Box<dyn Error>> {
+        self.wait_authorized_tool_call(workspace, sandbox, request, Duration::from_secs(5))
+            .map_err(|error| {
+                let diagnostic = self
+                    .token_grant_diagnostic()
+                    .unwrap_or_else(|diagnostic_error| {
+                        format!("token-grant diagnostic unavailable: {diagnostic_error}")
+                    });
+                io::Error::other(format!(
+                    "S5 dynamic token-grant preflight failed before revocation assertions: {error}; \
+                     captured Mint response: {diagnostic}"
+                ))
+                .into()
+            })
+    }
+
+    fn token_grant_diagnostic(&self) -> Result<String, Box<dyn Error>> {
+        let output = Command::new("curl")
+            .args(["-fsS", "--max-time", "5"])
+            .arg(format!("{}/token-grant", self.capture_url))
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "capture token-grant diagnostic failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+            .into());
+        }
+        Ok(String::from_utf8(output.stdout)?)
     }
 
     fn replay_status(&self, path: &str) -> Result<u16, Box<dyn Error>> {
@@ -486,15 +483,42 @@ async fn e2e_s5_terminated_runtime_holds_nothing() -> Result<(), Box<dyn Error>>
         )
         .await?;
 
-    let manifest = harness.write_runtime()?;
-    let applied = harness.kubectl_as_actor(&["apply", "-f", path_text(&manifest)?])?;
-    if !applied.status.success() {
-        return Err(io::Error::other(format!(
-            "S5 runtime admission failed: {}",
-            String::from_utf8_lossy(&applied.stderr).trim()
-        ))
-        .into());
-    }
+    let create = serde_json::json!({
+        "name": RUNTIME_NAME,
+        "spec": {
+            "principal": {
+                "kind": "user",
+                "actingUser": "alice@example.com"
+            },
+            "owner": "alice@example.com",
+            "agentType": {"name": "base"},
+            "llms": [{
+                "provider": "openai",
+                "model": "priced-model"
+            }],
+            "tools": [{
+                "provider": "github",
+                "resource": "search_repositories",
+                "action": "read"
+            }],
+            "budget": {
+                "monthlyLimit": "10.00",
+                "currency": "USD"
+            },
+            "ttl": "1h"
+        }
+    });
+    let (create_status, create_body) = harness.steward(
+        "POST",
+        "/v1/namespaces/team-a/runtimes",
+        Some(&create.to_string()),
+        "s5-revocation-create.json",
+        Caller::Alice,
+    )?;
+    assert_eq!(
+        create_status, 201,
+        "an in-envelope runtime request must be admitted through Steward: {create_body}"
+    );
     harness.wait_phase("Running", Duration::from_secs(600))?;
 
     let runtime_uid = harness.runtime_value("jsonpath={.metadata.uid}")?;
@@ -522,12 +546,8 @@ async fn e2e_s5_terminated_runtime_holds_nothing() -> Result<(), Box<dyn Error>>
         }
     })
     .to_string();
-    let tool_response = harness.wait_authorized_tool_call(
-        &workspace,
-        &sandbox,
-        &tool_request,
-        Duration::from_secs(60),
-    )?;
+    let tool_response =
+        harness.preflight_authorized_tool_call(&workspace, &sandbox, &tool_request)?;
     assert!(
         tool_response.contains("example-org/fixture-repository"),
         "the pre-termination HOP-1 did not authorize the expected tool: {tool_response}"
@@ -704,12 +724,11 @@ async fn e2e_poc_golden_journey() -> Result<(), Box<dyn Error>> {
         }
     })
     .to_string();
-    let tool_response = harness.wait_authorized_tool_call(
-        &workspace,
-        &sandbox,
-        &tool_request,
-        Duration::from_secs(60),
-    )?;
+    // This is deliberately the short same contract preflight used by S5.  A
+    // rejected dynamic Mint grant is a prerequisite failure, not something
+    // worth discovering after a minute of sandbox polling.
+    let tool_response =
+        harness.preflight_authorized_tool_call(&workspace, &sandbox, &tool_request)?;
     assert!(
         tool_response.contains("example-org/fixture-repository"),
         "the acting user's runtime could not call its authorized tool: {tool_response}"
@@ -759,9 +778,4 @@ fn required_json_string(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| io::Error::other(format!("response is missing {pointer}")).into())
-}
-
-fn path_text(path: &Path) -> Result<&str, Box<dyn Error>> {
-    path.to_str()
-        .ok_or_else(|| io::Error::other("run path is not valid UTF-8").into())
 }

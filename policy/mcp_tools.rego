@@ -14,19 +14,13 @@ principal_available if {
 	is_string(input.principal)
 }
 
-subject_matches if {
-	input.tokenClaims.sub == input.principal
-}
-
 user_principal_matches if {
 	email_matches
-	subject_matches
 	input.tokenClaims.steward.acting_as == "user"
 }
 
 delegated_service_principal_matches if {
 	email_matches
-	subject_matches
 	authority := input.tokenClaims.steward
 	authority.acting_as == "service_for_user"
 	is_string(authority.service)
@@ -61,7 +55,8 @@ authority_claims_match if {
 	authority := claims.steward
 	authority.acting_as == "user"
 	not authority.service
-	authority.version == 2
+	# Keep this aligned with steward-mint's HOP1_CLAIMS_VERSION.
+	authority.version == 3
 	is_string(authority.runtime_uid)
 	authority.runtime_uid != ""
 }
@@ -72,7 +67,8 @@ authority_claims_match if {
 	authority.acting_as in {"service", "service_for_user"}
 	is_string(authority.service)
 	authority.service != ""
-	authority.version == 2
+	# Keep this aligned with steward-mint's HOP1_CLAIMS_VERSION.
+	authority.version == 3
 	is_string(authority.runtime_uid)
 	authority.runtime_uid != ""
 }
@@ -101,8 +97,6 @@ denial_reason := "verified token claims are unavailable" if {
 } else := "verified token email does not match the request" if {
 	input.tokenClaims.steward.acting_as in {"user", "service_for_user"}
 	not email_matches
-} else := "verified token subject does not match the request" if {
-	not subject_matches
 } else := "verified token authority claims are invalid" if {
 	not authority_claims_match
 } else := "verified token has no matching tool grant"

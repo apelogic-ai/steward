@@ -545,10 +545,10 @@ elif [[ "$#" -eq 0 ]]; then
     --example workspace_contract
   cli_archive="${RUN_DIR}/${openshell_cli_archive}"
   cli_checksums="${RUN_DIR}/openshell-checksums-sha256.txt"
-  curl -fsSL \
+  curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
     "https://github.com/NVIDIA/OpenShell/releases/download/${OPEN_SHELL_RELEASE}/${openshell_cli_archive}" \
     -o "${cli_archive}"
-  curl -fsSL \
+  curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
     "https://github.com/NVIDIA/OpenShell/releases/download/${OPEN_SHELL_RELEASE}/openshell-checksums-sha256.txt" \
     -o "${cli_checksums}"
   (
@@ -558,7 +558,7 @@ elif [[ "$#" -eq 0 ]]; then
   )
   source_archive="${RUN_DIR}/openshell-${OPEN_SHELL_RELEASE}.tar.gz"
   source_directory="${RUN_DIR}/openshell-source"
-  curl -fsSL \
+  curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
     "https://github.com/NVIDIA/OpenShell/archive/refs/tags/${OPEN_SHELL_RELEASE}.tar.gz" \
     -o "${source_archive}"
   mkdir -p "${source_directory}"

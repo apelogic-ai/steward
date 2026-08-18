@@ -18,13 +18,13 @@ configured exact administrator group (the chart default is
 `agents.apelogic.ai/admin`). A member-role, Task, runtime, provider, or the
 route-scoped steward-run bootstrap identity is not administrator authority.
 
-Steward does not accept a token in a URL, HTML document, Web Storage, cookie, or
-JavaScript configuration. A browser deployment therefore needs a reviewed,
-same-origin authentication layer that injects a short-lived `Authorization:
-Bearer …` header on every upstream request. That deployment surface is not yet
-implemented and must stay internal until its identity and session lifecycle are
-reviewed. The static shell fails closed when the authenticated bootstrap cannot
-be read.
+Steward does not accept a provider token in a URL, HTML document, Web Storage,
+cookie, or JavaScript configuration. The local browser-session slice now defines
+a direct Google OIDC callback and an opaque server-managed cookie boundary; see
+`browser-session-contract-v1.md`. The production verifier is implemented, while
+runtime activation remains fail-closed until the reviewed Google client metadata and secret are
+injected. The existing TokenReview administrator shell and bootstrap in this document are
+unchanged.
 
 ### Localhost human-acceptance harness
 
