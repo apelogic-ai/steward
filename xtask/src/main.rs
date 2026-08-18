@@ -2713,6 +2713,18 @@ esac
     }
 
     #[test]
+    fn g1_github_api_probe_uses_a_non_secret_user_agent() -> Result<(), String> {
+        let script_path = root().join("scripts/g1-upstream-conformance-inside.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        assert!(
+            script.contains("-H 'User-Agent: steward-conformance/1.0' https://api.github.com/zen"),
+            "the public G-1 GitHub API probe must identify itself without adding a credential"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn migration_diff_accepts_a_divergent_base() -> Result<(), String> {
         let repository = TestRepository::create()?;
         git(&repository.path, &["init", "--initial-branch=main"])?;
