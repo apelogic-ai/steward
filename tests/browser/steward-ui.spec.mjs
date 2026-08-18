@@ -198,7 +198,7 @@ test.beforeAll(async () => {
   origin = demo.origin;
   adminDemo = await startLoopbackAdminDemo();
   adminOrigin = adminDemo.origin;
-});
+}, { timeout: 120_000 });
 
 test.afterAll(async () => {
   await stopLoopbackDemo(demo?.child);

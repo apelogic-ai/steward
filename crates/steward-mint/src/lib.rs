@@ -22,10 +22,14 @@ use sha2::{Digest as _, Sha256};
 pub use steward_ports::{
     SvidAssertion, SvidValidationError, ValidatedWorkload, WorkloadIdentity as SvidValidator,
 };
-use steward_types::{Principal, RuntimeId, ToolGrant};
+use steward_types::{
+    AgentRuntime, CanonicalAuthorityBinding, Phase, Principal, RuntimeId, ToolGrant,
+};
 use uuid::Uuid;
 
-pub const HOP1_CLAIMS_VERSION: u8 = 2;
+/// HOP-1 v3 binds a person to their stable canonical subject while exposing the currently
+/// verified email as a separate compatibility claim for downstream provider boundaries.
+pub const HOP1_CLAIMS_VERSION: u8 = 3;
 pub const DEFAULT_AUTHORITY_TTL: Duration = Duration::from_secs(60);
 pub const SPIFFE_CLIENT_ASSERTION_TYPE: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe";
@@ -64,8 +68,73 @@ pub struct AuthorityBinding {
     pub runtime: RuntimeId,
     pub runtime_namespace: String,
     pub principal: Principal,
+    pub canonical_authority: Option<CanonicalAuthorityBinding>,
     pub tools: Vec<ToolGrant>,
     pub state: AuthorityState,
+}
+
+/// Resolve one active authority from the runtime that owns an OpenShell workspace/sandbox pair.
+///
+/// The runtime's Kubernetes UID—not its mutable resource name—is the authority identifier used
+/// by credential grants. Keeping this mapping in the Mint library lets inexpensive contract tests
+/// exercise the same binding rule as the deployed Kubernetes resolver.
+pub fn authority_from_runtime_refs(
+    workload: &ValidatedWorkload,
+    workspace: &str,
+    sandbox: &str,
+    runtimes: &[AgentRuntime],
+) -> Result<AuthorityBinding, MintError> {
+    let mut matches = runtimes.iter().filter(|runtime| {
+        runtime.status.as_ref().is_some_and(|status| {
+            status.refs.workspace.as_deref() == Some(workspace)
+                && status.refs.sandbox.as_deref() == Some(sandbox)
+        })
+    });
+    let runtime = matches.next().ok_or(MintError::WorkloadMismatch)?;
+    if matches.next().is_some() {
+        return Err(MintError::WorkloadMismatch);
+    }
+    let runtime_uid = runtime
+        .metadata
+        .uid
+        .clone()
+        .filter(|uid| !uid.is_empty())
+        .ok_or(MintError::WorkloadMismatch)?;
+    let runtime_namespace = runtime
+        .metadata
+        .namespace
+        .clone()
+        .filter(|namespace| !namespace.is_empty())
+        .ok_or(MintError::WorkloadMismatch)?;
+    let phase = runtime
+        .status
+        .as_ref()
+        .map(|status| status.phase)
+        .ok_or(MintError::WorkloadMismatch)?;
+    Ok(AuthorityBinding {
+        workload_id: workload.spiffe_id.clone(),
+        runtime: RuntimeId(runtime_uid),
+        runtime_namespace,
+        principal: runtime.spec.principal.clone(),
+        canonical_authority: runtime.spec.canonical_authority.clone(),
+        tools: runtime.spec.tools.clone(),
+        state: authority_state(runtime.metadata.deletion_timestamp.is_some(), phase),
+    })
+}
+
+pub fn authority_state(deleting: bool, phase: Phase) -> AuthorityState {
+    if deleting {
+        return AuthorityState::Revoked;
+    }
+    match phase {
+        Phase::Running => AuthorityState::Active,
+        Phase::Suspended => AuthorityState::Suspended,
+        Phase::Terminating => AuthorityState::Revoked,
+        Phase::Terminated => AuthorityState::Terminated,
+        Phase::Pending | Phase::Admitted | Phase::Provisioning | Phase::Failed => {
+            AuthorityState::Revoked
+        }
+    }
 }
 
 pub trait AuthorityResolver: Send + Sync + 'static {
@@ -296,6 +365,73 @@ struct StewardClaims {
     version: u8,
 }
 
+struct AuthorityClaimIdentity {
+    acting_as: &'static str,
+    email: Option<String>,
+    service: Option<String>,
+    subject: String,
+}
+
+fn authority_claim_identity(
+    authority: &AuthorityBinding,
+) -> Result<AuthorityClaimIdentity, MintError> {
+    match &authority.principal {
+        Principal::User { acting_user } => {
+            let canonical = authority
+                .canonical_authority
+                .as_ref()
+                .ok_or(MintError::WorkloadMismatch)?;
+            canonical
+                .acting_user_id
+                .as_ref()
+                .filter(|acting_user_id| *acting_user_id == &canonical.owner_user_id)
+                .ok_or(MintError::WorkloadMismatch)?;
+            Ok(AuthorityClaimIdentity {
+                acting_as: "user",
+                email: Some(acting_user.0.clone()),
+                service: None,
+                subject: canonical.owner_user_id.as_str().to_owned(),
+            })
+        }
+        Principal::Service { name, acting_user } if !name.is_empty() => match acting_user {
+            Some(acting_user) => {
+                let canonical = authority
+                    .canonical_authority
+                    .as_ref()
+                    .ok_or(MintError::WorkloadMismatch)?;
+                canonical
+                    .acting_user_id
+                    .as_ref()
+                    .filter(|acting_user_id| *acting_user_id == &canonical.owner_user_id)
+                    .ok_or(MintError::WorkloadMismatch)?;
+                Ok(AuthorityClaimIdentity {
+                    acting_as: "service_for_user",
+                    email: Some(acting_user.0.clone()),
+                    service: Some(name.clone()),
+                    subject: canonical.owner_user_id.as_str().to_owned(),
+                })
+            }
+            None => {
+                if authority
+                    .canonical_authority
+                    .as_ref()
+                    .is_some_and(|canonical| canonical.acting_user_id.is_some())
+                {
+                    return Err(MintError::WorkloadMismatch);
+                }
+                let subject = format!("service:{name}");
+                Ok(AuthorityClaimIdentity {
+                    acting_as: "service",
+                    email: Some(subject.clone()),
+                    service: Some(name.clone()),
+                    subject,
+                })
+            }
+        },
+        Principal::Service { .. } => Err(MintError::InvalidRequest),
+    }
+}
+
 pub struct Mint<V, R, C = NoCredentialGrantResolver> {
     config: MintRuntimeConfig,
     credential_resolver: C,
@@ -411,29 +547,7 @@ where
         if authority.state != AuthorityState::Active {
             return Err(MintError::AuthorityInactive);
         }
-        let (acting_as, email, service, subject) = match &authority.principal {
-            Principal::User { acting_user } => (
-                "user",
-                Some(acting_user.0.clone()),
-                None,
-                acting_user.0.clone(),
-            ),
-            Principal::Service { name, acting_user } if !name.is_empty() => match acting_user {
-                Some(acting_user) => (
-                    "service_for_user",
-                    Some(acting_user.0.clone()),
-                    Some(name.clone()),
-                    acting_user.0.clone(),
-                ),
-                None => (
-                    "service",
-                    Some(format!("service:{name}")),
-                    Some(name.clone()),
-                    format!("service:{name}"),
-                ),
-            },
-            Principal::Service { .. } => return Err(MintError::InvalidRequest),
-        };
+        let identity = authority_claim_identity(&authority)?;
         match self
             .credential_resolver
             .resolve(&request.scope, &authority)
@@ -464,17 +578,17 @@ where
         let claims = Claims::new(Hop1Claims {
             aud: vec![self.config.audience.clone()],
             azp: workload.spiffe_id,
-            email,
+            email: identity.email,
             iss: self.config.issuer.clone(),
             jti: Uuid::new_v4().to_string(),
             steward: StewardClaims {
-                acting_as: acting_as.to_owned(),
+                acting_as: identity.acting_as.to_owned(),
                 runtime_uid: authority.runtime.0,
-                service,
+                service: identity.service,
                 tools: authority.tools,
                 version: HOP1_CLAIMS_VERSION,
             },
-            sub: subject,
+            sub: identity.subject,
         })
         .set_duration_and_issuance(&time, authority_ttl);
         let header = Header::empty()
@@ -542,29 +656,38 @@ where
             Err(MintError::AuthorityUnavailable) => return Err(MintError::AuthorityUnavailable),
             Err(_) => return Ok(TokenIntrospectionResponse::inactive()),
         };
+        // A person-bound HOP-1 carries the email that was verified at issuance as a downstream
+        // compatibility claim.  Email is deliberately mutable, whereas `sub` is the stable
+        // canonical authority that must remain valid at introspection.
         let principal_matches = match &authority.principal {
-            Principal::User { acting_user } => {
-                claims.custom.steward.acting_as == "user"
-                    && claims.custom.steward.service.is_none()
-                    && claims.custom.email.as_ref() == Some(&acting_user.0)
-                    && claims.custom.sub == acting_user.0
-            }
-            Principal::Service { name, acting_user } if !name.is_empty() => {
-                claims.custom.steward.service.as_ref() == Some(name)
-                    && match acting_user {
-                        Some(acting_user) => {
-                            claims.custom.steward.acting_as == "service_for_user"
-                                && claims.custom.email.as_ref() == Some(&acting_user.0)
-                                && claims.custom.sub == acting_user.0
-                        }
-                        None => {
-                            claims.custom.steward.acting_as == "service"
-                                && claims.custom.email.as_deref()
-                                    == Some(claims.custom.sub.as_str())
-                                && claims.custom.sub == format!("service:{name}")
-                        }
-                    }
-            }
+            Principal::User { .. } => authority_claim_identity(&authority)
+                .map(|identity| {
+                    claims.custom.steward.acting_as == identity.acting_as
+                        && claims.custom.steward.service.is_none()
+                        && claims.custom.sub == identity.subject
+                })
+                .unwrap_or(false),
+            Principal::Service {
+                name,
+                acting_user: Some(_),
+            } if !name.is_empty() => authority_claim_identity(&authority)
+                .map(|identity| {
+                    claims.custom.steward.acting_as == identity.acting_as
+                        && claims.custom.steward.service.as_deref() == Some(name)
+                        && claims.custom.sub == identity.subject
+                })
+                .unwrap_or(false),
+            Principal::Service {
+                name,
+                acting_user: None,
+            } if !name.is_empty() => authority_claim_identity(&authority)
+                .map(|identity| {
+                    claims.custom.steward.acting_as == identity.acting_as
+                        && claims.custom.steward.service == identity.service
+                        && claims.custom.sub == identity.subject
+                        && claims.custom.email == identity.email
+                })
+                .unwrap_or(false),
             Principal::Service { .. } => false,
         };
         let active = authority.state == AuthorityState::Active

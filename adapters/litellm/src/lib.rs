@@ -489,6 +489,9 @@ mod tests {
                             }
                         }
                     };
+                    stream.set_nonblocking(false).map_err(|error| {
+                        format!("failed to configure accepted mock LiteLLM connection: {error}")
+                    })?;
                     let request = read_request(&mut stream)?;
                     server_requests
                         .lock()

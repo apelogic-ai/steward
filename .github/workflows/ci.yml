@@ -30,6 +30,11 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt
 
+      - name: Restore shared Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: steward-rust-1.95.0
+
       - name: Install quality-gate tools
         uses: ./.github/actions/setup-tools
         with:
@@ -53,6 +58,11 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal
 
+      - name: Restore shared Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: steward-rust-1.95.0
+
       - name: Install conformance tools
         uses: ./.github/actions/setup-tools
         with:
@@ -75,6 +85,11 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal
 
+      - name: Restore shared Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: steward-rust-1.95.0
+
       - name: Install Kubernetes tools
         uses: ./.github/actions/setup-tools
         with:
@@ -83,10 +98,10 @@ jobs:
       - name: Verify provisioning and teardown
         run: cargo xtask e2e-s0
 
-  e2e-identity:
-    name: e2e / workload identity and tools
+  e2e-runtime:
+    name: e2e / runtime identity, inference and PoC
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 105
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -96,36 +111,34 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal
 
+      - name: Restore shared Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: steward-rust-1.95.0
+
       - name: Install integration tools
         uses: ./.github/actions/setup-tools
         with:
           kubernetes-tools: "true"
           supervisor-tools: "true"
+
+      # Keep runtime E2E lanes in one runner so cargo reuses the same target
+      # directory instead of recompiling the OpenShell/Mint graph per lane.
+      - name: Fail fast on the S5 Mint token-grant contract
+        run: >-
+          cargo test --locked --package steward-mint
+          --test fast_track_mcp_compatibility
+          s5_hop1_v3_authority_mints_and_introspects_the_required_mcp_grant
+          -- --exact
 
       - name: Verify workload identity and tool access
         run: cargo xtask e2e-s1
 
-  e2e-inference:
-    name: e2e / inference budget
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal
-
-      - name: Install integration tools
-        uses: ./.github/actions/setup-tools
-        with:
-          kubernetes-tools: "true"
-          supervisor-tools: "true"
-
       - name: Verify inference budget enforcement
         run: cargo xtask e2e-s2
+
+      - name: Verify the complete PoC journey and revocation
+        run: cargo xtask e2e-s5
 
   e2e-admission:
     name: e2e / envelope admission
@@ -139,6 +152,11 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Restore shared Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: steward-rust-1.95.0
 
       - name: Install Kubernetes tools
         uses: ./.github/actions/setup-tools
@@ -161,6 +179,11 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal
 
+      - name: Restore shared Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: steward-rust-1.95.0
+
       - name: Install Kubernetes tools
         uses: ./.github/actions/setup-tools
         with:
@@ -168,28 +191,6 @@ jobs:
 
       - name: Verify approval and instance-grant enforcement
         run: cargo xtask e2e-s4
-
-  e2e-revocation:
-    name: e2e / PoC journey and revocation
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal
-
-      - name: Install integration tools
-        uses: ./.github/actions/setup-tools
-        with:
-          kubernetes-tools: "true"
-          supervisor-tools: "true"
-
-      - name: Verify the complete PoC journey and revocation
-        run: cargo xtask e2e-s5
 
   openshell-adapter:
     name: integration / OpenShell 0.0.98 adapter
@@ -203,6 +204,11 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Restore shared Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: steward-rust-1.95.0
 
       - name: Install Kubernetes tools
         uses: ./.github/actions/setup-tools
@@ -224,6 +230,11 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Restore shared Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: steward-rust-1.95.0
 
       - name: Verify encrypted PostgreSQL connection and migrations
         run: cargo xtask e2e-postgres-tls
@@ -319,11 +330,9 @@ jobs:
       - quality
       - conformance-pinned
       - e2e-provisioning
-      - e2e-identity
-      - e2e-inference
+      - e2e-runtime
       - e2e-admission
       - e2e-escalation
-      - e2e-revocation
       - openshell-adapter
       - postgres-tls
       - browser-e2e
@@ -337,11 +346,9 @@ jobs:
           QUALITY: ${{ needs.quality.result }}
           CONFORMANCE: ${{ needs.conformance-pinned.result }}
           PROVISIONING: ${{ needs.e2e-provisioning.result }}
-          IDENTITY: ${{ needs.e2e-identity.result }}
-          INFERENCE: ${{ needs.e2e-inference.result }}
+          RUNTIME: ${{ needs.e2e-runtime.result }}
           ADMISSION: ${{ needs.e2e-admission.result }}
           ESCALATION: ${{ needs.e2e-escalation.result }}
-          REVOCATION: ${{ needs.e2e-revocation.result }}
           OPENSHELL_ADAPTER: ${{ needs.openshell-adapter.result }}
           POSTGRES_TLS: ${{ needs.postgres-tls.result }}
           BROWSER_E2E: ${{ needs.browser-e2e.result }}
@@ -352,11 +359,9 @@ jobs:
             "${QUALITY}" \
             "${CONFORMANCE}" \
             "${PROVISIONING}" \
-            "${IDENTITY}" \
-            "${INFERENCE}" \
+            "${RUNTIME}" \
             "${ADMISSION}" \
             "${ESCALATION}" \
-            "${REVOCATION}" \
             "${OPENSHELL_ADAPTER}" \
             "${POSTGRES_TLS}" \
             "${BROWSER_E2E}" \

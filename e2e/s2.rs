@@ -14,6 +14,9 @@ use steward_types::{Budget, Duration as RuntimeDuration, ModelRef, RunnerRequire
 const NAMESPACE: &str = "team-a";
 const PRICED_RUNTIME: &str = "runtime-priced";
 const UNPRICED_RUNTIME: &str = "runtime-unpriced";
+const ALICE_CANONICAL_USER: &str = "usr_0123456789abcdef0123456789abcdef";
+const SERVER_AUTHORING_USERNAME: &str = "system:serviceaccount:steward-system:steward-poc-api";
+const POC_SERVICE_PRINCIPAL: &str = "steward-poc-api";
 
 struct Harness {
     context: String,
@@ -69,6 +72,16 @@ impl Harness {
             .output()?)
     }
 
+    fn kubectl_as_server_authority(&self, arguments: &[&str]) -> Result<Output, Box<dyn Error>> {
+        Ok(Command::new("kubectl")
+            .args(["--kubeconfig"])
+            .arg(&self.kubeconfig)
+            .args(["--context", &self.context])
+            .args(["--as", SERVER_AUTHORING_USERNAME])
+            .args(arguments)
+            .output()?)
+    }
+
     fn write_runtime(
         &self,
         name: &str,
@@ -84,15 +97,21 @@ impl Harness {
                 "name": name,
                 "namespace": NAMESPACE,
                 "annotations": {
-                    "agents.apelogic.ai/member-role": "engineer"
+                    "agents.apelogic.ai/service-principal": POC_SERVICE_PRINCIPAL
                 }
             },
             "spec": {
                 "principal": {
-                    "kind": "user",
+                    "kind": "service",
+                    "name": POC_SERVICE_PRINCIPAL,
                     "actingUser": "alice@example.com"
                 },
                 "owner": "alice@example.com",
+                "canonicalAuthority": {
+                    "schemaVersion": "steward/canonical-authority-binding/v1",
+                    "ownerUserId": ALICE_CANONICAL_USER,
+                    "actingUserId": ALICE_CANONICAL_USER,
+                },
                 "agentType": {"name": "base"},
                 "llms": [{
                     "provider": "openai",
@@ -111,7 +130,10 @@ impl Harness {
     }
 
     fn apply_runtime(&self, path: &Path) -> Result<Output, Box<dyn Error>> {
-        self.kubectl_as_actor(&["apply", "-f", path_text(path)?])
+        // The user-facing API server derives this binding before creating a
+        // runtime.  S2 exercises the same trusted-writer admission path;
+        // an ordinary member-role identity remains unable to self-assert it.
+        self.kubectl_as_server_authority(&["apply", "-f", path_text(path)?])
     }
 
     fn wait_phase(
@@ -299,8 +321,8 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
     let store = PgStore::connect(&env::var("STEWARD_TEST_DATABASE_URL")?).await?;
     store.migrate().await?;
     store
-        .insert_envelope(
-            "engineer",
+        .insert_service_envelope(
+            POC_SERVICE_PRINCIPAL,
             &Envelope {
                 revision: 1,
                 spec: EnvelopeSpec {
@@ -329,13 +351,18 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
 
     let unpriced = harness.write_runtime(UNPRICED_RUNTIME, "unpriced-model", "1.00", "1h")?;
     let rejected = harness.apply_runtime(&unpriced)?;
-    assert!(
-        !rejected.status.success(),
-        "a model with no registered positive cost must be rejected at admission"
+    let rejection_output = format!(
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rejected.stdout).trim(),
+        String::from_utf8_lossy(&rejected.stderr).trim(),
     );
     assert!(
-        String::from_utf8_lossy(&rejected.stderr).contains("priced inference catalog"),
-        "unpriced-model rejection must identify the priced-catalog control"
+        !rejected.status.success(),
+        "a model with no registered positive cost must be rejected at admission: {rejection_output}"
+    );
+    assert!(
+        rejection_output.contains("priced inference catalog"),
+        "unpriced-model rejection must identify the priced-catalog control: {rejection_output}"
     );
 
     let priced = harness.write_runtime(PRICED_RUNTIME, "priced-model", "1.00", "1h")?;
@@ -407,8 +434,8 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
     harness.wait_phase(PRICED_RUNTIME, "Running", Duration::from_secs(180))?;
 
     store
-        .insert_envelope(
-            "engineer",
+        .insert_service_envelope(
+            POC_SERVICE_PRINCIPAL,
             &Envelope {
                 revision: 2,
                 spec: EnvelopeSpec {

@@ -180,6 +180,13 @@ pub struct BrowserPrincipal {
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct BrowserSessionBinding(String);
 
+#[cfg(all(test, feature = "admin-demo"))]
+impl BrowserSessionBinding {
+    pub(crate) fn from_test_value(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
 #[derive(Clone)]
 pub struct BrowserSessionContext {
     pub principal: BrowserPrincipal,
@@ -204,6 +211,13 @@ impl BrowserAdminAuthority {
 
 #[derive(Clone, Copy)]
 pub struct BrowserMutationProof(());
+
+#[cfg(all(test, feature = "admin-demo"))]
+impl BrowserMutationProof {
+    pub(crate) fn for_test() -> Self {
+        Self(())
+    }
+}
 
 pub struct VerifiedOrganizationClaims {
     pub(crate) issuer: String,
@@ -571,9 +585,11 @@ impl BrowserIdentityResolver for LocalFakeIdentityResolver {
                     .map_err(|_| BrowserAuthFailure::IdentityUnavailable)?,
                 display_email: identity.verified_email().clone(),
                 role,
-                member_roles: (role == BrowserRole::Admin)
-                    .then(|| vec!["developer".to_owned()])
-                    .unwrap_or_default(),
+                member_roles: if role == BrowserRole::Admin {
+                    vec!["developer".to_owned()]
+                } else {
+                    Vec::new()
+                },
             })
         })
     }

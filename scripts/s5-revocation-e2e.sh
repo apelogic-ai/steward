@@ -26,12 +26,20 @@ trap 'cleanup "$?"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for command in bash docker kind; do
+for command in bash cargo docker kind; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is missing: ${command}" >&2
     exit 2
   fi
 done
+
+echo "Running S5 HOP-1 v3 MCP and inference token-grant preflight"
+cargo test \
+  --locked \
+  --package steward-mint \
+  --test fast_track_mcp_compatibility \
+  s5_ \
+  -- --nocapture
 
 "${ROOT}/scripts/build-patched-mcp-gw.sh"
 "${ROOT}/scripts/build-steward-mint-image.sh"

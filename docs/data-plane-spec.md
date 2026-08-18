@@ -124,8 +124,9 @@ become delta-cheap and clones near-free.
   through the mirror. That is a lateral-movement primitive.
 
 So: shared storage, entitlement resolved per acting user. The sandbox presents its HOP-1
-JWT; the gateway resolves entitlement by email against upstream — exactly as `mcp-gw`
-resolves provider tokens. Verify at admission (bind the task to a repo set) and
+JWT; the gateway resolves entitlement by the immutable canonical-user `sub` — exactly as
+`mcp-gw` resolves provider tokens. Email remains attribution metadata only. Verify at
+admission (bind the task to a repo set) and
 **re-verify on a short TTL during the run**. Standing delegation with stale entitlement
 is precisely the #1757 shape already documented upstream.
 

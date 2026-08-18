@@ -30,20 +30,29 @@ must fail closed. The route requires the configured gateway credential as an
 `Authorization: Bearer` value before it parses the presented token or resolves
 authority. The mint retains only the credential's SHA-256 digest.
 
-## HOP-1 claim contract v2
+## HOP-1 claim contract v3
 
 The protected header is `alg=EdDSA`, `typ=JWT`, and a public-key `kid`.
 
 The payload contains the standard `iss`, `sub`, `aud`, `iat`, `exp`, and `jti`
 claims. `azp` is always the validated workload SPIFFE ID. For a user principal,
-`sub` and `email` are the acting user's email. A delegated service uses the same
-user subject while retaining its service name below. A pure service uses
+`sub` is the immutable `CanonicalUserId` from the live runtime's typed
+`canonicalAuthority`, while `email` is verified display metadata and never an
+authorization key. A delegated service uses the same canonical user subject while
+retaining its service name below. A pure service uses
 `service:<name>` for both `sub` and `email`; this is a service identifier for
 gateway compatibility, not a human acting user.
 
+No organization, identity-provider subject, or provider name is serialized into
+HOP-1. Consumers isolate user grants by the exact `(iss, sub, provider)` tuple and
+must not infer or adopt identity from `email`. A person-bound runtime without a
+valid canonical authority is a legacy runtime that must reconnect; it cannot mint.
+Introspection revalidates the stable canonical subject but deliberately does not
+revoke a token merely because the user's verified display email changed.
+
 Steward-specific claims live under `steward`:
 
-- `version`: `2`
+- `version`: `3`
 - `acting_as`: `user`, `service_for_user`, or `service`
 - `service`: the service name for either service mode; absent for users
 - `runtime_uid`: the immutable Kubernetes runtime UID
