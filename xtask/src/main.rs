@@ -205,6 +205,18 @@ fn browser_e2e(browser_ready: bool) -> TaskResult {
             &npm_environment,
         )?;
     }
+    run(
+        "cargo",
+        &[
+            "build",
+            "-p",
+            "steward-apiserver",
+            "--locked",
+            "--features",
+            "admin-demo",
+            "--examples",
+        ],
+    )?;
     run_with_env("npm", &["run", "test:browser-e2e"], &npm_environment)
 }
 
@@ -916,6 +928,7 @@ mod tests {
             .map_err(|error| format!("pinned Node version is required: {error}"))?;
         let journey = fs::read_to_string(repository.join("tests/browser/steward-ui.spec.mjs"))
             .map_err(|error| format!("loopback browser journey is required: {error}"))?;
+        let xtask_source = include_str!("main.rs");
 
         let browser_job = workflow
             .split("  browser-e2e:")
@@ -944,6 +957,13 @@ mod tests {
                 "cargo build -p steward-apiserver --locked --features admin-demo --examples"
             ),
             "browser E2E CI must precompile loopback demos before Playwright starts"
+        );
+        assert!(
+            xtask_source.contains("\"steward-apiserver\",")
+                && xtask_source.contains("\"--examples\",")
+                && journey.contains("exampleBinary(\"user-envelope-demo\")")
+                && journey.contains("exampleBinary(\"admin-dashboard-demo\")"),
+            "the local browser gate must build and then directly supervise its loopback demos"
         );
         assert!(
             package.contains("\"@playwright/test\": \"1.62.1\""),

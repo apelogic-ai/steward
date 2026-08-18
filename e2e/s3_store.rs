@@ -61,6 +61,7 @@ async fn s3_postgres_keeps_envelopes_immutable_and_parks_exact_rejections()
                 currency: "USD".to_owned(),
             },
             ttl: Duration("24h".to_owned()),
+            runner: RunnerRequirements::default(),
         },
     };
     store

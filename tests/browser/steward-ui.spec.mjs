@@ -3,33 +3,37 @@ import { once } from "node:events";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { expect, test } from "@playwright/test";
+import { chromium, expect, test } from "@playwright/test";
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const examplesDirectory = path.join(repository, "target", "debug", "examples");
+const executableSuffix = process.platform === "win32" ? ".exe" : "";
 let demo;
 let origin;
 let adminDemo;
 let adminOrigin;
+let sharedBrowser;
 const DEMO_STARTUP_TIMEOUT_MS = 120_000;
+
+function exampleBinary(name) {
+  return path.join(examplesDirectory, `${name}${executableSuffix}`);
+}
+
+function assertDemoIsRunning(demo, name) {
+  if (demo?.exit) {
+    throw new Error(`${name} exited unexpectedly (${demo.exit.code ?? demo.exit.signal}):\n${demo.output()}`);
+  }
+}
 
 function startLoopbackDemo() {
   return new Promise((resolve, reject) => {
     const child = spawn(
-      "cargo",
-      [
-        "run",
-        "-p",
-        "steward-apiserver",
-        "--locked",
-        "--features",
-        "admin-demo",
-        "--example",
-        "user-envelope-demo",
-        "--",
-        "--bind",
-        "127.0.0.1:0",
-      ],
-      { cwd: repository, stdio: ["ignore", "pipe", "pipe"] },
+      exampleBinary("user-envelope-demo"),
+      ["--bind", "127.0.0.1:0"],
+      // The xtask gate builds examples first. Give each direct demo process its
+      // own session so teardown cannot leave it holding a port after the test
+      // runner exits.
+      { cwd: repository, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" },
     );
     let output = "";
     let settled = false;
@@ -46,7 +50,12 @@ function startLoopbackDemo() {
       if (match && !settled) {
         settled = true;
         clearTimeout(timeout);
-        resolve({ child, origin: match[1], output });
+        resolve({
+          child,
+          origin: match[1],
+          output: () => output,
+          get exit() { return child.exitCode === null && child.signalCode === null ? null : { code: child.exitCode, signal: child.signalCode }; },
+        });
       }
     };
     child.stdout.on("data", inspect);
@@ -71,23 +80,9 @@ function startLoopbackDemo() {
 function startLoopbackAdminDemo() {
   return new Promise((resolve, reject) => {
     const child = spawn(
-      "cargo",
-      [
-        "run",
-        "-p",
-        "steward-apiserver",
-        "--locked",
-        "--features",
-        "admin-demo",
-        "--example",
-        "admin-dashboard-demo",
-        "--",
-        "--mode",
-        "oidc-admin",
-        "--bind",
-        "127.0.0.1:0",
-      ],
-      { cwd: repository, stdio: ["ignore", "pipe", "pipe"] },
+      exampleBinary("admin-dashboard-demo"),
+      ["--mode", "oidc-admin", "--bind", "127.0.0.1:0"],
+      { cwd: repository, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" },
     );
     let output = "";
     let settled = false;
@@ -104,7 +99,12 @@ function startLoopbackAdminDemo() {
       if (match && !settled) {
         settled = true;
         clearTimeout(timeout);
-        resolve({ child, origin: match[1], output });
+        resolve({
+          child,
+          origin: match[1],
+          output: () => output,
+          get exit() { return child.exitCode === null && child.signalCode === null ? null : { code: child.exitCode, signal: child.signalCode }; },
+        });
       }
     };
     child.stdout.on("data", inspect);
@@ -130,13 +130,24 @@ async function stopLoopbackDemo(child) {
   if (!child || child.exitCode !== null) {
     return;
   }
-  child.kill("SIGINT");
+  const terminate = (signal) => {
+    if (process.platform !== "win32") {
+      try {
+        process.kill(-child.pid, signal);
+        return;
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+    child.kill(signal);
+  };
+  terminate("SIGINT");
   await Promise.race([
     once(child, "exit"),
     new Promise((resolve) => setTimeout(resolve, 10_000)),
   ]);
   if (child.exitCode === null) {
-    child.kill("SIGKILL");
+    terminate("SIGKILL");
     await once(child, "exit");
   }
 }
@@ -199,20 +210,35 @@ test.beforeAll(async () => {
   origin = demo.origin;
   adminDemo = await startLoopbackAdminDemo();
   adminOrigin = adminDemo.origin;
+  sharedBrowser = await chromium.launch();
 });
 
 test.afterAll(async () => {
-  await stopLoopbackDemo(demo?.child);
-  await stopLoopbackDemo(adminDemo?.child);
+  try {
+    await sharedBrowser?.close();
+  } finally {
+    await stopLoopbackDemo(demo?.child);
+    await stopLoopbackDemo(adminDemo?.child);
+  }
 });
 
-test("dual-role administrator can switch presentation, while developer cannot enter it", async ({ browser }) => {
-  const userSession = await guardedPage(browser, { width: 1440, height: 900 });
-  const adminSession = await guardedPage(browser, { width: 1440, height: 900 });
+test.beforeEach(() => {
+  assertDemoIsRunning(demo, "loopback Steward envelope demo");
+  assertDemoIsRunning(adminDemo, "loopback Steward admin demo");
+});
+
+test.afterEach(() => {
+  assertDemoIsRunning(demo, "loopback Steward envelope demo");
+  assertDemoIsRunning(adminDemo, "loopback Steward admin demo");
+});
+
+test("dual-role administrator can switch presentation, while developer cannot enter it", async () => {
+  const userSession = await guardedPage(sharedBrowser, { width: 1440, height: 900 });
+  const adminSession = await guardedPage(sharedBrowser, { width: 1440, height: 900 });
   try {
     await signIn(userSession.page);
-    await userSession.page.goto(`${origin}/admin/workspace`);
-    await expect(userSession.page).toHaveText("Forbidden");
+    const forbiddenWorkspace = await userSession.page.request.get(`${origin}/admin/workspace`);
+    expect(forbiddenWorkspace.status()).toBe(403);
 
     const { page } = adminSession;
     await page.goto(`${adminOrigin}/admin/sign-in`);
@@ -236,8 +262,8 @@ test("dual-role administrator can switch presentation, while developer cannot en
   }
 });
 
-test("user can sign in, navigate shared top navigation, and connect then disconnect GitHub", async ({ browser }) => {
-  const session = await guardedPage(browser, { width: 1440, height: 900 });
+test("user can sign in, navigate shared top navigation, and connect then disconnect GitHub", async () => {
+  const session = await guardedPage(sharedBrowser, { width: 1440, height: 900 });
   try {
     const { page } = session;
     await signIn(page);
@@ -287,10 +313,11 @@ test("user can sign in, navigate shared top navigation, and connect then disconn
     await expect(templates).toContainText("Engineer · revision 3");
     await page.reload();
     await expect(templates).toHaveJSProperty("open", true);
-    await page.goto(`${origin}/envelopes/new`);
+    const newEnvelope = page.getByRole("link", { name: "New envelope" });
+    await expect(newEnvelope).toHaveCSS("text-decoration-line", "none");
+    await newEnvelope.click();
     await expect(page.getByRole("heading", { name: "New envelope" })).toBeVisible();
     await expect(navigation.getByRole("link", { name: "Envelopes", exact: true })).toHaveAttribute("aria-current", "page");
-    await expect(page.getByRole("link", { name: "New envelope" })).toHaveCSS("text-decoration-line", "none");
     await expect(page.getByRole("combobox", { name: "Template" })).toHaveValue("engineer");
     await expect(page.getByRole("combobox", { name: "Models" })).toHaveValue("openai/gpt-5.4");
     await expect(page.getByRole("combobox", { name: "Tools" })).toHaveValue("github:repository:get_file_contents");
@@ -322,8 +349,8 @@ test("user can sign in, navigate shared top navigation, and connect then disconn
   }
 });
 
-test("narrow user navigation remains available without horizontal overflow", async ({ browser }) => {
-  const session = await guardedPage(browser, { width: 390, height: 844 });
+test("narrow user navigation remains available without horizontal overflow", async () => {
+  const session = await guardedPage(sharedBrowser, { width: 390, height: 844 });
   try {
     const { page } = session;
     await signIn(page);
