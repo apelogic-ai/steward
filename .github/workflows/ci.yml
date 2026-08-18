@@ -266,6 +266,9 @@ jobs:
           npm ci
           npm exec playwright install --with-deps chromium
 
+      - name: Precompile loopback browser demos
+        run: cargo build -p steward-apiserver --locked --features admin-demo --examples
+
       - name: Verify loopback browser journeys
         run: cargo xtask browser-e2e --browser-ready
 

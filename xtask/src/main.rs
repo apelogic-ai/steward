@@ -940,6 +940,12 @@ mod tests {
             "browser E2E CI must use the cargo xtask gate"
         );
         assert!(
+            browser_job.contains(
+                "cargo build -p steward-apiserver --locked --features admin-demo --examples"
+            ),
+            "browser E2E CI must precompile loopback demos before Playwright starts"
+        );
+        assert!(
             package.contains("\"@playwright/test\": \"1.62.1\""),
             "the browser runner must be exact-version pinned in the source manifest"
         );
