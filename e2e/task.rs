@@ -32,16 +32,31 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         "create task input tar",
     )?;
 
-    let copy_smoke = submit(
+    let copy_submission = submit_response(
         &base_url,
         "github-assertion",
         "copy-smoke-123",
         r#"{"workflow":"copy-smoke","codingAgentRuntime":"base"}"#,
         &run_dir,
     )?;
+    assert_eq!(
+        copy_submission.http_status, 202,
+        "an admitted Task must acknowledge durable acceptance before the controller creates its runtime"
+    );
+    let copy_smoke = copy_submission.body;
     assert_eq!(copy_smoke["phase"], "submitted");
+    assert!(
+        copy_smoke["runtimeUid"].is_null(),
+        "the Task API must not bind a runtime UID before controller-owned creation"
+    );
     let copy_task_uid = json_string(&copy_smoke, "taskUid")?;
-    let copy_runtime_uid = json_string(&copy_smoke, "runtimeUid")?;
+    let copy_bound = wait_for_runtime_binding(
+        &base_url,
+        copy_task_uid,
+        "github-assertion",
+        &run_dir,
+    )?;
+    let copy_runtime_uid = json_string(&copy_bound, "runtimeUid")?;
     put_archive(
         &base_url,
         copy_task_uid,
@@ -124,7 +139,13 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         &run_dir,
     )?;
     let stale_task_uid = json_string(&stale, "taskUid")?;
-    let stale_runtime_uid = json_string(&stale, "runtimeUid")?;
+    let stale_bound = wait_for_runtime_binding(
+        &base_url,
+        stale_task_uid,
+        "github-assertion",
+        &run_dir,
+    )?;
+    let stale_runtime_uid = json_string(&stale_bound, "runtimeUid")?;
     let replacement_runtime_uid = replace_runtime_for_stale_uid_test(
         &base_url,
         stale_runtime_uid,
@@ -271,6 +292,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         )?;
         assert_eq!(submitted["phase"], "submitted");
         let submitted_task_uid = json_string(&submitted, "taskUid")?;
+        wait_for_runtime_binding(&base_url, submitted_task_uid, assertion, &run_dir)?;
         put_archive(
             &base_url,
             submitted_task_uid,
@@ -304,7 +326,13 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         &run_dir,
     )?;
     let scheduled_task_uid = json_string(&scheduled, "taskUid")?;
-    let scheduled_runtime_uid = json_string(&scheduled, "runtimeUid")?;
+    let scheduled_bound = wait_for_runtime_binding(
+        &base_url,
+        scheduled_task_uid,
+        "scheduled-assertion",
+        &run_dir,
+    )?;
+    let scheduled_runtime_uid = json_string(&scheduled_bound, "runtimeUid")?;
     let scheduled_runtime = runtime_by_uid(&runtime_api, scheduled_runtime_uid)
         .await?
         .ok_or_else(|| io::Error::other("scheduled Task runtime was not created"))?;
@@ -358,7 +386,13 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         &run_dir,
     )?;
     let standing_task_uid = json_string(&standing, "taskUid")?;
-    let standing_runtime_uid = json_string(&standing, "runtimeUid")?;
+    let standing_bound = wait_for_runtime_binding(
+        &base_url,
+        standing_task_uid,
+        "github-assertion",
+        &run_dir,
+    )?;
+    let standing_runtime_uid = json_string(&standing_bound, "runtimeUid")?;
     let adopted_body = format!(
         r#"{{"workflow":"code-review","codingAgentRuntime":"base","agentRuntimeUid":"{standing_runtime_uid}"}}"#
     );
@@ -416,7 +450,13 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         &run_dir,
     )?;
     let failing_task_uid = json_string(&failing, "taskUid")?;
-    let failing_runtime_uid = json_string(&failing, "runtimeUid")?;
+    let failing_bound = wait_for_runtime_binding(
+        &base_url,
+        failing_task_uid,
+        "github-assertion",
+        &run_dir,
+    )?;
+    let failing_runtime_uid = json_string(&failing_bound, "runtimeUid")?;
     put_archive(
         &base_url,
         failing_task_uid,
@@ -452,6 +492,11 @@ async fn runtime_by_uid(
         .find(|runtime| runtime.metadata.uid.as_deref() == Some(runtime_uid)))
 }
 
+struct TaskSubmission {
+    http_status: u16,
+    body: serde_json::Value,
+}
+
 fn submit(
     base_url: &str,
     assertion: &str,
@@ -459,6 +504,16 @@ fn submit(
     body: &str,
     run_dir: &Path,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    Ok(submit_response(base_url, assertion, key, body, run_dir)?.body)
+}
+
+fn submit_response(
+    base_url: &str,
+    assertion: &str,
+    key: &str,
+    body: &str,
+    run_dir: &Path,
+) -> Result<TaskSubmission, Box<dyn Error>> {
     let response = run_dir.join(format!("submit-{key}.json"));
     let status = curl_status(
         Command::new("curl")
@@ -488,7 +543,10 @@ fn submit(
         ))
         .into());
     }
-    Ok(serde_json::from_slice(&fs::read(response)?)?)
+    Ok(TaskSubmission {
+        http_status: status,
+        body: serde_json::from_slice(&fs::read(response)?)?,
+    })
 }
 
 fn put_archive(
@@ -722,6 +780,21 @@ fn assert_phase_stays(
         std::thread::sleep(Duration::from_secs(1));
     }
     Ok(())
+}
+
+fn wait_for_runtime_binding(
+    base_url: &str,
+    task_uid: &str,
+    assertion: &str,
+    run_dir: &Path,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    wait_for(
+        base_url,
+        task_uid,
+        assertion,
+        |status| status["phase"] == "submitted" && status["runtimeUid"].is_string(),
+        run_dir,
+    )
 }
 
 fn wait_for(
