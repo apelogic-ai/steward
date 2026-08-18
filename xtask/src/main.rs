@@ -209,9 +209,28 @@ fn migrate_check() -> TaskResult {
     Ok(())
 }
 
+fn git_command_in_repository(repository: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(repository);
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_QUARANTINE_PATH",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+    ] {
+        command.env_remove(variable);
+    }
+    command
+}
+
 fn migration_changes(repository: &Path, base: &str) -> Result<String, String> {
     let range = format!("{base}...HEAD");
-    let output = Command::new("git")
+    let output = git_command_in_repository(repository)
         .args([
             "diff",
             "--name-status",
@@ -220,7 +239,6 @@ fn migration_changes(repository: &Path, base: &str) -> Result<String, String> {
             "--",
             ":(glob)migrations/*.sql",
         ])
-        .current_dir(repository)
         .output()
         .map_err(|error| format!("failed to inspect migration history: {error}"))?;
     if !output.status.success() {
@@ -817,7 +835,9 @@ impl Drop for TemporaryTree {
 
 #[cfg(test)]
 mod tests {
-    use super::{migration_changes, root, validate_conformance_test_result};
+    use super::{
+        git_command_in_repository, migration_changes, root, validate_conformance_test_result,
+    };
     use std::fs;
     use std::io::ErrorKind;
     use std::os::unix::fs::PermissionsExt;
@@ -1709,13 +1729,12 @@ mod tests {
     }
 
     fn test_git_command(repository: &Path, arguments: &[&str]) -> Command {
-        let mut command = Command::new("git");
+        let mut command = git_command_in_repository(repository);
         command
             .args(["-c", "commit.gpgsign=false"])
             .args(arguments)
             .env("GIT_CONFIG_GLOBAL", repository.join(".gitconfig-disabled"))
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .current_dir(repository);
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         command
     }
 
@@ -1778,6 +1797,27 @@ mod tests {
             Some(std::ffi::OsStr::new("1")),
             "fixture Git commands must not inherit system configuration"
         );
+        for variable in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_QUARANTINE_PATH",
+            "GIT_NAMESPACE",
+            "GIT_PREFIX",
+        ] {
+            let value = command
+                .get_envs()
+                .find(|(key, _value)| *key == variable)
+                .map(|(_key, value)| value);
+            assert_eq!(
+                value,
+                Some(None),
+                "fixture Git commands must clear inherited {variable}"
+            );
+        }
         Ok(())
     }
 
