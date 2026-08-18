@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use kube::api::{Api, ListParams};
 use steward_store::{AgentRunTimelineKind, PgStore};
-use steward_types::{AgentRuntime, Principal, TaskPhase};
+use steward_types::{AgentRuntime, Phase, Principal, TaskPhase};
 
 #[tokio::test]
 async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Error>> {
@@ -189,6 +189,37 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
             .is_some(),
         "finalizing against a stale UID must not delete a same-name replacement runtime"
     );
+
+    let diagnostic = submit(
+        &base_url,
+        "github-assertion",
+        "provider-readiness-123",
+        r#"{"workflow":"code-review","codingAgentRuntime":"base"}"#,
+        &run_dir,
+    )?;
+    assert_eq!(diagnostic["phase"], "submitted");
+    let diagnostic_task_uid = json_string(&diagnostic, "taskUid")?;
+    let diagnostic_bound = wait_for_runtime_binding(
+        &base_url,
+        diagnostic_task_uid,
+        "github-assertion",
+        &run_dir,
+    )?;
+    let diagnostic_runtime_uid = json_string(&diagnostic_bound, "runtimeUid")?;
+    assert_controller_runtime_tool_ready(&runtime_api, diagnostic_runtime_uid).await?;
+    delete_task(
+        &base_url,
+        diagnostic_task_uid,
+        "github-assertion",
+        &run_dir,
+    )?;
+    wait_for(
+        &base_url,
+        diagnostic_task_uid,
+        "github-assertion",
+        |status| status["finalized"] == true,
+        &run_dir,
+    )?;
 
     let body = r#"{"workflow":"approval-review","codingAgentRuntime":"base"}"#;
     let parked = submit(
@@ -495,6 +526,99 @@ async fn runtime_by_uid(
 struct TaskSubmission {
     http_status: u16,
     body: serde_json::Value,
+}
+
+async fn wait_for_running_runtime(
+    runtimes: &Api<AgentRuntime>,
+    runtime_uid: &str,
+) -> Result<AgentRuntime, Box<dyn Error>> {
+    for _attempt in 0..240 {
+        if let Some(runtime) = runtime_by_uid(runtimes, runtime_uid).await?
+            && runtime.status.as_ref().is_some_and(|status| {
+                status.phase == Phase::Running
+                    && status.refs.workspace.is_some()
+                    && status.refs.sandbox.is_some()
+            })
+        {
+            return Ok(runtime);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(io::Error::other(format!(
+        "controller-created Task runtime {runtime_uid} did not reach Running with workspace and sandbox references"
+    ))
+    .into())
+}
+
+async fn assert_controller_runtime_tool_ready(
+    runtimes: &Api<AgentRuntime>,
+    runtime_uid: &str,
+) -> Result<(), Box<dyn Error>> {
+    let runtime = wait_for_running_runtime(runtimes, runtime_uid).await?;
+    assert!(
+        !runtime.spec.tools.is_empty(),
+        "the controller-created Task runtime must request a governed tool provider"
+    );
+    let refs = runtime
+        .status
+        .as_ref()
+        .map(|status| &status.refs)
+        .ok_or_else(|| io::Error::other("running Task runtime has no status references"))?;
+    let workspace = refs
+        .workspace
+        .as_deref()
+        .ok_or_else(|| io::Error::other("running Task runtime has no workspace reference"))?;
+    let sandbox = refs
+        .sandbox
+        .as_deref()
+        .ok_or_else(|| io::Error::other("running Task runtime has no sandbox reference"))?;
+    let openshell = required("STEWARD_OPENSHELL_CLI")?;
+    let endpoint = required("STEWARD_OPENSHELL_ENDPOINT")?;
+    let providers = Command::new(&openshell)
+        .args(["--gateway-endpoint", &endpoint, "--workspace", workspace])
+        .args(["sandbox", "provider", "list", sandbox])
+        .output()?;
+    if !providers.status.success() {
+        return Err(io::Error::other(format!(
+            "controller-created runtime provider inspection failed: {}",
+            String::from_utf8_lossy(&providers.stderr).trim()
+        ))
+        .into());
+    }
+    assert!(
+        String::from_utf8_lossy(&providers.stdout).contains("steward-mcp-gw"),
+        "controller-created runtime must attach the governed tool provider before execution"
+    );
+
+    let tool_call = Command::new(&openshell)
+        .args(["--gateway-endpoint", &endpoint, "--workspace", workspace])
+        .args(["sandbox", "exec", "--name", sandbox, "--no-tty", "--"])
+        .args([
+            "curl",
+            "-fsS",
+            "--max-time",
+            "20",
+            "-H",
+            "Content-Type: application/json",
+            "-H",
+            "MCP-Protocol-Version: 2025-06-18",
+            "-d",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_repositories","arguments":{}}}"#,
+            "http://hop1-capture-tools.steward-system.svc.cluster.local:8085/mcp",
+        ])
+        .output()?;
+    if !tool_call.status.success() {
+        return Err(io::Error::other(format!(
+            "exact OpenShell ExecSandbox tool call failed after provider attachment: {}",
+            String::from_utf8_lossy(&tool_call.stderr).trim()
+        ))
+        .into());
+    }
+    assert!(
+        String::from_utf8_lossy(&tool_call.stdout).contains("example-org/fixture-repository"),
+        "the supervisor must inject a dynamic provider credential for the controller-created runtime"
+    );
+    Ok(())
 }
 
 fn submit(
