@@ -119,7 +119,12 @@ if [[ ! -x "${OPEN_SHELL}" ]]; then
   exit 1
 fi
 
-kind load docker-image steward/mint:s1 --name "${cluster_name}"
+mint_image="steward/mint:s1"
+if ! docker image inspect "${mint_image}" >/dev/null 2>&1; then
+  echo "required mint image is absent; rebuilding ${mint_image} for this isolated run" >&2
+  STEWARD_MINT_IMAGE="${mint_image}" "${ROOT}/scripts/build-steward-mint-image.sh"
+fi
+kind load docker-image "${mint_image}" --name "${cluster_name}"
 kind load docker-image "${STEWARD_S2_CONTROLLER_IMAGE}" --name "${cluster_name}"
 if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   kind load docker-image "${STEWARD_S5_MCP_GW_IMAGE}" --name "${cluster_name}"
