@@ -998,6 +998,10 @@ mod tests {
         let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
         let xtask_source = include_str!("main.rs");
+        let task_wrapper = fs::read_to_string(root().join("scripts/task-submission-e2e.sh"))
+            .map_err(|error| format!("task lifecycle wrapper is required: {error}"))?;
+        let task_callback = fs::read_to_string(root().join("scripts/task-submission-inside.sh"))
+            .map_err(|error| format!("task lifecycle image callback is required: {error}"))?;
 
         let lifecycle_job = workflow
             .split("  e2e-controller-runtime-lifecycle:")
@@ -1016,6 +1020,55 @@ mod tests {
         assert!(
             xtask_source.contains("e2e_controller_runtime_lifecycle"),
             "the named controller-owned lifecycle command must have a dedicated implementation"
+        );
+        assert!(
+            task_wrapper.contains("scripts/task-submission-inside.sh"),
+            "the task lifecycle wrapper must defer image provision until the post-S0 callback"
+        );
+        assert!(
+            !task_wrapper.contains("build-steward-mint-image.sh"),
+            "the task lifecycle wrapper must not build the mint image before the long S0 setup gap"
+        );
+        assert!(
+            !task_wrapper.contains("build-patched-mcp-gw.sh"),
+            "the task lifecycle wrapper must not build mcp-gw before the long S0 setup gap"
+        );
+        for required in [
+            "build-steward-mint-image.sh",
+            "build-patched-mcp-gw.sh",
+            "e2e/Dockerfile.task",
+            "docker image inspect",
+            "exec bash \"${ROOT}/scripts/s2-inference-inside.sh\"",
+        ] {
+            assert!(
+                task_callback.contains(required),
+                "the post-S0 task callback must provision and inspect local images before S2: missing {required}"
+            );
+        }
+        let mint_build = task_callback
+            .find("build-steward-mint-image.sh")
+            .ok_or_else(|| "task callback must build mint".to_owned())?;
+        let mcp_gw_build = task_callback
+            .find("build-patched-mcp-gw.sh")
+            .ok_or_else(|| "task callback must build mcp-gw".to_owned())?;
+        let task_build = task_callback
+            .find("e2e/Dockerfile.task")
+            .ok_or_else(|| "task callback must build controller/task image".to_owned())?;
+        let image_inspect = task_callback
+            .find("docker image inspect")
+            .ok_or_else(|| "task callback must inspect built images".to_owned())?;
+        let s2_exec = task_callback
+            .find("exec bash \"${ROOT}/scripts/s2-inference-inside.sh\"")
+            .ok_or_else(|| "task callback must enter S2 after image checks".to_owned())?;
+        assert!(
+            mint_build < image_inspect
+                && mcp_gw_build < image_inspect
+                && task_build < image_inspect,
+            "the post-S0 callback must build every local image before inspecting it"
+        );
+        assert!(
+            image_inspect < s2_exec,
+            "the post-S0 callback must inspect every local image before any kind load in S2"
         );
 
         Ok(())
