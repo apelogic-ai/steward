@@ -5,6 +5,7 @@
 //! its exact Kubernetes UID.  A route may be stable while the underlying sandbox is replaced,
 //! but it is unavailable until the replacement is controller-observed as running.
 
+use steward_store::{ActiveTaskRuntime, PgStore};
 use steward_types::CanonicalUserId;
 
 use crate::{BoxFuture, RuntimeRepository};
@@ -67,6 +68,33 @@ pub trait ActiveTaskRuntimeSource: Clone + Send + Sync + 'static {
         owner: &'a CanonicalUserId,
         service: &'a BridgeService,
     ) -> BoxFuture<'a, Result<Option<BridgeRuntimeReference>, StableBridgeError>>;
+}
+
+fn bridge_runtime_reference(
+    active: ActiveTaskRuntime,
+) -> Result<BridgeRuntimeReference, StableBridgeError> {
+    BridgeRuntimeReference::new(
+        active.runtime_namespace,
+        active.runtime_name,
+        active.runtime_uid,
+    )
+    .map_err(|_| StableBridgeError::Unavailable)
+}
+
+impl ActiveTaskRuntimeSource for PgStore {
+    fn active_task_runtime<'a>(
+        &'a self,
+        owner: &'a CanonicalUserId,
+        service: &'a BridgeService,
+    ) -> BoxFuture<'a, Result<Option<BridgeRuntimeReference>, StableBridgeError>> {
+        Box::pin(async move {
+            PgStore::active_task_runtime(self, owner, service.as_str())
+                .await
+                .map_err(|_| StableBridgeError::Unavailable)?
+                .map(bridge_runtime_reference)
+                .transpose()
+        })
+    }
 }
 
 /// An immutable bridge artifact that was verified by an injected provenance verifier.  There is
@@ -451,6 +479,24 @@ mod tests {
             Err(StableBridgeError::ArtifactUnverified),
             "a mutable bridge image must not be distributed"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn task_store_reference_preserves_the_server_selected_runtime_identity() -> Result<(), String> {
+        let active = steward_store::ActiveTaskRuntime {
+            task_uid: uuid::Uuid::nil(),
+            runtime_uid: "runtime-uid-a".to_owned(),
+            runtime_namespace: "steward-test".to_owned(),
+            runtime_name: "runtime-a".to_owned(),
+        };
+
+        let reference = super::bridge_runtime_reference(active)
+            .map_err(|error| format!("convert active task runtime: {error:?}"))?;
+
+        assert_eq!(reference.namespace(), "steward-test");
+        assert_eq!(reference.name(), "runtime-a");
+        assert_eq!(reference.uid(), "runtime-uid-a");
         Ok(())
     }
 }
