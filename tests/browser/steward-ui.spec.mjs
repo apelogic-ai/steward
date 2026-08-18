@@ -1,5 +1,4 @@
 import { spawn } from "node:child_process";
-import { once } from "node:events";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -29,10 +28,10 @@ function startLoopbackDemo() {
     const child = spawn(
       exampleBinary("user-envelope-demo"),
       ["--bind", "127.0.0.1:0"],
-      // The xtask gate builds examples first. Give each direct demo process its
-      // own session so teardown cannot leave it holding a port after the test
-      // runner exits.
-      { cwd: repository, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" },
+      // The xtask gate builds examples first. These are the direct binaries,
+      // not cargo-run wrapper processes, so the child PID is the demo PID and
+      // can be terminated deterministically by the test runner.
+      { cwd: repository, stdio: ["ignore", "pipe", "pipe"] },
     );
     let output = "";
     let settled = false;
@@ -81,7 +80,7 @@ function startLoopbackAdminDemo() {
     const child = spawn(
       exampleBinary("admin-dashboard-demo"),
       ["--mode", "oidc-admin", "--bind", "127.0.0.1:0"],
-      { cwd: repository, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" },
+      { cwd: repository, stdio: ["ignore", "pipe", "pipe"] },
     );
     let output = "";
     let settled = false;
@@ -125,29 +124,32 @@ function startLoopbackAdminDemo() {
   });
 }
 
+function hasExited(child) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function waitForExit(child, timeoutMs) {
+  if (hasExited(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      child.removeListener("exit", onExit);
+      resolve(false);
+    }, timeoutMs);
+    const onExit = () => {
+      clearTimeout(timeout);
+      resolve(true);
+    };
+    child.once("exit", onExit);
+  });
+}
+
 async function stopLoopbackDemo(child) {
-  if (!child || child.exitCode !== null) {
-    return;
-  }
-  const terminate = (signal) => {
-    if (process.platform !== "win32") {
-      try {
-        process.kill(-child.pid, signal);
-        return;
-      } catch (error) {
-        if (error.code !== "ESRCH") throw error;
-      }
-    }
-    child.kill(signal);
-  };
-  terminate("SIGINT");
-  await Promise.race([
-    once(child, "exit"),
-    new Promise((resolve) => setTimeout(resolve, 10_000)),
-  ]);
-  if (child.exitCode === null) {
-    terminate("SIGKILL");
-    await once(child, "exit");
+  if (!child || hasExited(child)) return;
+  child.kill("SIGTERM");
+  if (await waitForExit(child, 5_000)) return;
+  child.kill("SIGKILL");
+  if (!(await waitForExit(child, 5_000))) {
+    throw new Error(`loopback demo did not exit after SIGKILL (pid ${child.pid})`);
   }
 }
 
