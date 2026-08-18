@@ -19,6 +19,13 @@
         <a href="/admin/connections">Connections</a>
         <a href="/settings">Settings</a>
       </nav>
+      <label id="workspace-mode" class="workspace-mode" hidden>
+        <span>Workspace</span>
+        <select id="workspace-mode-select" aria-label="Workspace presentation">
+          <option value="developer">Developer</option>
+          <option value="admin">Admin</option>
+        </select>
+      </label>
       <span id="signed-in-email" class="signed-in-email" aria-live="polite">Loading session…</span>
     </header>
     <main id="workspace" tabindex="-1">
@@ -141,6 +148,15 @@
             <ol id="run-timeline" class="run-timeline" aria-live="polite"></ol>
           </section>
         </div>
+      </section>
+      <section data-page="/admin/workspace" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Administrator workspace</p><h1>Admin</h1></div></div>
+        <div class="callout"><p>This presentation exposes organization-wide governed run history. Changing presentation never changes your server-authorized access.</p></div>
+        <section aria-labelledby="admin-runs-heading">
+          <h2 id="admin-runs-heading">All governed runs</h2>
+          <p id="admin-runs-message" role="status">Loading authoritative organization runs…</p>
+          <div id="admin-runs-list" class="group-list" aria-live="polite"></div>
+        </section>
       </section>
       <section data-page="/settings" hidden>
         <div class="section-heading"><div><p class="eyebrow">Organization access</p><h1>Settings</h1></div></div>

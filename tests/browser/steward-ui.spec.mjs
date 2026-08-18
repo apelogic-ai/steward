@@ -8,6 +8,8 @@ import { expect, test } from "@playwright/test";
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 let demo;
 let origin;
+let adminDemo;
+let adminOrigin;
 
 function startLoopbackDemo() {
   return new Promise((resolve, reject) => {
@@ -60,6 +62,64 @@ function startLoopbackDemo() {
         settled = true;
         clearTimeout(timeout);
         reject(new Error(`loopback Steward demo exited before readiness (${code ?? signal}):\n${output}`));
+      }
+    });
+  });
+}
+
+function startLoopbackAdminDemo() {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      "cargo",
+      [
+        "run",
+        "-p",
+        "steward-apiserver",
+        "--locked",
+        "--features",
+        "admin-demo",
+        "--example",
+        "admin-dashboard-demo",
+        "--",
+        "--mode",
+        "oidc-admin",
+        "--bind",
+        "127.0.0.1:0",
+      ],
+      { cwd: repository, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let output = "";
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        child.kill("SIGINT");
+        reject(new Error(`loopback Steward admin demo did not become ready:\n${output}`));
+      }
+    }, 30_000);
+    const inspect = (chunk) => {
+      output = `${output}${chunk}`.slice(-16_384);
+      const match = output.match(/Steward localhost demo: (http:\/\/127\.0\.0\.1:\d+)\/admin\/sign-in/);
+      if (match && !settled) {
+        settled = true;
+        clearTimeout(timeout);
+        resolve({ child, origin: match[1], output });
+      }
+    };
+    child.stdout.on("data", inspect);
+    child.stderr.on("data", inspect);
+    child.once("error", (error) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(error);
+      }
+    });
+    child.once("exit", (code, signal) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(new Error(`loopback Steward admin demo exited before readiness (${code ?? signal}):\n${output}`));
       }
     });
   });
@@ -136,10 +196,43 @@ async function signIn(page) {
 test.beforeAll(async () => {
   demo = await startLoopbackDemo();
   origin = demo.origin;
+  adminDemo = await startLoopbackAdminDemo();
+  adminOrigin = adminDemo.origin;
 });
 
 test.afterAll(async () => {
   await stopLoopbackDemo(demo?.child);
+  await stopLoopbackDemo(adminDemo?.child);
+});
+
+test("dual-role administrator can switch presentation, while developer cannot enter it", async ({ browser }) => {
+  const userSession = await guardedPage(browser, { width: 1440, height: 900 });
+  const adminSession = await guardedPage(browser, { width: 1440, height: 900 });
+  try {
+    await signIn(userSession.page);
+    await userSession.page.goto(`${origin}/admin/workspace`);
+    await expect(userSession.page).toHaveText("Forbidden");
+
+    const { page } = adminSession;
+    await page.goto(`${adminOrigin}/admin/sign-in`);
+    await page.getByRole("link", { name: "Continue with Google" }).click();
+    await expect(page).toHaveURL(`${adminOrigin}/envelopes`);
+    const workspace = page.getByRole("combobox", { name: "Workspace presentation" });
+    await expect(workspace).toBeVisible();
+    await expect(workspace).toHaveValue("developer");
+    await workspace.selectOption("admin");
+    await expect(page).toHaveURL(`${adminOrigin}/admin/workspace`);
+    await expect(page.getByRole("heading", { name: "Admin" })).toBeVisible();
+    await expect(workspace).toHaveValue("admin");
+    await expect(page.locator("#admin-runs-list")).toContainText("No entries.");
+
+    await page.getByRole("link", { name: "Connections", exact: true }).click();
+    await expect(page).toHaveURL(`${adminOrigin}/admin/connections`);
+    await expect(page.getByRole("combobox", { name: "Workspace presentation" })).toBeVisible();
+  } finally {
+    await closeGuardedPage(userSession);
+    await closeGuardedPage(adminSession);
+  }
 });
 
 test("user can sign in, navigate shared top navigation, and connect then disconnect GitHub", async ({ browser }) => {

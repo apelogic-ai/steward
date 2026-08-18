@@ -32,6 +32,15 @@ where
         .route("/envelopes/assets/workspace.css", get(stylesheet))
 }
 
+/// This route is mounted only behind the browser-admin middleware. A user who hand-authors the
+/// path must still have the server-side administrator assignment.
+pub(crate) fn admin_router<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::<S>::new().route("/admin/workspace", get(shell))
+}
+
 async fn shell() -> Html<&'static str> {
     Html(USER_WORKSPACE_HTML)
 }
@@ -148,6 +157,38 @@ mod tests {
                 "envelope accordion is missing the visible disclosure state {required}"
             );
         }
+    }
+
+    #[test]
+    fn dual_role_workspace_switch_has_a_server_protected_admin_destination() {
+        for required in [
+            "/admin/workspace",
+            "workspace-mode",
+            "workspace-mode-select",
+            "Administrator workspace",
+            "All governed runs",
+        ] {
+            assert!(
+                USER_WORKSPACE_HTML.contains(required),
+                "workspace is missing the dual-role presentation contract {required}"
+            );
+        }
+        for required in [
+            "value.role === \"admin\"",
+            "value.memberRoles.includes(\"developer\")",
+            "window.location.assign(\"/admin/workspace\")",
+            "window.location.assign(\"/envelopes\")",
+        ] {
+            assert!(
+                USER_WORKSPACE_JS.contains(required),
+                "workspace switch must derive mode only from the server session: {required}"
+            );
+        }
+        assert!(
+            USER_WORKSPACE_JS
+                .contains("if (activePage() === \"/admin/workspace\") loadAdminWorkspace();"),
+            "the administrator presentation must load its own authoritative data"
+        );
     }
 
     #[test]

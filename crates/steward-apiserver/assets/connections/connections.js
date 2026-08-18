@@ -7,6 +7,8 @@ const providerCard = document.querySelector(".provider-card");
 const principalEmail = document.querySelector("#principal-email");
 const canonicalUser = document.querySelector("#canonical-user");
 const signedInEmail = document.querySelector("#signed-in-email");
+const workspaceMode = document.querySelector("#workspace-mode");
+const workspaceModeSelect = document.querySelector("#workspace-mode-select");
 const githubStatus = document.querySelector("#github-status");
 const githubSummary = document.querySelector("#github-summary");
 const githubAccount = document.querySelector("#github-account");
@@ -142,6 +144,8 @@ async function loadSession() {
     !value.principal ||
     typeof value.principal.userId !== "string" ||
     typeof value.principal.displayEmail !== "string" ||
+    typeof value.role !== "string" ||
+    !Array.isArray(value.memberRoles) ||
     typeof value.csrf !== "string"
   ) {
     throw new Error("browser session contract mismatch");
@@ -150,6 +154,23 @@ async function loadSession() {
   canonicalUser.textContent = value.principal.userId;
   signedInEmail.textContent = value.principal.displayEmail;
   csrf = value.csrf;
+  setupWorkspaceMode(value);
+}
+
+function setupWorkspaceMode(value) {
+  const dualRole = value.role === "admin" && value.memberRoles.includes("developer");
+  workspaceMode.hidden = !dualRole;
+  if (!dualRole) {
+    return;
+  }
+  workspaceModeSelect.value = "developer";
+  workspaceModeSelect.addEventListener("change", () => {
+    if (workspaceModeSelect.value === "admin") {
+      window.location.assign("/admin/workspace");
+      return;
+    }
+    window.location.assign("/envelopes");
+  });
 }
 
 async function loadConnection() {

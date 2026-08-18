@@ -90,6 +90,21 @@ main:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.workspace-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+}
+
+.workspace-mode select {
+  width: auto;
+  min-height: 2rem;
+  padding: 0.2rem 1.7rem 0.2rem 0.5rem;
+  font: inherit;
+}
+
 .brand {
   color: var(--text);
   font-weight: 700;
@@ -386,6 +401,10 @@ dialog::backdrop {
 
   .signed-in-email {
     margin-left: 0;
+  }
+
+  .workspace-mode {
+    margin-left: auto;
   }
 
   .topbar,

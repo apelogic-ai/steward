@@ -209,4 +209,25 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn dual_role_connections_mode_uses_the_server_session_contract() {
+        for required in ["id=\"workspace-mode\"", "id=\"workspace-mode-select\""] {
+            assert!(
+                CONNECTIONS_HTML.contains(required),
+                "Connections shell is missing dual-role control {required:?}"
+            );
+        }
+        for required in [
+            "value.role === \"admin\"",
+            "value.memberRoles.includes(\"developer\")",
+            "window.location.assign(\"/admin/workspace\")",
+        ] {
+            assert!(
+                CONNECTIONS_JS.contains(required),
+                "Connections script is missing dual-role behavior {required:?}"
+            );
+        }
+        assert!(CONNECTIONS_CSS.contains(".workspace-mode {"));
+    }
 }

@@ -7,6 +7,7 @@ const path = window.location.pathname;
 const pages = Array.from(document.querySelectorAll("[data-page]"));
 
 function activePage() {
+  if (path === "/admin/workspace") return "/admin/workspace";
   if (/^\/runs\/[0-9a-f-]{36}$/i.test(path)) return "/runs/detail";
   if (/^\/envelopes\/[^/]+\/runs$/i.test(path)) return "/envelopes/runs";
   if (/^\/envelopes\/[^/]+$/i.test(path)) return path.endsWith("/new") ? "/envelopes/new" : "/envelopes/detail";
@@ -23,6 +24,7 @@ const PAGE_TITLES = {
   "/envelopes/runs": "Envelope runs · Steward",
   "/runs": "Runs · Steward",
   "/runs/detail": "Run · Steward",
+  "/admin/workspace": "Admin · Steward",
   "/settings": "Settings · Steward",
 };
 document.title = PAGE_TITLES[activePage()] ?? "Steward";
@@ -68,9 +70,25 @@ async function loadIdentity() {
   try {
     const session = await sessionInfo();
     text(target, session.principal.displayEmail);
+    setupWorkspaceMode(session);
     const canonicalUserId = document.querySelector("#canonical-user-id");
     if (canonicalUserId) text(canonicalUserId, session.principal.userId);
   } catch (_) { text(target, "Session unavailable"); }
+}
+
+function setupWorkspaceMode(value) {
+  const control = document.querySelector("#workspace-mode");
+  const select = document.querySelector("#workspace-mode-select");
+  const dualRole = value.role === "admin"
+    && Array.isArray(value.memberRoles)
+    && value.memberRoles.includes("developer");
+  control.hidden = !dualRole;
+  if (!dualRole) return;
+  select.value = activePage() === "/admin/workspace" ? "admin" : "developer";
+  select.addEventListener("change", () => {
+    if (select.value === "admin") window.location.assign("/admin/workspace");
+    else window.location.assign("/envelopes");
+  });
 }
 
 let sessionPromise;
@@ -86,7 +104,9 @@ async function sessionInfo() {
 
 async function runsApi(suffix = "", query = {}) {
   const session = await sessionInfo();
-  const endpoint = session.role === "admin" ? "/admin/api/v1/all-runs" : `${API}/runs`;
+  const endpoint = activePage() === "/admin/workspace" && session.role === "admin"
+    ? "/admin/api/v1/all-runs"
+    : `${API}/runs`;
   const params = new URLSearchParams(Object.entries(query).filter(([, value]) => value !== null && value !== undefined && value !== ""));
   const response = await fetch(`${endpoint}${suffix}${params.size ? `?${params}` : ""}`);
   if (!response.ok) throw new Error(`The authoritative run request failed (${response.status}).`);
@@ -415,6 +435,16 @@ async function loadRuns() {
   } catch (error) { text(message, error.message); }
 }
 
+async function loadAdminWorkspace() {
+  const message = document.querySelector("#admin-runs-message");
+  const list = document.querySelector("#admin-runs-list");
+  try {
+    const response = await runsApi();
+    list.replaceChildren(...(response.runs.length ? response.runs.map(renderRun) : [create("p", "No entries.")]));
+    text(message, "");
+  } catch (error) { text(message, error.message); }
+}
+
 function timelineLabel(event) {
   if (event.kind === "phase") return `Phase changed to ${event.phase}.`;
   if (event.kind === "finalizationRequested") return "Finalization requested.";
@@ -460,3 +490,4 @@ if (activePage() === "/envelopes/detail") loadDetail();
 if (activePage() === "/envelopes/runs") loadEnvelopeRuns();
 if (activePage() === "/runs") loadRuns();
 if (activePage() === "/runs/detail") loadRunDetail();
+if (activePage() === "/admin/workspace") loadAdminWorkspace();

@@ -571,7 +571,9 @@ impl BrowserIdentityResolver for LocalFakeIdentityResolver {
                     .map_err(|_| BrowserAuthFailure::IdentityUnavailable)?,
                 display_email: identity.verified_email().clone(),
                 role,
-                member_roles: Vec::new(),
+                member_roles: (role == BrowserRole::Admin)
+                    .then(|| vec!["developer".to_owned()])
+                    .unwrap_or_default(),
             })
         })
     }
@@ -605,6 +607,10 @@ pub fn browser_auth_router(service: BrowserAuthService) -> Router {
         .with_state(service.clone());
     auth.merge(protect_browser_routes(
         crate::user_ui::router::<()>(),
+        service.clone(),
+    ))
+    .merge(protect_browser_admin_routes(
+        crate::user_ui::admin_router::<()>(),
         service,
     ))
 }
@@ -2167,6 +2173,55 @@ mod tests {
             )
             .await
             .map_err(|error| format!("execute administrator browser request: {error}"))?;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn administrator_workspace_is_not_exposed_by_a_developer_session() -> Result<(), String> {
+        let service =
+            local_fake_browser_auth_service("http://127.0.0.1:33001", LocalFakeIdentity::User)?;
+        let user = service
+            .registry
+            .issue(principal()?, super::epoch_seconds())
+            .map_err(|error| format!("issue ordinary browser session: {error:?}"))?;
+        let mut administrator = principal()?;
+        administrator.role = BrowserRole::Admin;
+        administrator.member_roles = vec!["developer".to_owned()];
+        let admin = service
+            .registry
+            .issue(administrator, super::epoch_seconds())
+            .map_err(|error| format!("issue dual-role browser session: {error:?}"))?;
+
+        let routes = || browser_auth_router(service.clone());
+        let forbidden = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/workspace")
+                    .header(
+                        header::COOKIE,
+                        format!("steward-local-session={}", user.token),
+                    )
+                    .body(Body::empty())
+                    .map_err(|error| format!("build developer workspace request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute developer workspace request: {error}"))?;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let accepted = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/workspace")
+                    .header(
+                        header::COOKIE,
+                        format!("steward-local-session={}", admin.token),
+                    )
+                    .body(Body::empty())
+                    .map_err(|error| format!("build administrator workspace request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute administrator workspace request: {error}"))?;
         assert_eq!(accepted.status(), StatusCode::OK);
         Ok(())
     }

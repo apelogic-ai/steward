@@ -31,6 +31,24 @@
   overflow-wrap: anywhere;
 }
 
+.workspace-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.workspace-mode select {
+  min-height: 2rem;
+  padding: 0.25rem 1.75rem 0.25rem 0.55rem;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 0.4rem;
+  font: inherit;
+}
+
 .button {
   display: inline-flex;
   align-items: center;
@@ -185,5 +203,9 @@
 
   .signed-in-email {
     margin-left: 0;
+  }
+
+  .workspace-mode {
+    margin-left: auto;
   }
 }
