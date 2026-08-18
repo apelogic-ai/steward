@@ -22,12 +22,51 @@ use steward_apiserver::{
 };
 use steward_store::PgStore;
 use steward_types::{
-    AgentRuntime, Budget, CanonicalUserId, Duration, Email, RunnerRequirements, ToolGrant,
+    AgentRuntime, Budget, CanonicalPrincipal, Duration, OrganizationId, OrganizationIdentity,
+    OrganizationIdentityPolicy, RunnerRequirements, ToolGrant,
 };
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
-struct TestTaskIdentities;
+struct TestTaskIdentities {
+    assertions: Arc<BTreeMap<String, TaskIdentity>>,
+}
+
+impl TestTaskIdentities {
+    fn from_trusted_principals(
+        alice: &CanonicalPrincipal,
+        scheduled: &CanonicalPrincipal,
+    ) -> Self {
+        let mut assertions = BTreeMap::new();
+        for (assertion, service) in [
+            ("github-assertion", "steward-run"),
+            ("slack-assertion", "burble"),
+            ("portal-assertion", "request-portal"),
+        ] {
+            assertions.insert(
+                assertion.to_owned(),
+                TaskIdentity {
+                    service: service.to_owned(),
+                    acting_user: Some(alice.display_email.clone()),
+                    owner: alice.display_email.clone(),
+                    canonical_user_id: alice.user_id.clone(),
+                },
+            );
+        }
+        assertions.insert(
+            "scheduled-assertion".to_owned(),
+            TaskIdentity {
+                service: "scheduled-scanner".to_owned(),
+                acting_user: None,
+                owner: scheduled.display_email.clone(),
+                canonical_user_id: scheduled.user_id.clone(),
+            },
+        );
+        Self {
+            assertions: Arc::new(assertions),
+        }
+    }
+}
 
 impl TaskIdentityResolver for TestTaskIdentities {
     fn resolve<'a>(
@@ -41,33 +80,72 @@ impl TaskIdentityResolver for TestTaskIdentities {
         >,
     > {
         Box::pin(async move {
-            let (service, acting_user, owner) = match assertion {
-                "github-assertion" => (
-                    "steward-run",
-                    Some("alice@example.com"),
-                    "alice@example.com",
-                ),
-                "slack-assertion" => ("burble", Some("alice@example.com"), "alice@example.com"),
-                "portal-assertion" => (
-                    "request-portal",
-                    Some("alice@example.com"),
-                    "alice@example.com",
-                ),
-                "scheduled-assertion" => ("scheduled-scanner", None, "owner@example.org"),
-                _ => return Err(TaskAuthenticationError::InvalidCredentials),
-            };
-            Ok(TaskIdentity {
-                service: service.to_owned(),
-                acting_user: acting_user.map(|email| Email(email.to_owned())),
-                owner: Email(owner.to_owned()),
-                canonical_user_id: CanonicalUserId::parse(match assertion {
-                    "scheduled-assertion" => "usr_abcdef0123456789abcdef0123456789",
-                    _ => "usr_0123456789abcdef0123456789abcdef",
-                })
-                .map_err(|_| TaskAuthenticationError::InvalidCredentials)?,
-            })
+            self.assertions
+                .get(assertion)
+                .cloned()
+                .ok_or(TaskAuthenticationError::InvalidCredentials)
         })
     }
+}
+
+async fn seed_test_task_identities(store: &PgStore) -> Result<TestTaskIdentities, Box<dyn Error>> {
+    let alice = store
+        .register_canonical_identity(
+            &test_google_identity("task-server-alice", "alice@example.com")?,
+            "task-server-fixture-bootstrap",
+        )
+        .await?;
+    let scheduled = store
+        .register_canonical_identity(
+            &test_google_identity("task-server-scheduled", "owner@example.org")?,
+            "task-server-fixture-bootstrap",
+        )
+        .await?;
+    Ok(TestTaskIdentities::from_trusted_principals(
+        &alice, &scheduled,
+    ))
+}
+
+fn test_google_identity(
+    subject: &str,
+    email: &str,
+) -> Result<OrganizationIdentity, Box<dyn Error>> {
+    let policy = OrganizationIdentityPolicy::new(
+        "https://accounts.google.com",
+        "example.com",
+        OrganizationId::parse("org_example")?,
+    )?;
+    Ok(policy.validate(
+        "https://accounts.google.com",
+        subject,
+        "example.com",
+        email,
+        true,
+    )?)
+}
+
+#[tokio::test]
+async fn task_server_assertions_reference_persisted_canonical_principals()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")
+        .map_err(|_| io::Error::other("STEWARD_TEST_DATABASE_URL is required"))?;
+    let store = PgStore::connect(&database_url).await?;
+    store.migrate().await?;
+    let identity = seed_test_task_identities(&store)
+        .await?
+        .resolve("github-assertion")
+        .await
+        .map_err(|error| io::Error::other(format!("fixture identity failed to resolve: {error:?}")))?;
+
+    assert_eq!(
+        store
+            .resolve_canonical_principal(&identity.canonical_user_id, &identity.owner)
+            .await?
+            .user_id,
+        identity.canonical_user_id,
+        "a task-server fixture identity must reference an explicit trusted canonical-user row before Task insertion"
+    );
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -99,6 +177,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map_err(|_| io::Error::other("STEWARD_TEST_DATABASE_URL is required"))?;
     let store = PgStore::connect(&database_url).await?;
     store.migrate().await?;
+    let task_identities = seed_test_task_identities(&store).await?;
     let envelope = Envelope {
         revision: 1,
         spec: EnvelopeSpec {
@@ -172,7 +251,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         runtimes.clone(),
         store.clone(),
         decisions.clone(),
-        TestTaskIdentities,
+        task_identities,
         workflows,
     )
     .merge(api_router(
