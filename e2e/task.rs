@@ -116,6 +116,59 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         "the durable Task timeline must evidence submit, execute, output persistence, finalization request, and exact runtime cleanup"
     );
 
+    let stale = submit(
+        &base_url,
+        "github-assertion",
+        "stale-runtime-123",
+        r#"{"workflow":"code-review","codingAgentRuntime":"base"}"#,
+        &run_dir,
+    )?;
+    let stale_task_uid = json_string(&stale, "taskUid")?;
+    let stale_runtime_uid = json_string(&stale, "runtimeUid")?;
+    let replacement_runtime_uid = replace_runtime_for_stale_uid_test(
+        &base_url,
+        stale_runtime_uid,
+        &run_dir,
+    )?;
+    assert_ne!(
+        replacement_runtime_uid, stale_runtime_uid,
+        "the stale-runtime control must create a distinct UID under the same runtime name"
+    );
+    put_archive(
+        &base_url,
+        stale_task_uid,
+        "github-assertion",
+        &input_tar,
+        &run_dir,
+    )?;
+    execute(
+        &base_url,
+        stale_task_uid,
+        "github-assertion",
+        &run_dir,
+    )?;
+    assert_phase_stays(
+        &base_url,
+        stale_task_uid,
+        "github-assertion",
+        "queued",
+        &run_dir,
+    )?;
+    delete_task(&base_url, stale_task_uid, "github-assertion", &run_dir)?;
+    wait_for(
+        &base_url,
+        stale_task_uid,
+        "github-assertion",
+        |status| status["finalized"] == true,
+        &run_dir,
+    )?;
+    assert!(
+        runtime_by_uid(&runtime_api, &replacement_runtime_uid)
+            .await?
+            .is_some(),
+        "finalizing against a stale UID must not delete a same-name replacement runtime"
+    );
+
     let body = r#"{"workflow":"approval-review","codingAgentRuntime":"base"}"#;
     let parked = submit(
         &base_url,
@@ -623,6 +676,54 @@ fn get_output(
     Ok(())
 }
 
+fn replace_runtime_for_stale_uid_test(
+    base_url: &str,
+    runtime_uid: &str,
+    run_dir: &Path,
+) -> Result<String, Box<dyn Error>> {
+    let response = run_dir.join(format!("replace-runtime-{runtime_uid}.json"));
+    let status = curl_status(
+        Command::new("curl")
+            .args(["-sS", "-o"])
+            .arg(&response)
+            .args([
+                "-w",
+                "%{http_code}",
+                "-X",
+                "POST",
+                &format!("{base_url}/test/runtimes/{runtime_uid}/replace"),
+            ]),
+        "replace test runtime with a stale same-name UID",
+    )?;
+    if status != 201 {
+        return Err(io::Error::other(format!(
+            "test runtime replacement returned {status}: {}",
+            fs::read_to_string(response)?
+        ))
+        .into());
+    }
+    json_string(&serde_json::from_slice(&fs::read(response)?)?, "runtimeUid")
+        .map(str::to_owned)
+}
+
+fn assert_phase_stays(
+    base_url: &str,
+    task_uid: &str,
+    assertion: &str,
+    expected_phase: &str,
+    run_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    for _ in 0..4 {
+        let status = task_status(base_url, task_uid, assertion, run_dir)?;
+        assert_eq!(
+            status["phase"], expected_phase,
+            "a Task bound to a stale runtime UID must fail closed instead of executing on a replacement"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Ok(())
+}
+
 fn wait_for(
     base_url: &str,
     task_uid: &str,
@@ -630,38 +731,52 @@ fn wait_for(
     predicate: impl Fn(&serde_json::Value) -> bool,
     run_dir: &Path,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
-    let response = run_dir.join(format!("status-{task_uid}.json"));
     for _attempt in 0..240 {
-        let status = curl_status(
-            Command::new("curl")
-                .args(["-sS", "-o"])
-                .arg(&response)
-                .args([
-                    "-w",
-                    "%{http_code}",
-                    "-H",
-                    &format!("Authorization: Bearer {assertion}"),
-                    &format!("{base_url}/v1/tasks/{task_uid}"),
-                ]),
-            "get Task status",
-        )?;
-        if status == 200 {
-            let value = serde_json::from_slice::<serde_json::Value>(&fs::read(&response)?)?;
-            if predicate(&value) {
-                return Ok(value);
-            }
-            let finalized_terminal = value["finalized"] == true
-                && matches!(value["phase"].as_str(), Some("failed" | "cancelled"));
-            if finalized_terminal {
-                return Err(io::Error::other(format!(
-                    "Task {task_uid} reached terminal state: {value}"
-                ))
-                .into());
-            }
+        let value = task_status(base_url, task_uid, assertion, run_dir)?;
+        if predicate(&value) {
+            return Ok(value);
+        }
+        let finalized_terminal = value["finalized"] == true
+            && matches!(value["phase"].as_str(), Some("failed" | "cancelled"));
+        if finalized_terminal {
+            return Err(io::Error::other(format!(
+                "Task {task_uid} reached terminal state: {value}"
+            ))
+            .into());
         }
         std::thread::sleep(Duration::from_secs(1));
     }
     Err(io::Error::other(format!("Task {task_uid} did not reach expected state")).into())
+}
+
+fn task_status(
+    base_url: &str,
+    task_uid: &str,
+    assertion: &str,
+    run_dir: &Path,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let response = run_dir.join(format!("status-{task_uid}.json"));
+    let status = curl_status(
+        Command::new("curl")
+            .args(["-sS", "-o"])
+            .arg(&response)
+            .args([
+                "-w",
+                "%{http_code}",
+                "-H",
+                &format!("Authorization: Bearer {assertion}"),
+                &format!("{base_url}/v1/tasks/{task_uid}"),
+            ]),
+        "get Task status",
+    )?;
+    if status != 200 {
+        return Err(io::Error::other(format!(
+            "Task status returned {status}: {}",
+            fs::read_to_string(response)?
+        ))
+        .into());
+    }
+    Ok(serde_json::from_slice(&fs::read(response)?)?)
 }
 
 fn curl_status(command: &mut Command, context: &str) -> Result<u16, Box<dyn Error>> {

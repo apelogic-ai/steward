@@ -10,6 +10,8 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use kube::api::{Api, DeleteParams, ListParams, PostParams};
+use kube::ResourceExt;
 use serde_json::{Value, json};
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_admission::{Envelope, EnvelopeSpec};
@@ -19,7 +21,9 @@ use steward_apiserver::{
     TaskIdentityResolver, TaskWorkflow, router as api_router, task_router,
 };
 use steward_store::PgStore;
-use steward_types::{Budget, CanonicalUserId, Duration, Email, RunnerRequirements, ToolGrant};
+use steward_types::{
+    AgentRuntime, Budget, CanonicalUserId, Duration, Email, RunnerRequirements, ToolGrant,
+};
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
@@ -141,6 +145,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         workflow("failing-review", "1.00", "exit 23"),
     ]);
     let client = kube::Client::try_default().await?;
+    let runtime_controls = TestRuntimeControls {
+        runtimes: Api::all(client.clone()),
+        run_id: env::var("STEWARD_TEST_RUN_ID")
+            .map_err(|_| io::Error::other("STEWARD_TEST_RUN_ID is required"))?,
+    };
     let jira_listener = TcpListener::bind("127.0.0.1:8083").await?;
     let jira_state = JiraState::default();
     let jira_server_state = jira_state.clone();
@@ -176,6 +185,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Router::new()
             .route("/test/resolutions", get(resolutions))
             .with_state(jira_state),
+    )
+    .merge(
+        Router::new()
+            .route(
+                "/test/runtimes/{runtime_uid}/replace",
+                post(replace_runtime_for_stale_uid_test),
+            )
+            .with_state(runtime_controls),
     );
     let bind = env::var("STEWARD_TEST_TASK_BIND").unwrap_or_else(|_| "0.0.0.0:8082".to_owned());
     let result = axum::serve(TcpListener::bind(bind).await?, app).await;
@@ -194,6 +211,95 @@ struct JiraData {
     markers: BTreeMap<String, String>,
     resolutions: Vec<Value>,
     next_issue: u32,
+}
+
+#[derive(Clone)]
+struct TestRuntimeControls {
+    runtimes: Api<AgentRuntime>,
+    run_id: String,
+}
+
+async fn replace_runtime_for_stale_uid_test(
+    State(controls): State<TestRuntimeControls>,
+    Path(runtime_uid): Path<String>,
+) -> impl IntoResponse {
+    let current = match controls.runtimes.list(&ListParams::default()).await {
+        Ok(runtimes) => runtimes
+            .items
+            .into_iter()
+            .find(|runtime| runtime.metadata.uid.as_deref() == Some(runtime_uid.as_str())),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("could not list test runtimes: {error}")})),
+            );
+        }
+    };
+    let Some(current) = current else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "test runtime was not found"})),
+        );
+    };
+    if current.namespace().as_deref() != Some("team-a")
+        || !current.name_any().starts_with("task-")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "test replacement is limited to task runtimes in team-a"})),
+        );
+    }
+    let namespace = current.namespace().unwrap_or_default();
+    let name = current.name_any();
+    let mut replacement = AgentRuntime::new(&name, current.spec.clone());
+    replacement.metadata.namespace = Some(namespace.clone());
+    replacement.metadata.annotations = current.metadata.annotations.clone();
+    replacement.metadata.labels = Some(BTreeMap::from([(
+        "steward.test/run-id".to_owned(),
+        controls.run_id.clone(),
+    )]));
+    let namespaced = Api::<AgentRuntime>::namespaced(controls.runtimes.clone().into_client(), &namespace);
+    if let Err(error) = namespaced.delete(&name, &DeleteParams::default()).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("could not delete test runtime: {error}")})),
+        );
+    }
+    let mut deleted = false;
+    for _ in 0..60 {
+        match namespaced.get_opt(&name).await {
+            Ok(None) => {
+                deleted = true;
+                break;
+            }
+            Ok(Some(_)) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("could not observe test runtime deletion: {error}")})),
+                );
+            }
+        }
+    }
+    if !deleted {
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({"error": "test runtime deletion did not complete within 15 seconds"})),
+        );
+    }
+    match namespaced.create(&PostParams::default(), &replacement).await {
+        Ok(replacement) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "runtimeUid": replacement.metadata.uid,
+                "runId": controls.run_id,
+            })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("could not create replacement runtime: {error}")})),
+        ),
+    }
 }
 
 fn jira_router(state: JiraState) -> Router {
