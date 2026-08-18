@@ -8,8 +8,8 @@ use sqlx::postgres::PgPoolOptions;
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
 use steward_store::{
     AgentRunQuery, AgentRunTimelineKind, AgentRunTimelineProvenance, ApproveAdmission,
-    BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
-    ParkRejection, PgStore, StoreError, TaskReservationRequest,
+    BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, ParkRejection,
+    PgStore, StoreError, TaskReservationRequest,
 };
 use steward_types::{
     AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding, Duration, Email, ModelRef,
@@ -200,7 +200,8 @@ async fn canonical_identity_requires_exact_subject_mapping_and_explicit_reconnec
 }
 
 #[tokio::test]
-async fn browser_rbac_is_canonical_user_scoped_append_only_and_revocable() -> Result<(), Box<dyn Error>> {
+async fn browser_rbac_is_canonical_user_scoped_append_only_and_revocable()
+-> Result<(), Box<dyn Error>> {
     let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
         io::Error::other("STEWARD_TEST_DATABASE_URL is required for the browser RBAC Postgres test")
     })?;
@@ -267,7 +268,10 @@ async fn browser_rbac_is_canonical_user_scoped_append_only_and_revocable() -> Re
         })
         .await?;
     let after_revoke = store.browser_rbac_assignments(&user).await?;
-    assert!(after_revoke.is_admin, "an unrelated administrator grant remains active");
+    assert!(
+        after_revoke.is_admin,
+        "an unrelated administrator grant remains active"
+    );
     assert!(after_revoke.member_roles.is_empty());
     let mutation = sqlx::query(
         "UPDATE browser_rbac_assignment_events SET actor = 'mutation-attempt' WHERE user_id = $1",
