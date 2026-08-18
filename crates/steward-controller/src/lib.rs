@@ -73,6 +73,7 @@ enum TtlAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TaskRuntimeAction {
     Wait,
+    CreateRuntime,
     Release,
     Execute,
     DeleteRuntime,
@@ -98,7 +99,13 @@ fn task_runtime_action(
         };
     }
     let Some(runtime) = runtime else {
-        return TaskRuntimeAction::Wait;
+        return if ownership == RuntimeOwnership::Provisioned
+            && matches!(phase, TaskPhase::Submitted | TaskPhase::Queued)
+        {
+            TaskRuntimeAction::CreateRuntime
+        } else {
+            TaskRuntimeAction::Wait
+        };
     };
     if runtime.spec != *runtime_spec
         || runtime
@@ -526,6 +533,7 @@ async fn reconcile_task<R: SandboxTaskRuntime>(
         runtime.as_ref(),
     ) {
         TaskRuntimeAction::Wait => Ok(()),
+        TaskRuntimeAction::CreateRuntime => create_task_runtime(client, authority, task).await,
         TaskRuntimeAction::Release => authority
             .release_parked_task(task.task_uid)
             .await
@@ -621,6 +629,133 @@ async fn reconcile_task<R: SandboxTaskRuntime>(
             .await
             .map_err(TaskControllerError::Store),
     }
+}
+
+async fn create_task_runtime(
+    client: &Client,
+    authority: &PgStore,
+    task: &TaskRecord,
+) -> Result<(), TaskControllerError> {
+    let runtime = task_runtime_manifest(task)?;
+    let namespace = runtime.namespace().ok_or_else(|| {
+        TaskControllerError::InvalidState(
+            "server-authored task runtime has no namespace".to_owned(),
+        )
+    })?;
+    let api = Api::<AgentRuntime>::namespaced(client.clone(), &namespace);
+    let created = match api.create(&PostParams::default(), &runtime).await {
+        Ok(created) => created,
+        Err(kube::Error::Api(response)) if response.code == 409 => {
+            let existing = api
+                .get(&runtime.name_any())
+                .await
+                .map_err(TaskControllerError::Kubernetes)?;
+            if existing.spec != runtime.spec || existing.annotations() != runtime.annotations() {
+                return Err(TaskControllerError::InvalidState(
+                    "task runtime name is bound to unrelated desired state".to_owned(),
+                ));
+            }
+            existing
+        }
+        Err(error) => return Err(TaskControllerError::Kubernetes(error)),
+    };
+    let runtime_uid = created.metadata.uid.as_deref().ok_or_else(|| {
+        TaskControllerError::InvalidState("created task runtime has no UID".to_owned())
+    })?;
+    authority
+        .bind_task_runtime(task.task_uid, runtime_uid, task.phase)
+        .await
+        .map(|_| ())
+        .map_err(TaskControllerError::Store)
+}
+
+fn task_runtime_manifest(task: &TaskRecord) -> Result<AgentRuntime, TaskControllerError> {
+    if task.runtime_ownership != RuntimeOwnership::Provisioned || task.runtime_uid.is_some() {
+        return Err(TaskControllerError::InvalidState(
+            "only an unbound provisioned task may create a runtime".to_owned(),
+        ));
+    }
+    server_task_runtime_manifest(TaskRuntimeBinding::from(task))
+}
+
+struct TaskRuntimeBinding<'a> {
+    runtime_spec: &'a AgentRuntimeSpec,
+    submitter_service: &'a str,
+    acting_user: Option<&'a str>,
+    acting_user_id: Option<&'a str>,
+    owner: &'a str,
+    owner_user_id: Option<&'a str>,
+    identity_binding_state: &'a str,
+    runtime_namespace: &'a str,
+    runtime_name: &'a str,
+}
+
+impl<'a> From<&'a TaskRecord> for TaskRuntimeBinding<'a> {
+    fn from(task: &'a TaskRecord) -> Self {
+        Self {
+            runtime_spec: &task.runtime_spec,
+            submitter_service: &task.submitter_service,
+            acting_user: task.acting_user.as_deref(),
+            acting_user_id: task.acting_user_id.as_deref(),
+            owner: &task.owner,
+            owner_user_id: task.owner_user_id.as_deref(),
+            identity_binding_state: &task.identity_binding_state,
+            runtime_namespace: &task.runtime_namespace,
+            runtime_name: &task.runtime_name,
+        }
+    }
+}
+
+fn server_task_runtime_manifest(
+    task: TaskRuntimeBinding<'_>,
+) -> Result<AgentRuntime, TaskControllerError> {
+    if task.identity_binding_state != "bound" {
+        return Err(TaskControllerError::InvalidState(
+            "task identity binding is not server-verified".to_owned(),
+        ));
+    }
+    let owner_user_id = task.owner_user_id.ok_or_else(|| {
+        TaskControllerError::InvalidState("task has no canonical owner".to_owned())
+    })?;
+    let authority = task
+        .runtime_spec
+        .canonical_authority
+        .as_ref()
+        .ok_or_else(|| {
+            TaskControllerError::InvalidState("task runtime has no canonical authority".to_owned())
+        })?;
+    if authority.owner_user_id.as_str() != owner_user_id
+        || authority.acting_user_id.as_ref().map(|id| id.as_str()) != task.acting_user_id
+        || task.runtime_spec.owner.0 != task.owner
+    {
+        return Err(TaskControllerError::InvalidState(
+            "task runtime authority does not match its server-authored owner".to_owned(),
+        ));
+    }
+    match &task.runtime_spec.principal {
+        steward_types::Principal::Service {
+            name,
+            acting_user: service_acting_user,
+        } if name == task.submitter_service
+            && service_acting_user.as_ref().map(|email| email.0.as_str()) == task.acting_user => {}
+        _ => {
+            return Err(TaskControllerError::InvalidState(
+                "task runtime principal does not match its submitting service".to_owned(),
+            ));
+        }
+    }
+    if task.runtime_namespace.is_empty() || task.runtime_name.is_empty() {
+        return Err(TaskControllerError::InvalidState(
+            "task runtime name and namespace must be server-authored".to_owned(),
+        ));
+    }
+    let mut runtime = AgentRuntime::new(task.runtime_name, task.runtime_spec.clone());
+    runtime.metadata.namespace = Some(task.runtime_namespace.to_owned());
+    runtime.metadata.annotations = Some(std::collections::BTreeMap::from([(
+        SERVICE_PRINCIPAL_ANNOTATION.to_owned(),
+        task.submitter_service.to_owned(),
+    )]));
+    Ok(runtime)
 }
 
 fn task_output_archive_failure(archive_bytes: usize) -> Option<&'static str> {
@@ -2330,11 +2465,12 @@ mod tests {
 
     use super::{
         AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ReconcileDecision,
-        ReconcileIntent, SERVICE_PRINCIPAL_ANNOTATION, TaskRuntimeAction, authority_action,
-        authority_application_action, cleanup_runtime, exhausted_spend_to_preserve,
-        inference_action, reconcile_once, replace_as_authority, runtime_authority_action,
-        runtime_ttl_action, status_merge_patch, suspend_runtime_with_inference_cleanup,
-        task_output_archive_failure, task_runtime_action, ttl_action,
+        ReconcileIntent, SERVICE_PRINCIPAL_ANNOTATION, TaskRuntimeAction, TaskRuntimeBinding,
+        authority_action, authority_application_action, cleanup_runtime,
+        exhausted_spend_to_preserve, inference_action, reconcile_once, replace_as_authority,
+        runtime_authority_action, runtime_ttl_action, server_task_runtime_manifest,
+        status_merge_patch, suspend_runtime_with_inference_cleanup, task_output_archive_failure,
+        task_runtime_action, ttl_action,
     };
 
     #[test]
@@ -2448,6 +2584,70 @@ mod tests {
             ),
             TaskRuntimeAction::Wait,
             "a corrupted task record must never delete another canonical owner's runtime"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provisioned_submitted_task_without_a_runtime_is_not_left_waiting() {
+        let runtime = fixture();
+
+        assert_eq!(
+            task_runtime_action(
+                TaskPhase::Submitted,
+                RuntimeOwnership::Provisioned,
+                false,
+                &runtime.spec,
+                None,
+            ),
+            TaskRuntimeAction::CreateRuntime,
+            "a server-authored provisioned task with no bound runtime must drive controller creation rather than wait forever"
+        );
+    }
+
+    #[test]
+    fn task_runtime_manifest_rejects_a_record_with_tampered_owner_authority() -> Result<(), String>
+    {
+        let mut runtime = fixture();
+        runtime.spec.principal = Principal::Service {
+            name: "steward-run".to_owned(),
+            acting_user: Some(Email("alice@example.com".to_owned())),
+        };
+        runtime.spec.canonical_authority = Some(CanonicalAuthorityBinding::new(
+            CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
+            Some(CanonicalUserId::parse(
+                "usr_0123456789abcdef0123456789abcdef",
+            )?),
+        )?);
+        assert!(
+            server_task_runtime_manifest(TaskRuntimeBinding {
+                runtime_spec: &runtime.spec,
+                submitter_service: "steward-run",
+                acting_user: Some("alice@example.com"),
+                acting_user_id: Some("usr_0123456789abcdef0123456789abcdef"),
+                owner: "alice@example.com",
+                owner_user_id: Some("usr_0123456789abcdef0123456789abcdef"),
+                identity_binding_state: "bound",
+                runtime_namespace: "team-a",
+                runtime_name: "task-a",
+            },)
+            .is_ok(),
+            "the controller must accept the exact server-authored Task record"
+        );
+        assert!(
+            server_task_runtime_manifest(TaskRuntimeBinding {
+                runtime_spec: &runtime.spec,
+                submitter_service: "steward-run",
+                acting_user: Some("alice@example.com"),
+                acting_user_id: Some("usr_abcdef0123456789abcdef0123456789"),
+                owner: "alice@example.com",
+                owner_user_id: Some("usr_abcdef0123456789abcdef0123456789"),
+                identity_binding_state: "bound",
+                runtime_namespace: "team-a",
+                runtime_name: "task-a",
+            },)
+            .is_err(),
+            "a task record whose owner differs from the canonical runtime authority must fail before the controller creates any runtime"
         );
         Ok(())
     }
