@@ -740,6 +740,7 @@ where
         tools: workflow.tools.clone(),
         budget: workflow.budget.clone(),
         ttl: workflow.ttl.clone(),
+        runner: steward_types::RunnerRequirements::default(),
         bindings: None,
     };
     let envelope = state
@@ -794,6 +795,7 @@ where
                 runtime_ownership: RuntimeOwnership::Adopted,
                 runtime_spec: &spec,
                 agent_command: &workflow.command,
+                envelope_revision: envelope.revision,
             })
             .await
             .map_err(ApiError::Store)?;
@@ -836,6 +838,7 @@ where
             runtime_ownership: RuntimeOwnership::Provisioned,
             runtime_spec: &spec,
             agent_command: &workflow.command,
+            envelope_revision: envelope.revision,
         })
         .await
         .map_err(ApiError::Store)?;

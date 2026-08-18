@@ -4,8 +4,11 @@ use std::error::Error;
 use std::fmt;
 
 use sqlx::types::Json;
-use sqlx::{PgPool, Row};
-use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row};
+use steward_admission::{
+    AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec,
+    envelope_is_within,
+};
 use steward_types::{
     AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
     OrganizationIdentity, OrganizationIdentityMigration,
@@ -15,6 +18,101 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
+}
+
+/// The current Steward-local browser authorization for one opaque canonical user.
+///
+/// Google proves who a person is. This record proves only which Steward privileges an
+/// operator has explicitly granted to that canonical user; it deliberately has no email,
+/// issuer, provider-token, or cloud-provider input.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BrowserRbacAssignments {
+    pub is_admin: bool,
+    pub member_roles: Vec<String>,
+}
+
+impl BrowserRbacAssignments {
+    fn from_active_assignments(
+        assignments: impl IntoIterator<Item = BrowserRbacAssignment>,
+    ) -> Self {
+        let mut result = Self::default();
+        for assignment in assignments {
+            match assignment {
+                BrowserRbacAssignment::Administrator => result.is_admin = true,
+                BrowserRbacAssignment::MemberRole(member_role) => {
+                    result.member_roles.push(member_role)
+                }
+            }
+        }
+        result.member_roles.sort();
+        result.member_roles.dedup();
+        result
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrowserRbacAssignment {
+    Administrator,
+    MemberRole(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserRbacAssignmentAction {
+    Grant,
+    Revoke,
+}
+
+impl BrowserRbacAssignmentAction {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Grant => "grant",
+            Self::Revoke => "revoke",
+        }
+    }
+}
+
+pub struct BrowserRbacAssignmentChange<'a> {
+    pub user_id: &'a CanonicalUserId,
+    pub assignment: &'a BrowserRbacAssignment,
+    pub action: BrowserRbacAssignmentAction,
+    pub actor: &'a str,
+}
+
+fn is_valid_member_role(member_role: &str) -> bool {
+    let bytes = member_role.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+}
+
+#[cfg(test)]
+mod browser_rbac_tests {
+    use super::{BrowserRbacAssignment, BrowserRbacAssignments};
+
+    #[test]
+    fn unassigned_canonical_user_has_no_implicit_steward_authority() {
+        let assignments = BrowserRbacAssignments::from_active_assignments([]);
+        assert_eq!(assignments.member_roles, Vec::<String>::new());
+        assert!(
+            !assignments.is_admin,
+            "Google identity alone must not silently bootstrap a Steward administrator"
+        );
+    }
+
+    #[test]
+    fn active_assignments_are_explicit_and_member_roles_are_deduplicated() {
+        let assignments = BrowserRbacAssignments::from_active_assignments([
+            BrowserRbacAssignment::MemberRole("engineer".to_owned()),
+            BrowserRbacAssignment::Administrator,
+            BrowserRbacAssignment::MemberRole("engineer".to_owned()),
+            BrowserRbacAssignment::MemberRole("analyst".to_owned()),
+        ]);
+        assert!(assignments.is_admin);
+        assert_eq!(assignments.member_roles, ["analyst", "engineer"]);
+    }
 }
 
 impl PgStore {
@@ -38,6 +136,83 @@ impl PgStore {
             .run(&self.pool)
             .await
             .map_err(|error| StoreError::Database(error.to_string()))
+    }
+
+    /// Read the latest append-only local RBAC decisions for this exact canonical user.
+    ///
+    /// Missing rows deliberately mean no elevated authority. The database query is keyed only by
+    /// the opaque canonical ID; email and external-provider claims are never authorization keys.
+    pub async fn browser_rbac_assignments(
+        &self,
+        user_id: &CanonicalUserId,
+    ) -> Result<BrowserRbacAssignments, StoreError> {
+        let rows = sqlx::query(
+            "WITH latest AS ( \
+                SELECT DISTINCT ON (assignment_kind, member_role) \
+                       assignment_kind, member_role, action \
+                FROM browser_rbac_assignment_events \
+                WHERE user_id = $1 \
+                ORDER BY assignment_kind, member_role, at DESC, id DESC \
+             ) \
+             SELECT assignment_kind, member_role \
+             FROM latest \
+             WHERE action = 'grant'",
+        )
+        .bind(user_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        let mut assignments = Vec::with_capacity(rows.len());
+        for row in rows {
+            let assignment_kind: String = row.try_get("assignment_kind").map_err(database_error)?;
+            match assignment_kind.as_str() {
+                "administrator" => assignments.push(BrowserRbacAssignment::Administrator),
+                "member_role" => {
+                    let member_role: String = row.try_get("member_role").map_err(database_error)?;
+                    if !is_valid_member_role(&member_role) {
+                        return Err(StoreError::InvalidBrowserRbacRecord);
+                    }
+                    assignments.push(BrowserRbacAssignment::MemberRole(member_role));
+                }
+                _ => return Err(StoreError::InvalidBrowserRbacRecord),
+            }
+        }
+        Ok(BrowserRbacAssignments::from_active_assignments(assignments))
+    }
+
+    /// Append an audited local RBAC grant or revocation. Existing events are immutable; an
+    /// operator revokes authority by appending a new revocation event instead of editing history.
+    pub async fn append_browser_rbac_assignment(
+        &self,
+        change: BrowserRbacAssignmentChange<'_>,
+    ) -> Result<(), StoreError> {
+        if change.actor.trim().is_empty() {
+            return Err(StoreError::InvalidBrowserRbacActor);
+        }
+        let (assignment_kind, member_role) = match change.assignment {
+            BrowserRbacAssignment::Administrator => ("administrator", None),
+            BrowserRbacAssignment::MemberRole(member_role) if is_valid_member_role(member_role) => {
+                ("member_role", Some(member_role))
+            }
+            BrowserRbacAssignment::MemberRole(_) => {
+                return Err(StoreError::InvalidBrowserRbacAssignment);
+            }
+        };
+        sqlx::query(
+            "INSERT INTO browser_rbac_assignment_events \
+             (id, user_id, assignment_kind, member_role, action, actor) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(change.user_id.as_str())
+        .bind(assignment_kind)
+        .bind(member_role)
+        .bind(change.action.as_str())
+        .bind(change.actor)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(())
     }
 
     /// Resolve only an already-reviewed exact issuer/subject/organization mapping.
@@ -525,6 +700,367 @@ impl PgStore {
             })
         })
         .transpose()
+    }
+
+    pub async fn agent_runs(&self, query: &AgentRunQuery) -> Result<AgentRunPage, StoreError> {
+        if query.limit == 0 || query.limit > 100 {
+            return Err(StoreError::InvalidRunQuery);
+        }
+        if query
+            .workflow
+            .as_deref()
+            .is_some_and(|workflow| workflow.is_empty())
+        {
+            return Err(StoreError::InvalidRunQuery);
+        }
+        if query
+            .runtime_uid
+            .as_deref()
+            .is_some_and(|runtime_uid| runtime_uid.is_empty())
+        {
+            return Err(StoreError::InvalidRunQuery);
+        }
+        if let Some(cursor) = query.cursor {
+            let mut cursor_exists = QueryBuilder::<Postgres>::new(
+                "SELECT EXISTS(SELECT 1 FROM task_submissions WHERE task_uid = ",
+            );
+            cursor_exists.push_bind(cursor);
+            if let Some(owner_user_id) = query.owner_user_id.as_deref() {
+                cursor_exists.push(" AND owner_user_id = ");
+                cursor_exists.push_bind(owner_user_id);
+            }
+            cursor_exists.push(")");
+            let exists = cursor_exists
+                .build_query_scalar::<bool>()
+                .fetch_one(&self.pool)
+                .await
+                .map_err(database_error)?;
+            if !exists {
+                return Err(StoreError::InvalidRunCursor);
+            }
+        }
+
+        let mut statement = QueryBuilder::<Postgres>::new(AGENT_RUN_SELECT);
+        statement.push(" WHERE true");
+        if let Some(cursor) = query.cursor {
+            statement.push(
+                " AND (tasks.created_at, tasks.task_uid) < \
+                 (SELECT created_at, task_uid FROM task_submissions WHERE task_uid = ",
+            );
+            statement.push_bind(cursor);
+            statement.push(")");
+        }
+        if let Some(phase) = query.phase {
+            statement.push(" AND tasks.phase = ");
+            statement.push_bind(task_phase_text(phase));
+        }
+        if let Some(workflow) = query.workflow.as_deref() {
+            statement.push(" AND tasks.workflow = ");
+            statement.push_bind(workflow);
+        }
+        if let Some(owner_user_id) = query.owner_user_id.as_deref() {
+            statement.push(" AND tasks.owner_user_id = ");
+            statement.push_bind(owner_user_id);
+        }
+        if let Some(runtime_uid) = query.runtime_uid.as_deref() {
+            statement.push(" AND tasks.runtime_uid = ");
+            statement.push_bind(runtime_uid);
+        }
+        if let Some(task_uid) = query.task_uid {
+            statement.push(" AND tasks.task_uid = ");
+            statement.push_bind(task_uid);
+        }
+        statement.push(" ORDER BY tasks.created_at DESC, tasks.task_uid DESC LIMIT ");
+        statement.push_bind(i64::from(query.limit) + 1);
+
+        let mut records = statement
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .map(agent_run_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_cursor = if records.len() > query.limit as usize {
+            records.truncate(query.limit as usize);
+            records.last().map(|record| record.task_uid)
+        } else {
+            None
+        };
+        Ok(AgentRunPage {
+            records,
+            next_cursor,
+        })
+    }
+
+    pub async fn agent_run(&self, task_uid: Uuid) -> Result<Option<AgentRunRecord>, StoreError> {
+        let mut statement = QueryBuilder::<Postgres>::new(AGENT_RUN_SELECT);
+        statement.push(" WHERE tasks.task_uid = ");
+        statement.push_bind(task_uid);
+        statement
+            .build()
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?
+            .map(agent_run_record)
+            .transpose()
+    }
+
+    pub async fn agent_run_timeline(
+        &self,
+        task_uid: Uuid,
+    ) -> Result<Option<Vec<AgentRunTimelineEvent>>, StoreError> {
+        if !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM task_submissions WHERE task_uid = $1)",
+        )
+        .bind(task_uid)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?
+        {
+            return Ok(None);
+        }
+        sqlx::query(
+            "SELECT event_kind, phase, provenance, \
+                    to_char(at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS at \
+             FROM task_lifecycle_events \
+             WHERE task_uid = $1 \
+             ORDER BY at, id",
+        )
+        .bind(task_uid)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(agent_run_timeline_event)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+    }
+
+    /// Reserve an immutable user-envelope request under the server-resolved canonical owner.
+    ///
+    /// The initial `pending` event is written in the same transaction as the request. Callers
+    /// may only advance the request through `append_envelope_request_status`; neither the
+    /// browser nor this table ever overwrites a current status.
+    pub async fn reserve_envelope_request(
+        &self,
+        request: EnvelopeRequestReservationRequest<'_>,
+    ) -> Result<EnvelopeRequestReservation, StoreError> {
+        if request.template_id.trim().is_empty() || request.idempotency_key.trim().is_empty() {
+            return Err(StoreError::InvalidEnvelopeRequest);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "envelope-request:{}:{}",
+                request.owner_user_id.as_str(),
+                request.idempotency_key
+            ))
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let existing = sqlx::query(
+            "SELECT id, template_id, template_revision, requested_envelope \
+             FROM envelope_requests \
+             WHERE owner_user_id = $1 AND idempotency_key = $2",
+        )
+        .bind(request.owner_user_id.as_str())
+        .bind(request.idempotency_key)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if let Some(row) = existing {
+            let id: Uuid = row.try_get("id").map_err(database_error)?;
+            let template_id: String = row.try_get("template_id").map_err(database_error)?;
+            let template_revision: i64 =
+                row.try_get("template_revision").map_err(database_error)?;
+            let requested_envelope = row
+                .try_get::<Json<Envelope>, _>("requested_envelope")
+                .map_err(database_error)?
+                .0;
+            if template_id != request.template_id
+                || template_revision != request.template_revision
+                || requested_envelope != *request.requested_envelope
+            {
+                return Err(StoreError::EnvelopeRequestIdempotencyConflict);
+            }
+            transaction.commit().await.map_err(database_error)?;
+            let record = self
+                .envelope_request(request.owner_user_id, id)
+                .await?
+                .ok_or(StoreError::EnvelopeRequestNotFound)?;
+            return Ok(EnvelopeRequestReservation {
+                inserted: false,
+                record,
+            });
+        }
+
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO envelope_requests \
+             (id, owner_user_id, template_id, template_revision, requested_envelope, idempotency_key) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id)
+        .bind(request.owner_user_id.as_str())
+        .bind(request.template_id)
+        .bind(request.template_revision)
+        .bind(Json(request.requested_envelope))
+        .bind(request.idempotency_key)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        sqlx::query(
+            "INSERT INTO envelope_request_events (request_id, status) VALUES ($1, 'pending')",
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        let record = self
+            .envelope_request(request.owner_user_id, id)
+            .await?
+            .ok_or(StoreError::EnvelopeRequestNotFound)?;
+        Ok(EnvelopeRequestReservation {
+            inserted: true,
+            record,
+        })
+    }
+
+    /// Read the current authoritative status derived from the latest immutable event, scoped to
+    /// one canonical owner. An absent/mismatched owner is deliberately indistinguishable.
+    pub async fn envelope_request(
+        &self,
+        owner_user_id: &CanonicalUserId,
+        request_id: Uuid,
+    ) -> Result<Option<EnvelopeRequestRecord>, StoreError> {
+        let mut statement = QueryBuilder::<Postgres>::new(ENVELOPE_REQUEST_COLUMNS);
+        statement.push("WHERE requests.owner_user_id = ");
+        statement.push_bind(owner_user_id.as_str());
+        statement.push(" AND requests.id = ");
+        statement.push_bind(request_id);
+        statement
+            .build()
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?
+            .map(envelope_request_record)
+            .transpose()
+    }
+
+    /// List only the authenticated canonical owner's envelope requests.
+    pub async fn envelope_requests(
+        &self,
+        owner_user_id: &CanonicalUserId,
+    ) -> Result<Vec<EnvelopeRequestRecord>, StoreError> {
+        let mut statement = QueryBuilder::<Postgres>::new(ENVELOPE_REQUEST_COLUMNS);
+        statement.push("WHERE requests.owner_user_id = ");
+        statement.push_bind(owner_user_id.as_str());
+        statement.push(" ORDER BY requests.created_at DESC, requests.id DESC");
+        statement
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .map(envelope_request_record)
+            .collect()
+    }
+
+    /// Append a server-side lifecycle transition after the approval/provisioning authority has
+    /// made its decision. This API never accepts a browser session or caller-supplied owner.
+    pub async fn append_envelope_request_status(
+        &self,
+        request_id: Uuid,
+        update: EnvelopeRequestStatusUpdate<'_>,
+    ) -> Result<EnvelopeRequestRecord, StoreError> {
+        if !valid_envelope_request_transition(update.from, update.to) {
+            return Err(StoreError::InvalidEnvelopeRequestTransition);
+        }
+        if update.to == EnvelopeRequestStatus::Provisioned
+            && (update.envelope_instance_id.is_none() || update.envelope_digest.is_none())
+        {
+            return Err(StoreError::InvalidEnvelopeRequest);
+        }
+        if update.to != EnvelopeRequestStatus::Provisioned
+            && (update.envelope_instance_id.is_some() || update.envelope_digest.is_some())
+        {
+            return Err(StoreError::InvalidEnvelopeRequest);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let latest = sqlx::query(
+            "SELECT status FROM envelope_request_events \
+             WHERE request_id = $1 ORDER BY at DESC, id DESC LIMIT 1 FOR UPDATE",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::EnvelopeRequestNotFound)?;
+        let current = envelope_request_status_from_text(
+            &latest
+                .try_get::<String, _>("status")
+                .map_err(database_error)?,
+        )?;
+        if current != update.from {
+            return Err(StoreError::InvalidEnvelopeRequestTransition);
+        }
+        let requested_envelope =
+            sqlx::query("SELECT requested_envelope FROM envelope_requests WHERE id = $1")
+                .bind(request_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(database_error)?
+                .ok_or(StoreError::EnvelopeRequestNotFound)?
+                .try_get::<Json<Envelope>, _>("requested_envelope")
+                .map_err(database_error)?
+                .0;
+        let needs_snapshot = matches!(
+            update.to,
+            EnvelopeRequestStatus::Approved | EnvelopeRequestStatus::Provisioned
+        );
+        match (needs_snapshot, update.approved_envelope) {
+            (true, Some(approved_envelope))
+                if matches!(
+                    envelope_is_within(approved_envelope, &requested_envelope),
+                    Ok(AdmissionDecision::Admit)
+                ) => {}
+            (false, None) => {}
+            _ => return Err(StoreError::InvalidEnvelopeRequest),
+        }
+        sqlx::query(
+            "INSERT INTO envelope_request_events \
+             (request_id, status, approval_id, envelope_instance_id, envelope_digest, reason, approved_envelope) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(request_id)
+        .bind(update.to.as_str())
+        .bind(update.approval_id)
+        .bind(update.envelope_instance_id)
+        .bind(update.envelope_digest)
+        .bind(update.reason)
+        .bind(update.approved_envelope.map(Json))
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        let row = sqlx::query("SELECT owner_user_id FROM envelope_requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?
+            .ok_or(StoreError::EnvelopeRequestNotFound)?;
+        let owner_user_id = row
+            .try_get::<String, _>("owner_user_id")
+            .map_err(database_error)
+            .and_then(|value| {
+                CanonicalUserId::parse(value)
+                    .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+            })?;
+        self.envelope_request(&owner_user_id, request_id)
+            .await?
+            .ok_or(StoreError::EnvelopeRequestNotFound)
     }
 
     pub async fn insert_envelope(
@@ -1651,9 +2187,9 @@ impl PgStore {
              (task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, \
               owner, owner_user_id, identity_binding_state, workflow, \
               coding_agent_runtime, runtime_namespace, runtime_name, runtime_ownership, phase, \
-              runtime_spec, agent_command) \
+              runtime_spec, agent_command, envelope_revision) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, $12, \
-                     'submitted', $13, $14) \
+                     'submitted', $13, $14, $15) \
              ON CONFLICT DO NOTHING",
         )
         .bind(task_uid)
@@ -1670,6 +2206,7 @@ impl PgStore {
         .bind(ownership_text(request.runtime_ownership))
         .bind(Json(request.runtime_spec))
         .bind(Json(request.agent_command))
+        .bind(request.envelope_revision)
         .execute(&self.pool)
         .await
         .map_err(database_error)?
@@ -1987,6 +2524,144 @@ pub struct TaskReservationRequest<'a> {
     pub runtime_ownership: steward_types::RuntimeOwnership,
     pub runtime_spec: &'a AgentRuntimeSpec,
     pub agent_command: &'a [String],
+    pub envelope_revision: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRunQuery {
+    pub limit: u16,
+    pub cursor: Option<Uuid>,
+    pub phase: Option<steward_types::TaskPhase>,
+    pub workflow: Option<String>,
+    /// Exact server-derived canonical owner scope. `None` is reserved for administrator reads.
+    pub owner_user_id: Option<String>,
+    /// Exact runtime binding, used for an envelope's run history.
+    pub runtime_uid: Option<String>,
+    /// Exact durable task identity, used for a single run detail read.
+    pub task_uid: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentRunPage {
+    pub records: Vec<AgentRunRecord>,
+    pub next_cursor: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentRunRecord {
+    pub task_uid: Uuid,
+    pub submitter_service: String,
+    pub acting_user: Option<String>,
+    pub owner: String,
+    pub owner_user_id: Option<String>,
+    pub workflow: String,
+    pub coding_agent_runtime: String,
+    pub runtime_uid: Option<String>,
+    pub runtime_ownership: steward_types::RuntimeOwnership,
+    pub phase: steward_types::TaskPhase,
+    pub runtime_spec: AgentRuntimeSpec,
+    pub envelope_revision: Option<i64>,
+    pub finalize_requested: bool,
+    pub finalized: bool,
+    pub failure_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub spend: Option<AgentRunSpend>,
+    pub history_partial: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRunSpend {
+    pub observed_amount: String,
+    pub currency: String,
+    pub exhausted: bool,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentRunTimelineKind {
+    Phase(steward_types::TaskPhase),
+    FinalizationRequested,
+    Finalized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentRunTimelineProvenance {
+    Recorded,
+    Backfilled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRunTimelineEvent {
+    pub kind: AgentRunTimelineKind,
+    pub provenance: AgentRunTimelineProvenance,
+    pub at: String,
+}
+
+/// User-visible status derived from the latest append-only request event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnvelopeRequestStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Provisioned,
+    Stale,
+    Conflict,
+}
+
+impl EnvelopeRequestStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Provisioned => "provisioned",
+            Self::Stale => "stale",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
+/// Immutable request fact plus its latest server-authoritative status event.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvelopeRequestRecord {
+    pub id: Uuid,
+    pub owner_user_id: CanonicalUserId,
+    pub template_id: String,
+    pub template_revision: i64,
+    pub requested_envelope: Envelope,
+    pub approved_envelope: Option<Envelope>,
+    pub status: EnvelopeRequestStatus,
+    pub approval_id: Option<Uuid>,
+    pub envelope_instance_id: Option<String>,
+    pub envelope_digest: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub status_at: String,
+}
+
+pub struct EnvelopeRequestReservationRequest<'a> {
+    pub owner_user_id: &'a CanonicalUserId,
+    pub template_id: &'a str,
+    pub template_revision: i64,
+    pub requested_envelope: &'a Envelope,
+    pub idempotency_key: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvelopeRequestReservation {
+    pub inserted: bool,
+    pub record: EnvelopeRequestRecord,
+}
+
+pub struct EnvelopeRequestStatusUpdate<'a> {
+    pub from: EnvelopeRequestStatus,
+    pub to: EnvelopeRequestStatus,
+    pub approval_id: Option<Uuid>,
+    pub envelope_instance_id: Option<&'a str>,
+    pub envelope_digest: Option<&'a str>,
+    pub reason: Option<&'a str>,
+    pub approved_envelope: Option<&'a Envelope>,
 }
 
 fn validate_task_identity_binding(request: &TaskReservationRequest<'_>) -> Result<(), StoreError> {
@@ -2170,6 +2845,9 @@ pub enum StoreError {
     CanonicalIdentityConflict,
     CanonicalIdentityInvalidActor,
     CanonicalIdentityInvalidRecord,
+    InvalidBrowserRbacActor,
+    InvalidBrowserRbacAssignment,
+    InvalidBrowserRbacRecord,
     ApprovalNotFound,
     ApprovalNotPending,
     MissingDecisionReference,
@@ -2185,6 +2863,12 @@ pub enum StoreError {
     TaskIdempotencyConflict,
     InvalidTaskIdentityBinding,
     InvalidTaskTransition,
+    InvalidRunQuery,
+    InvalidRunCursor,
+    EnvelopeRequestNotFound,
+    EnvelopeRequestIdempotencyConflict,
+    InvalidEnvelopeRequest,
+    InvalidEnvelopeRequestTransition,
 }
 
 impl fmt::Display for StoreError {
@@ -2219,6 +2903,15 @@ impl fmt::Display for StoreError {
             }
             Self::CanonicalIdentityInvalidRecord => {
                 write!(formatter, "canonical identity record is invalid")
+            }
+            Self::InvalidBrowserRbacActor => {
+                write!(formatter, "browser RBAC actor is required")
+            }
+            Self::InvalidBrowserRbacAssignment => {
+                write!(formatter, "browser RBAC assignment is invalid")
+            }
+            Self::InvalidBrowserRbacRecord => {
+                write!(formatter, "browser RBAC record is invalid")
             }
             Self::ApprovalNotFound => write!(formatter, "approval does not exist"),
             Self::ApprovalNotPending => write!(formatter, "approval is not pending"),
@@ -2267,6 +2960,19 @@ impl fmt::Display for StoreError {
             }
             Self::InvalidTaskTransition => {
                 write!(formatter, "task lifecycle transition is invalid")
+            }
+            Self::InvalidRunQuery => write!(formatter, "agent-run query is invalid"),
+            Self::InvalidRunCursor => write!(formatter, "agent-run cursor is invalid"),
+            Self::EnvelopeRequestNotFound => write!(formatter, "envelope request does not exist"),
+            Self::EnvelopeRequestIdempotencyConflict => {
+                write!(
+                    formatter,
+                    "idempotency key is already bound to another envelope request"
+                )
+            }
+            Self::InvalidEnvelopeRequest => write!(formatter, "envelope request is invalid"),
+            Self::InvalidEnvelopeRequestTransition => {
+                write!(formatter, "envelope request transition is invalid")
             }
         }
     }
@@ -2335,29 +3041,8 @@ fn canonical_principal_from_row(
 }
 
 fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
-    let runtime_ownership = match row
-        .try_get::<String, _>("runtime_ownership")
-        .map_err(database_error)?
-        .as_str()
-    {
-        "provisioned" => steward_types::RuntimeOwnership::Provisioned,
-        "adopted" => steward_types::RuntimeOwnership::Adopted,
-        _ => return Err(StoreError::InvalidTaskTransition),
-    };
-    let phase = match row
-        .try_get::<String, _>("phase")
-        .map_err(database_error)?
-        .as_str()
-    {
-        "submitted" => steward_types::TaskPhase::Submitted,
-        "parked" => steward_types::TaskPhase::Parked,
-        "queued" => steward_types::TaskPhase::Queued,
-        "running" => steward_types::TaskPhase::Running,
-        "succeeded" => steward_types::TaskPhase::Succeeded,
-        "failed" => steward_types::TaskPhase::Failed,
-        "cancelled" => steward_types::TaskPhase::Cancelled,
-        _ => return Err(StoreError::InvalidTaskTransition),
-    };
+    let runtime_ownership = runtime_ownership_from_row(&row)?;
+    let phase = task_phase_from_row(&row, "phase")?;
     Ok(TaskRecord {
         task_uid: row.try_get("task_uid").map_err(database_error)?,
         idempotency_key: row.try_get("idempotency_key").map_err(database_error)?,
@@ -2393,6 +3078,240 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
         finalized: row.try_get("finalized").map_err(database_error)?,
         failure_reason: row.try_get("failure_reason").map_err(database_error)?,
     })
+}
+
+const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, tasks.acting_user, tasks.owner, tasks.owner_user_id, \
+            tasks.workflow, tasks.coding_agent_runtime, tasks.runtime_uid, \
+            tasks.runtime_ownership, tasks.phase, tasks.runtime_spec, \
+            tasks.envelope_revision, tasks.finalize_requested, tasks.finalized, \
+            tasks.failure_reason, \
+            to_char(tasks.created_at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+            to_char(tasks.updated_at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at, \
+            spend.observed_amount, spend.currency, spend.exhausted, spend.observed_at, \
+            EXISTS ( \
+                SELECT 1 FROM task_lifecycle_events history \
+                WHERE history.task_uid = tasks.task_uid \
+                  AND history.provenance = 'backfilled' \
+            ) AS history_partial \
+     FROM task_submissions tasks \
+     LEFT JOIN LATERAL ( \
+         SELECT observation.observed_amount::text AS observed_amount, \
+                observation.currency, observation.exhausted, \
+                to_char(observation.at AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS observed_at \
+         FROM spend_observations observation \
+         WHERE observation.runtime_uid = tasks.runtime_uid \
+         ORDER BY observation.at DESC, observation.id DESC \
+         LIMIT 1 \
+     ) spend ON true";
+
+const ENVELOPE_REQUEST_COLUMNS: &str = "SELECT requests.id, requests.owner_user_id, requests.template_id, \
+            requests.template_revision, requests.requested_envelope, \
+            status.status, status.approval_id, status.envelope_instance_id, \
+            status.envelope_digest, status.reason, status.approved_envelope, \
+            to_char(requests.created_at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+            to_char(status.at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS status_at \
+     FROM envelope_requests requests \
+     JOIN LATERAL ( \
+         SELECT events.status, events.approval_id, events.envelope_instance_id, \
+                events.envelope_digest, events.reason, events.approved_envelope, events.at \
+         FROM envelope_request_events events \
+         WHERE events.request_id = requests.id \
+         ORDER BY events.at DESC, events.id DESC \
+         LIMIT 1 \
+     ) status ON true ";
+
+fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreError> {
+    let observed_amount = row
+        .try_get::<Option<String>, _>("observed_amount")
+        .map_err(database_error)?;
+    let spend = observed_amount
+        .map(|observed_amount| {
+            Ok(AgentRunSpend {
+                observed_amount,
+                currency: row.try_get("currency").map_err(database_error)?,
+                exhausted: row.try_get("exhausted").map_err(database_error)?,
+                observed_at: row.try_get("observed_at").map_err(database_error)?,
+            })
+        })
+        .transpose()?;
+    Ok(AgentRunRecord {
+        task_uid: row.try_get("task_uid").map_err(database_error)?,
+        submitter_service: row.try_get("submitter_service").map_err(database_error)?,
+        acting_user: row.try_get("acting_user").map_err(database_error)?,
+        owner: row.try_get("owner").map_err(database_error)?,
+        owner_user_id: row.try_get("owner_user_id").map_err(database_error)?,
+        workflow: row.try_get("workflow").map_err(database_error)?,
+        coding_agent_runtime: row
+            .try_get("coding_agent_runtime")
+            .map_err(database_error)?,
+        runtime_uid: row.try_get("runtime_uid").map_err(database_error)?,
+        runtime_ownership: runtime_ownership_from_row(&row)?,
+        phase: task_phase_from_row(&row, "phase")?,
+        runtime_spec: row
+            .try_get::<Json<AgentRuntimeSpec>, _>("runtime_spec")
+            .map_err(database_error)?
+            .0,
+        envelope_revision: row.try_get("envelope_revision").map_err(database_error)?,
+        finalize_requested: row.try_get("finalize_requested").map_err(database_error)?,
+        finalized: row.try_get("finalized").map_err(database_error)?,
+        failure_reason: row.try_get("failure_reason").map_err(database_error)?,
+        created_at: row.try_get("created_at").map_err(database_error)?,
+        updated_at: row.try_get("updated_at").map_err(database_error)?,
+        spend,
+        history_partial: row.try_get("history_partial").map_err(database_error)?,
+    })
+}
+
+fn agent_run_timeline_event(
+    row: sqlx::postgres::PgRow,
+) -> Result<AgentRunTimelineEvent, StoreError> {
+    let kind = match row
+        .try_get::<String, _>("event_kind")
+        .map_err(database_error)?
+        .as_str()
+    {
+        "phase" => AgentRunTimelineKind::Phase(task_phase_from_row(&row, "phase")?),
+        "finalization_requested" => AgentRunTimelineKind::FinalizationRequested,
+        "finalized" => AgentRunTimelineKind::Finalized,
+        _ => return Err(StoreError::InvalidTaskTransition),
+    };
+    let provenance = match row
+        .try_get::<String, _>("provenance")
+        .map_err(database_error)?
+        .as_str()
+    {
+        "recorded" => AgentRunTimelineProvenance::Recorded,
+        "backfilled" => AgentRunTimelineProvenance::Backfilled,
+        _ => return Err(StoreError::InvalidTaskTransition),
+    };
+    Ok(AgentRunTimelineEvent {
+        kind,
+        provenance,
+        at: row.try_get("at").map_err(database_error)?,
+    })
+}
+
+fn envelope_request_record(
+    row: sqlx::postgres::PgRow,
+) -> Result<EnvelopeRequestRecord, StoreError> {
+    let owner_user_id = row
+        .try_get::<String, _>("owner_user_id")
+        .map_err(database_error)
+        .and_then(|value| {
+            CanonicalUserId::parse(value).map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+        })?;
+    let status = envelope_request_status_from_text(
+        &row.try_get::<String, _>("status").map_err(database_error)?,
+    )?;
+    Ok(EnvelopeRequestRecord {
+        id: row.try_get("id").map_err(database_error)?,
+        owner_user_id,
+        template_id: row.try_get("template_id").map_err(database_error)?,
+        template_revision: row.try_get("template_revision").map_err(database_error)?,
+        requested_envelope: row
+            .try_get::<Json<Envelope>, _>("requested_envelope")
+            .map_err(database_error)?
+            .0,
+        approved_envelope: row
+            .try_get::<Option<Json<Envelope>>, _>("approved_envelope")
+            .map_err(database_error)?
+            .map(|value| value.0),
+        status,
+        approval_id: row.try_get("approval_id").map_err(database_error)?,
+        envelope_instance_id: row
+            .try_get("envelope_instance_id")
+            .map_err(database_error)?,
+        envelope_digest: row.try_get("envelope_digest").map_err(database_error)?,
+        reason: row.try_get("reason").map_err(database_error)?,
+        created_at: row.try_get("created_at").map_err(database_error)?,
+        status_at: row.try_get("status_at").map_err(database_error)?,
+    })
+}
+
+fn envelope_request_status_from_text(value: &str) -> Result<EnvelopeRequestStatus, StoreError> {
+    match value {
+        "pending" => Ok(EnvelopeRequestStatus::Pending),
+        "approved" => Ok(EnvelopeRequestStatus::Approved),
+        "rejected" => Ok(EnvelopeRequestStatus::Rejected),
+        "provisioned" => Ok(EnvelopeRequestStatus::Provisioned),
+        "stale" => Ok(EnvelopeRequestStatus::Stale),
+        "conflict" => Ok(EnvelopeRequestStatus::Conflict),
+        _ => Err(StoreError::InvalidEnvelopeRequestTransition),
+    }
+}
+
+const fn valid_envelope_request_transition(
+    from: EnvelopeRequestStatus,
+    to: EnvelopeRequestStatus,
+) -> bool {
+    matches!(
+        (from, to),
+        (
+            EnvelopeRequestStatus::Pending,
+            EnvelopeRequestStatus::Approved
+        ) | (
+            EnvelopeRequestStatus::Pending,
+            EnvelopeRequestStatus::Rejected
+        ) | (
+            EnvelopeRequestStatus::Pending,
+            EnvelopeRequestStatus::Provisioned
+        ) | (EnvelopeRequestStatus::Pending, EnvelopeRequestStatus::Stale)
+            | (
+                EnvelopeRequestStatus::Pending,
+                EnvelopeRequestStatus::Conflict
+            )
+            | (
+                EnvelopeRequestStatus::Approved,
+                EnvelopeRequestStatus::Provisioned
+            )
+            | (
+                EnvelopeRequestStatus::Approved,
+                EnvelopeRequestStatus::Stale
+            )
+            | (
+                EnvelopeRequestStatus::Approved,
+                EnvelopeRequestStatus::Conflict
+            )
+    )
+}
+
+fn runtime_ownership_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<steward_types::RuntimeOwnership, StoreError> {
+    match row
+        .try_get::<String, _>("runtime_ownership")
+        .map_err(database_error)?
+        .as_str()
+    {
+        "provisioned" => Ok(steward_types::RuntimeOwnership::Provisioned),
+        "adopted" => Ok(steward_types::RuntimeOwnership::Adopted),
+        _ => Err(StoreError::InvalidTaskTransition),
+    }
+}
+
+fn task_phase_from_row(
+    row: &sqlx::postgres::PgRow,
+    column: &str,
+) -> Result<steward_types::TaskPhase, StoreError> {
+    match row
+        .try_get::<String, _>(column)
+        .map_err(database_error)?
+        .as_str()
+    {
+        "submitted" => Ok(steward_types::TaskPhase::Submitted),
+        "parked" => Ok(steward_types::TaskPhase::Parked),
+        "queued" => Ok(steward_types::TaskPhase::Queued),
+        "running" => Ok(steward_types::TaskPhase::Running),
+        "succeeded" => Ok(steward_types::TaskPhase::Succeeded),
+        "failed" => Ok(steward_types::TaskPhase::Failed),
+        "cancelled" => Ok(steward_types::TaskPhase::Cancelled),
+        _ => Err(StoreError::InvalidTaskTransition),
+    }
 }
 
 const fn ownership_text(ownership: steward_types::RuntimeOwnership) -> &'static str {
@@ -2453,5 +3372,9 @@ fn grant_dimension(delta: &AdmissionDelta) -> &'static str {
         AdmissionDelta::Ttl { .. } => "ttl",
         AdmissionDelta::Models { .. } => "models",
         AdmissionDelta::Tools { .. } => "tools",
+        AdmissionDelta::RunnerPlatforms { .. } => "runner-platforms",
+        AdmissionDelta::RunnerMemory { .. } => "runner-memory",
+        AdmissionDelta::RunnerCompute { .. } => "runner-compute",
+        AdmissionDelta::RunnerStorage { .. } => "runner-storage",
     }
 }

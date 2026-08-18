@@ -250,6 +250,7 @@ impl BrowserIdentityResolver for FastTrackIdentityResolver {
                 canonical_user_id: self.canonical_user_id.clone(),
                 display_email: self.compatibility_email.clone(),
                 role: BrowserRole::User,
+                member_roles: Vec::new(),
             })
         })
     }

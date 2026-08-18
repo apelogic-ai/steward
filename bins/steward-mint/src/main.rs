@@ -224,8 +224,8 @@ mod tests {
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
-        CanonicalAuthorityBinding, CanonicalUserId, Duration, Email, Phase, Principal, RuntimeId,
-        RuntimeRefs, ToolGrant,
+        CanonicalAuthorityBinding, CanonicalUserId, Duration, Email, Phase, Principal,
+        RunnerRequirements, RuntimeId, RuntimeRefs, ToolGrant,
     };
 
     use super::{
@@ -256,6 +256,7 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("1h".to_owned()),
+                runner: RunnerRequirements::default(),
                 bindings: None,
             },
         );

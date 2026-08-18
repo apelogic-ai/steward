@@ -129,6 +129,7 @@ pub enum ConnectionBrokerError {
     FastTrackUnavailable(FastTrackBffFailureStage),
 }
 
+/// Fixed diagnostic stages exposed only by the non-promotable attended preview.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FastTrackBffFailureStage {
     LifetimeExpired,
@@ -610,39 +611,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_track_status_failure_exposes_only_a_fixed_stage_header() -> Result<(), String> {
-        let broker = FakeBroker::default();
-        broker
-            .state
-            .lock()
-            .map_err(|_| "lock fake broker")?
-            .fast_track_stage = Some(FastTrackBffFailureStage::BridgeTransport);
-        let response = router(broker)
-            .layer(axum::Extension(session()?))
-            .oneshot(
-                Request::builder()
-                    .uri("/admin/api/v1/connections/github")
-                    .body(Body::empty())
-                    .map_err(|error| format!("build diagnostic status request: {error}"))?,
-            )
-            .await
-            .map_err(|error| format!("request diagnostic connection status: {error}"))?;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            response.headers().get("x-steward-fast-track-bff-stage"),
-            Some(&header::HeaderValue::from_static("bridge_transport"))
-        );
-        let body = to_bytes(response.into_body(), 16 * 1024)
-            .await
-            .map_err(|error| format!("read diagnostic status body: {error}"))?;
-        let value: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|error| format!("parse diagnostic status body: {error}"))?;
-        assert_eq!(value["status"]["phase"], "unavailable");
-        assert!(!String::from_utf8_lossy(&body).contains("bridge_transport"));
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn start_requires_authenticated_session_and_mutation_proof_and_returns_only_one_time_url()
     -> Result<(), String> {
         let broker = FakeBroker::default();
@@ -851,6 +819,39 @@ mod tests {
         for forbidden in ["alice@example.com", "usr_", "session-a", "token", "secret"] {
             assert!(!serialized.contains(forbidden));
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fast_track_status_failure_exposes_only_a_fixed_stage_header() -> Result<(), String> {
+        let broker = FakeBroker::default();
+        broker
+            .state
+            .lock()
+            .map_err(|_| "lock fake broker")?
+            .fast_track_stage = Some(FastTrackBffFailureStage::BridgeTransport);
+        let response = router(broker)
+            .layer(axum::Extension(session()?))
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/connections/github")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build diagnostic status request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request diagnostic connection status: {error}"))?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get("x-steward-fast-track-bff-stage"),
+            Some(&header::HeaderValue::from_static("bridge_transport"))
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read diagnostic status body: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse diagnostic status body: {error}"))?;
+        assert_eq!(value["status"]["phase"], "unavailable");
+        assert!(!String::from_utf8_lossy(&body).contains("bridge_transport"));
         Ok(())
     }
 }

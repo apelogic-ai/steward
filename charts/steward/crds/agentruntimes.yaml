@@ -103,6 +103,37 @@ spec:
                   rule: >-
                     (self.kind == 'user' && has(self.actingUser) && !has(self.name)) || (self.kind
                     == 'service' && has(self.name))
+              runner:
+                default: {}
+                properties:
+                  compute:
+                    description: |-
+                      A Kubernetes resource quantity. Admission validates the supported unit family for each
+                      resource dimension before it becomes authority.
+                    nullable: true
+                    type: string
+                  memory:
+                    description: |-
+                      A Kubernetes resource quantity. Admission validates the supported unit family for each
+                      resource dimension before it becomes authority.
+                    nullable: true
+                    type: string
+                  platforms:
+                    items:
+                      description: Canonical platform names accepted by the governed runner contract.
+                      enum:
+                      - linux
+                      - mac
+                      - windows
+                      type: string
+                    type: array
+                  storage:
+                    description: |-
+                      A Kubernetes resource quantity. Admission validates the supported unit family for each
+                      resource dimension before it becomes authority.
+                    nullable: true
+                    type: string
+                type: object
               tools:
                 items:
                   properties:

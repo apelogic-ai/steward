@@ -3486,6 +3486,7 @@ dependencies = [
  "kube",
  "reqwest",
  "serde",
+ "serde-saphyr",
  "serde_json",
  "sha2",
  "steward-admission",
@@ -3507,6 +3508,7 @@ dependencies = [
  "steward-adapter-jira",
  "steward-apiserver",
  "steward-store",
+ "steward-types",
  "tokio",
  "tokio-rustls",
 ]

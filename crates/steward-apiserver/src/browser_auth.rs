@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
-use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -15,7 +14,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use steward_store::{PgStore, StoreError};
+use steward_store::{BrowserRbacAssignments, PgStore, StoreError};
 use steward_types::{
     CanonicalUserId, Email, GOOGLE_ORGANIZATION_ISSUER, OrganizationId, OrganizationIdentity,
     OrganizationIdentityPolicy,
@@ -175,6 +174,7 @@ pub struct BrowserPrincipal {
     pub canonical_user_id: CanonicalUserId,
     pub display_email: Email,
     pub role: BrowserRole,
+    pub member_roles: Vec<String>,
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -282,15 +282,11 @@ pub trait BrowserIdentityResolver: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct PgBrowserIdentityResolver {
     store: PgStore,
-    admin_user_ids: HashSet<CanonicalUserId>,
 }
 
 impl PgBrowserIdentityResolver {
-    pub fn new(store: PgStore, admin_user_ids: HashSet<CanonicalUserId>) -> Self {
-        Self {
-            store,
-            admin_user_ids,
-        }
+    pub fn new(store: PgStore) -> Self {
+        Self { store }
     }
 }
 
@@ -309,17 +305,29 @@ impl BrowserIdentityResolver for PgBrowserIdentityResolver {
                     .map_err(map_store_error)?,
                 Err(error) => return Err(map_store_error(error)),
             };
-            let role = if self.admin_user_ids.contains(&principal.user_id) {
-                BrowserRole::Admin
-            } else {
-                BrowserRole::User
-            };
-            Ok(BrowserPrincipal {
-                canonical_user_id: principal.user_id,
-                display_email: principal.display_email,
-                role,
-            })
+            let assignments = self
+                .store
+                .browser_rbac_assignments(&principal.user_id)
+                .await
+                .map_err(map_store_error)?;
+            Ok(browser_principal_from_assignments(principal, assignments))
         })
+    }
+}
+
+fn browser_principal_from_assignments(
+    principal: steward_types::CanonicalPrincipal,
+    assignments: BrowserRbacAssignments,
+) -> BrowserPrincipal {
+    BrowserPrincipal {
+        canonical_user_id: principal.user_id,
+        display_email: principal.display_email,
+        role: if assignments.is_admin {
+            BrowserRole::Admin
+        } else {
+            BrowserRole::User
+        },
+        member_roles: assignments.member_roles,
     }
 }
 
@@ -577,6 +585,11 @@ impl BrowserIdentityResolver for LocalFakeIdentityResolver {
                     .map_err(|_| BrowserAuthFailure::IdentityUnavailable)?,
                 display_email: identity.verified_email().clone(),
                 role,
+                member_roles: if role == BrowserRole::Admin {
+                    vec!["developer".to_owned()]
+                } else {
+                    Vec::new()
+                },
             })
         })
     }
@@ -595,7 +608,7 @@ pub fn local_fake_browser_auth_service(
 }
 
 pub fn browser_auth_router(service: BrowserAuthService) -> Router {
-    Router::new()
+    let auth = Router::new()
         .route("/admin/sign-in", get(sign_in))
         .route("/admin/session-ready", get(session_ready))
         .route("/admin/auth/login", get(login))
@@ -607,7 +620,15 @@ pub fn browser_auth_router(service: BrowserAuthService) -> Router {
         .route_layer(middleware::from_fn(
             crate::admin_ui::add_browser_security_headers,
         ))
-        .with_state(service)
+        .with_state(service.clone());
+    auth.merge(protect_browser_routes(
+        crate::user_ui::router::<()>(),
+        service.clone(),
+    ))
+    .merge(protect_browser_admin_routes(
+        crate::user_ui::admin_router::<()>(),
+        service,
+    ))
 }
 
 pub fn protect_browser_routes(routes: Router, service: BrowserAuthService) -> Router {
@@ -643,7 +664,7 @@ struct LoginQuery {
 }
 
 fn default_return_to() -> String {
-    "/admin/connections".to_owned()
+    "/envelopes".to_owned()
 }
 
 async fn login(
@@ -670,28 +691,17 @@ async fn login(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CallbackQuery {
     code: String,
     state: String,
-    iss: Option<String>,
 }
 
 async fn callback(
     State(service): State<BrowserAuthService>,
-    query: Result<Query<CallbackQuery>, QueryRejection>,
+    Query(query): Query<CallbackQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(_) => return BrowserAuthFailure::InvalidRequest.into_response(),
-    };
-    if query
-        .iss
-        .as_deref()
-        .is_some_and(|issuer| issuer != GOOGLE_ORGANIZATION_ISSUER)
-    {
-        return BrowserAuthFailure::InvalidIdentity.into_response();
-    }
     let Some(flow_id) = cookie_value(&headers, service.config.flow_cookie) else {
         return BrowserAuthFailure::InvalidFlow.into_response();
     };
@@ -770,6 +780,7 @@ struct SessionResponse<'a> {
     api_version: &'static str,
     principal: SessionPrincipalResponse<'a>,
     role: BrowserRole,
+    member_roles: &'a [String],
     surfaces: &'static [&'static str],
     csrf: &'a str,
 }
@@ -797,6 +808,7 @@ async fn session(State(service): State<BrowserAuthService>, headers: HeaderMap) 
             display_email: &session.principal.display_email,
         },
         role: session.principal.role,
+        member_roles: &session.principal.member_roles,
         surfaces,
         csrf: &session.csrf,
     })
@@ -878,13 +890,7 @@ async fn authenticate_browser_request(
 ) -> Response {
     let session = match resolve_session(&service, request.headers()) {
         Ok(session) => session,
-        Err(error) => {
-            #[cfg(feature = "admin-demo")]
-            if request.method() == Method::GET && request.uri().path() == "/admin/connections" {
-                return Redirect::to("/admin/sign-in").into_response();
-            }
-            return error.into_response();
-        }
+        Err(error) => return error.into_response(),
     };
     if require_admin && session.principal.role != BrowserRole::Admin {
         return BrowserAuthFailure::InsufficientAuthority.into_response();
@@ -1062,7 +1068,19 @@ struct PendingAuthorization {
 
 impl PendingAuthorization {
     fn new(return_to: &str, now: u64) -> Result<Self, BrowserAuthError> {
-        if !matches!(return_to, "/admin/connections" | "/admin/session-ready") {
+        if !matches!(
+            return_to,
+            "/admin/connections"
+                | "/admin/session-ready"
+                | "/envelopes"
+                | "/envelopes/new"
+                | "/app"
+                | "/app/envelopes"
+                | "/app/envelopes/new"
+                | "/app/runs"
+                | "/runs"
+                | "/settings"
+        ) {
             return Err(BrowserAuthError::InvalidRedirect);
         }
         let pkce_verifier = random_secret();
@@ -1253,6 +1271,7 @@ mod tests {
     use axum::http::{Request, StatusCode, header};
     use axum::routing::post;
     use axum::{Extension, Json, Router};
+    use steward_store::BrowserRbacAssignments;
     use steward_types::{CanonicalUserId, Email, OrganizationId};
     use tower::ServiceExt;
 
@@ -1266,15 +1285,41 @@ mod tests {
     };
 
     #[test]
-    fn sign_in_journey_lands_on_connections_instead_of_the_session_fixture() {
+    fn sign_in_journey_lands_on_the_envelope_workspace_instead_of_a_fixture() {
         assert!(
-            super::SIGN_IN_HTML.contains("returnTo=%2Fadmin%2Fconnections"),
-            "the user-bound credential journey must continue directly to Connections"
+            super::SIGN_IN_HTML.contains("returnTo=%2Fenvelopes"),
+            "the user-bound journey must continue directly to Envelopes"
         );
         assert!(
             !super::SIGN_IN_HTML.contains("returnTo=%2Fadmin%2Fsession-ready"),
             "the sign-in call to action must not strand users on a fixture page"
         );
+    }
+
+    #[test]
+    fn user_workspace_return_paths_are_exactly_allowlisted() {
+        for path in [
+            "/envelopes",
+            "/envelopes/new",
+            "/app",
+            "/app/envelopes",
+            "/app/envelopes/new",
+            "/app/runs",
+            "/runs",
+            "/settings",
+        ] {
+            assert!(
+                PendingAuthorization::new(path, 100).is_ok(),
+                "the authenticated user workspace destination {path} must be a valid login return"
+            );
+        }
+        for path in ["/admin", "/app/unknown", "/app/runs?user=other"] {
+            assert_eq!(
+                PendingAuthorization::new(path, 100),
+                Err(BrowserAuthError::InvalidRedirect),
+                "only exact user workspace routes may be accepted as login returns"
+            );
+        }
     }
 
     fn google_config() -> Result<GoogleOidcConfig, String> {
@@ -1292,7 +1337,22 @@ mod tests {
             canonical_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
             display_email: Email::parse("alice@example.com")?,
             role: BrowserRole::User,
+            member_roles: Vec::new(),
         })
+    }
+
+    #[test]
+    fn local_rbac_default_does_not_turn_a_google_identity_into_an_admin() -> Result<(), String> {
+        let canonical = steward_types::CanonicalPrincipal::new(
+            CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
+            OrganizationId::parse("org_example")?,
+            Email::parse("alice@example.com")?,
+        )?;
+        let principal =
+            super::browser_principal_from_assignments(canonical, BrowserRbacAssignments::default());
+        assert_eq!(principal.role, BrowserRole::User);
+        assert!(principal.member_roles.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -1790,53 +1850,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_accepts_only_the_optional_exact_google_issuer_without_query_leakage()
-    -> Result<(), String> {
-        let (service, flow_cookie, callback_uri) =
-            start_local_flow(LocalFakeIdentity::User).await?;
-        for suffix in [
-            "&iss=",
-            "&iss=https%3A%2F%2Fissuer.example.test",
-            "&iss=https%3A%2F%2Faccounts.google.com&iss=https%3A%2F%2Faccounts.google.com",
-        ] {
-            let response = browser_auth_router(service.clone())
-                .oneshot(
-                    Request::builder()
-                        .uri(format!("{callback_uri}{suffix}"))
-                        .header(header::COOKIE, &flow_cookie)
-                        .body(Body::empty())
-                        .map_err(|error| format!("build rejected callback request: {error}"))?,
-                )
-                .await
-                .map_err(|error| format!("execute rejected callback request: {error}"))?;
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            let body = to_bytes(response.into_body(), 4096)
-                .await
-                .map_err(|error| format!("read rejected callback response: {error}"))?;
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&body)
-                    .map_err(|error| format!("parse rejected callback response: {error}"))?,
-                serde_json::json!({ "error": "browser authentication failed" })
-            );
-        }
-
-        let accepted = browser_auth_router(service)
-            .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "{callback_uri}&iss=https%3A%2F%2Faccounts.google.com&scope=openid%20email&authuser=0&prompt=consent&hd=example.com"
-                    ))
-                    .header(header::COOKIE, flow_cookie)
-                    .body(Body::empty())
-                    .map_err(|error| format!("build accepted callback request: {error}"))?,
-            )
-            .await
-            .map_err(|error| format!("execute accepted callback request: {error}"))?;
-        assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn local_fake_uses_real_callback_session_router_and_rotates_fixation_cookie()
     -> Result<(), String> {
         let (service, flow_cookie, callback_uri) =
@@ -1845,7 +1858,6 @@ mod tests {
             .registry
             .issue(principal()?, super::epoch_seconds())
             .map_err(|error| format!("issue prior session: {error:?}"))?;
-        let callback_uri = format!("{callback_uri}&iss=https%3A%2F%2Faccounts.google.com");
         let callback = browser_auth_router(service.clone())
             .oneshot(
                 Request::builder()
@@ -1862,7 +1874,7 @@ mod tests {
         assert_eq!(callback.status(), StatusCode::SEE_OTHER);
         assert_eq!(
             callback.headers().get(header::LOCATION),
-            Some(&header::HeaderValue::from_static("/admin/connections"))
+            Some(&header::HeaderValue::from_static("/envelopes"))
         );
         let session_cookie = cookie_pair(&callback, "steward-local-session")?;
         assert!(!session_cookie.ends_with(&prior.token));
@@ -1908,6 +1920,7 @@ mod tests {
         assert_eq!(value["apiVersion"], "steward.browser-session/v1");
         assert_eq!(value["principal"]["displayEmail"], "alice@example.com");
         assert_eq!(value["role"], "user");
+        assert_eq!(value["memberRoles"], serde_json::json!([]));
         assert_eq!(value["surfaces"][0], "connections");
         assert!(
             value["csrf"]
@@ -2176,6 +2189,55 @@ mod tests {
             )
             .await
             .map_err(|error| format!("execute administrator browser request: {error}"))?;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn administrator_workspace_is_not_exposed_by_a_developer_session() -> Result<(), String> {
+        let service =
+            local_fake_browser_auth_service("http://127.0.0.1:33001", LocalFakeIdentity::User)?;
+        let user = service
+            .registry
+            .issue(principal()?, super::epoch_seconds())
+            .map_err(|error| format!("issue ordinary browser session: {error:?}"))?;
+        let mut administrator = principal()?;
+        administrator.role = BrowserRole::Admin;
+        administrator.member_roles = vec!["developer".to_owned()];
+        let admin = service
+            .registry
+            .issue(administrator, super::epoch_seconds())
+            .map_err(|error| format!("issue dual-role browser session: {error:?}"))?;
+
+        let routes = || browser_auth_router(service.clone());
+        let forbidden = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/workspace")
+                    .header(
+                        header::COOKIE,
+                        format!("steward-local-session={}", user.token),
+                    )
+                    .body(Body::empty())
+                    .map_err(|error| format!("build developer workspace request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute developer workspace request: {error}"))?;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let accepted = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/workspace")
+                    .header(
+                        header::COOKIE,
+                        format!("steward-local-session={}", admin.token),
+                    )
+                    .body(Body::empty())
+                    .map_err(|error| format!("build administrator workspace request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute administrator workspace request: {error}"))?;
         assert_eq!(accepted.status(), StatusCode::OK);
         Ok(())
     }

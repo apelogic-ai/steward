@@ -16,8 +16,8 @@ use steward_mint::{
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
-    CanonicalAuthorityBinding, CanonicalUserId, Duration, Email, Phase, Principal, RuntimeId,
-    RuntimeRefs, ToolGrant,
+    CanonicalAuthorityBinding, CanonicalUserId, Duration, Email, Phase, Principal,
+    RunnerRequirements, RuntimeId, RuntimeRefs, ToolGrant,
 };
 
 const EMAIL: &str = "alice@example.com";
@@ -98,6 +98,7 @@ fn s5_runtime() -> Result<AgentRuntime, String> {
                 currency: "USD".to_owned(),
             },
             ttl: Duration("1h".to_owned()),
+            runner: RunnerRequirements::default(),
             bindings: None,
         },
     );

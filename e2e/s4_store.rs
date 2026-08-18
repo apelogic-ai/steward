@@ -6,11 +6,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
-use steward_store::{ApproveAdmission, ParkRejection, PgStore, StoreError, TaskReservationRequest};
+use steward_store::{
+    AgentRunQuery, AgentRunTimelineKind, AgentRunTimelineProvenance, ApproveAdmission,
+    BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, ParkRejection,
+    PgStore, StoreError, TaskReservationRequest,
+};
 use steward_types::{
     AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding, Duration, Email, ModelRef,
     OrganizationId, OrganizationIdentity, OrganizationIdentityMigration,
-    OrganizationIdentityPolicy, Principal, RuntimeOwnership, TaskPhase,
+    OrganizationIdentityPolicy, Principal, RunnerRequirements, RuntimeOwnership, SpendSummary,
+    TaskPhase,
 };
 
 fn google_identity(
@@ -66,6 +71,7 @@ fn proposed_spec() -> AgentRuntimeSpec {
             currency: "USD".to_owned(),
         },
         ttl: Duration("24h".to_owned()),
+        runner: RunnerRequirements::default(),
         bindings: None,
     }
 }
@@ -189,6 +195,93 @@ async fn canonical_identity_requires_exact_subject_mapping_and_explicit_reconnec
             .user_id,
         principal.user_id,
         "an explicitly reviewed issuer migration must preserve the opaque user ID"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn browser_rbac_is_canonical_user_scoped_append_only_and_revocable()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the browser RBAC Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let user = store
+        .register_canonical_identity(
+            &google_identity(
+                format!("browser-rbac-user-{suffix}"),
+                format!("browser-rbac-user-{suffix}@example.com"),
+            )?,
+            "identity-admin",
+        )
+        .await?
+        .user_id;
+    let other_user = store
+        .register_canonical_identity(
+            &google_identity(
+                format!("browser-rbac-other-{suffix}"),
+                format!("browser-rbac-other-{suffix}@example.com"),
+            )?,
+            "identity-admin",
+        )
+        .await?
+        .user_id;
+    let administrator = BrowserRbacAssignment::Administrator;
+    let engineer = BrowserRbacAssignment::MemberRole("engineer".to_owned());
+    for assignment in [&administrator, &engineer] {
+        store
+            .append_browser_rbac_assignment(BrowserRbacAssignmentChange {
+                user_id: &user,
+                assignment,
+                action: BrowserRbacAssignmentAction::Grant,
+                actor: "rbac-operator",
+            })
+            .await?;
+    }
+    assert_eq!(
+        store.browser_rbac_assignments(&user).await?.member_roles,
+        ["engineer"],
+        "the canonical user receives only their explicit member-role assignment"
+    );
+    assert!(store.browser_rbac_assignments(&user).await?.is_admin);
+    assert_eq!(
+        store.browser_rbac_assignments(&other_user).await?,
+        Default::default(),
+        "a role event for one canonical user cannot grant another user authority"
+    );
+
+    store
+        .append_browser_rbac_assignment(BrowserRbacAssignmentChange {
+            user_id: &user,
+            assignment: &engineer,
+            action: BrowserRbacAssignmentAction::Revoke,
+            actor: "rbac-operator",
+        })
+        .await?;
+    let after_revoke = store.browser_rbac_assignments(&user).await?;
+    assert!(
+        after_revoke.is_admin,
+        "an unrelated administrator grant remains active"
+    );
+    assert!(after_revoke.member_roles.is_empty());
+    let mutation = sqlx::query(
+        "UPDATE browser_rbac_assignment_events SET actor = 'mutation-attempt' WHERE user_id = $1",
+    )
+    .bind(user.as_str())
+    .execute(store.pool())
+    .await;
+    assert!(
+        mutation.is_err(),
+        "RBAC history must be revoked by an appended event, never modified in place"
     );
     Ok(())
 }
@@ -604,6 +697,7 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         runtime_ownership: RuntimeOwnership::Provisioned,
         runtime_spec: &spec,
         agent_command: &command,
+        envelope_revision: 1,
     };
     let first = store.reserve_task(&request).await?;
     assert!(first.inserted);
@@ -739,6 +833,18 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
     store
         .bind_task_runtime(first.record.task_uid, &runtime_uid, TaskPhase::Submitted)
         .await?;
+    store
+        .record_spend_observation(
+            &runtime_uid,
+            1,
+            "task-read-model-spec",
+            &SpendSummary {
+                observed_amount: "1.25".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            false,
+        )
+        .await?;
     let archive = b"neutral-tar-fixture";
     store
         .put_task_inputs(
@@ -787,6 +893,89 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
             .ok_or_else(|| io::Error::other("finalized task disappeared"))?
             .finalized
     );
+    let page = store
+        .agent_runs(&AgentRunQuery {
+            limit: 10,
+            cursor: None,
+            phase: Some(TaskPhase::Succeeded),
+            workflow: Some("code-review".to_owned()),
+            owner_user_id: None,
+            runtime_uid: None,
+            task_uid: None,
+        })
+        .await?;
+    let read_model = page
+        .records
+        .iter()
+        .find(|record| record.task_uid == first.record.task_uid)
+        .ok_or_else(|| io::Error::other("completed task is absent from Agent Runs"))?;
+    assert_eq!(read_model.envelope_revision, Some(1));
+    assert_eq!(read_model.runtime_spec, spec);
+    assert_eq!(
+        read_model
+            .spend
+            .as_ref()
+            .map(|spend| spend.observed_amount.as_str()),
+        Some("1.25")
+    );
+    assert!(!read_model.history_partial);
+    let owner_scoped = store
+        .agent_runs(&AgentRunQuery {
+            limit: 10,
+            cursor: None,
+            phase: Some(TaskPhase::Succeeded),
+            workflow: Some("code-review".to_owned()),
+            owner_user_id: Some(canonical.user_id.as_str().to_owned()),
+            runtime_uid: None,
+            task_uid: None,
+        })
+        .await?;
+    assert!(
+        owner_scoped
+            .records
+            .iter()
+            .any(|record| record.task_uid == first.record.task_uid),
+        "the canonical owner scope must return the caller's run"
+    );
+    assert_eq!(
+        store
+            .agent_runs(&AgentRunQuery {
+                limit: 10,
+                cursor: Some(first.record.task_uid),
+                phase: None,
+                workflow: None,
+                owner_user_id: Some(other.user_id.as_str().to_owned()),
+                runtime_uid: None,
+                task_uid: None,
+            })
+            .await,
+        Err(StoreError::InvalidRunCursor),
+        "an owner-scoped cursor must not reveal another user's run boundary"
+    );
+    let timeline = store
+        .agent_run_timeline(first.record.task_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("completed task timeline disappeared"))?;
+    assert!(
+        timeline
+            .iter()
+            .all(|event| { event.provenance == AgentRunTimelineProvenance::Recorded })
+    );
+    assert!(
+        timeline
+            .iter()
+            .any(|event| { event.kind == AgentRunTimelineKind::Phase(TaskPhase::Succeeded) })
+    );
+    assert!(
+        timeline
+            .iter()
+            .any(|event| { event.kind == AgentRunTimelineKind::FinalizationRequested })
+    );
+    assert!(
+        timeline
+            .iter()
+            .any(|event| { event.kind == AgentRunTimelineKind::Finalized })
+    );
     Ok(())
 }
 
@@ -816,6 +1005,7 @@ fn envelope(member_limit: &str, revision: i64) -> Envelope {
                 currency: spec.budget.currency,
             },
             ttl: spec.ttl,
+            runner: RunnerRequirements::default(),
         },
     }
 }
@@ -1344,6 +1534,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
             currency: "USD".to_owned(),
         },
         ttl: Duration("24h".to_owned()),
+        runner: RunnerRequirements::default(),
         bindings: None,
     };
     let deltas = vec![AdmissionDelta::Budget {

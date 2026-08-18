@@ -1,0 +1,13 @@
+{
+  "name": "steward-ui-assembly",
+  "private": true,
+  "engines": {
+    "node": "26.5.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1"
+  },
+  "scripts": {
+    "test:browser-e2e": "playwright test --config tests/browser/playwright.config.mjs"
+  }
+}

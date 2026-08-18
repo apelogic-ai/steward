@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Envelopes · Steward</title>
+    <link rel="icon" href="/admin/assets/icon.svg">
+    <link rel="stylesheet" href="/admin/assets/admin.css">
+    <link rel="stylesheet" href="/envelopes/assets/workspace.css">
+    <script src="/envelopes/assets/workspace.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">Skip to workspace</a>
+    <header class="shared-topbar">
+      <a class="brand" href="/envelopes"><strong>Steward</strong></a>
+      <nav aria-label="Steward primary navigation">
+        <a href="/envelopes" data-route="/envelopes">Envelopes</a>
+        <a href="/runs" data-route="/runs">Runs</a>
+        <a href="/admin/connections">Connections</a>
+        <a href="/settings">Settings</a>
+      </nav>
+      <label id="workspace-mode" class="workspace-mode" hidden>
+        <span>Workspace</span>
+        <select id="workspace-mode-select" aria-label="Workspace presentation">
+          <option value="developer">Developer</option>
+          <option value="admin">Admin</option>
+        </select>
+      </label>
+      <span id="signed-in-email" class="signed-in-email" aria-live="polite">Loading session…</span>
+    </header>
+    <main id="workspace" tabindex="-1">
+      <section data-page="/envelopes">
+        <div class="section-heading"><div><p class="eyebrow">Governed authority</p><h1>Envelopes</h1></div><a class="button" href="/envelopes/new">New envelope</a></div>
+        <p id="envelope-list-message" role="status">Loading authoritative envelope data…</p>
+        <div class="envelope-groups">
+          <details class="envelope-group" data-accordion="templates">
+            <summary>Templates</summary>
+            <div id="template-list" class="group-list"><p class="group-note">Loading templates available to your signed-in identity…</p></div>
+          </details>
+          <details class="envelope-group" data-accordion="drafts">
+            <summary>Drafts</summary>
+            <div id="draft-list" class="group-list"><p class="group-note">No entries.</p></div>
+          </details>
+          <details class="envelope-group" data-accordion="approved">
+            <summary>Approved</summary>
+            <div id="approved-list" class="group-list"><p class="group-note">Loading authoritative approved envelopes…</p></div>
+          </details>
+          <details class="envelope-group" data-accordion="in-review">
+            <summary>In Review</summary>
+            <div id="review-list" class="group-list"><p class="group-note">Loading authoritative review status…</p></div>
+          </details>
+        </div>
+      </section>
+      <section data-page="/envelopes/new" hidden>
+        <div class="section-heading"><h1>New envelope</h1></div>
+        <p id="envelope-form-message" role="status">Loading templates available to your signed-in identity…</p>
+        <form id="envelope-request-form" class="request-form-layout" hidden>
+          <label for="template-select">Template</label>
+          <select id="template-select" name="template" required></select>
+          <div id="template-summary" class="callout" aria-live="polite"></div>
+          <fieldset class="form-grid">
+            <legend>Requested authority</legend>
+            <label for="model-select">Models <select id="model-select" name="models" required></select></label>
+            <label for="tool-select">Tools <select id="tool-select" name="tools" required></select></label>
+            <label for="connection-select">Required connection <select id="connection-select" name="connection" required></select></label>
+          </fieldset>
+          <div class="form-grid">
+            <label for="budget-limit">Monthly budget <input id="budget-limit" name="budgetLimit" inputmode="decimal" required></label>
+            <label for="ttl">Maximum runtime <input id="ttl" name="ttl" required></label>
+          </div>
+          <fieldset class="form-grid">
+            <legend>Advanced runner properties</legend>
+            <label for="runner-platform">Runner platform <select id="runner-platform" name="runnerPlatform"></select></label>
+            <label for="runner-memory">Runner memory <select id="runner-memory" name="runnerMemory"></select></label>
+            <label for="runner-compute">Runner compute <select id="runner-compute" name="runnerCompute"></select></label>
+            <label for="runner-storage">Runner storage <select id="runner-storage" name="runnerStorage"></select></label>
+          </fieldset>
+          <div id="request-delta" class="callout" aria-live="polite"></div>
+          <button class="button" type="submit">Request envelope</button>
+        </form>
+      </section>
+      <section data-page="/envelopes/detail" data-route-pattern="/envelopes/{request_id}" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Envelope request</p><h1>Envelope form</h1></div><a class="button secondary" href="/envelopes">Back to Envelopes</a></div>
+        <p id="envelope-detail-message" role="status">Loading authoritative request…</p>
+        <div id="envelope-detail" class="request-form-layout" hidden>
+          <dl class="detail-list"></dl>
+          <section aria-labelledby="envelope-authority-heading">
+            <h2 id="envelope-authority-heading">Requested and approved authority</h2>
+            <dl class="detail-list">
+              <dt>Requested tools</dt><dd id="requested-tools">Loading…</dd>
+              <dt>Approved tools</dt><dd id="approved-tools">Loading…</dd>
+              <dt>Requested models</dt><dd id="requested-models">Loading…</dd>
+              <dt>Approved models</dt><dd id="approved-models">Loading…</dd>
+              <dt>Requested inference budget</dt><dd id="requested-budget">Loading…</dd>
+              <dt>Approved inference budget</dt><dd id="approved-budget">Loading…</dd>
+              <dt>Requested max run time</dt><dd id="requested-runtime">Loading…</dd>
+              <dt>Approved max run time</dt><dd id="approved-runtime">Loading…</dd>
+            </dl>
+            <h3>Advanced properties</h3>
+            <dl class="detail-list">
+              <dt>Requested runner platform</dt><dd id="requested-platform">Loading…</dd>
+              <dt>Approved runner platform</dt><dd id="approved-platform">Loading…</dd>
+              <dt>Requested runner memory</dt><dd id="requested-memory">Loading…</dd>
+              <dt>Approved runner memory</dt><dd id="approved-memory">Loading…</dd>
+              <dt>Requested runner compute</dt><dd id="requested-compute">Loading…</dd>
+              <dt>Approved runner compute</dt><dd id="approved-compute">Loading…</dd>
+              <dt>Requested runner storage</dt><dd id="requested-storage">Loading…</dd>
+              <dt>Approved runner storage</dt><dd id="approved-storage">Loading…</dd>
+            </dl>
+          </section>
+          <section id="github-actions-workflow" class="github-actions-workflow" aria-labelledby="github-actions-workflow-heading" hidden>
+            <h2 id="github-actions-workflow-heading">GitHub Actions workflow</h2>
+            <p>Generate a pinned workflow for this provisioned envelope. Steward never writes to your repository.</p>
+            <form id="github-actions-workflow-form" class="form-grid">
+              <label for="github-repository">Repository <input id="github-repository" name="repository" autocomplete="off" value="example-org/example-repository" required></label>
+              <label for="github-revision">Pinned commit <input id="github-revision" name="revision" autocomplete="off" value="0123456789abcdef0123456789abcdef01234567" required></label>
+              <label for="github-path">File path <input id="github-path" name="path" autocomplete="off" value="README.md" required></label>
+              <div class="detail-actions"><button id="generate-github-actions-workflow" class="button" type="submit">Generate YAML</button></div>
+            </form>
+            <p id="github-actions-workflow-message" role="status" aria-live="polite"></p>
+            <div id="generated-github-actions-workflow" class="generated-workflow" hidden>
+              <label for="generated-github-actions-yaml">Copyable GitHub Actions YAML</label>
+              <textarea id="generated-github-actions-yaml" readonly spellcheck="false"></textarea>
+              <p>Exact bytes: <code id="generated-github-actions-digest"></code></p>
+              <button id="copy-github-actions-workflow" class="button secondary" type="button">Copy YAML</button>
+            </div>
+          </section>
+          <div class="detail-actions"><a id="envelope-runs-link" class="button secondary" href="#">Recent runs</a></div>
+        </div>
+      </section>
+      <section data-page="/envelopes/runs" data-route-pattern="/envelopes/{request_id}/runs" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Envelope execution</p><h1>Recent runs</h1></div><a class="button secondary" href="/envelopes">Back to Envelopes</a></div>
+        <p id="envelope-runs-message" role="status">Loading your authoritative runs…</p>
+        <div id="envelope-runs-list" class="group-list" aria-live="polite"></div>
+      </section>
+      <section data-page="/runs" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Governed execution</p><h1>Runs</h1></div></div>
+        <p id="runs-message" role="status">Loading authoritative runs…</p>
+        <div id="runs-list" class="group-list" aria-live="polite"></div>
+      </section>
+      <section data-page="/runs/detail" data-route-pattern="/runs/{task_uid}" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Governed execution</p><h1>Run detail</h1></div><a class="button secondary" href="/runs">Back to Runs</a></div>
+        <p id="run-detail-message" role="status">Loading authoritative run details…</p>
+        <div id="run-detail" class="request-form-layout" hidden>
+          <dl class="detail-list"></dl>
+          <section aria-labelledby="run-timeline-heading">
+            <h2 id="run-timeline-heading">Timeline</h2>
+            <ol id="run-timeline" class="run-timeline" aria-live="polite"></ol>
+          </section>
+        </div>
+      </section>
+      <section data-page="/admin/workspace" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Administrator workspace</p><h1>Admin</h1></div></div>
+        <div class="callout"><p>This presentation exposes organization-wide governed run history. Changing presentation never changes your server-authorized access.</p></div>
+        <section aria-labelledby="admin-runs-heading">
+          <h2 id="admin-runs-heading">All governed runs</h2>
+          <p id="admin-runs-message" role="status">Loading authoritative organization runs…</p>
+          <div id="admin-runs-list" class="group-list" aria-live="polite"></div>
+        </section>
+      </section>
+      <section data-page="/settings" hidden>
+        <div class="section-heading"><div><p class="eyebrow">Organization access</p><h1>Settings</h1></div></div>
+        <div class="callout"><p>Your signed-in organization identity is shown in the navigation. Account and access administration remains with your SSO provider.</p></div>
+        <dl class="detail-list"><dt>Canonical Steward user ID</dt><dd><code id="canonical-user-id">Loading…</code></dd></dl>
+      </section>
+    </main>
+  </body>
+</html>

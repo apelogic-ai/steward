@@ -15,6 +15,7 @@ jsonwebtoken.workspace = true
 k8s-openapi.workspace = true
 kube = { workspace = true, features = ["client", "ring", "rustls-tls"] }
 serde.workspace = true
+serde-saphyr.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
@@ -32,6 +33,11 @@ tower.workspace = true
 [[example]]
 name = "admin-dashboard-demo"
 path = "examples/admin-dashboard-demo.rs"
+required-features = ["admin-demo"]
+
+[[example]]
+name = "user-envelope-demo"
+path = "examples/user-envelope-demo.rs"
 required-features = ["admin-demo"]
 
 [[example]]

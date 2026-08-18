@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use steward_admission::{Envelope, EnvelopeSpec};
 use steward_store::PgStore;
-use steward_types::{Budget, Duration as RuntimeDuration, ModelRef, ToolGrant};
+use steward_types::{Budget, Duration as RuntimeDuration, ModelRef, RunnerRequirements, ToolGrant};
 
 const NAMESPACE: &str = "team-a";
 const RUNTIME_NAME: &str = "runtime-revocation";
@@ -477,6 +477,7 @@ async fn e2e_s5_terminated_runtime_holds_nothing() -> Result<(), Box<dyn Error>>
                         currency: "USD".to_owned(),
                     },
                     ttl: RuntimeDuration("1h".to_owned()),
+                    runner: RunnerRequirements::default(),
                 },
             },
             "admin@example.com",
@@ -599,6 +600,7 @@ async fn e2e_poc_golden_journey() -> Result<(), Box<dyn Error>> {
                         currency: "USD".to_owned(),
                     },
                     ttl: RuntimeDuration("1h".to_owned()),
+                    runner: RunnerRequirements::default(),
                 },
             },
             "admin@example.com",

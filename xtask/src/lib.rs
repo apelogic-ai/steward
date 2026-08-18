@@ -26,7 +26,7 @@ pub fn neutrality_violations(content: &str) -> Vec<String> {
             }
 
             if token.contains('@') {
-                if !is_reserved_email(token) {
+                if !is_reserved_email(token) && !is_technical_package_scope(token) {
                     violations.push(format!("non-reserved email: {token}"));
                 }
                 continue;
@@ -340,6 +340,12 @@ fn is_reserved_email(token: &str) -> bool {
     !local.is_empty() && !local.contains('@') && is_example_domain(domain)
 }
 
+/// Package scopes are source-code dependencies, not fixture identities. Keep
+/// this list exact so the neutral identity boundary remains fail-closed.
+fn is_technical_package_scope(token: &str) -> bool {
+    token == "@playwright"
+}
+
 fn is_globally_routable(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => is_globally_routable_ipv4(address),
@@ -600,6 +606,16 @@ mod tests {
             violations.len(),
             3,
             "neutrality gate must reject every non-reserved identifier"
+        );
+    }
+
+    #[test]
+    fn neutrality_allows_the_browser_test_framework_package_scope() {
+        let package = ["@playwright", "test"].join("/");
+
+        assert!(
+            neutrality_violations(&format!("\"{package}\"")).is_empty(),
+            "a technical test-framework package is not a person, hostname, or customer identifier"
         );
     }
 

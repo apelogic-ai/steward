@@ -16,7 +16,8 @@ use kube::ResourceExt;
 use serde::{Deserialize, Serialize};
 use steward_admission::{AdmissionDecision, Envelope, EnvelopeSpec};
 use steward_types::{
-    AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, Phase, Principal, ToolGrant,
+    AgentRuntime, AgentRuntimeSpec, AgentType, Budget, Duration, Email, Phase, Principal,
+    RunnerRequirements, ToolGrant,
 };
 
 use crate::browser_auth::{
@@ -253,6 +254,7 @@ fn fixed_runtime(email: Email) -> AgentRuntime {
             currency: "USD".to_owned(),
         },
         ttl: Duration(FIXED_TTL.to_owned()),
+        runner: RunnerRequirements::default(),
         bindings: None,
     };
     let mut runtime = AgentRuntime::new(FAST_TRACK_RUNTIME_NAME, spec);
@@ -272,6 +274,7 @@ fn enforce_fixed_admission(spec: &AgentRuntimeSpec) -> Result<(), BootstrapError
             tools: spec.tools.clone(),
             budget: spec.budget.clone(),
             ttl: spec.ttl.clone(),
+            runner: spec.runner.clone(),
         },
     };
     match steward_admission::evaluate(spec, &envelope) {
@@ -412,6 +415,7 @@ mod tests {
                 canonical_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
                 display_email: Email::parse("alice@example.com")?,
                 role: BrowserRole::User,
+                member_roles: Vec::new(),
             },
             binding: BrowserSessionBinding::from_test_value(binding),
         })

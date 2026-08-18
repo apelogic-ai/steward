@@ -106,7 +106,7 @@ done
 
 "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
   --workspace "${WORKSPACE}" sandbox exec --name "${SANDBOX}" --no-tty -- \
-  curl -fsS --max-time 20 https://api.github.com/zen >/dev/null
+  curl -fsS --max-time 20 -H 'User-Agent: steward-conformance/1.0' https://api.github.com/zen >/dev/null
 
 if "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
   --workspace "${WORKSPACE}" sandbox exec --name "${SANDBOX}" --no-tty -- \

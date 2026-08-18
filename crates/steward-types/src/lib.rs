@@ -606,6 +606,38 @@ pub struct Budget {
 #[serde(transparent)]
 pub struct Duration(pub String);
 
+/// Canonical platform names accepted by the governed runner contract.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerPlatform {
+    Linux,
+    Mac,
+    Windows,
+}
+
+/// A Kubernetes resource quantity. Admission validates the supported unit family for each
+/// resource dimension before it becomes authority.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(transparent)]
+pub struct KubernetesQuantity(pub String);
+
+#[derive(
+    Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct RunnerRequirements {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<RunnerPlatform>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<KubernetesQuantity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute: Option<KubernetesQuantity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<KubernetesQuantity>,
+}
+
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct BindingRef(pub String);
@@ -634,6 +666,8 @@ pub struct AgentRuntimeSpec {
     pub tools: Vec<ToolGrant>,
     pub budget: Budget,
     pub ttl: Duration,
+    #[serde(default)]
+    pub runner: RunnerRequirements,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bindings: Option<Vec<BindingRef>>,
 }

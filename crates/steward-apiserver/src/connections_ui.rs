@@ -1,6 +1,5 @@
 //! Credential-free browser surface for user-bound provider connections.
 
-use std::borrow::Cow;
 use std::hash::Hash;
 
 use axum::http::{StatusCode, header};
@@ -13,8 +12,6 @@ use crate::connections::ConnectionSession;
 
 const CONNECTIONS_HTML: &str = include_str!("../assets/connections/index.html");
 const CONNECTIONS_CSS: &str = include_str!("../assets/connections/connections.css");
-#[cfg(feature = "admin-demo")]
-const PREVIEW_READINESS_JS: &str = include_str!("../assets/connections/preview-readiness.js");
 const CONNECTIONS_JS: &str = include_str!("../assets/connections/connections.js");
 
 pub(crate) fn router<B, S>() -> Router<S>
@@ -22,18 +19,13 @@ where
     B: Clone + Eq + Hash + Send + Sync + 'static,
     S: Clone + Send + Sync + 'static,
 {
-    let router = Router::<S>::new()
+    Router::<S>::new()
         .route("/admin/connections", get(connections_shell::<B>))
         .route("/admin/assets/connections.css", get(connections_stylesheet))
-        .route("/admin/assets/connections.js", get(connections_script));
-    #[cfg(feature = "admin-demo")]
-    let router = router.route(
-        "/admin/assets/preview-readiness.js",
-        get(preview_readiness_script),
-    );
-    router.layer(middleware::from_fn(
-        crate::admin_ui::add_browser_security_headers,
-    ))
+        .route("/admin/assets/connections.js", get(connections_script))
+        .layer(middleware::from_fn(
+            crate::admin_ui::add_browser_security_headers,
+        ))
 }
 
 async fn connections_shell<B>(session: Option<Extension<ConnectionSession<B>>>) -> Response
@@ -43,30 +35,7 @@ where
     if session.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Html(connections_document()).into_response()
-}
-
-fn connections_document() -> Cow<'static, str> {
-    #[cfg(feature = "admin-demo")]
-    {
-        Cow::Owned(
-            CONNECTIONS_HTML
-                .replacen(
-                    "data-fast-track-runtime=\"false\"",
-                    "data-fast-track-runtime=\"true\"",
-                    1,
-                )
-                .replacen(
-                    "<script src=\"/admin/assets/connections.js\" defer></script>",
-                    "<script src=\"/admin/assets/preview-readiness.js\" defer></script>\n    <script src=\"/admin/assets/connections.js\" defer></script>",
-                    1,
-                ),
-        )
-    }
-    #[cfg(not(feature = "admin-demo"))]
-    {
-        Cow::Borrowed(CONNECTIONS_HTML)
-    }
+    Html(CONNECTIONS_HTML).into_response()
 }
 
 async fn connections_stylesheet() -> Response {
@@ -83,16 +52,6 @@ async fn connections_script() -> Response {
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         CONNECTIONS_JS,
-    )
-        .into_response()
-}
-
-#[cfg(feature = "admin-demo")]
-async fn preview_readiness_script() -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        PREVIEW_READINESS_JS,
     )
         .into_response()
 }
@@ -158,44 +117,12 @@ mod tests {
         let body = to_bytes(authenticated.into_body(), 32 * 1024)
             .await
             .map_err(|error| format!("read Connections shell: {error}"))?;
-        assert_eq!(body.as_ref(), connections_document().as_bytes());
-
-        let readiness_asset = router::<TestBinding, ()>()
-            .oneshot(
-                Request::builder()
-                    .uri("/admin/assets/preview-readiness.js")
-                    .body(Body::empty())
-                    .map_err(|error| format!("build readiness asset request: {error}"))?,
-            )
-            .await
-            .map_err(|error| format!("request readiness asset: {error}"))?;
-        #[cfg(feature = "admin-demo")]
-        {
-            assert_eq!(readiness_asset.status(), StatusCode::OK);
-            let body = to_bytes(readiness_asset.into_body(), 32 * 1024)
-                .await
-                .map_err(|error| format!("read readiness asset: {error}"))?;
-            assert_eq!(body.as_ref(), PREVIEW_READINESS_JS.as_bytes());
-        }
-        #[cfg(not(feature = "admin-demo"))]
-        assert_eq!(readiness_asset.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body.as_ref(), CONNECTIONS_HTML.as_bytes());
         Ok(())
     }
 
     #[test]
     fn connections_assets_are_accessible_responsive_and_never_use_browser_storage_or_html_sinks() {
-        assert!(CONNECTIONS_HTML.contains("data-fast-track-runtime=\"false\""));
-        assert!(!CONNECTIONS_HTML.contains("/admin/assets/preview-readiness.js"));
-        #[cfg(feature = "admin-demo")]
-        {
-            assert!(connections_document().contains("data-fast-track-runtime=\"true\""));
-            assert!(connections_document().contains("/admin/assets/preview-readiness.js"));
-        }
-        #[cfg(not(feature = "admin-demo"))]
-        {
-            assert!(connections_document().contains("data-fast-track-runtime=\"false\""));
-            assert!(!connections_document().contains("/admin/assets/preview-readiness.js"));
-        }
         for required in [
             "<main",
             "<h1",
@@ -206,7 +133,12 @@ mod tests {
             "<dialog",
             "id=\"scope-status\"",
             "id=\"connection-error\"",
-            "id=\"runtime-status\"",
+            "aria-label=\"Steward primary navigation\"",
+            "href=\"/envelopes\"",
+            "href=\"/runs\"",
+            "href=\"/admin/connections\" aria-current=\"page\"",
+            "href=\"/settings\"",
+            "id=\"signed-in-email\"",
         ] {
             assert!(
                 CONNECTIONS_HTML.contains(required),
@@ -228,16 +160,7 @@ mod tests {
             "candidate.pathname === \"/admin/connections/github/callback\"",
             "callbackStatus.textContent = \"GitHub connected.\"",
             "callbackStatus.hidden = true",
-            "/admin/api/v1/fast-track/connections/runtime",
-            "async function fetchRuntimePhase()",
-            "const FAST_TRACK_STATUS_POLL_INTERVAL_MS = 1000;",
-            "const FAST_TRACK_STATUS_POLL_DEADLINE_MS = 90000;",
-            "const FAST_TRACK_STATUS_REVALIDATE_MS = 5000;",
-            "x-steward-fast-track-bff-stage",
-            "async function runPreviewReadinessController()",
-            "runtimeStatus.dataset.bffStage",
-            "previewReadiness.owns(generation)",
-            "previewReadiness.cancel();",
+            "signedInEmail.textContent = value.principal.displayEmail",
         ] {
             assert!(
                 CONNECTIONS_JS.contains(required),
@@ -251,54 +174,60 @@ mod tests {
             "innerHTML",
             "outerHTML",
             "insertAdjacentHTML",
-            "actingUser",
-            "canonicalAuthority",
-            "service-principal",
         ] {
             assert!(
                 !CONNECTIONS_JS.contains(forbidden),
                 "Connections script uses forbidden browser sink/storage {forbidden}"
             );
         }
-        assert!(
-            !CONNECTIONS_JS.contains("await startConnection()"),
-            "Connections initialization must not start GitHub OAuth automatically"
-        );
     }
 
     #[test]
-    #[cfg(feature = "admin-demo")]
-    fn preview_readiness_is_generation_owned_and_revalidates_stable_state() {
+    fn connections_uses_the_shared_workspace_shell_and_button_contract() {
         for required in [
-            "class PreviewReadinessState",
-            "begin()",
-            "cancel()",
-            "owns(generation)",
-            "acceptSuccess(generation, runtimeRunning)",
-            "acceptRetryableFailure(generation)",
-            "acceptTerminal(generation)",
-            "return IGNORE;",
-            "return HOLD_READY;",
+            "<section class=\"section-heading\"",
+            "class=\"connection-copy\"",
+            "class=\"button\"",
+            "class=\"button secondary danger\"",
         ] {
             assert!(
-                PREVIEW_READINESS_JS.contains(required),
-                "preview readiness is missing hysteresis contract {required:?}"
+                CONNECTIONS_HTML.contains(required),
+                "Connections shell is missing shared workspace markup {required:?}"
             );
         }
+        for required in [
+            "main {\n  width: min(68rem, calc(100% - 2rem));",
+            "min-height: 31rem;",
+            "background: var(--surface);",
+            ".section-heading {",
+            ".button {",
+            ".button.secondary {",
+        ] {
+            assert!(
+                CONNECTIONS_CSS.contains(required),
+                "Connections stylesheet is missing shared workspace treatment {required:?}"
+            );
+        }
+    }
 
-        assert!(
-            CONNECTIONS_JS.contains(
-                "const generation = previewReadiness.begin();\n  const deadline = Date.now()"
-            ),
-            "each readiness controller must own one generation"
-        );
-        assert!(
-            CONNECTIONS_JS.contains(
-                "await pollDelay(ready ? FAST_TRACK_STATUS_REVALIDATE_MS : FAST_TRACK_STATUS_POLL_INTERVAL_MS);"
-            ),
-            "stable readiness must continue bounded expiry revalidation"
-        );
-        assert!(CONNECTIONS_JS.contains("if (action !== \"hold_ready\")"));
-        assert!(CONNECTIONS_JS.contains("renderPreviewUnavailable(runtimePhase, stage);"));
+    #[test]
+    fn dual_role_connections_mode_uses_the_server_session_contract() {
+        for required in ["id=\"workspace-mode\"", "id=\"workspace-mode-select\""] {
+            assert!(
+                CONNECTIONS_HTML.contains(required),
+                "Connections shell is missing dual-role control {required:?}"
+            );
+        }
+        for required in [
+            "value.role === \"admin\"",
+            "value.memberRoles.includes(\"developer\")",
+            "window.location.assign(\"/admin/workspace\")",
+        ] {
+            assert!(
+                CONNECTIONS_JS.contains(required),
+                "Connections script is missing dual-role behavior {required:?}"
+            );
+        }
+        assert!(CONNECTIONS_CSS.contains(".workspace-mode {"));
     }
 }
