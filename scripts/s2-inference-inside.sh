@@ -412,7 +412,8 @@ if [[ "${SLICE}" == "s5" ]]; then
   cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s5 \
     e2e_poc_golden_journey -- --exact
 elif [[ "${SLICE}" == "task" ]]; then
-  cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test task -- --nocapture
+  cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test task \
+    e2e_controller_owned_task_runtime_lifecycle -- --exact --nocapture
 else
   cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s2_store
   cargo test --manifest-path "${ROOT}/e2e/Cargo.toml" --test s2 \

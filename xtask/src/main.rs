@@ -42,6 +42,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "e2e-s4" if rest.is_empty() => e2e_s4(),
         "e2e-s5" if rest.is_empty() => e2e_s5(),
         "e2e-task" if rest.is_empty() => e2e_task(),
+        "e2e-controller-runtime-lifecycle" if rest.is_empty() => e2e_controller_runtime_lifecycle(),
         "e2e-openshell-adapter" if rest.is_empty() => e2e_openshell_adapter(),
         "e2e-postgres-tls" if rest.is_empty() => e2e_postgres_tls(),
         "browser-e2e" if rest.is_empty() => browser_e2e(false),
@@ -78,6 +79,7 @@ fn usage() -> String {
         "  e2e-s4",
         "  e2e-s5",
         "  e2e-task",
+        "  e2e-controller-runtime-lifecycle",
         "  e2e-openshell-adapter",
         "  e2e-postgres-tls",
         "  browser-e2e [--browser-ready]",
@@ -174,6 +176,10 @@ fn e2e_s5() -> TaskResult {
 }
 
 fn e2e_task() -> TaskResult {
+    run("bash", &["scripts/task-submission-e2e.sh"])
+}
+
+fn e2e_controller_runtime_lifecycle() -> TaskResult {
     run("bash", &["scripts/task-submission-e2e.sh"])
 }
 
@@ -983,6 +989,34 @@ mod tests {
                 "the loopback browser journey must cover {required}"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn controller_owned_task_lifecycle_is_a_named_ci_e2e_gate() -> Result<(), String> {
+        let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let xtask_source = include_str!("main.rs");
+
+        let lifecycle_job = workflow
+            .split("  e2e-controller-runtime-lifecycle:")
+            .nth(1)
+            .and_then(|jobs| jobs.split("\n  e2e-admission:").next())
+            .ok_or_else(|| "controller-owned runtime lifecycle CI job is required".to_owned())?;
+
+        assert!(
+            lifecycle_job.contains("cargo xtask e2e-controller-runtime-lifecycle"),
+            "controller-owned lifecycle CI must invoke the named xtask E2E gate"
+        );
+        assert!(
+            xtask_source.contains("\"e2e-controller-runtime-lifecycle\" if rest.is_empty()"),
+            "the named controller-owned lifecycle E2E must be dispatchable locally"
+        );
+        assert!(
+            xtask_source.contains("e2e_controller_runtime_lifecycle"),
+            "the named controller-owned lifecycle command must have a dedicated implementation"
+        );
 
         Ok(())
     }

@@ -7,13 +7,14 @@ use std::process::Command;
 use std::time::Duration;
 
 use kube::api::{Api, ListParams};
-use steward_store::PgStore;
-use steward_types::{AgentRuntime, Principal};
+use steward_store::{AgentRunTimelineKind, PgStore};
+use steward_types::{AgentRuntime, Principal, TaskPhase};
 
 #[tokio::test]
-async fn task_submission_real_sandbox_lifecycle() -> Result<(), Box<dyn Error>> {
+async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Error>> {
     let base_url = required("STEWARD_TASK_URL")?;
     let runtime_api = Api::<AgentRuntime>::all(kube::Client::try_default().await?);
+    let store = PgStore::connect(&required("STEWARD_TEST_DATABASE_URL")?).await?;
     let run_dir = PathBuf::from(required("STEWARD_RUN_DIR")?).join("task-client");
     fs::create_dir_all(run_dir.join("input/in"))?;
     fs::write(
@@ -40,6 +41,7 @@ async fn task_submission_real_sandbox_lifecycle() -> Result<(), Box<dyn Error>> 
     )?;
     assert_eq!(copy_smoke["phase"], "submitted");
     let copy_task_uid = json_string(&copy_smoke, "taskUid")?;
+    let copy_runtime_uid = json_string(&copy_smoke, "runtimeUid")?;
     put_archive(
         &base_url,
         copy_task_uid,
@@ -78,6 +80,10 @@ async fn task_submission_real_sandbox_lifecycle() -> Result<(), Box<dyn Error>> 
         b"governed task payload\n",
         "copy-smoke must preserve the input bytes at the declared output path"
     );
+    assert!(
+        runtime_by_uid(&runtime_api, copy_runtime_uid).await?.is_some(),
+        "a successful provisioned Task must retain its exact runtime until finalization is requested"
+    );
     delete_task(&base_url, copy_task_uid, "github-assertion", &run_dir)?;
     wait_for(
         &base_url,
@@ -86,6 +92,29 @@ async fn task_submission_real_sandbox_lifecycle() -> Result<(), Box<dyn Error>> 
         |status| status["finalized"] == true,
         &run_dir,
     )?;
+    assert!(
+        runtime_by_uid(&runtime_api, copy_runtime_uid).await?.is_none(),
+        "finalizing a successful provisioned Task must delete its exact runtime"
+    );
+    let copy_timeline = store
+        .agent_run_timeline(copy_task_uid.parse()?)
+        .await?
+        .ok_or_else(|| io::Error::other("successful Task lifecycle timeline was not persisted"))?;
+    assert_eq!(
+        copy_timeline
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            AgentRunTimelineKind::Phase(TaskPhase::Submitted),
+            AgentRunTimelineKind::Phase(TaskPhase::Queued),
+            AgentRunTimelineKind::Phase(TaskPhase::Running),
+            AgentRunTimelineKind::Phase(TaskPhase::Succeeded),
+            AgentRunTimelineKind::FinalizationRequested,
+            AgentRunTimelineKind::Finalized,
+        ],
+        "the durable Task timeline must evidence submit, execute, output persistence, finalization request, and exact runtime cleanup"
+    );
 
     let body = r#"{"workflow":"approval-review","codingAgentRuntime":"base"}"#;
     let parked = submit(
@@ -117,7 +146,6 @@ async fn task_submission_real_sandbox_lifecycle() -> Result<(), Box<dyn Error>> 
     execute(&base_url, &task_uid, "github-assertion", &run_dir)?;
     execute(&base_url, &task_uid, "github-assertion", &run_dir)?;
 
-    let store = PgStore::connect(&required("STEWARD_TEST_DATABASE_URL")?).await?;
     let pending = store
         .pending_approvals()
         .await?
