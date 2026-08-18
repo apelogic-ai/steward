@@ -1599,6 +1599,25 @@ mod tests {
     }
 
     #[test]
+    fn s2_controller_can_create_only_task_agentruntimes() -> Result<(), String> {
+        let fixture = fs::read_to_string(root().join("config/s2/stack.yaml"))
+            .map_err(|error| format!("S2 controller fixture is required: {error}"))?;
+        let controller_role = fixture
+            .split("---")
+            .find(|document| {
+                document.contains("kind: ClusterRole")
+                    && document.contains("name: steward-s2-controller")
+            })
+            .ok_or_else(|| "S2 controller ClusterRole is required".to_owned())?;
+
+        assert!(
+            controller_role.contains("resources: [\"agentruntimes\"]\n    verbs: [\"create\"]"),
+            "the Task controller must be allowed to create only AgentRuntime resources"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn production_release_contract_is_complete_and_fail_closed() -> Result<(), String> {
         let chart = root().join("charts/steward");
         let values = fs::read_to_string(chart.join("values.yaml"))
