@@ -3,7 +3,7 @@ import { once } from "node:events";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { chromium, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const examplesDirectory = path.join(repository, "target", "debug", "examples");
@@ -12,7 +12,6 @@ let demo;
 let origin;
 let adminDemo;
 let adminOrigin;
-let sharedBrowser;
 const DEMO_STARTUP_TIMEOUT_MS = 120_000;
 
 function exampleBinary(name) {
@@ -210,16 +209,11 @@ test.beforeAll(async () => {
   origin = demo.origin;
   adminDemo = await startLoopbackAdminDemo();
   adminOrigin = adminDemo.origin;
-  sharedBrowser = await chromium.launch();
 });
 
 test.afterAll(async () => {
-  try {
-    await sharedBrowser?.close();
-  } finally {
-    await stopLoopbackDemo(demo?.child);
-    await stopLoopbackDemo(adminDemo?.child);
-  }
+  await stopLoopbackDemo(demo?.child);
+  await stopLoopbackDemo(adminDemo?.child);
 });
 
 test.beforeEach(() => {
@@ -232,9 +226,9 @@ test.afterEach(() => {
   assertDemoIsRunning(adminDemo, "loopback Steward admin demo");
 });
 
-test("dual-role administrator can switch presentation, while developer cannot enter it", async () => {
-  const userSession = await guardedPage(sharedBrowser, { width: 1440, height: 900 });
-  const adminSession = await guardedPage(sharedBrowser, { width: 1440, height: 900 });
+test("dual-role administrator can switch presentation, while developer cannot enter it", async ({ browser }) => {
+  const userSession = await guardedPage(browser, { width: 1440, height: 900 });
+  const adminSession = await guardedPage(browser, { width: 1440, height: 900 });
   try {
     await signIn(userSession.page);
     const forbiddenWorkspace = await userSession.page.request.get(`${origin}/admin/workspace`);
@@ -262,8 +256,8 @@ test("dual-role administrator can switch presentation, while developer cannot en
   }
 });
 
-test("user can sign in, navigate shared top navigation, and connect then disconnect GitHub", async () => {
-  const session = await guardedPage(sharedBrowser, { width: 1440, height: 900 });
+test("user can sign in, navigate shared top navigation, and connect then disconnect GitHub", async ({ browser }) => {
+  const session = await guardedPage(browser, { width: 1440, height: 900 });
   try {
     const { page } = session;
     await signIn(page);
@@ -349,8 +343,8 @@ test("user can sign in, navigate shared top navigation, and connect then disconn
   }
 });
 
-test("narrow user navigation remains available without horizontal overflow", async () => {
-  const session = await guardedPage(sharedBrowser, { width: 390, height: 844 });
+test("narrow user navigation remains available without horizontal overflow", async ({ browser }) => {
+  const session = await guardedPage(browser, { width: 390, height: 844 });
   try {
     const { page } = session;
     await signIn(page);
