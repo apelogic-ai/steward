@@ -27,6 +27,8 @@ use steward_types::{
 };
 use tokio::net::TcpListener;
 
+const SCHEDULED_OWNER_EMAIL: &str = "owner@example.com";
+
 #[derive(Clone)]
 struct TestTaskIdentities {
     assertions: Arc<BTreeMap<String, TaskIdentity>>,
@@ -97,7 +99,7 @@ async fn seed_test_task_identities(store: &PgStore) -> Result<TestTaskIdentities
         .await?;
     let scheduled = store
         .register_canonical_identity(
-            &test_google_identity("task-server-scheduled", "owner@example.org")?,
+            &test_google_identity("task-server-scheduled", SCHEDULED_OWNER_EMAIL)?,
             "task-server-fixture-bootstrap",
         )
         .await?;
@@ -122,6 +124,14 @@ fn test_google_identity(
         email,
         true,
     )?)
+}
+
+#[test]
+fn task_fixture_identities_match_the_reviewed_organization_domain() {
+    assert!(
+        test_google_identity("task-server-scheduled", SCHEDULED_OWNER_EMAIL).is_ok(),
+        "every fixture Task identity must satisfy the reviewed organization policy before the server starts"
+    );
 }
 
 #[tokio::test]

@@ -336,7 +336,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     let scheduled_runtime = runtime_by_uid(&runtime_api, scheduled_runtime_uid)
         .await?
         .ok_or_else(|| io::Error::other("scheduled Task runtime was not created"))?;
-    assert_eq!(scheduled_runtime.spec.owner.0, "owner@example.org");
+    assert_eq!(scheduled_runtime.spec.owner.0, "owner@example.com");
     assert_eq!(
         scheduled_runtime.spec.principal,
         Principal::Service {
