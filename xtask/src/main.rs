@@ -906,6 +906,21 @@ mod tests {
 
     static NEXT_REPOSITORY_ID: AtomicU64 = AtomicU64::new(0);
 
+    fn ci_job(workflow: &str, job_name: &str) -> Result<String, String> {
+        let header = format!("\n  {job_name}:");
+        let (_, job) = workflow
+            .split_once(&header)
+            .ok_or_else(|| format!("{job_name} CI job is required"))?;
+
+        Ok(job
+            .lines()
+            .take_while(|line| {
+                line.is_empty() || line.starts_with("    ") || !line.starts_with("  ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
     #[test]
     fn release_ci_installs_supervisor_build_tools() -> Result<(), String> {
         let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
@@ -1003,11 +1018,7 @@ mod tests {
         let task_callback = fs::read_to_string(root().join("scripts/task-submission-inside.sh"))
             .map_err(|error| format!("task lifecycle image callback is required: {error}"))?;
 
-        let lifecycle_job = workflow
-            .split("  e2e-controller-runtime-lifecycle:")
-            .nth(1)
-            .and_then(|jobs| jobs.split("\n  e2e-admission:").next())
-            .ok_or_else(|| "controller-owned runtime lifecycle CI job is required".to_owned())?;
+        let lifecycle_job = ci_job(&workflow, "e2e-controller-runtime-lifecycle")?;
 
         assert!(
             lifecycle_job.contains("cargo xtask e2e-controller-runtime-lifecycle"),
@@ -1117,11 +1128,7 @@ mod tests {
     fn runtime_e2e_reuses_builds_and_preserves_observed_runtime_headroom() -> Result<(), String> {
         let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
-        let runtime = workflow
-            .split("  e2e-runtime:")
-            .nth(1)
-            .and_then(|jobs| jobs.split("\n  e2e-admission:").next())
-            .ok_or_else(|| "shared runtime E2E CI job is required".to_owned())?;
+        let runtime = ci_job(&workflow, "e2e-runtime")?;
 
         assert!(
             runtime.contains("timeout-minutes: 105"),
