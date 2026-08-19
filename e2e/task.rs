@@ -73,6 +73,16 @@ fn http_probe_retains_the_safe_body_and_status() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn task_client_selects_a_rustls_crypto_provider() -> Result<(), String> {
+    install_rustls_crypto_provider().map_err(|error| error.to_string())?;
+    assert!(
+        tokio_rustls::rustls::crypto::CryptoProvider::get_default().is_some(),
+        "the Task client must select Rustls cryptography before it constructs Kubernetes clients"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 fn success_status() -> Result<std::process::ExitStatus, Box<dyn Error>> {
     Ok(std::os::unix::process::ExitStatusExt::from_raw(0))
@@ -80,6 +90,7 @@ fn success_status() -> Result<std::process::ExitStatus, Box<dyn Error>> {
 
 #[tokio::test]
 async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
     let base_url = required("STEWARD_TASK_URL")?;
     let runtime_api = Api::<AgentRuntime>::all(kube::Client::try_default().await?);
     let store = PgStore::connect(&required("STEWARD_TEST_DATABASE_URL")?).await?;
@@ -548,6 +559,19 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
             .is_none()
     );
     Ok(())
+}
+
+fn install_rustls_crypto_provider() -> Result<(), io::Error> {
+    use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
+
+    if CryptoProvider::get_default().is_none() {
+        let _ = ring::default_provider().install_default();
+    }
+    if CryptoProvider::get_default().is_some() {
+        Ok(())
+    } else {
+        Err(io::Error::other("Rustls crypto provider is unavailable"))
+    }
 }
 
 async fn runtime_by_uid(
