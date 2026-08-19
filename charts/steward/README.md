@@ -83,7 +83,7 @@ that allowlist remain inaccessible to both service accounts.
   raw API token in the configured Jira Secret. The chart does not support a
   dummy credential or an implicit Jira-disabled mode.
 - `stableBridge` defaults to disabled. Enabling it requires all of a
-  digest-pinned bridge image, GitHub signer identity, source repository and
+  digest-pinned bridge image, GitHub signer identity, HTTPS GitHub source repository and
   exact source commit, controller service identity, and the public GitHub
   artifact-attestation bundle. The bundle is rendered into an immutable,
   content-addressed ConfigMap and mounted read-only in the apiserver; it is

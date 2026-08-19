@@ -201,7 +201,7 @@
               "signerIdentity": {"$ref": "#/definitions/nonempty"},
               "sourceRepository": {
                 "type": "string",
-                "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+                "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
               },
               "sourceCommit": {
                 "type": "string",
