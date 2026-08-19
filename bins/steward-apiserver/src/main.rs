@@ -91,10 +91,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn install_rustls_crypto_provider() -> Result<(), io::Error> {
-    use tokio_rustls::rustls::crypto::{CryptoProvider, aws_lc_rs};
+    use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
 
     if CryptoProvider::get_default().is_none() {
-        let _ = aws_lc_rs::default_provider().install_default();
+        let _ = ring::default_provider().install_default();
     }
     if CryptoProvider::get_default().is_some() {
         Ok(())

@@ -28,6 +28,7 @@ const MAX_PENDING_TLS_HANDSHAKES: usize = 64;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
     let client = Client::try_default().await?;
     let sandbox_runtime = OpenShellRuntime::connect(openshell_connection_config()?)
         .await
@@ -69,6 +70,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         () = controller => return Err(io::Error::other("controller exited").into()),
     }
     Ok(())
+}
+
+fn install_rustls_crypto_provider() -> Result<(), io::Error> {
+    use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
+
+    if CryptoProvider::get_default().is_none() {
+        let _ = ring::default_provider().install_default();
+    }
+    if CryptoProvider::get_default().is_some() {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "install the Steward Rustls crypto provider",
+        ))
+    }
 }
 
 fn required(name: &str) -> Result<String, io::Error> {
@@ -219,7 +235,7 @@ mod tests {
     use tokio_rustls::rustls::ServerConfig;
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
-    use super::{TlsListener, decode_tls_material};
+    use super::{TlsListener, decode_tls_material, install_rustls_crypto_provider};
 
     #[test]
     fn cert_manager_pem_tls_material_is_decoded() -> Result<(), String> {
@@ -241,6 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_tls_handshakes_do_not_serialize_acceptance() -> Result<(), String> {
+        install_rustls_crypto_provider().map_err(|error| error.to_string())?;
         let tcp = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|error| format!("bind test listener: {error}"))?;
