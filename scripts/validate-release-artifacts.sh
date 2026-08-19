@@ -3,7 +3,8 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 rendered="$(mktemp)"
-trap 'rm -f "${rendered}"' EXIT INT TERM
+stable_bridge_rendered="$(mktemp)"
+trap 'rm -f "${rendered}" "${stable_bridge_rendered}"' EXIT INT TERM
 
 digest0="sha256:0000000000000000000000000000000000000000000000000000000000000000"
 digest1="sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -18,12 +19,44 @@ image_values=(
   --set 'runtimeNamespaces[0]=team-a'
   --set-string config.controller.openshellRuntimeClassName=openshell-runc
 )
+stable_bridge_values=(
+  --set stableBridge.enabled=true
+  --set-string stableBridge.image=ghcr.io/example-org/steward-bridge@sha256:3333333333333333333333333333333333333333333333333333333333333333
+  --set-string stableBridge.signerIdentity=https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.11
+  --set-string stableBridge.sourceRepository=example-org/steward
+  --set-string stableBridge.sourceCommit=0123456789abcdef0123456789abcdef01234567
+  --set-string stableBridge.service=steward-run
+  --set-string stableBridge.attestationBundle=test-attestation-bundle
+)
 
 helm lint "${root}/charts/steward" "${image_values[@]}"
 helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
   "${image_values[@]}" > "${rendered}"
+
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  "${stable_bridge_values[@]}" > "${stable_bridge_rendered}"
+
+grep -q '^kind: ConfigMap$' "${stable_bridge_rendered}"
+grep -Eq '^  name: steward-stable-bridge-attestation-[0-9a-f]{12}$' "${stable_bridge_rendered}"
+grep -q 'name: STEWARD_STABLE_BRIDGE_IMAGE' "${stable_bridge_rendered}"
+grep -q 'name: STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY' "${stable_bridge_rendered}"
+grep -q 'name: STEWARD_STABLE_BRIDGE_SOURCE_REPOSITORY' "${stable_bridge_rendered}"
+grep -q 'name: STEWARD_STABLE_BRIDGE_SOURCE_COMMIT' "${stable_bridge_rendered}"
+grep -q 'name: STEWARD_STABLE_BRIDGE_ATTESTATION_BUNDLE_FILE' "${stable_bridge_rendered}"
+grep -q 'name: STEWARD_STABLE_BRIDGE_SERVICE' "${stable_bridge_rendered}"
+grep -q 'mountPath: /run/stable-bridge-attestation' "${stable_bridge_rendered}"
+grep -q 'readOnly: true' "${stable_bridge_rendered}"
+if helm lint "${root}/charts/steward" "${image_values[@]}" \
+  --set stableBridge.enabled=true >/dev/null 2>&1
+then
+  echo "an enabled stable bridge without immutable provenance inputs must fail chart validation" >&2
+  exit 1
+fi
 
 test "$(grep -c '^kind: Deployment$' "${rendered}")" -eq 3
 test "$(grep -c '^kind: ServiceAccount$' "${rendered}")" -eq 3

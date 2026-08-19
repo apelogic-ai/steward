@@ -57,6 +57,16 @@ config:
     svidAudience: steward-mint
     spiffeTrustDomain: example.test
     openshellNamespace: openshell
+stableBridge:
+  # Disabled until GitOps supplies an immutable, provenance-verified bridge image and bundle.
+  enabled: false
+  image: ""
+  signerIdentity: ""
+  sourceRepository: ""
+  sourceCommit: ""
+  service: ""
+  # A public GitHub artifact-attestation bundle; it is mounted read-only, not stored as a Secret.
+  attestationBundle: ""
 runtimeNamespaces: []
 networkPolicy:
   enabled: true

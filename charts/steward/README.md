@@ -82,6 +82,22 @@ that allowlist remain inaccessible to both service accounts.
   the project must already exist, and the account email must correspond to the
   raw API token in the configured Jira Secret. The chart does not support a
   dummy credential or an implicit Jira-disabled mode.
+- `stableBridge` defaults to disabled. Enabling it requires all of a
+  digest-pinned bridge image, GitHub signer identity, source repository and
+  exact source commit, controller service identity, and the public GitHub
+  artifact-attestation bundle. The bundle is rendered into an immutable,
+  content-addressed ConfigMap and mounted read-only in the apiserver; it is
+  provenance evidence, not a Secret. Missing or partial bridge configuration
+  fails Helm validation, and the apiserver itself fails startup on an unreadable
+  or unverified bundle.
+- This chart wiring enables the session-protected stable bridge *resolver*.
+  It does not invent sandbox artifact installation, a Kubernetes pod selector,
+  or a direct pod copy/exec path. The pinned OpenShell API has no supported
+  artifact/sidecar delivery or replacement-safe service exposure contract;
+  that upstream requirement is tracked in
+  [NVIDIA/OpenShell#2818](https://github.com/NVIDIA/OpenShell/issues/2818).
+  GitOps must keep the feature disabled until that contract and the resulting
+  immutable bridge artifact are available.
 - `config.controller.litellmUrl` and
   `config.controller.openshellEndpoint` are internal service endpoints.
 - The OpenShell endpoint must use HTTPS. `openshellServerName` pins the TLS

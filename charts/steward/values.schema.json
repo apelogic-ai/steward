@@ -168,6 +168,52 @@
         }
       }
     },
+    "stableBridge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "image",
+        "signerIdentity",
+        "sourceRepository",
+        "sourceCommit",
+        "service",
+        "attestationBundle"
+      ],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "image": {"type": "string"},
+        "signerIdentity": {"type": "string"},
+        "sourceRepository": {"type": "string"},
+        "sourceCommit": {"type": "string"},
+        "service": {"type": "string"},
+        "attestationBundle": {"type": "string"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"enabled": {"const": true}}},
+          "then": {
+            "properties": {
+              "image": {
+                "type": "string",
+                "pattern": "^.+@sha256:[a-f0-9]{64}$"
+              },
+              "signerIdentity": {"$ref": "#/definitions/nonempty"},
+              "sourceRepository": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+              },
+              "sourceCommit": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{40}$"
+              },
+              "service": {"$ref": "#/definitions/nonempty"},
+              "attestationBundle": {"$ref": "#/definitions/nonempty"}
+            }
+          }
+        }
+      ]
+    },
     "runtimeNamespaces": {
       "type": "array",
       "items": {"type": "string", "minLength": 1},
