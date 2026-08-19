@@ -1557,9 +1557,9 @@ async fn suspend_runtime<R: SandboxRuntime>(
     let decision = reconcile_once(runtime, ReconcileIntent::Delete, sandbox_runtime)
         .await
         .map_err(ControllerError::Reconcile)?;
-    let mut status = match decision {
-        ReconcileDecision::Deleted => suspended_status(runtime)?,
-        ReconcileDecision::Status(status) => status,
+    let (mut status, requeue_after) = match decision {
+        ReconcileDecision::Deleted => (suspended_status(runtime)?, StdDuration::from_secs(60)),
+        ReconcileDecision::Status(status) => (status, StdDuration::from_secs(2)),
     };
     status.spend = spend;
     if runtime.status.as_ref() != Some(&status) {
@@ -1571,7 +1571,7 @@ async fn suspend_runtime<R: SandboxRuntime>(
         .await
         .map_err(ControllerError::Kubernetes)?;
     }
-    Ok(Action::requeue(StdDuration::from_secs(60)))
+    Ok(Action::requeue(requeue_after))
 }
 
 async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferencePlane>(
@@ -2464,13 +2464,13 @@ mod tests {
     use tower::service_fn;
 
     use super::{
-        AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ReconcileDecision,
+        Action, AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ReconcileDecision,
         ReconcileIntent, SERVICE_PRINCIPAL_ANNOTATION, TaskRuntimeAction, TaskRuntimeBinding,
         authority_action, authority_application_action, cleanup_runtime,
         exhausted_spend_to_preserve, inference_action, reconcile_once, replace_as_authority,
         runtime_authority_action, runtime_ttl_action, server_task_runtime_manifest,
-        status_merge_patch, suspend_runtime_with_inference_cleanup, task_output_archive_failure,
-        task_runtime_action, ttl_action,
+        status_merge_patch, suspend_runtime, suspend_runtime_with_inference_cleanup,
+        task_output_archive_failure, task_runtime_action, ttl_action,
     };
 
     #[test]
@@ -2999,6 +2999,27 @@ mod tests {
             spend: None,
         });
         runtime
+    }
+
+    #[tokio::test]
+    async fn suspension_requeues_promptly_while_sandbox_deletion_is_pending() -> Result<(), String>
+    {
+        let runtime = fixture();
+        let (client, _) = successful_cleanup_client(&runtime)?;
+        let api = kube::Api::<AgentRuntime>::namespaced(client.clone(), "team-a");
+
+        let action = suspend_runtime(&runtime, &api, &ProvisioningDeleteRuntime, None)
+            .await
+            .map_err(|error| {
+                format!("pending sandbox deletion must remain reconcilable: {error}")
+            })?;
+
+        assert_eq!(
+            action,
+            Action::requeue(StdDuration::from_secs(2)),
+            "a budget-exhausted runtime in Terminating must be polled promptly; a 60-second retry can make the required suspension transition miss its deadline"
+        );
+        Ok(())
     }
 
     fn successful_cleanup_client(
