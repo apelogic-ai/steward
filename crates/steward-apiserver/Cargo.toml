@@ -19,6 +19,7 @@ serde-saphyr.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
+sigstore-verify.workspace = true
 steward-admission = { path = "../steward-admission", version = "=0.0.0" }
 steward-ports = { path = "../steward-ports", version = "=0.0.0" }
 steward-store = { path = "../steward-store", version = "=0.0.0" }
