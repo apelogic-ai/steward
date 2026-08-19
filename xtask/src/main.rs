@@ -1019,10 +1019,19 @@ mod tests {
             .map_err(|error| format!("task lifecycle image callback is required: {error}"))?;
 
         let lifecycle_job = ci_job(&workflow, "e2e-controller-runtime-lifecycle")?;
+        let pinned_job = ci_job(&workflow, "pinned")?;
 
         assert!(
             lifecycle_job.contains("cargo xtask e2e-controller-runtime-lifecycle"),
             "controller-owned lifecycle CI must invoke the named xtask E2E gate"
+        );
+        assert!(
+            pinned_job.contains("- e2e-controller-runtime-lifecycle")
+                && pinned_job.contains(
+                    "CONTROLLER_RUNTIME_LIFECYCLE: ${{ needs.e2e-controller-runtime-lifecycle.result }}"
+                )
+                && pinned_job.contains("${CONTROLLER_RUNTIME_LIFECYCLE}"),
+            "the pinned aggregate must fail when the controller-owned lifecycle E2E fails"
         );
         assert!(
             xtask_source.contains("\"e2e-controller-runtime-lifecycle\" if rest.is_empty()"),

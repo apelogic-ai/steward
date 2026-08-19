@@ -361,6 +361,7 @@ jobs:
       - conformance-pinned
       - e2e-provisioning
       - e2e-runtime
+      - e2e-controller-runtime-lifecycle
       - e2e-admission
       - e2e-escalation
       - openshell-adapter
@@ -377,6 +378,7 @@ jobs:
           CONFORMANCE: ${{ needs.conformance-pinned.result }}
           PROVISIONING: ${{ needs.e2e-provisioning.result }}
           RUNTIME: ${{ needs.e2e-runtime.result }}
+          CONTROLLER_RUNTIME_LIFECYCLE: ${{ needs.e2e-controller-runtime-lifecycle.result }}
           ADMISSION: ${{ needs.e2e-admission.result }}
           ESCALATION: ${{ needs.e2e-escalation.result }}
           OPENSHELL_ADAPTER: ${{ needs.openshell-adapter.result }}
@@ -390,6 +392,7 @@ jobs:
             "${CONFORMANCE}" \
             "${PROVISIONING}" \
             "${RUNTIME}" \
+            "${CONTROLLER_RUNTIME_LIFECYCLE}" \
             "${ADMISSION}" \
             "${ESCALATION}" \
             "${OPENSHELL_ADAPTER}" \
