@@ -57,6 +57,8 @@ const NAME_LENGTH: usize = 19;
 const HASH_CHARACTERS: usize = NAME_LENGTH - 2;
 const LOWER_BASE36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 #[cfg(feature = "runtime")]
+const TAR_BLOCK_BYTES: usize = 512;
+#[cfg(feature = "runtime")]
 const KUBERNETES_DNS_SUBDOMAIN_MAX_LENGTH: usize = 253;
 #[cfg(feature = "runtime")]
 const KUBERNETES_DNS_LABEL_MAX_LENGTH: usize = 63;
@@ -334,6 +336,89 @@ fn is_digest_pinned_image(value: &str) -> bool {
         && digest["sha256:".len()..]
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(feature = "runtime")]
+fn validate_connections_bridge_archive(
+    archive: &[u8],
+    expected_file: &str,
+) -> Result<(), PortError> {
+    let reject = || PortError::Rejected {
+        reason: "Connections bridge archive must contain exactly one expected regular file"
+            .to_owned(),
+    };
+    if expected_file.is_empty()
+        || archive.len() < TAR_BLOCK_BYTES * 3
+        || !archive.len().is_multiple_of(TAR_BLOCK_BYTES)
+    {
+        return Err(reject());
+    }
+    let header = &archive[..TAR_BLOCK_BYTES];
+    if header.iter().all(|byte| *byte == 0)
+        || tar_checksum(header).is_none()
+        || header[156] != 0 && header[156] != b'0'
+        || header[345..500].iter().any(|byte| *byte != 0)
+        || header[157..257].iter().any(|byte| *byte != 0)
+        || tar_string(&header[..100]) != Some(expected_file)
+    {
+        return Err(reject());
+    }
+    let size = tar_octal(&header[124..136]).ok_or_else(reject)?;
+    let body_end = TAR_BLOCK_BYTES
+        .checked_add(size)
+        .and_then(|end| end.checked_add(TAR_BLOCK_BYTES - 1))
+        .map(|end| end / TAR_BLOCK_BYTES * TAR_BLOCK_BYTES)
+        .ok_or_else(reject)?;
+    if body_end > archive.len() - TAR_BLOCK_BYTES * 2
+        || archive[body_end..].iter().any(|byte| *byte != 0)
+    {
+        return Err(reject());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "runtime")]
+fn tar_checksum(header: &[u8]) -> Option<()> {
+    if header.len() != TAR_BLOCK_BYTES {
+        return None;
+    }
+    tar_octal(&header[148..156]).and_then(|expected| {
+        let actual = header
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| {
+                u32::from(if (148..156).contains(&index) {
+                    b' '
+                } else {
+                    *byte
+                })
+            })
+            .sum::<u32>();
+        (u32::try_from(expected).ok()? == actual).then_some(())
+    })
+}
+
+#[cfg(feature = "runtime")]
+fn tar_octal(field: &[u8]) -> Option<usize> {
+    let field = field
+        .strip_prefix(&[b' '][..])
+        .unwrap_or(field)
+        .split(|byte| *byte == 0 || *byte == b' ')
+        .next()
+        .filter(|value| !value.is_empty())?;
+    field.iter().try_fold(0_usize, |value, byte| {
+        (b'0'..=b'7')
+            .contains(byte)
+            .then(|| value.checked_mul(8)?.checked_add(usize::from(*byte - b'0')))
+            .flatten()
+    })
+}
+
+#[cfg(feature = "runtime")]
+fn tar_string(field: &[u8]) -> Option<&str> {
+    let nul = field.iter().position(|byte| *byte == 0)?;
+    field[nul..].iter().all(|byte| *byte == 0).then_some(())?;
+    std::str::from_utf8(&field[..nul]).ok()
 }
 
 #[cfg(feature = "runtime")]
@@ -1250,6 +1335,10 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 reason: "task command must contain only non-empty arguments".to_owned(),
             });
         }
+        let is_connections_bridge = request.agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE;
+        if is_connections_bridge {
+            validate_connections_bridge_archive(input_archive, "request.json")?;
+        }
         let snapshot = self
             .authenticated_client()
             .await?
@@ -1324,6 +1413,11 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 reason: format!("task agent exited with code {}", executed.exit_code),
             });
         }
+        let output_archive_command = if is_connections_bridge {
+            "set -eu; test -f /sandbox/steward-output/response.json; tar -cf - -C /sandbox/steward-output response.json"
+        } else {
+            "set -eu; tar -cf - -C /sandbox/steward-output ."
+        };
         let collected = self
             .authenticated_client()
             .await?
@@ -1333,7 +1427,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 &[
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "set -eu; tar -cf - -C /sandbox/steward-output .".to_owned(),
+                    output_archive_command.to_owned(),
                 ],
                 ExecOptions {
                     timeout: Some(StdDuration::from_secs(120)),
@@ -1346,6 +1440,9 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             return Err(PortError::Failed {
                 reason: "task output archive could not be collected".to_owned(),
             });
+        }
+        if is_connections_bridge {
+            validate_connections_bridge_archive(&collected.stdout, "response.json")?;
         }
         Ok(SandboxTaskOutput {
             archive: collected.stdout,
@@ -1413,6 +1510,8 @@ mod tests {
     #[cfg(feature = "runtime")]
     use steward_types::{AgentType, RuntimeId, RuntimeRefs, ToolGrant};
 
+    #[cfg(feature = "runtime")]
+    use super::validate_connections_bridge_archive;
     #[cfg(feature = "runtime")]
     use super::{
         CONNECTIONS_BRIDGE_AGENT_TYPE, OpenShellConnectionConfig, ProviderReconciliation,
@@ -2098,6 +2197,87 @@ mod tests {
             "only the exact digest that passed configuration may reach OpenShell"
         );
         Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn connections_bridge_archives_are_exact_single_files() {
+        let valid_request = single_file_tar("request.json", br#"{}"#);
+        assert!(
+            validate_connections_bridge_archive(&valid_request, "request.json").is_ok(),
+            "the bridge may stage exactly its one server-authored request file"
+        );
+        let valid_response = single_file_tar("response.json", br#"{}"#);
+        assert!(
+            validate_connections_bridge_archive(&valid_response, "response.json").is_ok(),
+            "the bridge may persist exactly its one response file"
+        );
+
+        for (description, archive) in [
+            (
+                "path traversal",
+                single_file_tar("../request.json", br#"{}"#),
+            ),
+            ("wrong filename", single_file_tar("other.json", br#"{}"#)),
+            (
+                "multiple entries",
+                two_file_tar("request.json", br#"{}"#, "extra.json", br#"{}"#),
+            ),
+        ] {
+            assert!(
+                validate_connections_bridge_archive(&archive, "request.json").is_err(),
+                "the bridge must reject {description} instead of extracting it"
+            );
+        }
+
+        let mut corrupted_checksum = valid_request;
+        corrupted_checksum[0] = b'X';
+        assert!(
+            validate_connections_bridge_archive(&corrupted_checksum, "request.json").is_err(),
+            "the bridge must reject an archive whose checksum does not bind its path"
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    fn single_file_tar(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut archive = tar_header(name, body.len());
+        archive.extend_from_slice(body);
+        archive.resize((archive.len() + 511) & !511, 0);
+        archive.extend_from_slice(&[0; 1024]);
+        archive
+    }
+
+    #[cfg(feature = "runtime")]
+    fn two_file_tar(
+        first_name: &str,
+        first_body: &[u8],
+        second_name: &str,
+        second_body: &[u8],
+    ) -> Vec<u8> {
+        let mut archive = tar_header(first_name, first_body.len());
+        archive.extend_from_slice(first_body);
+        archive.resize((archive.len() + 511) & !511, 0);
+        archive.extend_from_slice(&tar_header(second_name, second_body.len()));
+        archive.extend_from_slice(second_body);
+        archive.resize((archive.len() + 511) & !511, 0);
+        archive.extend_from_slice(&[0; 1024]);
+        archive
+    }
+
+    #[cfg(feature = "runtime")]
+    fn tar_header(name: &str, size: usize) -> Vec<u8> {
+        let mut header = vec![0_u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        let size = format!("{:011o}\0", size);
+        header[124..136].copy_from_slice(size.as_bytes());
+        header[148..156].fill(b' ');
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        let checksum = format!("{:06o}\0 ", checksum);
+        header[148..156].copy_from_slice(checksum.as_bytes());
+        header
     }
 
     #[cfg(feature = "runtime")]
