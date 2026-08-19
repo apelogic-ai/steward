@@ -23,6 +23,7 @@ use tokio_rustls::server::TlsStream;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
     let database_url = required("STEWARD_TEST_DATABASE_URL")?;
     let actor = required("STEWARD_TEST_ACTOR")?;
     let member_role = required("STEWARD_TEST_MEMBER_ROLE")?;
@@ -64,6 +65,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
     Ok(())
+}
+
+fn install_rustls_crypto_provider() -> Result<(), io::Error> {
+    use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
+
+    if CryptoProvider::get_default().is_none() {
+        let _ = ring::default_provider().install_default();
+    }
+    if CryptoProvider::get_default().is_some() {
+        Ok(())
+    } else {
+        Err(io::Error::other("Rustls crypto provider is unavailable"))
+    }
 }
 
 #[derive(Clone)]
@@ -146,5 +160,17 @@ impl Listener for TlsListener {
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
         self.listener.local_addr()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServerConfig, install_rustls_crypto_provider};
+
+    #[test]
+    fn tls_server_configuration_selects_a_crypto_provider() -> Result<(), String> {
+        install_rustls_crypto_provider().map_err(|error| error.to_string())?;
+        let _ = ServerConfig::builder();
+        Ok(())
     }
 }

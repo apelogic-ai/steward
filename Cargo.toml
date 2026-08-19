@@ -46,6 +46,7 @@ serde = { version = "1", features = ["derive"] }
 serde-saphyr = "0.0.29"
 serde_json = "1"
 sha2 = "0.10"
+sigstore-verify = { version = "0.11.0", default-features = false, features = ["rustls"] }
 spiffe = { version = "0.16.0", default-features = false, features = ["workload-api-jwt"] }
 sqlx = { version = "0.8", default-features = false, features = ["json", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-ring-native-roots", "uuid"] }
 tokio = { version = "1.43", features = ["macros", "net", "rt-multi-thread"] }

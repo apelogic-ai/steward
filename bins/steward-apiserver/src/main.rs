@@ -10,7 +10,7 @@ use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{
     KubeRuntimeRepository, KubernetesTaskIdentityResolver, KubernetesTokenAuthenticator,
     KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog, agent_runs_ui, browser_auth,
-    google_oidc, router, task_router, user_envelopes,
+    google_oidc, router, stable_runtime_bridge, task_router, user_envelopes,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
@@ -33,6 +33,7 @@ const MAX_PENDING_TLS_HANDSHAKES: usize = 64;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
     if env::args().nth(1).as_deref() == Some("bootstrap-rbac") {
         return bootstrap_rbac(env::args().skip(2).collect()).await;
     }
@@ -69,13 +70,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         decisions.clone(),
     )
     .merge(task_router(
-        runtimes,
+        runtimes.clone(),
         store.clone(),
         decisions,
         task_identities,
         task_workflows,
     ));
-    let app = match browser_application_router(store)? {
+    let app = match browser_application_router(store, runtimes)? {
         Some(browser) => app.merge(browser),
         None => app,
     };
@@ -89,7 +90,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn browser_application_router(store: PgStore) -> Result<Option<axum::Router>, Box<dyn Error>> {
+fn install_rustls_crypto_provider() -> Result<(), io::Error> {
+    use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
+
+    if CryptoProvider::get_default().is_none() {
+        let _ = ring::default_provider().install_default();
+    }
+    if CryptoProvider::get_default().is_some() {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "install the Steward Rustls crypto provider",
+        ))
+    }
+}
+
+fn browser_application_router(
+    store: PgStore,
+    runtimes: KubeRuntimeRepository,
+) -> Result<Option<axum::Router>, Box<dyn Error>> {
     let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
         return Ok(None);
     };
@@ -113,14 +132,100 @@ fn browser_application_router(store: PgStore) -> Result<Option<axum::Router>, Bo
         Arc::new(browser_auth::PgBrowserIdentityResolver::new(store.clone())),
     )
     .map_err(io::Error::other)?;
-    Ok(Some(
-        browser_auth::browser_auth_router(auth.clone())
-            .merge(user_envelopes::protected_router(
-                user_envelopes::PgEnvelopeRequestBroker::new(store.clone()),
-                auth.clone(),
-            ))
-            .merge(agent_runs_ui::protected_router(store, auth)),
-    ))
+    let app = browser_auth::browser_auth_router(auth.clone())
+        .merge(user_envelopes::protected_router(
+            user_envelopes::PgEnvelopeRequestBroker::new(store.clone()),
+            auth.clone(),
+        ))
+        .merge(agent_runs_ui::protected_router(store.clone(), auth.clone()));
+    let app = match stable_bridge_configuration()? {
+        Some((service, verifier)) => app.merge(stable_runtime_bridge::protected_router(
+            store, runtimes, verifier, auth, service,
+        )),
+        None => app,
+    };
+    Ok(Some(app))
+}
+
+fn stable_bridge_configuration() -> Result<
+    Option<(
+        stable_runtime_bridge::BridgeService,
+        stable_runtime_bridge::GitHubArtifactVerifier,
+    )>,
+    io::Error,
+> {
+    let image = env::var("STEWARD_STABLE_BRIDGE_IMAGE").ok();
+    let signer_identity = env::var("STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY").ok();
+    let source_repository = env::var("STEWARD_STABLE_BRIDGE_SOURCE_REPOSITORY").ok();
+    let source_commit = env::var("STEWARD_STABLE_BRIDGE_SOURCE_COMMIT").ok();
+    let bundle_file = env::var("STEWARD_STABLE_BRIDGE_ATTESTATION_BUNDLE_FILE").ok();
+    let service = env::var("STEWARD_STABLE_BRIDGE_SERVICE").ok();
+    let bundle = bundle_file
+        .as_deref()
+        .map(fs::read_to_string)
+        .transpose()
+        .map_err(|_| io::Error::other("read stable bridge attestation bundle"))?;
+    stable_bridge_configuration_from_values(
+        image,
+        signer_identity,
+        source_repository,
+        source_commit,
+        bundle,
+        service,
+    )
+}
+
+fn stable_bridge_configuration_from_values(
+    image: Option<String>,
+    signer_identity: Option<String>,
+    source_repository: Option<String>,
+    source_commit: Option<String>,
+    bundle: Option<String>,
+    service: Option<String>,
+) -> Result<
+    Option<(
+        stable_runtime_bridge::BridgeService,
+        stable_runtime_bridge::GitHubArtifactVerifier,
+    )>,
+    io::Error,
+> {
+    if [
+        image.as_ref(),
+        signer_identity.as_ref(),
+        source_repository.as_ref(),
+        source_commit.as_ref(),
+        bundle.as_ref(),
+        service.as_ref(),
+    ]
+    .iter()
+    .all(Option::is_none)
+    {
+        return Ok(None);
+    }
+    let image = image.ok_or_else(stable_bridge_configuration_error)?;
+    let signer_identity = signer_identity.ok_or_else(stable_bridge_configuration_error)?;
+    let source_repository = source_repository.ok_or_else(stable_bridge_configuration_error)?;
+    let source_commit = source_commit.ok_or_else(stable_bridge_configuration_error)?;
+    let bundle = bundle.ok_or_else(stable_bridge_configuration_error)?;
+    let service = stable_runtime_bridge::BridgeService::new(
+        service.ok_or_else(stable_bridge_configuration_error)?,
+    )
+    .map_err(io::Error::other)?;
+    let verifier = stable_runtime_bridge::GitHubArtifactVerifier::from_jsonl(
+        image,
+        signer_identity,
+        source_repository,
+        source_commit,
+        &bundle,
+    )
+    .map_err(io::Error::other)?;
+    Ok(Some((service, verifier)))
+}
+
+fn stable_bridge_configuration_error() -> io::Error {
+    io::Error::other(
+        "stable bridge configuration requires image, signer identity, source repository, source commit, attestation bundle file, and service together",
+    )
 }
 
 async fn bootstrap_rbac(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
@@ -312,8 +417,46 @@ mod tests {
 
     use super::{
         KubernetesTokenReviewAudience, TlsListener, bootstrap_rbac_arguments, decode_tls_material,
-        kubernetes_token_review_audience,
+        install_rustls_crypto_provider, kubernetes_token_review_audience,
+        stable_bridge_configuration_from_values,
     };
+
+    #[test]
+    fn stable_bridge_configuration_rejects_partial_or_unattested_input() {
+        let image = Some(
+            "ghcr.io/example-org/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        );
+        let signer = Some(
+            "https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.0"
+                .to_owned(),
+        );
+        let source_repository = Some("https://github.com/example-org/steward".to_owned());
+        let source_commit = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned());
+        assert!(
+            stable_bridge_configuration_from_values(
+                image.clone(),
+                signer.clone(),
+                source_repository.clone(),
+                source_commit.clone(),
+                None,
+                Some("steward-run".to_owned())
+            )
+            .is_err(),
+            "a production route must not start with only a digest and signer identity"
+        );
+        assert!(
+            stable_bridge_configuration_from_values(
+                image,
+                signer,
+                source_repository,
+                source_commit,
+                Some("not a bundle".to_owned()),
+                Some("steward-run".to_owned())
+            )
+            .is_err(),
+            "a production route must reject an unparseable provenance bundle"
+        );
+    }
 
     #[test]
     fn cert_manager_pem_tls_material_is_decoded() -> Result<(), String> {
@@ -386,6 +529,7 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_tls_handshakes_do_not_serialize_acceptance() -> Result<(), String> {
+        install_rustls_crypto_provider().map_err(|error| error.to_string())?;
         let tcp = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|error| format!("bind test listener: {error}"))?;
