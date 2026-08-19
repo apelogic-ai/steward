@@ -42,7 +42,7 @@ helm template steward "${root}/charts/steward" \
   "${stable_bridge_values[@]}" > "${stable_bridge_rendered}"
 
 grep -q '^kind: ConfigMap$' "${stable_bridge_rendered}"
-grep -Eq '^  name: steward-stable-bridge-attestation-[0-9a-f]{12}$' "${stable_bridge_rendered}"
+grep -Eq '^metadata: \{ name: steward-stable-bridge-attestation-[0-9a-f]{12} \}$' "${stable_bridge_rendered}"
 grep -q 'name: STEWARD_STABLE_BRIDGE_IMAGE' "${stable_bridge_rendered}"
 grep -q 'name: STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY' "${stable_bridge_rendered}"
 grep -q 'name: STEWARD_STABLE_BRIDGE_SOURCE_REPOSITORY' "${stable_bridge_rendered}"
