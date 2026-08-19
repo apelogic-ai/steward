@@ -11,6 +11,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
+use sigstore_verify::{
+    VerificationPolicy, Verifier,
+    trust_root::{SigstoreInstance, TrustedRoot},
+    types::{Bundle, Sha256Hash, SignatureContent, intoto::Statement},
+};
 use steward_store::{ActiveTaskRuntime, PgStore};
 use steward_types::CanonicalUserId;
 
@@ -127,6 +132,96 @@ pub trait BridgeArtifactVerifier: Clone + Send + Sync + 'static {
     /// Returns the immutable image reference only after the verifier has accepted the artifact's
     /// provenance.  The bridge additionally rejects mutable image references before use.
     fn verify_bridge_artifact<'a>(&'a self) -> BoxFuture<'a, Result<String, StableBridgeError>>;
+}
+
+const GITHUB_ACTIONS_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+const SLSA_PROVENANCE_V1: &str = "https://slsa.dev/provenance/v1";
+const IN_TOTO_STATEMENT_V1: &str = "https://in-toto.io/Statement/v1";
+
+/// A concrete, offline verifier for the GitHub artifact-attestation bundle shipped with a
+/// bridge release. The configured image remains digest-pinned; the bundle must additionally
+/// bind that digest to the configured GitHub Actions workflow identity.
+#[derive(Clone)]
+pub struct GitHubArtifactVerifier {
+    image_reference: String,
+    signer_identity: String,
+    bundles: Vec<Bundle>,
+}
+
+impl GitHubArtifactVerifier {
+    pub fn from_jsonl(
+        image_reference: String,
+        signer_identity: String,
+        bundle_jsonl: &str,
+    ) -> Result<Self, String> {
+        let _ = verified_artifact(image_reference.clone())
+            .map_err(|_| "bridge image must be an immutable sha256 reference".to_owned())?;
+        if signer_identity.trim().is_empty() {
+            return Err("GitHub bridge signer identity must be non-empty".to_owned());
+        }
+        let bundles = bundle_jsonl
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(Bundle::from_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "bridge provenance bundle is invalid".to_owned())?;
+        if bundles.is_empty() {
+            return Err("bridge provenance bundle must contain an attestation".to_owned());
+        }
+        Ok(Self {
+            image_reference,
+            signer_identity,
+            bundles,
+        })
+    }
+
+    fn verified_image_reference(&self) -> Result<String, StableBridgeError> {
+        let artifact = verified_artifact(self.image_reference.clone())?;
+        let digest_hex = artifact
+            .image_reference()
+            .rsplit_once('@')
+            .map(|(_, digest)| &digest["sha256:".len()..])
+            .ok_or(StableBridgeError::ArtifactUnverified)?;
+        let digest =
+            Sha256Hash::from_hex(digest_hex).map_err(|_| StableBridgeError::ArtifactUnverified)?;
+        let trusted_root = TrustedRoot::from_embedded(SigstoreInstance::GitHub)
+            .map_err(|_| StableBridgeError::ArtifactUnverified)?;
+        let verifier = Verifier::new(&trusted_root);
+        let policy = VerificationPolicy::default()
+            .require_identity(self.signer_identity.clone())
+            .require_issuer(GITHUB_ACTIONS_OIDC_ISSUER)
+            // GitHub's artifact-attestation Sigstore instance intentionally does not provide
+            // the public-good SCT/tlog material. Its embedded GitHub root still verifies the
+            // certificate chain, signature, declared signer identity, and DSSE subject digest.
+            .skip_sct()
+            .skip_tlog();
+        if self.bundles.iter().any(|bundle| {
+            github_slsa_provenance_binds_digest(bundle, digest_hex)
+                && verifier.verify(digest, bundle, &policy).is_ok()
+        }) {
+            Ok(artifact.image_reference().to_owned())
+        } else {
+            Err(StableBridgeError::ArtifactUnverified)
+        }
+    }
+}
+
+impl BridgeArtifactVerifier for GitHubArtifactVerifier {
+    fn verify_bridge_artifact<'a>(&'a self) -> BoxFuture<'a, Result<String, StableBridgeError>> {
+        Box::pin(async move { self.verified_image_reference() })
+    }
+}
+
+fn github_slsa_provenance_binds_digest(bundle: &Bundle, digest_hex: &str) -> bool {
+    let SignatureContent::DsseEnvelope(envelope) = &bundle.content else {
+        return false;
+    };
+    let Ok(statement) = serde_json::from_slice::<Statement>(&envelope.decode_payload()) else {
+        return false;
+    };
+    statement.type_ == IN_TOTO_STATEMENT_V1
+        && statement.predicate_type == SLSA_PROVENANCE_V1
+        && statement.matches_sha256(digest_hex)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -312,7 +407,8 @@ mod tests {
 
     use super::{
         ActiveTaskRuntimeSource, BridgeArtifactVerifier, BridgeRuntimeReference, BridgeService,
-        STABLE_RUNTIME_BRIDGE_PATH, StableBridgeError, StableRuntimeBridge, protected_router,
+        GitHubArtifactVerifier, STABLE_RUNTIME_BRIDGE_PATH, StableBridgeError, StableRuntimeBridge,
+        protected_router,
     };
     use crate::browser_auth::{
         BrowserAuthService, LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service,
@@ -354,6 +450,19 @@ mod tests {
         ) -> BoxFuture<'a, Result<String, StableBridgeError>> {
             Box::pin(async { Ok("registry.example.test/steward-bridge:latest".to_owned()) })
         }
+    }
+
+    #[test]
+    fn github_artifact_verifier_fails_closed_without_a_parseable_attestation() {
+        let result = GitHubArtifactVerifier::from_jsonl(
+            "ghcr.io/example-org/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.0".to_owned(),
+            "not a Sigstore bundle\n",
+        );
+        assert!(
+            result.is_err(),
+            "a digest alone must never activate the stable bridge without a parseable GitHub attestation"
+        );
     }
 
     #[derive(Clone)]
