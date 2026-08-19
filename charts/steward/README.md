@@ -92,12 +92,12 @@ that allowlist remain inaccessible to both service accounts.
   or unverified bundle.
 - This chart wiring enables the session-protected stable bridge *resolver*.
   It does not invent sandbox artifact installation, a Kubernetes pod selector,
-  or a direct pod copy/exec path. The pinned OpenShell API has no supported
-  artifact/sidecar delivery or replacement-safe service exposure contract;
-  that upstream requirement is tracked in
-  [NVIDIA/OpenShell#2818](https://github.com/NVIDIA/OpenShell/issues/2818).
-  GitOps must keep the feature disabled until that contract and the resulting
-  immutable bridge artifact are available.
+  or a direct pod copy/exec path. OpenShell upstream delivery work is not an
+  activation gate. [LBE-318](https://linear.app/lbelyaev/issue/LBE-318)
+  owns the controller-reconciled execution contract; [LBE-326](https://linear.app/lbelyaev/issue/LBE-326)
+  owns publication of the compatible, immutable bridge image and provenance
+  coordinates. GitOps keeps the feature disabled until those internal inputs
+  are available and verified.
 - `config.controller.litellmUrl` and
   `config.controller.openshellEndpoint` are internal service endpoints.
 - The OpenShell endpoint must use HTTPS. `openshellServerName` pins the TLS

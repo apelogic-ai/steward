@@ -134,7 +134,7 @@ metadata: { name: {{ $stableBridgeBundleName }} }
 immutable: true
 data:
   bundle.jsonl: |-
-{{ .Values.stableBridge.attestationBundle | nindent 4 }}
+{{ .Values.stableBridge.attestationBundle | indent 4 }}
 {{- end }}
 ---
 apiVersion: cert-manager.io/v1
