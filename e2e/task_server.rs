@@ -134,6 +134,23 @@ fn task_fixture_identities_match_the_reviewed_organization_domain() {
     );
 }
 
+#[test]
+fn task_mcp_seed_binds_the_registered_fixture_identity() {
+    let seed = include_str!("../config/s1/seed-mcp-gw.ts");
+    let tools_stack = include_str!("../config/s5/tools-stack.yaml");
+    assert!(
+        seed.contains("TASK_FIXTURE_IDENTITY_SUBJECT")
+            && seed.contains("canonical_identity_subjects")
+            && seed.contains("await taskFixtureHop1Subject()")
+            && seed.contains("task fixture canonical identity was not registered"),
+        "the Task GitHub fixture must resolve the persisted canonical subject instead of reusing S1's fixed account ID"
+    );
+    assert!(
+        tools_stack.contains("TASK_FIXTURE_IDENTITY_SUBJECT"),
+        "the task tools stack must opt the shared seed into canonical-identity lookup"
+    );
+}
+
 #[tokio::test]
 async fn task_server_assertions_reference_persisted_canonical_principals()
 -> Result<(), Box<dyn Error>> {

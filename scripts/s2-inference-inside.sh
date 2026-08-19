@@ -237,7 +237,13 @@ sed "s#STEWARD_S2_CONTROLLER_IMAGE#${STEWARD_S2_CONTROLLER_IMAGE}#g" \
 "${KUBECTL[@]}" apply -f "${rendered_stack}"
 if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   rendered_tools_stack="${STEWARD_RUN_DIR}/s5-tools-stack.yaml"
-  sed "s#STEWARD_S5_MCP_GW_IMAGE#${STEWARD_S5_MCP_GW_IMAGE}#g" \
+  task_fixture_identity_subject=""
+  if [[ "${SLICE}" == "task" ]]; then
+    task_fixture_identity_subject="task-server-alice"
+  fi
+  sed \
+    -e "s#STEWARD_S5_MCP_GW_IMAGE#${STEWARD_S5_MCP_GW_IMAGE}#g" \
+    -e "s#STEWARD_TASK_FIXTURE_IDENTITY_SUBJECT#${task_fixture_identity_subject}#g" \
     "${ROOT}/config/s5/tools-stack.yaml" >"${rendered_tools_stack}"
   "${KUBECTL[@]}" apply -f "${rendered_tools_stack}"
 fi

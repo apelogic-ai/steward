@@ -536,8 +536,9 @@ fn canonical_authority(acting_user: &str) -> Result<serde_json::Value, io::Error
 fn s1_provider_seed_uses_alices_canonical_hop1_subject() {
     let seed = include_str!("../config/s1/seed-mcp-gw.ts");
     assert!(
-        seed.contains(&format!(r#"hop1Subject: "{ALICE_CANONICAL_USER}""#)),
-        "the S1 GitHub fixture must use the canonical HOP-1 subject, not Alice's mutable email"
+        seed.contains("hop1Subject: aliceHop1Subject")
+            && seed.contains(&format!(r#""{ALICE_CANONICAL_USER}""#)),
+        "the S1 GitHub fixture must bind the account to the canonical HOP-1 fallback, not Alice's mutable email"
     );
 }
 

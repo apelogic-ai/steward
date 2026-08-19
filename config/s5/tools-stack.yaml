@@ -366,6 +366,8 @@ spec:
                   key: encryption-key
             - name: HOP1_ISSUER
               value: http://steward-mint-tools.steward-system.svc.cluster.local:8080
+            - name: TASK_FIXTURE_IDENTITY_SUBJECT
+              value: "STEWARD_TASK_FIXTURE_IDENTITY_SUBJECT"
             - name: TOKEN_STORE_DSN
               value: postgres://steward@postgres.steward-system.svc.cluster.local:5432/steward
           volumeMounts:
