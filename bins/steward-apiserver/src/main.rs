@@ -156,6 +156,8 @@ fn stable_bridge_configuration() -> Result<
 > {
     let image = env::var("STEWARD_STABLE_BRIDGE_IMAGE").ok();
     let signer_identity = env::var("STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY").ok();
+    let source_repository = env::var("STEWARD_STABLE_BRIDGE_SOURCE_REPOSITORY").ok();
+    let source_commit = env::var("STEWARD_STABLE_BRIDGE_SOURCE_COMMIT").ok();
     let bundle_file = env::var("STEWARD_STABLE_BRIDGE_ATTESTATION_BUNDLE_FILE").ok();
     let service = env::var("STEWARD_STABLE_BRIDGE_SERVICE").ok();
     let bundle = bundle_file
@@ -163,12 +165,21 @@ fn stable_bridge_configuration() -> Result<
         .map(fs::read_to_string)
         .transpose()
         .map_err(|_| io::Error::other("read stable bridge attestation bundle"))?;
-    stable_bridge_configuration_from_values(image, signer_identity, bundle, service)
+    stable_bridge_configuration_from_values(
+        image,
+        signer_identity,
+        source_repository,
+        source_commit,
+        bundle,
+        service,
+    )
 }
 
 fn stable_bridge_configuration_from_values(
     image: Option<String>,
     signer_identity: Option<String>,
+    source_repository: Option<String>,
+    source_commit: Option<String>,
     bundle: Option<String>,
     service: Option<String>,
 ) -> Result<
@@ -181,6 +192,8 @@ fn stable_bridge_configuration_from_values(
     if [
         image.as_ref(),
         signer_identity.as_ref(),
+        source_repository.as_ref(),
+        source_commit.as_ref(),
         bundle.as_ref(),
         service.as_ref(),
     ]
@@ -191,20 +204,27 @@ fn stable_bridge_configuration_from_values(
     }
     let image = image.ok_or_else(stable_bridge_configuration_error)?;
     let signer_identity = signer_identity.ok_or_else(stable_bridge_configuration_error)?;
+    let source_repository = source_repository.ok_or_else(stable_bridge_configuration_error)?;
+    let source_commit = source_commit.ok_or_else(stable_bridge_configuration_error)?;
     let bundle = bundle.ok_or_else(stable_bridge_configuration_error)?;
     let service = stable_runtime_bridge::BridgeService::new(
         service.ok_or_else(stable_bridge_configuration_error)?,
     )
     .map_err(io::Error::other)?;
-    let verifier =
-        stable_runtime_bridge::GitHubArtifactVerifier::from_jsonl(image, signer_identity, &bundle)
-            .map_err(io::Error::other)?;
+    let verifier = stable_runtime_bridge::GitHubArtifactVerifier::from_jsonl(
+        image,
+        signer_identity,
+        source_repository,
+        source_commit,
+        &bundle,
+    )
+    .map_err(io::Error::other)?;
     Ok(Some((service, verifier)))
 }
 
 fn stable_bridge_configuration_error() -> io::Error {
     io::Error::other(
-        "stable bridge configuration requires image, signer identity, attestation bundle file, and service together",
+        "stable bridge configuration requires image, signer identity, source repository, source commit, attestation bundle file, and service together",
     )
 }
 
@@ -410,10 +430,14 @@ mod tests {
             "https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.0"
                 .to_owned(),
         );
+        let source_repository = Some("https://github.com/example-org/steward".to_owned());
+        let source_commit = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned());
         assert!(
             stable_bridge_configuration_from_values(
                 image.clone(),
                 signer.clone(),
+                source_repository.clone(),
+                source_commit.clone(),
                 None,
                 Some("steward-run".to_owned())
             )
@@ -424,6 +448,8 @@ mod tests {
             stable_bridge_configuration_from_values(
                 image,
                 signer,
+                source_repository,
+                source_commit,
                 Some("not a bundle".to_owned()),
                 Some("steward-run".to_owned())
             )
