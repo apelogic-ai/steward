@@ -34,7 +34,9 @@ fn parse_http_response(output: Output, context: &str) -> Result<HttpResponse, Bo
         io::Error::other(format!("{context} did not return an HTTP status marker"))
     })?;
     let status = status.trim().parse::<u16>().map_err(|error| {
-        io::Error::other(format!("{context} returned an invalid HTTP status: {error}"))
+        io::Error::other(format!(
+            "{context} returned an invalid HTTP status: {error}"
+        ))
     })?;
     Ok(HttpResponse {
         body: body.trim_end_matches('\n').to_owned(),
@@ -116,12 +118,8 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         "the Task API must not bind a runtime UID before controller-owned creation"
     );
     let copy_task_uid = json_string(&copy_smoke, "taskUid")?;
-    let copy_bound = wait_for_runtime_binding(
-        &base_url,
-        copy_task_uid,
-        "github-assertion",
-        &run_dir,
-    )?;
+    let copy_bound =
+        wait_for_runtime_binding(&base_url, copy_task_uid, "github-assertion", &run_dir)?;
     let copy_runtime_uid = json_string(&copy_bound, "runtimeUid")?;
     put_archive(
         &base_url,
@@ -162,7 +160,9 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         "copy-smoke must preserve the input bytes at the declared output path"
     );
     assert!(
-        runtime_by_uid(&runtime_api, copy_runtime_uid).await?.is_some(),
+        runtime_by_uid(&runtime_api, copy_runtime_uid)
+            .await?
+            .is_some(),
         "a successful provisioned Task must retain its exact runtime until finalization is requested"
     );
     delete_task(&base_url, copy_task_uid, "github-assertion", &run_dir)?;
@@ -174,7 +174,9 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         &run_dir,
     )?;
     assert!(
-        runtime_by_uid(&runtime_api, copy_runtime_uid).await?.is_none(),
+        runtime_by_uid(&runtime_api, copy_runtime_uid)
+            .await?
+            .is_none(),
         "finalizing a successful provisioned Task must delete its exact runtime"
     );
     let copy_timeline = store
@@ -205,18 +207,11 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         &run_dir,
     )?;
     let stale_task_uid = json_string(&stale, "taskUid")?;
-    let stale_bound = wait_for_runtime_binding(
-        &base_url,
-        stale_task_uid,
-        "github-assertion",
-        &run_dir,
-    )?;
+    let stale_bound =
+        wait_for_runtime_binding(&base_url, stale_task_uid, "github-assertion", &run_dir)?;
     let stale_runtime_uid = json_string(&stale_bound, "runtimeUid")?;
-    let replacement_runtime_uid = replace_runtime_for_stale_uid_test(
-        &base_url,
-        stale_runtime_uid,
-        &run_dir,
-    )?;
+    let replacement_runtime_uid =
+        replace_runtime_for_stale_uid_test(&base_url, stale_runtime_uid, &run_dir)?;
     assert_ne!(
         replacement_runtime_uid, stale_runtime_uid,
         "the stale-runtime control must create a distinct UID under the same runtime name"
@@ -228,12 +223,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         &input_tar,
         &run_dir,
     )?;
-    execute(
-        &base_url,
-        stale_task_uid,
-        "github-assertion",
-        &run_dir,
-    )?;
+    execute(&base_url, stale_task_uid, "github-assertion", &run_dir)?;
     assert_phase_stays(
         &base_url,
         stale_task_uid,
@@ -265,20 +255,11 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     )?;
     assert_eq!(diagnostic["phase"], "submitted");
     let diagnostic_task_uid = json_string(&diagnostic, "taskUid")?;
-    let diagnostic_bound = wait_for_runtime_binding(
-        &base_url,
-        diagnostic_task_uid,
-        "github-assertion",
-        &run_dir,
-    )?;
+    let diagnostic_bound =
+        wait_for_runtime_binding(&base_url, diagnostic_task_uid, "github-assertion", &run_dir)?;
     let diagnostic_runtime_uid = json_string(&diagnostic_bound, "runtimeUid")?;
     assert_controller_runtime_tool_ready(&runtime_api, diagnostic_runtime_uid).await?;
-    delete_task(
-        &base_url,
-        diagnostic_task_uid,
-        "github-assertion",
-        &run_dir,
-    )?;
+    delete_task(&base_url, diagnostic_task_uid, "github-assertion", &run_dir)?;
     wait_for(
         &base_url,
         diagnostic_task_uid,
@@ -483,12 +464,8 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         &run_dir,
     )?;
     let standing_task_uid = json_string(&standing, "taskUid")?;
-    let standing_bound = wait_for_runtime_binding(
-        &base_url,
-        standing_task_uid,
-        "github-assertion",
-        &run_dir,
-    )?;
+    let standing_bound =
+        wait_for_runtime_binding(&base_url, standing_task_uid, "github-assertion", &run_dir)?;
     let standing_runtime_uid = json_string(&standing_bound, "runtimeUid")?;
     let adopted_body = format!(
         r#"{{"workflow":"code-review","codingAgentRuntime":"base","agentRuntimeUid":"{standing_runtime_uid}"}}"#
@@ -547,12 +524,8 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         &run_dir,
     )?;
     let failing_task_uid = json_string(&failing, "taskUid")?;
-    let failing_bound = wait_for_runtime_binding(
-        &base_url,
-        failing_task_uid,
-        "github-assertion",
-        &run_dir,
-    )?;
+    let failing_bound =
+        wait_for_runtime_binding(&base_url, failing_task_uid, "github-assertion", &run_dir)?;
     let failing_runtime_uid = json_string(&failing_bound, "runtimeUid")?;
     put_archive(
         &base_url,
@@ -973,8 +946,7 @@ fn replace_runtime_for_stale_uid_test(
         ))
         .into());
     }
-    json_string(&serde_json::from_slice(&fs::read(response)?)?, "runtimeUid")
-        .map(str::to_owned)
+    json_string(&serde_json::from_slice(&fs::read(response)?)?, "runtimeUid").map(str::to_owned)
 }
 
 fn assert_phase_stays(

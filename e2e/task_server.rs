@@ -10,8 +10,8 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use kube::ResourceExt;
+use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use serde_json::{Value, json};
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_admission::{Envelope, EnvelopeSpec};
@@ -35,10 +35,7 @@ struct TestTaskIdentities {
 }
 
 impl TestTaskIdentities {
-    fn from_trusted_principals(
-        alice: &CanonicalPrincipal,
-        scheduled: &CanonicalPrincipal,
-    ) -> Self {
+    fn from_trusted_principals(alice: &CanonicalPrincipal, scheduled: &CanonicalPrincipal) -> Self {
         let mut assertions = BTreeMap::new();
         for (assertion, service) in [
             ("github-assertion", "steward-run"),
@@ -162,7 +159,9 @@ async fn task_server_assertions_reference_persisted_canonical_principals()
         .await?
         .resolve("github-assertion")
         .await
-        .map_err(|error| io::Error::other(format!("fixture identity failed to resolve: {error:?}")))?;
+        .map_err(|error| {
+            io::Error::other(format!("fixture identity failed to resolve: {error:?}"))
+        })?;
 
     assert_eq!(
         store
@@ -347,8 +346,7 @@ async fn replace_runtime_for_stale_uid_test(
             Json(json!({"error": "test runtime was not found"})),
         );
     };
-    if current.namespace().as_deref() != Some("team-a")
-        || !current.name_any().starts_with("task-")
+    if current.namespace().as_deref() != Some("team-a") || !current.name_any().starts_with("task-")
     {
         return (
             StatusCode::FORBIDDEN,
@@ -364,7 +362,8 @@ async fn replace_runtime_for_stale_uid_test(
         "steward.test/run-id".to_owned(),
         controls.run_id.clone(),
     )]));
-    let namespaced = Api::<AgentRuntime>::namespaced(controls.runtimes.clone().into_client(), &namespace);
+    let namespaced =
+        Api::<AgentRuntime>::namespaced(controls.runtimes.clone().into_client(), &namespace);
     if let Err(error) = namespaced.delete(&name, &DeleteParams::default()).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -382,7 +381,9 @@ async fn replace_runtime_for_stale_uid_test(
             Err(error) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("could not observe test runtime deletion: {error}")})),
+                    Json(
+                        json!({"error": format!("could not observe test runtime deletion: {error}")}),
+                    ),
                 );
             }
         }
@@ -393,7 +394,10 @@ async fn replace_runtime_for_stale_uid_test(
             Json(json!({"error": "test runtime deletion did not complete within 15 seconds"})),
         );
     }
-    match namespaced.create(&PostParams::default(), &replacement).await {
+    match namespaced
+        .create(&PostParams::default(), &replacement)
+        .await
+    {
         Ok(replacement) => (
             StatusCode::CREATED,
             Json(json!({
