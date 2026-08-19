@@ -346,6 +346,9 @@ metadata:
   name: steward-s2-controller
 rules:
   - apiGroups: ["agents.apelogic.ai"]
+    resources: ["agentruntimes"]
+    verbs: ["create"]
+  - apiGroups: ["agents.apelogic.ai"]
     resources: ["agentruntimes", "agentruntimes/status", "agentruntimes/finalizers"]
     verbs: ["get", "list", "watch", "patch", "update", "delete"]
 ---

@@ -23,18 +23,10 @@ for command in bash docker; do
   fi
 done
 
-"${root}/scripts/build-steward-mint-image.sh"
-"${root}/scripts/build-patched-mcp-gw.sh"
-docker build \
-  --file "${root}/e2e/Dockerfile.task" \
-  --label "steward.test/run-id=${run_id}" \
-  --tag "${image}" \
-  "${root}"
-
 STEWARD_E2E_SLICE=task \
 STEWARD_RUN_ID="${run_id}" \
 STEWARD_S2_CONTROLLER_IMAGE="${image}" \
 STEWARD_S5_MCP_GW_IMAGE="${mcp_gw_image}" \
 STEWARD_TASK_IMAGE="${image}" \
   bash "${root}/scripts/s0-0-openshell-spike.sh" \
-  bash "${root}/scripts/s2-inference-inside.sh"
+  bash "${root}/scripts/task-submission-inside.sh"

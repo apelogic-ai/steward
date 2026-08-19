@@ -15,6 +15,7 @@ pub mod fast_track_connections_bridge;
 pub mod fast_track_runtime_bootstrap;
 mod github_actions;
 pub mod google_oidc;
+pub mod stable_runtime_bridge;
 mod tasks;
 pub mod user_envelopes;
 #[cfg(feature = "admin-demo")]
@@ -393,8 +394,8 @@ pub async fn budget_increase_contract() {}
     ),
     security(("taskBearer" = [])),
     responses(
-        (status = 201, description = "Task admitted without an approval hold and bound to its runtime", body = TaskStatusResponse, content_type = "application/json"),
-        (status = 202, description = "Task parked on a governed approval hold; execution resumes after approval", body = TaskStatusResponse, content_type = "application/json"),
+        (status = 201, description = "Task adopts an already-bound runtime", body = TaskStatusResponse, content_type = "application/json"),
+        (status = 202, description = "Task is accepted for controller-owned runtime creation or parked on a governed approval hold; runtimeUid is null until the controller binds the exact runtime UID", body = TaskStatusResponse, content_type = "application/json"),
         (status = 400, description = "Submission JSON is malformed", body = String, content_type = "text/plain"),
         (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
         (status = 404, description = "Selected workflow does not exist", body = TaskErrorResponse, content_type = "application/json"),
@@ -3680,15 +3681,19 @@ mod tests {
             submission
                 .pointer("/201/description")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| value.contains("without an approval hold")),
-            "201 must explicitly mean admitted without a hold"
+                .is_some_and(|value| value.contains("adopts an already-bound runtime")),
+            "201 must explicitly mean an adopted, already-bound runtime"
         );
         assert!(
             submission
                 .pointer("/202/description")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| value.contains("parked")),
-            "202 must explicitly mean parked for approval"
+                .is_some_and(|value| {
+                    value.contains("controller-owned")
+                        && value.contains("runtimeUid is null")
+                        && value.contains("parked")
+                }),
+            "202 must document controller-owned creation, null runtimeUid, and approval parking"
         );
         assert!(
             document
@@ -7052,11 +7057,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_submission_leaves_an_admitted_runtime_for_controller_reconciliation()
+    -> Result<(), String> {
+        let runtimes = MultiRuntimeRepository::default();
+        let runtime_state = runtimes.runtimes.clone();
+        let ledger = ledger();
+        let task_rows = ledger.tasks.clone();
+        let app = router(
+            runtimes.clone(),
+            ledger.clone(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        )
+        .merge(task_router(
+            runtimes,
+            ledger,
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+        ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "controller-owned-runtime")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"workflow":"code-review","codingAgentRuntime":"agent-v1"}"#,
+                    ))
+                    .map_err(|error| format!("failed to build task submission: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("task submission failed: {error}"))?;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "the Task API must record controller-owned desired work instead of creating an AgentRuntime"
+        );
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("failed to read task submission: {error}"))?;
+        let response = serde_json::from_slice::<serde_json::Value>(&body)
+            .map_err(|error| format!("task submission was not JSON: {error}"))?;
+        assert_eq!(
+            response.pointer("/runtimeUid"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            response.pointer("/phase"),
+            Some(&serde_json::json!("submitted"))
+        );
+        assert!(
+            runtime_state
+                .lock()
+                .map_err(|_| "multi-runtime repository lock was poisoned".to_owned())?
+                .is_empty(),
+            "the HTTP handler must not create the runtime that the controller owns"
+        );
+        let rows = task_rows
+            .lock()
+            .map_err(|_| "fake task ledger lock was poisoned".to_owned())?;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].runtime_uid.is_none());
+        assert_eq!(rows[0].phase, TaskPhase::Submitted);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn task_input_archive_is_persisted_for_the_resolved_submitter() -> Result<(), String> {
         let runtimes = FakeRuntimeRepository {
             runtime: Arc::new(Mutex::new(runtime())),
         };
-        let runtime_state = runtimes.runtime.clone();
         let ledger = ledger();
         let task_rows = ledger.tasks.clone();
         let decisions = FakeDecisionChannel::default();
@@ -7089,15 +7164,16 @@ mod tests {
             )
             .await
             .map_err(|error| format!("task submission failed: {error}"))?;
-        assert_eq!(submitted.status(), StatusCode::CREATED);
+        assert_eq!(submitted.status(), StatusCode::ACCEPTED);
         {
-            let runtime = runtime_state
+            let rows = task_rows
                 .lock()
-                .map_err(|_| "fake runtime lock was poisoned")?;
-            let authority =
-                runtime.spec.canonical_authority.as_ref().ok_or_else(|| {
-                    "delegated Task runtime lacked canonical authority".to_owned()
-                })?;
+                .map_err(|_| "fake task ledger lock was poisoned")?;
+            let authority = rows[0]
+                .runtime_spec
+                .canonical_authority
+                .as_ref()
+                .ok_or_else(|| "delegated Task runtime lacked canonical authority".to_owned())?;
             assert_eq!(
                 authority.owner_user_id.as_str(),
                 "usr_0123456789abcdef0123456789abcdef"
@@ -7347,8 +7423,8 @@ mod tests {
                 .map_err(|error| format!("owner-scoped submission failed: {error}"))?;
             assert_eq!(
                 response.status(),
-                StatusCode::CREATED,
-                "each canonical owner must receive an independent runtime"
+                StatusCode::ACCEPTED,
+                "each canonical owner must receive an independent controller-owned task"
             );
             let body = to_bytes(response.into_body(), 1024 * 1024)
                 .await
@@ -7360,7 +7436,7 @@ mod tests {
                 .oneshot(submit()?)
                 .await
                 .map_err(|error| format!("owner-scoped retry failed: {error}"))?;
-            assert_eq!(retried.status(), StatusCode::CREATED);
+            assert_eq!(retried.status(), StatusCode::ACCEPTED);
             let retry_body = to_bytes(retried.into_body(), 1024 * 1024)
                 .await
                 .map_err(|error| format!("failed to read owner-scoped retry: {error}"))?;
@@ -7402,8 +7478,8 @@ mod tests {
                 .lock()
                 .map_err(|_| "multi-runtime repository lock was poisoned".to_owned())?
                 .len(),
-            2,
-            "both owner-scoped reservations must bind distinct live runtimes"
+            0,
+            "HTTP reservation must not create either owner-scoped runtime"
         );
 
         for ((_, task), other_bearer) in submissions
@@ -7448,7 +7524,6 @@ mod tests {
         let runtimes = FakeRuntimeRepository {
             runtime: Arc::new(Mutex::new(runtime())),
         };
-        let runtime_state = runtimes.runtime.clone();
         let ledger = ledger();
         let task_rows = ledger.tasks.clone();
         let decisions = FakeDecisionChannel::default();
@@ -7484,7 +7559,7 @@ mod tests {
             .oneshot(request()?)
             .await
             .map_err(|error| format!("scheduled task submission failed: {error}"))?;
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         let first_body = to_bytes(response.into_body(), 1024 * 1024)
             .await
             .map_err(|error| format!("failed to read scheduled task: {error}"))?;
@@ -7496,7 +7571,7 @@ mod tests {
             .oneshot(request()?)
             .await
             .map_err(|error| format!("scheduled task retry failed: {error}"))?;
-        assert_eq!(retried.status(), StatusCode::CREATED);
+        assert_eq!(retried.status(), StatusCode::ACCEPTED);
         let retry_body = to_bytes(retried.into_body(), 1024 * 1024)
             .await
             .map_err(|error| format!("failed to read scheduled retry: {error}"))?;
@@ -7518,12 +7593,9 @@ mod tests {
             "idempotent retry must not create a second task"
         );
         assert_eq!(rows[0].owner, "owner@example.org");
-        let runtime = runtime_state
-            .lock()
-            .map_err(|_| "fake runtime lock was poisoned")?;
-        assert_eq!(runtime.spec.owner, Email("owner@example.org".to_owned()));
+        let runtime = &rows[0].runtime_spec;
+        assert_eq!(runtime.owner, Email("owner@example.org".to_owned()));
         let authority = runtime
-            .spec
             .canonical_authority
             .as_ref()
             .ok_or_else(|| "pure-service Task runtime lacked owner authority".to_owned())?;
@@ -7533,7 +7605,7 @@ mod tests {
         );
         assert_eq!(authority.acting_user_id, None);
         assert_eq!(
-            runtime.spec.principal,
+            runtime.principal,
             Principal::Service {
                 name: "scheduled-scanner".to_owned(),
                 acting_user: None,

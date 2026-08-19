@@ -374,7 +374,8 @@ pub struct TaskSubmissionRequest {
 pub struct TaskStatusResponse {
     #[schema(value_type = String, format = "uuid")]
     pub task_uid: Uuid,
-    pub runtime_uid: String,
+    #[schema(value_type = Option<String>)]
+    pub runtime_uid: Option<String>,
     pub phase: TaskPhase,
     pub runtime_ownership: RuntimeOwnership,
     pub finalized: bool,
@@ -846,6 +847,10 @@ where
         return task_response(reservation.record, Vec::new());
     }
 
+    if matches!(&decision, AdmissionDecision::Admit) {
+        return task_response(reservation.record, Vec::new());
+    }
+
     let (runtime, phase, deltas) = create_task_runtime(
         &state.runtimes,
         &state.ledger,
@@ -992,7 +997,7 @@ fn task_response(
     record: TaskRecord,
     deltas: Vec<AdmissionDelta>,
 ) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
-    let status = if record.phase == TaskPhase::Parked {
+    let status = if record.runtime_uid.is_none() || record.phase == TaskPhase::Parked {
         StatusCode::ACCEPTED
     } else if record.finalized {
         StatusCode::OK
@@ -1006,10 +1011,9 @@ fn status_response(
     record: TaskRecord,
     deltas: Vec<AdmissionDelta>,
 ) -> Result<TaskStatusResponse, ApiError> {
-    let runtime_uid = record.runtime_uid.ok_or(ApiError::TaskNotReady)?;
     Ok(TaskStatusResponse {
         task_uid: record.task_uid,
-        runtime_uid,
+        runtime_uid: record.runtime_uid,
         phase: record.phase,
         runtime_ownership: record.runtime_ownership,
         finalized: record.finalized,

@@ -42,6 +42,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "e2e-s4" if rest.is_empty() => e2e_s4(),
         "e2e-s5" if rest.is_empty() => e2e_s5(),
         "e2e-task" if rest.is_empty() => e2e_task(),
+        "e2e-controller-runtime-lifecycle" if rest.is_empty() => e2e_controller_runtime_lifecycle(),
         "e2e-openshell-adapter" if rest.is_empty() => e2e_openshell_adapter(),
         "e2e-postgres-tls" if rest.is_empty() => e2e_postgres_tls(),
         "browser-e2e" if rest.is_empty() => browser_e2e(false),
@@ -78,6 +79,7 @@ fn usage() -> String {
         "  e2e-s4",
         "  e2e-s5",
         "  e2e-task",
+        "  e2e-controller-runtime-lifecycle",
         "  e2e-openshell-adapter",
         "  e2e-postgres-tls",
         "  browser-e2e [--browser-ready]",
@@ -174,6 +176,10 @@ fn e2e_s5() -> TaskResult {
 }
 
 fn e2e_task() -> TaskResult {
+    run("bash", &["scripts/task-submission-e2e.sh"])
+}
+
+fn e2e_controller_runtime_lifecycle() -> TaskResult {
     run("bash", &["scripts/task-submission-e2e.sh"])
 }
 
@@ -900,6 +906,21 @@ mod tests {
 
     static NEXT_REPOSITORY_ID: AtomicU64 = AtomicU64::new(0);
 
+    fn ci_job(workflow: &str, job_name: &str) -> Result<String, String> {
+        let header = format!("\n  {job_name}:");
+        let (_, job) = workflow
+            .split_once(&header)
+            .ok_or_else(|| format!("{job_name} CI job is required"))?;
+
+        Ok(job
+            .lines()
+            .take_while(|line| {
+                line.is_empty() || line.starts_with("    ") || !line.starts_with("  ")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
     #[test]
     fn release_ci_installs_supervisor_build_tools() -> Result<(), String> {
         let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
@@ -988,6 +1009,92 @@ mod tests {
     }
 
     #[test]
+    fn controller_owned_task_lifecycle_is_a_named_ci_e2e_gate() -> Result<(), String> {
+        let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let xtask_source = include_str!("main.rs");
+        let task_wrapper = fs::read_to_string(root().join("scripts/task-submission-e2e.sh"))
+            .map_err(|error| format!("task lifecycle wrapper is required: {error}"))?;
+        let task_callback = fs::read_to_string(root().join("scripts/task-submission-inside.sh"))
+            .map_err(|error| format!("task lifecycle image callback is required: {error}"))?;
+
+        let lifecycle_job = ci_job(&workflow, "e2e-controller-runtime-lifecycle")?;
+        let pinned_job = ci_job(&workflow, "pinned")?;
+
+        assert!(
+            lifecycle_job.contains("cargo xtask e2e-controller-runtime-lifecycle"),
+            "controller-owned lifecycle CI must invoke the named xtask E2E gate"
+        );
+        assert!(
+            pinned_job.contains("- e2e-controller-runtime-lifecycle")
+                && pinned_job.contains(
+                    "CONTROLLER_RUNTIME_LIFECYCLE: ${{ needs.e2e-controller-runtime-lifecycle.result }}"
+                )
+                && pinned_job.contains("${CONTROLLER_RUNTIME_LIFECYCLE}"),
+            "the pinned aggregate must fail when the controller-owned lifecycle E2E fails"
+        );
+        assert!(
+            xtask_source.contains("\"e2e-controller-runtime-lifecycle\" if rest.is_empty()"),
+            "the named controller-owned lifecycle E2E must be dispatchable locally"
+        );
+        assert!(
+            xtask_source.contains("e2e_controller_runtime_lifecycle"),
+            "the named controller-owned lifecycle command must have a dedicated implementation"
+        );
+        assert!(
+            task_wrapper.contains("scripts/task-submission-inside.sh"),
+            "the task lifecycle wrapper must defer image provision until the post-S0 callback"
+        );
+        assert!(
+            !task_wrapper.contains("build-steward-mint-image.sh"),
+            "the task lifecycle wrapper must not build the mint image before the long S0 setup gap"
+        );
+        assert!(
+            !task_wrapper.contains("build-patched-mcp-gw.sh"),
+            "the task lifecycle wrapper must not build mcp-gw before the long S0 setup gap"
+        );
+        for required in [
+            "build-steward-mint-image.sh",
+            "build-patched-mcp-gw.sh",
+            "e2e/Dockerfile.task",
+            "docker image inspect",
+            "exec bash \"${ROOT}/scripts/s2-inference-inside.sh\"",
+        ] {
+            assert!(
+                task_callback.contains(required),
+                "the post-S0 task callback must provision and inspect local images before S2: missing {required}"
+            );
+        }
+        let mint_build = task_callback
+            .find("build-steward-mint-image.sh")
+            .ok_or_else(|| "task callback must build mint".to_owned())?;
+        let mcp_gw_build = task_callback
+            .find("build-patched-mcp-gw.sh")
+            .ok_or_else(|| "task callback must build mcp-gw".to_owned())?;
+        let task_build = task_callback
+            .find("e2e/Dockerfile.task")
+            .ok_or_else(|| "task callback must build controller/task image".to_owned())?;
+        let image_inspect = task_callback
+            .find("docker image inspect")
+            .ok_or_else(|| "task callback must inspect built images".to_owned())?;
+        let s2_exec = task_callback
+            .find("exec bash \"${ROOT}/scripts/s2-inference-inside.sh\"")
+            .ok_or_else(|| "task callback must enter S2 after image checks".to_owned())?;
+        assert!(
+            mint_build < image_inspect
+                && mcp_gw_build < image_inspect
+                && task_build < image_inspect,
+            "the post-S0 callback must build every local image before inspecting it"
+        );
+        assert!(
+            image_inspect < s2_exec,
+            "the post-S0 callback must inspect every local image before any kind load in S2"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn release_candidate_fails_closed_on_critical_component_images() -> Result<(), String> {
         let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
@@ -1030,11 +1137,7 @@ mod tests {
     fn runtime_e2e_reuses_builds_and_preserves_observed_runtime_headroom() -> Result<(), String> {
         let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
-        let runtime = workflow
-            .split("  e2e-runtime:")
-            .nth(1)
-            .and_then(|jobs| jobs.split("\n  e2e-admission:").next())
-            .ok_or_else(|| "shared runtime E2E CI job is required".to_owned())?;
+        let runtime = ci_job(&workflow, "e2e-runtime")?;
 
         assert!(
             runtime.contains("timeout-minutes: 105"),
@@ -1561,6 +1664,25 @@ mod tests {
             "in-cluster controller must use authenticated TLS to OpenShell"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn s2_controller_can_create_only_task_agentruntimes() -> Result<(), String> {
+        let fixture = fs::read_to_string(root().join("config/s2/stack.yaml"))
+            .map_err(|error| format!("S2 controller fixture is required: {error}"))?;
+        let controller_role = fixture
+            .split("---")
+            .find(|document| {
+                document.contains("kind: ClusterRole")
+                    && document.contains("name: steward-s2-controller")
+            })
+            .ok_or_else(|| "S2 controller ClusterRole is required".to_owned())?;
+
+        assert!(
+            controller_role.contains("resources: [\"agentruntimes\"]\n    verbs: [\"create\"]"),
+            "the Task controller must be allowed to create only AgentRuntime resources"
+        );
         Ok(())
     }
 

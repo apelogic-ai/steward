@@ -140,6 +140,33 @@ jobs:
       - name: Verify the complete PoC journey and revocation
         run: cargo xtask e2e-s5
 
+  e2e-controller-runtime-lifecycle:
+    name: e2e / controller runtime lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Restore shared Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: steward-rust-1.95.0
+
+      - name: Install controller lifecycle E2E tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+          supervisor-tools: "true"
+
+      - name: Verify controller-owned runtime lifecycle
+        run: cargo xtask e2e-controller-runtime-lifecycle
+
   e2e-admission:
     name: e2e / envelope admission
     runs-on: ubuntu-latest
@@ -334,6 +361,7 @@ jobs:
       - conformance-pinned
       - e2e-provisioning
       - e2e-runtime
+      - e2e-controller-runtime-lifecycle
       - e2e-admission
       - e2e-escalation
       - openshell-adapter
@@ -350,6 +378,7 @@ jobs:
           CONFORMANCE: ${{ needs.conformance-pinned.result }}
           PROVISIONING: ${{ needs.e2e-provisioning.result }}
           RUNTIME: ${{ needs.e2e-runtime.result }}
+          CONTROLLER_RUNTIME_LIFECYCLE: ${{ needs.e2e-controller-runtime-lifecycle.result }}
           ADMISSION: ${{ needs.e2e-admission.result }}
           ESCALATION: ${{ needs.e2e-escalation.result }}
           OPENSHELL_ADAPTER: ${{ needs.openshell-adapter.result }}
@@ -363,6 +392,7 @@ jobs:
             "${CONFORMANCE}" \
             "${PROVISIONING}" \
             "${RUNTIME}" \
+            "${CONTROLLER_RUNTIME_LIFECYCLE}" \
             "${ADMISSION}" \
             "${ESCALATION}" \
             "${OPENSHELL_ADAPTER}" \

@@ -2387,7 +2387,9 @@ impl PgStore {
     pub async fn task_work_items(&self) -> Result<Vec<TaskRecord>, StoreError> {
         sqlx::query(
             "SELECT * FROM task_submissions \
-             WHERE (execute_requested AND phase IN ('parked', 'queued')) \
+             WHERE (runtime_ownership = 'provisioned' AND runtime_uid IS NULL \
+                    AND phase IN ('submitted', 'queued') AND NOT finalize_requested) \
+                OR (execute_requested AND phase IN ('parked', 'queued')) \
                 OR (finalize_requested AND NOT finalized) \
              ORDER BY created_at, task_uid",
         )
@@ -2397,6 +2399,49 @@ impl PgStore {
         .into_iter()
         .map(task_record)
         .collect()
+    }
+
+    /// Resolve a bridge candidate from server-owned task state only.
+    ///
+    /// A caller cannot choose a namespace, runtime name, or UID. Ambiguity fails closed so a
+    /// bridge cannot accidentally follow an arbitrary concurrent run for the same owner.
+    pub async fn active_task_runtime(
+        &self,
+        owner_user_id: &CanonicalUserId,
+        submitter_service: &str,
+    ) -> Result<Option<ActiveTaskRuntime>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT task_uid, runtime_uid, runtime_namespace, runtime_name \
+             FROM task_submissions \
+             WHERE owner_user_id = $1 AND submitter_service = $2 \
+               AND identity_binding_state = 'bound' AND runtime_uid IS NOT NULL \
+               AND phase = 'running' AND NOT finalized \
+             ORDER BY created_at, task_uid \
+             LIMIT 2",
+        )
+        .bind(owner_user_id.as_str())
+        .bind(submitter_service)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if rows.len() != 1 {
+            return Ok(None);
+        }
+        let row = rows.into_iter().next().ok_or_else(|| {
+            StoreError::Database("active task runtime query returned no row".to_owned())
+        })?;
+        let runtime_uid = row
+            .try_get::<String, _>("runtime_uid")
+            .map_err(database_error)?;
+        if runtime_uid.is_empty() {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        Ok(Some(ActiveTaskRuntime {
+            task_uid: row.try_get("task_uid").map_err(database_error)?,
+            runtime_uid,
+            runtime_namespace: row.try_get("runtime_namespace").map_err(database_error)?,
+            runtime_name: row.try_get("runtime_name").map_err(database_error)?,
+        }))
     }
 
     pub async fn release_parked_task(&self, task_uid: Uuid) -> Result<bool, StoreError> {
@@ -2721,6 +2766,15 @@ pub struct TaskRecord {
     pub finalize_requested: bool,
     pub finalized: bool,
     pub failure_reason: Option<String>,
+}
+
+/// The sole durable candidate a stable bridge may inspect before it validates the live object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveTaskRuntime {
+    pub task_uid: Uuid,
+    pub runtime_uid: String,
+    pub runtime_namespace: String,
+    pub runtime_name: String,
 }
 
 pub struct ParkRejection<'a> {

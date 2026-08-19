@@ -65,6 +65,8 @@ spec:
               value: postgres://steward@postgres.steward-system.svc.cluster.local:5432/steward
             - name: STEWARD_TEST_TASK_BIND
               value: 0.0.0.0:8082
+            - name: STEWARD_TEST_RUN_ID
+              value: STEWARD_RUN_ID
           ports:
             - name: http
               containerPort: 8082

@@ -10,6 +10,8 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use kube::ResourceExt;
+use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use serde_json::{Value, json};
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_admission::{Envelope, EnvelopeSpec};
@@ -19,11 +21,51 @@ use steward_apiserver::{
     TaskIdentityResolver, TaskWorkflow, router as api_router, task_router,
 };
 use steward_store::PgStore;
-use steward_types::{Budget, CanonicalUserId, Duration, Email, RunnerRequirements, ToolGrant};
+use steward_types::{
+    AgentRuntime, Budget, CanonicalPrincipal, Duration, OrganizationId, OrganizationIdentity,
+    OrganizationIdentityPolicy, RunnerRequirements, ToolGrant,
+};
 use tokio::net::TcpListener;
 
+const SCHEDULED_OWNER_EMAIL: &str = "owner@example.com";
+
 #[derive(Clone)]
-struct TestTaskIdentities;
+struct TestTaskIdentities {
+    assertions: Arc<BTreeMap<String, TaskIdentity>>,
+}
+
+impl TestTaskIdentities {
+    fn from_trusted_principals(alice: &CanonicalPrincipal, scheduled: &CanonicalPrincipal) -> Self {
+        let mut assertions = BTreeMap::new();
+        for (assertion, service) in [
+            ("github-assertion", "steward-run"),
+            ("slack-assertion", "burble"),
+            ("portal-assertion", "request-portal"),
+        ] {
+            assertions.insert(
+                assertion.to_owned(),
+                TaskIdentity {
+                    service: service.to_owned(),
+                    acting_user: Some(alice.display_email.clone()),
+                    owner: alice.display_email.clone(),
+                    canonical_user_id: alice.user_id.clone(),
+                },
+            );
+        }
+        assertions.insert(
+            "scheduled-assertion".to_owned(),
+            TaskIdentity {
+                service: "scheduled-scanner".to_owned(),
+                acting_user: None,
+                owner: scheduled.display_email.clone(),
+                canonical_user_id: scheduled.user_id.clone(),
+            },
+        );
+        Self {
+            assertions: Arc::new(assertions),
+        }
+    }
+}
 
 impl TaskIdentityResolver for TestTaskIdentities {
     fn resolve<'a>(
@@ -37,33 +79,99 @@ impl TaskIdentityResolver for TestTaskIdentities {
         >,
     > {
         Box::pin(async move {
-            let (service, acting_user, owner) = match assertion {
-                "github-assertion" => (
-                    "steward-run",
-                    Some("alice@example.com"),
-                    "alice@example.com",
-                ),
-                "slack-assertion" => ("burble", Some("alice@example.com"), "alice@example.com"),
-                "portal-assertion" => (
-                    "request-portal",
-                    Some("alice@example.com"),
-                    "alice@example.com",
-                ),
-                "scheduled-assertion" => ("scheduled-scanner", None, "owner@example.org"),
-                _ => return Err(TaskAuthenticationError::InvalidCredentials),
-            };
-            Ok(TaskIdentity {
-                service: service.to_owned(),
-                acting_user: acting_user.map(|email| Email(email.to_owned())),
-                owner: Email(owner.to_owned()),
-                canonical_user_id: CanonicalUserId::parse(match assertion {
-                    "scheduled-assertion" => "usr_abcdef0123456789abcdef0123456789",
-                    _ => "usr_0123456789abcdef0123456789abcdef",
-                })
-                .map_err(|_| TaskAuthenticationError::InvalidCredentials)?,
-            })
+            self.assertions
+                .get(assertion)
+                .cloned()
+                .ok_or(TaskAuthenticationError::InvalidCredentials)
         })
     }
+}
+
+async fn seed_test_task_identities(store: &PgStore) -> Result<TestTaskIdentities, Box<dyn Error>> {
+    let alice = store
+        .register_canonical_identity(
+            &test_google_identity("task-server-alice", "alice@example.com")?,
+            "task-server-fixture-bootstrap",
+        )
+        .await?;
+    let scheduled = store
+        .register_canonical_identity(
+            &test_google_identity("task-server-scheduled", SCHEDULED_OWNER_EMAIL)?,
+            "task-server-fixture-bootstrap",
+        )
+        .await?;
+    Ok(TestTaskIdentities::from_trusted_principals(
+        &alice, &scheduled,
+    ))
+}
+
+fn test_google_identity(
+    subject: &str,
+    email: &str,
+) -> Result<OrganizationIdentity, Box<dyn Error>> {
+    let policy = OrganizationIdentityPolicy::new(
+        "https://accounts.google.com",
+        "example.com",
+        OrganizationId::parse("org_example")?,
+    )?;
+    Ok(policy.validate(
+        "https://accounts.google.com",
+        subject,
+        "example.com",
+        email,
+        true,
+    )?)
+}
+
+#[test]
+fn task_fixture_identities_match_the_reviewed_organization_domain() {
+    assert!(
+        test_google_identity("task-server-scheduled", SCHEDULED_OWNER_EMAIL).is_ok(),
+        "every fixture Task identity must satisfy the reviewed organization policy before the server starts"
+    );
+}
+
+#[test]
+fn task_mcp_seed_binds_the_registered_fixture_identity() {
+    let seed = include_str!("../config/s1/seed-mcp-gw.ts");
+    let tools_stack = include_str!("../config/s5/tools-stack.yaml");
+    assert!(
+        seed.contains("TASK_FIXTURE_IDENTITY_SUBJECT")
+            && seed.contains("canonical_identity_subjects")
+            && seed.contains("await taskFixtureHop1Subject()")
+            && seed.contains("task fixture canonical identity was not registered"),
+        "the Task GitHub fixture must resolve the persisted canonical subject instead of reusing S1's fixed account ID"
+    );
+    assert!(
+        tools_stack.contains("TASK_FIXTURE_IDENTITY_SUBJECT"),
+        "the task tools stack must opt the shared seed into canonical-identity lookup"
+    );
+}
+
+#[tokio::test]
+async fn task_server_assertions_reference_persisted_canonical_principals()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")
+        .map_err(|_| io::Error::other("STEWARD_TEST_DATABASE_URL is required"))?;
+    let store = PgStore::connect(&database_url).await?;
+    store.migrate().await?;
+    let identity = seed_test_task_identities(&store)
+        .await?
+        .resolve("github-assertion")
+        .await
+        .map_err(|error| {
+            io::Error::other(format!("fixture identity failed to resolve: {error:?}"))
+        })?;
+
+    assert_eq!(
+        store
+            .resolve_canonical_principal(&identity.canonical_user_id, &identity.owner)
+            .await?
+            .user_id,
+        identity.canonical_user_id,
+        "a task-server fixture identity must reference an explicit trusted canonical-user row before Task insertion"
+    );
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -95,6 +203,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map_err(|_| io::Error::other("STEWARD_TEST_DATABASE_URL is required"))?;
     let store = PgStore::connect(&database_url).await?;
     store.migrate().await?;
+    let task_identities = seed_test_task_identities(&store).await?;
     let envelope = Envelope {
         revision: 1,
         spec: EnvelopeSpec {
@@ -141,6 +250,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         workflow("failing-review", "1.00", "exit 23"),
     ]);
     let client = kube::Client::try_default().await?;
+    let runtime_controls = TestRuntimeControls {
+        runtimes: Api::all(client.clone()),
+        run_id: env::var("STEWARD_TEST_RUN_ID")
+            .map_err(|_| io::Error::other("STEWARD_TEST_RUN_ID is required"))?,
+    };
     let jira_listener = TcpListener::bind("127.0.0.1:8083").await?;
     let jira_state = JiraState::default();
     let jira_server_state = jira_state.clone();
@@ -163,7 +277,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         runtimes.clone(),
         store.clone(),
         decisions.clone(),
-        TestTaskIdentities,
+        task_identities,
         workflows,
     )
     .merge(api_router(
@@ -176,6 +290,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Router::new()
             .route("/test/resolutions", get(resolutions))
             .with_state(jira_state),
+    )
+    .merge(
+        Router::new()
+            .route(
+                "/test/runtimes/{runtime_uid}/replace",
+                post(replace_runtime_for_stale_uid_test),
+            )
+            .with_state(runtime_controls),
     );
     let bind = env::var("STEWARD_TEST_TASK_BIND").unwrap_or_else(|_| "0.0.0.0:8082".to_owned());
     let result = axum::serve(TcpListener::bind(bind).await?, app).await;
@@ -194,6 +316,100 @@ struct JiraData {
     markers: BTreeMap<String, String>,
     resolutions: Vec<Value>,
     next_issue: u32,
+}
+
+#[derive(Clone)]
+struct TestRuntimeControls {
+    runtimes: Api<AgentRuntime>,
+    run_id: String,
+}
+
+async fn replace_runtime_for_stale_uid_test(
+    State(controls): State<TestRuntimeControls>,
+    Path(runtime_uid): Path<String>,
+) -> impl IntoResponse {
+    let current = match controls.runtimes.list(&ListParams::default()).await {
+        Ok(runtimes) => runtimes
+            .items
+            .into_iter()
+            .find(|runtime| runtime.metadata.uid.as_deref() == Some(runtime_uid.as_str())),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("could not list test runtimes: {error}")})),
+            );
+        }
+    };
+    let Some(current) = current else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "test runtime was not found"})),
+        );
+    };
+    if current.namespace().as_deref() != Some("team-a") || !current.name_any().starts_with("task-")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "test replacement is limited to task runtimes in team-a"})),
+        );
+    }
+    let namespace = current.namespace().unwrap_or_default();
+    let name = current.name_any();
+    let mut replacement = AgentRuntime::new(&name, current.spec.clone());
+    replacement.metadata.namespace = Some(namespace.clone());
+    replacement.metadata.annotations = current.metadata.annotations.clone();
+    replacement.metadata.labels = Some(BTreeMap::from([(
+        "steward.test/run-id".to_owned(),
+        controls.run_id.clone(),
+    )]));
+    let namespaced =
+        Api::<AgentRuntime>::namespaced(controls.runtimes.clone().into_client(), &namespace);
+    if let Err(error) = namespaced.delete(&name, &DeleteParams::default()).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("could not delete test runtime: {error}")})),
+        );
+    }
+    let mut deleted = false;
+    for _ in 0..60 {
+        match namespaced.get_opt(&name).await {
+            Ok(None) => {
+                deleted = true;
+                break;
+            }
+            Ok(Some(_)) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(
+                        json!({"error": format!("could not observe test runtime deletion: {error}")}),
+                    ),
+                );
+            }
+        }
+    }
+    if !deleted {
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({"error": "test runtime deletion did not complete within 15 seconds"})),
+        );
+    }
+    match namespaced
+        .create(&PostParams::default(), &replacement)
+        .await
+    {
+        Ok(replacement) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "runtimeUid": replacement.metadata.uid,
+                "runId": controls.run_id,
+            })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("could not create replacement runtime: {error}")})),
+        ),
+    }
 }
 
 fn jira_router(state: JiraState) -> Router {
