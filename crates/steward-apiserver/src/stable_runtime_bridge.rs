@@ -5,10 +5,23 @@
 //! its exact Kubernetes UID.  A route may be stable while the underlying sandbox is replaced,
 //! but it is unavailable until the replacement is controller-observed as running.
 
+use axum::extract::{Extension, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
+use serde::Serialize;
 use steward_store::{ActiveTaskRuntime, PgStore};
 use steward_types::CanonicalUserId;
 
-use crate::{BoxFuture, RuntimeRepository};
+use crate::{
+    BoxFuture, RuntimeRepository,
+    browser_auth::{BrowserAuthService, BrowserSessionContext, protect_browser_routes},
+};
+
+/// Session-protected stable bridge resolution route. The configured service and authenticated
+/// browser principal are the only inputs; callers cannot select a runtime by name or UID.
+pub const STABLE_RUNTIME_BRIDGE_PATH: &str = "/app/api/v1/stable-runtime-bridge";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BridgeService(String);
@@ -123,6 +136,14 @@ pub struct StableBridgeTarget {
     pub artifact: VerifiedBridgeArtifact,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StableBridgeResolution {
+    runtime_uid: String,
+    sandbox: String,
+    artifact_image: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StableBridgeError {
     Unavailable,
@@ -136,6 +157,72 @@ pub struct StableRuntimeBridge<S, R, A> {
     source: S,
     runtimes: R,
     artifacts: A,
+}
+
+#[derive(Clone)]
+struct StableBridgeRouteState<S, R, A> {
+    bridge: StableRuntimeBridge<S, R, A>,
+    service: BridgeService,
+}
+
+/// Mount the stable bridge resolver behind the common browser authentication boundary.
+///
+/// The route implementation is deliberately kept separate from artifact deployment: this
+/// resolver can only return a target after the injected verifier accepts its immutable image.
+pub fn protected_router<S, R, A>(
+    source: S,
+    runtimes: R,
+    artifacts: A,
+    browser_auth: BrowserAuthService,
+    service: BridgeService,
+) -> Router
+where
+    S: ActiveTaskRuntimeSource,
+    R: RuntimeRepository,
+    A: BridgeArtifactVerifier,
+{
+    let state = StableBridgeRouteState {
+        bridge: StableRuntimeBridge::new(source, runtimes, artifacts),
+        service,
+    };
+    let routes = Router::new()
+        .route(
+            STABLE_RUNTIME_BRIDGE_PATH,
+            get(resolve_stable_runtime_bridge::<S, R, A>),
+        )
+        .with_state(state);
+    protect_browser_routes(routes, browser_auth)
+}
+
+async fn resolve_stable_runtime_bridge<S, R, A>(
+    session: Option<Extension<BrowserSessionContext>>,
+    State(state): State<StableBridgeRouteState<S, R, A>>,
+) -> Response
+where
+    S: ActiveTaskRuntimeSource,
+    R: RuntimeRepository,
+    A: BridgeArtifactVerifier,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match state
+        .bridge
+        .resolve(&session.principal.canonical_user_id, &state.service)
+        .await
+    {
+        Ok(target) => Json(StableBridgeResolution {
+            runtime_uid: target.runtime_uid,
+            sandbox: target.sandbox,
+            artifact_image: target.artifact.image_reference().to_owned(),
+        })
+        .into_response(),
+        Err(StableBridgeError::Unavailable)
+        | Err(StableBridgeError::NotReady)
+        | Err(StableBridgeError::ArtifactUnverified) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
 }
 
 impl<S, R, A> StableRuntimeBridge<S, R, A>
@@ -214,15 +301,21 @@ fn verified_artifact(image_reference: String) -> Result<VerifiedBridgeArtifact, 
 mod tests {
     use std::sync::Arc;
 
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode, header};
     use kube::ResourceExt;
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding,
         CanonicalUserId, Duration, Email, Phase, Principal, RunnerRequirements, RuntimeRefs,
     };
+    use tower::ServiceExt;
 
     use super::{
         ActiveTaskRuntimeSource, BridgeArtifactVerifier, BridgeRuntimeReference, BridgeService,
-        StableBridgeError, StableRuntimeBridge,
+        STABLE_RUNTIME_BRIDGE_PATH, StableBridgeError, StableRuntimeBridge, protected_router,
+    };
+    use crate::browser_auth::{
+        BrowserAuthService, LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service,
     };
     use crate::{AdmissionContext, BoxFuture, RuntimeCreateError, RuntimeRepository};
 
@@ -377,6 +470,150 @@ mod tests {
             spend: None,
         });
         Ok(runtime)
+    }
+
+    fn cookie(response: &axum::response::Response, name: &str) -> Result<String, String> {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with(&format!("{name}=")))
+            .and_then(|value| value.split(';').next())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("response omitted {name} cookie"))
+    }
+
+    async fn signed_in_cookie() -> Result<(BrowserAuthService, String), String> {
+        let service =
+            local_fake_browser_auth_service("http://127.0.0.1:33003", LocalFakeIdentity::User)?;
+        let login = browser_auth_router(service.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/auth/login")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build login request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute login request: {error}"))?;
+        let flow_cookie = cookie(&login, "steward-local-oidc-flow")?;
+        let authorize = login
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "login omitted authorize redirect".to_owned())?;
+        let authorized = browser_auth_router(service.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(authorize)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build authorize request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute authorize request: {error}"))?;
+        let callback = authorized
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "authorize omitted callback redirect".to_owned())?;
+        let callback = browser_auth_router(service.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(callback)
+                    .header(header::COOKIE, flow_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build callback request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute callback request: {error}"))?;
+        Ok((service, cookie(&callback, "steward-local-session")?))
+    }
+
+    #[tokio::test]
+    async fn stable_route_fails_closed_until_the_controller_reports_replacement_ready()
+    -> Result<(), String> {
+        let (browser_auth, session_cookie) = signed_in_cookie().await?;
+        let mut replacement = runtime()?;
+        replacement.metadata.uid = Some("runtime-uid-b".to_owned());
+        replacement
+            .status
+            .as_mut()
+            .ok_or("fixture runtime lacks status")?
+            .phase = Phase::Provisioning;
+        let app = protected_router(
+            Source(Some(BridgeRuntimeReference::new(
+                "steward-test".to_owned(),
+                "runtime-a".to_owned(),
+                "runtime-uid-b".to_owned(),
+            )?)),
+            Runtimes(Arc::new(replacement)),
+            Artifacts,
+            browser_auth,
+            BridgeService::new("steward-run".to_owned())?,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(STABLE_RUNTIME_BRIDGE_PATH)
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build stable route request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute stable route request: {error}"))?;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the stable route must not serve a replacement before controller readiness"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stable_route_uses_the_authenticated_owner_and_ignores_caller_runtime_identifiers()
+    -> Result<(), String> {
+        let (browser_auth, session_cookie) = signed_in_cookie().await?;
+        let app = protected_router(
+            Source(Some(BridgeRuntimeReference::new(
+                "steward-test".to_owned(),
+                "runtime-a".to_owned(),
+                "runtime-uid-a".to_owned(),
+            )?)),
+            Runtimes(Arc::new(runtime()?)),
+            Artifacts,
+            browser_auth,
+            BridgeService::new("steward-run".to_owned())?,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "{STABLE_RUNTIME_BRIDGE_PATH}?runtimeUid=caller-selected&namespace=caller-selected"
+                    ))
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build stable route request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute stable route request: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8 * 1024)
+            .await
+            .map_err(|error| format!("read stable route response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse stable route response: {error}"))?;
+        assert_eq!(value["runtimeUid"], "runtime-uid-a");
+        assert_eq!(value["sandbox"], "sandbox-a");
+        assert_eq!(
+            value["artifactImage"],
+            "registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert!(!value.to_string().contains("caller-selected"));
+        Ok(())
     }
 
     #[tokio::test]
