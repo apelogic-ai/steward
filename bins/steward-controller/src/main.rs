@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use axum::serve::Listener;
 use kube::Client;
+use steward_adapter_github_artifact::GitHubArtifactVerifier;
 use steward_adapter_litellm::{LiteLlmAdapter, LiteLlmConfig};
 use steward_adapter_openshell::{OpenShellConnectionConfig, OpenShellRuntime};
 use steward_store::PgStore;
@@ -112,7 +113,83 @@ fn openshell_connection_config() -> Result<OpenShellConnectionConfig, io::Error>
         )?),
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
         runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
+        bridge_image: verified_bridge_image_configuration()?,
     })
+}
+
+/// Reads one all-or-nothing provenance configuration set. The controller never accepts a bridge
+/// image directly from an environment value: this function returns it only after offline GitHub
+/// provenance verification binds the digest to the configured source and workflow signer.
+fn verified_bridge_image_configuration() -> Result<Option<String>, io::Error> {
+    let image = env::var("STEWARD_STABLE_BRIDGE_IMAGE").ok();
+    let signer_identity = env::var("STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY").ok();
+    let source_repository = env::var("STEWARD_STABLE_BRIDGE_SOURCE_REPOSITORY").ok();
+    let source_commit = env::var("STEWARD_STABLE_BRIDGE_SOURCE_COMMIT").ok();
+    let bundle_file = env::var("STEWARD_STABLE_BRIDGE_ATTESTATION_BUNDLE_FILE").ok();
+    let values = [
+        image.as_ref(),
+        signer_identity.as_ref(),
+        source_repository.as_ref(),
+        source_commit.as_ref(),
+        bundle_file.as_ref(),
+    ];
+    if values.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    if values.iter().any(Option::is_none) {
+        return Err(io::Error::other(
+            "bridge image provenance requires image, signer identity, source repository, source commit, and attestation bundle together",
+        ));
+    }
+    let bundle = fs::read_to_string(
+        bundle_file
+            .as_deref()
+            .ok_or_else(|| io::Error::other("bridge image provenance bundle path is required"))?,
+    )
+    .map_err(|_| io::Error::other("read bridge image provenance bundle"))?;
+    verify_bridge_image_provenance(
+        image,
+        signer_identity,
+        source_repository,
+        source_commit,
+        Some(bundle),
+    )
+}
+
+fn verify_bridge_image_provenance(
+    image: Option<String>,
+    signer_identity: Option<String>,
+    source_repository: Option<String>,
+    source_commit: Option<String>,
+    bundle: Option<String>,
+) -> Result<Option<String>, io::Error> {
+    let values = [
+        image.as_ref(),
+        signer_identity.as_ref(),
+        source_repository.as_ref(),
+        source_commit.as_ref(),
+        bundle.as_ref(),
+    ];
+    if values.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    if values.iter().any(Option::is_none) {
+        return Err(io::Error::other(
+            "bridge image provenance requires image, signer identity, source repository, source commit, and attestation bundle together",
+        ));
+    }
+    GitHubArtifactVerifier::from_jsonl(
+        image.ok_or_else(|| io::Error::other("bridge image is required"))?,
+        signer_identity.ok_or_else(|| io::Error::other("bridge signer identity is required"))?,
+        source_repository
+            .ok_or_else(|| io::Error::other("bridge source repository is required"))?,
+        source_commit.ok_or_else(|| io::Error::other("bridge source commit is required"))?,
+        &bundle.ok_or_else(|| io::Error::other("bridge image provenance bundle is required"))?,
+    )
+    .map_err(|_| io::Error::other("bridge image provenance configuration is invalid"))?
+    .verify()
+    .map(|artifact| Some(artifact.image_reference().to_owned()))
+    .map_err(|_| io::Error::other("bridge image provenance is unverified"))
 }
 
 async fn tls_listener(
@@ -235,7 +312,42 @@ mod tests {
     use tokio_rustls::rustls::ServerConfig;
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
-    use super::{TlsListener, decode_tls_material, install_rustls_crypto_provider};
+    use super::{
+        TlsListener, decode_tls_material, install_rustls_crypto_provider,
+        verify_bridge_image_provenance,
+    };
+
+    #[test]
+    fn bridge_image_configuration_is_all_or_nothing_and_fails_closed() -> Result<(), String> {
+        assert_eq!(
+            verify_bridge_image_provenance(None, None, None, None, None)
+                .map_err(|error| error.to_string())?,
+            None
+        );
+        assert!(
+            verify_bridge_image_provenance(
+                Some("registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_err(),
+            "a bare image reference cannot bypass provenance verification"
+        );
+        assert!(
+            verify_bridge_image_provenance(
+                Some("registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                Some("https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.0".to_owned()),
+                Some("https://github.com/example-org/steward".to_owned()),
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                Some("not-a-signed-bundle".to_owned()),
+            )
+            .is_err(),
+            "an unverifiable configured bridge is rejected before OpenShell is contacted"
+        );
+        Ok(())
+    }
 
     #[test]
     fn cert_manager_pem_tls_material_is_decoded() -> Result<(), String> {

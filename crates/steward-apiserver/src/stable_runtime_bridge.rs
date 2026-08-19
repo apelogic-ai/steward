@@ -11,11 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
-use sigstore_verify::{
-    VerificationPolicy, Verifier,
-    trust_root::{SigstoreInstance, TrustedRoot},
-    types::{Bundle, Sha256Hash, SignatureContent, intoto::Statement},
-};
+use steward_adapter_github_artifact::GitHubArtifactVerifier as SharedGitHubArtifactVerifier;
 use steward_store::{ActiveTaskRuntime, PgStore};
 use steward_types::CanonicalUserId;
 
@@ -120,16 +116,11 @@ impl ActiveTaskRuntimeSource for PgStore {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedBridgeArtifact {
     image_reference: String,
-    repository: String,
 }
 
 impl VerifiedBridgeArtifact {
     pub fn image_reference(&self) -> &str {
         &self.image_reference
-    }
-
-    fn repository(&self) -> &str {
-        &self.repository
     }
 }
 
@@ -139,225 +130,16 @@ pub trait BridgeArtifactVerifier: Clone + Send + Sync + 'static {
     fn verify_bridge_artifact<'a>(&'a self) -> BoxFuture<'a, Result<String, StableBridgeError>>;
 }
 
-const GITHUB_ACTIONS_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
-const SLSA_PROVENANCE_V1: &str = "https://slsa.dev/provenance/v1";
-const IN_TOTO_STATEMENT_V1: &str = "https://in-toto.io/Statement/v1";
-
-/// A concrete, offline verifier for the GitHub artifact-attestation bundle shipped with a
-/// bridge release. The configured image remains digest-pinned; the bundle must additionally
-/// bind that digest to the configured GitHub Actions workflow identity.
-#[derive(Clone)]
-pub struct GitHubArtifactVerifier {
-    image_reference: String,
-    signer_identity: String,
-    source_repository: String,
-    source_commit: String,
-    bundles: Vec<Bundle>,
-}
-
-impl GitHubArtifactVerifier {
-    pub fn from_jsonl(
-        image_reference: String,
-        signer_identity: String,
-        source_repository: String,
-        source_commit: String,
-        bundle_jsonl: &str,
-    ) -> Result<Self, String> {
-        let _ = verified_artifact(image_reference.clone())
-            .map_err(|_| "bridge image must be an immutable sha256 reference".to_owned())?;
-        if signer_identity.trim().is_empty() {
-            return Err("GitHub bridge signer identity must be non-empty".to_owned());
-        }
-        validate_github_source(&source_repository, &source_commit, &signer_identity)?;
-        let bundles = bundle_jsonl
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(Bundle::from_json)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| "bridge provenance bundle is invalid".to_owned())?;
-        if bundles.is_empty() {
-            return Err("bridge provenance bundle must contain an attestation".to_owned());
-        }
-        Ok(Self {
-            image_reference,
-            signer_identity,
-            source_repository,
-            source_commit,
-            bundles,
-        })
-    }
-
-    fn verified_image_reference(&self) -> Result<String, StableBridgeError> {
-        let artifact = verified_artifact(self.image_reference.clone())?;
-        let digest_hex = artifact
-            .image_reference()
-            .rsplit_once('@')
-            .map(|(_, digest)| &digest["sha256:".len()..])
-            .ok_or(StableBridgeError::ArtifactUnverified)?;
-        let digest =
-            Sha256Hash::from_hex(digest_hex).map_err(|_| StableBridgeError::ArtifactUnverified)?;
-        let trusted_root = TrustedRoot::from_embedded(SigstoreInstance::PublicGood)
-            .map_err(|_| StableBridgeError::ArtifactUnverified)?;
-        let verifier = Verifier::new(&trusted_root);
-        self.verified_image_reference_with(
-            &verifier,
-            digest,
-            digest_hex,
-            GITHUB_ACTIONS_OIDC_ISSUER,
-        )
-    }
-
-    fn verified_image_reference_with(
-        &self,
-        verifier: &Verifier,
-        digest: Sha256Hash,
-        digest_hex: &str,
-        issuer: &str,
-    ) -> Result<String, StableBridgeError> {
-        let artifact = verified_artifact(self.image_reference.clone())?;
-        let policy = VerificationPolicy::default()
-            .require_identity(self.signer_identity.clone())
-            .require_issuer(issuer)
-            // Artifact attestations are rooted in Sigstore Public Good. The bundle's signed
-            // certificate chain, signature, declared signer identity, and DSSE binding remain
-            // mandatory; GitHub does not supply compatible SCT/tlog material for this offline
-            // verification path.
-            .skip_sct()
-            .skip_tlog();
-        if self.bundles.iter().any(|bundle| {
-            github_slsa_provenance_binds_artifact(
-                bundle,
-                artifact.repository(),
-                digest_hex,
-                &self.signer_identity,
-                &self.source_repository,
-                &self.source_commit,
-            ) && verifier.verify(digest, bundle, &policy).is_ok()
-        }) {
-            Ok(artifact.image_reference().to_owned())
-        } else {
-            Err(StableBridgeError::ArtifactUnverified)
-        }
-    }
-}
-
-impl BridgeArtifactVerifier for GitHubArtifactVerifier {
+/// Production callers share the controller's GitHub/Sigstore verifier rather than interpreting
+/// the same bundle in two independently maintained implementations.
+impl BridgeArtifactVerifier for SharedGitHubArtifactVerifier {
     fn verify_bridge_artifact<'a>(&'a self) -> BoxFuture<'a, Result<String, StableBridgeError>> {
-        Box::pin(async move { self.verified_image_reference() })
-    }
-}
-
-fn github_slsa_provenance_binds_artifact(
-    bundle: &Bundle,
-    artifact_repository: &str,
-    digest_hex: &str,
-    signer_identity: &str,
-    source_repository: &str,
-    source_commit: &str,
-) -> bool {
-    let SignatureContent::DsseEnvelope(envelope) = &bundle.content else {
-        return false;
-    };
-    let Ok(statement) = serde_json::from_slice::<Statement>(&envelope.decode_payload()) else {
-        return false;
-    };
-    github_slsa_provenance_statement_binds_artifact(
-        &statement,
-        artifact_repository,
-        digest_hex,
-        signer_identity,
-        source_repository,
-        source_commit,
-    )
-}
-
-fn github_slsa_provenance_statement_binds_artifact(
-    statement: &Statement,
-    artifact_repository: &str,
-    digest_hex: &str,
-    signer_identity: &str,
-    source_repository: &str,
-    source_commit: &str,
-) -> bool {
-    statement.type_ == IN_TOTO_STATEMENT_V1
-        && statement.predicate_type == SLSA_PROVENANCE_V1
-        && statement.subject.iter().any(|subject| {
-            subject.name == artifact_repository
-                && subject.digest.sha256.as_deref() == Some(digest_hex)
+        Box::pin(async move {
+            self.verify()
+                .map(|artifact| artifact.image_reference().to_owned())
+                .map_err(|_| StableBridgeError::ArtifactUnverified)
         })
-        && statement
-            .predicate
-            .pointer("/runDetails/builder/id")
-            .and_then(serde_json::Value::as_str)
-            == Some(signer_identity)
-        && statement
-            .predicate
-            .pointer("/buildDefinition/externalParameters/workflow/repository")
-            .and_then(serde_json::Value::as_str)
-            == Some(source_repository)
-        && statement
-            .predicate
-            .pointer("/buildDefinition/resolvedDependencies")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|dependencies| {
-                dependencies.iter().any(|dependency| {
-                    let Some(uri) = dependency.get("uri").and_then(serde_json::Value::as_str)
-                    else {
-                        return false;
-                    };
-                    let Some(repository) = uri
-                        .strip_prefix("git+")
-                        .and_then(|value| value.rsplit_once('@').map(|(repository, _)| repository))
-                    else {
-                        return false;
-                    };
-                    repository == source_repository
-                        && dependency
-                            .pointer("/digest/gitCommit")
-                            .and_then(serde_json::Value::as_str)
-                            == Some(source_commit)
-                })
-            })
-}
-
-fn validate_github_source(
-    source_repository: &str,
-    source_commit: &str,
-    signer_identity: &str,
-) -> Result<(), String> {
-    let Some(path) = source_repository.strip_prefix("https://github.com/") else {
-        return Err(
-            "GitHub bridge source repository must be an https://github.com owner/repository URL"
-                .to_owned(),
-        );
-    };
-    if path.split('/').count() != 2 || path.split('/').any(str::is_empty) {
-        return Err(
-            "GitHub bridge source repository must name exactly one owner and repository".to_owned(),
-        );
     }
-    if source_commit.len() != 40
-        || !source_commit
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(
-            "GitHub bridge source commit must be a lowercase 40-character SHA-1".to_owned(),
-        );
-    }
-    let workflow_prefix = format!("{source_repository}/.github/workflows/");
-    let Some(workflow) = signer_identity.strip_prefix(&workflow_prefix) else {
-        return Err("GitHub bridge signer identity must name a workflow in the configured source repository".to_owned());
-    };
-    if workflow
-        .rsplit_once('@')
-        .is_none_or(|(path, reference)| path.is_empty() || reference.is_empty())
-    {
-        return Err(
-            "GitHub bridge signer identity must include a workflow path and Git ref".to_owned(),
-        );
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -525,11 +307,7 @@ fn verified_artifact(image_reference: String) -> Result<VerifiedBridgeArtifact, 
     {
         return Err(StableBridgeError::ArtifactUnverified);
     }
-    let repository = repository.to_owned();
-    Ok(VerifiedBridgeArtifact {
-        image_reference,
-        repository,
-    })
+    Ok(VerifiedBridgeArtifact { image_reference })
 }
 
 #[cfg(test)]
@@ -547,8 +325,7 @@ mod tests {
 
     use super::{
         ActiveTaskRuntimeSource, BridgeArtifactVerifier, BridgeRuntimeReference, BridgeService,
-        GitHubArtifactVerifier, STABLE_RUNTIME_BRIDGE_PATH, StableBridgeError, StableRuntimeBridge,
-        github_slsa_provenance_statement_binds_artifact, protected_router,
+        STABLE_RUNTIME_BRIDGE_PATH, StableBridgeError, StableRuntimeBridge, protected_router,
     };
     use crate::browser_auth::{
         BrowserAuthService, LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service,
@@ -590,264 +367,6 @@ mod tests {
         ) -> BoxFuture<'a, Result<String, StableBridgeError>> {
             Box::pin(async { Ok("registry.example.test/steward-bridge:latest".to_owned()) })
         }
-    }
-
-    const PUBLIC_GITHUB_FIXTURE: &str =
-        include_str!("../testdata/stable-runtime-bridge/github-cli-v2.64.0.b64");
-    const PUBLIC_GITHUB_ARTIFACT: &str = "gh_2.64.0_linux_amd64.tar.gz@sha256:0e44a4c43014bd513550ec190b7c33f5f8b63d162927a1f6445ef38ea25cd2fa";
-    const PUBLIC_GITHUB_SUBJECT: &str = "gh_2.64.0_linux_amd64.tar.gz";
-    const PUBLIC_GITHUB_SIGNER: &str =
-        "https://github.com/cli/cli/.github/workflows/deployment.yml@refs/heads/trunk";
-    const PUBLIC_GITHUB_SOURCE: &str = "https://github.com/cli/cli";
-    const PUBLIC_GITHUB_COMMIT: &str = "5402e207ee89f2f3dc52779c3edde632485074cd";
-    const PUBLIC_GITHUB_DIGEST: &str =
-        "0e44a4c43014bd513550ec190b7c33f5f8b63d162927a1f6445ef38ea25cd2fa";
-
-    fn public_github_fixture() -> Result<String, String> {
-        String::from_utf8(decode_base64(PUBLIC_GITHUB_FIXTURE)?)
-            .map_err(|error| format!("fixture must be UTF-8: {error}"))
-    }
-
-    fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
-        fn value(byte: u8) -> Option<u8> {
-            match byte {
-                b'A'..=b'Z' => Some(byte - b'A'),
-                b'a'..=b'z' => Some(byte - b'a' + 26),
-                b'0'..=b'9' => Some(byte - b'0' + 52),
-                b'+' => Some(62),
-                b'/' => Some(63),
-                _ => None,
-            }
-        }
-
-        let encoded = input
-            .bytes()
-            .filter(|byte| !byte.is_ascii_whitespace())
-            .collect::<Vec<_>>();
-        if encoded.len() % 4 != 0 {
-            return Err("fixture base64 length must be a multiple of four".to_owned());
-        }
-        let mut decoded = Vec::with_capacity(encoded.len() / 4 * 3);
-        for group in encoded.chunks_exact(4) {
-            let first = value(group[0]).ok_or_else(|| "fixture base64 character".to_owned())?;
-            let second = value(group[1]).ok_or_else(|| "fixture base64 character".to_owned())?;
-            let third = if group[2] == b'=' {
-                None
-            } else {
-                Some(value(group[2]).ok_or_else(|| "fixture base64 character".to_owned())?)
-            };
-            let fourth = if group[3] == b'=' {
-                None
-            } else {
-                Some(value(group[3]).ok_or_else(|| "fixture base64 character".to_owned())?)
-            };
-            if third.is_none() && fourth.is_some() {
-                return Err("fixture base64 padding order".to_owned());
-            }
-            decoded.push((first << 2) | (second >> 4));
-            if let Some(third) = third {
-                decoded.push((second << 4) | (third >> 2));
-                if let Some(fourth) = fourth {
-                    decoded.push((third << 6) | fourth);
-                }
-            }
-        }
-        Ok(decoded)
-    }
-
-    fn public_github_verifier() -> Result<GitHubArtifactVerifier, String> {
-        let fixture = public_github_fixture()?;
-        GitHubArtifactVerifier::from_jsonl(
-            PUBLIC_GITHUB_ARTIFACT.to_owned(),
-            PUBLIC_GITHUB_SIGNER.to_owned(),
-            PUBLIC_GITHUB_SOURCE.to_owned(),
-            PUBLIC_GITHUB_COMMIT.to_owned(),
-            &fixture,
-        )
-    }
-
-    fn public_github_statement() -> Result<sigstore_verify::types::intoto::Statement, String> {
-        use sigstore_verify::types::{Bundle, SignatureContent};
-
-        let fixture = public_github_fixture()?;
-        let bundle =
-            Bundle::from_json(&fixture).map_err(|error| format!("fixture parses: {error}"))?;
-        let SignatureContent::DsseEnvelope(envelope) = bundle.content else {
-            return Err("fixture must contain an in-toto DSSE envelope".to_owned());
-        };
-        serde_json::from_slice(&envelope.decode_payload())
-            .map_err(|error| format!("fixture statement parses: {error}"))
-    }
-
-    #[test]
-    fn github_artifact_verifier_fails_closed_without_a_parseable_attestation() {
-        let result = GitHubArtifactVerifier::from_jsonl(
-            "ghcr.io/example-org/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            "https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.0".to_owned(),
-            "https://github.com/example-org/steward".to_owned(),
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            "not a Sigstore bundle\n",
-        );
-        assert!(
-            result.is_err(),
-            "a digest alone must never activate the stable bridge without a parseable GitHub attestation"
-        );
-    }
-
-    #[test]
-    fn github_artifact_verifier_accepts_a_real_signed_github_provenance_bundle()
-    -> Result<(), String> {
-        let verifier = public_github_verifier()?;
-        let result = verifier.verified_image_reference();
-        assert!(
-            result.is_ok(),
-            "the public GitHub provenance bundle must verify before subject binding is evaluated: {result:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn github_artifact_verifier_rejects_a_wrong_issuer() -> Result<(), String> {
-        use sigstore_verify::{
-            Verifier,
-            trust_root::{SigstoreInstance, TrustedRoot},
-            types::Sha256Hash,
-        };
-
-        let verifier = public_github_verifier()?;
-        let digest = Sha256Hash::from_hex(PUBLIC_GITHUB_DIGEST)
-            .map_err(|error| format!("fixture digest parses: {error}"))?;
-        let root = TrustedRoot::from_embedded(SigstoreInstance::PublicGood)
-            .map_err(|error| format!("public-good root: {error}"))?;
-        assert_eq!(
-            verifier.verified_image_reference_with(
-                &Verifier::new(&root),
-                digest,
-                PUBLIC_GITHUB_DIGEST,
-                "https://issuer.example.test",
-            ),
-            Err(StableBridgeError::ArtifactUnverified),
-            "a valid bundle is not valid when its issuer differs"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn github_artifact_verifier_rejects_wrong_signer_and_source() -> Result<(), String> {
-        let wrong_signer = GitHubArtifactVerifier::from_jsonl(
-            PUBLIC_GITHUB_ARTIFACT.to_owned(),
-            "https://github.com/cli/cli/.github/workflows/other.yml@refs/heads/trunk".to_owned(),
-            PUBLIC_GITHUB_SOURCE.to_owned(),
-            PUBLIC_GITHUB_COMMIT.to_owned(),
-            &public_github_fixture()?,
-        )?;
-        assert_eq!(
-            wrong_signer.verified_image_reference(),
-            Err(StableBridgeError::ArtifactUnverified),
-            "the workflow signer must be exact"
-        );
-
-        let wrong_source = GitHubArtifactVerifier::from_jsonl(
-            PUBLIC_GITHUB_ARTIFACT.to_owned(),
-            PUBLIC_GITHUB_SIGNER.to_owned(),
-            "https://github.com/cli/other".to_owned(),
-            PUBLIC_GITHUB_COMMIT.to_owned(),
-            &public_github_fixture()?,
-        );
-        assert!(
-            wrong_source.is_err(),
-            "the signer identity must be bound to the configured source repository"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn github_slsa_provenance_rejects_wrong_subject_digest_predicate_and_source()
-    -> Result<(), String> {
-        let statement = public_github_statement()?;
-        assert!(github_slsa_provenance_statement_binds_artifact(
-            &statement,
-            PUBLIC_GITHUB_SUBJECT,
-            PUBLIC_GITHUB_DIGEST,
-            PUBLIC_GITHUB_SIGNER,
-            PUBLIC_GITHUB_SOURCE,
-            PUBLIC_GITHUB_COMMIT,
-        ));
-
-        let mut wrong_subject = statement.clone();
-        let subject = wrong_subject
-            .subject
-            .iter_mut()
-            .find(|subject| subject.name == PUBLIC_GITHUB_SUBJECT)
-            .ok_or_else(|| "fixture subject".to_owned())?;
-        subject.name = "other-artifact".to_owned();
-        assert!(!github_slsa_provenance_statement_binds_artifact(
-            &wrong_subject,
-            PUBLIC_GITHUB_SUBJECT,
-            PUBLIC_GITHUB_DIGEST,
-            PUBLIC_GITHUB_SIGNER,
-            PUBLIC_GITHUB_SOURCE,
-            PUBLIC_GITHUB_COMMIT,
-        ));
-
-        let mut wrong_digest = statement.clone();
-        let subject = wrong_digest
-            .subject
-            .iter_mut()
-            .find(|subject| subject.name == PUBLIC_GITHUB_SUBJECT)
-            .ok_or_else(|| "fixture subject".to_owned())?;
-        subject.digest.sha256 =
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned());
-        assert!(!github_slsa_provenance_statement_binds_artifact(
-            &wrong_digest,
-            PUBLIC_GITHUB_SUBJECT,
-            PUBLIC_GITHUB_DIGEST,
-            PUBLIC_GITHUB_SIGNER,
-            PUBLIC_GITHUB_SOURCE,
-            PUBLIC_GITHUB_COMMIT,
-        ));
-
-        let mut wrong_predicate = statement.clone();
-        wrong_predicate.predicate_type = "https://slsa.dev/provenance/v0.2".to_owned();
-        assert!(!github_slsa_provenance_statement_binds_artifact(
-            &wrong_predicate,
-            PUBLIC_GITHUB_SUBJECT,
-            PUBLIC_GITHUB_DIGEST,
-            PUBLIC_GITHUB_SIGNER,
-            PUBLIC_GITHUB_SOURCE,
-            PUBLIC_GITHUB_COMMIT,
-        ));
-
-        let mut wrong_source = statement;
-        let source_commit = wrong_source
-            .predicate
-            .pointer_mut("/buildDefinition/resolvedDependencies/0/digest/gitCommit")
-            .ok_or_else(|| "fixture source commit".to_owned())?;
-        *source_commit = serde_json::json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        assert!(!github_slsa_provenance_statement_binds_artifact(
-            &wrong_source,
-            PUBLIC_GITHUB_SUBJECT,
-            PUBLIC_GITHUB_DIGEST,
-            PUBLIC_GITHUB_SIGNER,
-            PUBLIC_GITHUB_SOURCE,
-            PUBLIC_GITHUB_COMMIT,
-        ));
-
-        let mut wrong_source_repository = public_github_statement()?;
-        let source_repository = wrong_source_repository
-            .predicate
-            .pointer_mut("/buildDefinition/externalParameters/workflow/repository")
-            .ok_or_else(|| "fixture source repository".to_owned())?;
-        *source_repository = serde_json::json!("https://github.com/example-org/other");
-        assert!(!github_slsa_provenance_statement_binds_artifact(
-            &wrong_source_repository,
-            PUBLIC_GITHUB_SUBJECT,
-            PUBLIC_GITHUB_DIGEST,
-            PUBLIC_GITHUB_SIGNER,
-            PUBLIC_GITHUB_SOURCE,
-            PUBLIC_GITHUB_COMMIT,
-        ));
-        Ok(())
     }
 
     #[derive(Clone)]

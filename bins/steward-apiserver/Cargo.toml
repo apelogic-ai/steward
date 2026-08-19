@@ -10,6 +10,7 @@ version.workspace = true
 axum.workspace = true # Serves the authenticated REST admission and escalation API.
 kube = { workspace = true, features = ["client", "ring", "rustls-tls"] } # Authenticates bearer tokens through Kubernetes TokenReview and writes AgentRuntime desired state.
 steward-adapter-jira = { path = "../../adapters/jira", version = "=0.0.0" } # Delivers escalation decisions without leaking Jira types into core.
+steward-adapter-github-artifact = { path = "../../adapters/github-artifact", version = "=0.0.0" } # Verifies the same digest-pinned bridge artifact used by controller provisioning.
 steward-apiserver = { path = "../../crates/steward-apiserver", version = "=0.0.0" } # Provides the single authenticated REST admission router.
 steward-store = { path = "../../crates/steward-store", version = "=0.0.0" } # Persists immutable envelopes, decisions, approvals, and instance grants.
 steward-types = { path = "../../crates/steward-types", version = "=0.0.0" } # Parses opaque canonical user IDs for the explicit local-RBAC bootstrap command.

@@ -142,6 +142,8 @@ pub trait SandboxRuntime: Send + Sync + 'static {
 pub struct SandboxTaskRequest {
     pub runtime: RuntimeId,
     pub refs: RuntimeRefs,
+    /// The controller reads this only from the persisted runtime spec; callers cannot choose it.
+    pub agent_type: AgentType,
     pub command: Vec<String>,
 }
 
