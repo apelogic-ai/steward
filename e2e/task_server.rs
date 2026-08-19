@@ -132,6 +132,16 @@ fn task_fixture_identities_match_the_reviewed_organization_domain() {
 }
 
 #[test]
+fn task_server_selects_a_rustls_crypto_provider() -> Result<(), String> {
+    install_rustls_crypto_provider().map_err(|error| error.to_string())?;
+    assert!(
+        tokio_rustls::rustls::crypto::CryptoProvider::get_default().is_some(),
+        "the Task server must select Rustls cryptography before it constructs Kubernetes clients"
+    );
+    Ok(())
+}
+
+#[test]
 fn task_mcp_seed_binds_the_registered_fixture_identity() {
     let seed = include_str!("../config/s1/seed-mcp-gw.ts");
     let tools_stack = include_str!("../config/s5/tools-stack.yaml");
@@ -199,6 +209,7 @@ impl RequestAuthenticator for TestAdminAuthenticator {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
     let database_url = env::var("STEWARD_TEST_DATABASE_URL")
         .map_err(|_| io::Error::other("STEWARD_TEST_DATABASE_URL is required"))?;
     let store = PgStore::connect(&database_url).await?;
@@ -304,6 +315,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     jira_task.abort();
     result?;
     Ok(())
+}
+
+fn install_rustls_crypto_provider() -> Result<(), io::Error> {
+    use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
+
+    if CryptoProvider::get_default().is_none() {
+        let _ = ring::default_provider().install_default();
+    }
+    if CryptoProvider::get_default().is_some() {
+        Ok(())
+    } else {
+        Err(io::Error::other("Rustls crypto provider is unavailable"))
+    }
 }
 
 #[derive(Clone, Default)]
