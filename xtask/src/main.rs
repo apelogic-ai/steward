@@ -1936,10 +1936,17 @@ mod tests {
             "production images must run as a numeric non-root user"
         );
         for required in [
-            "FROM debian:bookworm-slim@sha256:",
-            "apt-get install -y --no-install-recommends ca-certificates iproute2 tar",
+            "FROM busybox:1.37.0-musl@sha256:",
+            "FROM gcr.io/distroless/cc-debian12:nonroot@sha256:",
+            "COPY --from=toolbox /bin/busybox /bin/busybox",
+            "COPY --from=toolbox /bin/tar /bin/tar",
+            "COPY --from=toolbox /bin/ip /bin/ip",
+            "COPY --from=toolbox /bin/id /bin/id",
+            "COPY --from=toolbox /bin/mkdir /bin/mkdir",
+            "COPY --from=toolbox /bin/rm /bin/rm",
+            "COPY --chown=65532:65532 --from=toolbox /sandbox /sandbox",
             "mkdir -p /sandbox",
-            "chown -R 65532:65532 /sandbox",
+            "chown 65532:65532 /sandbox",
             "USER 65532:65532",
             "/usr/local/bin/steward-connections-bridge",
         ] {

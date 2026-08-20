@@ -142,6 +142,23 @@ then
   echo "a stable bridge image without its controller-owned MCP-GW origin must fail chart validation" >&2
   exit 1
 fi
+for invalid_bridge_origin in \
+  'https://bridge-user@mcp-gw.example.test' \
+  'https://mcp-gw.example.test:70000' \
+  'https://mcp gw.example.test'
+do
+  if helm template steward "${root}/charts/steward" \
+    --namespace steward \
+    --include-crds \
+    "${image_values[@]}" \
+    "${stable_bridge_values[@]}" \
+    --set-string "stableBridge.mcpGatewayOrigin=${invalid_bridge_origin}" \
+    --set-file "stableBridge.attestationBundle=${stable_bridge_bundle}" >/dev/null 2>&1
+  then
+    echo "a stable bridge origin must reject userinfo, invalid ports, and whitespace: ${invalid_bridge_origin}" >&2
+    exit 1
+  fi
+done
 if helm lint "${root}/charts/steward" "${image_values[@]}" \
   --set stableBridge.enabled=true >/dev/null 2>&1
 then
@@ -238,9 +255,11 @@ if [[ "${1:-}" == "--build-images" ]]; then
   docker run --rm --entrypoint /bin/sh steward-bridge:release-validation -ceu '
     command -v tar >/dev/null
     command -v ip >/dev/null
+    command -v mkdir >/dev/null
+    command -v rm >/dev/null
     test -w /sandbox
     test "$(id -u)" = "65532"
-    touch /sandbox/release-validation
+    : >/sandbox/release-validation
     rm /sandbox/release-validation
   '
 elif [[ -n "${1:-}" ]]; then

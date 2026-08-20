@@ -10,7 +10,9 @@ use axum::serve::Listener;
 use kube::Client;
 use steward_adapter_github_artifact::GitHubArtifactVerifier;
 use steward_adapter_litellm::{LiteLlmAdapter, LiteLlmConfig};
-use steward_adapter_openshell::{OpenShellConnectionConfig, OpenShellRuntime};
+use steward_adapter_openshell::{
+    OpenShellConnectionConfig, OpenShellRuntime, validate_connections_bridge_gateway_origin,
+};
 use steward_store::PgStore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinError, JoinSet};
@@ -128,8 +130,15 @@ fn bridge_gateway_origin_for_image(
 ) -> Result<Option<String>, io::Error> {
     match (bridge_image, configured_origin) {
         (None, None) => Ok(None),
-        (Some(_), Some(origin)) if !origin.trim().is_empty() => Ok(Some(origin)),
-        (Some(_), None | Some(_)) => Err(io::Error::other(
+        (Some(_), Some(origin)) => {
+            validate_connections_bridge_gateway_origin(&origin).map_err(|error| {
+                io::Error::other(format!(
+                    "STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN must be an exact HTTP(S) origin: {error:?}"
+                ))
+            })?;
+            Ok(Some(origin))
+        }
+        (Some(_), None) => Err(io::Error::other(
             "bridge image provenance requires STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN",
         )),
         (None, Some(_)) => Err(io::Error::other(
@@ -383,6 +392,35 @@ mod tests {
             bridge_gateway_origin_for_image(&None, Some("https://mcp-gw.example.test".to_owned()))
                 .is_err(),
             "a gateway origin cannot turn on the bridge without verified image provenance"
+        );
+    }
+
+    #[test]
+    fn bridge_gateway_origin_is_rejected_before_controller_startup_when_not_exact() {
+        let image = Some(
+            "registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        );
+        for invalid_origin in [
+            " https://mcp-gw.example.test",
+            "https://bridge-user@mcp-gw.example.test",
+            "https://mcp-gw.example.test:70000",
+            "https://mcp-gw.example.test:0",
+            "https://mcp-gw.example.test/path",
+            "https://mcp-gw.example.test?target=other",
+            "https://mcp-gw.example.test#fragment",
+        ] {
+            assert!(
+                bridge_gateway_origin_for_image(&image, Some(invalid_origin.to_owned())).is_err(),
+                "controller startup must reject non-exact bridge origin {invalid_origin:?}"
+            );
+        }
+        let accepted_origin = bridge_gateway_origin_for_image(
+            &image,
+            Some("https://mcp-gw.example.test:8443".to_owned()),
+        );
+        assert!(
+            matches!(accepted_origin, Ok(Some(ref origin)) if origin == "https://mcp-gw.example.test:8443"),
+            "an exact HTTPS origin must be accepted and retained before controller startup"
         );
     }
 

@@ -551,7 +551,7 @@ impl OpenShellConnectionConfig {
                             .to_owned(),
                     });
                 }
-                validate_bridge_gateway_origin(origin)?;
+                validate_connections_bridge_gateway_origin(origin)?;
             }
             (Some(_), None) | (None, Some(_)) => {
                 return Err(PortError::Rejected {
@@ -566,7 +566,16 @@ impl OpenShellConnectionConfig {
 }
 
 #[cfg(feature = "runtime")]
-fn validate_bridge_gateway_origin(value: &str) -> Result<(), PortError> {
+/// Rejects every value other than one exact HTTP(S) origin before a bridge runtime is created.
+///
+/// The controller calls this while loading its configuration so malformed gateway targets cannot
+/// reach the OpenShell connection path.
+pub fn validate_connections_bridge_gateway_origin(value: &str) -> Result<(), PortError> {
+    if value.trim() != value {
+        return Err(PortError::Rejected {
+            reason: "Connections bridge gateway origin must be an exact HTTP(S) origin".to_owned(),
+        });
+    }
     let origin = Url::parse(value).map_err(|_| PortError::Rejected {
         reason: "Connections bridge gateway origin must be an exact HTTP(S) origin".to_owned(),
     })?;
@@ -577,6 +586,7 @@ fn validate_bridge_gateway_origin(value: &str) -> Result<(), PortError> {
         || origin.path() != "/"
         || origin.query().is_some()
         || origin.fragment().is_some()
+        || origin.port() == Some(0)
     {
         return Err(PortError::Rejected {
             reason: "Connections bridge gateway origin must be an exact HTTP(S) origin".to_owned(),
@@ -1557,6 +1567,8 @@ mod tests {
     use steward_types::{AgentType, RuntimeId, RuntimeRefs, ToolGrant};
 
     #[cfg(feature = "runtime")]
+    use super::RUNTIME_UID_LABEL;
+    #[cfg(feature = "runtime")]
     use super::validate_connections_bridge_archive;
     #[cfg(feature = "runtime")]
     use super::{
@@ -1567,7 +1579,7 @@ mod tests {
     };
     #[cfg(feature = "identity")]
     use super::{IdentityResolutionError, SANDBOX_ID_LABEL, binding_from_sandbox};
-    use super::{NameKind, RUNTIME_UID_LABEL, stable_name};
+    use super::{NameKind, stable_name};
 
     #[cfg(feature = "runtime")]
     struct MockExchange {
