@@ -98,6 +98,7 @@ fn required_file(name: &str) -> Result<Vec<u8>, io::Error> {
 }
 
 fn openshell_connection_config() -> Result<OpenShellConnectionConfig, io::Error> {
+    let bridge_image = verified_bridge_image_configuration()?;
     Ok(OpenShellConnectionConfig {
         endpoint: required("STEWARD_OPENSHELL_ENDPOINT")?,
         ca_certificate_pem: required_file("STEWARD_OPENSHELL_CA_CERTIFICATE_FILE")?,
@@ -113,8 +114,28 @@ fn openshell_connection_config() -> Result<OpenShellConnectionConfig, io::Error>
         )?),
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
         runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
-        bridge_image: verified_bridge_image_configuration()?,
+        bridge_gateway_origin: bridge_gateway_origin_for_image(
+            &bridge_image,
+            env::var("STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN").ok(),
+        )?,
+        bridge_image,
     })
+}
+
+fn bridge_gateway_origin_for_image(
+    bridge_image: &Option<String>,
+    configured_origin: Option<String>,
+) -> Result<Option<String>, io::Error> {
+    match (bridge_image, configured_origin) {
+        (None, None) => Ok(None),
+        (Some(_), Some(origin)) if !origin.trim().is_empty() => Ok(Some(origin)),
+        (Some(_), None | Some(_)) => Err(io::Error::other(
+            "bridge image provenance requires STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN",
+        )),
+        (None, Some(_)) => Err(io::Error::other(
+            "STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN requires bridge image provenance",
+        )),
+    }
 }
 
 /// Reads one all-or-nothing provenance configuration set. The controller never accepts a bridge
@@ -313,8 +334,8 @@ mod tests {
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
     use super::{
-        TlsListener, decode_tls_material, install_rustls_crypto_provider,
-        verify_bridge_image_provenance,
+        TlsListener, bridge_gateway_origin_for_image, decode_tls_material,
+        install_rustls_crypto_provider, verify_bridge_image_provenance,
     };
 
     #[test]
@@ -347,6 +368,22 @@ mod tests {
             "an unverifiable configured bridge is rejected before OpenShell is contacted"
         );
         Ok(())
+    }
+
+    #[test]
+    fn bridge_gateway_origin_is_paired_with_a_verified_bridge_image() {
+        let image = Some(
+            "registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        );
+        assert!(
+            bridge_gateway_origin_for_image(&image, None).is_err(),
+            "the controller must not construct a bridge-capable runtime without its server-owned gateway origin"
+        );
+        assert!(
+            bridge_gateway_origin_for_image(&None, Some("https://mcp-gw.example.test".to_owned()))
+                .is_err(),
+            "a gateway origin cannot turn on the bridge without verified image provenance"
+        );
     }
 
     #[test]

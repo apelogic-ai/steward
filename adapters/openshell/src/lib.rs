@@ -491,6 +491,8 @@ pub struct OpenShellConnectionConfig {
     /// Digest-pinned bridge image only. Its provenance is verified by the controller process
     /// before this adapter is constructed.
     pub bridge_image: Option<String>,
+    /// Server-configured gateway origin passed only to the fixed bridge executable.
+    pub bridge_gateway_origin: Option<String>,
 }
 
 #[cfg(feature = "runtime")]
@@ -537,17 +539,50 @@ impl OpenShellConnectionConfig {
                     .to_owned(),
             });
         }
-        if self
-            .bridge_image
-            .as_deref()
-            .is_some_and(|image| !is_digest_pinned_image(image))
-        {
-            return Err(PortError::Rejected {
-                reason: "Connections bridge image must be an immutable sha256 reference".to_owned(),
-            });
+        match (
+            self.bridge_image.as_deref(),
+            self.bridge_gateway_origin.as_deref(),
+        ) {
+            (None, None) => {}
+            (Some(image), Some(origin)) => {
+                if !is_digest_pinned_image(image) {
+                    return Err(PortError::Rejected {
+                        reason: "Connections bridge image must be an immutable sha256 reference"
+                            .to_owned(),
+                    });
+                }
+                validate_bridge_gateway_origin(origin)?;
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(PortError::Rejected {
+                    reason:
+                        "Connections bridge image and gateway origin must be configured together"
+                            .to_owned(),
+                });
+            }
         }
         Ok(())
     }
+}
+
+#[cfg(feature = "runtime")]
+fn validate_bridge_gateway_origin(value: &str) -> Result<(), PortError> {
+    let origin = Url::parse(value).map_err(|_| PortError::Rejected {
+        reason: "Connections bridge gateway origin must be an exact HTTP(S) origin".to_owned(),
+    })?;
+    if !matches!(origin.scheme(), "http" | "https")
+        || origin.host_str().is_none()
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+    {
+        return Err(PortError::Rejected {
+            reason: "Connections bridge gateway origin must be an exact HTTP(S) origin".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(feature = "runtime")]
@@ -777,6 +812,7 @@ pub struct OpenShellRuntime {
     channel: Channel,
     token_provider: WorkloadExchangeTokenProvider,
     bridge_image: Option<String>,
+    bridge_gateway_origin: Option<String>,
 }
 
 #[cfg(feature = "runtime")]
@@ -803,6 +839,7 @@ impl OpenShellRuntime {
             channel,
             token_provider,
             bridge_image: config.bridge_image,
+            bridge_gateway_origin: config.bridge_gateway_origin,
         };
         runtime.authenticated_client().await?;
         Ok(runtime)
@@ -1392,6 +1429,15 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             "STEWARD_OUTPUT_DIR".to_owned(),
             "/sandbox/steward-output".to_owned(),
         );
+        if is_connections_bridge {
+            let origin =
+                self.bridge_gateway_origin
+                    .as_deref()
+                    .ok_or_else(|| PortError::Rejected {
+                        reason: "Connections bridge gateway origin is not configured".to_owned(),
+                    })?;
+            environment.insert("STEWARD_MCP_GW_ORIGIN".to_owned(), origin.to_owned());
+        }
         let executed = self
             .authenticated_client()
             .await?
@@ -1659,6 +1705,7 @@ mod tests {
             server_name: "gateway.example.test".to_owned(),
             runtime_class_name: "kata-qemu".to_owned(),
             bridge_image: None,
+            bridge_gateway_origin: None,
         }
     }
 
@@ -2197,6 +2244,19 @@ mod tests {
             "only the exact digest that passed configuration may reach OpenShell"
         );
         Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn connections_bridge_configuration_requires_an_exact_server_origin() {
+        let mut config = valid_connection_config();
+        config.bridge_image = Some(
+            "registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        );
+        assert!(
+            matches!(config.validate(), Err(PortError::Rejected { .. })),
+            "a bridge image without its controller-owned gateway origin must fail before a sandbox can be created"
+        );
     }
 
     #[cfg(feature = "runtime")]

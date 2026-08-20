@@ -1104,7 +1104,7 @@ mod tests {
             .and_then(|jobs| jobs.split("\n  pinned:").next())
             .ok_or_else(|| "release-candidate CI job is required".to_owned())?;
 
-        for component in ["apiserver", "controller", "mint"] {
+        for component in ["apiserver", "controller", "mint", "bridge"] {
             assert!(
                 release_candidate.contains(&format!(
                     "image-ref: steward-{component}:release-validation"
@@ -1116,17 +1116,17 @@ mod tests {
             release_candidate
                 .matches("aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8")
                 .count(),
-            3,
+            4,
             "release-candidate CI must use the pinned Trivy action for every component image"
         );
         assert_eq!(
             release_candidate.matches("exit-code: \"1\"").count(),
-            3,
+            4,
             "every release-candidate image scan must fail closed"
         );
         assert_eq!(
             release_candidate.matches("severity: CRITICAL").count(),
-            3,
+            4,
             "every release-candidate image scan must enforce CRITICAL findings"
         );
 

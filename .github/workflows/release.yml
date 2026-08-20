@@ -72,10 +72,16 @@ jobs:
         include:
           - component: apiserver
             binary: steward-apiserver-bin
+            dockerfile: build/package.Dockerfile
           - component: controller
             binary: steward-controller-bin
+            dockerfile: build/package.Dockerfile
           - component: mint
             binary: steward-mint-bin
+            dockerfile: build/package.Dockerfile
+          - component: bridge
+            binary: steward-connections-bridge
+            dockerfile: build/connections-bridge.Dockerfile
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -101,7 +107,7 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
         with:
           context: .
-          file: build/package.Dockerfile
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/steward:${{ steps.version.outputs.version }}-${{ matrix.component }}
           build-args: BINARY=${{ matrix.binary }}
@@ -337,7 +343,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           image_repository="$ECR_REGISTRY/$STEWARD_ECR_IMAGE_REPOSITORY"
           chart_repository="$ECR_REGISTRY/$STEWARD_ECR_CHART_REPOSITORY"
-          for component in apiserver controller mint; do
+          for component in apiserver controller mint bridge; do
             source_digest="$(cat "dist/$component.digest")"
             source="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward@$source_digest"
             scripts/promote-ecr-artifact.sh \
@@ -362,6 +368,7 @@ jobs:
             printf 'apiserver-digest=%s\n' "$(cat dist/ecr-apiserver.digest)"
             printf 'controller-digest=%s\n' "$(cat dist/ecr-controller.digest)"
             printf 'mint-digest=%s\n' "$(cat dist/ecr-mint.digest)"
+            printf 'bridge-digest=%s\n' "$(cat dist/ecr-bridge.digest)"
             printf 'chart-digest=%s\n' "$source_chart_digest"
           } >> "$GITHUB_OUTPUT"
 
@@ -369,7 +376,7 @@ jobs:
         run: |
           set -euo pipefail
           scan_failed=0
-          for component in apiserver controller mint; do
+          for component in apiserver controller mint bridge; do
             index_digest="$(cat "dist/ecr-$component.digest")"
             index_ref="$ECR_REGISTRY/$STEWARD_ECR_IMAGE_REPOSITORY@$index_digest"
             if ! platform_digest="$(scripts/resolve-ecr-platform-digest.sh \
@@ -423,7 +430,7 @@ jobs:
           CHART_REPOSITORY: ${{ steps.promote.outputs['chart-repository'] }}
         run: |
           set -euo pipefail
-          for component in apiserver controller mint; do
+          for component in apiserver controller mint bridge; do
             digest="$(cat "dist/ecr-$component.digest")"
             cosign sign --yes \
               --output-signature "dist/ecr-$component.sig" \
@@ -456,6 +463,13 @@ jobs:
           subject-digest: ${{ steps.promote.outputs['mint-digest'] }}
           push-to-registry: true
 
+      - name: Attest promoted bridge provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-name: ${{ steps.promote.outputs['image-repository'] }}
+          subject-digest: ${{ steps.promote.outputs['bridge-digest'] }}
+          push-to-registry: true
+
       - name: Attest promoted chart provenance
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
@@ -474,7 +488,7 @@ jobs:
             printf '# Steward private registry handoff %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '| Artifact | Immutable reference | Scanned linux/amd64 digest |\n|---|---|---|\n'
-            for component in apiserver controller mint; do
+            for component in apiserver controller mint bridge; do
               printf '| %s | %s:%s-%s@%s | %s |\n' \
                 "$component" "$IMAGE_REPOSITORY" "$version" "$component" \
                 "$(cat "dist/ecr-$component.digest")" \
@@ -533,7 +547,7 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
-            for component in apiserver controller mint; do
+            for component in apiserver controller mint bridge; do
               printf '| %s | %s:%s-%s | %s |\n' \
                 "$component" "$repository" "$version" "$component" "$(cat "dist/$component.digest")"
             done
@@ -545,7 +559,7 @@ jobs:
       - name: Verify public artifact access
         run: |
           set -euo pipefail
-          for component in apiserver controller mint; do
+          for component in apiserver controller mint bridge; do
             docker buildx imagetools inspect \
               "ghcr.io/$GITHUB_REPOSITORY_OWNER/steward@$(cat "dist/$component.digest")"
           done

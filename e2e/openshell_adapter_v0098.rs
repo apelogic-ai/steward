@@ -42,6 +42,7 @@ fn valid_config() -> Result<OpenShellConnectionConfig, String> {
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
         runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
         bridge_image: None,
+        bridge_gateway_origin: None,
     })
 }
 

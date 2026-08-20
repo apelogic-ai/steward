@@ -107,6 +107,10 @@ if [[ "${1:-}" == "--build-images" ]]; then
       --tag "steward-${component}:release-validation" \
       "${root}"
   done
+  docker build \
+    --file "${root}/build/connections-bridge.Dockerfile" \
+    --tag "steward-bridge:release-validation" \
+    "${root}"
 elif [[ -n "${1:-}" ]]; then
   echo "usage: $0 [--build-images]" >&2
   exit 2
