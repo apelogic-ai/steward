@@ -1,3 +1,4 @@
+{{- $stableBridgeBundleName := printf "steward-stable-bridge-attestation-%s" (.Values.stableBridge.attestationBundle | sha256sum | trunc 12) }}
 {{- range $component := list "apiserver" "controller" "mint" }}
 ---
 apiVersion: v1
@@ -125,6 +126,16 @@ spec:
     - steward-apiserver.{{ .Release.Namespace }}.svc.{{ .Values.services.clusterDomain }}
   issuerRef:
 {{ toYaml .Values.tls.issuerRef | nindent 4 }}
+{{- if .Values.stableBridge.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: {{ $stableBridgeBundleName }} }
+immutable: true
+data:
+  bundle.jsonl: |-
+{{ .Values.stableBridge.attestationBundle | indent 4 }}
+{{- end }}
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -206,12 +217,31 @@ spec:
             - { name: STEWARD_JIRA_ACCOUNT_EMAIL, value: {{ .Values.config.apiserver.jiraAccountEmail | quote }} }
             - { name: STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE, value: {{ .Values.config.apiserver.kubernetesTokenReviewAudience | quote }} }
             - { name: STEWARD_TASK_WORKFLOWS_JSON, value: {{ .Values.config.apiserver.taskWorkflowsJson | quote }} }
+{{- if .Values.stableBridge.enabled }}
+            - { name: STEWARD_STABLE_BRIDGE_IMAGE, value: {{ .Values.stableBridge.image | quote }} }
+            - { name: STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY, value: {{ .Values.stableBridge.signerIdentity | quote }} }
+            - { name: STEWARD_STABLE_BRIDGE_SOURCE_REPOSITORY, value: {{ .Values.stableBridge.sourceRepository | quote }} }
+            - { name: STEWARD_STABLE_BRIDGE_SOURCE_COMMIT, value: {{ .Values.stableBridge.sourceCommit | quote }} }
+            - { name: STEWARD_STABLE_BRIDGE_ATTESTATION_BUNDLE_FILE, value: /run/stable-bridge-attestation/bundle.jsonl }
+            - { name: STEWARD_STABLE_BRIDGE_SERVICE, value: {{ .Values.stableBridge.service | quote }} }
+{{- end }}
             - { name: STEWARD_TLS_CERT_DER, value: /run/tls/tls.crt }
             - { name: STEWARD_TLS_KEY_DER, value: /run/tls/tls.key }
-          volumeMounts: [{ name: tls, mountPath: /run/tls, readOnly: true }]
+          volumeMounts:
+            - { name: tls, mountPath: /run/tls, readOnly: true }
+{{- if .Values.stableBridge.enabled }}
+            - { name: stable-bridge-attestation, mountPath: /run/stable-bridge-attestation, readOnly: true }
+{{- end }}
           resources:
 {{ toYaml .Values.resources.apiserver | nindent 12 }}
-      volumes: [{ name: tls, secret: { secretName: steward-apiserver-tls } }]
+      volumes:
+        - { name: tls, secret: { secretName: steward-apiserver-tls } }
+{{- if .Values.stableBridge.enabled }}
+        - name: stable-bridge-attestation
+          configMap:
+            name: {{ $stableBridgeBundleName }}
+            items: [{ key: bundle.jsonl, path: bundle.jsonl }]
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment

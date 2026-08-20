@@ -3,7 +3,11 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 rendered="$(mktemp)"
-trap 'rm -f "${rendered}"' EXIT INT TERM
+stable_bridge_rendered="$(mktemp)"
+stable_bridge_bundle="$(mktemp)"
+stable_bridge_configmap="$(mktemp)"
+stable_bridge_deployment="$(mktemp)"
+trap 'rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" "${stable_bridge_configmap}" "${stable_bridge_deployment}"' EXIT INT TERM
 
 digest0="sha256:0000000000000000000000000000000000000000000000000000000000000000"
 digest1="sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -18,12 +22,99 @@ image_values=(
   --set 'runtimeNamespaces[0]=team-a'
   --set-string config.controller.openshellRuntimeClassName=openshell-runc
 )
+stable_bridge_values=(
+  --set stableBridge.enabled=true
+  --set-string stableBridge.image=ghcr.io/example-org/steward-bridge@sha256:3333333333333333333333333333333333333333333333333333333333333333
+  --set-string stableBridge.signerIdentity=https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.11
+  --set-string stableBridge.sourceRepository=https://github.com/example-org/steward
+  --set-string stableBridge.sourceCommit=0123456789abcdef0123456789abcdef01234567
+  --set-string stableBridge.service=steward-run
+)
+
+printf '%s\n%s' \
+  '{"statement":"first provenance record"}' \
+  '{"statement":"second provenance record"}' > "${stable_bridge_bundle}"
+stable_bridge_bundle_content="$(<"${stable_bridge_bundle}")"
+stable_bridge_bundle_hash="$(printf '%s' "${stable_bridge_bundle_content}" | shasum -a 256 | awk '{print $1}')"
+stable_bridge_configmap_name="steward-stable-bridge-attestation-${stable_bridge_bundle_hash:0:12}"
 
 helm lint "${root}/charts/steward" "${image_values[@]}"
 helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
   "${image_values[@]}" > "${rendered}"
+
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  "${stable_bridge_values[@]}" \
+  --set-file "stableBridge.attestationBundle=${stable_bridge_bundle}" > "${stable_bridge_rendered}"
+
+awk -v name="${stable_bridge_configmap_name}" '
+  BEGIN { RS = "---\\n" }
+  $0 ~ ("kind: ConfigMap\\nmetadata: \\{ name: " name " \\}") { print; exit }
+' "${stable_bridge_rendered}" > "${stable_bridge_configmap}"
+grep -Fxq 'kind: ConfigMap' "${stable_bridge_configmap}"
+grep -Fxq "metadata: { name: ${stable_bridge_configmap_name} }" "${stable_bridge_configmap}"
+grep -Fxq 'immutable: true' "${stable_bridge_configmap}"
+rendered_stable_bridge_bundle="$(awk '
+  $0 == "  bundle.jsonl: |-" { capture = 1; next }
+  capture && /^    / { line = $0; sub(/^    /, "", line); print line; next }
+  capture { exit }
+' "${stable_bridge_configmap}")"
+if [[ "${rendered_stable_bridge_bundle}" != "${stable_bridge_bundle_content}" ]]; then
+  echo "stable bridge attestation ConfigMap bytes must exactly match the configured bundle" >&2
+  exit 1
+fi
+
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-apiserver/ { print; exit }
+' "${stable_bridge_rendered}" > "${stable_bridge_deployment}"
+grep -Fxq "            - { name: STEWARD_STABLE_BRIDGE_IMAGE, value: \"ghcr.io/example-org/steward-bridge@sha256:3333333333333333333333333333333333333333333333333333333333333333\" }" "${stable_bridge_deployment}"
+grep -Fxq '            - { name: STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY, value: "https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.11" }' "${stable_bridge_deployment}"
+grep -Fxq '            - { name: STEWARD_STABLE_BRIDGE_SOURCE_REPOSITORY, value: "https://github.com/example-org/steward" }' "${stable_bridge_deployment}"
+grep -Fxq '            - { name: STEWARD_STABLE_BRIDGE_SOURCE_COMMIT, value: "0123456789abcdef0123456789abcdef01234567" }' "${stable_bridge_deployment}"
+grep -Fxq '            - { name: STEWARD_STABLE_BRIDGE_ATTESTATION_BUNDLE_FILE, value: /run/stable-bridge-attestation/bundle.jsonl }' "${stable_bridge_deployment}"
+grep -Fxq '            - { name: STEWARD_STABLE_BRIDGE_SERVICE, value: "steward-run" }' "${stable_bridge_deployment}"
+grep -Fxq '            - { name: stable-bridge-attestation, mountPath: /run/stable-bridge-attestation, readOnly: true }' "${stable_bridge_deployment}"
+grep -Fxq '        - name: stable-bridge-attestation' "${stable_bridge_deployment}"
+grep -Fxq "            name: ${stable_bridge_configmap_name}" "${stable_bridge_deployment}"
+grep -Fxq '            items: [{ key: bundle.jsonl, path: bundle.jsonl }]' "${stable_bridge_deployment}"
+
+if grep -Fq 'steward-stable-bridge-attestation-' "${rendered}" \
+  || grep -Fq 'STEWARD_STABLE_BRIDGE_' "${rendered}"
+then
+  echo "a disabled stable bridge must render no bridge ConfigMap or apiserver wiring" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set stableBridge.enabled=true >/dev/null 2>&1
+then
+  echo "an enabled stable bridge without immutable provenance inputs must fail chart validation" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  "${stable_bridge_values[@]}" \
+  --set-string stableBridge.image=ghcr.io/example-org/steward-bridge:mutable \
+  --set-file "stableBridge.attestationBundle=${stable_bridge_bundle}" >/dev/null 2>&1
+then
+  echo "a mutable stable bridge image must fail chart validation" >&2
+  exit 1
+fi
+if helm lint "${root}/charts/steward" "${image_values[@]}" \
+  --set stableBridge.enabled=true >/dev/null 2>&1
+then
+  echo "an enabled stable bridge without immutable provenance inputs must fail chart validation" >&2
+  exit 1
+fi
 
 test "$(grep -c '^kind: Deployment$' "${rendered}")" -eq 3
 test "$(grep -c '^kind: ServiceAccount$' "${rendered}")" -eq 3
