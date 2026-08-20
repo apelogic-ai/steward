@@ -108,6 +108,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/steward:${{ steps.version.outputs.version }}-${{ matrix.component }}
           build-args: BINARY=${{ matrix.binary }}
@@ -518,6 +519,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write
+      packages: read
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -530,6 +532,13 @@ jobs:
       - name: Set up Helm
         uses: azure/setup-helm@bf6a7d304bc2fdb57e0331155b7ebf2c504acf0a
 
+      - name: Log in to GHCR for bridge provenance bundle
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Download release evidence
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
@@ -537,12 +546,29 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Download immutable bridge provenance bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bridge_digest="$(cat dist/bridge.digest)"
+          gh attestation download \
+            "oci://ghcr.io/$GITHUB_REPOSITORY_OWNER/steward@$bridge_digest" \
+            --repo "$GITHUB_REPOSITORY" \
+            --predicate-type https://slsa.dev/provenance/v1
+          bundle_file="${bridge_digest}.jsonl"
+          test -s "$bundle_file"
+          mv "$bundle_file" dist/bridge-attestation-bundle.jsonl
+
       - name: Generate public release handoff
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
+          bridge_digest="$(cat dist/bridge.digest)"
+          bridge_signer_identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
+          bridge_source_repository="https://github.com/$GITHUB_REPOSITORY"
           {
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
@@ -553,6 +579,12 @@ jobs:
             done
             printf '| chart | oci://%s:%s | %s |\n' \
               "$chart" "$version" "$(cat dist/helm-chart.digest)"
+            printf '\n## Stable bridge provenance inputs\n\n'
+            printf 'Bridge image: %s@%s\n\n' "$repository" "$bridge_digest"
+            printf 'Bridge signer identity: %s\n\n' "$bridge_signer_identity"
+            printf 'Bridge source repository: %s\n\n' "$bridge_source_repository"
+            printf 'Bridge source commit: %s\n\n' "$GITHUB_SHA"
+            printf 'Bridge attestation bundle: bridge-attestation-bundle.jsonl\n\n'
             printf '\nEach image and the chart includes an SPDX SBOM, a vulnerability report, and GitHub artifact provenance.\n'
           } > dist/release-handoff.md
 

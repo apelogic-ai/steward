@@ -1731,6 +1731,10 @@ mod tests {
         .collect::<Result<Vec<_>, _>>()?;
         let container = fs::read_to_string(root().join("build/package.Dockerfile"))
             .map_err(|error| format!("production container build is required: {error}"))?;
+        let bridge_container = fs::read_to_string(
+            root().join("build/connections-bridge.Dockerfile"),
+        )
+        .map_err(|error| format!("Connections bridge sandbox image build is required: {error}"))?;
 
         for required in [
             "apiserver:",
@@ -1850,6 +1854,13 @@ mod tests {
             "apiserver.digest",
             "controller.digest",
             "mint.digest",
+            "bridge.digest",
+            "bridge-attestation-bundle.jsonl",
+            "gh attestation download",
+            "--predicate-type https://slsa.dev/provenance/v1",
+            "Bridge signer identity:",
+            "Bridge source repository:",
+            "Bridge source commit:",
             "helm-chart.digest",
         ] {
             assert!(
@@ -1906,9 +1917,26 @@ mod tests {
             container.contains("USER 65532:65532"),
             "production images must run as a numeric non-root user"
         );
+        for required in [
+            "FROM debian:bookworm-slim@sha256:",
+            "apt-get install -y --no-install-recommends ca-certificates iproute2 tar",
+            "mkdir -p /sandbox",
+            "chown -R 65532:65532 /sandbox",
+            "USER 65532:65532",
+            "/usr/local/bin/steward-connections-bridge",
+        ] {
+            assert!(
+                bridge_container.contains(required),
+                "Connections bridge sandbox image is missing required OpenShell runtime prerequisite: {required}"
+            );
+        }
         assert!(
             workflow.contains("${{ steps.version.outputs.version }}-${{ matrix.component }}"),
             "component tags must match the published chart contract"
+        );
+        assert!(
+            workflow.contains("platforms: linux/amd64"),
+            "release images must publish the supported linux/amd64 runtime platform explicitly"
         );
         assert!(
             workflow.contains("push:\n    tags:"),
@@ -1936,7 +1964,15 @@ mod tests {
                 "pinned CI workflow tools are missing {required}"
             );
         }
-        for required in ["helm template steward", "docker build"] {
+        for required in [
+            "helm template steward",
+            "docker build",
+            "docker run --rm --entrypoint /bin/sh",
+            "command -v tar",
+            "command -v ip",
+            "test -w /sandbox",
+            "test \"$(id -u)\" = \"65532\"",
+        ] {
             assert!(
                 release_validation.contains(required),
                 "release validation must exercise artifact construction: missing {required}"

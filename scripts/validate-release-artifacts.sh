@@ -202,6 +202,14 @@ if [[ "${1:-}" == "--build-images" ]]; then
     --file "${root}/build/connections-bridge.Dockerfile" \
     --tag "steward-bridge:release-validation" \
     "${root}"
+  docker run --rm --entrypoint /bin/sh steward-bridge:release-validation -ceu '
+    command -v tar >/dev/null
+    command -v ip >/dev/null
+    test -w /sandbox
+    test "$(id -u)" = "65532"
+    touch /sandbox/release-validation
+    rm /sandbox/release-validation
+  '
 elif [[ -n "${1:-}" ]]; then
   echo "usage: $0 [--build-images]" >&2
   exit 2
