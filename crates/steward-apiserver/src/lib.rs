@@ -2529,7 +2529,7 @@ where
             "approval envelope is no longer current".to_owned(),
         ));
     }
-    let mut runtime = runtimes
+    let runtime = runtimes
         .get_bound(
             &candidate.runtime_namespace,
             &candidate.runtime_name,
@@ -2542,12 +2542,53 @@ where
             "runtime repository returned a different runtime UID".to_owned(),
         ));
     }
+    validate_parked_approval_runtime(&runtime, &candidate, scope_kind)?;
+    let approved = ledger
+        .approve_admission(ApproveAdmission {
+            approval_id,
+            decided_by: &admin.actor,
+            rationale: &request.rationale,
+            evidence_url: &request.evidence_url,
+            expires_at: &request.expires_at,
+        })
+        .await
+        .map_err(ApiError::Store)?;
+    if approved.proposed_spec != candidate.proposed_spec {
+        return Err(ApiError::Conflict(
+            "approved manifest does not match the parked approval request".to_owned(),
+        ));
+    }
+    apply_approved_parked_runtime(runtimes, &candidate, scope_kind, runtime, &approved).await?;
+    decisions
+        .record_resolution(&DecisionResolution {
+            request_id: approval_id.to_string(),
+            key: approved.decision_key,
+            decided_by: approved.decided_by,
+            rationale: approved.rationale,
+            evidence_url: approved.evidence_url,
+        })
+        .await
+        .map_err(|error| ApiError::DecisionChannel(format!("{error:?}")))?;
+    Ok(SubmissionOutcome::Applied {
+        proposed_spec: approved.proposed_spec,
+    })
+}
+
+fn validate_parked_approval_runtime(
+    runtime: &AgentRuntime,
+    candidate: &ApprovalCandidate,
+    scope_kind: EnvelopeScopeKind,
+) -> Result<bool, ApiError> {
+    if runtime.metadata.uid.as_deref() != Some(candidate.runtime_uid.as_str()) {
+        return Err(ApiError::Runtime(
+            "runtime repository returned a different runtime UID".to_owned(),
+        ));
+    }
     let pending_digest = runtime
         .annotations()
         .get(PENDING_APPROVAL_ANNOTATION)
         .map(String::as_str);
     let proposed_digest = spec_digest(&candidate.proposed_spec)?;
-    let proposed_actor = principal_actor(&candidate.proposed_spec);
     let bound_scope = match scope_kind {
         EnvelopeScopeKind::MemberRole => runtime
             .annotations()
@@ -2564,46 +2605,50 @@ where
             .as_deref()
             .is_some_and(|digest| digest != proposed_digest)
         || bound_scope != Some(candidate.member_role.as_str())
-        || proposed_actor != candidate.actor
+        || principal_actor(&candidate.proposed_spec) != candidate.actor
     {
         return Err(ApiError::Conflict(
             "parked approval provenance does not match the bound runtime".to_owned(),
         ));
     }
-    let current_digest = spec_digest(&runtime.spec)?;
-    let already_applied = runtime.spec == candidate.proposed_spec;
-    if !already_applied && current_digest != candidate.base_spec_digest {
+    if runtime.spec == candidate.proposed_spec && pending_digest.is_none() {
+        return Ok(true);
+    }
+    if spec_digest(&runtime.spec)? != candidate.base_spec_digest {
         return Err(ApiError::Conflict(
             "runtime changed after the approval request was parked".to_owned(),
         ));
     }
-    let approved = ledger
-        .approve_admission(ApproveAdmission {
-            approval_id,
-            decided_by: &admin.actor,
-            rationale: &request.rationale,
-            evidence_url: &request.evidence_url,
-            expires_at: &request.expires_at,
-        })
-        .await
-        .map_err(ApiError::Store)?;
-    let pending_annotation_removed = runtime
-        .metadata
-        .annotations
-        .get_or_insert_default()
-        .remove(PENDING_APPROVAL_ANNOTATION)
-        .is_some();
-    if !already_applied || pending_annotation_removed {
+    Ok(false)
+}
+
+async fn apply_approved_parked_runtime<R>(
+    runtimes: &R,
+    candidate: &ApprovalCandidate,
+    scope_kind: EnvelopeScopeKind,
+    mut runtime: AgentRuntime,
+    approved: &ApprovedAdmission,
+) -> Result<(), ApiError>
+where
+    R: RuntimeRepository,
+{
+    for attempt in 0..2 {
+        if validate_parked_approval_runtime(&runtime, candidate, scope_kind)? {
+            return Ok(());
+        }
+        let pending_annotation_removed = runtime
+            .metadata
+            .annotations
+            .get_or_insert_default()
+            .remove(PENDING_APPROVAL_ANNOTATION)
+            .is_some();
         let canonical_authority = runtime.spec.canonical_authority.clone();
         runtime.spec = approved.proposed_spec.clone();
         runtime.spec.canonical_authority = canonical_authority;
-        if pending_annotation_removed
+        let result = if pending_annotation_removed
             || matches!(&approved.proposed_spec.principal, Principal::Service { .. })
         {
-            runtimes
-                .replace_as_authority(&runtime)
-                .await
-                .map_err(ApiError::Runtime)?;
+            runtimes.replace_as_authority(&runtime).await
         } else {
             runtimes
                 .replace(
@@ -2615,22 +2660,29 @@ where
                     },
                 )
                 .await
-                .map_err(ApiError::Runtime)?;
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt == 0 && is_stale_runtime_write(&error) => {
+                runtime = runtimes
+                    .get_bound(
+                        &candidate.runtime_namespace,
+                        &candidate.runtime_name,
+                        &candidate.runtime_uid,
+                    )
+                    .await
+                    .map_err(ApiError::Runtime)?;
+            }
+            Err(error) => return Err(ApiError::Runtime(error)),
         }
     }
-    decisions
-        .record_resolution(&DecisionResolution {
-            request_id: approval_id.to_string(),
-            key: approved.decision_key,
-            decided_by: approved.decided_by,
-            rationale: approved.rationale,
-            evidence_url: approved.evidence_url,
-        })
-        .await
-        .map_err(|error| ApiError::DecisionChannel(format!("{error:?}")))?;
-    Ok(SubmissionOutcome::Applied {
-        proposed_spec: approved.proposed_spec,
-    })
+    Err(ApiError::Runtime(
+        "approval runtime replacement exhausted its bounded retry".to_owned(),
+    ))
+}
+
+fn is_stale_runtime_write(error: &str) -> bool {
+    error.contains("object has been modified")
 }
 
 fn principal_actor(spec: &AgentRuntimeSpec) -> &str {
@@ -3859,6 +3911,14 @@ mod tests {
         runtime: Arc<Mutex<AgentRuntime>>,
     }
 
+    #[derive(Clone)]
+    struct ConflictOnceRuntimeRepository {
+        inner: FakeRuntimeRepository,
+        replace_attempts: Arc<AtomicUsize>,
+        mutate_spec_on_conflict: bool,
+        first_replace_error: &'static str,
+    }
+
     #[derive(Clone, Default)]
     struct MultiRuntimeRepository {
         runtimes: Arc<Mutex<Vec<AgentRuntime>>>,
@@ -4076,6 +4136,133 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    impl RuntimeRepository for ConflictOnceRuntimeRepository {
+        fn create<'a>(
+            &'a self,
+            namespace: &'a str,
+            runtime: &'a AgentRuntime,
+            context: &'a AdmissionContext,
+        ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+            self.inner.create(namespace, runtime, context)
+        }
+
+        fn create_as_authority<'a>(
+            &'a self,
+            namespace: &'a str,
+            runtime: &'a AgentRuntime,
+        ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
+            self.inner.create_as_authority(namespace, runtime)
+        }
+
+        fn get<'a>(
+            &'a self,
+            namespace: &'a str,
+            name: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            self.inner.get(namespace, name)
+        }
+
+        fn get_bound<'a>(
+            &'a self,
+            namespace: &'a str,
+            name: &'a str,
+            runtime_uid: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            self.inner.get_bound(namespace, name, runtime_uid)
+        }
+
+        fn get_by_uid<'a>(
+            &'a self,
+            runtime_uid: &'a str,
+        ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+            self.inner.get_by_uid(runtime_uid)
+        }
+
+        fn replace<'a>(
+            &'a self,
+            runtime: &'a AgentRuntime,
+            context: &'a AdmissionContext,
+        ) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                if self.replace_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let mut stored = self
+                        .inner
+                        .runtime
+                        .lock()
+                        .map_err(|_| "fake runtime lock was poisoned".to_owned())?;
+                    stored.metadata.resource_version = Some("2".to_owned());
+                    if self.mutate_spec_on_conflict {
+                        stored.spec.llms[0].model = "model-concurrent".to_owned();
+                    }
+                    return Err(self.first_replace_error.to_owned());
+                }
+                self.inner.replace(runtime, context).await
+            })
+        }
+
+        fn replace_as_authority<'a>(
+            &'a self,
+            runtime: &'a AgentRuntime,
+        ) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                if self.replace_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let mut stored = self
+                        .inner
+                        .runtime
+                        .lock()
+                        .map_err(|_| "fake runtime lock was poisoned".to_owned())?;
+                    stored.metadata.resource_version = Some("2".to_owned());
+                    if self.mutate_spec_on_conflict {
+                        stored.spec.llms[0].model = "model-concurrent".to_owned();
+                    }
+                    return Err(self.first_replace_error.to_owned());
+                }
+                self.inner.replace_as_authority(runtime).await
+            })
+        }
+    }
+
+    async fn approve_parked_budget_increase<R>(runtimes: R) -> Result<StatusCode, String>
+    where
+        R: RuntimeRepository,
+    {
+        let app = router(
+            runtimes,
+            ledger(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        let parked = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/v1/namespaces/team-a/runtimes/runtime-a/budget")
+                    .header("authorization", "Bearer user-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"amount":"120.00"}"#))
+                    .map_err(|error| format!("failed to build parked request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("parked request failed: {error}"))?;
+        assert_eq!(parked.status(), StatusCode::ACCEPTED);
+        let approved = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/approvals/00000000-0000-0000-0000-000000000000/approve")
+                    .header("authorization", "Bearer admin-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"rationale":"runtime approval","evidenceUrl":"https://jira.example.com/browse/PROJ-123","expiresAt":"2999-01-01T00:00:00Z"}"#,
+                    ))
+                    .map_err(|error| format!("failed to build approval request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("approval request failed: {error}"))?;
+        Ok(approved.status())
     }
 
     impl RuntimeRepository for MultiRuntimeRepository {
@@ -7873,6 +8060,99 @@ mod tests {
                 .model,
             "model-b",
             "stale approval must preserve the intervening runtime change"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approval_refetch_after_a_conflict_never_overwrites_a_concurrent_spec_change()
+    -> Result<(), String> {
+        let inner = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = inner.runtime.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let approved = approve_parked_budget_increase(
+            ConflictOnceRuntimeRepository {
+                inner,
+                replace_attempts: attempts.clone(),
+                mutate_spec_on_conflict: true,
+                first_replace_error: "Operation cannot be fulfilled on agentruntimes: object has been modified (409 Conflict)",
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            approved,
+            StatusCode::CONFLICT,
+            "a retry must revalidate the refreshed runtime instead of overwriting concurrent desired state"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime_state
+                .lock()
+                .map_err(|_| "fake runtime lock was poisoned")?
+                .spec
+                .llms[0]
+                .model,
+            "model-concurrent",
+            "a failed retry must preserve the concurrent spec change"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approval_retries_once_after_a_stale_runtime_write() -> Result<(), String> {
+        let inner = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = inner.runtime.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let approved = approve_parked_budget_increase(
+            ConflictOnceRuntimeRepository {
+                inner,
+                replace_attempts: attempts.clone(),
+                mutate_spec_on_conflict: false,
+                first_replace_error: "Operation cannot be fulfilled on agentruntimes: object has been modified (409 Conflict)",
+            },
+        )
+        .await?;
+
+        assert_eq!(approved, StatusCode::OK);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let runtime = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert_eq!(runtime.metadata.resource_version.as_deref(), Some("2"));
+        assert_eq!(runtime.spec.budget.monthly_limit, "220.00");
+        assert!(
+            !runtime
+                .annotations()
+                .contains_key(PENDING_APPROVAL_ANNOTATION),
+            "the refreshed object must be released only after the successful retry"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approval_does_not_retry_a_non_conflict_runtime_write_failure() -> Result<(), String> {
+        let inner = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let approved = approve_parked_budget_increase(ConflictOnceRuntimeRepository {
+            inner,
+            replace_attempts: attempts.clone(),
+            mutate_spec_on_conflict: false,
+            first_replace_error: "runtime API unavailable",
+        })
+        .await?;
+
+        assert_eq!(approved, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "an outage must be surfaced rather than retried as if it were an optimistic-lock conflict"
         );
         Ok(())
     }
