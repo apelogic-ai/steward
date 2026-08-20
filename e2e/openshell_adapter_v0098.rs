@@ -41,6 +41,8 @@ fn valid_config() -> Result<OpenShellConnectionConfig, String> {
         workload_source_credential_file: required_path("STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE")?,
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
         runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
+        bridge_image: None,
+        bridge_gateway_origin: None,
     })
 }
 
@@ -269,6 +271,7 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
             &SandboxTaskRequest {
                 runtime: request.runtime.clone(),
                 refs,
+                agent_type: request.agent_type.clone(),
                 command: vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),

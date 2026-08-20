@@ -571,6 +571,7 @@ async fn reconcile_task<R: SandboxTaskRuntime>(
                             )
                         })?),
                         refs,
+                        agent_type: task.runtime_spec.agent_type.clone(),
                         command: task.agent_command.clone(),
                     },
                     input,

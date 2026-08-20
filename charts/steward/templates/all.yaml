@@ -278,6 +278,14 @@ spec:
             - { name: STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE, value: /var/run/secrets/steward/workload/source-token }
             - { name: STEWARD_CONTROLLER_USERNAME, value: {{ printf "system:serviceaccount:%s:steward-controller" .Release.Namespace | quote }} }
             - { name: STEWARD_APISERVER_USERNAME, value: {{ printf "system:serviceaccount:%s:steward-apiserver" .Release.Namespace | quote }} }
+{{- if .Values.stableBridge.enabled }}
+            - { name: STEWARD_STABLE_BRIDGE_IMAGE, value: {{ .Values.stableBridge.image | quote }} }
+            - { name: STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY, value: {{ .Values.stableBridge.signerIdentity | quote }} }
+            - { name: STEWARD_STABLE_BRIDGE_SOURCE_REPOSITORY, value: {{ .Values.stableBridge.sourceRepository | quote }} }
+            - { name: STEWARD_STABLE_BRIDGE_SOURCE_COMMIT, value: {{ .Values.stableBridge.sourceCommit | quote }} }
+            - { name: STEWARD_STABLE_BRIDGE_ATTESTATION_BUNDLE_FILE, value: /run/stable-bridge-attestation/bundle.jsonl }
+            - { name: STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN, value: {{ .Values.stableBridge.mcpGatewayOrigin | quote }} }
+{{- end }}
             - { name: STEWARD_TLS_CERT_DER, value: /run/tls/tls.crt }
             - { name: STEWARD_TLS_KEY_DER, value: /run/tls/tls.key }
           volumeMounts:
@@ -285,6 +293,9 @@ spec:
             - { name: openshell-client, mountPath: /run/openshell, readOnly: true }
             - { name: workload-exchange-ca, mountPath: /run/workload-exchange, readOnly: true }
             - { name: workload-source-credential, mountPath: /var/run/secrets/steward/workload, readOnly: true }
+{{- if .Values.stableBridge.enabled }}
+            - { name: stable-bridge-attestation, mountPath: /run/stable-bridge-attestation, readOnly: true }
+{{- end }}
           resources:
 {{ toYaml .Values.resources.controller | nindent 12 }}
       volumes:
@@ -308,6 +319,12 @@ spec:
                   audience: apelogic-workload-exchange
                   expirationSeconds: 600
                   path: source-token
+{{- if .Values.stableBridge.enabled }}
+        - name: stable-bridge-attestation
+          configMap:
+            name: {{ $stableBridgeBundleName }}
+            items: [{ key: bundle.jsonl, path: bundle.jsonl }]
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment

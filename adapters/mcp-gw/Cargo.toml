@@ -7,7 +7,13 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+# Forward the bridge's three fixed operations through the provider-attached MCP-GW boundary.
+reqwest.workspace = true
+# Parse and emit the narrow one-shot bridge archive payloads without a compatibility identity.
+serde_json.workspace = true
 steward-ports = { path = "../../crates/steward-ports", version = "=0.0.0" }
+# Runs the one-shot bridge executable without introducing a second async runtime.
+tokio.workspace = true
 
 [lints]
 workspace = true

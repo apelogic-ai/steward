@@ -1104,7 +1104,7 @@ mod tests {
             .and_then(|jobs| jobs.split("\n  pinned:").next())
             .ok_or_else(|| "release-candidate CI job is required".to_owned())?;
 
-        for component in ["apiserver", "controller", "mint"] {
+        for component in ["apiserver", "controller", "mint", "bridge"] {
             assert!(
                 release_candidate.contains(&format!(
                     "image-ref: steward-{component}:release-validation"
@@ -1116,17 +1116,17 @@ mod tests {
             release_candidate
                 .matches("aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8")
                 .count(),
-            3,
+            4,
             "release-candidate CI must use the pinned Trivy action for every component image"
         );
         assert_eq!(
             release_candidate.matches("exit-code: \"1\"").count(),
-            3,
+            4,
             "every release-candidate image scan must fail closed"
         );
         assert_eq!(
             release_candidate.matches("severity: CRITICAL").count(),
-            3,
+            4,
             "every release-candidate image scan must enforce CRITICAL findings"
         );
 
@@ -1731,6 +1731,10 @@ mod tests {
         .collect::<Result<Vec<_>, _>>()?;
         let container = fs::read_to_string(root().join("build/package.Dockerfile"))
             .map_err(|error| format!("production container build is required: {error}"))?;
+        let bridge_container = fs::read_to_string(
+            root().join("build/connections-bridge.Dockerfile"),
+        )
+        .map_err(|error| format!("Connections bridge sandbox image build is required: {error}"))?;
 
         for required in [
             "apiserver:",
@@ -1850,13 +1854,38 @@ mod tests {
             "apiserver.digest",
             "controller.digest",
             "mint.digest",
+            "bridge.digest",
+            "bridge-attestation-bundle.jsonl",
+            "gh attestation download",
+            "--predicate-type https://slsa.dev/provenance/v1",
+            "Bridge signer identity:",
+            "Bridge source repository:",
+            "Bridge source commit:",
             "helm-chart.digest",
+            "ecr-bridge-attestation-bundle.jsonl",
+            "oci://${IMAGE_REPOSITORY}@${bridge_digest}",
+            "docker login \"$ECR_REGISTRY\" --username AWS --password-stdin",
+            "Bridge ECR signer identity:",
+            "Bridge ECR source repository:",
+            "Bridge ECR source commit:",
         ] {
             assert!(
                 workflow.contains(artifact),
                 "release workflow must record {artifact}"
             );
         }
+        assert!(
+            values.contains("mcpGatewayOrigin") && schema.contains("mcpGatewayOrigin"),
+            "stable bridge chart values must require the controller-owned MCP-GW origin"
+        );
+        assert!(
+            controller.contains("stable-bridge-attestation"),
+            "stable bridge controller must mount the immutable provenance bundle"
+        );
+        assert!(
+            controller.contains("STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN"),
+            "stable bridge controller must receive the server-owned MCP-GW origin"
+        );
         assert!(
             workflow.matches("exit-code: \"1\"").count() >= 2,
             "image and chart vulnerability scans must fail releases on critical findings"
@@ -1906,9 +1935,33 @@ mod tests {
             container.contains("USER 65532:65532"),
             "production images must run as a numeric non-root user"
         );
+        for required in [
+            "FROM busybox:1.37.0-musl@sha256:",
+            "FROM gcr.io/distroless/cc-debian12:nonroot@sha256:",
+            "COPY --from=toolbox /bin/busybox /bin/busybox",
+            "COPY --from=toolbox /bin/tar /bin/tar",
+            "COPY --from=toolbox /bin/ip /bin/ip",
+            "COPY --from=toolbox /bin/id /bin/id",
+            "COPY --from=toolbox /bin/mkdir /bin/mkdir",
+            "COPY --from=toolbox /bin/rm /bin/rm",
+            "COPY --chown=65532:65532 --from=toolbox /sandbox /sandbox",
+            "mkdir -p /sandbox",
+            "chown 65532:65532 /sandbox",
+            "USER 65532:65532",
+            "/usr/local/bin/steward-connections-bridge",
+        ] {
+            assert!(
+                bridge_container.contains(required),
+                "Connections bridge sandbox image is missing required OpenShell runtime prerequisite: {required}"
+            );
+        }
         assert!(
             workflow.contains("${{ steps.version.outputs.version }}-${{ matrix.component }}"),
             "component tags must match the published chart contract"
+        );
+        assert!(
+            workflow.contains("platforms: linux/amd64"),
+            "release images must publish the supported linux/amd64 runtime platform explicitly"
         );
         assert!(
             workflow.contains("push:\n    tags:"),
@@ -1936,7 +1989,15 @@ mod tests {
                 "pinned CI workflow tools are missing {required}"
             );
         }
-        for required in ["helm template steward", "docker build"] {
+        for required in [
+            "helm template steward",
+            "docker build",
+            "docker run --rm --entrypoint /bin/sh",
+            "command -v tar",
+            "command -v ip",
+            "test -w /sandbox",
+            "test \"$(id -u)\" = \"65532\"",
+        ] {
             assert!(
                 release_validation.contains(required),
                 "release validation must exercise artifact construction: missing {required}"

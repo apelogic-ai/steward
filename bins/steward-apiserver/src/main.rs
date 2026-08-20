@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::serve::Listener;
+use steward_adapter_github_artifact::GitHubArtifactVerifier;
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{
     KubeRuntimeRepository, KubernetesTaskIdentityResolver, KubernetesTokenAuthenticator,
@@ -147,13 +148,8 @@ fn browser_application_router(
     Ok(Some(app))
 }
 
-fn stable_bridge_configuration() -> Result<
-    Option<(
-        stable_runtime_bridge::BridgeService,
-        stable_runtime_bridge::GitHubArtifactVerifier,
-    )>,
-    io::Error,
-> {
+fn stable_bridge_configuration()
+-> Result<Option<(stable_runtime_bridge::BridgeService, GitHubArtifactVerifier)>, io::Error> {
     let image = env::var("STEWARD_STABLE_BRIDGE_IMAGE").ok();
     let signer_identity = env::var("STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY").ok();
     let source_repository = env::var("STEWARD_STABLE_BRIDGE_SOURCE_REPOSITORY").ok();
@@ -182,13 +178,7 @@ fn stable_bridge_configuration_from_values(
     source_commit: Option<String>,
     bundle: Option<String>,
     service: Option<String>,
-) -> Result<
-    Option<(
-        stable_runtime_bridge::BridgeService,
-        stable_runtime_bridge::GitHubArtifactVerifier,
-    )>,
-    io::Error,
-> {
+) -> Result<Option<(stable_runtime_bridge::BridgeService, GitHubArtifactVerifier)>, io::Error> {
     if [
         image.as_ref(),
         signer_identity.as_ref(),
@@ -211,14 +201,14 @@ fn stable_bridge_configuration_from_values(
         service.ok_or_else(stable_bridge_configuration_error)?,
     )
     .map_err(io::Error::other)?;
-    let verifier = stable_runtime_bridge::GitHubArtifactVerifier::from_jsonl(
+    let verifier = GitHubArtifactVerifier::from_jsonl(
         image,
         signer_identity,
         source_repository,
         source_commit,
         &bundle,
     )
-    .map_err(io::Error::other)?;
+    .map_err(|_| io::Error::other("stable bridge provenance configuration is invalid"))?;
     Ok(Some((service, verifier)))
 }
 

@@ -85,11 +85,11 @@ that allowlist remain inaccessible to both service accounts.
 - `stableBridge` defaults to disabled. Enabling it requires all of a
   digest-pinned bridge image, GitHub signer identity, HTTPS GitHub source repository and
   exact source commit, controller service identity, and the public GitHub
-  artifact-attestation bundle. The bundle is rendered into an immutable,
-  content-addressed ConfigMap and mounted read-only in the apiserver; it is
-  provenance evidence, not a Secret. Missing or partial bridge configuration
-  fails Helm validation, and the apiserver itself fails startup on an unreadable
-  or unverified bundle.
+  artifact-attestation bundle, and an exact HTTP(S) MCP-GW origin. The bundle is
+  rendered into an immutable, content-addressed ConfigMap and mounted read-only
+  in both apiserver and controller; it is provenance evidence, not a Secret.
+  Missing or partial bridge configuration fails Helm validation, and either
+  workload fails startup on an unreadable or unverified bundle.
 - This chart wiring enables the session-protected stable bridge *resolver*.
   It does not invent sandbox artifact installation, a Kubernetes pod selector,
   or a direct pod copy/exec path. OpenShell upstream delivery work is not an

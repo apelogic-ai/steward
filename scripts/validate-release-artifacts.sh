@@ -7,7 +7,8 @@ stable_bridge_rendered="$(mktemp)"
 stable_bridge_bundle="$(mktemp)"
 stable_bridge_configmap="$(mktemp)"
 stable_bridge_deployment="$(mktemp)"
-trap 'rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" "${stable_bridge_configmap}" "${stable_bridge_deployment}"' EXIT INT TERM
+stable_bridge_controller_deployment="$(mktemp)"
+trap 'rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" "${stable_bridge_configmap}" "${stable_bridge_deployment}" "${stable_bridge_controller_deployment}"' EXIT INT TERM
 
 digest0="sha256:0000000000000000000000000000000000000000000000000000000000000000"
 digest1="sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -29,6 +30,7 @@ stable_bridge_values=(
   --set-string stableBridge.sourceRepository=https://github.com/example-org/steward
   --set-string stableBridge.sourceCommit=0123456789abcdef0123456789abcdef01234567
   --set-string stableBridge.service=steward-run
+  --set-string stableBridge.mcpGatewayOrigin=https://mcp-gw.example.test
 )
 
 printf '%s\n%s' \
@@ -83,10 +85,30 @@ grep -Fxq '        - name: stable-bridge-attestation' "${stable_bridge_deploymen
 grep -Fxq "            name: ${stable_bridge_configmap_name}" "${stable_bridge_deployment}"
 grep -Fxq '            items: [{ key: bundle.jsonl, path: bundle.jsonl }]' "${stable_bridge_deployment}"
 
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-controller/ { print; exit }
+' "${stable_bridge_rendered}" > "${stable_bridge_controller_deployment}"
+grep -Fxq 'kind: Deployment' "${stable_bridge_controller_deployment}"
+for required in \
+  '            - { name: STEWARD_STABLE_BRIDGE_IMAGE, value: "ghcr.io/example-org/steward-bridge@sha256:3333333333333333333333333333333333333333333333333333333333333333" }' \
+  '            - { name: STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY, value: "https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.11" }' \
+  '            - { name: STEWARD_STABLE_BRIDGE_SOURCE_REPOSITORY, value: "https://github.com/example-org/steward" }' \
+  '            - { name: STEWARD_STABLE_BRIDGE_SOURCE_COMMIT, value: "0123456789abcdef0123456789abcdef01234567" }' \
+  '            - { name: STEWARD_STABLE_BRIDGE_ATTESTATION_BUNDLE_FILE, value: /run/stable-bridge-attestation/bundle.jsonl }' \
+  '            - { name: STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN, value: "https://mcp-gw.example.test" }' \
+  '            - { name: stable-bridge-attestation, mountPath: /run/stable-bridge-attestation, readOnly: true }' \
+  '        - name: stable-bridge-attestation' \
+  "            name: ${stable_bridge_configmap_name}" \
+  '            items: [{ key: bundle.jsonl, path: bundle.jsonl }]'
+do
+  grep -Fxq "${required}" "${stable_bridge_controller_deployment}"
+done
+
 if grep -Fq 'steward-stable-bridge-attestation-' "${rendered}" \
   || grep -Fq 'STEWARD_STABLE_BRIDGE_' "${rendered}"
 then
-  echo "a disabled stable bridge must render no bridge ConfigMap or apiserver wiring" >&2
+  echo "a disabled stable bridge must render no bridge ConfigMap or workload wiring" >&2
   exit 1
 fi
 if helm template steward "${root}/charts/steward" \
@@ -109,6 +131,34 @@ then
   echo "a mutable stable bridge image must fail chart validation" >&2
   exit 1
 fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  "${stable_bridge_values[@]}" \
+  --set-string stableBridge.mcpGatewayOrigin= \
+  --set-file "stableBridge.attestationBundle=${stable_bridge_bundle}" >/dev/null 2>&1
+then
+  echo "a stable bridge image without its controller-owned MCP-GW origin must fail chart validation" >&2
+  exit 1
+fi
+for invalid_bridge_origin in \
+  'https://bridge-user@mcp-gw.example.test' \
+  'https://mcp-gw.example.test:70000' \
+  'https://mcp gw.example.test'
+do
+  if helm template steward "${root}/charts/steward" \
+    --namespace steward \
+    --include-crds \
+    "${image_values[@]}" \
+    "${stable_bridge_values[@]}" \
+    --set-string "stableBridge.mcpGatewayOrigin=${invalid_bridge_origin}" \
+    --set-file "stableBridge.attestationBundle=${stable_bridge_bundle}" >/dev/null 2>&1
+  then
+    echo "a stable bridge origin must reject userinfo, invalid ports, and whitespace: ${invalid_bridge_origin}" >&2
+    exit 1
+  fi
+done
 if helm lint "${root}/charts/steward" "${image_values[@]}" \
   --set stableBridge.enabled=true >/dev/null 2>&1
 then
@@ -198,6 +248,20 @@ if [[ "${1:-}" == "--build-images" ]]; then
       --tag "steward-${component}:release-validation" \
       "${root}"
   done
+  docker build \
+    --file "${root}/build/connections-bridge.Dockerfile" \
+    --tag "steward-bridge:release-validation" \
+    "${root}"
+  docker run --rm --entrypoint /bin/sh steward-bridge:release-validation -ceu '
+    command -v tar >/dev/null
+    command -v ip >/dev/null
+    command -v mkdir >/dev/null
+    command -v rm >/dev/null
+    test -w /sandbox
+    test "$(id -u)" = "65532"
+    : >/sandbox/release-validation
+    rm /sandbox/release-validation
+  '
 elif [[ -n "${1:-}" ]]; then
   echo "usage: $0 [--build-images]" >&2
   exit 2

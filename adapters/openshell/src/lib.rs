@@ -24,7 +24,8 @@ use openshell_sdk::raw::proto::datamodel::v1::{ObjectMeta, Provider};
 #[cfg(feature = "runtime")]
 use openshell_sdk::raw::proto::{
     AttachSandboxProviderRequest, CreateProviderRequest, DetachSandboxProviderRequest,
-    GetProviderRequest, ListSandboxProvidersRequest,
+    GetProviderRequest, GetSandboxRequest, ListSandboxProvidersRequest, Sandbox as RawSandbox,
+    SandboxPhase as RawSandboxPhase,
 };
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
@@ -45,7 +46,7 @@ use steward_ports::{
     SandboxTaskRuntime,
 };
 #[cfg(feature = "runtime")]
-use steward_types::RuntimeRefs;
+use steward_types::{AgentType, RuntimeRefs};
 #[cfg(feature = "runtime")]
 use tokio::sync::Mutex;
 #[cfg(feature = "runtime")]
@@ -56,11 +57,15 @@ const NAME_LENGTH: usize = 19;
 const HASH_CHARACTERS: usize = NAME_LENGTH - 2;
 const LOWER_BASE36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 #[cfg(feature = "runtime")]
+const TAR_BLOCK_BYTES: usize = 512;
+#[cfg(feature = "runtime")]
 const KUBERNETES_DNS_SUBDOMAIN_MAX_LENGTH: usize = 253;
 #[cfg(feature = "runtime")]
 const KUBERNETES_DNS_LABEL_MAX_LENGTH: usize = 63;
 #[cfg(feature = "runtime")]
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
+/// Server-authored agent type for the one-shot Connections bridge operation.
+pub const CONNECTIONS_BRIDGE_AGENT_TYPE: &str = "connections-bridge";
 #[cfg(feature = "runtime")]
 const TOOL_PROVIDER: &str = "steward-mcp-gw";
 #[cfg(feature = "runtime")]
@@ -274,6 +279,7 @@ struct OpenShellProjection {
     sandbox: String,
     providers: Vec<String>,
     runtime_uid: String,
+    image: Option<String>,
 }
 
 #[cfg(feature = "runtime")]
@@ -299,15 +305,128 @@ fn deletion_names(request: &SandboxRequest) -> (String, String) {
 }
 
 #[cfg(feature = "runtime")]
-fn project_request(request: &SandboxRequest) -> Result<OpenShellProjection, PortError> {
-    match request.agent_type.name.as_str() {
-        "base" => {}
-        other => {
-            return Err(PortError::Rejected {
-                reason: format!("unsupported agent type: {other}"),
-            });
-        }
+fn bridge_image_for_agent_type(
+    agent_type: &AgentType,
+    bridge_image: Option<&str>,
+) -> Result<Option<String>, PortError> {
+    match agent_type.name.as_str() {
+        "base" => Ok(None),
+        CONNECTIONS_BRIDGE_AGENT_TYPE => bridge_image
+            .filter(|image| is_digest_pinned_image(image))
+            .map(str::to_owned)
+            .map(Some)
+            .ok_or_else(|| PortError::Rejected {
+                reason: "Connections bridge requires a provenance-verified digest-pinned image"
+                    .to_owned(),
+            }),
+        other => Err(PortError::Rejected {
+            reason: format!("unsupported agent type: {other}"),
+        }),
     }
+}
+
+#[cfg(feature = "runtime")]
+fn is_digest_pinned_image(value: &str) -> bool {
+    let Some((repository, digest)) = value.rsplit_once('@') else {
+        return false;
+    };
+    !repository.is_empty()
+        && digest.starts_with("sha256:")
+        && digest.len() == "sha256:".len() + 64
+        && digest["sha256:".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(feature = "runtime")]
+fn validate_connections_bridge_archive(
+    archive: &[u8],
+    expected_file: &str,
+) -> Result<(), PortError> {
+    let reject = || PortError::Rejected {
+        reason: "Connections bridge archive must contain exactly one expected regular file"
+            .to_owned(),
+    };
+    if expected_file.is_empty()
+        || archive.len() < TAR_BLOCK_BYTES * 3
+        || !archive.len().is_multiple_of(TAR_BLOCK_BYTES)
+    {
+        return Err(reject());
+    }
+    let header = &archive[..TAR_BLOCK_BYTES];
+    if header.iter().all(|byte| *byte == 0)
+        || tar_checksum(header).is_none()
+        || header[156] != 0 && header[156] != b'0'
+        || header[345..500].iter().any(|byte| *byte != 0)
+        || header[157..257].iter().any(|byte| *byte != 0)
+        || tar_string(&header[..100]) != Some(expected_file)
+    {
+        return Err(reject());
+    }
+    let size = tar_octal(&header[124..136]).ok_or_else(reject)?;
+    let body_end = TAR_BLOCK_BYTES
+        .checked_add(size)
+        .and_then(|end| end.checked_add(TAR_BLOCK_BYTES - 1))
+        .map(|end| end / TAR_BLOCK_BYTES * TAR_BLOCK_BYTES)
+        .ok_or_else(reject)?;
+    if body_end > archive.len() - TAR_BLOCK_BYTES * 2
+        || archive[body_end..].iter().any(|byte| *byte != 0)
+    {
+        return Err(reject());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "runtime")]
+fn tar_checksum(header: &[u8]) -> Option<()> {
+    if header.len() != TAR_BLOCK_BYTES {
+        return None;
+    }
+    tar_octal(&header[148..156]).and_then(|expected| {
+        let actual = header
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| {
+                u32::from(if (148..156).contains(&index) {
+                    b' '
+                } else {
+                    *byte
+                })
+            })
+            .sum::<u32>();
+        (u32::try_from(expected).ok()? == actual).then_some(())
+    })
+}
+
+#[cfg(feature = "runtime")]
+fn tar_octal(field: &[u8]) -> Option<usize> {
+    let field = field
+        .strip_prefix(&[b' '][..])
+        .unwrap_or(field)
+        .split(|byte| *byte == 0 || *byte == b' ')
+        .next()
+        .filter(|value| !value.is_empty())?;
+    field.iter().try_fold(0_usize, |value, byte| {
+        (b'0'..=b'7')
+            .contains(byte)
+            .then(|| value.checked_mul(8)?.checked_add(usize::from(*byte - b'0')))
+            .flatten()
+    })
+}
+
+#[cfg(feature = "runtime")]
+fn tar_string(field: &[u8]) -> Option<&str> {
+    let nul = field.iter().position(|byte| *byte == 0)?;
+    field[nul..].iter().all(|byte| *byte == 0).then_some(())?;
+    std::str::from_utf8(&field[..nul]).ok()
+}
+
+#[cfg(feature = "runtime")]
+fn project_request(
+    request: &SandboxRequest,
+    bridge_image: Option<&str>,
+) -> Result<OpenShellProjection, PortError> {
+    let image = bridge_image_for_agent_type(&request.agent_type, bridge_image)?;
     Ok(OpenShellProjection {
         workspace: stable_name(NameKind::Workspace, request.workspace_key.as_bytes()),
         workspace_key: request.workspace_key.clone(),
@@ -320,6 +439,7 @@ fn project_request(request: &SandboxRequest) -> Result<OpenShellProjection, Port
         .flatten()
         .collect(),
         runtime_uid: request.runtime.0.clone(),
+        image,
     })
 }
 
@@ -329,7 +449,7 @@ fn sandbox_spec(projection: &OpenShellProjection) -> SandboxSpec {
     labels.insert(RUNTIME_UID_LABEL.to_owned(), projection.runtime_uid.clone());
     SandboxSpec {
         name: Some(projection.sandbox.clone()),
-        image: None,
+        image: projection.image.clone(),
         labels,
         providers: projection.providers.clone(),
         ..SandboxSpec::default()
@@ -368,6 +488,11 @@ pub struct OpenShellConnectionConfig {
     pub workload_source_credential_file: PathBuf,
     pub server_name: String,
     pub runtime_class_name: String,
+    /// Digest-pinned bridge image only. Its provenance is verified by the controller process
+    /// before this adapter is constructed.
+    pub bridge_image: Option<String>,
+    /// Server-configured gateway origin passed only to the fixed bridge executable.
+    pub bridge_gateway_origin: Option<String>,
 }
 
 #[cfg(feature = "runtime")]
@@ -414,8 +539,60 @@ impl OpenShellConnectionConfig {
                     .to_owned(),
             });
         }
+        match (
+            self.bridge_image.as_deref(),
+            self.bridge_gateway_origin.as_deref(),
+        ) {
+            (None, None) => {}
+            (Some(image), Some(origin)) => {
+                if !is_digest_pinned_image(image) {
+                    return Err(PortError::Rejected {
+                        reason: "Connections bridge image must be an immutable sha256 reference"
+                            .to_owned(),
+                    });
+                }
+                validate_connections_bridge_gateway_origin(origin)?;
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(PortError::Rejected {
+                    reason:
+                        "Connections bridge image and gateway origin must be configured together"
+                            .to_owned(),
+                });
+            }
+        }
         Ok(())
     }
+}
+
+#[cfg(feature = "runtime")]
+/// Rejects every value other than one exact HTTP(S) origin before a bridge runtime is created.
+///
+/// The controller calls this while loading its configuration so malformed gateway targets cannot
+/// reach the OpenShell connection path.
+pub fn validate_connections_bridge_gateway_origin(value: &str) -> Result<(), PortError> {
+    if value.trim() != value {
+        return Err(PortError::Rejected {
+            reason: "Connections bridge gateway origin must be an exact HTTP(S) origin".to_owned(),
+        });
+    }
+    let origin = Url::parse(value).map_err(|_| PortError::Rejected {
+        reason: "Connections bridge gateway origin must be an exact HTTP(S) origin".to_owned(),
+    })?;
+    if !matches!(origin.scheme(), "http" | "https")
+        || origin.host_str().is_none()
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+        || origin.port() == Some(0)
+    {
+        return Err(PortError::Rejected {
+            reason: "Connections bridge gateway origin must be an exact HTTP(S) origin".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(feature = "runtime")]
@@ -644,6 +821,8 @@ fn workload_exchange_unavailable(_: reqwest::Error) -> PortError {
 pub struct OpenShellRuntime {
     channel: Channel,
     token_provider: WorkloadExchangeTokenProvider,
+    bridge_image: Option<String>,
+    bridge_gateway_origin: Option<String>,
 }
 
 #[cfg(feature = "runtime")]
@@ -669,6 +848,8 @@ impl OpenShellRuntime {
         let runtime = Self {
             channel,
             token_provider,
+            bridge_image: config.bridge_image,
+            bridge_gateway_origin: config.bridge_gateway_origin,
         };
         runtime.authenticated_client().await?;
         Ok(runtime)
@@ -686,6 +867,35 @@ impl OpenShellRuntime {
             self.channel.clone(),
             interceptor,
         ))
+    }
+
+    async fn verify_raw_sandbox_binding(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        runtime_uid: &str,
+        expected_image: Option<&str>,
+        require_ready: bool,
+    ) -> Result<(), PortError> {
+        let mut client = self
+            .authenticated_client()
+            .await?
+            .raw_grpc_fresh()
+            .await
+            .map_err(port_failure)?;
+        let snapshot = client
+            .get_sandbox(GetSandboxRequest {
+                name: sandbox.to_owned(),
+                workspace: workspace.to_owned(),
+            })
+            .await
+            .map_err(raw_port_failure)?
+            .into_inner()
+            .sandbox
+            .ok_or_else(|| PortError::Failed {
+                reason: "OpenShell returned an empty sandbox response".to_owned(),
+            })?;
+        validate_raw_sandbox_binding(&snapshot, runtime_uid, expected_image, require_ready)
     }
 
     async fn ensure_workspace(&self, name: &str, workspace_key: &str) -> Result<(), PortError> {
@@ -936,6 +1146,48 @@ fn validate_provider(
 }
 
 #[cfg(feature = "runtime")]
+fn validate_raw_sandbox_binding(
+    snapshot: &RawSandbox,
+    runtime_uid: &str,
+    expected_image: Option<&str>,
+    require_ready: bool,
+) -> Result<(), PortError> {
+    let metadata = snapshot
+        .metadata
+        .as_ref()
+        .ok_or_else(|| PortError::Rejected {
+            reason: "OpenShell raw sandbox has no identity metadata".to_owned(),
+        })?;
+    if metadata.labels.get(RUNTIME_UID_LABEL).map(String::as_str) != Some(runtime_uid) {
+        return Err(PortError::Rejected {
+            reason: "raw sandbox is bound to a different runtime UID".to_owned(),
+        });
+    }
+    if let Some(expected_image) = expected_image {
+        let actual_image = snapshot
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+            .map(|template| template.image.as_str());
+        if actual_image != Some(expected_image) {
+            return Err(PortError::Rejected {
+                reason: "raw sandbox image does not match the provenance-verified digest"
+                    .to_owned(),
+            });
+        }
+    }
+    if require_ready
+        && snapshot.status.as_ref().map(|status| status.phase)
+            != Some(RawSandboxPhase::Ready as i32)
+    {
+        return Err(PortError::Rejected {
+            reason: "raw sandbox is not Ready for task execution".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "runtime")]
 trait SandboxDeleteClient {
     fn sandbox_labels(
         &self,
@@ -1010,7 +1262,7 @@ where
 #[cfg(feature = "runtime")]
 impl SandboxRuntime for OpenShellRuntime {
     async fn ensure(&self, request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
-        let projection = project_request(request)?;
+        let projection = project_request(request, self.bridge_image.as_deref())?;
         self.ensure_workspace(&projection.workspace, &projection.workspace_key)
             .await?;
         for provider in &projection.providers {
@@ -1051,6 +1303,14 @@ impl SandboxRuntime for OpenShellRuntime {
                 reason: "sandbox name resolved to a different runtime UID".to_owned(),
             });
         }
+        self.verify_raw_sandbox_binding(
+            &projection.workspace,
+            &projection.sandbox,
+            &projection.runtime_uid,
+            projection.image.as_deref(),
+            false,
+        )
+        .await?;
         for provider_name in [TOOL_PROVIDER, INFERENCE_PROVIDER] {
             self.reconcile_provider(
                 &projection.workspace,
@@ -1122,6 +1382,10 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 reason: "task command must contain only non-empty arguments".to_owned(),
             });
         }
+        let is_connections_bridge = request.agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE;
+        if is_connections_bridge {
+            validate_connections_bridge_archive(input_archive, "request.json")?;
+        }
         let snapshot = self
             .authenticated_client()
             .await?
@@ -1136,6 +1400,16 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 reason: "task sandbox is bound to a different runtime UID".to_owned(),
             });
         }
+        let expected_image =
+            bridge_image_for_agent_type(&request.agent_type, self.bridge_image.as_deref())?;
+        self.verify_raw_sandbox_binding(
+            workspace,
+            sandbox,
+            &request.runtime.0,
+            expected_image.as_deref(),
+            true,
+        )
+        .await?;
         let stage = self
             .authenticated_client()
             .await?
@@ -1165,6 +1439,15 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             "STEWARD_OUTPUT_DIR".to_owned(),
             "/sandbox/steward-output".to_owned(),
         );
+        if is_connections_bridge {
+            let origin =
+                self.bridge_gateway_origin
+                    .as_deref()
+                    .ok_or_else(|| PortError::Rejected {
+                        reason: "Connections bridge gateway origin is not configured".to_owned(),
+                    })?;
+            environment.insert("STEWARD_MCP_GW_ORIGIN".to_owned(), origin.to_owned());
+        }
         let executed = self
             .authenticated_client()
             .await?
@@ -1186,6 +1469,11 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 reason: format!("task agent exited with code {}", executed.exit_code),
             });
         }
+        let output_archive_command = if is_connections_bridge {
+            "set -eu; test -f /sandbox/steward-output/response.json; tar -cf - -C /sandbox/steward-output response.json"
+        } else {
+            "set -eu; tar -cf - -C /sandbox/steward-output ."
+        };
         let collected = self
             .authenticated_client()
             .await?
@@ -1195,7 +1483,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 &[
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "set -eu; tar -cf - -C /sandbox/steward-output .".to_owned(),
+                    output_archive_command.to_owned(),
                 ],
                 ExecOptions {
                     timeout: Some(StdDuration::from_secs(120)),
@@ -1208,6 +1496,9 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             return Err(PortError::Failed {
                 reason: "task output archive could not be collected".to_owned(),
             });
+        }
+        if is_connections_bridge {
+            validate_connections_bridge_archive(&collected.stdout, "response.json")?;
         }
         Ok(SandboxTaskOutput {
             archive: collected.stdout,
@@ -1257,6 +1548,13 @@ mod tests {
     use std::time::Duration;
 
     #[cfg(feature = "runtime")]
+    use openshell_sdk::raw::proto::datamodel::v1::ObjectMeta;
+    #[cfg(feature = "runtime")]
+    use openshell_sdk::raw::proto::{
+        Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase, SandboxSpec as RawSandboxSpec,
+        SandboxStatus as RawSandboxStatus, SandboxTemplate as RawSandboxTemplate,
+    };
+    #[cfg(feature = "runtime")]
     use reqwest::{Client as HttpClient, Url};
     #[cfg(feature = "runtime")]
     use tokio::sync::Mutex;
@@ -1268,16 +1566,20 @@ mod tests {
     #[cfg(feature = "runtime")]
     use steward_types::{AgentType, RuntimeId, RuntimeRefs, ToolGrant};
 
+    #[cfg(feature = "runtime")]
+    use super::RUNTIME_UID_LABEL;
+    #[cfg(feature = "runtime")]
+    use super::validate_connections_bridge_archive;
+    #[cfg(feature = "runtime")]
+    use super::{
+        CONNECTIONS_BRIDGE_AGENT_TYPE, OpenShellConnectionConfig, ProviderReconciliation,
+        SandboxDeleteClient, WorkloadExchangeTokenProvider, delete_owned_sandbox, deletion_names,
+        load_source_credential, project_request, provider_reconciliation, sandbox_spec,
+        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
+    };
     #[cfg(feature = "identity")]
     use super::{IdentityResolutionError, SANDBOX_ID_LABEL, binding_from_sandbox};
     use super::{NameKind, stable_name};
-    #[cfg(feature = "runtime")]
-    use super::{
-        OpenShellConnectionConfig, ProviderReconciliation, SandboxDeleteClient,
-        WorkloadExchangeTokenProvider, delete_owned_sandbox, deletion_names,
-        load_source_credential, project_request, provider_reconciliation, sandbox_spec,
-        validate_workload_exchange_endpoint,
-    };
 
     #[cfg(feature = "runtime")]
     struct MockExchange {
@@ -1414,6 +1716,8 @@ mod tests {
             workload_source_credential_file: PathBuf::from("/run/workload/source-credential"),
             server_name: "gateway.example.test".to_owned(),
             runtime_class_name: "kata-qemu".to_owned(),
+            bridge_image: None,
+            bridge_gateway_origin: None,
         }
     }
 
@@ -1888,16 +2192,19 @@ mod tests {
     #[cfg(feature = "runtime")]
     #[test]
     fn runtime_projection_is_stable_and_uid_bound() -> Result<(), String> {
-        let projection = project_request(&SandboxRequest {
-            runtime: RuntimeId("runtime-uid-a".to_owned()),
-            workspace_key: "team-a".to_owned(),
-            agent_type: AgentType {
-                name: "base".to_owned(),
+        let projection = project_request(
+            &SandboxRequest {
+                runtime: RuntimeId("runtime-uid-a".to_owned()),
+                workspace_key: "team-a".to_owned(),
+                agent_type: AgentType {
+                    name: "base".to_owned(),
+                },
+                models: Vec::new(),
+                tools: Vec::new(),
+                refs: RuntimeRefs::default(),
             },
-            models: Vec::new(),
-            tools: Vec::new(),
-            refs: RuntimeRefs::default(),
-        })
+            None,
+        )
         .map_err(|error| format!("runtime projection failed: {error:?}"))?;
 
         assert_eq!(projection.workspace, "w-9086ou4eujpgku8z0");
@@ -1909,6 +2216,215 @@ mod tests {
         );
         assert_eq!(projection.runtime_uid, "runtime-uid-a");
         Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn connections_bridge_requires_a_digest_pinned_verified_image() -> Result<(), String> {
+        let request = SandboxRequest {
+            runtime: RuntimeId("runtime-uid-a".to_owned()),
+            workspace_key: "team-a".to_owned(),
+            agent_type: AgentType {
+                name: CONNECTIONS_BRIDGE_AGENT_TYPE.to_owned(),
+            },
+            models: Vec::new(),
+            tools: Vec::new(),
+            refs: RuntimeRefs::default(),
+        };
+        assert!(
+            project_request(&request, None).is_err(),
+            "the bridge must not create a sandbox without a verified image"
+        );
+        assert!(
+            project_request(
+                &request,
+                Some("registry.example.test/steward-bridge:latest")
+            )
+            .is_err(),
+            "the bridge must reject mutable image tags"
+        );
+        let projection = project_request(
+            &request,
+            Some("registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )
+        .map_err(|error| format!("verified bridge image rejected: {error:?}"))?;
+        assert_eq!(
+            sandbox_spec(&projection).image.as_deref(),
+            Some(
+                "registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            "only the exact digest that passed configuration may reach OpenShell"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn connections_bridge_configuration_requires_an_exact_server_origin() {
+        let mut config = valid_connection_config();
+        config.bridge_image = Some(
+            "registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        );
+        assert!(
+            matches!(config.validate(), Err(PortError::Rejected { .. })),
+            "a bridge image without its controller-owned gateway origin must fail before a sandbox can be created"
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn connections_bridge_archives_are_exact_single_files() {
+        let valid_request = single_file_tar("request.json", br#"{}"#);
+        assert!(
+            validate_connections_bridge_archive(&valid_request, "request.json").is_ok(),
+            "the bridge may stage exactly its one server-authored request file"
+        );
+        let valid_response = single_file_tar("response.json", br#"{}"#);
+        assert!(
+            validate_connections_bridge_archive(&valid_response, "response.json").is_ok(),
+            "the bridge may persist exactly its one response file"
+        );
+
+        for (description, archive) in [
+            (
+                "path traversal",
+                single_file_tar("../request.json", br#"{}"#),
+            ),
+            ("wrong filename", single_file_tar("other.json", br#"{}"#)),
+            (
+                "multiple entries",
+                two_file_tar("request.json", br#"{}"#, "extra.json", br#"{}"#),
+            ),
+        ] {
+            assert!(
+                validate_connections_bridge_archive(&archive, "request.json").is_err(),
+                "the bridge must reject {description} instead of extracting it"
+            );
+        }
+
+        let mut corrupted_checksum = valid_request;
+        corrupted_checksum[0] = b'X';
+        assert!(
+            validate_connections_bridge_archive(&corrupted_checksum, "request.json").is_err(),
+            "the bridge must reject an archive whose checksum does not bind its path"
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    fn single_file_tar(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut archive = tar_header(name, body.len());
+        archive.extend_from_slice(body);
+        archive.resize((archive.len() + 511) & !511, 0);
+        archive.extend_from_slice(&[0; 1024]);
+        archive
+    }
+
+    #[cfg(feature = "runtime")]
+    fn two_file_tar(
+        first_name: &str,
+        first_body: &[u8],
+        second_name: &str,
+        second_body: &[u8],
+    ) -> Vec<u8> {
+        let mut archive = tar_header(first_name, first_body.len());
+        archive.extend_from_slice(first_body);
+        archive.resize((archive.len() + 511) & !511, 0);
+        archive.extend_from_slice(&tar_header(second_name, second_body.len()));
+        archive.extend_from_slice(second_body);
+        archive.resize((archive.len() + 511) & !511, 0);
+        archive.extend_from_slice(&[0; 1024]);
+        archive
+    }
+
+    #[cfg(feature = "runtime")]
+    fn tar_header(name: &str, size: usize) -> Vec<u8> {
+        let mut header = vec![0_u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        let size = format!("{:011o}\0", size);
+        header[124..136].copy_from_slice(size.as_bytes());
+        header[148..156].fill(b' ');
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+        let checksum = format!("{:06o}\0 ", checksum);
+        header[148..156].copy_from_slice(checksum.as_bytes());
+        header
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn raw_sandbox_binding_rejects_stale_uid_image_mismatch_and_not_ready() {
+        let expected_image = "registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let valid = RawSandbox {
+            metadata: Some(ObjectMeta {
+                labels: HashMap::from([(RUNTIME_UID_LABEL.to_owned(), "runtime-uid-a".to_owned())]),
+                ..ObjectMeta::default()
+            }),
+            spec: Some(RawSandboxSpec {
+                template: Some(RawSandboxTemplate {
+                    image: expected_image.to_owned(),
+                    ..RawSandboxTemplate::default()
+                }),
+                ..RawSandboxSpec::default()
+            }),
+            status: Some(RawSandboxStatus {
+                phase: RawSandboxPhase::Ready as i32,
+                ..RawSandboxStatus::default()
+            }),
+        };
+        assert!(
+            validate_raw_sandbox_binding(&valid, "runtime-uid-a", Some(expected_image), true)
+                .is_ok(),
+            "the controller may execute only its exact Ready sandbox image"
+        );
+
+        let mut stale_uid = valid.clone();
+        stale_uid.metadata.as_mut().map(|metadata| {
+            metadata
+                .labels
+                .insert(RUNTIME_UID_LABEL.to_owned(), "runtime-uid-b".to_owned())
+        });
+        assert!(
+            validate_raw_sandbox_binding(&stale_uid, "runtime-uid-a", Some(expected_image), true)
+                .is_err(),
+            "a name-reused sandbox with a stale runtime UID must fail closed"
+        );
+
+        let mut mismatched_image = valid.clone();
+        if let Some(template) = mismatched_image
+            .spec
+            .as_mut()
+            .and_then(|spec| spec.template.as_mut())
+        {
+            template.image = "registry.example.test/steward-bridge@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
+        }
+        assert!(
+            validate_raw_sandbox_binding(
+                &mismatched_image,
+                "runtime-uid-a",
+                Some(expected_image),
+                true,
+            )
+            .is_err(),
+            "a raw image value that differs from the verified digest must fail closed"
+        );
+
+        let mut provisioning = valid;
+        provisioning.status = Some(RawSandboxStatus {
+            phase: RawSandboxPhase::Provisioning as i32,
+            ..RawSandboxStatus::default()
+        });
+        assert!(
+            validate_raw_sandbox_binding(
+                &provisioning,
+                "runtime-uid-a",
+                Some(expected_image),
+                true
+            )
+            .is_err(),
+            "execution must not begin until the raw sandbox is Ready"
+        );
     }
 
     #[cfg(feature = "runtime")]
@@ -1942,20 +2458,23 @@ mod tests {
     #[cfg(feature = "runtime")]
     #[test]
     fn tool_authority_attaches_only_the_steward_gateway_provider() -> Result<(), String> {
-        let projection = project_request(&SandboxRequest {
-            runtime: RuntimeId("runtime-uid-a".to_owned()),
-            workspace_key: "team-a".to_owned(),
-            agent_type: AgentType {
-                name: "base".to_owned(),
+        let projection = project_request(
+            &SandboxRequest {
+                runtime: RuntimeId("runtime-uid-a".to_owned()),
+                workspace_key: "team-a".to_owned(),
+                agent_type: AgentType {
+                    name: "base".to_owned(),
+                },
+                models: Vec::new(),
+                tools: vec![ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "search_repositories".to_owned(),
+                    action: "read".to_owned(),
+                }],
+                refs: RuntimeRefs::default(),
             },
-            models: Vec::new(),
-            tools: vec![ToolGrant {
-                provider: "github".to_owned(),
-                resource: "search_repositories".to_owned(),
-                action: "read".to_owned(),
-            }],
-            refs: RuntimeRefs::default(),
-        })
+            None,
+        )
         .map_err(|error| format!("runtime projection failed: {error:?}"))?;
 
         assert_eq!(
@@ -1969,19 +2488,22 @@ mod tests {
     #[cfg(feature = "runtime")]
     #[test]
     fn inference_authority_attaches_only_the_runtime_key_provider() -> Result<(), String> {
-        let projection = project_request(&SandboxRequest {
-            runtime: RuntimeId("runtime-uid-a".to_owned()),
-            workspace_key: "team-a".to_owned(),
-            agent_type: AgentType {
-                name: "base".to_owned(),
+        let projection = project_request(
+            &SandboxRequest {
+                runtime: RuntimeId("runtime-uid-a".to_owned()),
+                workspace_key: "team-a".to_owned(),
+                agent_type: AgentType {
+                    name: "base".to_owned(),
+                },
+                models: vec![steward_types::ModelRef {
+                    provider: "openai".to_owned(),
+                    model: "priced-model".to_owned(),
+                }],
+                tools: Vec::new(),
+                refs: RuntimeRefs::default(),
             },
-            models: vec![steward_types::ModelRef {
-                provider: "openai".to_owned(),
-                model: "priced-model".to_owned(),
-            }],
-            tools: Vec::new(),
-            refs: RuntimeRefs::default(),
-        })
+            None,
+        )
         .map_err(|error| format!("runtime projection failed: {error:?}"))?;
 
         assert_eq!(

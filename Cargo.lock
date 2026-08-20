@@ -3740,6 +3740,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "steward-adapter-github-artifact"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "sigstore-verify",
+]
+
+[[package]]
 name = "steward-adapter-jira"
 version = "0.0.0"
 dependencies = [
@@ -3766,7 +3774,10 @@ dependencies = [
 name = "steward-adapter-mcp-gw"
 version = "0.0.0"
 dependencies = [
+ "reqwest 0.12.28",
+ "serde_json",
  "steward-ports",
+ "tokio",
 ]
 
 [[package]]
@@ -3823,7 +3834,7 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "sha2",
- "sigstore-verify",
+ "steward-adapter-github-artifact",
  "steward-admission",
  "steward-ports",
  "steward-store",
@@ -3840,6 +3851,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "kube",
+ "steward-adapter-github-artifact",
  "steward-adapter-jira",
  "steward-apiserver",
  "steward-store",
@@ -3871,6 +3883,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "kube",
+ "steward-adapter-github-artifact",
  "steward-adapter-litellm",
  "steward-adapter-openshell",
  "steward-controller",

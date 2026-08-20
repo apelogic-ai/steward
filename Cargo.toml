@@ -3,6 +3,7 @@ resolver = "2"
 exclude = ["conformance", "e2e"]
 members = [
     "adapters/fake",
+    "adapters/github-artifact",
     "adapters/jira",
     "adapters/litellm",
     "adapters/mcp-gw",
