@@ -1862,12 +1862,30 @@ mod tests {
             "Bridge source repository:",
             "Bridge source commit:",
             "helm-chart.digest",
+            "ecr-bridge-attestation-bundle.jsonl",
+            "oci://${IMAGE_REPOSITORY}@${bridge_digest}",
+            "docker login \"$ECR_REGISTRY\" --username AWS --password-stdin",
+            "Bridge ECR signer identity:",
+            "Bridge ECR source repository:",
+            "Bridge ECR source commit:",
         ] {
             assert!(
                 workflow.contains(artifact),
                 "release workflow must record {artifact}"
             );
         }
+        assert!(
+            values.contains("mcpGatewayOrigin") && schema.contains("mcpGatewayOrigin"),
+            "stable bridge chart values must require the controller-owned MCP-GW origin"
+        );
+        assert!(
+            controller.contains("stable-bridge-attestation"),
+            "stable bridge controller must mount the immutable provenance bundle"
+        );
+        assert!(
+            controller.contains("STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN"),
+            "stable bridge controller must receive the server-owned MCP-GW origin"
+        );
         assert!(
             workflow.matches("exit-code: \"1\"").count() >= 2,
             "image and chart vulnerability scans must fail releases on critical findings"

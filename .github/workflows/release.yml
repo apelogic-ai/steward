@@ -336,6 +336,8 @@ jobs:
           printf '%s' "$GH_TOKEN" | oras login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           aws ecr get-login-password --region "$AWS_REGION" \
             | oras login "$ECR_REGISTRY" --username AWS --password-stdin
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login "$ECR_REGISTRY" --username AWS --password-stdin
 
       - name: Promote exact approved manifests
         id: promote
@@ -471,6 +473,21 @@ jobs:
           subject-digest: ${{ steps.promote.outputs['bridge-digest'] }}
           push-to-registry: true
 
+      - name: Download ECR bridge provenance bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_REPOSITORY: ${{ steps.promote.outputs['image-repository'] }}
+        run: |
+          set -euo pipefail
+          bridge_digest="$(cat dist/ecr-bridge.digest)"
+          gh attestation download \
+            "oci://${IMAGE_REPOSITORY}@${bridge_digest}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --predicate-type https://slsa.dev/provenance/v1
+          bundle_file="${bridge_digest}.jsonl"
+          test -s "$bundle_file"
+          mv "$bundle_file" dist/ecr-bridge-attestation-bundle.jsonl
+
       - name: Attest promoted chart provenance
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
@@ -485,6 +502,9 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          bridge_digest="$(cat dist/ecr-bridge.digest)"
+          bridge_signer_identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
+          bridge_source_repository="https://github.com/$GITHUB_REPOSITORY"
           {
             printf '# Steward private registry handoff %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
@@ -497,6 +517,12 @@ jobs:
             done
             printf '| chart | oci://%s@%s | n/a |\n' \
               "$CHART_REPOSITORY" "$(cat dist/ecr-helm-chart.digest)"
+            printf '\n## Stable bridge provenance inputs\n\n'
+            printf 'Bridge ECR image: %s@%s\n\n' "$IMAGE_REPOSITORY" "$bridge_digest"
+            printf 'Bridge ECR signer identity: %s\n\n' "$bridge_signer_identity"
+            printf 'Bridge ECR source repository: %s\n\n' "$bridge_source_repository"
+            printf 'Bridge ECR source commit: %s\n\n' "$GITHUB_SHA"
+            printf 'Bridge ECR attestation bundle: ecr-bridge-attestation-bundle.jsonl\n'
           } > dist/ecr-release-handoff.md
 
       - name: Upload private registry handoff

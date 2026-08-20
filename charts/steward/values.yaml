@@ -65,6 +65,8 @@ stableBridge:
   sourceRepository: ""
   sourceCommit: ""
   service: ""
+  # Exact MCP-GW origin injected only into the one-shot bridge runtime by the controller.
+  mcpGatewayOrigin: ""
   # A public GitHub artifact-attestation bundle; it is mounted read-only, not stored as a Secret.
   attestationBundle: ""
 runtimeNamespaces: []

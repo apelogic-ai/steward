@@ -178,6 +178,7 @@
         "sourceRepository",
         "sourceCommit",
         "service",
+        "mcpGatewayOrigin",
         "attestationBundle"
       ],
       "properties": {
@@ -187,6 +188,7 @@
         "sourceRepository": {"type": "string"},
         "sourceCommit": {"type": "string"},
         "service": {"type": "string"},
+        "mcpGatewayOrigin": {"type": "string"},
         "attestationBundle": {"type": "string"}
       },
       "allOf": [
@@ -208,6 +210,11 @@
                 "pattern": "^[a-f0-9]{40}$"
               },
               "service": {"$ref": "#/definitions/nonempty"},
+              "mcpGatewayOrigin": {
+                "type": "string",
+                "pattern": "^https?://[^/?#]+(?::[0-9]+)?$",
+                "minLength": 10
+              },
               "attestationBundle": {"$ref": "#/definitions/nonempty"}
             }
           }
