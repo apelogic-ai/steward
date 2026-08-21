@@ -194,17 +194,40 @@ where
     R: RuntimeRepository,
     A: BridgeArtifactVerifier,
 {
+    protect_browser_routes(
+        resolver_router(source, runtimes, artifacts, service),
+        browser_auth,
+    )
+}
+
+fn resolver_router<S, R, A>(source: S, runtimes: R, artifacts: A, service: BridgeService) -> Router
+where
+    S: ActiveTaskRuntimeSource,
+    R: RuntimeRepository,
+    A: BridgeArtifactVerifier,
+{
     let state = StableBridgeRouteState {
         bridge: StableRuntimeBridge::new(source, runtimes, artifacts),
         service,
     };
-    let routes = Router::new()
+    Router::new()
         .route(
             STABLE_RUNTIME_BRIDGE_PATH,
             get(resolve_stable_runtime_bridge::<S, R, A>),
         )
-        .with_state(state);
-    protect_browser_routes(routes, browser_auth)
+        .with_state(state)
+}
+
+/// Mount only the stable bridge authentication boundary.
+///
+/// A complete bridge configuration must make the route observable even when the optional browser
+/// application is disabled. Without a configured browser identity provider there is no principal
+/// source, so this route cannot touch the task ledger or runtime repository and always rejects.
+pub fn authentication_required_router() -> Router {
+    Router::new().route(
+        STABLE_RUNTIME_BRIDGE_PATH,
+        get(|| async { StatusCode::UNAUTHORIZED }),
+    )
 }
 
 async fn resolve_stable_runtime_bridge<S, R, A>(
@@ -325,7 +348,8 @@ mod tests {
 
     use super::{
         ActiveTaskRuntimeSource, BridgeArtifactVerifier, BridgeRuntimeReference, BridgeService,
-        STABLE_RUNTIME_BRIDGE_PATH, StableBridgeError, StableRuntimeBridge, protected_router,
+        STABLE_RUNTIME_BRIDGE_PATH, StableBridgeError, StableRuntimeBridge,
+        authentication_required_router, protected_router,
     };
     use crate::browser_auth::{
         BrowserAuthService, LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service,
@@ -343,6 +367,23 @@ mod tests {
         ) -> BoxFuture<'a, Result<Option<BridgeRuntimeReference>, StableBridgeError>> {
             Box::pin(async move { Ok(self.0.clone()) })
         }
+    }
+
+    #[tokio::test]
+    async fn configured_route_without_browser_identity_is_mounted_but_always_unauthorized()
+    -> Result<(), String> {
+        let response = authentication_required_router()
+            .oneshot(
+                Request::builder()
+                    .uri(STABLE_RUNTIME_BRIDGE_PATH)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build stable route request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute stable route request: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
     }
 
     #[derive(Clone)]
@@ -580,6 +621,37 @@ mod tests {
             response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "the stable route must not serve a replacement before controller readiness"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authenticated_route_without_one_eligible_runtime_is_unavailable() -> Result<(), String>
+    {
+        let (browser_auth, session_cookie) = signed_in_cookie().await?;
+        let app = protected_router(
+            Source(None),
+            Runtimes(Arc::new(runtime()?)),
+            Artifacts,
+            browser_auth,
+            BridgeService::new("steward-run".to_owned())?,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(STABLE_RUNTIME_BRIDGE_PATH)
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build stable route request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute stable route request: {error}"))?;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an authenticated caller must receive 503 until server authority selects exactly one eligible runtime"
         );
         Ok(())
     }

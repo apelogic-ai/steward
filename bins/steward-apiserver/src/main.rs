@@ -77,10 +77,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         task_identities,
         task_workflows,
     ));
-    let app = match browser_application_router(store, runtimes)? {
-        Some(browser) => app.merge(browser),
-        None => app,
-    };
+    let browser = browser_application_router(store.clone())?;
+    let stable_bridge =
+        stable_bridge_configuration()?.map(|(service, verifier)| match browser.as_ref() {
+            Some(browser) => stable_runtime_bridge::protected_router(
+                store,
+                runtimes,
+                verifier,
+                browser.auth.clone(),
+                service,
+            ),
+            None => stable_runtime_bridge::authentication_required_router(),
+        });
+    let app = application_router(app, browser.map(|browser| browser.router), stable_bridge);
     let listener = tls_listener(
         &env::var("STEWARD_APISERVER_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_owned()),
         &required("STEWARD_TLS_CERT_DER")?,
@@ -106,10 +115,14 @@ fn install_rustls_crypto_provider() -> Result<(), io::Error> {
     }
 }
 
+struct BrowserApplication {
+    router: axum::Router,
+    auth: browser_auth::BrowserAuthService,
+}
+
 fn browser_application_router(
     store: PgStore,
-    runtimes: KubeRuntimeRepository,
-) -> Result<Option<axum::Router>, Box<dyn Error>> {
+) -> Result<Option<BrowserApplication>, Box<dyn Error>> {
     let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
         return Ok(None);
     };
@@ -133,19 +146,30 @@ fn browser_application_router(
         Arc::new(browser_auth::PgBrowserIdentityResolver::new(store.clone())),
     )
     .map_err(io::Error::other)?;
-    let app = browser_auth::browser_auth_router(auth.clone())
+    let router = browser_auth::browser_auth_router(auth.clone())
         .merge(user_envelopes::protected_router(
             user_envelopes::PgEnvelopeRequestBroker::new(store.clone()),
             auth.clone(),
         ))
         .merge(agent_runs_ui::protected_router(store.clone(), auth.clone()));
-    let app = match stable_bridge_configuration()? {
-        Some((service, verifier)) => app.merge(stable_runtime_bridge::protected_router(
-            store, runtimes, verifier, auth, service,
-        )),
-        None => app,
-    };
-    Ok(Some(app))
+    Ok(Some(BrowserApplication { router, auth }))
+}
+
+fn application_router(
+    app: axum::Router,
+    browser: Option<axum::Router>,
+    stable_bridge: Option<axum::Router>,
+) -> axum::Router {
+    match browser {
+        Some(browser) => match stable_bridge {
+            Some(stable_bridge) => app.merge(browser).merge(stable_bridge),
+            None => app.merge(browser),
+        },
+        None => match stable_bridge {
+            Some(stable_bridge) => app.merge(stable_bridge),
+            None => app,
+        },
+    }
 }
 
 fn stable_bridge_configuration()
@@ -396,6 +420,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use axum::Router;
+    use axum::routing::get;
     use axum::serve::Listener;
     use steward_store::BrowserRbacAssignment;
     use tokio::io::AsyncReadExt;
@@ -406,10 +432,24 @@ mod tests {
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
     use super::{
-        KubernetesTokenReviewAudience, TlsListener, bootstrap_rbac_arguments, decode_tls_material,
-        install_rustls_crypto_provider, kubernetes_token_review_audience,
+        KubernetesTokenReviewAudience, TlsListener, application_router, bootstrap_rbac_arguments,
+        decode_tls_material, install_rustls_crypto_provider, kubernetes_token_review_audience,
         stable_bridge_configuration_from_values,
     };
+
+    #[test]
+    fn stable_bridge_route_is_mounted_without_a_google_browser_application() {
+        let stable_bridge = Router::new().route(
+            "/app/api/v1/stable-runtime-bridge",
+            get(|| async { "authentication required" }),
+        );
+        let app = application_router(Router::new(), None, Some(stable_bridge));
+
+        assert!(
+            app.has_routes(),
+            "complete stable bridge configuration must mount its fail-closed route even when Google browser OIDC is disabled"
+        );
+    }
 
     #[test]
     fn stable_bridge_configuration_rejects_partial_or_unattested_input() {
