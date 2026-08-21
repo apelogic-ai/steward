@@ -2384,21 +2384,18 @@ impl PgStore {
         self.task(task_uid).await?.ok_or(StoreError::TaskNotFound)
     }
 
+    /// Return only server-verified task rows eligible for normal lifecycle reconciliation.
+    ///
+    /// Historical `legacy_reconnect_required` rows remain unchanged and available through exact
+    /// task/audit reads. They are never selected here and never silently rebound to a new identity.
     pub async fn task_work_items(&self) -> Result<Vec<TaskRecord>, StoreError> {
-        sqlx::query(
-            "SELECT * FROM task_submissions \
-             WHERE (runtime_ownership = 'provisioned' AND runtime_uid IS NULL \
-                    AND phase IN ('submitted', 'queued') AND NOT finalize_requested) \
-                OR (execute_requested AND phase IN ('parked', 'queued')) \
-                OR (finalize_requested AND NOT finalized) \
-             ORDER BY created_at, task_uid",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(database_error)?
-        .into_iter()
-        .map(task_record)
-        .collect()
+        sqlx::query(TASK_WORK_ITEMS_QUERY)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .map(task_record)
+            .collect()
     }
 
     /// Resolve a bridge candidate from server-owned task state only.
@@ -2552,6 +2549,28 @@ impl PgStore {
         .await
         .map_err(database_error)?;
         row.map(task_record).transpose()
+    }
+}
+
+const TASK_WORK_ITEMS_QUERY: &str = "SELECT * FROM task_submissions \
+     WHERE identity_binding_state = 'bound' AND (\
+            (runtime_ownership = 'provisioned' AND runtime_uid IS NULL \
+             AND phase IN ('submitted', 'queued') AND NOT finalize_requested) \
+            OR (execute_requested AND phase IN ('parked', 'queued')) \
+            OR (finalize_requested AND NOT finalized)\
+     ) \
+     ORDER BY created_at, task_uid";
+
+#[cfg(test)]
+mod task_work_queue_tests {
+    use super::TASK_WORK_ITEMS_QUERY;
+
+    #[test]
+    fn historical_unbound_tasks_are_not_normal_controller_work() {
+        assert!(
+            TASK_WORK_ITEMS_QUERY.contains("WHERE identity_binding_state = 'bound' AND ("),
+            "the normal controller queue must exclude legacy_reconnect_required and every other non-bound historical identity state"
+        );
     }
 }
 
