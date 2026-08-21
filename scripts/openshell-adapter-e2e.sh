@@ -23,6 +23,8 @@ BRIDGE_IMAGE_REPOSITORY="docker.io/library/steward-bridge"
 BRIDGE_IMAGE_TAGGED="${BRIDGE_IMAGE_REPOSITORY}:${RUN_ID}"
 BRIDGE_IMAGE_ARCHIVE="${RUN_DIR}/steward-bridge.oci.tar"
 BRIDGE_IMAGE_METADATA="${RUN_DIR}/steward-bridge-build-metadata.json"
+BUILDX_BUILDER_NAME="steward-${RUN_ID}"
+BUILDX_BUILDER_CREATED=0
 
 cleanup() {
   status="$1"
@@ -38,6 +40,9 @@ cleanup() {
   if [[ -n "${WORKLOAD_EXCHANGE_PID}" ]]; then
     kill "${WORKLOAD_EXCHANGE_PID}" >/dev/null 2>&1 || true
     wait "${WORKLOAD_EXCHANGE_PID}" >/dev/null 2>&1 || true
+  fi
+  if [[ "${BUILDX_BUILDER_CREATED}" == "1" ]]; then
+    docker buildx rm --force "${BUILDX_BUILDER_NAME}" >/dev/null 2>&1 || true
   fi
   if [[ "${CLUSTER_CREATED}" == "1" && "${STEWARD_DEV_KEEP:-0}" != "1" ]]; then
     KUBECONFIG="${KUBECONFIG_PATH}" kind delete cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1 || true
@@ -63,7 +68,17 @@ docker info >/dev/null
 docker buildx version >/dev/null
 
 mkdir -p "${RUN_DIR}"
+if docker buildx inspect "${BUILDX_BUILDER_NAME}" >/dev/null 2>&1; then
+  echo "run-owned Buildx builder already exists: ${BUILDX_BUILDER_NAME}" >&2
+  exit 2
+fi
+docker buildx create \
+  --name "${BUILDX_BUILDER_NAME}" \
+  --driver docker-container >/dev/null
+BUILDX_BUILDER_CREATED=1
+docker buildx inspect --bootstrap "${BUILDX_BUILDER_NAME}" >/dev/null
 docker buildx build \
+  --builder "${BUILDX_BUILDER_NAME}" \
   --file "${ROOT}/build/connections-bridge.Dockerfile" \
   --tag "${BRIDGE_IMAGE_TAGGED}" \
   --provenance=false \

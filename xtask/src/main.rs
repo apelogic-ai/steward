@@ -1542,6 +1542,12 @@ mod tests {
         for required in [
             "OPEN_SHELL_RELEASE=\"v0.0.98\"",
             "build/connections-bridge.Dockerfile",
+            "BUILDX_BUILDER_NAME=\"steward-${RUN_ID}\"",
+            "BUILDX_BUILDER_CREATED=0",
+            "docker buildx create",
+            "--driver docker-container",
+            "--builder \"${BUILDX_BUILDER_NAME}\"",
+            "docker buildx rm --force \"${BUILDX_BUILDER_NAME}\"",
             "docker buildx build",
             "type=oci",
             "containerimage.digest",
@@ -1559,6 +1565,10 @@ mod tests {
                 "OpenShell adapter integration harness is missing {required}"
             );
         }
+        assert!(
+            !harness.contains("--use"),
+            "the run-owned Buildx builder must not replace the caller's ambient builder"
+        );
         assert!(
             e2e_source.contains("assert_runtime_class_propagation")
                 && !e2e_source.contains("kata_bound"),
