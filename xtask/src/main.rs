@@ -2009,6 +2009,18 @@ mod tests {
                 "Connections bridge release smoke must exercise the OpenShell workspace-init operation: {exercise}"
             );
         }
+        for assertion in [
+            "test \"$(id -g)\" = \"65532\"",
+            "test -f \"${workspace_init}/copied\"",
+            "test -s \"${workspace_init}/copied\"",
+            "/bin/busybox cmp \"${workspace_init}/source\" \"${workspace_init}/copied\"",
+            "test ! -e \"${workspace_init}\"",
+        ] {
+            assert!(
+                release_validation.contains(assertion),
+                "Connections bridge release smoke must retain its runtime postcondition: {assertion}"
+            );
+        }
         assert!(
             workflow.contains("${{ steps.version.outputs.version }}-${{ matrix.component }}"),
             "component tags must match the published chart contract"
