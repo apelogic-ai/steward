@@ -1969,11 +1969,15 @@ mod tests {
             "FROM busybox:1.37.0-musl@sha256:",
             "FROM gcr.io/distroless/cc-debian12:nonroot@sha256:",
             "COPY --from=toolbox /bin/busybox /bin/busybox",
+            "COPY --from=toolbox /bin/cp /bin/cp",
             "COPY --from=toolbox /bin/tar /bin/tar",
             "COPY --from=toolbox /bin/ip /bin/ip",
             "COPY --from=toolbox /bin/id /bin/id",
+            "COPY --from=toolbox /bin/find /bin/find",
+            "COPY --from=toolbox /bin/mktemp /bin/mktemp",
             "COPY --from=toolbox /bin/mkdir /bin/mkdir",
             "COPY --from=toolbox /bin/rm /bin/rm",
+            "COPY --from=toolbox /bin/touch /bin/touch",
             "COPY --chown=65532:65532 --from=toolbox /sandbox /sandbox",
             "mkdir -p /sandbox",
             "chown 65532:65532 /sandbox",
@@ -1983,6 +1987,26 @@ mod tests {
             assert!(
                 bridge_container.contains(required),
                 "Connections bridge sandbox image is missing required OpenShell runtime prerequisite: {required}"
+            );
+        }
+        for command in ["cp", "find", "mktemp", "rm", "tar", "touch"] {
+            let smoke_check = format!("command -v {command} >/dev/null");
+            assert!(
+                release_validation.contains(&smoke_check),
+                "Connections bridge release smoke must execute the OpenShell workspace-init prerequisite check: {smoke_check}"
+            );
+        }
+        for exercise in [
+            "mktemp -d /sandbox/workspace-init.XXXXXX",
+            "touch \"${workspace_init}/source\"",
+            "cp \"${workspace_init}/source\" \"${workspace_init}/copied\"",
+            "find \"${workspace_init}\" -type f -name source",
+            "tar -cf \"${workspace_init}/source.tar\" -C \"${workspace_init}\" source",
+            "rm -rf \"${workspace_init}\"",
+        ] {
+            assert!(
+                release_validation.contains(exercise),
+                "Connections bridge release smoke must exercise the OpenShell workspace-init operation: {exercise}"
             );
         }
         assert!(
