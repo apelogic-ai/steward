@@ -15,6 +15,7 @@ steward-adapter-spire = { path = "../../adapters/spire", version = "=0.0.0" } # 
 steward-mint = { path = "../../crates/steward-mint", version = "=0.0.0" } # Owns the reviewed SVID-to-HOP-1 exchange and signing-key boundary.
 steward-types = { path = "../../crates/steward-types", version = "=0.0.0" } # Reads AgentRuntime principal, tool authority, and lifecycle state.
 tokio.workspace = true # Runs Kubernetes, SPIRE, and HTTP I/O.
+tokio-rustls.workspace = true # Selects the process-wide Rustls Ring provider before constructing the Kubernetes client in the combined release build.
 
 [lints]
 workspace = true

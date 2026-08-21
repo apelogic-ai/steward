@@ -2003,6 +2003,18 @@ mod tests {
                 "release validation must exercise artifact construction: missing {required}"
             );
         }
+        for required in [
+            "steward-mint:release-validation",
+            "--network none",
+            "KUBECONFIG=/run/steward-release/kubeconfig",
+            "Could not automatically determine the process-level CryptoProvider",
+            "OpenShell identity discovery failed",
+        ] {
+            assert!(
+                release_validation.contains(required),
+                "release validation must smoke-test the combined mint image startup: missing {required}"
+            );
+        }
         Ok(())
     }
 

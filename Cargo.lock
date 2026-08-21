@@ -3923,6 +3923,7 @@ dependencies = [
  "steward-mint",
  "steward-types",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
