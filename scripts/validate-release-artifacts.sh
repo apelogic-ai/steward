@@ -262,6 +262,7 @@ if [[ "${1:-}" == "--build-images" ]]; then
     command -v mktemp >/dev/null
     command -v mkdir >/dev/null
     command -v rm >/dev/null
+    command -v sleep >/dev/null
     command -v touch >/dev/null
     test -w /sandbox
     test "$(id -u)" = "65532"
@@ -280,6 +281,15 @@ if [[ "${1:-}" == "--build-images" ]]; then
     test -f "${workspace_init}/source.tar"
     rm -rf "${workspace_init}"
     test ! -e "${workspace_init}"
+    sleep infinity &
+    sleep_pid="$!"
+    kill -0 "${sleep_pid}"
+    kill "${sleep_pid}"
+    wait "${sleep_pid}" || test "$?" = "143"
+    if kill -0 "${sleep_pid}" 2>/dev/null; then
+      echo "the OpenShell supervisor command must terminate cleanly" >&2
+      exit 1
+    fi
   '
   cat > "${mint_synthetic_kubeconfig}" <<'EOF'
 apiVersion: v1

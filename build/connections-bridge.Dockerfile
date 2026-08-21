@@ -14,6 +14,7 @@ RUN mkdir -p /sandbox \
   && ln -sf busybox /bin/mktemp \
   && ln -sf busybox /bin/mkdir \
   && ln -sf busybox /bin/rm \
+  && ln -sf busybox /bin/sleep \
   && ln -sf busybox /bin/touch
 
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
@@ -28,6 +29,7 @@ COPY --from=toolbox /bin/find /bin/find
 COPY --from=toolbox /bin/mktemp /bin/mktemp
 COPY --from=toolbox /bin/mkdir /bin/mkdir
 COPY --from=toolbox /bin/rm /bin/rm
+COPY --from=toolbox /bin/sleep /bin/sleep
 COPY --from=toolbox /bin/touch /bin/touch
 COPY --from=build /workspace/target/release/steward-connections-bridge /usr/local/bin/steward-connections-bridge
 COPY --chown=65532:65532 --from=toolbox /sandbox /sandbox

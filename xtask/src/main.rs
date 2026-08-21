@@ -1977,6 +1977,7 @@ mod tests {
             "COPY --from=toolbox /bin/mktemp /bin/mktemp",
             "COPY --from=toolbox /bin/mkdir /bin/mkdir",
             "COPY --from=toolbox /bin/rm /bin/rm",
+            "COPY --from=toolbox /bin/sleep /bin/sleep",
             "COPY --from=toolbox /bin/touch /bin/touch",
             "COPY --chown=65532:65532 --from=toolbox /sandbox /sandbox",
             "mkdir -p /sandbox",
@@ -1989,7 +1990,7 @@ mod tests {
                 "Connections bridge sandbox image is missing required OpenShell runtime prerequisite: {required}"
             );
         }
-        for command in ["cp", "find", "mktemp", "rm", "tar", "touch"] {
+        for command in ["cp", "find", "mktemp", "rm", "sleep", "tar", "touch"] {
             let smoke_check = format!("command -v {command} >/dev/null");
             assert!(
                 release_validation.contains(&smoke_check),
@@ -2019,6 +2020,19 @@ mod tests {
             assert!(
                 release_validation.contains(assertion),
                 "Connections bridge release smoke must retain its runtime postcondition: {assertion}"
+            );
+        }
+        for assertion in [
+            "sleep infinity &",
+            "sleep_pid=\"$!\"",
+            "kill -0 \"${sleep_pid}\"",
+            "kill \"${sleep_pid}\"",
+            "wait \"${sleep_pid}\" || test \"$?\" = \"143\"",
+            "if kill -0 \"${sleep_pid}\" 2>/dev/null; then",
+        ] {
+            assert!(
+                release_validation.contains(assertion),
+                "Connections bridge release smoke must retain its OpenShell supervisor command assertion: {assertion}"
             );
         }
         assert!(
