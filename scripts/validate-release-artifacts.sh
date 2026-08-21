@@ -255,14 +255,52 @@ if [[ "${1:-}" == "--build-images" ]]; then
     --tag "steward-bridge:release-validation" \
     "${root}"
   docker run --rm --entrypoint /bin/sh steward-bridge:release-validation -ceu '
+    command -v bash >/dev/null
+    command -v cp >/dev/null
     command -v tar >/dev/null
     command -v ip >/dev/null
+    command -v find >/dev/null
+    command -v mktemp >/dev/null
     command -v mkdir >/dev/null
+    command -v nsenter >/dev/null
     command -v rm >/dev/null
+    command -v sleep >/dev/null
+    command -v touch >/dev/null
     test -w /sandbox
     test "$(id -u)" = "65532"
+    test "$(id -g)" = "65532"
+    test "$(/bin/busybox readlink /bin/sh)" = "/usr/bin/sh"
+    test "$(/bin/busybox readlink /bin/bash)" = "/usr/bin/bash"
+    test "$(/bin/busybox readlink /usr/bin/sh)" = "/usr/bin/busybox"
+    test "$(/bin/busybox readlink /usr/bin/ip)" = "/usr/sbin/ip"
+    test "$(/bin/busybox readlink /var/run/netns)" = "/run/netns"
+    ip -Version 2>&1 | /bin/busybox grep -F "iproute2-6.1.0" >/dev/null
+    ip netns list >/dev/null
+    nsenter --version | /bin/busybox grep -F "util-linux 2.38.1" >/dev/null
+    /bin/bash -lc "test -x /usr/bin/sh && test -x /usr/bin/cp"
     : >/sandbox/release-validation
     rm /sandbox/release-validation
+    workspace_init="$(mktemp -d /sandbox/workspace-init.XXXXXX)"
+    touch "${workspace_init}/source"
+    printf "%s\n" "workspace-init-copy" > "${workspace_init}/source"
+    cp "${workspace_init}/source" "${workspace_init}/copied"
+    test -f "${workspace_init}/copied"
+    test -s "${workspace_init}/copied"
+    /bin/busybox cmp "${workspace_init}/source" "${workspace_init}/copied"
+    test "$(find "${workspace_init}" -type f -name source)" = "${workspace_init}/source"
+    tar -cf "${workspace_init}/source.tar" -C "${workspace_init}" source
+    test -f "${workspace_init}/source.tar"
+    rm -rf "${workspace_init}"
+    test ! -e "${workspace_init}"
+    sleep infinity &
+    sleep_pid="$!"
+    kill -0 "${sleep_pid}"
+    kill "${sleep_pid}"
+    wait "${sleep_pid}" || test "$?" = "143"
+    if kill -0 "${sleep_pid}" 2>/dev/null; then
+      echo "the OpenShell supervisor command must terminate cleanly" >&2
+      exit 1
+    fi
   '
   cat > "${mint_synthetic_kubeconfig}" <<'EOF'
 apiVersion: v1

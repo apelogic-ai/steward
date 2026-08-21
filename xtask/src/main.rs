@@ -939,6 +939,36 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_local_identity_fixture_is_absent_from_release_images() -> Result<(), String> {
+        let repository = root();
+        let production_container = fs::read_to_string(repository.join("build/package.Dockerfile"))
+            .map_err(|error| format!("production container build is required: {error}"))?;
+        let release_workflow = fs::read_to_string(repository.join(".github/workflows/release.yml"))
+            .map_err(|error| format!("release workflow is required: {error}"))?;
+        let binary_manifest =
+            fs::read_to_string(repository.join("bins/steward-apiserver/Cargo.toml"))
+                .map_err(|error| format!("apiserver manifest is required: {error}"))?;
+        let binary_source =
+            fs::read_to_string(repository.join("bins/steward-apiserver/src/main.rs"))
+                .map_err(|error| format!("apiserver source is required: {error}"))?;
+
+        assert!(
+            binary_manifest.contains("local-fixtures = [\"steward-store/local-fixtures\"]"),
+            "the local fixture command must require an explicit compile-time feature"
+        );
+        assert!(
+            binary_source.contains("#[cfg(feature = \"local-fixtures\")]"),
+            "the local fixture command must be compile-time excluded by default"
+        );
+        assert!(
+            !production_container.contains("local-fixtures")
+                && !release_workflow.contains("--features local-fixtures"),
+            "published runtime images must never enable the deterministic local identity fixture"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn browser_e2e_ci_uses_the_pinned_loopback_gate() -> Result<(), String> {
         let repository = root();
         let workflow = fs::read_to_string(repository.join(".github/workflows/ci.yml"))
@@ -1511,8 +1541,21 @@ mod tests {
         );
         for required in [
             "OPEN_SHELL_RELEASE=\"v0.0.98\"",
+            "build/connections-bridge.Dockerfile",
+            "BUILDX_BUILDER_NAME=\"steward-${RUN_ID}\"",
+            "BUILDX_BUILDER_CREATED=0",
+            "docker buildx create",
+            "--driver docker-container",
+            "--builder \"${BUILDX_BUILDER_NAME}\"",
+            "docker buildx rm --force \"${BUILDX_BUILDER_NAME}\"",
+            "docker buildx build",
+            "type=oci",
+            "containerimage.digest",
+            "kind load image-archive",
+            "server.sandboxImagePullPolicy=Never",
             "server.defaultRuntimeClassName=openshell-runc",
             "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME=openshell-runc",
+            "STEWARD_CONNECTIONS_BRIDGE_IMAGE",
             "handler: runc",
             "server.oidc.issuer=",
             "--test openshell_adapter_v0098",
@@ -1523,9 +1566,35 @@ mod tests {
             );
         }
         assert!(
+            !harness.contains("--use"),
+            "the run-owned Buildx builder must not replace the caller's ambient builder"
+        );
+        assert!(
             e2e_source.contains("assert_runtime_class_propagation")
                 && !e2e_source.contains("kata_bound"),
             "the kind lane must describe runtime-class propagation, not Kata isolation"
+        );
+        for required in [
+            "CONNECTIONS_BRIDGE_AGENT_TYPE",
+            "bridge_image: Some(required(\"STEWARD_CONNECTIONS_BRIDGE_IMAGE\")?)",
+            "\"/bin/sh\".to_owned()",
+            "input_root.join(\"request.json\")",
+            ".env(\"COPYFILE_DISABLE\", \"1\")",
+            ".arg(\"--format=ustar\")",
+            ".arg(\"request.json\")",
+            "cp request.json \\\"$STEWARD_OUTPUT_DIR/response.json\\\"",
+            "output_root.join(\"response.json\")",
+            "Sha256::digest(&actual_response)",
+            "Sha256::digest(&expected_request)",
+        ] {
+            assert!(
+                e2e_source.contains(required),
+                "the pinned OpenShell lane must execute the bridge stage/copy/collect path under the v0.0.98 supervisor and Landlock: missing {required}"
+            );
+        }
+        assert!(
+            !e2e_source.contains("in/payload.bin") && !e2e_source.contains("out/payload.bin"),
+            "the pinned OpenShell lane must use the exact request.json/response.json connections-bridge archive contract"
         );
         assert!(
             chart_readme.contains("does not prove a VM isolation boundary"),
@@ -1735,6 +1804,12 @@ mod tests {
             root().join("build/connections-bridge.Dockerfile"),
         )
         .map_err(|error| format!("Connections bridge sandbox image build is required: {error}"))?;
+        let bridge_bash = fs::read_to_string(root().join("build/connections-bridge-bash"))
+            .map_err(|error| {
+                format!("Connections bridge bash compatibility wrapper is required: {error}")
+            })?;
+        let dockerignore = fs::read_to_string(root().join(".dockerignore"))
+            .map_err(|error| format!("Docker build-context policy is required: {error}"))?;
 
         for required in [
             "apiserver:",
@@ -1938,12 +2013,22 @@ mod tests {
         for required in [
             "FROM busybox:1.37.0-musl@sha256:",
             "FROM gcr.io/distroless/cc-debian12:nonroot@sha256:",
-            "COPY --from=toolbox /bin/busybox /bin/busybox",
-            "COPY --from=toolbox /bin/tar /bin/tar",
-            "COPY --from=toolbox /bin/ip /bin/ip",
-            "COPY --from=toolbox /bin/id /bin/id",
-            "COPY --from=toolbox /bin/mkdir /bin/mkdir",
-            "COPY --from=toolbox /bin/rm /bin/rm",
+            "FROM build AS runtime-tools",
+            "apt-get install --yes --no-install-recommends iproute2=6.1.0-3",
+            "cp --parents /usr/sbin/ip /usr/bin/nsenter /runtime-root",
+            "COPY --chmod=0755 build/connections-bridge-bash /rootfs/usr/bin/bash",
+            "cp /bin/busybox /rootfs/usr/bin/busybox",
+            "for applet in cp find id mkdir mktemp rm sh sleep tar touch",
+            "ln -s /usr/bin/busybox /rootfs/usr/bin/",
+            "ln -s \"/usr/bin/${applet}\" \"/rootfs/bin/${applet}\"",
+            "ln -s /usr/sbin/ip /rootfs/usr/bin/ip",
+            "ln -s /usr/sbin/ip /rootfs/bin/ip",
+            "ln -s /run/netns /rootfs/var/run/netns",
+            "ln -s /usr/bin/bash /rootfs/bin/bash",
+            "COPY --from=runtime-tools /runtime-root/ /",
+            "COPY --from=toolbox /rootfs/var/run/ /var/run/",
+            "COPY --from=toolbox /rootfs/usr/bin/ /usr/bin/",
+            "COPY --from=toolbox /rootfs/bin/ /bin/",
             "COPY --chown=65532:65532 --from=toolbox /sandbox /sandbox",
             "mkdir -p /sandbox",
             "chown 65532:65532 /sandbox",
@@ -1953,6 +2038,78 @@ mod tests {
             assert!(
                 bridge_container.contains(required),
                 "Connections bridge sandbox image is missing required OpenShell runtime prerequisite: {required}"
+            );
+        }
+        assert!(
+            !bridge_container.contains("COPY --from=toolbox /bin/busybox /bin/busybox"),
+            "Connections bridge applets must resolve to executable inodes under Landlock-allowed /usr"
+        );
+        assert_eq!(
+            bridge_bash, "#!/usr/bin/sh\nexec /usr/bin/sh \"$@\"\n",
+            "the bash compatibility wrapper must delegate only the OpenShell -lc relay to BusyBox sh"
+        );
+        assert!(
+            dockerignore.lines().any(|line| line == "build/*")
+                && dockerignore
+                    .lines()
+                    .any(|line| line == "!build/connections-bridge-bash")
+                && !dockerignore.lines().any(|line| line == "build"),
+            "the Docker build context must exclude other build helpers while carrying the connections-bridge bash wrapper"
+        );
+        for command in [
+            "cp", "find", "mktemp", "nsenter", "rm", "sleep", "tar", "touch",
+        ] {
+            let smoke_check = format!("command -v {command} >/dev/null");
+            assert!(
+                release_validation.contains(&smoke_check),
+                "Connections bridge release smoke must execute the OpenShell workspace-init prerequisite check: {smoke_check}"
+            );
+        }
+        for exercise in [
+            "mktemp -d /sandbox/workspace-init.XXXXXX",
+            "touch \"${workspace_init}/source\"",
+            "cp \"${workspace_init}/source\" \"${workspace_init}/copied\"",
+            "find \"${workspace_init}\" -type f -name source",
+            "tar -cf \"${workspace_init}/source.tar\" -C \"${workspace_init}\" source",
+            "rm -rf \"${workspace_init}\"",
+        ] {
+            assert!(
+                release_validation.contains(exercise),
+                "Connections bridge release smoke must exercise the OpenShell workspace-init operation: {exercise}"
+            );
+        }
+        for assertion in [
+            "test \"$(id -g)\" = \"65532\"",
+            "test -f \"${workspace_init}/copied\"",
+            "test -s \"${workspace_init}/copied\"",
+            "/bin/busybox cmp \"${workspace_init}/source\" \"${workspace_init}/copied\"",
+            "test ! -e \"${workspace_init}\"",
+        ] {
+            assert!(
+                release_validation.contains(assertion),
+                "Connections bridge release smoke must retain its runtime postcondition: {assertion}"
+            );
+        }
+        for assertion in [
+            "/bin/bash -lc",
+            "test \"$(/bin/busybox readlink /bin/sh)\" = \"/usr/bin/sh\"",
+            "test \"$(/bin/busybox readlink /bin/bash)\" = \"/usr/bin/bash\"",
+            "test \"$(/bin/busybox readlink /usr/bin/sh)\" = \"/usr/bin/busybox\"",
+            "test \"$(/bin/busybox readlink /usr/bin/ip)\" = \"/usr/sbin/ip\"",
+            "test \"$(/bin/busybox readlink /var/run/netns)\" = \"/run/netns\"",
+            "iproute2-6.1.0",
+            "ip netns list >/dev/null",
+            "util-linux 2.38.1",
+            "sleep infinity &",
+            "sleep_pid=\"$!\"",
+            "kill -0 \"${sleep_pid}\"",
+            "kill \"${sleep_pid}\"",
+            "wait \"${sleep_pid}\" || test \"$?\" = \"143\"",
+            "if kill -0 \"${sleep_pid}\" 2>/dev/null; then",
+        ] {
+            assert!(
+                release_validation.contains(assertion),
+                "Connections bridge release smoke must retain its OpenShell supervisor command assertion: {assertion}"
             );
         }
         assert!(

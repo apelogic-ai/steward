@@ -19,6 +19,12 @@ PORT_FORWARD_PID=""
 WORKLOAD_EXCHANGE_PID=""
 CLUSTER_CREATED=0
 OIDC_AUDIENCE="openshell-api"
+BRIDGE_IMAGE_REPOSITORY="docker.io/library/steward-bridge"
+BRIDGE_IMAGE_TAGGED="${BRIDGE_IMAGE_REPOSITORY}:${RUN_ID}"
+BRIDGE_IMAGE_ARCHIVE="${RUN_DIR}/steward-bridge.oci.tar"
+BRIDGE_IMAGE_METADATA="${RUN_DIR}/steward-bridge-build-metadata.json"
+BUILDX_BUILDER_NAME="steward-${RUN_ID}"
+BUILDX_BUILDER_CREATED=0
 
 cleanup() {
   status="$1"
@@ -34,6 +40,9 @@ cleanup() {
   if [[ -n "${WORKLOAD_EXCHANGE_PID}" ]]; then
     kill "${WORKLOAD_EXCHANGE_PID}" >/dev/null 2>&1 || true
     wait "${WORKLOAD_EXCHANGE_PID}" >/dev/null 2>&1 || true
+  fi
+  if [[ "${BUILDX_BUILDER_CREATED}" == "1" ]]; then
+    docker buildx rm --force "${BUILDX_BUILDER_NAME}" >/dev/null 2>&1 || true
   fi
   if [[ "${CLUSTER_CREATED}" == "1" && "${STEWARD_DEV_KEEP:-0}" != "1" ]]; then
     KUBECONFIG="${KUBECONFIG_PATH}" kind delete cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1 || true
@@ -56,13 +65,53 @@ for command in cargo curl docker helm kind kubectl openssl python3 tar xxd; do
   fi
 done
 docker info >/dev/null
+docker buildx version >/dev/null
 
 mkdir -p "${RUN_DIR}"
+if docker buildx inspect "${BUILDX_BUILDER_NAME}" >/dev/null 2>&1; then
+  echo "run-owned Buildx builder already exists: ${BUILDX_BUILDER_NAME}" >&2
+  exit 2
+fi
+docker buildx create \
+  --name "${BUILDX_BUILDER_NAME}" \
+  --driver docker-container >/dev/null
+BUILDX_BUILDER_CREATED=1
+docker buildx inspect --bootstrap "${BUILDX_BUILDER_NAME}" >/dev/null
+docker buildx build \
+  --builder "${BUILDX_BUILDER_NAME}" \
+  --file "${ROOT}/build/connections-bridge.Dockerfile" \
+  --tag "${BRIDGE_IMAGE_TAGGED}" \
+  --provenance=false \
+  --sbom=false \
+  --output "type=oci,dest=${BRIDGE_IMAGE_ARCHIVE}" \
+  --metadata-file "${BRIDGE_IMAGE_METADATA}" \
+  "${ROOT}"
+bridge_image_digest="$(
+  python3 - "${BRIDGE_IMAGE_METADATA}" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as metadata_file:
+    digest = json.load(metadata_file).get("containerimage.digest", "")
+if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+    raise SystemExit("bridge build did not publish one exact OCI manifest digest")
+print(digest)
+PY
+)"
+BRIDGE_IMAGE="${BRIDGE_IMAGE_REPOSITORY}@${bridge_image_digest}"
+
 kind create cluster \
   --name "${CLUSTER_NAME}" \
   --kubeconfig "${KUBECONFIG_PATH}" \
   --wait 120s
 CLUSTER_CREATED=1
+kind load image-archive "${BRIDGE_IMAGE_ARCHIVE}" --name "${CLUSTER_NAME}"
+docker exec "${CLUSTER_NAME}-control-plane" \
+  ctr --namespace k8s.io images tag --force \
+  "${BRIDGE_IMAGE_TAGGED}" "${BRIDGE_IMAGE}" >/dev/null
+docker exec "${CLUSTER_NAME}-control-plane" \
+  crictl inspecti "${BRIDGE_IMAGE}" >/dev/null
 
 actual_context="$(kubectl --kubeconfig "${KUBECONFIG_PATH}" config current-context)"
 if [[ "${actual_context}" != "${KUBE_CONTEXT}" ]]; then
@@ -283,6 +332,7 @@ env \
   --namespace openshell \
   --create-namespace \
   --set-string server.defaultRuntimeClassName=openshell-runc \
+  --set-string server.sandboxImagePullPolicy=Never \
   --set server.auth.allowUnauthenticatedUsers=false \
   --set-string "server.oidc.issuer=${oidc_issuer}" \
   --set-string "server.oidc.audience=${OIDC_AUDIENCE}" \
@@ -377,6 +427,7 @@ STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE="${client_private_key}" \
 STEWARD_OPENSHELL_UNTRUSTED_CA_FILE="${invalid_ca}" \
 STEWARD_OPENSHELL_SERVER_NAME=localhost \
 STEWARD_OPENSHELL_RUNTIME_CLASS_NAME=openshell-runc \
+STEWARD_CONNECTIONS_BRIDGE_IMAGE="${BRIDGE_IMAGE}" \
 STEWARD_WORKLOAD_EXCHANGE_ENDPOINT="${workload_exchange_endpoint}" \
 STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME=127.0.0.1 \
 STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE="${workload_exchange_ca_certificate}" \
