@@ -8,7 +8,9 @@ stable_bridge_bundle="$(mktemp)"
 stable_bridge_configmap="$(mktemp)"
 stable_bridge_deployment="$(mktemp)"
 stable_bridge_controller_deployment="$(mktemp)"
-trap 'rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" "${stable_bridge_configmap}" "${stable_bridge_deployment}" "${stable_bridge_controller_deployment}"' EXIT INT TERM
+mint_synthetic_kubeconfig="$(mktemp)"
+mint_startup_output="$(mktemp)"
+trap 'rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" "${stable_bridge_configmap}" "${stable_bridge_deployment}" "${stable_bridge_controller_deployment}" "${mint_synthetic_kubeconfig}" "${mint_startup_output}"' EXIT INT TERM
 
 digest0="sha256:0000000000000000000000000000000000000000000000000000000000000000"
 digest1="sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -262,6 +264,40 @@ if [[ "${1:-}" == "--build-images" ]]; then
     : >/sandbox/release-validation
     rm /sandbox/release-validation
   '
+  cat > "${mint_synthetic_kubeconfig}" <<'EOF'
+apiVersion: v1
+kind: Config
+clusters:
+  - name: synthetic
+    cluster:
+      server: https://127.0.0.1:1
+      insecure-skip-tls-verify: true
+contexts:
+  - name: synthetic
+    context:
+      cluster: synthetic
+      user: synthetic
+current-context: synthetic
+users:
+  - name: synthetic
+    user:
+      token: synthetic-token
+EOF
+  chmod 0644 "${mint_synthetic_kubeconfig}"
+  if docker run --rm --network none \
+    --env KUBECONFIG=/run/steward-release/kubeconfig \
+    --volume "${mint_synthetic_kubeconfig}:/run/steward-release/kubeconfig:ro" \
+    steward-mint:release-validation > "${mint_startup_output}" 2>&1
+  then
+    echo "the mint release-image smoke expects the synthetic Kubernetes endpoint to be unavailable" >&2
+    exit 1
+  fi
+  if grep -Fq 'Could not automatically determine the process-level CryptoProvider' "${mint_startup_output}"; then
+    echo "the combined release mint image must select the Rustls crypto provider before Kubernetes startup" >&2
+    cat "${mint_startup_output}" >&2
+    exit 1
+  fi
+  grep -Fq 'OpenShell identity discovery failed' "${mint_startup_output}"
 elif [[ -n "${1:-}" ]]; then
   echo "usage: $0 [--build-images]" >&2
   exit 2
