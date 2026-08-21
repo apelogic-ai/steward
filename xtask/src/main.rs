@@ -1579,6 +1579,8 @@ mod tests {
             "bridge_image: Some(required(\"STEWARD_CONNECTIONS_BRIDGE_IMAGE\")?)",
             "\"/bin/sh\".to_owned()",
             "input_root.join(\"request.json\")",
+            ".env(\"COPYFILE_DISABLE\", \"1\")",
+            ".arg(\"--format=ustar\")",
             ".arg(\"request.json\")",
             "cp request.json \\\"$STEWARD_OUTPUT_DIR/response.json\\\"",
             "output_root.join(\"response.json\")",
@@ -2011,12 +2013,20 @@ mod tests {
         for required in [
             "FROM busybox:1.37.0-musl@sha256:",
             "FROM gcr.io/distroless/cc-debian12:nonroot@sha256:",
+            "FROM build AS runtime-tools",
+            "apt-get install --yes --no-install-recommends iproute2=6.1.0-3",
+            "cp --parents /usr/sbin/ip /usr/bin/nsenter /runtime-root",
             "COPY --chmod=0755 build/connections-bridge-bash /rootfs/usr/bin/bash",
             "cp /bin/busybox /rootfs/usr/bin/busybox",
-            "for applet in cp find id ip mkdir mktemp rm sh sleep tar touch",
+            "for applet in cp find id mkdir mktemp rm sh sleep tar touch",
             "ln -s /usr/bin/busybox /rootfs/usr/bin/",
             "ln -s \"/usr/bin/${applet}\" \"/rootfs/bin/${applet}\"",
+            "ln -s /usr/sbin/ip /rootfs/usr/bin/ip",
+            "ln -s /usr/sbin/ip /rootfs/bin/ip",
+            "ln -s /run/netns /rootfs/var/run/netns",
             "ln -s /usr/bin/bash /rootfs/bin/bash",
+            "COPY --from=runtime-tools /runtime-root/ /",
+            "COPY --from=toolbox /rootfs/var/run/ /var/run/",
             "COPY --from=toolbox /rootfs/usr/bin/ /usr/bin/",
             "COPY --from=toolbox /rootfs/bin/ /bin/",
             "COPY --chown=65532:65532 --from=toolbox /sandbox /sandbox",
@@ -2046,7 +2056,9 @@ mod tests {
                 && !dockerignore.lines().any(|line| line == "build"),
             "the Docker build context must exclude other build helpers while carrying the connections-bridge bash wrapper"
         );
-        for command in ["cp", "find", "mktemp", "rm", "sleep", "tar", "touch"] {
+        for command in [
+            "cp", "find", "mktemp", "nsenter", "rm", "sleep", "tar", "touch",
+        ] {
             let smoke_check = format!("command -v {command} >/dev/null");
             assert!(
                 release_validation.contains(&smoke_check),
@@ -2083,6 +2095,11 @@ mod tests {
             "test \"$(/bin/busybox readlink /bin/sh)\" = \"/usr/bin/sh\"",
             "test \"$(/bin/busybox readlink /bin/bash)\" = \"/usr/bin/bash\"",
             "test \"$(/bin/busybox readlink /usr/bin/sh)\" = \"/usr/bin/busybox\"",
+            "test \"$(/bin/busybox readlink /usr/bin/ip)\" = \"/usr/sbin/ip\"",
+            "test \"$(/bin/busybox readlink /var/run/netns)\" = \"/run/netns\"",
+            "iproute2-6.1.0",
+            "ip netns list >/dev/null",
+            "util-linux 2.38.1",
             "sleep infinity &",
             "sleep_pid=\"$!\"",
             "kill -0 \"${sleep_pid}\"",

@@ -73,6 +73,8 @@ fn make_bridge_input_archive(run_dir: &Path) -> Result<(Vec<u8>, Vec<u8>), Strin
     let archive_path = run_dir.join("adapter-input.tar");
     run(
         Command::new("tar")
+            .env("COPYFILE_DISABLE", "1")
+            .arg("--format=ustar")
             .arg("-cf")
             .arg(&archive_path)
             .arg("-C")
