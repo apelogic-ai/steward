@@ -42,6 +42,27 @@ existing opaque user ID and preserves it. An explicitly reviewed email rename us
 actor. Wrong organization, inactive user, stale email, subject collision, and invalid record
 states fail with bounded categories that contain no claim or token material.
 
+### Isolated local integration fixture
+
+A cross-product local test may need its workload identity mapper and Steward to agree on one exact
+opaque user ID without a real Google login. The production registration path must not be weakened
+for that purpose. A feature-gated, local-only command migrates the schema and registers the exact
+typed fixture principal with an append-only audit event:
+
+```text
+STEWARD_DATABASE_URL=<local-test-database> cargo run -p steward-apiserver-bin \
+  --features local-fixtures -- bootstrap-local-canonical-user \
+  --user-id usr_0123456789abcdef0123456789abcdef \
+  --organization-id org_example \
+  --email alice@example.com \
+  --actor local-e2e
+```
+
+The command is absent from default and release builds. It is idempotent only for the exact active
+tuple, never discovers by email, never creates an external OIDC subject, and rejects any attempt to
+rebind or reactivate an existing canonical user. It exists only to seed isolated local workload
+TokenReview integration; production identity continues to require validated provider claims.
+
 ## Task binding
 
 The trusted TokenReview result must contain exactly one

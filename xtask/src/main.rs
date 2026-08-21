@@ -939,6 +939,36 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_local_identity_fixture_is_absent_from_release_images() -> Result<(), String> {
+        let repository = root();
+        let production_container = fs::read_to_string(repository.join("build/package.Dockerfile"))
+            .map_err(|error| format!("production container build is required: {error}"))?;
+        let release_workflow = fs::read_to_string(repository.join(".github/workflows/release.yml"))
+            .map_err(|error| format!("release workflow is required: {error}"))?;
+        let binary_manifest =
+            fs::read_to_string(repository.join("bins/steward-apiserver/Cargo.toml"))
+                .map_err(|error| format!("apiserver manifest is required: {error}"))?;
+        let binary_source =
+            fs::read_to_string(repository.join("bins/steward-apiserver/src/main.rs"))
+                .map_err(|error| format!("apiserver source is required: {error}"))?;
+
+        assert!(
+            binary_manifest.contains("local-fixtures = [\"steward-store/local-fixtures\"]"),
+            "the local fixture command must require an explicit compile-time feature"
+        );
+        assert!(
+            binary_source.contains("#[cfg(feature = \"local-fixtures\")]"),
+            "the local fixture command must be compile-time excluded by default"
+        );
+        assert!(
+            !production_container.contains("local-fixtures")
+                && !release_workflow.contains("--features local-fixtures"),
+            "published runtime images must never enable the deterministic local identity fixture"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn browser_e2e_ci_uses_the_pinned_loopback_gate() -> Result<(), String> {
         let repository = root();
         let workflow = fs::read_to_string(repository.join(".github/workflows/ci.yml"))

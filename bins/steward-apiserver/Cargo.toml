@@ -6,6 +6,9 @@ publish.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+local-fixtures = ["steward-store/local-fixtures"]
+
 [dependencies]
 axum.workspace = true # Serves the authenticated REST admission and escalation API.
 kube = { workspace = true, features = ["client", "ring", "rustls-tls"] } # Authenticates bearer tokens through Kubernetes TokenReview and writes AgentRuntime desired state.

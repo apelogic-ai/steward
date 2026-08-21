@@ -468,6 +468,98 @@ impl PgStore {
         .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
     }
 
+    /// Register one deterministic canonical principal for an isolated local integration fixture.
+    ///
+    /// This API is absent unless the explicit `local-fixtures` feature is enabled. It accepts only
+    /// already-parsed opaque identity types, records the same append-only `registered` audit event
+    /// as normal registration, and is idempotent only for the exact active tuple. It deliberately
+    /// creates no external identity subject: the local workload mapper is responsible for emitting
+    /// this reviewed canonical user ID directly.
+    #[cfg(feature = "local-fixtures")]
+    pub async fn register_local_fixture_canonical_principal(
+        &self,
+        user_id: &CanonicalUserId,
+        organization_id: &OrganizationId,
+        display_email: &Email,
+        actor: &str,
+    ) -> Result<CanonicalPrincipal, StoreError> {
+        if actor.trim().is_empty() {
+            return Err(StoreError::CanonicalIdentityInvalidActor);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+            .bind(user_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let existing = sqlx::query(
+            "SELECT organization_id, display_email, state \
+             FROM canonical_users WHERE user_id = $1",
+        )
+        .bind(user_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if let Some(existing) = existing {
+            let existing_organization_id: String = existing
+                .try_get("organization_id")
+                .map_err(database_error)?;
+            let existing_display_email: String =
+                existing.try_get("display_email").map_err(database_error)?;
+            let state: String = existing.try_get("state").map_err(database_error)?;
+            return local_fixture_existing_principal(
+                user_id,
+                organization_id,
+                display_email,
+                &existing_organization_id,
+                &existing_display_email,
+                &state,
+            );
+        }
+        let email_owner = sqlx::query_scalar::<_, String>(
+            "SELECT user_id FROM canonical_users \
+             WHERE organization_id = $1 AND lower(display_email) = lower($2)",
+        )
+        .bind(organization_id.as_str())
+        .bind(display_email.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if email_owner.is_some() {
+            return Err(StoreError::CanonicalIdentityAmbiguousEmail);
+        }
+        sqlx::query(
+            "INSERT INTO canonical_users (user_id, organization_id, display_email) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(user_id.as_str())
+        .bind(organization_id.as_str())
+        .bind(display_email.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(canonical_identity_database_error)?;
+        sqlx::query(
+            "INSERT INTO canonical_identity_audit \
+             (id, user_id, action, actor, new_display_email) \
+             VALUES ($1, $2, 'registered', $3, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(user_id.as_str())
+        .bind(actor)
+        .bind(display_email.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+
+        CanonicalPrincipal::new(
+            user_id.clone(),
+            organization_id.clone(),
+            display_email.clone(),
+        )
+        .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+    }
+
     /// Attach a newly reviewed external issuer/subject to an existing person.
     ///
     /// This is the only issuer-migration path: callers must name the opaque user ID,
@@ -2172,6 +2264,101 @@ impl PgStore {
         .await
         .map_err(database_error)?;
         Ok(result.rows_affected())
+    }
+}
+
+#[cfg(feature = "local-fixtures")]
+fn local_fixture_existing_principal(
+    user_id: &CanonicalUserId,
+    organization_id: &OrganizationId,
+    display_email: &Email,
+    existing_organization_id: &str,
+    existing_display_email: &str,
+    state: &str,
+) -> Result<CanonicalPrincipal, StoreError> {
+    if state != "active" {
+        return Err(StoreError::CanonicalIdentityInactive);
+    }
+    if existing_organization_id != organization_id.as_str()
+        || !existing_display_email.eq_ignore_ascii_case(display_email.as_str())
+    {
+        return Err(StoreError::CanonicalIdentityConflict);
+    }
+    CanonicalPrincipal::new(
+        user_id.clone(),
+        organization_id.clone(),
+        display_email.clone(),
+    )
+    .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+}
+
+#[cfg(all(test, feature = "local-fixtures"))]
+mod local_fixture_tests {
+    use steward_types::{CanonicalUserId, Email, OrganizationId};
+
+    use super::{StoreError, local_fixture_existing_principal};
+
+    fn fixture() -> Result<(CanonicalUserId, OrganizationId, Email), String> {
+        Ok((
+            CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
+            OrganizationId::parse("org_example")?,
+            Email::parse("alice@example.com")?,
+        ))
+    }
+
+    #[test]
+    fn exact_active_local_fixture_retry_is_idempotent() -> Result<(), String> {
+        let (user_id, organization_id, email) = fixture()?;
+        let principal = local_fixture_existing_principal(
+            &user_id,
+            &organization_id,
+            &email,
+            "org_example",
+            "ALICE@example.com",
+            "active",
+        )
+        .map_err(|error| error.to_string())?;
+
+        assert_eq!(principal.user_id, user_id);
+        assert_eq!(principal.organization_id, organization_id);
+        assert_eq!(principal.display_email, email);
+        Ok(())
+    }
+
+    #[test]
+    fn local_fixture_retry_never_rebinds_or_reactivates_identity() -> Result<(), String> {
+        let (user_id, organization_id, email) = fixture()?;
+        for (stored_organization, stored_email, state, expected) in [
+            (
+                "org_other",
+                "alice@example.com",
+                "active",
+                StoreError::CanonicalIdentityConflict,
+            ),
+            (
+                "org_example",
+                "bob@example.org",
+                "active",
+                StoreError::CanonicalIdentityConflict,
+            ),
+            (
+                "org_example",
+                "alice@example.com",
+                "disabled",
+                StoreError::CanonicalIdentityInactive,
+            ),
+        ] {
+            let result = local_fixture_existing_principal(
+                &user_id,
+                &organization_id,
+                &email,
+                stored_organization,
+                stored_email,
+                state,
+            );
+            assert_eq!(result, Err(expected));
+        }
+        Ok(())
     }
 }
 
