@@ -255,6 +255,7 @@ if [[ "${1:-}" == "--build-images" ]]; then
     --tag "steward-bridge:release-validation" \
     "${root}"
   docker run --rm --entrypoint /bin/sh steward-bridge:release-validation -ceu '
+    command -v bash >/dev/null
     command -v cp >/dev/null
     command -v tar >/dev/null
     command -v ip >/dev/null
@@ -267,6 +268,10 @@ if [[ "${1:-}" == "--build-images" ]]; then
     test -w /sandbox
     test "$(id -u)" = "65532"
     test "$(id -g)" = "65532"
+    test "$(/bin/busybox readlink /bin/sh)" = "/usr/bin/sh"
+    test "$(/bin/busybox readlink /bin/bash)" = "/usr/bin/bash"
+    test "$(/bin/busybox readlink /usr/bin/sh)" = "/usr/bin/busybox"
+    /bin/bash -lc "test -x /usr/bin/sh && test -x /usr/bin/cp"
     : >/sandbox/release-validation
     rm /sandbox/release-validation
     workspace_init="$(mktemp -d /sandbox/workspace-init.XXXXXX)"

@@ -5,7 +5,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use steward_adapter_openshell::{OpenShellConnectionConfig, OpenShellRuntime};
+use steward_adapter_openshell::{
+    CONNECTIONS_BRIDGE_AGENT_TYPE, OpenShellConnectionConfig, OpenShellRuntime,
+};
 use steward_ports::{
     SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskRequest, SandboxTaskRuntime,
 };
@@ -41,8 +43,8 @@ fn valid_config() -> Result<OpenShellConnectionConfig, String> {
         workload_source_credential_file: required_path("STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE")?,
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
         runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
-        bridge_image: None,
-        bridge_gateway_origin: None,
+        bridge_image: Some(required("STEWARD_CONNECTIONS_BRIDGE_IMAGE")?),
+        bridge_gateway_origin: Some("https://mcp-gw.example.test".to_owned()),
     })
 }
 
@@ -245,7 +247,7 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
         runtime: RuntimeId("runtime-adapter-v0098".to_owned()),
         workspace_key: "team-a".to_owned(),
         agent_type: AgentType {
-            name: "base".to_owned(),
+            name: CONNECTIONS_BRIDGE_AGENT_TYPE.to_owned(),
         },
         models: Vec::new(),
         tools: Vec::new(),

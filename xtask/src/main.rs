@@ -1541,8 +1541,15 @@ mod tests {
         );
         for required in [
             "OPEN_SHELL_RELEASE=\"v0.0.98\"",
+            "build/connections-bridge.Dockerfile",
+            "docker buildx build",
+            "type=oci",
+            "containerimage.digest",
+            "kind load image-archive",
+            "server.sandboxImagePullPolicy=Never",
             "server.defaultRuntimeClassName=openshell-runc",
             "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME=openshell-runc",
+            "STEWARD_CONNECTIONS_BRIDGE_IMAGE",
             "handler: runc",
             "server.oidc.issuer=",
             "--test openshell_adapter_v0098",
@@ -1557,6 +1564,17 @@ mod tests {
                 && !e2e_source.contains("kata_bound"),
             "the kind lane must describe runtime-class propagation, not Kata isolation"
         );
+        for required in [
+            "CONNECTIONS_BRIDGE_AGENT_TYPE",
+            "bridge_image: Some(required(\"STEWARD_CONNECTIONS_BRIDGE_IMAGE\")?)",
+            "\"/bin/sh\".to_owned()",
+            "cp in/payload.bin",
+        ] {
+            assert!(
+                e2e_source.contains(required),
+                "the pinned OpenShell lane must execute the bridge stage/copy/collect path under the v0.0.98 supervisor and Landlock: missing {required}"
+            );
+        }
         assert!(
             chart_readme.contains("does not prove a VM isolation boundary"),
             "the chart documentation must not overstate runtime-class propagation as VM isolation"
@@ -1765,6 +1783,10 @@ mod tests {
             root().join("build/connections-bridge.Dockerfile"),
         )
         .map_err(|error| format!("Connections bridge sandbox image build is required: {error}"))?;
+        let bridge_bash = fs::read_to_string(root().join("build/connections-bridge-bash"))
+            .map_err(|error| {
+                format!("Connections bridge bash compatibility wrapper is required: {error}")
+            })?;
 
         for required in [
             "apiserver:",
@@ -1968,17 +1990,14 @@ mod tests {
         for required in [
             "FROM busybox:1.37.0-musl@sha256:",
             "FROM gcr.io/distroless/cc-debian12:nonroot@sha256:",
-            "COPY --from=toolbox /bin/busybox /bin/busybox",
-            "COPY --from=toolbox /bin/cp /bin/cp",
-            "COPY --from=toolbox /bin/tar /bin/tar",
-            "COPY --from=toolbox /bin/ip /bin/ip",
-            "COPY --from=toolbox /bin/id /bin/id",
-            "COPY --from=toolbox /bin/find /bin/find",
-            "COPY --from=toolbox /bin/mktemp /bin/mktemp",
-            "COPY --from=toolbox /bin/mkdir /bin/mkdir",
-            "COPY --from=toolbox /bin/rm /bin/rm",
-            "COPY --from=toolbox /bin/sleep /bin/sleep",
-            "COPY --from=toolbox /bin/touch /bin/touch",
+            "COPY --chmod=0755 build/connections-bridge-bash /rootfs/usr/bin/bash",
+            "cp /bin/busybox /rootfs/usr/bin/busybox",
+            "for applet in cp find id ip mkdir mktemp rm sh sleep tar touch",
+            "ln -s /usr/bin/busybox /rootfs/usr/bin/",
+            "ln -s \"/usr/bin/${applet}\" \"/rootfs/bin/${applet}\"",
+            "ln -s /usr/bin/bash /rootfs/bin/bash",
+            "COPY --from=toolbox /rootfs/usr/bin/ /usr/bin/",
+            "COPY --from=toolbox /rootfs/bin/ /bin/",
             "COPY --chown=65532:65532 --from=toolbox /sandbox /sandbox",
             "mkdir -p /sandbox",
             "chown 65532:65532 /sandbox",
@@ -1990,6 +2009,14 @@ mod tests {
                 "Connections bridge sandbox image is missing required OpenShell runtime prerequisite: {required}"
             );
         }
+        assert!(
+            !bridge_container.contains("COPY --from=toolbox /bin/busybox /bin/busybox"),
+            "Connections bridge applets must resolve to executable inodes under Landlock-allowed /usr"
+        );
+        assert_eq!(
+            bridge_bash, "#!/usr/bin/sh\nexec /usr/bin/sh \"$@\"\n",
+            "the bash compatibility wrapper must delegate only the OpenShell -lc relay to BusyBox sh"
+        );
         for command in ["cp", "find", "mktemp", "rm", "sleep", "tar", "touch"] {
             let smoke_check = format!("command -v {command} >/dev/null");
             assert!(
@@ -2023,6 +2050,10 @@ mod tests {
             );
         }
         for assertion in [
+            "/bin/bash -lc",
+            "test \"$(/bin/busybox readlink /bin/sh)\" = \"/usr/bin/sh\"",
+            "test \"$(/bin/busybox readlink /bin/bash)\" = \"/usr/bin/bash\"",
+            "test \"$(/bin/busybox readlink /usr/bin/sh)\" = \"/usr/bin/busybox\"",
             "sleep infinity &",
             "sleep_pid=\"$!\"",
             "kill -0 \"${sleep_pid}\"",
