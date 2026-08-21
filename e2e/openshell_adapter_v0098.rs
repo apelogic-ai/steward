@@ -62,17 +62,13 @@ fn run(command: &mut Command, description: &str) -> Result<(), String> {
     }
 }
 
-fn make_input_archive(run_dir: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
+fn make_bridge_input_archive(run_dir: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
     let input_root = run_dir.join("adapter-input");
-    let input_path = input_root.join("in/payload.bin");
-    fs::create_dir_all(
-        input_path
-            .parent()
-            .ok_or_else(|| "input fixture has no parent directory".to_owned())?,
-    )
-    .map_err(|error| format!("failed to create input fixture directory: {error}"))?;
-    let payload = b"steward-openshell-v0098\n".to_vec();
-    fs::write(&input_path, &payload)
+    let input_path = input_root.join("request.json");
+    fs::create_dir_all(&input_root)
+        .map_err(|error| format!("failed to create input fixture directory: {error}"))?;
+    let request = br#"{"operation":"copy-smoke","version":"v1"}"#.to_vec();
+    fs::write(&input_path, &request)
         .map_err(|error| format!("failed to write input fixture: {error}"))?;
     let archive_path = run_dir.join("adapter-input.tar");
     run(
@@ -81,15 +77,15 @@ fn make_input_archive(run_dir: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
             .arg(&archive_path)
             .arg("-C")
             .arg(&input_root)
-            .arg("in/payload.bin"),
+            .arg("request.json"),
         "input archive creation",
     )?;
     let archive = fs::read(&archive_path)
         .map_err(|error| format!("failed to read input archive: {error}"))?;
-    Ok((archive, payload))
+    Ok((archive, request))
 }
 
-fn output_payload(run_dir: &Path, archive: &[u8]) -> Result<Vec<u8>, String> {
+fn bridge_response(run_dir: &Path, archive: &[u8]) -> Result<Vec<u8>, String> {
     let archive_path = run_dir.join("adapter-output.tar");
     let output_root = run_dir.join("adapter-output");
     fs::write(&archive_path, archive)
@@ -104,8 +100,8 @@ fn output_payload(run_dir: &Path, archive: &[u8]) -> Result<Vec<u8>, String> {
             .arg(&output_root),
         "output archive extraction",
     )?;
-    fs::read(output_root.join("out/payload.bin"))
-        .map_err(|error| format!("declared output out/payload.bin is missing: {error}"))
+    fs::read(output_root.join("response.json"))
+        .map_err(|error| format!("declared output response.json is missing: {error}"))
 }
 
 fn assert_runtime_class_propagation(
@@ -267,7 +263,7 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
     request.refs = refs.clone();
 
     let run_dir = PathBuf::from(required("STEWARD_RUN_DIR")?);
-    let (input_archive, expected_payload) = make_input_archive(&run_dir)?;
+    let (input_archive, expected_request) = make_bridge_input_archive(&run_dir)?;
     let task_result = runtime
         .run_task(
             &SandboxTaskRequest {
@@ -277,22 +273,22 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
                 command: vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "set -eu; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; cp in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"".to_owned(),
+                    "set -eu; cp request.json \"$STEWARD_OUTPUT_DIR/response.json\"".to_owned(),
                 ],
             },
             &input_archive,
         )
         .await
         .map_err(|error| format!("adapter task round trip failed: {error:?}"))
-        .and_then(|output| output_payload(&run_dir, &output.archive));
+        .and_then(|output| bridge_response(&run_dir, &output.archive));
 
     let cleanup_result = delete_sandbox(&runtime, &request).await;
-    let actual_payload = task_result?;
+    let actual_response = task_result?;
     cleanup_result?;
     assert_eq!(
-        Sha256::digest(&actual_payload),
-        Sha256::digest(&expected_payload),
-        "copied output must have the same SHA-256 as the uploaded input"
+        Sha256::digest(&actual_response),
+        Sha256::digest(&expected_request),
+        "response.json must have the same SHA-256 as request.json"
     );
     Ok(())
 }

@@ -1568,13 +1568,22 @@ mod tests {
             "CONNECTIONS_BRIDGE_AGENT_TYPE",
             "bridge_image: Some(required(\"STEWARD_CONNECTIONS_BRIDGE_IMAGE\")?)",
             "\"/bin/sh\".to_owned()",
-            "cp in/payload.bin",
+            "input_root.join(\"request.json\")",
+            ".arg(\"request.json\")",
+            "cp request.json \\\"$STEWARD_OUTPUT_DIR/response.json\\\"",
+            "output_root.join(\"response.json\")",
+            "Sha256::digest(&actual_response)",
+            "Sha256::digest(&expected_request)",
         ] {
             assert!(
                 e2e_source.contains(required),
                 "the pinned OpenShell lane must execute the bridge stage/copy/collect path under the v0.0.98 supervisor and Landlock: missing {required}"
             );
         }
+        assert!(
+            !e2e_source.contains("in/payload.bin") && !e2e_source.contains("out/payload.bin"),
+            "the pinned OpenShell lane must use the exact request.json/response.json connections-bridge archive contract"
+        );
         assert!(
             chart_readme.contains("does not prove a VM isolation boundary"),
             "the chart documentation must not overstate runtime-class propagation as VM isolation"
