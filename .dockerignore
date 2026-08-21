@@ -1,7 +1,8 @@
 .git
 .steward-run
 .worktrees
-build
+build/*
+!build/connections-bridge-bash
 charts
 target
 e2e/target

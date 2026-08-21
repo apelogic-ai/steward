@@ -1796,6 +1796,8 @@ mod tests {
             .map_err(|error| {
                 format!("Connections bridge bash compatibility wrapper is required: {error}")
             })?;
+        let dockerignore = fs::read_to_string(root().join(".dockerignore"))
+            .map_err(|error| format!("Docker build-context policy is required: {error}"))?;
 
         for required in [
             "apiserver:",
@@ -2025,6 +2027,14 @@ mod tests {
         assert_eq!(
             bridge_bash, "#!/usr/bin/sh\nexec /usr/bin/sh \"$@\"\n",
             "the bash compatibility wrapper must delegate only the OpenShell -lc relay to BusyBox sh"
+        );
+        assert!(
+            dockerignore.lines().any(|line| line == "build/*")
+                && dockerignore
+                    .lines()
+                    .any(|line| line == "!build/connections-bridge-bash")
+                && !dockerignore.lines().any(|line| line == "build"),
+            "the Docker build context must exclude other build helpers while carrying the connections-bridge bash wrapper"
         );
         for command in ["cp", "find", "mktemp", "rm", "sleep", "tar", "touch"] {
             let smoke_check = format!("command -v {command} >/dev/null");
