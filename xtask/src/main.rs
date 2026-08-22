@@ -1759,6 +1759,7 @@ mod tests {
             "apiserver:",
             "controller:",
             "mint:",
+            "browserAuth:",
             "digest:",
             "pullPolicy:",
         ] {
@@ -1783,6 +1784,9 @@ mod tests {
             "kind: ClusterSPIFFEID",
             ".Values.runtimeNamespaces",
             "kind: RoleBinding",
+            "STEWARD_GOOGLE_OIDC_CLIENT_ID",
+            "STEWARD_GOOGLE_OIDC_CLIENT_SECRET",
+            ".Values.browserAuth.enabled",
         ] {
             assert!(
                 templates.contains(required),

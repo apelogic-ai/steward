@@ -217,6 +217,13 @@ spec:
             - { name: STEWARD_JIRA_ACCOUNT_EMAIL, value: {{ .Values.config.apiserver.jiraAccountEmail | quote }} }
             - { name: STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE, value: {{ .Values.config.apiserver.kubernetesTokenReviewAudience | quote }} }
             - { name: STEWARD_TASK_WORKFLOWS_JSON, value: {{ .Values.config.apiserver.taskWorkflowsJson | quote }} }
+{{- if .Values.browserAuth.enabled }}
+            - { name: STEWARD_GOOGLE_OIDC_CLIENT_ID, value: {{ .Values.browserAuth.google.clientId | quote }} }
+            - { name: STEWARD_BROWSER_ORIGIN, value: {{ .Values.browserAuth.google.origin | quote }} }
+            - { name: STEWARD_GOOGLE_WORKSPACE_DOMAIN, value: {{ .Values.browserAuth.google.workspaceDomain | quote }} }
+            - { name: STEWARD_ORGANIZATION_ID, value: {{ .Values.browserAuth.google.organizationId | quote }} }
+            - { name: STEWARD_GOOGLE_OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: {{ .Values.browserAuth.google.clientSecret.name }}, key: {{ .Values.browserAuth.google.clientSecret.key }} } } }
+{{- end }}
 {{- if .Values.stableBridge.enabled }}
             - { name: STEWARD_STABLE_BRIDGE_IMAGE, value: {{ .Values.stableBridge.image | quote }} }
             - { name: STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY, value: {{ .Values.stableBridge.signerIdentity | quote }} }
