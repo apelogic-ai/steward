@@ -7,6 +7,18 @@ use serde_json::Value;
 
 pub const PROVIDER_PROFILE_BUNDLE_SCHEMA: &str = "steward.provider-profile-bundle/v1";
 pub const PROVIDER_PROFILE_TEMPLATE_SCHEMA: &str = "steward.provider-profile-template/v1";
+pub const PROVIDER_PROFILE_INPUTS_SCHEMA: &str = "steward.provider-profile-inputs/v1";
+pub const PROVIDER_PROFILE_INSTALL_STATE_SCHEMA: &str = "steward.provider-profile-install-state/v1";
+
+/// The concrete, environment-bound profiles generated from one portable
+/// release bundle.  The renderer deliberately returns values rather than
+/// writing them: callers own the installation boundary and can make its
+/// filesystem transition atomic.
+#[derive(Debug, PartialEq)]
+pub struct RenderedProviderProfileBundle {
+    pub profiles: BTreeMap<String, Value>,
+    pub state: Value,
+}
 
 pub fn validate_provider_profile_bundle_directory(directory: &Path) -> Result<(), String> {
     let manifest_path = directory.join("bundle.json");
@@ -63,6 +75,68 @@ pub fn validate_provider_profile_bundle_directory(directory: &Path) -> Result<()
         template_paths
             .iter()
             .map(|(path, content)| (path.as_str(), content.as_str())),
+    )
+}
+
+pub fn render_provider_profile_bundle_directory(
+    directory: &Path,
+    inputs_content: &str,
+) -> Result<RenderedProviderProfileBundle, String> {
+    let manifest_path = directory.join("bundle.json");
+    let bundle_content = fs::read_to_string(&manifest_path).map_err(|error| {
+        format!(
+            "provider profile bundle manifest {} is required: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let profile_directory = directory.join("profiles");
+    let entries = fs::read_dir(&profile_directory).map_err(|error| {
+        format!(
+            "provider profile bundle templates {} are required: {error}",
+            profile_directory.display()
+        )
+    })?;
+    let mut template_paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read provider profile bundle template directory {}: {error}",
+                profile_directory.display()
+            )
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "failed to inspect provider profile bundle template {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        if file_type.is_file()
+            && entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("json")
+        {
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| "provider profile template filename must be UTF-8".to_owned())?;
+            let content = fs::read_to_string(entry.path()).map_err(|error| {
+                format!(
+                    "failed to read provider profile bundle template {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+            template_paths.push((format!("profiles/{name}"), content));
+        }
+    }
+    template_paths.sort_by(|left, right| left.0.cmp(&right.0));
+    render_provider_profile_bundle(
+        &bundle_content,
+        template_paths
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str())),
+        inputs_content,
     )
 }
 
@@ -157,6 +231,696 @@ where
     Ok(())
 }
 
+/// Renders the portable provider-profile contract using a separately supplied
+/// environment-input document.  The input document is bundle-bound and exact:
+/// a deployment may select concrete HTTPS origins and CIDRs, but cannot add a
+/// profile, inject a credential, or change policy-bearing template fields.
+pub fn render_provider_profile_bundle<'a, I>(
+    bundle_content: &str,
+    templates: I,
+    inputs_content: &str,
+) -> Result<RenderedProviderProfileBundle, String>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let templates = templates.into_iter().collect::<BTreeMap<_, _>>();
+    validate_provider_profile_bundle(
+        bundle_content,
+        templates.iter().map(|(path, content)| (*path, *content)),
+    )?;
+
+    let bundle = parse_json(bundle_content, "provider profile bundle")?;
+    let bundle_object = bundle
+        .as_object()
+        .ok_or_else(|| "provider profile bundle must be a JSON object".to_owned())?;
+    let bundle_metadata = require_object(bundle_object, "bundle", "provider profile bundle")?;
+    let bundle_id = require_nonempty_string(bundle_metadata, "id", "bundle metadata")?;
+    let bundle_version = require_nonempty_string(bundle_metadata, "version", "bundle metadata")?;
+    let bundle_profiles = require_array(bundle_object, "profiles", "provider profile bundle")?;
+
+    let inputs = parse_json(inputs_content, "provider profile environment inputs")?;
+    let inputs_object = inputs
+        .as_object()
+        .ok_or_else(|| "provider profile environment inputs must be a JSON object".to_owned())?;
+    require_exact_keys(
+        inputs_object,
+        &["schema", "bundle", "profiles"],
+        "provider profile environment inputs",
+    )?;
+    require_string(
+        inputs_object,
+        "schema",
+        PROVIDER_PROFILE_INPUTS_SCHEMA,
+        "provider profile environment inputs",
+    )?;
+    let input_bundle = require_object(
+        inputs_object,
+        "bundle",
+        "provider profile environment inputs",
+    )?;
+    require_exact_keys(
+        input_bundle,
+        &["id", "version"],
+        "provider profile environment input bundle",
+    )?;
+    if require_nonempty_string(
+        input_bundle,
+        "id",
+        "provider profile environment input bundle",
+    )? != bundle_id
+        || require_nonempty_string(
+            input_bundle,
+            "version",
+            "provider profile environment input bundle",
+        )? != bundle_version
+    {
+        return Err(
+            "provider profile environment inputs must bind to the exact release bundle id and version"
+                .to_owned(),
+        );
+    }
+
+    let input_profiles = require_array(
+        inputs_object,
+        "profiles",
+        "provider profile environment inputs",
+    )?;
+    let input_profiles = collect_input_profiles(input_profiles)?;
+    let mut expected_profile_ids = BTreeSet::new();
+    let mut rendered_profiles = BTreeMap::new();
+
+    for declaration in bundle_profiles {
+        let declaration = declaration
+            .as_object()
+            .ok_or_else(|| "each provider profile declaration must be an object".to_owned())?;
+        let profile_id =
+            require_nonempty_string(declaration, "id", "provider profile declaration")?;
+        expected_profile_ids.insert(profile_id);
+        let declared_inputs = require_array(declaration, "inputs", "provider profile declaration")?;
+        let supplied_inputs = input_profiles.get(profile_id).ok_or_else(|| {
+            format!("provider profile environment inputs are missing profile {profile_id}")
+        })?;
+        let bound_inputs = validate_bound_inputs(profile_id, declared_inputs, supplied_inputs)?;
+        let template_path =
+            require_nonempty_string(declaration, "template", "provider profile declaration")?;
+        let template_content = templates.get(template_path).ok_or_else(|| {
+            format!("provider profile {profile_id} references missing template {template_path}")
+        })?;
+        let template = parse_json(template_content, "provider profile template")?;
+        rendered_profiles.insert(
+            profile_id.to_owned(),
+            render_provider_profile(profile_id, &template, &bound_inputs)?,
+        );
+    }
+
+    let supplied_profile_ids = input_profiles.keys().copied().collect::<BTreeSet<_>>();
+    if supplied_profile_ids != expected_profile_ids {
+        return Err(format!(
+            "provider profile environment input profiles must exactly match the release bundle; unexpected={:?}, missing={:?}",
+            supplied_profile_ids
+                .difference(&expected_profile_ids)
+                .copied()
+                .collect::<Vec<_>>(),
+            expected_profile_ids
+                .difference(&supplied_profile_ids)
+                .copied()
+                .collect::<Vec<_>>(),
+        ));
+    }
+
+    let state = serde_json::json!({
+        "schema": PROVIDER_PROFILE_INSTALL_STATE_SCHEMA,
+        "bundle": {"id": bundle_id, "version": bundle_version},
+        "profiles": rendered_profiles,
+    });
+    let profiles = state
+        .get("profiles")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "rendered provider profile state must contain profiles".to_owned())?
+        .iter()
+        .map(|(id, profile)| (id.clone(), profile.clone()))
+        .collect();
+
+    Ok(RenderedProviderProfileBundle { profiles, state })
+}
+
+/// Installs rendered profiles only into an absent destination.  The temporary
+/// sibling followed by rename gives consumers either no installation or a
+/// complete, self-describing installation; a partial directory is never a
+/// valid predecessor for the bundle's `absent` transition.
+pub fn install_rendered_provider_profile_bundle(
+    output_directory: &Path,
+    rendered: &RenderedProviderProfileBundle,
+) -> Result<(), String> {
+    if output_directory.exists() {
+        return Err(format!(
+            "provider profile install requires an absent destination; {} already exists",
+            output_directory.display()
+        ));
+    }
+    let parent = output_directory.parent().ok_or_else(|| {
+        format!(
+            "provider profile install destination {} must have a parent directory",
+            output_directory.display()
+        )
+    })?;
+    if !parent.is_dir() {
+        return Err(format!(
+            "provider profile install parent {} must be an existing directory",
+            parent.display()
+        ));
+    }
+    let output_name = output_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "provider profile install destination {} must have a UTF-8 basename",
+                output_directory.display()
+            )
+        })?;
+    let temporary = parent.join(format!(".{output_name}.install-{}", std::process::id()));
+    if temporary.exists() {
+        return Err(format!(
+            "provider profile install temporary destination {} already exists; classify and remove only its owner-created state",
+            temporary.display()
+        ));
+    }
+    fs::create_dir(&temporary).map_err(|error| {
+        format!(
+            "failed to create provider profile installation directory {}: {error}",
+            temporary.display()
+        )
+    })?;
+    let result = write_rendered_provider_profile_bundle(&temporary, rendered).and_then(|()| {
+        fs::rename(&temporary, output_directory).map_err(|error| {
+            format!(
+                "failed to atomically publish provider profile installation to {}: {error}",
+                output_directory.display()
+            )
+        })
+    });
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&temporary);
+    }
+    result
+}
+
+/// Reconciles only an exact installation from the same bundle.  It is
+/// deliberately verification-only: profile policy changes require a new
+/// signed bundle and an explicit migration contract rather than an in-place
+/// deployment rewrite.
+pub fn reconcile_rendered_provider_profile_bundle(
+    output_directory: &Path,
+    rendered: &RenderedProviderProfileBundle,
+) -> Result<(), String> {
+    let state_path = output_directory.join("install-state.json");
+    let state_content = fs::read_to_string(&state_path).map_err(|error| {
+        format!(
+            "provider profile reconcile requires installation state {}: {error}",
+            state_path.display()
+        )
+    })?;
+    let actual_state = parse_json(&state_content, "provider profile installation state")?;
+    if actual_state != rendered.state {
+        return Err(
+            "provider profile reconcile accepts only the exact same rendered bundle state; use an explicit signed migration for any change"
+                .to_owned(),
+        );
+    }
+    let expected_root_entries =
+        BTreeSet::from(["install-state.json".to_owned(), "profiles".to_owned()]);
+    let root_entries = directory_entry_names(output_directory, "provider profile installation")?;
+    if root_entries != expected_root_entries {
+        return Err(format!(
+            "provider profile reconcile installation contents are not exact; unexpected={:?}, missing={:?}",
+            root_entries
+                .difference(&expected_root_entries)
+                .cloned()
+                .collect::<Vec<_>>(),
+            expected_root_entries
+                .difference(&root_entries)
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+    }
+    let profile_directory = output_directory.join("profiles");
+    let expected_profiles = rendered
+        .profiles
+        .keys()
+        .map(|id| format!("{id}.json"))
+        .collect::<BTreeSet<_>>();
+    let actual_profiles =
+        directory_entry_names(&profile_directory, "provider profile installation profiles")?;
+    if actual_profiles != expected_profiles {
+        return Err(format!(
+            "provider profile reconcile profile files are not exact; unexpected={:?}, missing={:?}",
+            actual_profiles
+                .difference(&expected_profiles)
+                .cloned()
+                .collect::<Vec<_>>(),
+            expected_profiles
+                .difference(&actual_profiles)
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+    }
+    for (id, expected) in &rendered.profiles {
+        let path = profile_directory.join(format!("{id}.json"));
+        let actual = parse_json(
+            &fs::read_to_string(&path).map_err(|error| {
+                format!(
+                    "provider profile reconcile requires rendered profile {}: {error}",
+                    path.display()
+                )
+            })?,
+            "rendered provider profile",
+        )?;
+        if &actual != expected {
+            return Err(format!(
+                "provider profile reconcile found drift in {id}; in-place policy rewrites are forbidden"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_rendered_provider_profile_bundle(
+    directory: &Path,
+    rendered: &RenderedProviderProfileBundle,
+) -> Result<(), String> {
+    let profile_directory = directory.join("profiles");
+    fs::create_dir(&profile_directory).map_err(|error| {
+        format!(
+            "failed to create rendered provider profile directory {}: {error}",
+            profile_directory.display()
+        )
+    })?;
+    for (id, profile) in &rendered.profiles {
+        write_json_file(&profile_directory.join(format!("{id}.json")), profile)?;
+    }
+    write_json_file(&directory.join("install-state.json"), &rendered.state)
+}
+
+fn write_json_file(path: &Path, value: &Value) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(value)
+        .map_err(|error| format!("failed to serialize provider profile content: {error}"))?;
+    fs::write(path, format!("{content}\n")).map_err(|error| {
+        format!(
+            "failed to write provider profile file {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn directory_entry_names(directory: &Path, description: &str) -> Result<BTreeSet<String>, String> {
+    let entries = fs::read_dir(directory).map_err(|error| {
+        format!(
+            "{description} directory {} is required: {error}",
+            directory.display()
+        )
+    })?;
+    entries
+        .map(|entry| {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "failed to read {description} directory {}: {error}",
+                    directory.display()
+                )
+            })?;
+            entry.file_name().into_string().map_err(|_| {
+                format!(
+                    "{description} directory {} has a non-UTF-8 entry",
+                    directory.display()
+                )
+            })
+        })
+        .collect()
+}
+
+fn collect_input_profiles(
+    profiles: &[Value],
+) -> Result<BTreeMap<&str, &serde_json::Map<String, Value>>, String> {
+    let mut result = BTreeMap::new();
+    for profile in profiles {
+        let profile = profile.as_object().ok_or_else(|| {
+            "provider profile environment input profile must be an object".to_owned()
+        })?;
+        require_exact_keys(
+            profile,
+            &["id", "inputs"],
+            "provider profile environment input profile",
+        )?;
+        let id =
+            require_nonempty_string(profile, "id", "provider profile environment input profile")?;
+        ensure_identifier(id, "provider profile environment input id")?;
+        let inputs = require_object(
+            profile,
+            "inputs",
+            "provider profile environment input profile",
+        )?;
+        if result.insert(id, inputs).is_some() {
+            return Err(format!(
+                "provider profile environment inputs declare duplicate profile {id}"
+            ));
+        }
+    }
+    Ok(result)
+}
+
+fn validate_bound_inputs(
+    profile_id: &str,
+    declarations: &[Value],
+    supplied: &serde_json::Map<String, Value>,
+) -> Result<BTreeMap<String, Value>, String> {
+    let mut declared = BTreeMap::new();
+    for declaration in declarations {
+        let declaration = declaration.as_object().ok_or_else(|| {
+            format!("provider profile {profile_id} input declaration must be an object")
+        })?;
+        let name = require_nonempty_string(declaration, "name", "provider profile input")?;
+        let kind = require_nonempty_string(declaration, "kind", "provider profile input")?;
+        if declared.insert(name, kind).is_some() {
+            return Err(format!(
+                "provider profile {profile_id} declares duplicate input {name}"
+            ));
+        }
+    }
+    let declared_names = declared.keys().copied().collect::<BTreeSet<_>>();
+    let supplied_names = supplied.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if declared_names != supplied_names {
+        return Err(format!(
+            "provider profile {profile_id} environment inputs must exactly match the release bundle; unexpected={:?}, missing={:?}",
+            supplied_names
+                .difference(&declared_names)
+                .copied()
+                .collect::<Vec<_>>(),
+            declared_names
+                .difference(&supplied_names)
+                .copied()
+                .collect::<Vec<_>>(),
+        ));
+    }
+
+    let mut normalized = BTreeMap::new();
+    for (name, kind) in declared {
+        let value = supplied.get(name).ok_or_else(|| {
+            format!("provider profile {profile_id} environment input {name} is required")
+        })?;
+        let value = match kind {
+            "https-origin" => Value::String(parse_https_origin(
+                value.as_str().ok_or_else(|| {
+                    format!(
+                        "provider profile {profile_id} environment input {name} must be an HTTPS origin"
+                    )
+                })?,
+            )?
+            .origin),
+            "cidr-list" => Value::Array(normalize_cidrs(
+                value.as_array().ok_or_else(|| {
+                    format!(
+                        "provider profile {profile_id} environment input {name} must be a CIDR list"
+                    )
+                })?,
+            )?),
+            _ => {
+                return Err(format!(
+                    "provider profile {profile_id} input {name} has unsupported kind {kind}"
+                ));
+            }
+        };
+        normalized.insert(name.to_owned(), value);
+    }
+    Ok(normalized)
+}
+
+fn render_provider_profile(
+    profile_id: &str,
+    template: &Value,
+    inputs: &BTreeMap<String, Value>,
+) -> Result<Value, String> {
+    let template = template
+        .as_object()
+        .ok_or_else(|| "provider profile template must be a JSON object".to_owned())?;
+    let metadata = require_object(template, "metadata", "provider profile template")?;
+    let network = require_object(template, "network", "provider profile template")?;
+    let authorization = require_object(template, "authorization", "provider profile template")?;
+    let runtime = require_object(template, "runtime", "provider profile template")?;
+    let endpoint_input = require_nonempty_string(
+        network,
+        "endpointInput",
+        "provider profile template network",
+    )?;
+    let endpoint = inputs
+        .get(endpoint_input)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!("provider profile {profile_id} is missing endpoint input {endpoint_input}")
+        })?;
+    let endpoint = parse_https_origin(endpoint)?;
+    let cidr_input = require_nonempty_string(
+        network,
+        "allowedCidrsInput",
+        "provider profile template network",
+    )?;
+    let allowed_ips = inputs
+        .get(cidr_input)
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!("provider profile {profile_id} is missing CIDR input {cidr_input}")
+        })?;
+    let grant_input = require_nonempty_string(
+        authorization,
+        "tokenGrantOriginInput",
+        "provider profile template authorization",
+    )?;
+    let grant_origin = inputs
+        .get(grant_input)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!("provider profile {profile_id} is missing grant input {grant_input}")
+        })?;
+    let grant_origin = parse_https_origin(grant_origin)?;
+    let token_path = require_nonempty_string(
+        authorization,
+        "tokenPath",
+        "provider profile template authorization",
+    )?;
+    let token_endpoint = join_origin_path(&grant_origin.origin, token_path)?;
+    let capabilities = require_array(template, "capabilities", "provider profile template")?;
+    let category =
+        require_nonempty_string(metadata, "category", "provider profile template metadata")?;
+    let inference_capable = capabilities
+        .iter()
+        .any(|capability| capability.as_str() == Some("inference.completions"));
+    let access = if capabilities
+        .iter()
+        .any(|capability| capability.as_str() == Some("tool.read"))
+    {
+        "read-only"
+    } else {
+        "read-write"
+    };
+    let binaries = require_array(
+        runtime,
+        "requiredBinaries",
+        "provider profile template runtime",
+    )?;
+
+    let mut profile = serde_json::json!({
+        "id": profile_id,
+        "display_name": require_nonempty_string(metadata, "displayName", "provider profile template metadata")?,
+        "description": require_nonempty_string(metadata, "description", "provider profile template metadata")?,
+        "category": category,
+        "credentials": [{
+            "name": require_nonempty_string(authorization, "authName", "provider profile template authorization")?,
+            "description": require_nonempty_string(authorization, "authDescription", "provider profile template authorization")?,
+            "required": false,
+            "auth_style": "bearer",
+            "header_name": "Authorization",
+            "token_grant": {
+                "token_endpoint": token_endpoint,
+                "audience": require_nonempty_string(authorization, "audience", "provider profile template authorization")?,
+                "jwt_svid_audience": require_nonempty_string(authorization, "jwtSvidAudience", "provider profile template authorization")?,
+                "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
+                "scopes": require_array(authorization, "scopes", "provider profile template authorization")?,
+                "cache_ttl_seconds": authorization.get("cacheTtlSeconds").cloned().ok_or_else(|| "provider profile template authorization must declare cacheTtlSeconds".to_owned())?,
+            }
+        }],
+        "endpoints": [{
+            "host": endpoint.host,
+            "port": endpoint.port,
+            "protocol": "rest",
+            "tls": "required",
+            "access": access,
+            "enforcement": "enforce",
+            "allowed_ips": allowed_ips,
+        }],
+        "binaries": binaries,
+    });
+    if inference_capable {
+        profile["inference_capable"] = Value::Bool(true);
+    }
+    Ok(profile)
+}
+
+struct HttpsOrigin {
+    origin: String,
+    host: String,
+    port: u16,
+}
+
+fn parse_https_origin(value: &str) -> Result<HttpsOrigin, String> {
+    let value = value.strip_suffix('/').unwrap_or(value);
+    let authority = value
+        .strip_prefix("https://")
+        .filter(|authority| !authority.is_empty())
+        .ok_or_else(|| "provider profile HTTPS origin must start with https://".to_owned())?;
+    if authority.contains(['/', '?', '#', '@']) {
+        return Err(
+            "provider profile HTTPS origin must not contain a path, query, fragment, or userinfo"
+                .to_owned(),
+        );
+    }
+    let (host, port) = if authority.starts_with('[') {
+        let closing = authority.find(']').ok_or_else(|| {
+            "provider profile HTTPS origin IPv6 host must have a closing bracket".to_owned()
+        })?;
+        let host = &authority[1..closing];
+        let suffix = &authority[closing + 1..];
+        let port = suffix
+            .strip_prefix(':')
+            .map(parse_port)
+            .transpose()?
+            .unwrap_or(443);
+        if !suffix.is_empty() && !suffix.starts_with(':') {
+            return Err("provider profile HTTPS origin has an invalid IPv6 authority".to_owned());
+        }
+        host.parse::<Ipv6Addr>()
+            .map_err(|_| "provider profile HTTPS origin has an invalid IPv6 host".to_owned())?;
+        (host.to_owned(), port)
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.contains(':') {
+            return Err("provider profile HTTPS origin IPv6 hosts must use brackets".to_owned());
+        }
+        (validate_origin_host(host)?, parse_port(port)?)
+    } else {
+        (validate_origin_host(authority)?, 443)
+    };
+    let rendered_authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.clone()
+    };
+    let origin = if port == 443 {
+        format!("https://{rendered_authority}")
+    } else {
+        format!("https://{rendered_authority}:{port}")
+    };
+    Ok(HttpsOrigin { origin, host, port })
+}
+
+fn validate_origin_host(host: &str) -> Result<String, String> {
+    if host.is_empty()
+        || host.len() > 253
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        || host.starts_with('-')
+        || host.ends_with('-')
+        || host.starts_with('.')
+        || host.ends_with('.')
+    {
+        return Err("provider profile HTTPS origin has an invalid host".to_owned());
+    }
+    Ok(host.to_ascii_lowercase())
+}
+
+fn parse_port(port: &str) -> Result<u16, String> {
+    port.parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| "provider profile HTTPS origin has an invalid port".to_owned())
+}
+
+fn join_origin_path(origin: &str, path: &str) -> Result<String, String> {
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains(['?', '#'])
+        || path.split('/').any(|part| part == "." || part == "..")
+    {
+        return Err("provider profile token path must be an absolute normalized path".to_owned());
+    }
+    Ok(format!("{origin}{path}"))
+}
+
+fn normalize_cidrs(values: &[Value]) -> Result<Vec<Value>, String> {
+    if values.is_empty() {
+        return Err("provider profile CIDR list must not be empty".to_owned());
+    }
+    let mut normalized = BTreeSet::new();
+    for value in values {
+        let value = value
+            .as_str()
+            .ok_or_else(|| "provider profile CIDR list entries must be strings".to_owned())?;
+        let (address, prefix) = value.split_once('/').ok_or_else(|| {
+            "provider profile CIDR list entries must use address/prefix".to_owned()
+        })?;
+        let address = address
+            .parse::<IpAddr>()
+            .map_err(|_| "provider profile CIDR list contains an invalid address".to_owned())?;
+        let prefix = prefix
+            .parse::<u8>()
+            .map_err(|_| "provider profile CIDR list contains an invalid prefix".to_owned())?;
+        let canonical = match address {
+            IpAddr::V4(address) => {
+                if prefix > 32 {
+                    return Err("provider profile CIDR IPv4 prefix must be at most 32".to_owned());
+                }
+                let network = u32::from(address) & prefix_mask_v4(prefix);
+                if network != u32::from(address) {
+                    return Err(
+                        "provider profile CIDR entries must use canonical network addresses"
+                            .to_owned(),
+                    );
+                }
+                format!("{address}/{prefix}")
+            }
+            IpAddr::V6(address) => {
+                if prefix > 128 {
+                    return Err("provider profile CIDR IPv6 prefix must be at most 128".to_owned());
+                }
+                let network = u128::from(address) & prefix_mask_v6(prefix);
+                if network != u128::from(address) {
+                    return Err(
+                        "provider profile CIDR entries must use canonical network addresses"
+                            .to_owned(),
+                    );
+                }
+                format!("{address}/{prefix}")
+            }
+        };
+        normalized.insert(canonical);
+    }
+    Ok(normalized.into_iter().map(Value::String).collect())
+}
+
+fn prefix_mask_v4(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+fn prefix_mask_v6(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
+}
+
 fn validate_provider_profile_template(
     content: &str,
     expected_id: &str,
@@ -178,6 +942,29 @@ fn validate_provider_profile_template(
         return Err(format!(
             "provider profile template id {actual_id} does not match manifest id {expected_id}"
         ));
+    }
+    let metadata = require_object(object, "metadata", "provider profile template")?;
+    require_exact_keys(
+        metadata,
+        &["displayName", "description", "category"],
+        "provider profile template metadata",
+    )?;
+    require_nonempty_string(
+        metadata,
+        "displayName",
+        "provider profile template metadata",
+    )?;
+    require_nonempty_string(
+        metadata,
+        "description",
+        "provider profile template metadata",
+    )?;
+    let category =
+        require_nonempty_string(metadata, "category", "provider profile template metadata")?;
+    if !matches!(category, "source_control" | "inference") {
+        return Err(
+            "provider profile template category must be source_control or inference".to_owned(),
+        );
     }
     let capabilities = require_array(object, "capabilities", "provider profile template")?;
     if capabilities.is_empty()
@@ -220,6 +1007,96 @@ fn validate_provider_profile_template(
         "https",
         "provider profile template network",
     )?;
+    let authorization = require_object(object, "authorization", "provider profile template")?;
+    require_exact_keys(
+        authorization,
+        &[
+            "authName",
+            "authDescription",
+            "tokenGrantOriginInput",
+            "tokenPath",
+            "audience",
+            "jwtSvidAudience",
+            "scopes",
+            "cacheTtlSeconds",
+        ],
+        "provider profile template authorization",
+    )?;
+    require_nonempty_string(
+        authorization,
+        "authName",
+        "provider profile template authorization",
+    )?;
+    require_nonempty_string(
+        authorization,
+        "authDescription",
+        "provider profile template authorization",
+    )?;
+    let grant_origin_input = require_nonempty_string(
+        authorization,
+        "tokenGrantOriginInput",
+        "provider profile template authorization",
+    )?;
+    if !input_names.contains(grant_origin_input) {
+        return Err(format!(
+            "provider profile template tokenGrantOriginInput {grant_origin_input} is not a declared manifest input"
+        ));
+    }
+    join_origin_path(
+        "https://origin.test",
+        require_nonempty_string(
+            authorization,
+            "tokenPath",
+            "provider profile template authorization",
+        )?,
+    )?;
+    ensure_identifier(
+        require_nonempty_string(
+            authorization,
+            "audience",
+            "provider profile template authorization",
+        )?,
+        "provider profile template authorization audience",
+    )?;
+    ensure_identifier(
+        require_nonempty_string(
+            authorization,
+            "jwtSvidAudience",
+            "provider profile template authorization",
+        )?,
+        "provider profile template authorization JWT-SVID audience",
+    )?;
+    let scopes = require_array(
+        authorization,
+        "scopes",
+        "provider profile template authorization",
+    )?;
+    if scopes.is_empty() {
+        return Err(
+            "provider profile template authorization must declare at least one scope".to_owned(),
+        );
+    }
+    for scope in scopes {
+        ensure_identifier(
+            scope.as_str().ok_or_else(|| {
+                "provider profile template authorization scopes must be strings".to_owned()
+            })?,
+            "provider profile template authorization scope",
+        )?;
+    }
+    let cache_ttl = authorization
+        .get("cacheTtlSeconds")
+        .and_then(Value::as_u64)
+        .filter(|ttl| (1..=120).contains(ttl))
+        .ok_or_else(|| {
+            "provider profile template authorization cacheTtlSeconds must be an integer from 1 to 120"
+                .to_owned()
+        })?;
+    if cache_ttl == 0 {
+        return Err(
+            "provider profile template authorization cacheTtlSeconds must be positive".to_owned(),
+        );
+    }
     let runtime = require_object(object, "runtime", "provider profile template")?;
     let binaries = require_array(
         runtime,
@@ -233,6 +1110,24 @@ fn validate_provider_profile_template(
         );
     }
     Ok(())
+}
+
+fn require_exact_keys(
+    object: &serde_json::Map<String, Value>,
+    expected: &[&str],
+    description: &str,
+) -> Result<(), String> {
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "{description} fields must exactly match the release schema; unexpected={:?}, missing={:?}",
+            actual.difference(&expected).copied().collect::<Vec<_>>(),
+            expected.difference(&actual).copied().collect::<Vec<_>>(),
+        ))
+    }
 }
 
 fn validate_input_declarations(inputs: &[Value], profile_id: &str) -> Result<(), String> {
@@ -1000,11 +1895,18 @@ fn is_literal_secret(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
+        RenderedProviderProfileBundle, install_rendered_provider_profile_bundle,
         local_test_context_is_safe, migration_base_candidates, migration_history_violations,
-        neutrality_violations, secret_violations, select_migration_base,
+        neutrality_violations, reconcile_rendered_provider_profile_bundle,
+        render_provider_profile_bundle, secret_violations, select_migration_base,
         validate_provider_profile_bundle, validate_register_content,
     };
+    use std::collections::BTreeMap;
+    use std::fs;
     use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_RENDER_INSTALL_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn neutrality_rejects_non_reserved_identifiers() {
@@ -1212,6 +2114,7 @@ mod tests {
             "template": "profiles/steward-mcp-gw.json",
             "inputs": [
               {"name": "gateway-origin", "kind": "https-origin"},
+              {"name": "runtime-grant-origin", "kind": "https-origin"},
               {"name": "service-cidrs", "kind": "cidr-list"}
             ]
           }]
@@ -1219,11 +2122,26 @@ mod tests {
         let template = r#"{
           "schema": "steward.provider-profile-template/v1",
           "id": "steward-mcp-gw",
+          "metadata": {
+            "displayName": "Steward MCP gateway",
+            "description": "Runtime-scoped MCP gateway access",
+            "category": "source_control"
+          },
           "capabilities": ["tool.read"],
           "network": {
             "endpointInput": "gateway-origin",
             "allowedCidrsInput": "service-cidrs",
             "protocol": "https"
+          },
+          "authorization": {
+            "authName": "access_token",
+            "authDescription": "Runtime-bound MCP access",
+            "tokenGrantOriginInput": "runtime-grant-origin",
+            "tokenPath": "/token",
+            "audience": "steward-mcp",
+            "jwtSvidAudience": "steward-mint",
+            "scopes": ["mcp"],
+            "cacheTtlSeconds": 2
           },
           "runtime": {"requiredBinaries": ["/usr/bin/curl"]}
         }"#;
@@ -1249,6 +2167,205 @@ mod tests {
             matches!(&result, Err(error) if error.contains("OAuth")),
             "the rejection must identify the forbidden contract class without echoing a value: {result:?}"
         );
+    }
+
+    #[test]
+    fn provider_profile_render_requires_exact_bundle_bound_https_and_network_inputs()
+    -> Result<(), String> {
+        let bundle = r#"{
+          "schema": "steward.provider-profile-bundle/v1",
+          "bundle": {"id": "steward-runtime-providers", "version": "1.0.0"},
+          "transitions": {"install": ["absent"], "reconcile": ["same-bundle"]},
+          "profiles": [{
+            "id": "steward-mcp-gw",
+            "template": "profiles/steward-mcp-gw.json",
+            "inputs": [
+              {"name": "gateway-origin", "kind": "https-origin"},
+              {"name": "runtime-grant-origin", "kind": "https-origin"},
+              {"name": "service-cidrs", "kind": "cidr-list"}
+            ]
+          }]
+        }"#;
+        let template = r#"{
+          "schema": "steward.provider-profile-template/v1",
+          "id": "steward-mcp-gw",
+          "metadata": {
+            "displayName": "Steward MCP gateway",
+            "description": "Runtime-scoped MCP gateway access",
+            "category": "source_control"
+          },
+          "capabilities": ["tool.read"],
+          "network": {
+            "endpointInput": "gateway-origin",
+            "allowedCidrsInput": "service-cidrs",
+            "protocol": "https"
+          },
+          "authorization": {
+            "authName": "access_token",
+            "authDescription": "Runtime-bound MCP access",
+            "tokenGrantOriginInput": "runtime-grant-origin",
+            "tokenPath": "/token",
+            "audience": "steward-mcp",
+            "jwtSvidAudience": "steward-mint",
+            "scopes": ["mcp"],
+            "cacheTtlSeconds": 2
+          },
+          "runtime": {"requiredBinaries": ["/usr/bin/curl"]}
+        }"#;
+        let inputs = r#"{
+          "schema": "steward.provider-profile-inputs/v1",
+          "bundle": {"id": "steward-runtime-providers", "version": "1.0.0"},
+          "profiles": [{
+            "id": "steward-mcp-gw",
+            "inputs": {
+              "gateway-origin": "https://mcp.gateway.test:8443",
+              "runtime-grant-origin": "https://mint.gateway.test",
+              "service-cidrs": ["10.42.0.0/16", "fd00:42::/64"]
+            }
+          }]
+        }"#;
+
+        let rendered = render_provider_profile_bundle(
+            bundle,
+            [("profiles/steward-mcp-gw.json", template)],
+            inputs,
+        )?;
+
+        let profile = rendered
+            .profiles
+            .get("steward-mcp-gw")
+            .ok_or_else(|| "rendered profile must retain its manifest id".to_owned())?;
+        assert_eq!(
+            profile
+                .pointer("/endpoints/0/host")
+                .and_then(serde_json::Value::as_str),
+            Some("mcp.gateway.test")
+        );
+        assert_eq!(
+            profile
+                .pointer("/endpoints/0/port")
+                .and_then(serde_json::Value::as_u64),
+            Some(8443)
+        );
+        assert_eq!(
+            profile
+                .pointer("/endpoints/0/access")
+                .and_then(serde_json::Value::as_str),
+            Some("read-only"),
+            "the rendered tool profile must not silently widen tool.read"
+        );
+        assert_eq!(
+            profile
+                .pointer("/credentials/0/token_grant/token_endpoint")
+                .and_then(serde_json::Value::as_str),
+            Some("https://mint.gateway.test/token")
+        );
+        assert_eq!(
+            rendered
+                .state
+                .pointer("/schema")
+                .and_then(serde_json::Value::as_str),
+            Some("steward.provider-profile-install-state/v1")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_profile_render_rejects_extra_or_noncanonical_environment_inputs() {
+        let bundle = r#"{
+          "schema": "steward.provider-profile-bundle/v1",
+          "bundle": {"id": "steward-runtime-providers", "version": "1.0.0"},
+          "transitions": {"install": ["absent"], "reconcile": ["same-bundle"]},
+          "profiles": [{
+            "id": "steward-mcp-gw",
+            "template": "profiles/steward-mcp-gw.json",
+            "inputs": [{"name": "gateway-origin", "kind": "https-origin"}]
+          }]
+        }"#;
+        let template = r#"{
+          "schema": "steward.provider-profile-template/v1",
+          "id": "steward-mcp-gw",
+          "metadata": {"displayName": "Steward MCP gateway", "description": "Runtime MCP access", "category": "source_control"},
+          "capabilities": ["tool.read"],
+          "network": {"endpointInput": "gateway-origin", "allowedCidrsInput": "gateway-origin", "protocol": "https"},
+          "authorization": {
+            "authName": "access_token",
+            "authDescription": "Runtime access",
+            "tokenGrantOriginInput": "gateway-origin",
+            "tokenPath": "/token",
+            "audience": "steward-mcp",
+            "jwtSvidAudience": "steward-mint",
+            "scopes": ["mcp"],
+            "cacheTtlSeconds": 2
+          },
+          "runtime": {"requiredBinaries": ["/usr/bin/curl"]}
+        }"#;
+        let inputs = r#"{
+          "schema": "steward.provider-profile-inputs/v1",
+          "bundle": {"id": "steward-runtime-providers", "version": "1.0.0"},
+          "profiles": [{
+            "id": "steward-mcp-gw",
+            "inputs": {
+              "gateway-origin": "https://gateway.test/path",
+              "unexpected": "value"
+            }
+          }]
+        }"#;
+
+        let result = render_provider_profile_bundle(
+            bundle,
+            [("profiles/steward-mcp-gw.json", template)],
+            inputs,
+        );
+        assert!(
+            matches!(result, Err(ref error) if error.contains("exactly match")),
+            "extra inputs must be rejected before any profile is rendered: {result:?}"
+        );
+    }
+
+    #[test]
+    fn provider_profile_install_is_absent_only_and_reconcile_rejects_drift() -> Result<(), String> {
+        let profile = serde_json::json!({"id": "steward-mcp-gw", "policy": "read-only"});
+        let mut profiles = BTreeMap::new();
+        profiles.insert("steward-mcp-gw".to_owned(), profile.clone());
+        let rendered = RenderedProviderProfileBundle {
+            profiles,
+            state: serde_json::json!({
+                "schema": "steward.provider-profile-install-state/v1",
+                "bundle": {"id": "steward-runtime-providers", "version": "1.0.0"},
+                "profiles": {"steward-mcp-gw": profile}
+            }),
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "steward-provider-profile-install-test-{}-{}",
+            std::process::id(),
+            NEXT_RENDER_INSTALL_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&directory).map_err(|error| format!("create fixture: {error}"))?;
+        let output = directory.join("installed");
+
+        let result = (|| {
+            install_rendered_provider_profile_bundle(&output, &rendered)?;
+            reconcile_rendered_provider_profile_bundle(&output, &rendered)?;
+            let repeat = install_rendered_provider_profile_bundle(&output, &rendered);
+            if !matches!(repeat, Err(ref error) if error.contains("absent destination")) {
+                return Err(format!(
+                    "install must not overwrite an existing state: {repeat:?}"
+                ));
+            }
+            fs::write(
+                output.join("profiles/steward-mcp-gw.json"),
+                "{\"id\":\"steward-mcp-gw\",\"policy\":\"read-write\"}\n",
+            )
+            .map_err(|error| format!("write drift fixture: {error}"))?;
+            let drift = reconcile_rendered_provider_profile_bundle(&output, &rendered);
+            if !matches!(drift, Err(ref error) if error.contains("drift")) {
+                return Err(format!("reconcile must reject profile drift: {drift:?}"));
+            }
+            Ok(())
+        })();
+        fs::remove_dir_all(&directory).map_err(|error| format!("remove fixture: {error}"))?;
+        result
     }
 
     #[test]
