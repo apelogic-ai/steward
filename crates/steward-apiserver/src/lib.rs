@@ -15,6 +15,7 @@ pub mod fast_track_connections_bridge;
 pub mod fast_track_runtime_bootstrap;
 mod github_actions;
 pub mod google_oidc;
+pub mod mcp_gw_connections;
 pub mod stable_runtime_bridge;
 mod tasks;
 pub mod user_envelopes;
