@@ -304,6 +304,7 @@
         "kubeApiCidrs",
         "postgresCidrs",
         "jiraCidrs",
+        "browserAuthEgressCidrs",
         "burbleNamespace",
         "arcNamespace",
         "mcpGatewayNamespace",
@@ -318,6 +319,7 @@
         "kubeApiCidrs": {"$ref": "#/definitions/cidrs"},
         "postgresCidrs": {"$ref": "#/definitions/cidrs"},
         "jiraCidrs": {"$ref": "#/definitions/cidrs"},
+        "browserAuthEgressCidrs": {"$ref": "#/definitions/cidrs"},
         "burbleNamespace": {"$ref": "#/definitions/nonempty"},
         "arcNamespace": {"$ref": "#/definitions/nonempty"},
         "mcpGatewayNamespace": {"$ref": "#/definitions/nonempty"},
@@ -381,6 +383,29 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "browserAuth": {
+            "properties": {"enabled": {"const": true}}
+          },
+          "networkPolicy": {
+            "properties": {"enabled": {"const": true}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "networkPolicy": {
+            "properties": {
+              "browserAuthEgressCidrs": {"minItems": 1}
+            }
+          }
+        }
+      }
+    }
+  ],
   "definitions": {
     "nonempty": {"type": "string", "minLength": 1},
     "port": {"type": "integer", "minimum": 1, "maximum": 65535},

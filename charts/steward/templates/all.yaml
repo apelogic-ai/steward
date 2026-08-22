@@ -470,7 +470,7 @@ metadata: { name: steward-apiserver-egress }
 spec:
   podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
   policyTypes: [Egress]
-{{- if or .Values.networkPolicy.postgresCidrs .Values.networkPolicy.jiraCidrs .Values.networkPolicy.kubeApiCidrs }}
+{{- if or .Values.networkPolicy.postgresCidrs .Values.networkPolicy.jiraCidrs .Values.networkPolicy.kubeApiCidrs (and .Values.browserAuth.enabled .Values.networkPolicy.browserAuthEgressCidrs) }}
   egress:
 {{- if .Values.networkPolicy.postgresCidrs }}
     - to:
@@ -485,6 +485,13 @@ spec:
         - ipBlock: { cidr: {{ . }} }
 {{- end }}
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.jira }} }]
+{{- end }}
+{{- if and .Values.browserAuth.enabled .Values.networkPolicy.browserAuthEgressCidrs }}
+    - to:
+{{- range .Values.networkPolicy.browserAuthEgressCidrs }}
+        - ipBlock: { cidr: {{ . }} }
+{{- end }}
+      ports: [{ protocol: TCP, port: 443 }]
 {{- end }}
 {{- if .Values.networkPolicy.kubeApiCidrs }}
     - to:
