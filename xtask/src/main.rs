@@ -10,9 +10,11 @@ use steward_adapter_fake::IMPLEMENTED_PORTS as FAKE_PORTS;
 use steward_ports::{Maturity, PORTS};
 use steward_types::agent_runtime_crd;
 use xtask::{
-    local_test_context_is_safe, migration_base_candidates, migration_history_violations,
-    neutrality_violations, secret_violations, select_migration_base,
-    validate_provider_profile_bundle_directory, validate_register_content,
+    install_rendered_provider_profile_bundle, local_test_context_is_safe,
+    migration_base_candidates, migration_history_violations, neutrality_violations,
+    reconcile_rendered_provider_profile_bundle, render_provider_profile_bundle_directory,
+    secret_violations, select_migration_base, validate_provider_profile_bundle_directory,
+    validate_register_content,
 };
 
 type TaskResult = Result<(), String>;
@@ -57,7 +59,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "conformance" => conformance(rest),
         "register" => register(rest),
         "ports" if rest == ["--check"] => ports_check(),
-        "provider-profile-bundle" if rest == ["validate"] => provider_profile_bundle_validate(),
+        "provider-profile-bundle" => provider_profile_bundle(rest),
         "layering-test" if rest.is_empty() => layering_test(),
         "dev" => dev(rest),
         "reap" if rest.is_empty() => Err(
@@ -95,6 +97,9 @@ fn usage() -> String {
         "  register --check",
         "  ports --check",
         "  provider-profile-bundle validate",
+        "  provider-profile-bundle render --inputs <file>",
+        "  provider-profile-bundle install --inputs <file> --output <directory>",
+        "  provider-profile-bundle reconcile --inputs <file> --output <directory>",
         "  layering-test",
         "  dev doctor|up|down",
         "  reap",
@@ -168,6 +173,66 @@ fn provider_profile_bundle_validate() -> TaskResult {
         directory.display()
     );
     Ok(())
+}
+
+fn provider_profile_bundle(arguments: &[String]) -> TaskResult {
+    match arguments {
+        [command] if command == "validate" => provider_profile_bundle_validate(),
+        [command, inputs_flag, input_path] if command == "render" && inputs_flag == "--inputs" => {
+            let rendered = render_provider_profile_bundle_from_input(input_path)?;
+            let output = serde_json::to_string_pretty(&rendered.state)
+                .map_err(|error| format!("failed to serialize rendered provider profiles: {error}"))?;
+            println!("{output}");
+            Ok(())
+        }
+        [command, inputs_flag, input_path, output_flag, output_directory]
+            if command == "install" && inputs_flag == "--inputs" && output_flag == "--output" =>
+        {
+            let rendered = render_provider_profile_bundle_from_input(input_path)?;
+            install_rendered_provider_profile_bundle(Path::new(output_directory), &rendered)?;
+            println!(
+                "provider-profile-bundle: installed {} {} into {}",
+                rendered
+                    .state
+                    .pointer("/bundle/id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                rendered
+                    .state
+                    .pointer("/bundle/version")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                output_directory
+            );
+            Ok(())
+        }
+        [command, inputs_flag, input_path, output_flag, output_directory]
+            if command == "reconcile" && inputs_flag == "--inputs" && output_flag == "--output" =>
+        {
+            let rendered = render_provider_profile_bundle_from_input(input_path)?;
+            reconcile_rendered_provider_profile_bundle(Path::new(output_directory), &rendered)?;
+            println!(
+                "provider-profile-bundle: verified same-bundle installation in {output_directory}"
+            );
+            Ok(())
+        }
+        _ => Err(
+            "usage: cargo xtask provider-profile-bundle validate|render --inputs <file>|install --inputs <file> --output <directory>|reconcile --inputs <file> --output <directory>"
+                .to_owned(),
+        ),
+    }
+}
+
+fn render_provider_profile_bundle_from_input(
+    input_path: &str,
+) -> Result<xtask::RenderedProviderProfileBundle, String> {
+    let input_content = fs::read_to_string(input_path).map_err(|error| {
+        format!("provider profile environment input file {input_path} is required: {error}")
+    })?;
+    render_provider_profile_bundle_directory(
+        &root().join("config/provider-profile-bundle/v1"),
+        &input_content,
+    )
 }
 
 fn e2e_s0() -> TaskResult {
