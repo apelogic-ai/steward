@@ -39,8 +39,10 @@ jobs:
           shellcheck \
             scripts/postgres-tls-e2e.sh \
             scripts/postgres-tls-init.sh \
+            scripts/package-provider-profile-bundle.sh \
             scripts/promote-ecr-artifact.sh \
             scripts/resolve-ecr-platform-digest.sh \
+            scripts/test-package-provider-profile-bundle.sh \
             scripts/test-promote-ecr-artifact.sh \
             scripts/test-resolve-ecr-platform-digest.sh \
             scripts/validate-release-artifacts.sh
@@ -176,6 +178,73 @@ jobs:
           name: release-${{ matrix.component }}
           path: dist/*
           if-no-files-found: error
+
+  publish-provider-profile-bundle:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve release version
+        id: version
+        run: printf 'version=%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package immutable provider-profile bundle
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          scripts/package-provider-profile-bundle.sh \
+            --version '${{ steps.version.outputs.version }}' \
+            --output dist
+
+      - name: Attest provider-profile bundle provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: dist/steward-runtime-providers-${{ steps.version.outputs.version }}.tar.gz
+
+      - name: Upload provider-profile bundle release evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: release-provider-profile-bundle
+          path: |
+            dist/steward-runtime-providers-${{ steps.version.outputs.version }}.tar.gz
+            dist/provider-profile-bundle.digest
+          if-no-files-found: error
+
+  openshell-x86-conformance:
+    needs: validate
+    name: release / linux-amd64 OpenShell adapter
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Restore shared Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: steward-rust-1.95.0
+
+      - name: Install Kubernetes tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+
+      - name: Verify authenticated OpenShell adapter on linux/amd64
+        run: cargo xtask e2e-openshell-adapter
 
   publish-chart:
     needs: validate
@@ -533,11 +602,13 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [publish-images, publish-chart, promote-ecr]
+    needs: [publish-images, publish-provider-profile-bundle, openshell-x86-conformance, publish-chart, promote-ecr]
     if: >-
       ${{
         always() &&
         needs.publish-images.result == 'success' &&
+        needs.publish-provider-profile-bundle.result == 'success' &&
+        needs.openshell-x86-conformance.result == 'success' &&
         needs.publish-chart.result == 'success' &&
         (needs.promote-ecr.result == 'success' || needs.promote-ecr.result == 'skipped')
       }}
@@ -546,6 +617,7 @@ jobs:
     permissions:
       contents: write
       packages: read
+      attestations: read
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -593,6 +665,8 @@ jobs:
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
           bridge_digest="$(cat dist/bridge.digest)"
+          provider_profile_bundle_asset="steward-runtime-providers-${version}.tar.gz"
+          provider_profile_bundle_digest="$(cat dist/provider-profile-bundle.digest)"
           bridge_signer_identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
           bridge_source_repository="https://github.com/$GITHUB_REPOSITORY"
           {
@@ -611,6 +685,13 @@ jobs:
             printf 'Bridge source repository: %s\n\n' "$bridge_source_repository"
             printf 'Bridge source commit: %s\n\n' "$GITHUB_SHA"
             printf 'Bridge attestation bundle: bridge-attestation-bundle.jsonl\n\n'
+            printf '\n## Provider-profile bundle provenance inputs\n\n'
+            printf 'Provider profile bundle asset: %s\n\n' "$provider_profile_bundle_asset"
+            printf 'Provider profile bundle SHA-256: %s\n\n' "$provider_profile_bundle_digest"
+            printf 'Provider profile bundle signer identity: %s\n\n' "$bridge_signer_identity"
+            printf 'Provider profile bundle source repository: %s\n\n' "$bridge_source_repository"
+            printf 'Provider profile bundle source commit: %s\n\n' "$GITHUB_SHA"
+            printf 'Provider profile bundle verification: pin the SHA-256 above; verify GitHub artifact provenance with this signer identity, repository, tag, and source commit; then verify the downloaded archive SHA-256 before render/install.\n\n'
             printf '\nEach image and the chart includes an SPDX SBOM, a vulnerability report, and GitHub artifact provenance.\n'
           } > dist/release-handoff.md
 
@@ -633,3 +714,21 @@ jobs:
             --verify-tag \
             --generate-notes \
             --notes-file dist/release-handoff.md
+
+      - name: Verify published provider-profile bundle availability
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          asset="steward-runtime-providers-${version}.tar.gz"
+          destination="$RUNNER_TEMP/provider-profile-bundle"
+          mkdir -p "$destination"
+          gh release download "$GITHUB_REF_NAME" --pattern "$asset" --dir "$destination"
+          signer_identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
+          gh attestation verify "$destination/$asset" \
+            --repo "$GITHUB_REPOSITORY" \
+            --cert-identity "$signer_identity"
+          actual="sha256:$(sha256sum "$destination/$asset" | awk '{print $1}')"
+          expected="$(cat dist/provider-profile-bundle.digest)"
+          test "$actual" = "$expected"

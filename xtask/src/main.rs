@@ -1782,6 +1782,138 @@ mod tests {
     }
 
     #[test]
+    fn provider_profile_bundle_release_is_archived_attested_and_publicly_verified()
+    -> Result<(), String> {
+        let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("published Steward release workflow is required: {error}"))?;
+        let packaging = fs::read_to_string(
+            root().join("scripts/package-provider-profile-bundle.sh"),
+        )
+        .map_err(|error| format!("provider-profile bundle packager is required: {error}"))?;
+        let packaging_test =
+            fs::read_to_string(root().join("scripts/test-package-provider-profile-bundle.sh"))
+                .map_err(|error| {
+                    format!("provider-profile bundle packaging test is required: {error}")
+                })?;
+
+        let publisher = workflow
+            .split("  publish-provider-profile-bundle:")
+            .nth(1)
+            .and_then(|job| job.split("\n  openshell-x86-conformance:").next())
+            .ok_or_else(|| "provider-profile bundle release job is required".to_owned())?;
+        for required in [
+            "needs: validate",
+            "attestations: write",
+            "scripts/package-provider-profile-bundle.sh",
+            "actions/attest-build-provenance@",
+            "subject-path: dist/steward-runtime-providers-${{ steps.version.outputs.version }}.tar.gz",
+            "release-provider-profile-bundle",
+            "provider-profile-bundle.digest",
+        ] {
+            assert!(
+                publisher.contains(required),
+                "provider-profile bundle release job must include {required}"
+            );
+        }
+        for required in [
+            "publish-provider-profile-bundle",
+            "openshell-x86-conformance",
+            "release / linux-amd64 OpenShell adapter",
+            "Verify authenticated OpenShell adapter on linux/amd64",
+            "cargo xtask e2e-openshell-adapter",
+            "Provider profile bundle asset:",
+            "Provider profile bundle SHA-256:",
+            "Provider profile bundle signer identity:",
+            "Provider profile bundle source repository:",
+            "Provider profile bundle source commit:",
+            "Provider profile bundle verification:",
+            "Verify published provider-profile bundle availability",
+            "gh release download",
+            "gh attestation verify \"$destination/$asset\"",
+            "--cert-identity \"$signer_identity\"",
+            "provider-profile-bundle.digest",
+        ] {
+            assert!(
+                workflow.contains(required),
+                "public release handoff must include {required}"
+            );
+        }
+        let create_release = workflow
+            .find("gh release create \"$GITHUB_REF_NAME\"")
+            .ok_or_else(|| "GitHub release creation must remain explicit".to_owned())?;
+        let verify_release = workflow
+            .find("Verify published provider-profile bundle availability")
+            .ok_or_else(|| {
+                "published provider-profile bundle verification is required".to_owned()
+            })?;
+        assert!(
+            verify_release > create_release,
+            "bundle availability must be verified after the GitHub Release publishes its asset"
+        );
+        let release = workflow
+            .split("  release:")
+            .nth(1)
+            .ok_or_else(|| "GitHub Release job is required".to_owned())?;
+        for required in [
+            "openshell-x86-conformance",
+            "needs.openshell-x86-conformance.result == 'success'",
+        ] {
+            assert!(
+                release.contains(required),
+                "GitHub Release must fail closed without {required}"
+            );
+        }
+        for required in [
+            "--sort=name",
+            "--mtime=@0",
+            "--owner=0",
+            "--group=0",
+            "--numeric-owner",
+            "--format=ustar",
+            "gzip -n",
+            "provider-profile-bundle/v1/bundle.json",
+            "provider-profile-bundle/v1/profiles/steward-litellm.json",
+            "provider-profile-bundle/v1/profiles/steward-mcp-gw.json",
+            "sha256sum",
+        ] {
+            assert!(
+                packaging.contains(required),
+                "provider-profile bundle packager must retain {required}"
+            );
+        }
+        for required in [
+            "deterministic provider-profile bundle archive",
+            "archive bytes must be reproducible",
+            "unexpected archive entry",
+            "digest must bind the archive bytes",
+        ] {
+            assert!(
+                packaging_test.contains(required),
+                "provider-profile bundle packaging test must prove {required}"
+            );
+        }
+        let bundle_readme =
+            fs::read_to_string(root().join("config/provider-profile-bundle/v1/README.md"))
+                .map_err(|error| format!("provider-profile bundle README is required: {error}"))?;
+        for required in [
+            "Verify a released bundle before rendering or installation",
+            "gh attestation verify",
+            "--cert-identity",
+            "source repository and",
+            "exact source commit",
+            "test \"$actual_digest\" = \"$expected_digest\"",
+            "source-only validation",
+            "eligible for release",
+        ] {
+            assert!(
+                bundle_readme.contains(required),
+                "provider-profile bundle consumer verification instructions must include {required}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn production_release_contract_is_complete_and_fail_closed() -> Result<(), String> {
         let chart = root().join("charts/steward");
         let values = fs::read_to_string(chart.join("values.yaml"))
