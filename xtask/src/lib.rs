@@ -1,6 +1,418 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
+
+use serde_json::Value;
+
+pub const PROVIDER_PROFILE_BUNDLE_SCHEMA: &str = "steward.provider-profile-bundle/v1";
+pub const PROVIDER_PROFILE_TEMPLATE_SCHEMA: &str = "steward.provider-profile-template/v1";
+
+pub fn validate_provider_profile_bundle_directory(directory: &Path) -> Result<(), String> {
+    let manifest_path = directory.join("bundle.json");
+    let bundle_content = fs::read_to_string(&manifest_path).map_err(|error| {
+        format!(
+            "provider profile bundle manifest {} is required: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let profile_directory = directory.join("profiles");
+    let entries = fs::read_dir(&profile_directory).map_err(|error| {
+        format!(
+            "provider profile bundle templates {} are required: {error}",
+            profile_directory.display()
+        )
+    })?;
+    let mut template_paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read provider profile bundle template directory {}: {error}",
+                profile_directory.display()
+            )
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "failed to inspect provider profile bundle template {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        if file_type.is_file()
+            && entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("json")
+        {
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| "provider profile template filename must be UTF-8".to_owned())?;
+            let content = fs::read_to_string(entry.path()).map_err(|error| {
+                format!(
+                    "failed to read provider profile bundle template {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+            template_paths.push((format!("profiles/{name}"), content));
+        }
+    }
+    template_paths.sort_by(|left, right| left.0.cmp(&right.0));
+    validate_provider_profile_bundle(
+        &bundle_content,
+        template_paths
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str())),
+    )
+}
+
+/// Validates the portable, release-owned portion of the OpenShell provider
+/// profile contract.  Deployment adapters deliberately supply concrete
+/// endpoints and network ranges later; those values cannot appear here.
+pub fn validate_provider_profile_bundle<'a, I>(
+    bundle_content: &str,
+    templates: I,
+) -> Result<(), String>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let bundle = parse_json(bundle_content, "provider profile bundle")?;
+    reject_nonportable_values(&bundle, "bundle")?;
+
+    let object = bundle
+        .as_object()
+        .ok_or_else(|| "provider profile bundle must be a JSON object".to_owned())?;
+    require_string(
+        object,
+        "schema",
+        PROVIDER_PROFILE_BUNDLE_SCHEMA,
+        "provider profile bundle",
+    )?;
+    let bundle_metadata = require_object(object, "bundle", "provider profile bundle")?;
+    let bundle_id = require_nonempty_string(bundle_metadata, "id", "bundle metadata")?;
+    ensure_identifier(bundle_id, "bundle id")?;
+    validate_semver(require_nonempty_string(
+        bundle_metadata,
+        "version",
+        "bundle metadata",
+    )?)?;
+
+    let profiles = require_array(object, "profiles", "provider profile bundle")?;
+    if profiles.is_empty() {
+        return Err("provider profile bundle must declare at least one profile".to_owned());
+    }
+    validate_transition_contract(require_object(
+        object,
+        "transitions",
+        "provider profile bundle",
+    )?)?;
+
+    let template_map = templates.into_iter().collect::<BTreeMap<_, _>>();
+    let mut declared_templates = BTreeSet::new();
+    let mut profile_ids = BTreeSet::new();
+
+    for profile in profiles {
+        let profile = profile
+            .as_object()
+            .ok_or_else(|| "each provider profile declaration must be an object".to_owned())?;
+        let id = require_nonempty_string(profile, "id", "provider profile declaration")?;
+        ensure_identifier(id, "provider profile id")?;
+        if !profile_ids.insert(id) {
+            return Err(format!(
+                "provider profile bundle declares duplicate profile id {id}"
+            ));
+        }
+        let template_path =
+            require_nonempty_string(profile, "template", "provider profile declaration")?;
+        let expected_template_path = format!("profiles/{id}.json");
+        if template_path != expected_template_path {
+            return Err(format!(
+                "provider profile {id} must use its canonical template path {expected_template_path}"
+            ));
+        }
+        declared_templates.insert(template_path);
+        let inputs = require_array(profile, "inputs", "provider profile declaration")?;
+        validate_input_declarations(inputs, id)?;
+        let template_content = template_map.get(template_path).ok_or_else(|| {
+            format!("provider profile {id} references missing template {template_path}")
+        })?;
+        validate_provider_profile_template(template_content, id, inputs)?;
+    }
+
+    let supplied_templates = template_map.keys().copied().collect::<BTreeSet<_>>();
+    if supplied_templates != declared_templates {
+        let unexpected = supplied_templates
+            .difference(&declared_templates)
+            .copied()
+            .collect::<Vec<_>>();
+        let missing = declared_templates
+            .difference(&supplied_templates)
+            .copied()
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "provider profile bundle templates must exactly match the manifest; unexpected={unexpected:?}, missing={missing:?}"
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_provider_profile_template(
+    content: &str,
+    expected_id: &str,
+    inputs: &[Value],
+) -> Result<(), String> {
+    let template = parse_json(content, "provider profile template")?;
+    reject_nonportable_values(&template, "provider profile template")?;
+    let object = template
+        .as_object()
+        .ok_or_else(|| "provider profile template must be a JSON object".to_owned())?;
+    require_string(
+        object,
+        "schema",
+        PROVIDER_PROFILE_TEMPLATE_SCHEMA,
+        "provider profile template",
+    )?;
+    let actual_id = require_nonempty_string(object, "id", "provider profile template")?;
+    if actual_id != expected_id {
+        return Err(format!(
+            "provider profile template id {actual_id} does not match manifest id {expected_id}"
+        ));
+    }
+    let capabilities = require_array(object, "capabilities", "provider profile template")?;
+    if capabilities.is_empty()
+        || capabilities
+            .iter()
+            .any(|capability| !capability.is_string())
+    {
+        return Err(
+            "provider profile template must declare non-empty string capabilities".to_owned(),
+        );
+    }
+    let input_names = inputs
+        .iter()
+        .filter_map(|input| input.get("name").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    let network = require_object(object, "network", "provider profile template")?;
+    let endpoint_input = require_nonempty_string(
+        network,
+        "endpointInput",
+        "provider profile template network",
+    )?;
+    if !input_names.contains(endpoint_input) {
+        return Err(format!(
+            "provider profile template endpointInput {endpoint_input} is not a declared manifest input"
+        ));
+    }
+    let allowed_cidrs_input = require_nonempty_string(
+        network,
+        "allowedCidrsInput",
+        "provider profile template network",
+    )?;
+    if !input_names.contains(allowed_cidrs_input) {
+        return Err(format!(
+            "provider profile template allowedCidrsInput {allowed_cidrs_input} is not a declared manifest input"
+        ));
+    }
+    require_string(
+        network,
+        "protocol",
+        "https",
+        "provider profile template network",
+    )?;
+    let runtime = require_object(object, "runtime", "provider profile template")?;
+    let binaries = require_array(
+        runtime,
+        "requiredBinaries",
+        "provider profile template runtime",
+    )?;
+    if binaries.is_empty() || binaries.iter().any(|binary| !binary.is_string()) {
+        return Err(
+            "provider profile template runtime must declare non-empty string requiredBinaries"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_input_declarations(inputs: &[Value], profile_id: &str) -> Result<(), String> {
+    if inputs.is_empty() {
+        return Err(format!(
+            "provider profile {profile_id} must declare its adapter inputs"
+        ));
+    }
+    let mut input_names = BTreeSet::new();
+    for input in inputs {
+        let input = input
+            .as_object()
+            .ok_or_else(|| format!("provider profile {profile_id} input must be an object"))?;
+        if input.len() != 2 || !input.contains_key("name") || !input.contains_key("kind") {
+            return Err(format!(
+                "provider profile {profile_id} inputs may contain only name and kind, never deployment values"
+            ));
+        }
+        let name = require_nonempty_string(input, "name", "provider profile input")?;
+        ensure_identifier(name, "provider profile input name")?;
+        if !input_names.insert(name) {
+            return Err(format!(
+                "provider profile {profile_id} declares duplicate input {name}"
+            ));
+        }
+        let kind = require_nonempty_string(input, "kind", "provider profile input")?;
+        if !matches!(kind, "https-origin" | "cidr-list") {
+            return Err(format!(
+                "provider profile {profile_id} input {name} uses unsupported portable input kind {kind}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_transition_contract(
+    transitions: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let install = require_array(
+        transitions,
+        "install",
+        "provider profile bundle transitions",
+    )?;
+    let reconcile = require_array(
+        transitions,
+        "reconcile",
+        "provider profile bundle transitions",
+    )?;
+    if install.len() != 1
+        || install.first().and_then(Value::as_str) != Some("absent")
+        || reconcile.len() != 1
+        || reconcile.first().and_then(Value::as_str) != Some("same-bundle")
+    {
+        return Err(
+            "provider profile bundle transitions must allow only install from absent and reconcile from same-bundle"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn reject_nonportable_values(value: &Value, location: &str) -> Result<(), String> {
+    match value {
+        Value::Object(object) => {
+            for (key, nested) in object {
+                let normalized = key.to_ascii_lowercase();
+                if ["credential", "oauth", "secret", "certificate"]
+                    .iter()
+                    .any(|term| normalized.contains(term))
+                    || matches!(normalized.as_str(), "ca" | "cabundle" | "capath")
+                {
+                    return Err(format!(
+                        "{location} contains forbidden secret, OAuth, credential, or CA field {key}"
+                    ));
+                }
+                reject_nonportable_values(nested, location)?;
+            }
+        }
+        Value::Array(values) => {
+            for nested in values {
+                reject_nonportable_values(nested, location)?;
+            }
+        }
+        Value::String(text) => {
+            let normalized = text.to_ascii_lowercase();
+            if normalized.contains(".svc.") || normalized.contains(".cluster.local") {
+                return Err(format!("{location} contains cluster DNS value"));
+            }
+            if normalized.contains("://") {
+                return Err(format!("{location} contains a concrete endpoint value"));
+            }
+            if normalized.contains("-----begin") {
+                return Err(format!("{location} contains certificate or key material"));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn parse_json(content: &str, description: &str) -> Result<Value, String> {
+    serde_json::from_str(content).map_err(|error| format!("{description} is invalid JSON: {error}"))
+}
+
+fn require_object<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+    description: &str,
+) -> Result<&'a serde_json::Map<String, Value>, String> {
+    object
+        .get(field)
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{description} must declare object {field}"))
+}
+
+fn require_array<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+    description: &str,
+) -> Result<&'a [Value], String> {
+    object
+        .get(field)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("{description} must declare array {field}"))
+}
+
+fn require_nonempty_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+    description: &str,
+) -> Result<&'a str, String> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{description} must declare non-empty string {field}"))
+}
+
+fn require_string(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    expected: &str,
+    description: &str,
+) -> Result<(), String> {
+    let actual = require_nonempty_string(object, field, description)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("{description} field {field} must equal {expected}"))
+    }
+}
+
+fn ensure_identifier(value: &str, description: &str) -> Result<(), String> {
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{description} must be a lowercase kebab-case identifier"
+        ))
+    }
+}
+
+fn validate_semver(value: &str) -> Result<(), String> {
+    let parts = value.split('.').collect::<Vec<_>>();
+    if parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        Ok(())
+    } else {
+        Err("provider profile bundle version must use MAJOR.MINOR.PATCH".to_owned())
+    }
+}
 
 pub fn local_test_context_is_safe(context: &str) -> bool {
     ["kind-steward-", "k3d-steward-"]
@@ -589,7 +1001,8 @@ fn is_literal_secret(value: &str) -> bool {
 mod tests {
     use super::{
         local_test_context_is_safe, migration_base_candidates, migration_history_violations,
-        neutrality_violations, secret_violations, select_migration_base, validate_register_content,
+        neutrality_violations, secret_violations, select_migration_base,
+        validate_provider_profile_bundle, validate_register_content,
     };
     use std::path::Path;
 
@@ -756,6 +1169,85 @@ mod tests {
             violations.len(),
             1,
             "an ambiguous bare name under a real top-level domain must remain a hostname"
+        );
+    }
+
+    #[test]
+    fn provider_profile_bundle_rejects_cluster_bound_or_secret_bearing_inputs() {
+        let bundle = r#"{
+          "schema": "steward.provider-profile-bundle/v1",
+          "bundle": {"id": "steward-runtime-providers", "version": "1.0.0"},
+          "transitions": {"install": ["absent"], "reconcile": ["same-bundle"]},
+          "profiles": [{
+            "id": "steward-mcp-gw",
+            "template": "profiles/steward-mcp-gw.json",
+            "inputs": [{"name": "gateway", "kind": "https-origin"}]
+          }]
+        }"#;
+        let template = r#"{
+          "schema": "steward.provider-profile-template/v1",
+          "id": "steward-mcp-gw",
+          "capabilities": ["tool.read"],
+          "network": {"endpointInput": "gateway", "protocol": "https"},
+          "forbiddenExample": "mcp-gw.namespace.svc.cluster.local"
+        }"#;
+
+        let result =
+            validate_provider_profile_bundle(bundle, [("profiles/steward-mcp-gw.json", template)]);
+
+        assert!(
+            matches!(&result, Err(error) if error.contains("cluster DNS")),
+            "a portable bundle must reject cluster DNS and name the portability boundary: {result:?}"
+        );
+    }
+
+    #[test]
+    fn provider_profile_bundle_accepts_only_named_portable_adapter_inputs() {
+        let bundle = r#"{
+          "schema": "steward.provider-profile-bundle/v1",
+          "bundle": {"id": "steward-runtime-providers", "version": "1.0.0"},
+          "transitions": {"install": ["absent"], "reconcile": ["same-bundle"]},
+          "profiles": [{
+            "id": "steward-mcp-gw",
+            "template": "profiles/steward-mcp-gw.json",
+            "inputs": [
+              {"name": "gateway-origin", "kind": "https-origin"},
+              {"name": "service-cidrs", "kind": "cidr-list"}
+            ]
+          }]
+        }"#;
+        let template = r#"{
+          "schema": "steward.provider-profile-template/v1",
+          "id": "steward-mcp-gw",
+          "capabilities": ["tool.read"],
+          "network": {
+            "endpointInput": "gateway-origin",
+            "allowedCidrsInput": "service-cidrs",
+            "protocol": "https"
+          },
+          "runtime": {"requiredBinaries": ["/usr/bin/curl"]}
+        }"#;
+
+        let result =
+            validate_provider_profile_bundle(bundle, [("profiles/steward-mcp-gw.json", template)]);
+        assert!(
+            result.is_ok(),
+            "named endpoint and CIDR inputs keep the bundle portable: {result:?}"
+        );
+    }
+
+    #[test]
+    fn provider_profile_bundle_rejects_oauth_or_secret_contract_fields_before_release() {
+        let bundle = r#"{
+          "schema": "steward.provider-profile-bundle/v1",
+          "oauthClient": "must-not-be-here"
+        }"#;
+
+        let result = validate_provider_profile_bundle(bundle, []);
+
+        assert!(
+            matches!(&result, Err(error) if error.contains("OAuth")),
+            "the rejection must identify the forbidden contract class without echoing a value: {result:?}"
         );
     }
 

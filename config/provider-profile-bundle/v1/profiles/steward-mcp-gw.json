@@ -1,0 +1,13 @@
+{
+  "schema": "steward.provider-profile-template/v1",
+  "id": "steward-mcp-gw",
+  "capabilities": ["tool.read"],
+  "network": {
+    "endpointInput": "gateway-origin",
+    "allowedCidrsInput": "service-cidrs",
+    "protocol": "https"
+  },
+  "runtime": {
+    "requiredBinaries": ["/usr/bin/curl", "/usr/local/bin/curl"]
+  }
+}
