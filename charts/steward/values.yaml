@@ -29,6 +29,16 @@ secrets:
     name: steward-mint
     signingKey: signing-key
     introspectionCredential: introspection-credential
+browserAuth:
+  enabled: false
+  google:
+    clientId: ""
+    origin: ""
+    workspaceDomain: ""
+    organizationId: ""
+    clientSecret:
+      name: ""
+      key: ""
 workloadExchangeTrust:
   name: steward-workload-exchange-ca
   caCertificate: ca.crt

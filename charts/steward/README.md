@@ -45,6 +45,7 @@ The chart references five existing Secrets and never creates their values:
 | `steward-litellm` | `master-key` | controller |
 | `steward-openshell-client` | `ca.crt`, `tls.crt`, `tls.key` | controller |
 | `steward-mint` | `signing-key`, `introspection-credential` | mint |
+| browser-auth Secret (selected only when `browserAuth.enabled=true`) | configured client-secret key | apiserver |
 
 The controller also requires the public workload-exchange CA bundle in the
 ConfigMap selected by `workloadExchangeTrust.name` and
@@ -54,6 +55,18 @@ The mint Secret is not referenced by either the apiserver or controller
 Deployment. `steward-apiserver-tls` and `steward-webhook-tls` are issued by
 cert-manager from `tls.issuerRef`; the binaries accept cert-manager's PEM
 certificate chains and private keys.
+
+## Browser authentication
+
+`browserAuth` defaults to disabled. It is an atomic apiserver-only contract:
+when disabled, every Google/OIDC value and Secret reference must be empty and
+the chart renders no browser-auth environment variables or Secret projection.
+When enabled, the chart requires an exact HTTPS browser origin, Google client
+ID, hosted Workspace domain, Steward organization ID, and an existing Secret
+name/key for the Google client secret. The chart never creates the Secret or a
+public edge. A deployment adapter supplies the HTTPS route, certificate and
+network policy appropriate to its platform (for example, a local Kind adapter
+or a DEV gateway); those controls do not belong in this portable chart.
 
 The globally bound controller and mint ClusterRoles have no Secret verbs.
 Runtime Secret access is granted by namespaced Roles and RoleBindings only for

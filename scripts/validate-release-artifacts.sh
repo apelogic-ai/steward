@@ -8,9 +8,11 @@ stable_bridge_bundle="$(mktemp)"
 stable_bridge_configmap="$(mktemp)"
 stable_bridge_deployment="$(mktemp)"
 stable_bridge_controller_deployment="$(mktemp)"
+browser_auth_rendered="$(mktemp)"
+browser_auth_deployment="$(mktemp)"
 mint_synthetic_kubeconfig="$(mktemp)"
 mint_startup_output="$(mktemp)"
-trap 'rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" "${stable_bridge_configmap}" "${stable_bridge_deployment}" "${stable_bridge_controller_deployment}" "${mint_synthetic_kubeconfig}" "${mint_startup_output}"' EXIT INT TERM
+trap 'rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" "${stable_bridge_configmap}" "${stable_bridge_deployment}" "${stable_bridge_controller_deployment}" "${browser_auth_rendered}" "${browser_auth_deployment}" "${mint_synthetic_kubeconfig}" "${mint_startup_output}"' EXIT INT TERM
 
 digest0="sha256:0000000000000000000000000000000000000000000000000000000000000000"
 digest1="sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -54,6 +56,80 @@ helm template steward "${root}/charts/steward" \
   "${image_values[@]}" \
   "${stable_bridge_values[@]}" \
   --set-file "stableBridge.attestationBundle=${stable_bridge_bundle}" > "${stable_bridge_rendered}"
+
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret > "${browser_auth_rendered}"
+
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-apiserver/ { print; exit }
+' "${browser_auth_rendered}" > "${browser_auth_deployment}"
+for required in \
+  '            - { name: STEWARD_GOOGLE_OIDC_CLIENT_ID, value: "google-client-id" }' \
+  '            - { name: STEWARD_BROWSER_ORIGIN, value: "https://steward.example.test" }' \
+  '            - { name: STEWARD_GOOGLE_WORKSPACE_DOMAIN, value: "example.test" }' \
+  '            - { name: STEWARD_ORGANIZATION_ID, value: "org_example" }' \
+  '            - { name: STEWARD_GOOGLE_OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: steward-google-oidc, key: client-secret } } }'
+do
+  grep -Fxq "${required}" "${browser_auth_deployment}"
+done
+if grep -Fq 'STEWARD_GOOGLE_OIDC_' "${rendered}" \
+  || grep -Fq 'STEWARD_BROWSER_ORIGIN' "${rendered}" \
+  || grep -Fq 'steward-google-oidc' "${rendered}"
+then
+  echo "disabled browser authentication must render no browser auth wiring" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set browserAuth.enabled=true >/dev/null 2>&1
+then
+  echo "enabled browser authentication without every required input must fail chart validation" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set browserAuth.enabled=false \
+  --set-string browserAuth.google.clientId=stale-client >/dev/null 2>&1
+then
+  echo "disabled browser authentication with stale configuration must fail chart validation" >&2
+  exit 1
+fi
+for invalid_browser_origin in \
+  'http://steward.example.test' \
+  'https://user@steward.example.test' \
+  'https://steward.example.test:70000' \
+  'https://steward example.test'
+do
+  if helm template steward "${root}/charts/steward" \
+    --namespace steward \
+    --include-crds \
+    "${image_values[@]}" \
+    --set browserAuth.enabled=true \
+    --set-string browserAuth.google.clientId=google-client-id \
+    --set-string "browserAuth.google.origin=${invalid_browser_origin}" \
+    --set-string browserAuth.google.workspaceDomain=example.test \
+    --set-string browserAuth.google.organizationId=org_example \
+    --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+    --set-string browserAuth.google.clientSecret.key=client-secret >/dev/null 2>&1
+  then
+    echo "browser authentication origin must be HTTPS without userinfo, whitespace, or invalid ports: ${invalid_browser_origin}" >&2
+    exit 1
+  fi
+done
 
 awk -v name="${stable_bridge_configmap_name}" '
   BEGIN { RS = "---\\n" }

@@ -5,6 +5,7 @@
   "required": [
     "images",
     "secrets",
+    "browserAuth",
     "workloadExchangeTrust",
     "tls",
     "config",
@@ -63,6 +64,74 @@
           }
         }
       }
+    },
+    "browserAuth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "google"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "google": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["clientId", "origin", "workspaceDomain", "organizationId", "clientSecret"],
+          "properties": {
+            "clientId": {"type": "string"},
+            "origin": {"type": "string"},
+            "workspaceDomain": {"type": "string"},
+            "organizationId": {"type": "string"},
+            "clientSecret": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "key"],
+              "properties": {
+                "name": {"type": "string"},
+                "key": {"type": "string"}
+              }
+            }
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "enabled": {"const": false},
+            "google": {
+              "properties": {
+                "clientId": {"const": ""},
+                "origin": {"const": ""},
+                "workspaceDomain": {"const": ""},
+                "organizationId": {"const": ""},
+                "clientSecret": {
+                  "properties": {
+                    "name": {"const": ""},
+                    "key": {"const": ""}
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "enabled": {"const": true},
+            "google": {
+              "properties": {
+                "clientId": {"type": "string", "minLength": 1, "pattern": "^\\S+$"},
+                "origin": {"type": "string", "minLength": 9, "pattern": "^https://[^\\s/@?#:]+(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$"},
+                "workspaceDomain": {"type": "string", "minLength": 3, "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"},
+                "organizationId": {"type": "string", "minLength": 1, "pattern": "^\\S+$"},
+                "clientSecret": {
+                  "properties": {
+                    "name": {"$ref": "#/definitions/nonempty"},
+                    "key": {"$ref": "#/definitions/nonempty"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "workloadExchangeTrust": {
       "type": "object",
