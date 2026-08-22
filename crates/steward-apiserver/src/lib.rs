@@ -5,6 +5,7 @@ pub mod admin_demo;
 mod admin_ui;
 pub mod agent_runs_ui;
 pub mod browser_auth;
+pub mod browser_hop1_attestation;
 pub mod connections;
 #[cfg(feature = "admin-demo")]
 pub mod connections_demo;

@@ -11,8 +11,8 @@ use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{
     KubeRuntimeRepository, KubernetesTaskIdentityResolver, KubernetesTokenAuthenticator,
     KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog, agent_runs_ui, browser_auth,
-    google_oidc, router, router_without_admin_dashboard, stable_runtime_bridge, task_router,
-    user_envelopes,
+    browser_hop1_attestation, connections, google_oidc, mcp_gw_connections, router,
+    router_without_admin_dashboard, stable_runtime_bridge, task_router, user_envelopes,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
@@ -150,6 +150,10 @@ fn browser_application_router(
             auth.clone(),
         ))
         .merge(agent_runs_ui::protected_router(store.clone(), auth.clone()));
+    let app = match browser_hop1_connections_configuration(&origin)? {
+        Some(broker) => app.merge(connections::protected_router(broker, auth.clone())),
+        None => app,
+    };
     let app = match stable_bridge_configuration()? {
         Some((service, verifier)) => app.merge(stable_runtime_bridge::protected_router(
             store, runtimes, verifier, auth, service,
@@ -157,6 +161,112 @@ fn browser_application_router(
         None => app,
     };
     Ok(Some(app))
+}
+
+type BrowserHop1ConnectionsBroker = mcp_gw_connections::McpGwConnectionsBroker<
+    browser_auth::BrowserSessionBinding,
+    browser_hop1_attestation::BrowserHop1AttestationIssuer<
+        browser_hop1_attestation::IdentityBrowserHop1Client,
+    >,
+>;
+
+fn browser_hop1_connections_configuration(
+    browser_origin: &str,
+) -> Result<Option<BrowserHop1ConnectionsBroker>, io::Error> {
+    let values = BrowserHop1Environment::from_process()?;
+    let Some(values) = values else {
+        return Ok(None);
+    };
+    let signing = browser_hop1_attestation::BrowserHop1AttestationConfig::from_files(
+        values.issuer,
+        values.assertion_audience,
+        values.key_id,
+        &values.signing_key_file,
+        &values.public_jwks_file,
+    )
+    .map_err(|_| io::Error::other("browser HOP-1 signer configuration is invalid"))?;
+    let service_account_token = browser_hop1_attestation::ProjectedServiceAccountTokenFile::new(
+        values.service_account_token_file,
+    )
+    .map_err(|_| io::Error::other("browser HOP-1 workload token configuration is invalid"))?;
+    let endpoint =
+        browser_hop1_attestation::IdentityBrowserHop1Endpoint::new(values.identity_endpoint)
+            .map_err(|_| io::Error::other("browser HOP-1 Identity endpoint is invalid"))?;
+    let client = browser_hop1_attestation::IdentityBrowserHop1Client::new(endpoint)
+        .map_err(|_| io::Error::other("browser HOP-1 Identity client is unavailable"))?;
+    let issuer = browser_hop1_attestation::BrowserHop1AttestationIssuer::new(
+        signing,
+        service_account_token,
+        client,
+    );
+    let mcp_gateway_origin = values.mcp_gateway_origin;
+    let config = mcp_gw_connections::McpGwConnectionsConfig::new(
+        mcp_gateway_origin,
+        browser_origin.to_owned(),
+    )
+    .map_err(|_| io::Error::other("browser MCP-GW connection origin is invalid"))?;
+    mcp_gw_connections::McpGwConnectionsBroker::new(config, issuer)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
+struct BrowserHop1Environment {
+    mcp_gateway_origin: String,
+    identity_endpoint: String,
+    issuer: String,
+    assertion_audience: String,
+    key_id: String,
+    signing_key_file: std::path::PathBuf,
+    public_jwks_file: std::path::PathBuf,
+    service_account_token_file: std::path::PathBuf,
+}
+
+impl BrowserHop1Environment {
+    fn from_process() -> Result<Option<Self>, io::Error> {
+        Self::from_values([
+            env::var("STEWARD_MCP_GW_ORIGIN").ok(),
+            env::var("STEWARD_IDENTITY_BROWSER_HOP1_ENDPOINT").ok(),
+            env::var("STEWARD_BROWSER_HOP1_ISSUER").ok(),
+            env::var("STEWARD_BROWSER_HOP1_ASSERTION_AUDIENCE").ok(),
+            env::var("STEWARD_BROWSER_HOP1_KEY_ID").ok(),
+            env::var("STEWARD_BROWSER_HOP1_SIGNING_KEY_FILE").ok(),
+            env::var("STEWARD_BROWSER_HOP1_JWKS_FILE").ok(),
+            env::var("STEWARD_BROWSER_HOP1_SERVICE_ACCOUNT_TOKEN_FILE").ok(),
+        ])
+    }
+
+    fn from_values(values: [Option<String>; 8]) -> Result<Option<Self>, io::Error> {
+        if values.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let [
+            mcp_gateway_origin,
+            identity_endpoint,
+            issuer,
+            assertion_audience,
+            key_id,
+            signing_key_file,
+            public_jwks_file,
+            service_account_token_file,
+        ] = values;
+        let required = |value: Option<String>| {
+            value
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| io::Error::other("browser HOP-1 configuration must be complete"))
+        };
+        Ok(Some(Self {
+            mcp_gateway_origin: required(mcp_gateway_origin)?,
+            identity_endpoint: required(identity_endpoint)?,
+            issuer: required(issuer)?,
+            assertion_audience: required(assertion_audience)?,
+            key_id: required(key_id)?,
+            signing_key_file: std::path::PathBuf::from(required(signing_key_file)?),
+            public_jwks_file: std::path::PathBuf::from(required(public_jwks_file)?),
+            service_account_token_file: std::path::PathBuf::from(required(
+                service_account_token_file,
+            )?),
+        }))
+    }
 }
 
 fn stable_bridge_configuration()
@@ -417,10 +527,40 @@ mod tests {
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
     use super::{
-        KubernetesTokenReviewAudience, TlsListener, bootstrap_rbac_arguments, decode_tls_material,
-        install_rustls_crypto_provider, kubernetes_token_review_audience,
-        stable_bridge_configuration_from_values,
+        BrowserHop1Environment, KubernetesTokenReviewAudience, TlsListener,
+        bootstrap_rbac_arguments, decode_tls_material, install_rustls_crypto_provider,
+        kubernetes_token_review_audience, stable_bridge_configuration_from_values,
     };
+
+    #[test]
+    fn browser_hop1_connections_configuration_is_all_or_nothing() -> Result<(), String> {
+        let mut partial = std::array::from_fn(|_| None);
+        partial[0] = Some("https://mcp-gw.example.test".to_owned());
+        assert!(BrowserHop1Environment::from_values(partial).is_err());
+        assert!(
+            BrowserHop1Environment::from_values(std::array::from_fn(|_| None))
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        let configured = BrowserHop1Environment::from_values([
+            Some("https://mcp-gw.example.test".to_owned()),
+            Some("https://identity.example.test/v1/browser-hop1/exchange".to_owned()),
+            Some("https://steward.example.test".to_owned()),
+            Some("identity-browser-hop1".to_owned()),
+            Some("steward-browser-hop1-current".to_owned()),
+            Some("/run/steward-browser-hop1/signing-key.der".to_owned()),
+            Some("/run/steward-browser-hop1/jwks.json".to_owned()),
+            Some("/var/run/secrets/tokens/identity-exchange".to_owned()),
+        ])
+        .map_err(|error| error.to_string())?
+        .ok_or("complete browser HOP-1 configuration was disabled")?;
+        assert_eq!(configured.assertion_audience, "identity-browser-hop1");
+        assert_eq!(
+            configured.signing_key_file.to_string_lossy(),
+            "/run/steward-browser-hop1/signing-key.der"
+        );
+        Ok(())
+    }
 
     #[test]
     fn stable_bridge_configuration_rejects_partial_or_unattested_input() {
