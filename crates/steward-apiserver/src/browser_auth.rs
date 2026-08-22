@@ -627,6 +627,10 @@ pub fn browser_auth_router(service: BrowserAuthService) -> Router {
     ))
     .merge(protect_browser_admin_routes(
         crate::user_ui::admin_router::<()>(),
+        service.clone(),
+    ))
+    .merge(protect_browser_admin_routes(
+        crate::admin_ui::browser_router(),
         service,
     ))
 }
@@ -2194,7 +2198,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn administrator_workspace_is_not_exposed_by_a_developer_session() -> Result<(), String> {
+    async fn administrator_workspace_and_dashboard_are_not_exposed_by_a_developer_session()
+    -> Result<(), String> {
         let service =
             local_fake_browser_auth_service("http://127.0.0.1:33001", LocalFakeIdentity::User)?;
         let user = service
@@ -2210,35 +2215,64 @@ mod tests {
             .map_err(|error| format!("issue dual-role browser session: {error:?}"))?;
 
         let routes = || browser_auth_router(service.clone());
-        let forbidden = routes()
-            .oneshot(
-                Request::builder()
-                    .uri("/admin/workspace")
-                    .header(
-                        header::COOKIE,
-                        format!("steward-local-session={}", user.token),
-                    )
-                    .body(Body::empty())
-                    .map_err(|error| format!("build developer workspace request: {error}"))?,
-            )
-            .await
-            .map_err(|error| format!("execute developer workspace request: {error}"))?;
-        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        for uri in ["/admin", "/admin/api/v1/bootstrap"] {
+            let bearer_only = routes()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, "Bearer operator-token")
+                        .body(Body::empty())
+                        .map_err(|error| format!("build bearer-only request for {uri}: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("execute bearer-only request for {uri}: {error}"))?;
+            assert_eq!(
+                bearer_only.status(),
+                StatusCode::UNAUTHORIZED,
+                "the browser-admin dashboard must not accept a bearer token at {uri}"
+            );
+        }
+        for uri in ["/admin/workspace", "/admin", "/admin/api/v1/bootstrap"] {
+            let forbidden = routes()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(
+                            header::COOKIE,
+                            format!("steward-local-session={}", user.token),
+                        )
+                        .body(Body::empty())
+                        .map_err(|error| format!("build developer request for {uri}: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("execute developer request for {uri}: {error}"))?;
+            assert_eq!(
+                forbidden.status(),
+                StatusCode::FORBIDDEN,
+                "a browser user without the server-side administrator assignment must not access {uri}"
+            );
 
-        let accepted = routes()
-            .oneshot(
-                Request::builder()
-                    .uri("/admin/workspace")
-                    .header(
-                        header::COOKIE,
-                        format!("steward-local-session={}", admin.token),
-                    )
-                    .body(Body::empty())
-                    .map_err(|error| format!("build administrator workspace request: {error}"))?,
-            )
-            .await
-            .map_err(|error| format!("execute administrator workspace request: {error}"))?;
-        assert_eq!(accepted.status(), StatusCode::OK);
+            let accepted = routes()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(
+                            header::COOKIE,
+                            format!("steward-local-session={}", admin.token),
+                        )
+                        .body(Body::empty())
+                        .map_err(|error| {
+                            format!("build administrator request for {uri}: {error}")
+                        })?,
+                )
+                .await
+                .map_err(|error| format!("execute administrator request for {uri}: {error}"))?;
+            assert_eq!(
+                accepted.status(),
+                StatusCode::OK,
+                "a browser administrator must access the production dashboard route {uri}"
+            );
+        }
         Ok(())
     }
 }
