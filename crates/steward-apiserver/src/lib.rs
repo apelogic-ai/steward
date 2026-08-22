@@ -2251,37 +2251,15 @@ where
                         .get(namespace, &request.name)
                         .await
                         .map_err(ApiError::Runtime)?;
-                    let request_digest = spec_digest(&proposed_spec)?;
-                    let annotations = existing.annotations();
-                    let matching_actor = matches!(
-                        &existing.spec.principal,
-                        Principal::User { acting_user } if acting_user.0 == context.actor
-                    );
-                    if annotations
-                        .get(PENDING_APPROVAL_ANNOTATION)
-                        .map(String::as_str)
-                        != Some(request_digest.as_str())
-                        || annotations
-                            .get("agents.apelogic.ai/member-role")
-                            .map(String::as_str)
-                            != Some(context.member_role.as_str())
-                        || !matching_actor
-                    {
-                        return Err(ApiError::Conflict(
-                            "an unrelated AgentRuntime already uses this name".to_owned(),
-                        ));
-                    }
-                    let mut released = existing;
-                    released.spec = proposed_spec.clone();
-                    released
-                        .metadata
-                        .annotations
-                        .get_or_insert_default()
-                        .remove(PENDING_APPROVAL_ANNOTATION);
-                    runtimes
-                        .replace_as_authority(&released)
-                        .await
-                        .map_err(ApiError::Runtime)?;
+                    release_matching_parked_create(
+                        runtimes,
+                        context,
+                        namespace,
+                        request,
+                        &proposed_spec,
+                        existing,
+                    )
+                    .await?;
                 }
                 Err(error) => return Err(ApiError::RuntimeCreate(error)),
             }
@@ -2405,6 +2383,88 @@ where
             })
         }
     }
+}
+
+async fn release_matching_parked_create<R>(
+    runtimes: &R,
+    context: &AdmissionContext,
+    namespace: &str,
+    request: &CreateRuntimeRequest,
+    proposed_spec: &AgentRuntimeSpec,
+    mut existing: AgentRuntime,
+) -> Result<(), ApiError>
+where
+    R: RuntimeRepository,
+{
+    let request_digest = spec_digest(proposed_spec)?;
+    for attempt in 0..2 {
+        validate_matching_parked_create(
+            &existing,
+            context,
+            request,
+            proposed_spec,
+            &request_digest,
+        )?;
+        let mut released = existing;
+        released.spec = proposed_spec.clone();
+        released
+            .metadata
+            .annotations
+            .get_or_insert_default()
+            .remove(PENDING_APPROVAL_ANNOTATION);
+        match runtimes.replace_as_authority(&released).await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt == 0 && is_stale_runtime_write(&error) => {
+                existing = runtimes
+                    .get(namespace, &request.name)
+                    .await
+                    .map_err(ApiError::Runtime)?;
+            }
+            Err(error) => return Err(ApiError::Runtime(error)),
+        }
+    }
+    Err(ApiError::Runtime(
+        "parked create replacement exhausted its bounded retry".to_owned(),
+    ))
+}
+
+fn validate_matching_parked_create(
+    existing: &AgentRuntime,
+    context: &AdmissionContext,
+    request: &CreateRuntimeRequest,
+    proposed_spec: &AgentRuntimeSpec,
+    request_digest: &str,
+) -> Result<(), ApiError> {
+    let annotations = existing.annotations();
+    let matching_actor = matches!(
+        &existing.spec.principal,
+        Principal::User { acting_user } if acting_user.0 == context.actor
+    );
+    let matching_identity = existing.spec.owner == proposed_spec.owner
+        && existing.spec.agent_type == proposed_spec.agent_type
+        && existing.spec.canonical_authority == proposed_spec.canonical_authority;
+    let inert_placeholder = existing.spec.llms.is_empty()
+        && existing.spec.tools.is_empty()
+        && existing.spec.budget.monthly_limit == "0"
+        && existing.spec.bindings.is_none();
+    if existing.name_any() != request.name
+        || annotations
+            .get(PENDING_APPROVAL_ANNOTATION)
+            .map(String::as_str)
+            != Some(request_digest)
+        || annotations
+            .get("agents.apelogic.ai/member-role")
+            .map(String::as_str)
+            != Some(context.member_role.as_str())
+        || !matching_actor
+        || !matching_identity
+        || !inert_placeholder
+    {
+        return Err(ApiError::Conflict(
+            "an unrelated or changed AgentRuntime already uses this name".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn converge_superseded_create<R, L>(
@@ -6437,6 +6497,136 @@ mod tests {
                 .annotations()
                 .contains_key(PENDING_APPROVAL_ANNOTATION),
             "envelope admission must remove the pending hold"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn envelope_expansion_retry_retries_a_stale_placeholder_release_once()
+    -> Result<(), String> {
+        let inner = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = inner.runtime.clone();
+        let replace_attempts = Arc::new(AtomicUsize::new(0));
+        let runtimes = ConflictOnceRuntimeRepository {
+            inner,
+            replace_attempts: replace_attempts.clone(),
+            mutate_spec_on_conflict: false,
+            first_replace_error: "Operation cannot be fulfilled on agentruntimes.agents.apelogic.ai \\\"runtime-b\\\": the object has been modified; please apply your changes to the latest version and try again: Conflict (Status { code: 409 })",
+        };
+        let ledger = ledger();
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+            canonical_user_id: None,
+        };
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: proposed_spec.clone(),
+        };
+
+        let parked = super::submit_runtime_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &context,
+            "team-a",
+            &request,
+        )
+        .await
+        .map_err(|error| format!("initial create did not park: {error:?}"))?;
+        assert!(matches!(parked, SubmissionOutcome::Parked { .. }));
+        {
+            let mut envelope = ledger
+                .envelope
+                .lock()
+                .map_err(|_| "fake envelope lock was poisoned")?;
+            envelope.revision += 1;
+            envelope.spec.budget.monthly_limit = "300.00".to_owned();
+        }
+
+        let retry = super::submit_runtime_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &context,
+            "team-a",
+            &request,
+        )
+        .await;
+
+        assert!(
+            matches!(retry, Ok(SubmissionOutcome::Applied { .. })),
+            "a transient Kubernetes resourceVersion conflict must retry the matching release: {retry:?}"
+        );
+        assert_eq!(replace_attempts.load(Ordering::SeqCst), 2);
+        let restored = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?;
+        assert_eq!(restored.spec, proposed_spec);
+        assert_eq!(restored.metadata.resource_version.as_deref(), Some("2"));
+        assert!(
+            !restored
+                .annotations()
+                .contains_key(PENDING_APPROVAL_ANNOTATION),
+            "the successful retry must remove the pending hold"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn envelope_expansion_retry_does_not_release_a_changed_placeholder() -> Result<(), String>
+    {
+        let runtimes = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let runtime_state = runtimes.runtime.clone();
+        let ledger = ledger();
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+            canonical_user_id: None,
+        };
+        let mut proposed_spec = runtime().spec;
+        proposed_spec.budget.monthly_limit = "201.00".to_owned();
+        let request = CreateRuntimeRequest {
+            name: "runtime-b".to_owned(),
+            spec: proposed_spec.clone(),
+        };
+
+        let parked = super::submit_runtime_request(
+            &runtimes,
+            &ledger,
+            &FakeDecisionChannel::default(),
+            &context,
+            "team-a",
+            &request,
+        )
+        .await
+        .map_err(|error| format!("initial create did not park: {error:?}"))?;
+        assert!(matches!(parked, SubmissionOutcome::Parked { .. }));
+        let mut changed = runtime_state
+            .lock()
+            .map_err(|_| "fake runtime lock was poisoned")?
+            .clone();
+        changed.spec.owner = Email("concurrent@example.com".to_owned());
+        let request_digest = super::spec_digest(&proposed_spec)
+            .map_err(|error| format!("failed to digest proposed spec: {error:?}"))?;
+
+        let result = super::validate_matching_parked_create(
+            &changed,
+            &context,
+            &request,
+            &proposed_spec,
+            &request_digest,
+        );
+
+        assert!(
+            matches!(result, Err(ApiError::Conflict(_))),
+            "a retry must not release a placeholder whose immutable request fields changed: {result:?}"
         );
         Ok(())
     }
