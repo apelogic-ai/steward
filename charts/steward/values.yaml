@@ -39,6 +39,22 @@ browserAuth:
     clientSecret:
       name: ""
       key: ""
+browserHop1:
+  # Disabled unless browser authentication, a private Identity exchange endpoint,
+  # and every signer/projection input are supplied together.
+  enabled: false
+  mcpGatewayOrigin: ""
+  identityEndpoint: ""
+  issuer: ""
+  assertionAudience: ""
+  keyId: ""
+  signingKeySecret:
+    name: ""
+    key: ""
+  publicJwksConfigMap:
+    name: ""
+    key: ""
+  serviceAccountTokenAudience: ""
 workloadExchangeTrust:
   name: steward-workload-exchange-ca
   caCertificate: ca.crt
@@ -100,6 +116,7 @@ networkPolicy:
     litellm: 4000
     openshell: 8080
     identityExchange: 8443
+    mcpGateway: 8080
 spire:
   csiDriver: csi.spiffe.io
   socketPath: /run/spire/sockets

@@ -20,7 +20,7 @@ use jsonwebtoken::{
 use p256::SecretKey;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::pkcs8::DecodePrivateKey;
-use reqwest::{Client, Url};
+use reqwest::{Certificate, Client, Url};
 use serde::{Deserialize, Serialize};
 use steward_types::Email;
 use uuid::Uuid;
@@ -276,11 +276,17 @@ pub struct IdentityBrowserHop1Client {
 }
 
 impl IdentityBrowserHop1Client {
-    pub fn new(endpoint: IdentityBrowserHop1Endpoint) -> Result<Self, BrowserHop1AttestationError> {
+    pub fn new(
+        endpoint: IdentityBrowserHop1Endpoint,
+        ca_certificate_pem: Vec<u8>,
+    ) -> Result<Self, BrowserHop1AttestationError> {
+        let ca_certificate = Certificate::from_pem(&ca_certificate_pem)
+            .map_err(|_| BrowserHop1AttestationError::Unavailable)?;
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(10))
+            .add_root_certificate(ca_certificate)
             .build()
             .map_err(|_| BrowserHop1AttestationError::Unavailable)?;
         Ok(Self { endpoint, client })

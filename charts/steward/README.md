@@ -77,6 +77,24 @@ Google's endpoints evolve. A local isolated lane may instead set
 `networkPolicy.enabled=false`; that is not a substitute for a production
 egress policy.
 
+## Browser-to-MCP HOP-1
+
+`browserHop1` is separately disabled by default. When enabled, it can be used
+only with enabled `browserAuth`; every MCP-GW origin, private Identity exchange
+endpoint, assertion issuer/audience/key ID, signer Secret reference, public
+JWKS ConfigMap reference, and projected service-account-token audience is
+required together. The apiserver receives the signer and public JWKS read-only,
+and projects a short-lived service-account token only for the private Identity
+exchange. It mounts the configured `workloadExchangeTrust` CA bundle to verify
+that Identity TLS endpoint; certificate verification is never disabled.
+
+The chart grants apiserver egress only to the configured MCP-GW and Identity
+namespaces/ports while this feature is enabled. The deployment must configure
+Identity's private workload policy to grant `browser-hop1-issuer` exclusively
+to the rendered apiserver service account and must project the same public
+JWKS into Identity. The chart does not create signing keys, JWKS, Identity
+policy, an OAuth client, or a public edge.
+
 The globally bound controller and mint ClusterRoles have no Secret verbs.
 Runtime Secret access is granted by namespaced Roles and RoleBindings only for
 names listed in `runtimeNamespaces`. The default is an empty list, so a release

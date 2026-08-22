@@ -224,6 +224,17 @@ spec:
             - { name: STEWARD_ORGANIZATION_ID, value: {{ .Values.browserAuth.google.organizationId | quote }} }
             - { name: STEWARD_GOOGLE_OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: {{ .Values.browserAuth.google.clientSecret.name }}, key: {{ .Values.browserAuth.google.clientSecret.key }} } } }
 {{- end }}
+{{- if .Values.browserHop1.enabled }}
+            - { name: STEWARD_MCP_GW_ORIGIN, value: {{ .Values.browserHop1.mcpGatewayOrigin | quote }} }
+            - { name: STEWARD_IDENTITY_BROWSER_HOP1_ENDPOINT, value: {{ .Values.browserHop1.identityEndpoint | quote }} }
+            - { name: STEWARD_IDENTITY_BROWSER_HOP1_CA_CERTIFICATE_FILE, value: /run/browser-hop1/identity-ca.crt }
+            - { name: STEWARD_BROWSER_HOP1_ISSUER, value: {{ .Values.browserHop1.issuer | quote }} }
+            - { name: STEWARD_BROWSER_HOP1_ASSERTION_AUDIENCE, value: {{ .Values.browserHop1.assertionAudience | quote }} }
+            - { name: STEWARD_BROWSER_HOP1_KEY_ID, value: {{ .Values.browserHop1.keyId | quote }} }
+            - { name: STEWARD_BROWSER_HOP1_SIGNING_KEY_FILE, value: /run/browser-hop1/signing-key.der }
+            - { name: STEWARD_BROWSER_HOP1_JWKS_FILE, value: /run/browser-hop1/jwks.json }
+            - { name: STEWARD_BROWSER_HOP1_SERVICE_ACCOUNT_TOKEN_FILE, value: /var/run/secrets/steward/browser-hop1/source-token }
+{{- end }}
 {{- if .Values.stableBridge.enabled }}
             - { name: STEWARD_STABLE_BRIDGE_IMAGE, value: {{ .Values.stableBridge.image | quote }} }
             - { name: STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY, value: {{ .Values.stableBridge.signerIdentity | quote }} }
@@ -236,6 +247,10 @@ spec:
             - { name: STEWARD_TLS_KEY_DER, value: /run/tls/tls.key }
           volumeMounts:
             - { name: tls, mountPath: /run/tls, readOnly: true }
+{{- if .Values.browserHop1.enabled }}
+            - { name: browser-hop1, mountPath: /run/browser-hop1, readOnly: true }
+            - { name: browser-hop1-source-credential, mountPath: /var/run/secrets/steward/browser-hop1, readOnly: true }
+{{- end }}
 {{- if .Values.stableBridge.enabled }}
             - { name: stable-bridge-attestation, mountPath: /run/stable-bridge-attestation, readOnly: true }
 {{- end }}
@@ -243,6 +258,27 @@ spec:
 {{ toYaml .Values.resources.apiserver | nindent 12 }}
       volumes:
         - { name: tls, secret: { secretName: steward-apiserver-tls } }
+{{- if .Values.browserHop1.enabled }}
+        - name: browser-hop1
+          projected:
+            sources:
+              - secret:
+                  name: {{ .Values.browserHop1.signingKeySecret.name }}
+                  items: [{ key: {{ .Values.browserHop1.signingKeySecret.key }}, path: signing-key.der }]
+              - configMap:
+                  name: {{ .Values.browserHop1.publicJwksConfigMap.name }}
+                  items: [{ key: {{ .Values.browserHop1.publicJwksConfigMap.key }}, path: jwks.json }]
+              - configMap:
+                  name: {{ .Values.workloadExchangeTrust.name }}
+                  items: [{ key: {{ .Values.workloadExchangeTrust.caCertificate }}, path: identity-ca.crt }]
+        - name: browser-hop1-source-credential
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: {{ .Values.browserHop1.serviceAccountTokenAudience | quote }}
+                  expirationSeconds: 600
+                  path: source-token
+{{- end }}
 {{- if .Values.stableBridge.enabled }}
         - name: stable-bridge-attestation
           configMap:
@@ -470,7 +506,7 @@ metadata: { name: steward-apiserver-egress }
 spec:
   podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
   policyTypes: [Egress]
-{{- if or .Values.networkPolicy.postgresCidrs .Values.networkPolicy.jiraCidrs .Values.networkPolicy.kubeApiCidrs (and .Values.browserAuth.enabled .Values.networkPolicy.browserAuthEgressCidrs) }}
+{{- if or .Values.networkPolicy.postgresCidrs .Values.networkPolicy.jiraCidrs .Values.networkPolicy.kubeApiCidrs (and .Values.browserAuth.enabled .Values.networkPolicy.browserAuthEgressCidrs) .Values.browserHop1.enabled }}
   egress:
 {{- if .Values.networkPolicy.postgresCidrs }}
     - to:
@@ -490,6 +526,12 @@ spec:
     - to:
 {{- range .Values.networkPolicy.browserAuthEgressCidrs }}
         - ipBlock: { cidr: {{ . }} }
+{{- end }}
+{{- if .Values.browserHop1.enabled }}
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.mcpGatewayNamespace }} } } }]
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.mcpGateway }} }]
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.identityExchangeNamespace }} } } }]
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.identityExchange }} }]
 {{- end }}
       ports: [{ protocol: TCP, port: 443 }]
 {{- end }}

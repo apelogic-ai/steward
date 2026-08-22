@@ -6,6 +6,7 @@
     "images",
     "secrets",
     "browserAuth",
+    "browserHop1",
     "workloadExchangeTrust",
     "tls",
     "config",
@@ -129,6 +130,78 @@
                 }
               }
             }
+          }
+        }
+      ]
+    },
+    "browserHop1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "mcpGatewayOrigin",
+        "identityEndpoint",
+        "issuer",
+        "assertionAudience",
+        "keyId",
+        "signingKeySecret",
+        "publicJwksConfigMap",
+        "serviceAccountTokenAudience"
+      ],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "mcpGatewayOrigin": {"type": "string"},
+        "identityEndpoint": {"type": "string"},
+        "issuer": {"type": "string"},
+        "assertionAudience": {"type": "string"},
+        "keyId": {"type": "string"},
+        "signingKeySecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "key"],
+          "properties": {"name": {"type": "string"}, "key": {"type": "string"}}
+        },
+        "publicJwksConfigMap": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "key"],
+          "properties": {"name": {"type": "string"}, "key": {"type": "string"}}
+        },
+        "serviceAccountTokenAudience": {"type": "string"}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "enabled": {"const": false},
+            "mcpGatewayOrigin": {"const": ""},
+            "identityEndpoint": {"const": ""},
+            "issuer": {"const": ""},
+            "assertionAudience": {"const": ""},
+            "keyId": {"const": ""},
+            "signingKeySecret": {
+              "properties": {"name": {"const": ""}, "key": {"const": ""}}
+            },
+            "publicJwksConfigMap": {
+              "properties": {"name": {"const": ""}, "key": {"const": ""}}
+            },
+            "serviceAccountTokenAudience": {"const": ""}
+          }
+        },
+        {
+          "properties": {
+            "enabled": {"const": true},
+            "mcpGatewayOrigin": {"type": "string", "pattern": "^https://[^\\s/@?#:]+(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$"},
+            "identityEndpoint": {"type": "string", "pattern": "^https://[^/?#]+(?::[0-9]+)?/v1/browser-hop1/exchange$"},
+            "issuer": {"type": "string", "pattern": "^https://[^/?#]+(?:/[^?#]*)?$"},
+            "assertionAudience": {"$ref": "#/definitions/nonempty"},
+            "keyId": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"},
+            "signingKeySecret": {
+              "properties": {"name": {"$ref": "#/definitions/nonempty"}, "key": {"$ref": "#/definitions/nonempty"}}
+            },
+            "publicJwksConfigMap": {
+              "properties": {"name": {"$ref": "#/definitions/nonempty"}, "key": {"$ref": "#/definitions/nonempty"}}
+            },
+            "serviceAccountTokenAudience": {"$ref": "#/definitions/nonempty"}
           }
         }
       ]
@@ -329,14 +402,15 @@
         "ports": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kubernetesApi", "postgres", "jira", "litellm", "openshell", "identityExchange"],
+          "required": ["kubernetesApi", "postgres", "jira", "litellm", "openshell", "identityExchange", "mcpGateway"],
           "properties": {
             "kubernetesApi": {"$ref": "#/definitions/port"},
             "postgres": {"$ref": "#/definitions/port"},
             "jira": {"$ref": "#/definitions/port"},
             "litellm": {"$ref": "#/definitions/port"},
             "openshell": {"$ref": "#/definitions/port"},
-            "identityExchange": {"$ref": "#/definitions/port"}
+            "identityExchange": {"$ref": "#/definitions/port"},
+            "mcpGateway": {"$ref": "#/definitions/port"}
           }
         }
       }
@@ -384,6 +458,23 @@
     }
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "browserHop1": {
+            "properties": {"enabled": {"const": true}},
+            "required": ["enabled"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "browserAuth": {
+            "properties": {"enabled": {"const": true}}
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {
