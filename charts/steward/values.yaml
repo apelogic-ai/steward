@@ -86,6 +86,7 @@ networkPolicy:
   kubeApiCidrs: []
   postgresCidrs: []
   jiraCidrs: []
+  browserAuthEgressCidrs: []
   burbleNamespace: burble
   arcNamespace: arc-runners
   mcpGatewayNamespace: mcp-gw

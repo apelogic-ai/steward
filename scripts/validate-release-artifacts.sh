@@ -67,7 +67,8 @@ helm template steward "${root}/charts/steward" \
   --set-string browserAuth.google.workspaceDomain=example.test \
   --set-string browserAuth.google.organizationId=org_example \
   --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
-  --set-string browserAuth.google.clientSecret.key=client-secret > "${browser_auth_rendered}"
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' > "${browser_auth_rendered}"
 
 awk '
   BEGIN { RS = "---\\n" }
@@ -82,6 +83,7 @@ for required in \
 do
   grep -Fxq "${required}" "${browser_auth_deployment}"
 done
+grep -Fxq '        - ipBlock: { cidr: 203.0.113.0/24 }' "${browser_auth_rendered}"
 if grep -Fq 'STEWARD_GOOGLE_OIDC_' "${rendered}" \
   || grep -Fq 'STEWARD_BROWSER_ORIGIN' "${rendered}" \
   || grep -Fq 'steward-google-oidc' "${rendered}"
@@ -96,6 +98,21 @@ if helm template steward "${root}/charts/steward" \
   --set browserAuth.enabled=true >/dev/null 2>&1
 then
   echo "enabled browser authentication without every required input must fail chart validation" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret >/dev/null 2>&1
+then
+  echo "browser authentication with default-deny policy must require explicit Google OIDC egress CIDRs" >&2
   exit 1
 fi
 if helm template steward "${root}/charts/steward" \
@@ -124,7 +141,8 @@ do
     --set-string browserAuth.google.workspaceDomain=example.test \
     --set-string browserAuth.google.organizationId=org_example \
     --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
-    --set-string browserAuth.google.clientSecret.key=client-secret >/dev/null 2>&1
+    --set-string browserAuth.google.clientSecret.key=client-secret \
+    --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' >/dev/null 2>&1
   then
     echo "browser authentication origin must be HTTPS without userinfo, whitespace, or invalid ports: ${invalid_browser_origin}" >&2
     exit 1

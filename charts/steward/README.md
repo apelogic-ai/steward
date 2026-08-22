@@ -68,6 +68,15 @@ public edge. A deployment adapter supplies the HTTPS route, certificate and
 network policy appropriate to its platform (for example, a local Kind adapter
 or a DEV gateway); those controls do not belong in this portable chart.
 
+When `networkPolicy.enabled=true`, browser authentication additionally requires
+at least one `networkPolicy.browserAuthEgressCidrs` entry. The chart allows
+apiserver HTTPS egress only to those platform-managed CIDRs; it does not open
+unrestricted internet egress or encode Google IP ranges. The deployment
+adapter is responsible for maintaining the approved resolver/egress policy as
+Google's endpoints evolve. A local isolated lane may instead set
+`networkPolicy.enabled=false`; that is not a substitute for a production
+egress policy.
+
 The globally bound controller and mint ClusterRoles have no Secret verbs.
 Runtime Secret access is granted by namespaced Roles and RoleBindings only for
 names listed in `runtimeNamespaces`. The default is an empty list, so a release
