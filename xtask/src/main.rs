@@ -11,7 +11,8 @@ use steward_ports::{Maturity, PORTS};
 use steward_types::agent_runtime_crd;
 use xtask::{
     local_test_context_is_safe, migration_base_candidates, migration_history_violations,
-    neutrality_violations, secret_violations, select_migration_base, validate_register_content,
+    neutrality_violations, secret_violations, select_migration_base,
+    validate_provider_profile_bundle_directory, validate_register_content,
 };
 
 type TaskResult = Result<(), String>;
@@ -56,6 +57,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "conformance" => conformance(rest),
         "register" => register(rest),
         "ports" if rest == ["--check"] => ports_check(),
+        "provider-profile-bundle" if rest == ["validate"] => provider_profile_bundle_validate(),
         "layering-test" if rest.is_empty() => layering_test(),
         "dev" => dev(rest),
         "reap" if rest.is_empty() => Err(
@@ -92,6 +94,7 @@ fn usage() -> String {
         "  conformance --pinned|--latest",
         "  register --check",
         "  ports --check",
+        "  provider-profile-bundle validate",
         "  layering-test",
         "  dev doctor|up|down",
         "  reap",
@@ -146,9 +149,25 @@ fn quality() -> TaskResult {
     verify_manifests()?;
     check_neutrality()?;
     check_secrets()?;
+    provider_profile_bundle_validate()?;
     register(&["--check".to_owned()])?;
     ports_check()?;
     layering_test()
+}
+
+fn provider_profile_bundle_validate() -> TaskResult {
+    let directory = root().join("config/provider-profile-bundle/v1");
+    validate_provider_profile_bundle_directory(&directory).map_err(|error| {
+        format!(
+            "provider profile bundle validation failed for {}: {error}",
+            directory.display()
+        )
+    })?;
+    println!(
+        "provider-profile-bundle: {} validated as portable product-owned v1 contract",
+        directory.display()
+    );
+    Ok(())
 }
 
 fn e2e_s0() -> TaskResult {
