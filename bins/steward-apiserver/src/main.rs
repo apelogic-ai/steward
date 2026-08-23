@@ -192,8 +192,13 @@ fn browser_hop1_connections_configuration(
     let endpoint =
         browser_hop1_attestation::IdentityBrowserHop1Endpoint::new(values.identity_endpoint)
             .map_err(|_| io::Error::other("browser HOP-1 Identity endpoint is invalid"))?;
-    let client = browser_hop1_attestation::IdentityBrowserHop1Client::new(endpoint)
-        .map_err(|_| io::Error::other("browser HOP-1 Identity client is unavailable"))?;
+    let identity_ca_certificate_pem = fs::read(values.identity_ca_certificate_file)
+        .map_err(|_| io::Error::other("read browser HOP-1 Identity CA certificate"))?;
+    let client = browser_hop1_attestation::IdentityBrowserHop1Client::new(
+        endpoint,
+        identity_ca_certificate_pem,
+    )
+    .map_err(|_| io::Error::other("browser HOP-1 Identity client is unavailable"))?;
     let issuer = browser_hop1_attestation::BrowserHop1AttestationIssuer::new(
         signing,
         service_account_token,
@@ -213,6 +218,7 @@ fn browser_hop1_connections_configuration(
 struct BrowserHop1Environment {
     mcp_gateway_origin: String,
     identity_endpoint: String,
+    identity_ca_certificate_file: std::path::PathBuf,
     issuer: String,
     assertion_audience: String,
     key_id: String,
@@ -226,6 +232,7 @@ impl BrowserHop1Environment {
         Self::from_values([
             env::var("STEWARD_MCP_GW_ORIGIN").ok(),
             env::var("STEWARD_IDENTITY_BROWSER_HOP1_ENDPOINT").ok(),
+            env::var("STEWARD_IDENTITY_BROWSER_HOP1_CA_CERTIFICATE_FILE").ok(),
             env::var("STEWARD_BROWSER_HOP1_ISSUER").ok(),
             env::var("STEWARD_BROWSER_HOP1_ASSERTION_AUDIENCE").ok(),
             env::var("STEWARD_BROWSER_HOP1_KEY_ID").ok(),
@@ -235,13 +242,14 @@ impl BrowserHop1Environment {
         ])
     }
 
-    fn from_values(values: [Option<String>; 8]) -> Result<Option<Self>, io::Error> {
+    fn from_values(values: [Option<String>; 9]) -> Result<Option<Self>, io::Error> {
         if values.iter().all(Option::is_none) {
             return Ok(None);
         }
         let [
             mcp_gateway_origin,
             identity_endpoint,
+            identity_ca_certificate_file,
             issuer,
             assertion_audience,
             key_id,
@@ -257,6 +265,9 @@ impl BrowserHop1Environment {
         Ok(Some(Self {
             mcp_gateway_origin: required(mcp_gateway_origin)?,
             identity_endpoint: required(identity_endpoint)?,
+            identity_ca_certificate_file: std::path::PathBuf::from(required(
+                identity_ca_certificate_file,
+            )?),
             issuer: required(issuer)?,
             assertion_audience: required(assertion_audience)?,
             key_id: required(key_id)?,
@@ -545,6 +556,7 @@ mod tests {
         let configured = BrowserHop1Environment::from_values([
             Some("https://mcp-gw.example.test".to_owned()),
             Some("https://identity.example.test/v1/browser-hop1/exchange".to_owned()),
+            Some("/run/browser-hop1/identity-ca.crt".to_owned()),
             Some("https://steward.example.test".to_owned()),
             Some("identity-browser-hop1".to_owned()),
             Some("steward-browser-hop1-current".to_owned()),
@@ -555,6 +567,10 @@ mod tests {
         .map_err(|error| error.to_string())?
         .ok_or("complete browser HOP-1 configuration was disabled")?;
         assert_eq!(configured.assertion_audience, "identity-browser-hop1");
+        assert_eq!(
+            configured.identity_ca_certificate_file.to_string_lossy(),
+            "/run/browser-hop1/identity-ca.crt"
+        );
         assert_eq!(
             configured.signing_key_file.to_string_lossy(),
             "/run/steward-browser-hop1/signing-key.der"

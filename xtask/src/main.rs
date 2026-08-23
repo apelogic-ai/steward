@@ -1285,10 +1285,21 @@ mod tests {
                 "the controller must consume the rotating OpenShell workload token contract {projected_token_contract}"
             );
         }
+        for projected_token_contract in [
+            "name: browser-hop1-source-credential",
+            "audience: {{ .Values.browserHop1.serviceAccountTokenAudience | quote }}",
+            "mountPath: /var/run/secrets/steward/browser-hop1",
+            "value: /var/run/secrets/steward/browser-hop1/source-token",
+        ] {
+            assert!(
+                templates.contains(projected_token_contract),
+                "the browser HOP-1 path must use its own bounded projected service-account token contract {projected_token_contract}"
+            );
+        }
         assert_eq!(
             templates.matches("path: source-token").count(),
-            1,
-            "only the projected service-account token volume may provide the workload source credential path"
+            2,
+            "only the controller workload and browser HOP-1 projections may provide source-token credentials"
         );
         assert!(
             !templates.contains("STEWARD_OPENSHELL_BEARER_TOKEN_FILE")
@@ -1759,6 +1770,7 @@ mod tests {
             "apiserver:",
             "controller:",
             "mint:",
+            "browserAuth:",
             "digest:",
             "pullPolicy:",
         ] {
@@ -1783,6 +1795,9 @@ mod tests {
             "kind: ClusterSPIFFEID",
             ".Values.runtimeNamespaces",
             "kind: RoleBinding",
+            "STEWARD_GOOGLE_OIDC_CLIENT_ID",
+            "STEWARD_GOOGLE_OIDC_CLIENT_SECRET",
+            ".Values.browserAuth.enabled",
         ] {
             assert!(
                 templates.contains(required),

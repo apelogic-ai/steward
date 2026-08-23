@@ -45,6 +45,7 @@ The chart references five existing Secrets and never creates their values:
 | `steward-litellm` | `master-key` | controller |
 | `steward-openshell-client` | `ca.crt`, `tls.crt`, `tls.key` | controller |
 | `steward-mint` | `signing-key`, `introspection-credential` | mint |
+| browser-auth Secret (selected only when `browserAuth.enabled=true`) | configured client-secret key | apiserver |
 
 The controller also requires the public workload-exchange CA bundle in the
 ConfigMap selected by `workloadExchangeTrust.name` and
@@ -54,6 +55,45 @@ The mint Secret is not referenced by either the apiserver or controller
 Deployment. `steward-apiserver-tls` and `steward-webhook-tls` are issued by
 cert-manager from `tls.issuerRef`; the binaries accept cert-manager's PEM
 certificate chains and private keys.
+
+## Browser authentication
+
+`browserAuth` defaults to disabled. It is an atomic apiserver-only contract:
+when disabled, every Google/OIDC value and Secret reference must be empty and
+the chart renders no browser-auth environment variables or Secret projection.
+When enabled, the chart requires an exact HTTPS browser origin, Google client
+ID, hosted Workspace domain, Steward organization ID, and an existing Secret
+name/key for the Google client secret. The chart never creates the Secret or a
+public edge. A deployment adapter supplies the HTTPS route, certificate and
+network policy appropriate to its platform (for example, a local Kind adapter
+or a DEV gateway); those controls do not belong in this portable chart.
+
+When `networkPolicy.enabled=true`, browser authentication additionally requires
+at least one `networkPolicy.browserAuthEgressCidrs` entry. The chart allows
+apiserver HTTPS egress only to those platform-managed CIDRs; it does not open
+unrestricted internet egress or encode Google IP ranges. The deployment
+adapter is responsible for maintaining the approved resolver/egress policy as
+Google's endpoints evolve. A local isolated lane may instead set
+`networkPolicy.enabled=false`; that is not a substitute for a production
+egress policy.
+
+## Browser-to-MCP HOP-1
+
+`browserHop1` is separately disabled by default. When enabled, it can be used
+only with enabled `browserAuth`; every MCP-GW origin, private Identity exchange
+endpoint, assertion issuer/audience/key ID, signer Secret reference, public
+JWKS ConfigMap reference, and projected service-account-token audience is
+required together. The apiserver receives the signer and public JWKS read-only,
+and projects a short-lived service-account token only for the private Identity
+exchange. It mounts the configured `workloadExchangeTrust` CA bundle to verify
+that Identity TLS endpoint; certificate verification is never disabled.
+
+The chart grants apiserver egress only to the configured MCP-GW and Identity
+namespaces/ports while this feature is enabled. The deployment must configure
+Identity's private workload policy to grant `browser-hop1-issuer` exclusively
+to the rendered apiserver service account and must project the same public
+JWKS into Identity. The chart does not create signing keys, JWKS, Identity
+policy, an OAuth client, or a public edge.
 
 The globally bound controller and mint ClusterRoles have no Secret verbs.
 Runtime Secret access is granted by namespaced Roles and RoleBindings only for
