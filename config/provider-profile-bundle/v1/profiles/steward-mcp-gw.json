@@ -1,11 +1,26 @@
 {
   "schema": "steward.provider-profile-template/v1",
   "id": "steward-mcp-gw",
+  "metadata": {
+    "displayName": "Steward MCP gateway",
+    "description": "Runtime-scoped read-only MCP gateway access",
+    "category": "source_control"
+  },
   "capabilities": ["tool.read"],
   "network": {
     "endpointInput": "gateway-origin",
     "allowedCidrsInput": "service-cidrs",
     "protocol": "https"
+  },
+  "authorization": {
+    "authName": "access_token",
+    "authDescription": "Runtime-bound MCP access",
+    "tokenGrantOriginInput": "runtime-grant-origin",
+    "tokenPath": "/token",
+    "audience": "steward-mcp",
+    "jwtSvidAudience": "steward-mint",
+    "scopes": ["mcp"],
+    "cacheTtlSeconds": 2
   },
   "runtime": {
     "requiredBinaries": ["/usr/bin/curl", "/usr/local/bin/curl"]
