@@ -14,6 +14,7 @@
       "template": "profiles/steward-mcp-gw.json",
       "inputs": [
         {"name": "gateway-origin", "kind": "https-origin"},
+        {"name": "runtime-grant-origin", "kind": "https-origin"},
         {"name": "service-cidrs", "kind": "cidr-list"}
       ]
     },
@@ -22,6 +23,7 @@
       "template": "profiles/steward-litellm.json",
       "inputs": [
         {"name": "gateway-origin", "kind": "https-origin"},
+        {"name": "runtime-grant-origin", "kind": "https-origin"},
         {"name": "service-cidrs", "kind": "cidr-list"}
       ]
     }

@@ -10,9 +10,11 @@ use steward_adapter_fake::IMPLEMENTED_PORTS as FAKE_PORTS;
 use steward_ports::{Maturity, PORTS};
 use steward_types::agent_runtime_crd;
 use xtask::{
-    local_test_context_is_safe, migration_base_candidates, migration_history_violations,
-    neutrality_violations, secret_violations, select_migration_base,
-    validate_provider_profile_bundle_directory, validate_register_content,
+    install_rendered_provider_profile_bundle, local_test_context_is_safe,
+    migration_base_candidates, migration_history_violations, neutrality_violations,
+    reconcile_rendered_provider_profile_bundle, render_provider_profile_bundle_directory,
+    secret_violations, select_migration_base, validate_provider_profile_bundle_directory,
+    validate_register_content,
 };
 
 type TaskResult = Result<(), String>;
@@ -57,7 +59,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "conformance" => conformance(rest),
         "register" => register(rest),
         "ports" if rest == ["--check"] => ports_check(),
-        "provider-profile-bundle" if rest == ["validate"] => provider_profile_bundle_validate(),
+        "provider-profile-bundle" => provider_profile_bundle(rest),
         "layering-test" if rest.is_empty() => layering_test(),
         "dev" => dev(rest),
         "reap" if rest.is_empty() => Err(
@@ -95,6 +97,9 @@ fn usage() -> String {
         "  register --check",
         "  ports --check",
         "  provider-profile-bundle validate",
+        "  provider-profile-bundle render --inputs <file>",
+        "  provider-profile-bundle install --inputs <file> --output <directory>",
+        "  provider-profile-bundle reconcile --inputs <file> --output <directory>",
         "  layering-test",
         "  dev doctor|up|down",
         "  reap",
@@ -168,6 +173,66 @@ fn provider_profile_bundle_validate() -> TaskResult {
         directory.display()
     );
     Ok(())
+}
+
+fn provider_profile_bundle(arguments: &[String]) -> TaskResult {
+    match arguments {
+        [command] if command == "validate" => provider_profile_bundle_validate(),
+        [command, inputs_flag, input_path] if command == "render" && inputs_flag == "--inputs" => {
+            let rendered = render_provider_profile_bundle_from_input(input_path)?;
+            let output = serde_json::to_string_pretty(&rendered.state)
+                .map_err(|error| format!("failed to serialize rendered provider profiles: {error}"))?;
+            println!("{output}");
+            Ok(())
+        }
+        [command, inputs_flag, input_path, output_flag, output_directory]
+            if command == "install" && inputs_flag == "--inputs" && output_flag == "--output" =>
+        {
+            let rendered = render_provider_profile_bundle_from_input(input_path)?;
+            install_rendered_provider_profile_bundle(Path::new(output_directory), &rendered)?;
+            println!(
+                "provider-profile-bundle: installed {} {} into {}",
+                rendered
+                    .state
+                    .pointer("/bundle/id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                rendered
+                    .state
+                    .pointer("/bundle/version")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown"),
+                output_directory
+            );
+            Ok(())
+        }
+        [command, inputs_flag, input_path, output_flag, output_directory]
+            if command == "reconcile" && inputs_flag == "--inputs" && output_flag == "--output" =>
+        {
+            let rendered = render_provider_profile_bundle_from_input(input_path)?;
+            reconcile_rendered_provider_profile_bundle(Path::new(output_directory), &rendered)?;
+            println!(
+                "provider-profile-bundle: verified same-bundle installation in {output_directory}"
+            );
+            Ok(())
+        }
+        _ => Err(
+            "usage: cargo xtask provider-profile-bundle validate|render --inputs <file>|install --inputs <file> --output <directory>|reconcile --inputs <file> --output <directory>"
+                .to_owned(),
+        ),
+    }
+}
+
+fn render_provider_profile_bundle_from_input(
+    input_path: &str,
+) -> Result<xtask::RenderedProviderProfileBundle, String> {
+    let input_content = fs::read_to_string(input_path).map_err(|error| {
+        format!("provider profile environment input file {input_path} is required: {error}")
+    })?;
+    render_provider_profile_bundle_directory(
+        &root().join("config/provider-profile-bundle/v1"),
+        &input_content,
+    )
 }
 
 fn e2e_s0() -> TaskResult {
@@ -1702,6 +1767,138 @@ mod tests {
             controller_role.contains("resources: [\"agentruntimes\"]\n    verbs: [\"create\"]"),
             "the Task controller must be allowed to create only AgentRuntime resources"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_profile_bundle_release_is_archived_attested_and_publicly_verified()
+    -> Result<(), String> {
+        let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("published Steward release workflow is required: {error}"))?;
+        let packaging = fs::read_to_string(
+            root().join("scripts/package-provider-profile-bundle.sh"),
+        )
+        .map_err(|error| format!("provider-profile bundle packager is required: {error}"))?;
+        let packaging_test =
+            fs::read_to_string(root().join("scripts/test-package-provider-profile-bundle.sh"))
+                .map_err(|error| {
+                    format!("provider-profile bundle packaging test is required: {error}")
+                })?;
+
+        let publisher = workflow
+            .split("  publish-provider-profile-bundle:")
+            .nth(1)
+            .and_then(|job| job.split("\n  openshell-x86-conformance:").next())
+            .ok_or_else(|| "provider-profile bundle release job is required".to_owned())?;
+        for required in [
+            "needs: validate",
+            "attestations: write",
+            "scripts/package-provider-profile-bundle.sh",
+            "actions/attest-build-provenance@",
+            "subject-path: dist/steward-runtime-providers-${{ steps.version.outputs.version }}.tar.gz",
+            "release-provider-profile-bundle",
+            "provider-profile-bundle.digest",
+        ] {
+            assert!(
+                publisher.contains(required),
+                "provider-profile bundle release job must include {required}"
+            );
+        }
+        for required in [
+            "publish-provider-profile-bundle",
+            "openshell-x86-conformance",
+            "release / linux-amd64 OpenShell adapter",
+            "Verify authenticated OpenShell adapter on linux/amd64",
+            "cargo xtask e2e-openshell-adapter",
+            "Provider profile bundle asset:",
+            "Provider profile bundle SHA-256:",
+            "Provider profile bundle signer identity:",
+            "Provider profile bundle source repository:",
+            "Provider profile bundle source commit:",
+            "Provider profile bundle verification:",
+            "Verify published provider-profile bundle availability",
+            "gh release download",
+            "gh attestation verify \"$destination/$asset\"",
+            "--cert-identity \"$signer_identity\"",
+            "provider-profile-bundle.digest",
+        ] {
+            assert!(
+                workflow.contains(required),
+                "public release handoff must include {required}"
+            );
+        }
+        let create_release = workflow
+            .find("gh release create \"$GITHUB_REF_NAME\"")
+            .ok_or_else(|| "GitHub release creation must remain explicit".to_owned())?;
+        let verify_release = workflow
+            .find("Verify published provider-profile bundle availability")
+            .ok_or_else(|| {
+                "published provider-profile bundle verification is required".to_owned()
+            })?;
+        assert!(
+            verify_release > create_release,
+            "bundle availability must be verified after the GitHub Release publishes its asset"
+        );
+        let release = workflow
+            .split("  release:")
+            .nth(1)
+            .ok_or_else(|| "GitHub Release job is required".to_owned())?;
+        for required in [
+            "openshell-x86-conformance",
+            "needs.openshell-x86-conformance.result == 'success'",
+        ] {
+            assert!(
+                release.contains(required),
+                "GitHub Release must fail closed without {required}"
+            );
+        }
+        for required in [
+            "--sort=name",
+            "--mtime=@0",
+            "--owner=0",
+            "--group=0",
+            "--numeric-owner",
+            "--format=ustar",
+            "gzip -n",
+            "provider-profile-bundle/v1/bundle.json",
+            "provider-profile-bundle/v1/profiles/steward-litellm.json",
+            "provider-profile-bundle/v1/profiles/steward-mcp-gw.json",
+            "sha256sum",
+        ] {
+            assert!(
+                packaging.contains(required),
+                "provider-profile bundle packager must retain {required}"
+            );
+        }
+        for required in [
+            "deterministic provider-profile bundle archive",
+            "archive bytes must be reproducible",
+            "unexpected archive entry",
+            "digest must bind the archive bytes",
+        ] {
+            assert!(
+                packaging_test.contains(required),
+                "provider-profile bundle packaging test must prove {required}"
+            );
+        }
+        let bundle_readme =
+            fs::read_to_string(root().join("config/provider-profile-bundle/v1/README.md"))
+                .map_err(|error| format!("provider-profile bundle README is required: {error}"))?;
+        for required in [
+            "Verify a released bundle before rendering or installation",
+            "gh attestation verify",
+            "--cert-identity",
+            "source repository and",
+            "exact source commit",
+            "test \"$actual_digest\" = \"$expected_digest\"",
+            "source-only validation",
+            "eligible for release",
+        ] {
+            assert!(
+                bundle_readme.contains(required),
+                "provider-profile bundle consumer verification instructions must include {required}"
+            );
+        }
         Ok(())
     }
 
