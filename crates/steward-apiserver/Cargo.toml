@@ -11,6 +11,7 @@ admin-demo = []
 
 [dependencies]
 axum.workspace = true
+base64.workspace = true
 jsonwebtoken.workspace = true
 k8s-openapi.workspace = true
 kube = { workspace = true, features = ["client", "ring", "rustls-tls"] }
@@ -19,6 +20,7 @@ serde-saphyr.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
+p256.workspace = true
 steward-admission = { path = "../steward-admission", version = "=0.0.0" }
 steward-adapter-github-artifact = { path = "../../adapters/github-artifact", version = "=0.0.0" }
 steward-ports = { path = "../steward-ports", version = "=0.0.0" }
@@ -28,6 +30,7 @@ utoipa.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+rand_core.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tower.workspace = true
 

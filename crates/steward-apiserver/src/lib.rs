@@ -5,6 +5,7 @@ pub mod admin_demo;
 mod admin_ui;
 pub mod agent_runs_ui;
 pub mod browser_auth;
+pub mod browser_hop1_attestation;
 pub mod connections;
 #[cfg(feature = "admin-demo")]
 pub mod connections_demo;
@@ -15,6 +16,7 @@ pub mod fast_track_connections_bridge;
 pub mod fast_track_runtime_bootstrap;
 mod github_actions;
 pub mod google_oidc;
+pub mod mcp_gw_connections;
 pub mod stable_runtime_bridge;
 mod tasks;
 pub mod user_envelopes;

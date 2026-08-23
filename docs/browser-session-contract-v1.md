@@ -45,6 +45,11 @@ The existing Kubernetes TokenReview administrator routes remain unchanged. Brows
 parallel, route-specific frontend boundary and cannot inject a bearer assertion into that operator
 path.
 
+The optional browser Connections path obtains MCP authority only through the internal
+[browser-to-Identity HOP-1 attestation contract](browser-hop1-attestation-contract-v1.md). It
+does not place a bearer, provider credential, browser session value, or role claim in browser
+JavaScript.
+
 Production browser configuration parses and canonicalizes one real HTTPS origin. Userinfo,
 non-root paths, query strings, fragments, malformed ports, whitespace, scheme-like strings, and
 insecure schemes fail closed. The configured callback must then equal the canonical origin plus
