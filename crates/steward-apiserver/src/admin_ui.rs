@@ -7,6 +7,7 @@ use axum::{Extension, Json, Router};
 use serde::Serialize;
 
 use crate::AdminContext;
+use crate::browser_auth::BrowserAdminAuthority;
 
 const ADMIN_API_VERSION: &str = "steward.admin/v1";
 const ADMIN_HTML: &str = include_str!("../assets/admin/index.html");
@@ -43,6 +44,23 @@ where
         .route("/admin/", get(shell))
         .merge(asset_router())
         .merge(browser_api)
+}
+
+/// The browser administrator dashboard has its own authentication boundary.
+///
+/// Operator endpoints keep using `router`, which extracts `AdminContext` from
+/// Kubernetes TokenReview. This surface is mounted only behind
+/// `protect_browser_admin_routes`, so it deliberately extracts the typed
+/// browser authority instead of accepting a bearer-derived context.
+pub(crate) fn browser_router() -> Router {
+    let browser_api = Router::new()
+        .route("/admin/api/v1/bootstrap", get(browser_bootstrap))
+        .route_layer(middleware::from_fn(enforce_browser_mutation_boundary));
+    Router::new()
+        .route("/admin", get(shell))
+        .route("/admin/", get(shell))
+        .merge(browser_api)
+        .route_layer(middleware::from_fn(add_browser_security_headers))
 }
 
 pub(crate) fn asset_router<S>() -> Router<S>
@@ -102,6 +120,20 @@ pub(crate) async fn bootstrap(
     Json(AdminBootstrapResponse {
         api_version: ADMIN_API_VERSION,
         actor: admin.actor,
+        surfaces: [
+            AdminSurface::Approvals,
+            AdminSurface::Envelope,
+            AdminSurface::Fleet,
+        ],
+    })
+}
+
+async fn browser_bootstrap(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+) -> Json<AdminBootstrapResponse> {
+    Json(AdminBootstrapResponse {
+        api_version: ADMIN_API_VERSION,
+        actor: authority.principal().canonical_user_id.as_str().to_owned(),
         surfaces: [
             AdminSurface::Approvals,
             AdminSurface::Envelope,

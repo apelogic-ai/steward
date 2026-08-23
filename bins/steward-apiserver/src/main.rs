@@ -11,7 +11,8 @@ use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{
     KubeRuntimeRepository, KubernetesTaskIdentityResolver, KubernetesTokenAuthenticator,
     KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog, agent_runs_ui, browser_auth,
-    google_oidc, router, stable_runtime_bridge, task_router, user_envelopes,
+    google_oidc, router, router_without_admin_dashboard, stable_runtime_bridge, task_router,
+    user_envelopes,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
@@ -64,12 +65,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         StaticTaskWorkflowCatalog::from_json(&required("STEWARD_TASK_WORKFLOWS_JSON")?)
             .map_err(io::Error::other)?;
     let runtimes = KubeRuntimeRepository::new(client);
-    let app = router(
-        runtimes.clone(),
-        store.clone(),
-        authenticator,
-        decisions.clone(),
-    )
+    let browser = browser_application_router(store.clone(), runtimes.clone())?;
+    let app = if browser.is_some() {
+        router_without_admin_dashboard(
+            runtimes.clone(),
+            store.clone(),
+            authenticator,
+            decisions.clone(),
+        )
+    } else {
+        router(
+            runtimes.clone(),
+            store.clone(),
+            authenticator,
+            decisions.clone(),
+        )
+    }
     .merge(task_router(
         runtimes.clone(),
         store.clone(),
@@ -77,7 +88,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         task_identities,
         task_workflows,
     ));
-    let app = match browser_application_router(store, runtimes)? {
+    let app = match browser {
         Some(browser) => app.merge(browser),
         None => app,
     };

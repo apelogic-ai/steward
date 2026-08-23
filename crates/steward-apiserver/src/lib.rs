@@ -1316,6 +1316,43 @@ where
     A: RequestAuthenticator,
     D: DecisionChannel + Clone,
 {
+    router_with_admin_dashboard(runtimes, ledger, authenticator, decisions, true)
+}
+
+/// Build the TokenReview-protected operator API without the browser dashboard.
+///
+/// The production binary selects this when browser authentication is configured:
+/// `/admin` and its bootstrap endpoint are then owned exclusively by the typed
+/// browser-admin router, while all TokenReview operator APIs retain their
+/// existing paths and authorization boundary.
+pub fn router_without_admin_dashboard<R, L, A, D>(
+    runtimes: R,
+    ledger: L,
+    authenticator: A,
+    decisions: D,
+) -> Router
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger + AgentRunLedger,
+    A: RequestAuthenticator,
+    D: DecisionChannel + Clone,
+{
+    router_with_admin_dashboard(runtimes, ledger, authenticator, decisions, false)
+}
+
+fn router_with_admin_dashboard<R, L, A, D>(
+    runtimes: R,
+    ledger: L,
+    authenticator: A,
+    decisions: D,
+    include_dashboard: bool,
+) -> Router
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger + AgentRunLedger,
+    A: RequestAuthenticator,
+    D: DecisionChannel + Clone,
+{
     let admission = Router::new()
         .route(
             "/v1/namespaces/{namespace}/runtimes",
@@ -1329,41 +1366,43 @@ where
             authenticator.clone(),
             authenticate_admission::<A>,
         ));
-    let admin = protect_admin_routes(
-        Router::new()
-            .merge(admin_ui::router::<AppState<R, L, D>>())
-            .route("/admin/api/v1/runs", get(agent_runs_handler::<R, L, D>))
-            .route(
-                "/admin/api/v1/runs/{taskUid}",
-                get(agent_run_handler::<R, L, D>),
-            )
-            .route(
-                "/admin/api/v1/runs/{taskUid}/timeline",
-                get(agent_run_timeline_handler::<R, L, D>),
-            )
-            .route("/admin/approvals", get(approval_queue_handler::<R, L, D>))
-            .route(
-                "/admin/envelopes/{member_role}",
-                post(author_envelope_handler::<R, L, D>),
-            )
-            .route(
-                "/admin/service-envelopes/{service}",
-                post(author_service_envelope_handler::<R, L, D>),
-            )
-            .route(
-                "/admin/approvals/{approval_id}/approve",
-                post(approve_handler::<R, L, D>),
-            )
-            .route(
-                "/admin/approvals/{approval_id}/file",
-                post(file_decision_handler::<R, L, D>),
-            )
-            .route(
-                "/admin/runtimes/{runtime_uid}/grants/revoke",
-                post(revoke_grants_handler::<R, L, D>),
-            ),
-        authenticator,
-    );
+    let admin_routes = Router::new()
+        .route("/admin/api/v1/runs", get(agent_runs_handler::<R, L, D>))
+        .route(
+            "/admin/api/v1/runs/{taskUid}",
+            get(agent_run_handler::<R, L, D>),
+        )
+        .route(
+            "/admin/api/v1/runs/{taskUid}/timeline",
+            get(agent_run_timeline_handler::<R, L, D>),
+        )
+        .route("/admin/approvals", get(approval_queue_handler::<R, L, D>))
+        .route(
+            "/admin/envelopes/{member_role}",
+            post(author_envelope_handler::<R, L, D>),
+        )
+        .route(
+            "/admin/service-envelopes/{service}",
+            post(author_service_envelope_handler::<R, L, D>),
+        )
+        .route(
+            "/admin/approvals/{approval_id}/approve",
+            post(approve_handler::<R, L, D>),
+        )
+        .route(
+            "/admin/approvals/{approval_id}/file",
+            post(file_decision_handler::<R, L, D>),
+        )
+        .route(
+            "/admin/runtimes/{runtime_uid}/grants/revoke",
+            post(revoke_grants_handler::<R, L, D>),
+        );
+    let admin_routes = if include_dashboard {
+        admin_routes.merge(admin_ui::router::<AppState<R, L, D>>())
+    } else {
+        admin_routes
+    };
+    let admin = protect_admin_routes(admin_routes, authenticator);
     admission.merge(admin).with_state(AppState {
         runtimes,
         ledger,
