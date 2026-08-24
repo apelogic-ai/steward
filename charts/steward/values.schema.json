@@ -4,6 +4,7 @@
   "additionalProperties": false,
   "required": [
     "images",
+    "web",
     "secrets",
     "browserAuth",
     "browserHop1",
@@ -21,13 +22,32 @@
     "images": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["repository", "pullPolicy", "apiserver", "controller", "mint"],
+      "required": ["repository", "pullPolicy", "apiserver", "controller", "mint", "web"],
       "properties": {
         "repository": {"type": "string", "minLength": 1},
         "pullPolicy": {"enum": ["IfNotPresent", "Always", "Never"]},
         "apiserver": {"$ref": "#/definitions/image"},
         "controller": {"$ref": "#/definitions/image"},
-        "mint": {"$ref": "#/definitions/image"}
+        "mint": {"$ref": "#/definitions/image"},
+        "web": {"$ref": "#/definitions/optionalImage"}
+      }
+    },
+    "web": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "host", "ingress"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "host": {"type": "string"},
+        "ingress": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["className", "tlsSecretName"],
+          "properties": {
+            "className": {"type": "string"},
+            "tlsSecretName": {"type": "string"}
+          }
+        }
       }
     },
     "secrets": {
@@ -378,6 +398,7 @@
         "postgresCidrs",
         "jiraCidrs",
         "browserAuthEgressCidrs",
+        "ingressNamespace",
         "burbleNamespace",
         "arcNamespace",
         "mcpGatewayNamespace",
@@ -393,6 +414,7 @@
         "postgresCidrs": {"$ref": "#/definitions/cidrs"},
         "jiraCidrs": {"$ref": "#/definitions/cidrs"},
         "browserAuthEgressCidrs": {"$ref": "#/definitions/cidrs"},
+        "ingressNamespace": {"$ref": "#/definitions/nonempty"},
         "burbleNamespace": {"$ref": "#/definitions/nonempty"},
         "arcNamespace": {"$ref": "#/definitions/nonempty"},
         "mcpGatewayNamespace": {"$ref": "#/definitions/nonempty"},
@@ -428,36 +450,64 @@
     "services": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["clusterDomain", "apiserverPort", "webhookPort", "mintPort"],
+      "required": ["clusterDomain", "apiserverPort", "webhookPort", "mintPort", "webPort"],
       "properties": {
         "clusterDomain": {"$ref": "#/definitions/nonempty"},
         "apiserverPort": {"$ref": "#/definitions/port"},
         "webhookPort": {"$ref": "#/definitions/port"},
-        "mintPort": {"$ref": "#/definitions/port"}
+        "mintPort": {"$ref": "#/definitions/port"},
+        "webPort": {"$ref": "#/definitions/port"}
       }
     },
     "replicaCount": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["apiserver", "controller", "mint"],
+      "required": ["apiserver", "controller", "mint", "web"],
       "properties": {
         "apiserver": {"type": "integer", "minimum": 1},
         "controller": {"type": "integer", "minimum": 1},
-        "mint": {"type": "integer", "minimum": 1}
+        "mint": {"type": "integer", "minimum": 1},
+        "web": {"type": "integer", "minimum": 1}
       }
     },
     "resources": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["apiserver", "controller", "mint"],
+      "required": ["apiserver", "controller", "mint", "web"],
       "properties": {
         "apiserver": {"type": "object"},
         "controller": {"type": "object"},
-        "mint": {"type": "object"}
+        "mint": {"type": "object"},
+        "web": {"type": "object"}
       }
     }
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "web": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}
+        }
+      },
+      "then": {
+        "properties": {
+          "images": {"properties": {"web": {"$ref": "#/definitions/image"}}},
+          "browserAuth": {"properties": {"enabled": {"const": true}}},
+          "networkPolicy": {"properties": {"enabled": {"const": true}}},
+          "web": {
+            "properties": {
+              "host": {"type": "string", "minLength": 3, "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"},
+              "ingress": {
+                "properties": {
+                  "className": {"$ref": "#/definitions/nonempty"},
+                  "tlsSecretName": {"$ref": "#/definitions/nonempty"}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {
@@ -513,6 +563,17 @@
         "tag": {"type": "string", "minLength": 1},
         "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
       }
+    },
+    "optionalImage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tag", "digest"],
+          "properties": {"tag": {"const": ""}, "digest": {"const": ""}}
+        },
+        {"$ref": "#/definitions/image"}
+      ]
     },
     "secretKey": {
       "type": "object",

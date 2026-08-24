@@ -1,4 +1,7 @@
 {{- $stableBridgeBundleName := printf "steward-stable-bridge-attestation-%s" (.Values.stableBridge.attestationBundle | sha256sum | trunc 12) }}
+{{- if and .Values.web.enabled (ne .Values.browserAuth.google.origin (printf "https://%s" .Values.web.host)) }}
+{{- fail "web.host must exactly match the HTTPS browserAuth.google.origin" }}
+{{- end }}
 {{- range $component := list "apiserver" "controller" "mint" }}
 ---
 apiVersion: v1
@@ -7,6 +10,15 @@ metadata:
   name: {{ include (printf "steward.%sName" $component) $ }}
   labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: {{ $component }} }
 automountServiceAccountToken: true
+{{- end }}
+{{- if .Values.web.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "steward.webName" . }}
+  labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: web }
+automountServiceAccountToken: false
 {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -169,6 +181,15 @@ metadata: { name: steward-mint }
 spec:
   selector: { app.kubernetes.io/name: steward, app.kubernetes.io/component: mint }
   ports: [{ name: http, port: {{ .Values.services.mintPort }}, targetPort: http }]
+{{- if .Values.web.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata: { name: steward-web }
+spec:
+  selector: { app.kubernetes.io/name: steward, app.kubernetes.io/component: web }
+  ports: [{ name: http, port: {{ .Values.services.webPort }}, targetPort: http }]
+{{- end }}
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
@@ -412,6 +433,78 @@ spec:
               - { key: {{ .Values.secrets.mint.introspectionCredential }}, path: introspection-credential }
         - name: spiffe-workload-api
           csi: { driver: {{ .Values.spire.csiDriver }}, readOnly: true }
+{{- if .Values.web.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: steward-web }
+spec:
+  replicas: {{ .Values.replicaCount.web }}
+  selector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: web } }
+  template:
+    metadata: { labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: web } }
+    spec:
+      serviceAccountName: {{ include "steward.webName" . }}
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: web
+          image: {{ include "steward.image" (dict "root" . "image" .Values.images.web) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          ports: [{ name: http, containerPort: 3000 }]
+          readinessProbe: { httpGet: { path: /health/ready, port: http }, initialDelaySeconds: 2, periodSeconds: 5 }
+          livenessProbe: { httpGet: { path: /health/ready, port: http }, initialDelaySeconds: 10, periodSeconds: 10 }
+          env:
+            - { name: HOSTNAME, value: 0.0.0.0 }
+            - { name: NODE_ENV, value: production }
+            - { name: PORT, value: "3000" }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+          resources:
+{{ toYaml .Values.resources.web | nindent 12 }}
+      volumes:
+        - { name: tmp, emptyDir: {} }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: steward-api
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: {{ .Values.web.ingress.className }}
+  tls:
+    - hosts: [{{ .Values.web.host | quote }}]
+      secretName: {{ .Values.web.ingress.tlsSecretName }}
+  rules:
+    - host: {{ .Values.web.host | quote }}
+      http:
+        paths:
+          - { path: /admin/api, pathType: Prefix, backend: { service: { name: steward-apiserver, port: { name: https } } } }
+          - { path: /admin/auth, pathType: Prefix, backend: { service: { name: steward-apiserver, port: { name: https } } } }
+          - { path: /admin/connections/github/callback, pathType: Exact, backend: { service: { name: steward-apiserver, port: { name: https } } } }
+          - { path: /app/api, pathType: Prefix, backend: { service: { name: steward-apiserver, port: { name: https } } } }
+          - { path: /v1, pathType: Prefix, backend: { service: { name: steward-apiserver, port: { name: https } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: steward-web
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: {{ .Values.web.ingress.className }}
+  tls:
+    - hosts: [{{ .Values.web.host | quote }}]
+      secretName: {{ .Values.web.ingress.tlsSecretName }}
+  rules:
+    - host: {{ .Values.web.host | quote }}
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: steward-web, port: { name: http } } } }
+{{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---
 apiVersion: networking.k8s.io/v1
@@ -442,6 +535,11 @@ spec:
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.burbleNamespace }} } }
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.arcNamespace }} } }
       ports: [{ protocol: TCP, port: 8443 }]
+{{- if .Values.web.enabled }}
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressNamespace }} } }
+      ports: [{ protocol: TCP, port: 8443 }]
+{{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -560,6 +658,27 @@ spec:
 {{- end }}
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.kubernetesApi }} }]
 {{- else }}
+  egress: []
+{{- end }}
+{{- if .Values.web.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: steward-web-ingress }
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: web } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressNamespace }} } }
+      ports: [{ protocol: TCP, port: 3000 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: steward-web-egress }
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: web } }
+  policyTypes: [Egress]
   egress: []
 {{- end }}
 {{- end }}

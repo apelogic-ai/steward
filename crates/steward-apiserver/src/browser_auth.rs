@@ -162,7 +162,7 @@ impl GoogleAuthorizationOnlyProvider {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum BrowserRole {
     User,
@@ -211,6 +211,10 @@ impl BrowserAdminAuthority {
 
 #[derive(Clone, Copy)]
 pub struct BrowserMutationProof(());
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BrowserMutationRequest {}
 
 #[cfg(all(test, feature = "admin-demo"))]
 impl BrowserMutationProof {
@@ -771,16 +775,16 @@ async fn callback(
     response
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct SessionPrincipalResponse<'a> {
+pub(crate) struct SessionPrincipalResponse<'a> {
     user_id: &'a CanonicalUserId,
     display_email: &'a Email,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct SessionResponse<'a> {
+pub(crate) struct SessionResponse<'a> {
     api_version: &'static str,
     principal: SessionPrincipalResponse<'a>,
     role: BrowserRole,
@@ -789,7 +793,20 @@ struct SessionResponse<'a> {
     csrf: &'a str,
 }
 
-async fn session(State(service): State<BrowserAuthService>, headers: HeaderMap) -> Response {
+#[utoipa::path(
+    get,
+    path = "/admin/api/v1/session",
+    security(("browserSession" = [])),
+    responses(
+        (status = 200, description = "Opaque browser session identity, authorized modes, surfaces, and CSRF value", body = SessionResponse),
+        (status = 401, description = "Opaque browser session is missing, invalid, or expired"),
+        (status = 503, description = "Browser session registry is unavailable")
+    )
+)]
+pub(crate) async fn session(
+    State(service): State<BrowserAuthService>,
+    headers: HeaderMap,
+) -> Response {
     let session = match resolve_session(&service, &headers) {
         Ok(session) => session,
         Err(error) => return error.into_response(),

@@ -24,15 +24,15 @@ kubeconfig.*
 # approved workspace; ignored so they never appear as untracked.
 .worktrees/
 
-# Generated — regenerate, never hand-edit (AGENTS.md §9)
-/web/src/api-client/
-
 # Local tooling
 .DS_Store
 *.swp
 .idea/
 .vscode/
 node_modules/
+web/.next/
+web/tsconfig.tsbuildinfo
 playwright-report/
+.playwright-cli/
 test-results/
 output/playwright/

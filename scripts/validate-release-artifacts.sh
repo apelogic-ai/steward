@@ -12,13 +12,16 @@ browser_auth_rendered="$(mktemp)"
 browser_auth_deployment="$(mktemp)"
 browser_hop1_rendered="$(mktemp)"
 browser_hop1_deployment="$(mktemp)"
+web_rendered="$(mktemp)"
+web_deployment="$(mktemp)"
 mint_synthetic_kubeconfig="$(mktemp)"
 mint_startup_output="$(mktemp)"
-trap 'rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" "${stable_bridge_configmap}" "${stable_bridge_deployment}" "${stable_bridge_controller_deployment}" "${browser_auth_rendered}" "${browser_auth_deployment}" "${browser_hop1_rendered}" "${browser_hop1_deployment}" "${mint_synthetic_kubeconfig}" "${mint_startup_output}"' EXIT INT TERM
+trap 'rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" "${stable_bridge_configmap}" "${stable_bridge_deployment}" "${stable_bridge_controller_deployment}" "${browser_auth_rendered}" "${browser_auth_deployment}" "${browser_hop1_rendered}" "${browser_hop1_deployment}" "${web_rendered}" "${web_deployment}" "${mint_synthetic_kubeconfig}" "${mint_startup_output}"' EXIT INT TERM
 
 digest0="sha256:0000000000000000000000000000000000000000000000000000000000000000"
 digest1="sha256:1111111111111111111111111111111111111111111111111111111111111111"
 digest2="sha256:2222222222222222222222222222222222222222222222222222222222222222"
+digest3="sha256:3333333333333333333333333333333333333333333333333333333333333333"
 image_values=(
   --set images.apiserver.tag=validation-apiserver
   --set "images.apiserver.digest=${digest0}"
@@ -51,6 +54,70 @@ helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
   "${image_values[@]}" > "${rendered}"
+
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set web.enabled=true \
+  --set-string web.host=steward.example.test \
+  --set-string web.ingress.className=nginx \
+  --set-string web.ingress.tlsSecretName=steward-public-tls \
+  --set images.web.tag=validation-web \
+  --set "images.web.digest=${digest3}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' > "${web_rendered}"
+
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-web/ { print; exit }
+' "${web_rendered}" > "${web_deployment}"
+for required in \
+  'kind: Deployment' \
+  'metadata: { name: steward-web }' \
+  '      automountServiceAccountToken: false' \
+  '      securityContext: { runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: { type: RuntimeDefault } }' \
+  '          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }' \
+  '          readinessProbe: { httpGet: { path: /health/ready, port: http }, initialDelaySeconds: 2, periodSeconds: 5 }'
+do
+  grep -Fxq "${required}" "${web_deployment}"
+done
+for forbidden in STEWARD_DATABASE_URL STEWARD_JIRA_TOKEN STEWARD_LITELLM_MASTER_KEY STEWARD_MINT_SIGNING_KEY serviceAccountToken:
+do
+  if grep -Fq "${forbidden}" "${web_deployment}"; then
+    echo "web workload must not receive control-plane credentials: ${forbidden}" >&2
+    exit 1
+  fi
+done
+for required in \
+  'kind: Ingress' \
+  'name: steward-api' \
+  'name: steward-web' \
+  'path: /admin/api' \
+  'path: /admin/auth' \
+  'path: /admin/connections/github/callback' \
+  'path: /app/api' \
+  'path: /, pathType: Prefix' \
+  'metadata: { name: steward-web-egress }' \
+  '  egress: []'
+do
+  grep -Fq "${required}" "${web_rendered}"
+done
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set web.enabled=true >/dev/null 2>&1
+then
+  echo "enabled web presentation without immutable image and ingress inputs must fail chart validation" >&2
+  exit 1
+fi
 
 helm template steward "${root}/charts/steward" \
   --namespace steward \
@@ -413,6 +480,10 @@ if [[ "${1:-}" == "--build-images" ]]; then
   docker build \
     --file "${root}/build/connections-bridge.Dockerfile" \
     --tag "steward-bridge:release-validation" \
+    "${root}"
+  docker build \
+    --file "${root}/build/web.Dockerfile" \
+    --tag "steward-web:release-validation" \
     "${root}"
   docker run --rm --entrypoint /bin/sh steward-bridge:release-validation -ceu '
     command -v tar >/dev/null

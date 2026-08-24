@@ -1571,6 +1571,36 @@ fn text_regions(content: &str) -> Vec<String> {
             continue;
         }
 
+        if characters[index] == '`' {
+            index += 1;
+            let mut region = String::new();
+            let mut escaped = false;
+            while index < characters.len() {
+                let character = characters[index];
+                index += 1;
+                if escaped {
+                    region.push(character);
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '`' {
+                    break;
+                } else if character == '$' && characters.get(index) == Some(&'{') {
+                    if !region.is_empty() {
+                        regions.push(std::mem::take(&mut region));
+                    }
+                    index += 1;
+                    index = skip_template_expression(&characters, index);
+                } else {
+                    region.push(character);
+                }
+            }
+            if !region.is_empty() {
+                regions.push(region);
+            }
+            continue;
+        }
+
         if characters[index] == '/' && characters.get(index + 1) == Some(&'/') {
             index += 2;
             let mut region = String::new();
@@ -1606,6 +1636,55 @@ fn text_regions(content: &str) -> Vec<String> {
     }
 
     regions
+}
+
+fn skip_template_expression(characters: &[char], mut index: usize) -> usize {
+    let mut depth = 1;
+    while index < characters.len() && depth > 0 {
+        match characters[index] {
+            '"' | '\'' => {
+                let delimiter = characters[index];
+                index += 1;
+                let mut escaped = false;
+                while index < characters.len() {
+                    let character = characters[index];
+                    index += 1;
+                    if escaped {
+                        escaped = false;
+                    } else if character == '\\' {
+                        escaped = true;
+                    } else if character == delimiter {
+                        break;
+                    }
+                }
+            }
+            '`' => {
+                index += 1;
+                let mut escaped = false;
+                while index < characters.len() {
+                    let character = characters[index];
+                    index += 1;
+                    if escaped {
+                        escaped = false;
+                    } else if character == '\\' {
+                        escaped = true;
+                    } else if character == '`' {
+                        break;
+                    }
+                }
+            }
+            '{' => {
+                depth += 1;
+                index += 1;
+            }
+            '}' => {
+                depth -= 1;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    index
 }
 
 fn is_rust_lifetime(characters: &[char], quote: usize) -> bool {
@@ -1752,7 +1831,12 @@ fn is_reserved_hostname(token: &str) -> bool {
     token == "test"
         || token.ends_with(".test")
         || is_example_domain(token)
+        || is_recognized_schema_identifier(token)
         || is_recognized_upstream_hostname(token)
+}
+
+fn is_recognized_schema_identifier(token: &str) -> bool {
+    matches!(token, "steward.admin" | "steward.connections")
 }
 
 fn is_example_domain(token: &str) -> bool {
@@ -1763,9 +1847,15 @@ fn is_example_domain(token: &str) -> bool {
 }
 
 fn is_recognized_upstream_hostname(token: &str) -> bool {
-    ["crates.io", "docs.rs", "github.com", "openpolicyagent.org"]
-        .into_iter()
-        .any(|domain| token == domain || token.ends_with(&format!(".{domain}")))
+    [
+        "crates.io",
+        "docs.rs",
+        "github.com",
+        "openpolicyagent.org",
+        "sigstore.dev",
+    ]
+    .into_iter()
+    .any(|domain| token == domain || token.ends_with(&format!(".{domain}")))
 }
 
 fn is_sensitive_path(path: &Path) -> bool {
@@ -2059,6 +2149,23 @@ mod tests {
         assert!(
             violations.is_empty(),
             "routine filename literals are not hostnames: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn neutrality_ignores_registered_media_types() {
+        assert!(
+            neutrality_violations("\"application/vnd.dev.sigstore.bundle.v0.3+json\"").is_empty()
+        );
+    }
+
+    #[test]
+    fn neutrality_allows_the_sigstore_transparency_log_hostname() {
+        let hostname = ["rekor", "sigstore", "dev"].join(".");
+
+        assert!(
+            neutrality_violations(&format!("\"{hostname}\"")).is_empty(),
+            "an upstream dependency hostname is not fixture identity data"
         );
     }
 

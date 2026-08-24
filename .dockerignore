@@ -5,6 +5,10 @@ build
 charts
 target
 e2e/target
+node_modules
+web/.next
+test-results
+.playwright-cli
 .env*
 *.key
 *.pem

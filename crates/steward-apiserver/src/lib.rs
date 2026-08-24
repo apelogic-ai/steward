@@ -4,6 +4,7 @@
 pub mod admin_demo;
 mod admin_ui;
 pub mod agent_runs_ui;
+pub mod browser_admin;
 pub mod browser_auth;
 pub mod browser_hop1_attestation;
 pub mod connections;
@@ -266,7 +267,7 @@ pub struct CreateRuntimeRequest {
     pub spec: AgentRuntimeSpec,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApprovalRequest {
     pub rationale: String,
@@ -291,7 +292,27 @@ pub struct GrantRevocationRequest {
         task_status_contract,
         task_outputs_contract,
         task_delete_contract,
+        browser_auth::session,
         admin_ui::bootstrap,
+        user_envelopes::list_templates,
+        user_envelopes::list_requests,
+        user_envelopes::get_request,
+        user_envelopes::create_request,
+        user_envelopes::render_github_actions_for_envelope,
+        agent_runs_ui::my_runs,
+        agent_runs_ui::my_run,
+        agent_runs_ui::my_run_timeline,
+        agent_runs_ui::all_runs,
+        agent_runs_ui::all_run,
+        agent_runs_ui::all_run_timeline,
+        connections::connection_status,
+        connections::start_connection,
+        connections::disconnect_connection,
+        browser_admin::get_envelope_template,
+        browser_admin::author_envelope_template,
+        browser_admin::list_approvals,
+        browser_admin::approve,
+        browser_admin::file_decision,
         agent_runs_contract,
         agent_run_contract,
         agent_run_timeline_contract
@@ -304,6 +325,9 @@ pub struct GrantRevocationRequest {
         TaskAdmissionDelta,
         TaskArchive,
         TaskErrorResponse,
+        browser_auth::BrowserRole,
+        browser_auth::SessionPrincipalResponse,
+        browser_auth::SessionResponse,
         admin_ui::AdminBootstrapResponse,
         admin_ui::AdminSurface,
         AgentRunAvailability,
@@ -324,7 +348,9 @@ struct TaskSecurity;
 
 impl utoipa::Modify for TaskSecurity {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+        use utoipa::openapi::security::{
+            ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme,
+        };
 
         if let Some(components) = openapi.components.as_mut() {
             components.add_security_scheme(
@@ -344,6 +370,10 @@ impl utoipa::Modify for TaskSecurity {
                         .bearer_format("short-lived OIDC assertion")
                         .build(),
                 ),
+            );
+            components.add_security_scheme(
+                "browserSession",
+                SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new("__Host-steward-session"))),
             );
         }
     }
@@ -2950,7 +2980,8 @@ fn spec_digest(spec: &AgentRuntimeSpec) -> Result<String, ApiError> {
 #[cfg(test)]
 mod tests {
     use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode};
+    use axum::http::{Request, StatusCode, header};
+    use axum::response::Response;
     use k8s_openapi::api::authentication::v1::{TokenReviewStatus, UserInfo};
     use kube::ResourceExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2978,6 +3009,10 @@ mod tests {
     use utoipa::OpenApi;
     use uuid::Uuid;
 
+    use super::browser_admin;
+    use super::browser_auth::{
+        BrowserAuthService, LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service,
+    };
     use super::tasks::task_identity_from_token_review;
     use super::{
         AGENT_RUNS_API_VERSION, AdmissionContext, AdmissionLedger, AgentRunLedger, ApiDoc,
@@ -2991,6 +3026,85 @@ mod tests {
     };
 
     const KUBERNETES_TOKEN_REVIEW_AUDIENCE: &str = "https://kubernetes.default.svc";
+
+    fn browser_cookie(response: &Response, name: &str) -> Result<String, String> {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with(&format!("{name}=")))
+            .and_then(|value| value.split(';').next())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("response omitted {name} cookie"))
+    }
+
+    async fn signed_in_browser(
+        origin: &str,
+        identity: LocalFakeIdentity,
+    ) -> Result<(BrowserAuthService, String, String), String> {
+        let service = local_fake_browser_auth_service(origin, identity)?;
+        let login = browser_auth_router(service.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/auth/login")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build login request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute login request: {error}"))?;
+        let flow_cookie = browser_cookie(&login, "steward-local-oidc-flow")?;
+        let authorize = login
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "login omitted authorize redirect".to_owned())?;
+        let authorized = browser_auth_router(service.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(authorize)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build authorize request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute authorize request: {error}"))?;
+        let callback = authorized
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "authorize omitted callback redirect".to_owned())?;
+        let callback = browser_auth_router(service.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(callback)
+                    .header(header::COOKIE, flow_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build callback request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute callback request: {error}"))?;
+        let session_cookie = browser_cookie(&callback, "steward-local-session")?;
+        let session = browser_auth_router(service.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/session")
+                    .header(header::COOKIE, &session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build session request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute session request: {error}"))?;
+        let session = to_bytes(session.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read session response: {error}"))?;
+        let session: serde_json::Value = serde_json::from_slice(&session)
+            .map_err(|error| format!("parse session response: {error}"))?;
+        let csrf = session["csrf"]
+            .as_str()
+            .ok_or_else(|| "session response omitted CSRF".to_owned())?
+            .to_owned();
+        Ok((service, session_cookie, csrf))
+    }
 
     #[derive(Clone)]
     struct FakeAuthenticator;
@@ -3669,6 +3783,268 @@ mod tests {
                 "runtime create OpenAPI is missing its {schema} component"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn browser_session_is_published_as_an_opaque_cookie_openapi_contract() -> Result<(), String> {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        let operation = document
+            .pointer("/paths/~1admin~1api~1v1~1session/get")
+            .ok_or_else(|| "browser session operation is absent from OpenAPI".to_owned())?;
+        assert!(
+            operation
+                .pointer("/responses/200/content/application~1json/schema")
+                .is_some(),
+            "browser session must advertise its typed response schema"
+        );
+        for status in ["401", "503"] {
+            assert!(
+                operation.pointer(&format!("/responses/{status}")).is_some(),
+                "browser session OpenAPI is missing its {status} response"
+            );
+        }
+        let cookie = document
+            .pointer("/components/securitySchemes/browserSession")
+            .ok_or_else(|| "opaque browser session security scheme is absent".to_owned())?;
+        assert_eq!(
+            cookie.pointer("/type").and_then(serde_json::Value::as_str),
+            Some("apiKey")
+        );
+        assert_eq!(
+            cookie.pointer("/in").and_then(serde_json::Value::as_str),
+            Some("cookie")
+        );
+        assert_eq!(
+            cookie.pointer("/name").and_then(serde_json::Value::as_str),
+            Some("__Host-steward-session")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn next_presentation_browser_apis_are_published_as_typed_cookie_scoped_contracts()
+    -> Result<(), String> {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        let operations = [
+            ("/paths/~1app~1api~1v1~1envelope-templates/get", "200"),
+            ("/paths/~1app~1api~1v1~1envelope-requests/get", "200"),
+            ("/paths/~1app~1api~1v1~1envelope-requests/post", "201"),
+            (
+                "/paths/~1app~1api~1v1~1envelope-requests~1{request_id}/get",
+                "200",
+            ),
+            (
+                "/paths/~1app~1api~1v1~1envelope-requests~1{request_id}~1github-actions-workflow/post",
+                "200",
+            ),
+            ("/paths/~1app~1api~1v1~1runs/get", "200"),
+            ("/paths/~1app~1api~1v1~1runs~1{task_uid}/get", "200"),
+            (
+                "/paths/~1app~1api~1v1~1runs~1{task_uid}~1timeline/get",
+                "200",
+            ),
+            ("/paths/~1admin~1api~1v1~1all-runs/get", "200"),
+            ("/paths/~1admin~1api~1v1~1all-runs~1{task_uid}/get", "200"),
+            (
+                "/paths/~1admin~1api~1v1~1all-runs~1{task_uid}~1timeline/get",
+                "200",
+            ),
+            ("/paths/~1admin~1api~1v1~1connections~1github/get", "200"),
+            (
+                "/paths/~1admin~1api~1v1~1connections~1github~1start/post",
+                "200",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1connections~1github~1disconnect/post",
+                "204",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/get",
+                "200",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/post",
+                "201",
+            ),
+            ("/paths/~1admin~1api~1v1~1approvals/get", "200"),
+            (
+                "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1approve/post",
+                "204",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1file/post",
+                "200",
+            ),
+        ];
+        for (pointer, success_status) in operations {
+            let operation = document
+                .pointer(pointer)
+                .ok_or_else(|| format!("browser API operation is absent at {pointer}"))?;
+            assert!(
+                operation
+                    .pointer(&format!("/responses/{success_status}"))
+                    .is_some(),
+                "browser API at {pointer} is missing success response {success_status}"
+            );
+            assert!(
+                operation.pointer("/responses/401").is_some(),
+                "browser API at {pointer} is missing its unauthorized response"
+            );
+            assert_eq!(
+                operation
+                    .pointer("/security/0/browserSession")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::len),
+                Some(0),
+                "browser API at {pointer} must use the opaque browser cookie"
+            );
+            if success_status != "204" {
+                assert!(
+                    operation
+                        .pointer(&format!(
+                            "/responses/{success_status}/content/application~1json/schema"
+                        ))
+                        .is_some(),
+                    "browser API at {pointer} must advertise a typed JSON response"
+                );
+            }
+        }
+        for pointer in [
+            "/paths/~1app~1api~1v1~1envelope-requests/post",
+            "/paths/~1app~1api~1v1~1envelope-requests~1{request_id}~1github-actions-workflow/post",
+            "/paths/~1admin~1api~1v1~1connections~1github~1start/post",
+            "/paths/~1admin~1api~1v1~1connections~1github~1disconnect/post",
+            "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/post",
+            "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1approve/post",
+            "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1file/post",
+        ] {
+            let operation = document
+                .pointer(pointer)
+                .ok_or_else(|| format!("browser mutation is absent at {pointer}"))?;
+            assert!(
+                operation.pointer("/responses/403").is_some(),
+                "browser mutation at {pointer} is missing its CSRF/origin rejection"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_admin_routes_require_cookie_admin_and_exact_mutation_proof_and_audit_canonical_actor()
+    -> Result<(), String> {
+        let origin = "http://127.0.0.1:33002";
+        let runtime_repository = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let user_ledger = ledger();
+        let (user_auth, user_cookie, _) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let user_app = browser_admin::protected_router(
+            runtime_repository.clone(),
+            user_ledger,
+            FakeDecisionChannel::default(),
+            user_auth,
+        );
+        let forbidden = user_app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/envelope-templates/engineer")
+                    .header(header::COOKIE, user_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build user template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute user template request: {error}"))?;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let admin_ledger = ledger();
+        let (admin_auth, admin_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let admin_app = browser_admin::protected_router(
+            runtime_repository,
+            admin_ledger.clone(),
+            FakeDecisionChannel::default(),
+            admin_auth,
+        );
+        let bearer_only = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/approvals")
+                    .header(header::AUTHORIZATION, "Bearer admin-session")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build bearer approval request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute bearer approval request: {error}"))?;
+        assert_eq!(bearer_only.status(), StatusCode::UNAUTHORIZED);
+
+        let template = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/envelope-templates/engineer")
+                    .header(header::COOKIE, &admin_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build admin template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute admin template request: {error}"))?;
+        assert_eq!(template.status(), StatusCode::OK);
+
+        let mut next = admin_ledger
+            .envelope
+            .lock()
+            .map_err(|_| "lock browser admin envelope")?
+            .clone();
+        next.revision += 1;
+        let body = serde_json::to_vec(&next)
+            .map_err(|error| format!("serialize browser admin envelope: {error}"))?;
+        let missing_proof = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-templates/engineer")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .map_err(|error| format!("build unproved template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute unproved template request: {error}"))?;
+        assert_eq!(missing_proof.status(), StatusCode::FORBIDDEN);
+
+        let created = admin_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-templates/engineer")
+                    .header(header::COOKIE, admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .map_err(|error| format!("build proved template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute proved template request: {error}"))?;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let authors = admin_ledger
+            .envelope_authors
+            .lock()
+            .map_err(|_| "lock browser envelope authors")?;
+        assert_eq!(authors.len(), 1);
+        assert_eq!(authors[0].0, "engineer");
+        assert_eq!(
+            authors[0].1, "usr_abcdef0123456789abcdef0123456789",
+            "browser writes must audit the canonical Rust-resolved actor, never display identity or UI state"
+        );
+        assert_eq!(authors[0].2, next);
         Ok(())
     }
 
@@ -4486,6 +4862,7 @@ mod tests {
     #[derive(Clone)]
     struct FakeLedger {
         envelope: Arc<Mutex<Envelope>>,
+        envelope_authors: Arc<Mutex<Vec<(String, String, Envelope)>>>,
         grants: Vec<AdmissionDelta>,
         parked: ParkedRows,
         decision_references: DecisionReferences,
@@ -4522,11 +4899,28 @@ mod tests {
     impl AdmissionLedger for FakeLedger {
         fn insert_envelope<'a>(
             &'a self,
-            _member_role: &'a str,
-            _envelope: &'a Envelope,
-            _authored_by: &'a str,
+            member_role: &'a str,
+            envelope: &'a Envelope,
+            authored_by: &'a str,
         ) -> BoxFuture<'a, Result<(), StoreError>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                self.envelope_authors
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake member-envelope author lock was poisoned".to_owned(),
+                        )
+                    })?
+                    .push((
+                        member_role.to_owned(),
+                        authored_by.to_owned(),
+                        envelope.clone(),
+                    ));
+                *self.envelope.lock().map_err(|_| {
+                    StoreError::Database("fake envelope lock was poisoned".to_owned())
+                })? = envelope.clone();
+                Ok(())
+            })
         }
 
         fn insert_service_envelope<'a>(
@@ -5289,6 +5683,7 @@ mod tests {
                     runner: steward_types::RunnerRequirements::default(),
                 },
             })),
+            envelope_authors: Arc::new(Mutex::new(Vec::new())),
             grants: Vec::new(),
             parked: Arc::new(Mutex::new(Vec::new())),
             decision_references: Arc::new(Mutex::new(Vec::new())),

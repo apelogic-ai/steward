@@ -10,6 +10,15 @@ images:
   mint:
     tag: ""
     digest: ""
+  web:
+    tag: ""
+    digest: ""
+web:
+  enabled: false
+  host: ""
+  ingress:
+    className: ""
+    tlsSecretName: ""
 secrets:
   database:
     name: steward-database
@@ -103,6 +112,7 @@ networkPolicy:
   postgresCidrs: []
   jiraCidrs: []
   browserAuthEgressCidrs: []
+  ingressNamespace: ingress-nginx
   burbleNamespace: burble
   arcNamespace: arc-runners
   mcpGatewayNamespace: mcp-gw
@@ -126,11 +136,14 @@ services:
   apiserverPort: 443
   webhookPort: 443
   mintPort: 8080
+  webPort: 3000
 replicaCount:
   apiserver: 1
   controller: 1
   mint: 1
+  web: 1
 resources:
   apiserver: {}
   controller: {}
   mint: {}
+  web: {}

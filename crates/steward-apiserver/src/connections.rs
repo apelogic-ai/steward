@@ -13,8 +13,8 @@ use steward_types::CanonicalUserId;
 
 use crate::BoxFuture;
 use crate::browser_auth::{
-    BrowserAuthService, BrowserMutationProof, BrowserSessionBinding, BrowserSessionContext,
-    protect_browser_routes,
+    BrowserAuthService, BrowserMutationProof, BrowserMutationRequest, BrowserSessionBinding,
+    BrowserSessionContext, protect_browser_routes,
 };
 
 pub const CONNECTIONS_API_VERSION: &str = "steward.connections/v1";
@@ -39,7 +39,7 @@ pub struct ConnectionSession<B> {
 #[derive(Clone, Copy)]
 pub(crate) struct ConnectionMutationProof;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionPhase {
     Disconnected,
@@ -49,7 +49,7 @@ pub enum ConnectionPhase {
     Unavailable,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConnectionStatus {
     pub phase: ConnectionPhase,
@@ -60,9 +60,9 @@ pub struct ProviderConnectionStatus {
     pub expires_at: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct ConnectionStatusResponse {
+pub(crate) struct ConnectionStatusResponse {
     api_version: &'static str,
     provider: &'static str,
     status: ProviderConnectionStatus,
@@ -74,10 +74,19 @@ struct ConnectionCallbackQuery {
     continuation: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct DisconnectConnectionRequest {
+pub(crate) struct DisconnectConnectionRequest {
     confirm: bool,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StartConnectionResponse {
+    api_version: &'static str,
+    provider: &'static str,
+    /// One-time HTTPS destination. It must not be persisted or logged by clients.
+    authorization_url: String,
 }
 
 /// One-time browser destination. It intentionally implements neither `Debug` nor `Display`.
@@ -182,7 +191,7 @@ where
 }
 
 #[derive(Clone)]
-struct ConnectionsState<P> {
+pub(crate) struct ConnectionsState<P> {
     broker: P,
 }
 
@@ -254,10 +263,26 @@ where
     inner_router(broker)
 }
 
-async fn start_connection<P, B>(
+#[utoipa::path(
+    post,
+    path = "/admin/api/v1/connections/github/start",
+    params(("X-Steward-CSRF" = String, Header)),
+    request_body = BrowserMutationRequest,
+    responses(
+        (status = 200, body = StartConnectionResponse),
+        (status = 400, description = "Mutation JSON is malformed"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 502, description = "Provider continuation is invalid"),
+        (status = 503, description = "Connection broker is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn start_connection<P, B>(
     session: Option<Extension<ConnectionSession<B>>>,
     proof: Option<Extension<ConnectionMutationProof>>,
     State(state): State<ConnectionsState<P>>,
+    Json(_request): Json<BrowserMutationRequest>,
 ) -> Response
 where
     P: ProviderConnectionBroker<B>,
@@ -270,11 +295,11 @@ where
         return StatusCode::FORBIDDEN.into_response();
     }
     match state.broker.start(&session).await {
-        Ok(authorization_url) => Json(serde_json::json!({
-            "apiVersion": CONNECTIONS_API_VERSION,
-            "provider": "github",
-            "authorizationUrl": authorization_url.as_str(),
-        }))
+        Ok(authorization_url) => Json(StartConnectionResponse {
+            api_version: CONNECTIONS_API_VERSION,
+            provider: "github",
+            authorization_url: authorization_url.as_str().to_owned(),
+        })
         .into_response(),
         Err(ConnectionBrokerError::Unavailable) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(ConnectionBrokerError::FastTrackUnavailable(stage)) => {
@@ -319,7 +344,22 @@ where
     }
 }
 
-async fn disconnect_connection<P, B>(
+#[utoipa::path(
+    post,
+    path = "/admin/api/v1/connections/github/disconnect",
+    params(("X-Steward-CSRF" = String, Header)),
+    request_body = DisconnectConnectionRequest,
+    responses(
+        (status = 204, description = "Connection was disconnected"),
+        (status = 400, description = "Explicit confirmation is required"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 502, description = "Provider state is invalid"),
+        (status = 503, description = "Connection broker is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn disconnect_connection<P, B>(
     session: Option<Extension<ConnectionSession<B>>>,
     proof: Option<Extension<ConnectionMutationProof>>,
     State(state): State<ConnectionsState<P>>,
@@ -351,7 +391,18 @@ where
     }
 }
 
-async fn connection_status<P, B>(
+#[utoipa::path(
+    get,
+    path = "/admin/api/v1/connections/github",
+    responses(
+        (status = 200, body = ConnectionStatusResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 502, description = "Provider state is invalid"),
+        (status = 503, body = ConnectionStatusResponse)
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn connection_status<P, B>(
     session: Option<Extension<ConnectionSession<B>>>,
     State(state): State<ConnectionsState<P>>,
 ) -> Response

@@ -1,13 +1,24 @@
 {
   "name": "steward-ui-assembly",
   "private": true,
+  "packageManager": "bun@1.2.21",
+  "workspaces": [
+    "web"
+  ],
   "engines": {
+    "bun": "1.2.21",
     "node": "26.5.0"
   },
   "devDependencies": {
     "@playwright/test": "1.62.1"
   },
   "scripts": {
-    "test:browser-e2e": "playwright test --config tests/browser/playwright.config.mjs"
+    "test:browser-e2e": "playwright test --config tests/browser/playwright.config.mjs",
+    "web:build": "bun run web:generate-api && bun run --cwd web build",
+    "web:check": "bun run web:check-generated && bun run --cwd web check",
+    "web:check-generated": "bun run web:generate-api && git diff --exit-code -- web/src/api-client",
+    "web:dev": "bun run --cwd web dev",
+    "web:export-openapi": "cargo run --quiet -p steward-apiserver --example export-openapi -- target/steward-openapi.json",
+    "web:generate-api": "bun run web:export-openapi && bun run --cwd web generate:api"
   }
 }
