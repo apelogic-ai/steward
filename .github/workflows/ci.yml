@@ -361,6 +361,35 @@ jobs:
           exit-code: "1"
           severity: CRITICAL
 
+  arm64-release-candidate:
+    name: release / arm64 chart and images
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Helm
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+          workflow-tools: "true"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Set up QEMU for arm64 image validation
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.6.0
+        with:
+          platforms: arm64
+
+      - name: Render the chart and build all arm64 component images
+        env:
+          RELEASE_IMAGE_PLATFORM: linux/arm64
+        run: scripts/validate-release-artifacts.sh --build-images
+
   pinned:
     name: pinned
     if: always()
@@ -376,6 +405,7 @@ jobs:
       - postgres-tls
       - browser-e2e
       - release-candidate
+      - arm64-release-candidate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -393,6 +423,7 @@ jobs:
           POSTGRES_TLS: ${{ needs.postgres-tls.result }}
           BROWSER_E2E: ${{ needs.browser-e2e.result }}
           RELEASE_CANDIDATE: ${{ needs.release-candidate.result }}
+          ARM64_RELEASE_CANDIDATE: ${{ needs.arm64-release-candidate.result }}
         run: |
           set -euo pipefail
           for result in \
@@ -406,7 +437,8 @@ jobs:
             "${OPENSHELL_ADAPTER}" \
             "${POSTGRES_TLS}" \
             "${BROWSER_E2E}" \
-            "${RELEASE_CANDIDATE}"
+            "${RELEASE_CANDIDATE}" \
+            "${ARM64_RELEASE_CANDIDATE}"
           do
             if [[ "${result}" != "success" ]]; then
               echo "a required pinned functional lane ended with: ${result}" >&2

@@ -93,6 +93,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
+      - name: Set up QEMU for arm64 component images
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.6.0
+        with:
+          platforms: arm64
+
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
@@ -110,7 +115,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/steward:${{ steps.version.outputs.version }}-${{ matrix.component }}
           build-args: BINARY=${{ matrix.binary }}
@@ -444,51 +449,53 @@ jobs:
             printf 'chart-digest=%s\n' "$source_chart_digest"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Wait for and enforce native ECR image scans
+      - name: Wait for and enforce ECR scans on every runnable platform
         run: |
           set -euo pipefail
           scan_failed=0
           for component in apiserver controller mint bridge; do
             index_digest="$(cat "dist/ecr-$component.digest")"
             index_ref="$ECR_REGISTRY/$STEWARD_ECR_IMAGE_REPOSITORY@$index_digest"
-            if ! platform_digest="$(scripts/resolve-ecr-platform-digest.sh \
-              "$index_ref" linux amd64)"
-            then
-              echo "runnable linux/amd64 manifest resolution failed for $component@$index_digest" >&2
-              scan_failed=1
-              continue
-            fi
-            printf '%s\n' "$platform_digest" > "dist/ecr-$component-scan-platform.digest"
-            report="dist/ecr-$component-scan.json"
-            if ! aws ecr wait image-scan-complete \
-              --repository-name "$STEWARD_ECR_IMAGE_REPOSITORY" \
-              --image-id "imageDigest=$platform_digest"
-            then
-              echo "ECR scan did not complete for $component platform $platform_digest (index $index_digest)" >&2
-              scan_failed=1
-              continue
-            fi
-            if ! aws ecr describe-image-scan-findings \
-              --repository-name "$STEWARD_ECR_IMAGE_REPOSITORY" \
-              --image-id "imageDigest=$platform_digest" \
-              --output json > "$report"
-            then
-              echo "ECR scan findings were unavailable for $component platform $platform_digest (index $index_digest)" >&2
-              scan_failed=1
-              continue
-            fi
-            critical="$(jq '[
-              .imageScanFindings.findingSeverityCounts.CRITICAL // 0,
-              ([.imageScanFindings.enhancedFindings[]? | select(.severity == "CRITICAL")] | length)
-            ] | max' "$report")"
-            if [[ "$critical" -ne 0 ]]; then
-              echo "ECR reported $critical critical findings for $component platform $platform_digest (index $index_digest)" >&2
-              scan_failed=1
-            fi
+            for architecture in amd64 arm64; do
+              if ! platform_digest="$(scripts/resolve-ecr-platform-digest.sh \
+                "$index_ref" linux "$architecture")"
+              then
+                echo "runnable linux/$architecture manifest resolution failed for $component@$index_digest" >&2
+                scan_failed=1
+                continue
+              fi
+              printf '%s\n' "$platform_digest" > "dist/ecr-$component-scan-platform-$architecture.digest"
+              report="dist/ecr-$component-scan-$architecture.json"
+              if ! aws ecr wait image-scan-complete \
+                --repository-name "$STEWARD_ECR_IMAGE_REPOSITORY" \
+                --image-id "imageDigest=$platform_digest"
+              then
+                echo "ECR scan did not complete for $component linux/$architecture platform $platform_digest (index $index_digest)" >&2
+                scan_failed=1
+                continue
+              fi
+              if ! aws ecr describe-image-scan-findings \
+                --repository-name "$STEWARD_ECR_IMAGE_REPOSITORY" \
+                --image-id "imageDigest=$platform_digest" \
+                --output json > "$report"
+              then
+                echo "ECR scan findings were unavailable for $component linux/$architecture platform $platform_digest (index $index_digest)" >&2
+                scan_failed=1
+                continue
+              fi
+              critical="$(jq '[
+                .imageScanFindings.findingSeverityCounts.CRITICAL // 0,
+                ([.imageScanFindings.enhancedFindings[]? | select(.severity == "CRITICAL")] | length)
+              ] | max' "$report")"
+              if [[ "$critical" -ne 0 ]]; then
+                echo "ECR reported $critical critical findings for $component linux/$architecture platform $platform_digest (index $index_digest)" >&2
+                scan_failed=1
+              fi
+            done
           done
           test "$scan_failed" -eq 0
 
-      - name: Retain native ECR scan evidence
+      - name: Retain ECR scan evidence for every runnable platform
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
@@ -577,14 +584,15 @@ jobs:
           {
             printf '# Steward private registry handoff %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
-            printf '| Artifact | Immutable reference | Scanned linux/amd64 digest |\n|---|---|---|\n'
+            printf '| Artifact | Immutable reference | Scanned linux/amd64 digest | Scanned linux/arm64 digest |\n|---|---|---|---|\n'
             for component in apiserver controller mint bridge; do
-              printf '| %s | %s:%s-%s@%s | %s |\n' \
+              printf '| %s | %s:%s-%s@%s | %s | %s |\n' \
                 "$component" "$IMAGE_REPOSITORY" "$version" "$component" \
                 "$(cat "dist/ecr-$component.digest")" \
-                "$(cat "dist/ecr-$component-scan-platform.digest")"
+                "$(cat "dist/ecr-$component-scan-platform-amd64.digest")" \
+                "$(cat "dist/ecr-$component-scan-platform-arm64.digest")"
             done
-            printf '| chart | oci://%s@%s | n/a |\n' \
+            printf '| chart | oci://%s@%s | n/a | n/a |\n' \
               "$CHART_REPOSITORY" "$(cat dist/ecr-helm-chart.digest)"
             printf '\n## Stable bridge provenance inputs\n\n'
             printf 'Bridge ECR image: %s@%s\n\n' "$IMAGE_REPOSITORY" "$bridge_digest"
@@ -679,6 +687,14 @@ jobs:
             done
             printf '| chart | oci://%s:%s | %s |\n' \
               "$chart" "$version" "$(cat dist/helm-chart.digest)"
+            printf '\n## Runnable image platform manifests\n\n'
+            printf '| Component | linux/amd64 digest | linux/arm64 digest |\n|---|---|---|\n'
+            for component in apiserver controller mint bridge; do
+              index="$(cat "dist/$component.digest")"
+              amd64="$(scripts/resolve-ecr-platform-digest.sh "$repository@$index" linux amd64)"
+              arm64="$(scripts/resolve-ecr-platform-digest.sh "$repository@$index" linux arm64)"
+              printf '| %s | %s | %s |\n' "$component" "$amd64" "$arm64"
+            done
             printf '\n## Stable bridge provenance inputs\n\n'
             printf 'Bridge image: %s@%s\n\n' "$repository" "$bridge_digest"
             printf 'Bridge signer identity: %s\n\n' "$bridge_signer_identity"

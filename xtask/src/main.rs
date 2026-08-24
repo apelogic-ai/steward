@@ -2128,8 +2128,9 @@ mod tests {
             "scripts/test-promote-ecr-artifact.sh",
             "scripts/resolve-ecr-platform-digest.sh",
             "scripts/test-resolve-ecr-platform-digest.sh",
-            "ecr-$component-scan-platform.digest",
+            "ecr-$component-scan-platform-$architecture.digest",
             "Scanned linux/amd64 digest",
+            "Scanned linux/arm64 digest",
         ] {
             assert!(
                 workflow.contains(required) || release_validation.contains(required),
@@ -2191,8 +2192,8 @@ mod tests {
             "component tags must match the published chart contract"
         );
         assert!(
-            workflow.contains("platforms: linux/amd64"),
-            "release images must publish the supported linux/amd64 runtime platform explicitly"
+            workflow.contains("platforms: linux/amd64,linux/arm64"),
+            "release images must publish both supported runtime platforms explicitly"
         );
         assert!(
             workflow.contains("push:\n    tags:"),
@@ -2223,7 +2224,7 @@ mod tests {
         for required in [
             "helm template steward",
             "docker build",
-            "docker run --rm --entrypoint /bin/sh",
+            "docker run --rm --platform \"${release_image_platform}\" --entrypoint /bin/sh",
             "command -v tar",
             "command -v ip",
             "test -w /sandbox",

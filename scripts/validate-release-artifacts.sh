@@ -403,18 +403,25 @@ if grep -q '^kind: Ingress$' "${rendered}"; then
 fi
 
 if [[ "${1:-}" == "--build-images" ]]; then
+  release_image_platform="${RELEASE_IMAGE_PLATFORM:-linux/amd64}"
+  [[ "${release_image_platform}" == linux/amd64 || "${release_image_platform}" == linux/arm64 ]] || {
+    echo "RELEASE_IMAGE_PLATFORM must be linux/amd64 or linux/arm64" >&2
+    exit 2
+  }
   for component in apiserver controller mint; do
     docker build \
+      --platform "${release_image_platform}" \
       --file "${root}/build/package.Dockerfile" \
       --build-arg "BINARY=steward-${component}-bin" \
       --tag "steward-${component}:release-validation" \
       "${root}"
   done
   docker build \
+    --platform "${release_image_platform}" \
     --file "${root}/build/connections-bridge.Dockerfile" \
     --tag "steward-bridge:release-validation" \
     "${root}"
-  docker run --rm --entrypoint /bin/sh steward-bridge:release-validation -ceu '
+  docker run --rm --platform "${release_image_platform}" --entrypoint /bin/sh steward-bridge:release-validation -ceu '
     command -v tar >/dev/null
     command -v ip >/dev/null
     command -v mkdir >/dev/null
@@ -444,7 +451,7 @@ users:
       token: synthetic-token
 EOF
   chmod 0644 "${mint_synthetic_kubeconfig}"
-  if docker run --rm --network none \
+  if docker run --rm --platform "${release_image_platform}" --network none \
     --env KUBECONFIG=/run/steward-release/kubeconfig \
     --volume "${mint_synthetic_kubeconfig}:/run/steward-release/kubeconfig:ro" \
     steward-mint:release-validation > "${mint_startup_output}" 2>&1
@@ -462,6 +469,26 @@ elif [[ -n "${1:-}" ]]; then
   echo "usage: $0 [--build-images]" >&2
   exit 2
 fi
+
+release_workflow="${root}/.github/workflows/release.yml"
+ci_workflow="${root}/.github/workflows/ci.yml"
+for required in \
+  'docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130' \
+  'platforms: linux/amd64,linux/arm64' \
+  'for architecture in amd64 arm64; do' \
+  'ecr-$component-scan-platform-$architecture.digest' \
+  'Runnable image platform manifests'
+do
+  grep -Fq -- "${required}" "${release_workflow}"
+done
+for required in \
+  'arm64-release-candidate:' \
+  'RELEASE_IMAGE_PLATFORM: linux/arm64' \
+  'Render the chart and build all arm64 component images' \
+  'ARM64_RELEASE_CANDIDATE: ${{ needs.arm64-release-candidate.result }}'
+do
+  grep -Fq -- "${required}" "${ci_workflow}"
+done
 
 "${root}/scripts/test-promote-ecr-artifact.sh"
 "${root}/scripts/test-resolve-ecr-platform-digest.sh"
