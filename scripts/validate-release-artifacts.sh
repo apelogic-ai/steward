@@ -472,11 +472,12 @@ fi
 
 release_workflow="${root}/.github/workflows/release.yml"
 ci_workflow="${root}/.github/workflows/ci.yml"
+workflow_dollar='$'
 for required in \
   'docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130' \
   'platforms: linux/amd64,linux/arm64' \
   'for architecture in amd64 arm64; do' \
-  'ecr-$component-scan-platform-$architecture.digest' \
+  "ecr-${workflow_dollar}component-scan-platform-${workflow_dollar}architecture.digest" \
   'Runnable image platform manifests'
 do
   grep -Fq -- "${required}" "${release_workflow}"
@@ -485,7 +486,7 @@ for required in \
   'arm64-release-candidate:' \
   'RELEASE_IMAGE_PLATFORM: linux/arm64' \
   'Render the chart and build all arm64 component images' \
-  'ARM64_RELEASE_CANDIDATE: ${{ needs.arm64-release-candidate.result }}'
+  "ARM64_RELEASE_CANDIDATE: ${workflow_dollar}{{ needs.arm64-release-candidate.result }}"
 do
   grep -Fq -- "${required}" "${ci_workflow}"
 done
