@@ -2556,7 +2556,8 @@ const TASK_WORK_ITEMS_QUERY: &str = "SELECT * FROM task_submissions \
      WHERE identity_binding_state = 'bound' AND (\
             (runtime_ownership = 'provisioned' AND runtime_uid IS NULL \
              AND phase IN ('submitted', 'queued') AND NOT finalize_requested) \
-            OR (execute_requested AND phase IN ('parked', 'queued')) \
+            OR (execute_requested AND phase IN ('parked', 'queued') \
+                AND NOT finalize_requested AND NOT finalized) \
             OR (finalize_requested AND NOT finalized)\
      ) \
      ORDER BY created_at, task_uid";
@@ -2570,6 +2571,16 @@ mod task_work_queue_tests {
         assert!(
             TASK_WORK_ITEMS_QUERY.contains("WHERE identity_binding_state = 'bound' AND ("),
             "the normal controller queue must exclude legacy_reconnect_required and every other non-bound historical identity state"
+        );
+    }
+
+    #[test]
+    fn finalized_execute_requests_are_not_normal_controller_work() {
+        assert!(
+            TASK_WORK_ITEMS_QUERY.contains(
+                "(execute_requested AND phase IN ('parked', 'queued') AND NOT finalize_requested AND NOT finalized)"
+            ),
+            "an execute request must not keep a finalizing or finalized Task in the controller queue"
         );
     }
 }
