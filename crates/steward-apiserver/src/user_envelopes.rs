@@ -1137,7 +1137,9 @@ mod tests {
             .ok_or_else(|| "render response omitted YAML".to_owned())?;
         assert!(yaml.contains("# envelope-id: env_local_test"));
         assert!(yaml.contains("      workflow: repository-review@1"));
-        assert!(yaml.contains("uses: apelogic-ai/steward-run/.github/workflows/steward-task.yml@"));
+        assert!(yaml.contains(
+            "uses: apelogic-ai/steward-run/.github/workflows/steward-task-self-hosted.yml@be04cf3acf43237327c26a06a36d784eadfdbe7a"
+        ));
         assert!(!yaml.contains("contents: write"));
         assert!(!yaml.contains("coding-agent-runtime"));
         assert!(!yaml.contains("TARGET_REVISION"));

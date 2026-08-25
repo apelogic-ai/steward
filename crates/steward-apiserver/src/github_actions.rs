@@ -14,7 +14,10 @@ pub const GITHUB_FILE_READ_TEMPLATE: &str = "github-file-read/v1";
 
 const REVIEWED_STEWARD_RUN_WORKFLOW_COMMIT: &str = "9c7487bd18d5e90b24b3e4b296bfdd232a3f4f5a";
 const REVIEWED_STEWARD_RUN_ACTION_COMMIT: &str = "b26790e29ce9c243c6a7aa00450a2a1a98fbd250";
-const VERSIONED_STEWARD_RUN_WORKFLOW_COMMIT: &str = "894d50f44da45bb26e4838a35ac247ae7ce9646f";
+// Versioned Workflow runs are executed by the separately reviewed self-hosted
+// reusable workflow. It preserves GitHub's `job_workflow_ref` OIDC claim while
+// intentionally avoiding the ARC/ECR job container used by the legacy lane.
+const VERSIONED_STEWARD_RUN_WORKFLOW_COMMIT: &str = "be04cf3acf43237327c26a06a36d784eadfdbe7a";
 const VERSIONED_STEWARD_RUN_ACTION_COMMIT: &str = "19230cc59a6b1246224912961e35c7044b0808d3";
 const REVIEWED_STEWARD_RUN_JOB_CONTAINER: &str = "663383948333.dkr.ecr.us-east-1.amazonaws.com/steward-run@sha256:27235891b596debb1d8bba5f7763e14a56ce4435e2fc82f3de80122b19ff8c61";
 
@@ -144,7 +147,7 @@ pub fn render_versioned_github_actions_workflow(
         "      contents: read".to_owned(),
         "      id-token: write".to_owned(),
         format!(
-            "    uses: apelogic-ai/steward-run/.github/workflows/steward-task.yml@{}",
+            "    uses: apelogic-ai/steward-run/.github/workflows/steward-task-self-hosted.yml@{}",
             release.workflow_commit
         ),
         "    with:".to_owned(),
@@ -606,7 +609,7 @@ mod tests {
 
     const WORKFLOW_COMMIT: &str = "9c7487bd18d5e90b24b3e4b296bfdd232a3f4f5a";
     const ACTION_COMMIT: &str = "b26790e29ce9c243c6a7aa00450a2a1a98fbd250";
-    const VERSIONED_WORKFLOW_COMMIT: &str = "894d50f44da45bb26e4838a35ac247ae7ce9646f";
+    const VERSIONED_WORKFLOW_COMMIT: &str = "be04cf3acf43237327c26a06a36d784eadfdbe7a";
     const VERSIONED_ACTION_COMMIT: &str = "19230cc59a6b1246224912961e35c7044b0808d3";
     const JOB_CONTAINER: &str = "663383948333.dkr.ecr.us-east-1.amazonaws.com/steward-run@sha256:27235891b596debb1d8bba5f7763e14a56ce4435e2fc82f3de80122b19ff8c61";
 
@@ -640,6 +643,13 @@ mod tests {
                 .yaml
                 .contains("      workflow: repository-review@1")
         );
+        assert!(
+            generated.yaml.contains(
+                "uses: apelogic-ai/steward-run/.github/workflows/steward-task-self-hosted.yml@be04cf3acf43237327c26a06a36d784eadfdbe7a"
+            ),
+            "versioned runs must preserve reusable-workflow OIDC provenance without inheriting the ARC ECR container"
+        );
+        assert!(!generated.yaml.contains("steward-task.yml@"));
         assert!(!generated.yaml.contains("coding-agent-runtime"));
         assert!(!generated.yaml.contains("TARGET_REVISION"));
         assert!(!generated.yaml.contains("TARGET_PATH"));
