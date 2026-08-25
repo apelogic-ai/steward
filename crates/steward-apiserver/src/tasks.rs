@@ -339,11 +339,11 @@ impl StaticTaskWorkflowCatalog {
                     .to_owned(),
             );
         }
-        let catalog = Self::new(workflows);
-        if catalog.workflows.is_empty() {
-            return Err("task workflow catalog must not be empty".to_owned());
-        }
-        Ok(catalog)
+        // Versioned Workflows are stored separately and may be the only task
+        // submission path.  An empty legacy catalog is therefore valid: no
+        // legacy workflow can resolve, while a versioned `name@version`
+        // reference remains governed by the persisted Workflow repository.
+        Ok(Self::new(workflows))
     }
 }
 
@@ -1335,7 +1335,10 @@ fn stable_task_runtime_name(
 
 #[cfg(test)]
 mod workflow_request_tests {
-    use super::{resolve_versioned_task_plan, versioned_workflow_reference};
+    use super::{
+        StaticTaskWorkflowCatalog, TaskWorkflowCatalog, resolve_versioned_task_plan,
+        versioned_workflow_reference,
+    };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{Envelope, EnvelopeSpec};
     use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, WorkflowRevisionRecord};
@@ -1365,6 +1368,13 @@ mod workflow_request_tests {
                 "malformed versioned reference {workflow:?} must not reach the legacy path"
             );
         }
+    }
+
+    #[test]
+    fn empty_legacy_catalog_allows_versioned_only_deployments() {
+        let catalog = StaticTaskWorkflowCatalog::from_json("[]")
+            .expect("a versioned-Workflow deployment may omit legacy workflows");
+        assert!(catalog.workflow("legacy-smoke").is_none());
     }
 
     fn identity(user_id: &str) -> Result<TaskIdentity, String> {
