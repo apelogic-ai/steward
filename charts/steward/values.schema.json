@@ -166,7 +166,8 @@
         "keyId",
         "signingKeySecret",
         "publicJwksConfigMap",
-        "serviceAccountTokenAudience"
+        "serviceAccountTokenAudience",
+        "loopbackProxy"
       ],
       "properties": {
         "enabled": {"type": "boolean"},
@@ -187,7 +188,36 @@
           "required": ["name", "key"],
           "properties": {"name": {"type": "string"}, "key": {"type": "string"}}
         },
-        "serviceAccountTokenAudience": {"type": "string"}
+        "serviceAccountTokenAudience": {"type": "string"},
+        "loopbackProxy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "image", "targetHost", "targetPort"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "image": {"type": "string"},
+            "targetHost": {"type": "string"},
+            "targetPort": {"type": "integer"}
+          },
+          "oneOf": [
+            {
+              "properties": {
+                "enabled": {"const": false},
+                "image": {"const": ""},
+                "targetHost": {"const": ""},
+                "targetPort": {"const": 0}
+              }
+            },
+            {
+              "properties": {
+                "enabled": {"const": true},
+                "image": {"type": "string", "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"},
+                "targetHost": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$"},
+                "targetPort": {"type": "integer", "minimum": 1, "maximum": 65535}
+              }
+            }
+          ]
+        }
       },
       "oneOf": [
         {
@@ -204,7 +234,15 @@
             "publicJwksConfigMap": {
               "properties": {"name": {"const": ""}, "key": {"const": ""}}
             },
-            "serviceAccountTokenAudience": {"const": ""}
+            "serviceAccountTokenAudience": {"const": ""},
+            "loopbackProxy": {
+              "properties": {
+                "enabled": {"const": false},
+                "image": {"const": ""},
+                "targetHost": {"const": ""},
+                "targetPort": {"const": 0}
+              }
+            }
           }
         },
         {
@@ -503,6 +541,28 @@
                   "tlsSecretName": {"$ref": "#/definitions/nonempty"}
                 }
               }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "browserHop1": {
+            "properties": {
+              "loopbackProxy": {
+                "properties": {"enabled": {"const": true}}
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "browserHop1": {
+            "properties": {
+              "mcpGatewayOrigin": {"const": "http://127.0.0.1:18080"}
             }
           }
         }

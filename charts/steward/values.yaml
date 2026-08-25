@@ -64,6 +64,14 @@ browserHop1:
     name: ""
     key: ""
   serviceAccountTokenAudience: ""
+  # A local-only TCP bridge may expose an in-cluster HTTP provider endpoint
+  # to the browser-session broker's explicit 127.0.0.1 origin. It is disabled
+  # by default and every enabled input is immutable and explicit.
+  loopbackProxy:
+    enabled: false
+    image: ""
+    targetHost: ""
+    targetPort: 0
 workloadExchangeTrust:
   name: steward-workload-exchange-ca
   caCertificate: ca.crt

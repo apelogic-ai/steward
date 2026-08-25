@@ -95,6 +95,14 @@ to the rendered apiserver service account and must project the same public
 JWKS into Identity. The chart does not create signing keys, JWKS, Identity
 policy, an OAuth client, or a public edge.
 
+For a local topology whose MCP-GW provider wrapper is HTTP-only inside the
+cluster, `browserHop1.loopbackProxy` can explicitly add one immutable
+`socat` sidecar. It is disabled by default. When enabled it accepts traffic
+only on the apiserver pod's `127.0.0.1:18080`, forwards only to the configured
+Kubernetes service host/port, and requires `mcpGatewayOrigin` to be exactly
+`http://127.0.0.1:18080`. This is a local network adapter—not a browser
+endpoint, credential store, or relaxed production TLS mode.
+
 The globally bound controller and mint ClusterRoles have no Secret verbs.
 Runtime Secret access is granted by namespaced Roles and RoleBindings only for
 names listed in `runtimeNamespaces`. The default is an empty list, so a release

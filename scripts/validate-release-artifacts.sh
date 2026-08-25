@@ -13,6 +13,7 @@ browser_auth_deployment="$(mktemp)"
 browser_hop1_rendered="$(mktemp)"
 browser_hop1_deployment="$(mktemp)"
 browser_hop1_loopback_rendered="$(mktemp)"
+browser_hop1_loopback_proxy_rendered="$(mktemp)"
 web_rendered="$(mktemp)"
 web_deployment="$(mktemp)"
 mint_synthetic_kubeconfig="$(mktemp)"
@@ -31,6 +32,7 @@ cleanup() {
     "${stable_bridge_controller_deployment}" "${browser_auth_rendered}" \
     "${browser_auth_deployment}" "${browser_hop1_rendered}" \
     "${browser_hop1_deployment}" "${browser_hop1_loopback_rendered}" \
+    "${browser_hop1_loopback_proxy_rendered}" \
     "${web_rendered}" "${web_deployment}" \
     "${mint_synthetic_kubeconfig}" "${mint_startup_output}"
   exit "${status}"
@@ -315,6 +317,76 @@ helm template steward "${root}/charts/steward" \
   --set-string browserHop1.publicJwksConfigMap.key=jwks.json \
   --set-string browserHop1.serviceAccountTokenAudience=identity-browser-hop1 > "${browser_hop1_loopback_rendered}"
 grep -Fxq '            - { name: STEWARD_MCP_GW_ORIGIN, value: "http://127.0.0.1:18080" }' "${browser_hop1_loopback_rendered}"
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
+  --set browserHop1.enabled=true \
+  --set-string browserHop1.mcpGatewayOrigin=http://127.0.0.1:18080 \
+  --set-string browserHop1.identityEndpoint=https://identity.example.test:8443/v1/browser-hop1/exchange \
+  --set-string browserHop1.issuer=https://steward.example.test \
+  --set-string browserHop1.assertionAudience=identity-browser-hop1 \
+  --set-string browserHop1.keyId=steward-browser-hop1-current \
+  --set-string browserHop1.signingKeySecret.name=steward-browser-hop1 \
+  --set-string browserHop1.signingKeySecret.key=signing-key.der \
+  --set-string browserHop1.publicJwksConfigMap.name=steward-browser-hop1-jwks \
+  --set-string browserHop1.publicJwksConfigMap.key=jwks.json \
+  --set-string browserHop1.serviceAccountTokenAudience=identity-browser-hop1 \
+  --set browserHop1.loopbackProxy.enabled=true \
+  --set-string browserHop1.loopbackProxy.image=example.test/local-socat@sha256:4444444444444444444444444444444444444444444444444444444444444444 \
+  --set-string browserHop1.loopbackProxy.targetHost=mcp-gw-github-wrapper.mcp-gw.svc.cluster.local \
+  --set browserHop1.loopbackProxy.targetPort=8080 > "${browser_hop1_loopback_proxy_rendered}"
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-apiserver/ { print; exit }
+' "${browser_hop1_loopback_proxy_rendered}" > "${browser_hop1_deployment}"
+for required in \
+  '        - name: mcp-loopback' \
+  '        image: example.test/local-socat@sha256:4444444444444444444444444444444444444444444444444444444444444444' \
+  '        - TCP-LISTEN:18080,bind=127.0.0.1,reuseaddr,fork' \
+  '        - TCP:mcp-gw-github-wrapper.mcp-gw.svc.cluster.local:8080'
+do
+  grep -Fxq "${required}" "${browser_hop1_deployment}"
+done
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
+  --set browserHop1.enabled=true \
+  --set-string browserHop1.mcpGatewayOrigin=https://mcp-gw.example.test:8080 \
+  --set-string browserHop1.identityEndpoint=https://identity.example.test:8443/v1/browser-hop1/exchange \
+  --set-string browserHop1.issuer=https://steward.example.test \
+  --set-string browserHop1.assertionAudience=identity-browser-hop1 \
+  --set-string browserHop1.keyId=steward-browser-hop1-current \
+  --set-string browserHop1.signingKeySecret.name=steward-browser-hop1 \
+  --set-string browserHop1.signingKeySecret.key=signing-key.der \
+  --set-string browserHop1.publicJwksConfigMap.name=steward-browser-hop1-jwks \
+  --set-string browserHop1.publicJwksConfigMap.key=jwks.json \
+  --set-string browserHop1.serviceAccountTokenAudience=identity-browser-hop1 \
+  --set browserHop1.loopbackProxy.enabled=true \
+  --set-string browserHop1.loopbackProxy.image=example.test/local-socat@sha256:4444444444444444444444444444444444444444444444444444444444444444 \
+  --set-string browserHop1.loopbackProxy.targetHost=mcp-gw-github-wrapper.mcp-gw.svc.cluster.local \
+  --set browserHop1.loopbackProxy.targetPort=8080 >/dev/null 2>&1
+then
+  echo "browser HOP-1 loopback proxy must require its exact localhost origin" >&2
+  exit 1
+fi
 if helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \

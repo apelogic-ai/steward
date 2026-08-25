@@ -277,6 +277,17 @@ spec:
 {{- end }}
           resources:
 {{ toYaml .Values.resources.apiserver | nindent 12 }}
+{{- if and .Values.browserHop1.enabled .Values.browserHop1.loopbackProxy.enabled }}
+        - name: mcp-loopback
+          image: {{ .Values.browserHop1.loopbackProxy.image }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["socat"]
+          args:
+            - {{ printf "TCP-LISTEN:18080,bind=127.0.0.1,reuseaddr,fork" | quote }}
+            - {{ printf "TCP:%s:%d" .Values.browserHop1.loopbackProxy.targetHost (int .Values.browserHop1.loopbackProxy.targetPort) | quote }}
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] }, runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532 }
+          resources: {}
+{{- end }}
       volumes:
         - { name: tls, secret: { secretName: steward-apiserver-tls } }
 {{- if .Values.browserHop1.enabled }}
