@@ -54,6 +54,21 @@ const githubToolCatalog = [
   { value: "pull_request:get", enabled: false },
 ] as const;
 
+export const initialEnvelopeTemplate: BrowserEnvelope = {
+  revision: 1,
+  spec: {
+    budget: {
+      currency: "USD",
+      monthlyLimit: "0.10",
+      singleRunLimit: "0.10",
+    },
+    llms: [{ provider: "openai", model: "gpt-5.4" }],
+    tools: [{ provider: "github", resource: "repository", action: "get_file_contents" }],
+    ttl: "15m",
+    runner: { platforms: ["linux"] },
+  },
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -176,7 +191,11 @@ function AuthenticatedTemplateList() {
 
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Review the current immutable envelope templates available in Steward." title="Envelope templates" />
+      <PageHeader
+        actions={<Link className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-brand-strong" href="/admin/envelopes/templates/new">Create template</Link>}
+        description="Review the current immutable envelope templates available in Steward."
+        title="Envelope templates"
+      />
       <ResourceBoundary state={acceptedState}>{({ templates }) => templates.length === 0 ? (
         <EmptyState title="No data" />
       ) : (
@@ -236,7 +255,24 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
   );
 }
 
-function TemplateEditor({ csrf, memberRole, template }: Readonly<{ csrf: string; memberRole: string; template: BrowserEnvelope }>) {
+export function AdminNewEnvelopeTemplateView() {
+  const session = useSession();
+  if (session.status !== "authenticated") {
+    return <EmptyState title="Session unavailable"><p>The authoritative administrator session is not available.</p></EmptyState>;
+  }
+  return (
+    <section aria-labelledby="page-title" className="space-y-6">
+      <PageHeader
+        actions={<Link className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas" href="/admin/envelopes/templates">All templates</Link>}
+        description="Author the first immutable revision for a member role. All suggested values remain editable before saving."
+        title="Create envelope template"
+      />
+      <TemplateEditor create csrf={session.value.csrf} memberRole="" template={initialEnvelopeTemplate} />
+    </section>
+  );
+}
+
+function TemplateEditor({ create = false, csrf, memberRole, template }: Readonly<{ create?: boolean; csrf: string; memberRole: string; template: BrowserEnvelope }>) {
   const router = useRouter();
   const [status, setStatus] = useState<TemplateMutationState>("idle");
   const [currentRevision, setCurrentRevision] = useState(template.revision);
@@ -265,10 +301,10 @@ function TemplateEditor({ csrf, memberRole, template }: Readonly<{ csrf: string;
     event.preventDefault();
     const fields = new FormData(event.currentTarget);
     const submitter = (event.nativeEvent as SubmitEvent).submitter;
-    const action = submitter instanceof HTMLButtonElement ? submitter.value : "version";
+    const action = submitter instanceof HTMLButtonElement ? submitter.value : (create ? "create" : "version");
     const saveAsNew = action === "copy";
     const newTemplateId = String(fields.get("newTemplateId") ?? "").trim();
-    const targetRole = saveAsNew ? newTemplateId : memberRole;
+    const targetRole = create || saveAsNew ? newTemplateId : memberRole;
     const platforms = fields.getAll("platforms").filter((value): value is RunnerPlatform =>
       value === "linux" || value === "mac" || value === "windows");
     if (!targetRole
@@ -284,7 +320,7 @@ function TemplateEditor({ csrf, memberRole, template }: Readonly<{ csrf: string;
     const compute = String(fields.get("compute") ?? "").trim();
     const storage = String(fields.get("storage") ?? "").trim();
     const body: BrowserEnvelope = {
-      revision: saveAsNew ? 1 : currentRevision + 1,
+      revision: create || saveAsNew ? 1 : currentRevision + 1,
       spec: {
         budget: {
           currency: "USD",
@@ -313,7 +349,7 @@ function TemplateEditor({ csrf, memberRole, template }: Readonly<{ csrf: string;
     if (result.data && result.response?.status === 201) {
       setCurrentRevision(result.data.envelope.revision);
       setStatus("saved");
-      if (saveAsNew) router.push(`/admin/envelopes/templates/${encodeURIComponent(targetRole)}`);
+      if (create || saveAsNew) router.push(`/admin/envelopes/templates/${encodeURIComponent(targetRole)}`);
       return;
     }
     setStatus(classifyMutationFailure(result.response?.status));
@@ -323,8 +359,8 @@ function TemplateEditor({ csrf, memberRole, template }: Readonly<{ csrf: string;
   return (
     <form className="space-y-6 rounded-panel border bg-panel p-6 shadow-sm" onSubmit={submit}>
       <div>
-        <h2 className="text-xl font-semibold">{displayName(memberRole)}</h2>
-        <p className="mt-1 text-sm text-muted-ink">Current revision {currentRevision}</p>
+        <h2 className="text-xl font-semibold">{create ? "New template" : displayName(memberRole)}</h2>
+        <p className="mt-1 text-sm text-muted-ink">{create ? "Initial revision 1" : `Current revision ${currentRevision}`}</p>
       </div>
 
       <fieldset className="grid gap-4 sm:grid-cols-4">
@@ -420,11 +456,11 @@ function TemplateEditor({ csrf, memberRole, template }: Readonly<{ csrf: string;
       ) : null}
 
       <div className="flex flex-wrap items-end gap-3 border-t pt-5">
-        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="version">{status === "saving" ? "Saving…" : "Save new version"}</button>
-        <label className="grid min-w-56 flex-1 gap-2 text-sm font-semibold">New template ID
-          <input className={fieldClass} name="newTemplateId" placeholder="reviewer" />
+        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value={create ? "create" : "version"}>{status === "saving" ? "Saving…" : create ? "Create template" : "Save new version"}</button>
+        <label className="grid min-w-56 flex-1 gap-2 text-sm font-semibold">{create ? "Template ID" : "New template ID"}
+          <input className={fieldClass} name="newTemplateId" placeholder="developer" required={create} />
         </label>
-        <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="copy">Save as new</button>
+        {!create ? <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="copy">Save as new</button> : null}
       </div>
     </form>
   );
