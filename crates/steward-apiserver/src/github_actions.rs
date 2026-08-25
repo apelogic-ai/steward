@@ -159,6 +159,7 @@ pub fn render_versioned_github_actions_workflow(
         "      output-artifact: steward-workflow-output".to_owned(),
         "      steward-api-url: ${{ vars.STEWARD_API_URL }}".to_owned(),
         "      identity-exchange-url: ${{ vars.IDENTITY_EXCHANGE_URL }}".to_owned(),
+        "      oidc-audience: ${{ vars.IDENTITY_EXCHANGE_AUDIENCE }}".to_owned(),
         "      steward-ca-certificate-file: ${{ vars.STEWARD_CA_CERTIFICATE_FILE }}".to_owned(),
         String::new(),
         "  verify:".to_owned(),
@@ -657,6 +658,12 @@ mod tests {
         assert!(!generated.yaml.contains("TARGET_PATH"));
         assert!(!generated.yaml.contains("full commit SHA"));
         assert!(!generated.yaml.contains("src/lib.rs"));
+        assert!(
+            generated
+                .yaml
+                .contains("      oidc-audience: ${{ vars.IDENTITY_EXCHANGE_AUDIENCE }}"),
+            "the reusable workflow must receive the exact local Identity audience"
+        );
         assert!(
             generated
                 .yaml
