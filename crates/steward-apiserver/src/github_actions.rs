@@ -130,6 +130,8 @@ pub fn render_versioned_github_actions_workflow(
         "      - name: Check out triggered revision".to_owned(),
         "        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2"
             .to_owned(),
+        "        with:".to_owned(),
+        "          persist-credentials: false".to_owned(),
         "      - name: Upload repository snapshot".to_owned(),
         "        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2"
             .to_owned(),
@@ -137,7 +139,7 @@ pub fn render_versioned_github_actions_workflow(
         "          name: steward-workflow-input".to_owned(),
         "          path: .".to_owned(),
         "          if-no-files-found: error".to_owned(),
-        "          include-hidden-files: true".to_owned(),
+        "          include-hidden-files: false".to_owned(),
         "          retention-days: 1".to_owned(),
         String::new(),
         "  governed:".to_owned(),
@@ -655,6 +657,18 @@ mod tests {
         assert!(!generated.yaml.contains("TARGET_PATH"));
         assert!(!generated.yaml.contains("full commit SHA"));
         assert!(!generated.yaml.contains("src/lib.rs"));
+        assert!(
+            generated
+                .yaml
+                .contains("          persist-credentials: false"),
+            "the checkout token must never be written into the repository snapshot"
+        );
+        assert!(
+            generated
+                .yaml
+                .contains("          include-hidden-files: false"),
+            "the governed input must exclude dotfiles, which can contain credentials"
+        );
         Ok(())
     }
 
