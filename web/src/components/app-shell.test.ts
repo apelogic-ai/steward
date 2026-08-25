@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { hasDualRole, isActive } from "./app-shell";
+import { hasDualRole, isActive, workspaceLandingPath } from "./app-shell";
 
 describe("primary navigation", () => {
   test("selects Envelopes for list, new, detail, and nested run routes", () => {
@@ -34,5 +34,10 @@ describe("workspace mode availability", () => {
         surfaces: ["agentRuns"],
       },
     })).toBe(true);
+  });
+
+  test("lands administrators on template authoring and members on envelopes", () => {
+    expect(workspaceLandingPath("admin")).toBe("/admin/envelopes/templates");
+    expect(workspaceLandingPath("user")).toBe("/envelopes");
   });
 });

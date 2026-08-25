@@ -31,6 +31,10 @@ export function hasDualRole(session: SessionState): boolean {
     && session.value.role === "admin";
 }
 
+export function workspaceLandingPath(workspace: "admin" | "user"): string {
+  return workspace === "admin" ? "/admin/envelopes/templates" : "/envelopes";
+}
+
 type Theme = "dark" | "light";
 
 function preferredTheme(): Theme {
@@ -183,7 +187,7 @@ function AccountMenu({ adminMode, session }: Readonly<{
                 id="account-workspace"
                 onChange={(event) => {
                   setOpen(false);
-                  router.push(event.target.value === "admin" ? "/admin/runs" : "/envelopes");
+                  router.push(workspaceLandingPath(event.target.value === "admin" ? "admin" : "user"));
                 }}
                 value={adminMode ? "admin" : "user"}
               >
