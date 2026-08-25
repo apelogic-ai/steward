@@ -101,6 +101,7 @@ fn demo_template() -> AvailableEnvelopeTemplate {
             }],
             budget: Budget {
                 monthly_limit: "250.00".to_owned(),
+                single_run_limit: None,
                 currency: "USD".to_owned(),
             },
             ttl: Duration("720h".to_owned()),
@@ -121,6 +122,7 @@ fn demo_template() -> AvailableEnvelopeTemplate {
             spec: EnvelopeSpec {
                 budget: Budget {
                     monthly_limit: "100.00".to_owned(),
+                    single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("168h".to_owned()),

@@ -3,16 +3,14 @@ import type { ReactNode } from "react";
 
 import type { ResourceState } from "@/data/use-api-resource";
 
-export function PageHeader({ actions, description, eyebrow, title }: Readonly<{
+export function PageHeader({ actions, description, title }: Readonly<{
   actions?: ReactNode;
   description: string;
-  eyebrow: string;
   title: string;
 }>) {
   return (
     <header className="flex flex-wrap items-end justify-between gap-4">
       <div className="max-w-3xl space-y-2">
-        <p className="text-xs font-semibold uppercase tracking-[0.18em] text-brand">{eyebrow}</p>
         <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl" id="page-title">{title}</h1>
         <p className="text-base leading-7 text-muted-ink">{description}</p>
       </div>
@@ -26,14 +24,19 @@ export function PrimaryLink({ children, href }: Readonly<{ children: ReactNode; 
 }
 
 export function StatusBadge({ value }: Readonly<{ value: string }>) {
-  return <span className="inline-flex rounded-full border bg-canvas px-2.5 py-1 text-xs font-semibold capitalize text-muted-ink">{value.replaceAll("_", " ")}</span>;
+  const provisioned = value.toLowerCase() === "provisioned";
+  return (
+    <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold capitalize ${provisioned ? "status-badge-provisioned" : "bg-canvas text-muted-ink"}`}>
+      {value.replaceAll("_", " ")}
+    </span>
+  );
 }
 
-export function EmptyState({ children, title }: Readonly<{ children: ReactNode; title: string }>) {
+export function EmptyState({ children, title }: Readonly<{ children?: ReactNode; title: string }>) {
   return (
     <section className="rounded-panel border bg-panel p-6 shadow-sm">
       <h2 className="font-semibold">{title}</h2>
-      <div className="mt-2 text-sm leading-6 text-muted-ink">{children}</div>
+      {children ? <div className="mt-2 text-sm leading-6 text-muted-ink">{children}</div> : null}
     </section>
   );
 }

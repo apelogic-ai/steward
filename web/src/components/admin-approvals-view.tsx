@@ -9,6 +9,7 @@ import {
   type BrowserApprovalsResponse,
   type BrowserApprovalView,
   type BrowserDecisionReferenceResponse,
+  type BrowserEnvelopeRequestView,
 } from "@/api-client";
 import { DefinitionList, EmptyState, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
@@ -16,6 +17,10 @@ import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
 type ApprovalActionState = "idle" | "filing" | "filed" | "approving" | "approved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
+
+type BrowserApprovalQueueResponse = BrowserApprovalsResponse & {
+  envelopeRequests: BrowserEnvelopeRequestView[];
+};
 
 function actionMessage(status: Exclude<ApprovalActionState, "idle" | "filing" | "approving">): string {
   return {
@@ -30,17 +35,50 @@ function actionMessage(status: Exclude<ApprovalActionState, "idle" | "filing" | 
 }
 
 export function AdminApprovalsView() {
-  const load = useCallback(() => listAdminApprovals({ cache: "no-store", credentials: "same-origin" }), []);
-  const state = useApiResource<BrowserApprovalsResponse>(load);
+  const load = useCallback(async () => {
+    const result = await listAdminApprovals({ cache: "no-store", credentials: "same-origin" });
+    const data = result.data as (BrowserApprovalsResponse & { envelopeRequests?: unknown }) | undefined;
+    return {
+      ...result,
+      data: data ? {
+        ...data,
+        envelopeRequests: Array.isArray(data.envelopeRequests) ? data.envelopeRequests as BrowserEnvelopeRequestView[] : [],
+      } : undefined,
+    };
+  }, []);
+  const state = useApiResource<BrowserApprovalQueueResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Review parked envelope exceptions and apply only server-recorded decisions." eyebrow="Administration" title="Pending approvals" />
-      <ResourceBoundary state={state}>{({ approvals }) => approvals.length === 0 ? (
-        <EmptyState title="No pending approvals"><p>The authoritative approval queue is empty.</p></EmptyState>
+      <PageHeader description="Review pending user envelope requests and parked runtime exceptions." title="Pending approvals" />
+      <ResourceBoundary state={state}>{({ approvals, envelopeRequests }) => approvals.length === 0 && envelopeRequests.length === 0 ? (
+        <EmptyState title="No data" />
       ) : (
-        <ul className="space-y-5">{approvals.map((approval) => <ApprovalCard approval={approval} key={approval.approvalId} />)}</ul>
+        <ul className="space-y-5">
+          {envelopeRequests.map((request) => <EnvelopeRequestCard key={request.requestId} request={request} />)}
+          {approvals.map((approval) => <ApprovalCard approval={approval} key={approval.approvalId} />)}
+        </ul>
       )}</ResourceBoundary>
     </section>
+  );
+}
+
+function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnvelopeRequestView }>) {
+  const spec = request.requestedEnvelope.spec;
+  return (
+    <li className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div><h2 className="text-xl font-semibold">User envelope request</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.requestId}</p></div>
+        <StatusBadge value="pending" />
+      </div>
+      <DefinitionList items={[
+        ["Requested by", request.ownerDisplayEmail],
+        ["Template", request.templateId],
+        ["Template revision", request.templateRevision],
+        ["Budget", `${spec.budget.monthlyLimit} ${spec.budget.currency}`],
+        ["TTL", spec.ttl],
+        ["Created", request.createdAt],
+      ]} />
+    </li>
   );
 }
 

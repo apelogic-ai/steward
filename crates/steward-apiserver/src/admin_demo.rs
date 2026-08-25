@@ -144,6 +144,7 @@ fn engineer_template() -> Envelope {
             }],
             budget: Budget {
                 monthly_limit: "250.00".to_owned(),
+                single_run_limit: None,
                 currency: "USD".to_owned(),
             },
             ttl: Duration("720h".to_owned()),
@@ -223,6 +224,7 @@ async fn prove_envelope_template(
         tools: request.candidate.spec.tools.clone(),
         budget: Budget {
             monthly_limit: request.thresholds.budget_monthly_limit,
+            single_run_limit: None,
             currency: request.candidate.spec.budget.currency.clone(),
         },
         ttl: Duration(request.thresholds.ttl),

@@ -1317,6 +1317,43 @@ mod tests {
     }
 
     #[test]
+    fn versioned_workflow_e2e_creates_a_run_owned_runtime_namespace() -> Result<(), String> {
+        let harness = fs::read_to_string(root().join("scripts/s2-inference-inside.sh"))
+            .map_err(|error| format!("in-cluster task E2E harness is required: {error}"))?;
+        let task_stack = fs::read_to_string(root().join("config/task/stack.yaml"))
+            .map_err(|error| format!("versioned Workflow E2E stack is required: {error}"))?;
+
+        assert!(
+            harness.contains("namespaces+=(steward-workflows)"),
+            "the versioned Workflow E2E must create its dedicated runtime namespace"
+        );
+        assert!(
+            harness.contains(
+                "elif [[ \"${SLICE}\" == \"task\" ]]; then\n  profile_sources=(\n    \"${ROOT}/config/s5/tool-provider-profile.yaml\"\n    \"${ROOT}/config/s5/inference-provider-profile.yaml\"\n  )"
+            ),
+            "the versioned Workflow E2E must install both Envelope-selected provider profiles"
+        );
+        assert!(
+            harness.contains("label namespace \"${namespace}\"")
+                && harness.contains("steward.test/run-id=${STEWARD_RUN_ID}"),
+            "the versioned Workflow runtime namespace must be owned by the current test run"
+        );
+        for required in [
+            "name: steward-task-controller-credentials",
+            "name: steward-task-mint-credentials",
+            "namespace: steward-workflows",
+            "resources: [\"secrets\"]",
+        ] {
+            assert!(
+                task_stack.contains(required),
+                "the versioned Workflow E2E must grant scoped runtime-credential access: missing {required}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn release_candidate_fails_closed_on_critical_component_images() -> Result<(), String> {
         let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
@@ -2065,6 +2102,10 @@ mod tests {
             .map_err(|error| format!("published release workflow is required: {error}"))?;
         let container = fs::read_to_string(root().join("build/web.Dockerfile"))
             .map_err(|error| format!("production web container is required: {error}"))?;
+        let release_validation = fs::read_to_string(
+            root().join("scripts/validate-release-artifacts.sh"),
+        )
+        .map_err(|error| format!("release artifact validation script is required: {error}"))?;
 
         for required in ["web:", "ingress:", "host:", "tlsSecretName:"] {
             assert!(
@@ -2085,6 +2126,7 @@ mod tests {
             "kind: Ingress",
             "path: /admin/api",
             "path: /admin/auth",
+            "path: /admin/sign-in",
             "path: /admin/connections/github/callback",
             "path: /app/api",
             "name: steward-apiserver",
@@ -2145,6 +2187,20 @@ mod tests {
             workflow.contains("dockerfile: build/web.Dockerfile"),
             "release matrix must select the web Dockerfile"
         );
+        for required in [
+            "docker run --rm --detach",
+            "--read-only",
+            "docker inspect --format",
+            "65532:65532 true",
+            "--retry-all-errors",
+            "/health/ready",
+            "web release image did not become ready",
+        ] {
+            assert!(
+                release_validation.contains(required),
+                "release validation must run the built web image and prove {required}"
+            );
+        }
         Ok(())
     }
 
@@ -3350,6 +3406,21 @@ esac
             String::from_utf8_lossy(&output.stdout).trim(),
             "openshell/supervisor:steward-spiffe-v0090",
             "the identity spike must use the supervisor built from the carried patch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_sandbox_image_override_is_optional_under_bash_nounset() -> Result<(), String> {
+        let script_path = root().join("scripts/s0-0-openshell-spike.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+
+        assert!(
+            script.contains(
+                "if [[ -n \"${STEWARD_OPENSHELL_SANDBOX_IMAGE:-}\" ]]; then\n  openshell_helm_args+=(\"${sandbox_image_args[@]}\")\nfi"
+            ),
+            "the optional sandbox image args must not expand an empty array under Bash nounset"
         );
         Ok(())
     }

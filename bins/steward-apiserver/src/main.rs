@@ -12,7 +12,7 @@ use steward_apiserver::{
     KubeRuntimeRepository, KubernetesTaskIdentityResolver, KubernetesTokenAuthenticator,
     KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog, agent_runs_ui, browser_admin,
     browser_auth, browser_hop1_attestation, connections, google_oidc, mcp_gw_connections, router,
-    router_without_admin_dashboard, stable_runtime_bridge, task_router, user_envelopes,
+    router_without_admin_dashboard, stable_runtime_bridge, task_router, user_envelopes, workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
@@ -155,6 +155,10 @@ fn browser_application_router(
             runtimes.clone(),
             store.clone(),
             decisions,
+            auth.clone(),
+        ))
+        .merge(workflows::protected_admin_router(
+            store.clone(),
             auth.clone(),
         ));
     let app = match browser_hop1_connections_configuration(&origin)? {

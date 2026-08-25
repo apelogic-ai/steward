@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { AgentRunContractData, AgentRunContractErrors, AgentRunContractResponses, AgentRunsContractData, AgentRunsContractErrors, AgentRunsContractResponses, AgentRunTimelineContractData, AgentRunTimelineContractErrors, AgentRunTimelineContractResponses, AllRunData, AllRunErrors, AllRunResponses, AllRunsData, AllRunsErrors, AllRunsResponses, AllRunTimelineData, AllRunTimelineErrors, AllRunTimelineResponses, ApproveAdminApprovalData, ApproveAdminApprovalErrors, ApproveAdminApprovalResponses, AuthorAdminEnvelopeTemplateData, AuthorAdminEnvelopeTemplateErrors, AuthorAdminEnvelopeTemplateResponses, BootstrapData, BootstrapErrors, BootstrapResponses, BudgetIncreaseContractData, BudgetIncreaseContractErrors, BudgetIncreaseContractResponses, ConnectionStatusData, ConnectionStatusErrors, ConnectionStatusResponses, CreateRequestData, CreateRequestErrors, CreateRequestResponses, CreateRuntimeContractData, CreateRuntimeContractErrors, CreateRuntimeContractResponses, DisconnectConnectionData, DisconnectConnectionErrors, DisconnectConnectionResponses, FileAdminApprovalDecisionData, FileAdminApprovalDecisionErrors, FileAdminApprovalDecisionResponses, GetAdminEnvelopeTemplateData, GetAdminEnvelopeTemplateErrors, GetAdminEnvelopeTemplateResponses, GetRequestData, GetRequestErrors, GetRequestResponses, ListAdminApprovalsData, ListAdminApprovalsErrors, ListAdminApprovalsResponses, ListRequestsData, ListRequestsErrors, ListRequestsResponses, ListTemplatesData, ListTemplatesErrors, ListTemplatesResponses, MyRunData, MyRunErrors, MyRunResponses, MyRunsData, MyRunsErrors, MyRunsResponses, MyRunTimelineData, MyRunTimelineErrors, MyRunTimelineResponses, RenderGithubActionsForEnvelopeData, RenderGithubActionsForEnvelopeErrors, RenderGithubActionsForEnvelopeResponses, SessionData, SessionErrors, SessionResponses, StartConnectionData, StartConnectionErrors, StartConnectionResponses, TaskDeleteContractData, TaskDeleteContractErrors, TaskDeleteContractResponses, TaskExecuteContractData, TaskExecuteContractErrors, TaskExecuteContractResponses, TaskInputsContractData, TaskInputsContractErrors, TaskInputsContractResponses, TaskOutputsContractData, TaskOutputsContractErrors, TaskOutputsContractResponses, TaskStatusContractData, TaskStatusContractErrors, TaskStatusContractResponses, TaskSubmissionContractData, TaskSubmissionContractErrors, TaskSubmissionContractResponses } from './types.gen';
+import type { AgentRunContractData, AgentRunContractErrors, AgentRunContractResponses, AgentRunsContractData, AgentRunsContractErrors, AgentRunsContractResponses, AgentRunTimelineContractData, AgentRunTimelineContractErrors, AgentRunTimelineContractResponses, AllRunData, AllRunErrors, AllRunResponses, AllRunsData, AllRunsErrors, AllRunsResponses, AllRunTimelineData, AllRunTimelineErrors, AllRunTimelineResponses, ApproveAdminApprovalData, ApproveAdminApprovalErrors, ApproveAdminApprovalResponses, AuthorAdminEnvelopeTemplateData, AuthorAdminEnvelopeTemplateErrors, AuthorAdminEnvelopeTemplateResponses, BootstrapData, BootstrapErrors, BootstrapResponses, BudgetIncreaseContractData, BudgetIncreaseContractErrors, BudgetIncreaseContractResponses, ConnectionStatusData, ConnectionStatusErrors, ConnectionStatusResponses, CreateRequestData, CreateRequestErrors, CreateRequestResponses, CreateRuntimeContractData, CreateRuntimeContractErrors, CreateRuntimeContractResponses, DisconnectConnectionData, DisconnectConnectionErrors, DisconnectConnectionResponses, FileAdminApprovalDecisionData, FileAdminApprovalDecisionErrors, FileAdminApprovalDecisionResponses, GetAdminEnvelopeTemplateData, GetAdminEnvelopeTemplateErrors, GetAdminEnvelopeTemplateResponses, GetAdminWorkflowVersionData, GetAdminWorkflowVersionErrors, GetAdminWorkflowVersionResponses, GetRequestData, GetRequestErrors, GetRequestResponses, ListAdminApprovalsData, ListAdminApprovalsErrors, ListAdminApprovalsResponses, ListAdminEnvelopeTemplatesData, ListAdminEnvelopeTemplatesErrors, ListAdminEnvelopeTemplatesResponses, ListAdminWorkflowsData, ListAdminWorkflowsErrors, ListAdminWorkflowsResponses, ListPublishedWorkflowsData, ListPublishedWorkflowsErrors, ListPublishedWorkflowsResponses, ListRequestsData, ListRequestsErrors, ListRequestsResponses, ListTemplatesData, ListTemplatesErrors, ListTemplatesResponses, MyRunData, MyRunErrors, MyRunResponses, MyRunsData, MyRunsErrors, MyRunsResponses, MyRunTimelineData, MyRunTimelineErrors, MyRunTimelineResponses, PublishAdminWorkflowData, PublishAdminWorkflowErrors, PublishAdminWorkflowResponses, PublishAdminWorkflowVersionData, PublishAdminWorkflowVersionErrors, PublishAdminWorkflowVersionResponses, RenderGithubActionsForEnvelopeData, RenderGithubActionsForEnvelopeErrors, RenderGithubActionsForEnvelopeResponses, SessionData, SessionErrors, SessionResponses, StartConnectionData, StartConnectionErrors, StartConnectionResponses, TaskDeleteContractData, TaskDeleteContractErrors, TaskDeleteContractResponses, TaskExecuteContractData, TaskExecuteContractErrors, TaskExecuteContractResponses, TaskInputsContractData, TaskInputsContractErrors, TaskInputsContractResponses, TaskOutputsContractData, TaskOutputsContractErrors, TaskOutputsContractResponses, TaskStatusContractData, TaskStatusContractErrors, TaskStatusContractResponses, TaskSubmissionContractData, TaskSubmissionContractErrors, TaskSubmissionContractResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -134,6 +134,16 @@ export const startConnection = <ThrowOnError extends boolean = false>(options: O
     }
 });
 
+export const listAdminEnvelopeTemplates = <ThrowOnError extends boolean = false>(options?: Options<ListAdminEnvelopeTemplatesData, ThrowOnError>): RequestResult<ListAdminEnvelopeTemplatesResponses, ListAdminEnvelopeTemplatesErrors, ThrowOnError> => (options?.client ?? client).get<ListAdminEnvelopeTemplatesResponses, ListAdminEnvelopeTemplatesErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: '__Host-steward-session',
+            type: 'apiKey'
+        }],
+    url: '/admin/api/v1/envelope-templates',
+    ...options
+});
+
 export const getAdminEnvelopeTemplate = <ThrowOnError extends boolean = false>(options: Options<GetAdminEnvelopeTemplateData, ThrowOnError>): RequestResult<GetAdminEnvelopeTemplateResponses, GetAdminEnvelopeTemplateErrors, ThrowOnError> => (options.client ?? client).get<GetAdminEnvelopeTemplateResponses, GetAdminEnvelopeTemplateErrors, ThrowOnError>({
     security: [{
             in: 'cookie',
@@ -195,6 +205,54 @@ export const session = <ThrowOnError extends boolean = false>(options?: Options<
             type: 'apiKey'
         }],
     url: '/admin/api/v1/session',
+    ...options
+});
+
+export const listAdminWorkflows = <ThrowOnError extends boolean = false>(options?: Options<ListAdminWorkflowsData, ThrowOnError>): RequestResult<ListAdminWorkflowsResponses, ListAdminWorkflowsErrors, ThrowOnError> => (options?.client ?? client).get<ListAdminWorkflowsResponses, ListAdminWorkflowsErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: '__Host-steward-session',
+            type: 'apiKey'
+        }],
+    url: '/admin/api/v1/workflows',
+    ...options
+});
+
+export const publishAdminWorkflow = <ThrowOnError extends boolean = false>(options: Options<PublishAdminWorkflowData, ThrowOnError>): RequestResult<PublishAdminWorkflowResponses, PublishAdminWorkflowErrors, ThrowOnError> => (options.client ?? client).post<PublishAdminWorkflowResponses, PublishAdminWorkflowErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: '__Host-steward-session',
+            type: 'apiKey'
+        }],
+    url: '/admin/api/v1/workflows',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const publishAdminWorkflowVersion = <ThrowOnError extends boolean = false>(options: Options<PublishAdminWorkflowVersionData, ThrowOnError>): RequestResult<PublishAdminWorkflowVersionResponses, PublishAdminWorkflowVersionErrors, ThrowOnError> => (options.client ?? client).post<PublishAdminWorkflowVersionResponses, PublishAdminWorkflowVersionErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: '__Host-steward-session',
+            type: 'apiKey'
+        }],
+    url: '/admin/api/v1/workflows/{name}/versions',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const getAdminWorkflowVersion = <ThrowOnError extends boolean = false>(options: Options<GetAdminWorkflowVersionData, ThrowOnError>): RequestResult<GetAdminWorkflowVersionResponses, GetAdminWorkflowVersionErrors, ThrowOnError> => (options.client ?? client).get<GetAdminWorkflowVersionResponses, GetAdminWorkflowVersionErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: '__Host-steward-session',
+            type: 'apiKey'
+        }],
+    url: '/admin/api/v1/workflows/{name}/versions/{version}',
     ...options
 });
 
@@ -283,6 +341,16 @@ export const myRunTimeline = <ThrowOnError extends boolean = false>(options: Opt
             type: 'apiKey'
         }],
     url: '/app/api/v1/runs/{task_uid}/timeline',
+    ...options
+});
+
+export const listPublishedWorkflows = <ThrowOnError extends boolean = false>(options?: Options<ListPublishedWorkflowsData, ThrowOnError>): RequestResult<ListPublishedWorkflowsResponses, ListPublishedWorkflowsErrors, ThrowOnError> => (options?.client ?? client).get<ListPublishedWorkflowsResponses, ListPublishedWorkflowsErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: '__Host-steward-session',
+            type: 'apiKey'
+        }],
+    url: '/app/api/v1/workflows',
     ...options
 });
 

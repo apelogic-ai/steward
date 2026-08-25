@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -172,6 +173,7 @@ pub enum BrowserRole {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrowserPrincipal {
     pub canonical_user_id: CanonicalUserId,
+    pub display_name: String,
     pub display_email: Email,
     pub role: BrowserRole,
     pub member_roles: Vec<String>,
@@ -229,6 +231,7 @@ pub struct VerifiedOrganizationClaims {
     pub(crate) hosted_domain: String,
     pub(crate) email: String,
     pub(crate) email_verified: bool,
+    pub(crate) display_name: Option<String>,
     pub(crate) nonce: String,
 }
 
@@ -325,6 +328,7 @@ fn browser_principal_from_assignments(
 ) -> BrowserPrincipal {
     BrowserPrincipal {
         canonical_user_id: principal.user_id,
+        display_name: principal.display_email.as_str().to_owned(),
         display_email: principal.display_email,
         role: if assignments.is_admin {
             BrowserRole::Admin
@@ -556,6 +560,13 @@ impl BrowserOidcProvider for LocalFakeOidcProvider {
                         hosted_domain: hosted_domain.to_owned(),
                         email: email.to_owned(),
                         email_verified: true,
+                        display_name: Some(
+                            match self.identity {
+                                LocalFakeIdentity::Admin => "Bob Example",
+                                _ => "Alice Example",
+                            }
+                            .to_owned(),
+                        ),
                         nonce: nonce.to_owned(),
                     },
                 );
@@ -587,6 +598,7 @@ impl BrowserIdentityResolver for LocalFakeIdentityResolver {
             Ok(BrowserPrincipal {
                 canonical_user_id: CanonicalUserId::parse(user_id)
                     .map_err(|_| BrowserAuthFailure::IdentityUnavailable)?,
+                display_name: identity.verified_email().as_str().to_owned(),
                 display_email: identity.verified_email().clone(),
                 role,
                 member_roles: if role == BrowserRole::Admin {
@@ -703,22 +715,48 @@ async fn login(
 struct CallbackQuery {
     code: String,
     state: String,
+    iss: Option<String>,
+    scope: Option<String>,
+    authuser: Option<String>,
+    prompt: Option<String>,
+    hd: Option<String>,
+}
+
+fn rejected_callback(config: &BrowserAuthConfig) -> Response {
+    response_with_cookie(
+        StatusCode::SEE_OTHER,
+        Some("/admin/sign-in"),
+        &expire_cookie(config.flow_cookie, config.secure_cookies, "/admin/auth"),
+        Body::empty(),
+    )
 }
 
 async fn callback(
     State(service): State<BrowserAuthService>,
-    Query(query): Query<CallbackQuery>,
+    query: Result<Query<CallbackQuery>, QueryRejection>,
     headers: HeaderMap,
 ) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return rejected_callback(&service.config),
+    };
+    let _google_callback_metadata = (&query.scope, &query.authuser, &query.prompt, &query.hd);
+    if query
+        .iss
+        .as_deref()
+        .is_some_and(|issuer| issuer != GOOGLE_ORGANIZATION_ISSUER)
+    {
+        return rejected_callback(&service.config);
+    }
     let Some(flow_id) = cookie_value(&headers, service.config.flow_cookie) else {
-        return BrowserAuthFailure::InvalidFlow.into_response();
+        return rejected_callback(&service.config);
     };
     let flow = match service
         .registry
         .consume_flow(&flow_id, &query.state, epoch_seconds())
     {
         Ok(flow) => flow,
-        Err(error) => return map_registry_error(error).into_response(),
+        Err(_) => return rejected_callback(&service.config),
     };
     let claims = match service
         .provider
@@ -731,10 +769,10 @@ async fn callback(
         .await
     {
         Ok(claims) => claims,
-        Err(error) => return error.into_response(),
+        Err(_) => return rejected_callback(&service.config),
     };
     if !secret_eq(&claims.nonce, &flow.nonce) {
-        return BrowserAuthFailure::InvalidIdentity.into_response();
+        return rejected_callback(&service.config);
     }
     let identity = match service.config.policy.validate(
         &claims.issuer,
@@ -744,20 +782,23 @@ async fn callback(
         claims.email_verified,
     ) {
         Ok(identity) => identity,
-        Err(_) => return BrowserAuthFailure::InvalidIdentity.into_response(),
+        Err(_) => return rejected_callback(&service.config),
     };
-    let principal = match service.identities.resolve_or_register(&identity).await {
+    let mut principal = match service.identities.resolve_or_register(&identity).await {
         Ok(principal) => principal,
-        Err(error) => return error.into_response(),
+        Err(_) => return rejected_callback(&service.config),
     };
+    if let Some(display_name) = claims.display_name {
+        principal.display_name = display_name;
+    }
     if let Some(previous) = cookie_value(&headers, service.config.session_cookie)
-        && let Err(error) = service.registry.revoke(&previous)
+        && service.registry.revoke(&previous).is_err()
     {
-        return map_registry_error(error).into_response();
+        return rejected_callback(&service.config);
     }
     let session = match service.registry.issue(principal, epoch_seconds()) {
         Ok(session) => session,
-        Err(error) => return map_registry_error(error).into_response(),
+        Err(_) => return rejected_callback(&service.config),
     };
     let mut response = response_with_cookie(
         StatusCode::SEE_OTHER,
@@ -779,6 +820,7 @@ async fn callback(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionPrincipalResponse<'a> {
     user_id: &'a CanonicalUserId,
+    display_name: &'a str,
     display_email: &'a Email,
 }
 
@@ -826,6 +868,7 @@ pub(crate) async fn session(
         api_version: BROWSER_SESSION_API_VERSION,
         principal: SessionPrincipalResponse {
             user_id: &session.principal.canonical_user_id,
+            display_name: &session.principal.display_name,
             display_email: &session.principal.display_email,
         },
         role: session.principal.role,
@@ -1356,6 +1399,7 @@ mod tests {
     fn principal() -> Result<BrowserPrincipal, String> {
         Ok(BrowserPrincipal {
             canonical_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
+            display_name: "Alice Example".to_owned(),
             display_email: Email::parse("alice@example.com")?,
             role: BrowserRole::User,
             member_roles: Vec::new(),
@@ -1871,6 +1915,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_accepts_only_the_optional_exact_google_issuer_without_query_leakage()
+    -> Result<(), String> {
+        let (service, flow_cookie, callback_uri) =
+            start_local_flow(LocalFakeIdentity::User).await?;
+        for suffix in [
+            "&iss=",
+            "&iss=https%3A%2F%2Fissuer.example.test",
+            "&iss=https%3A%2F%2Faccounts.google.com&iss=https%3A%2F%2Faccounts.google.com",
+            "&issuer=https%3A%2F%2Faccounts.google.com",
+        ] {
+            let response = browser_auth_router(service.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{callback_uri}{suffix}"))
+                        .header(header::COOKIE, &flow_cookie)
+                        .body(Body::empty())
+                        .map_err(|error| format!("build rejected callback request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("execute rejected callback request: {error}"))?;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                response.headers().get(header::LOCATION),
+                Some(&axum::http::HeaderValue::from_static("/admin/sign-in")),
+                "a rejected OAuth callback must return the browser to a recoverable sign-in page"
+            );
+            let body = to_bytes(response.into_body(), 4096)
+                .await
+                .map_err(|error| format!("read rejected callback response: {error}"))?;
+            assert!(
+                body.is_empty(),
+                "a rejected OAuth callback must not expose an authentication failure body"
+            );
+        }
+
+        let accepted = browser_auth_router(service)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "{callback_uri}&iss=https%3A%2F%2Faccounts.google.com&scope=openid%20email%20profile&authuser=0&prompt=consent&hd=example.com"
+                    ))
+                    .header(header::COOKIE, flow_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build accepted callback request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute accepted callback request: {error}"))?;
+        assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            accepted.headers().get(header::LOCATION),
+            Some(&axum::http::HeaderValue::from_static("/envelopes")),
+            "Google's allow-listed callback metadata must complete authentication"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn local_fake_uses_real_callback_session_router_and_rotates_fixation_cookie()
     -> Result<(), String> {
         let (service, flow_cookie, callback_uri) =
@@ -1939,6 +2040,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|error| format!("parse session response: {error}"))?;
         assert_eq!(value["apiVersion"], "steward.browser-session/v1");
+        assert_eq!(value["principal"]["displayName"], "Alice Example");
         assert_eq!(value["principal"]["displayEmail"], "alice@example.com");
         assert_eq!(value["role"], "user");
         assert_eq!(value["memberRoles"], serde_json::json!([]));
@@ -1959,7 +2061,11 @@ mod tests {
             )
             .await
             .map_err(|error| format!("execute replay request: {error}"))?;
-        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(replay.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            replay.headers().get(header::LOCATION),
+            Some(&header::HeaderValue::from_static("/admin/sign-in"))
+        );
         Ok(())
     }
 
@@ -1978,7 +2084,11 @@ mod tests {
             )
             .await
             .map_err(|error| format!("execute wrong-tenant callback: {error}"))?;
-        assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(wrong.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            wrong.headers().get(header::LOCATION),
+            Some(&header::HeaderValue::from_static("/admin/sign-in"))
+        );
         assert!(cookie_pair(&wrong, "steward-local-session").is_err());
 
         let (service, flow_cookie, callback_uri) =

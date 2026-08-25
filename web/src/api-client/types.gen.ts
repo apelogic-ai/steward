@@ -153,6 +153,7 @@ export type BrowserApprovalView = {
 export type BrowserApprovalsResponse = {
     apiVersion: string;
     approvals: Array<BrowserApprovalView>;
+    envelopeRequests: Array<BrowserEnvelopeRequestView>;
 };
 
 export type BrowserDecisionReferenceResponse = {
@@ -167,12 +168,31 @@ export type BrowserEnvelope = {
     spec: BrowserEnvelopeSpec;
 };
 
+export type BrowserEnvelopeRequestView = {
+    createdAt: string;
+    ownerDisplayEmail: string;
+    requestId: string;
+    requestedEnvelope: BrowserEnvelope;
+    templateId: string;
+    templateRevision: number;
+};
+
 export type BrowserEnvelopeSpec = {
     budget: Budget;
     llms: Array<ModelRef>;
     runner?: RunnerRequirements;
     tools: Array<ToolGrant>;
     ttl: Duration;
+};
+
+export type BrowserEnvelopeTemplateListItem = {
+    envelope: BrowserEnvelope;
+    memberRole: string;
+};
+
+export type BrowserEnvelopeTemplateListResponse = {
+    apiVersion: string;
+    templates: Array<BrowserEnvelopeTemplateListItem>;
 };
 
 export type BrowserEnvelopeTemplateResponse = {
@@ -223,12 +243,19 @@ export type BrowserRunView = {
     runtimeUid?: string | null;
     taskUid: string;
     updatedAt: string;
+    userEnvelopeDigest?: string | null;
+    userEnvelopeInstanceId?: string | null;
+    userEnvelopeRevision?: number | null;
     workflow: string;
+    workflowDigest?: string | null;
+    workflowName?: string | null;
+    workflowVersion?: number | null;
 };
 
 export type Budget = {
     currency: string;
     monthlyLimit: string;
+    singleRunLimit?: string | null;
 };
 
 export type BudgetIncrease = {
@@ -347,10 +374,33 @@ export type ProviderConnectionStatus = {
     scopesRequired: Array<string>;
 };
 
+export type PublishWorkflowRequest = {
+    agent: string;
+    displayName: string;
+    name: string;
+    prompt: string;
+};
+
+export type PublishWorkflowVersionRequest = {
+    agent: string;
+    displayName: string;
+    prompt: string;
+};
+
+export type PublishedWorkflowOption = {
+    agent: string;
+    displayName: string;
+    name: string;
+    version: number;
+};
+
+export type PublishedWorkflowsResponse = {
+    apiVersion: string;
+    workflows: Array<PublishedWorkflowOption>;
+};
+
 export type RenderGithubActionsWorkflowBody = {
-    path: string;
-    repository: string;
-    revision: string;
+    workflow: string;
 };
 
 /**
@@ -369,6 +419,7 @@ export type RuntimeOwnership = 'provisioned' | 'adopted';
 
 export type SessionPrincipalResponse = {
     displayEmail: Email;
+    displayName: string;
     userId: CanonicalUserId;
 };
 
@@ -438,7 +489,7 @@ export type TaskStatusResponse = {
 
 export type TaskSubmissionRequest = {
     agentRuntimeUid?: string | null;
-    codingAgentRuntime: string;
+    codingAgentRuntime?: string | null;
     workflow: string;
 };
 
@@ -461,6 +512,27 @@ export type UserEnvelopeRequest = {
     statusAt: string;
     templateId: string;
     templateRevision: number;
+};
+
+export type WorkflowListResponse = {
+    apiVersion: string;
+    workflows: Array<WorkflowRevisionView>;
+};
+
+export type WorkflowRevisionResponse = {
+    apiVersion: string;
+    workflow: WorkflowRevisionView;
+};
+
+export type WorkflowRevisionView = {
+    agent: string;
+    contentDigest: string;
+    displayName: string;
+    name: string;
+    prompt: string;
+    publishedAt: string;
+    publishedBy: string;
+    version: number;
 };
 
 export type AllRunsData = {
@@ -826,6 +898,34 @@ export type StartConnectionResponses = {
 
 export type StartConnectionResponse2 = StartConnectionResponses[keyof StartConnectionResponses];
 
+export type ListAdminEnvelopeTemplatesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/envelope-templates';
+};
+
+export type ListAdminEnvelopeTemplatesErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Envelope templates are unavailable
+     */
+    503: unknown;
+};
+
+export type ListAdminEnvelopeTemplatesResponses = {
+    200: BrowserEnvelopeTemplateListResponse;
+};
+
+export type ListAdminEnvelopeTemplatesResponse = ListAdminEnvelopeTemplatesResponses[keyof ListAdminEnvelopeTemplatesResponses];
+
 export type GetAdminEnvelopeTemplateData = {
     body?: never;
     path: {
@@ -1059,6 +1159,149 @@ export type SessionResponses = {
 };
 
 export type SessionResponse2 = SessionResponses[keyof SessionResponses];
+
+export type ListAdminWorkflowsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/workflows';
+};
+
+export type ListAdminWorkflowsErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Workflow store is unavailable
+     */
+    503: unknown;
+};
+
+export type ListAdminWorkflowsResponses = {
+    200: WorkflowListResponse;
+};
+
+export type ListAdminWorkflowsResponse = ListAdminWorkflowsResponses[keyof ListAdminWorkflowsResponses];
+
+export type PublishAdminWorkflowData = {
+    body: PublishWorkflowRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/workflows';
+};
+
+export type PublishAdminWorkflowErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role or mutation proof is invalid
+     */
+    403: unknown;
+    /**
+     * Workflow name already exists
+     */
+    409: unknown;
+    /**
+     * Workflow content is invalid
+     */
+    422: unknown;
+    /**
+     * Workflow store is unavailable
+     */
+    503: unknown;
+};
+
+export type PublishAdminWorkflowResponses = {
+    201: WorkflowRevisionResponse;
+};
+
+export type PublishAdminWorkflowResponse = PublishAdminWorkflowResponses[keyof PublishAdminWorkflowResponses];
+
+export type PublishAdminWorkflowVersionData = {
+    body: PublishWorkflowVersionRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/workflows/{name}/versions';
+};
+
+export type PublishAdminWorkflowVersionErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role or mutation proof is invalid
+     */
+    403: unknown;
+    /**
+     * Workflow was not found
+     */
+    404: unknown;
+    /**
+     * Workflow content is invalid
+     */
+    422: unknown;
+    /**
+     * Workflow store is unavailable
+     */
+    503: unknown;
+};
+
+export type PublishAdminWorkflowVersionResponses = {
+    201: WorkflowRevisionResponse;
+};
+
+export type PublishAdminWorkflowVersionResponse = PublishAdminWorkflowVersionResponses[keyof PublishAdminWorkflowVersionResponses];
+
+export type GetAdminWorkflowVersionData = {
+    body?: never;
+    path: {
+        name: string;
+        version: number;
+    };
+    query?: never;
+    url: '/admin/api/v1/workflows/{name}/versions/{version}';
+};
+
+export type GetAdminWorkflowVersionErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Workflow revision was not found
+     */
+    404: unknown;
+    /**
+     * Workflow store is unavailable
+     */
+    503: unknown;
+};
+
+export type GetAdminWorkflowVersionResponses = {
+    200: WorkflowRevisionResponse;
+};
+
+export type GetAdminWorkflowVersionResponse = GetAdminWorkflowVersionResponses[keyof GetAdminWorkflowVersionResponses];
 
 export type ListRequestsData = {
     body?: never;
@@ -1319,6 +1562,30 @@ export type MyRunTimelineResponses = {
 };
 
 export type MyRunTimelineResponse = MyRunTimelineResponses[keyof MyRunTimelineResponses];
+
+export type ListPublishedWorkflowsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/app/api/v1/workflows';
+};
+
+export type ListPublishedWorkflowsErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Workflow store is unavailable
+     */
+    503: unknown;
+};
+
+export type ListPublishedWorkflowsResponses = {
+    200: PublishedWorkflowsResponse;
+};
+
+export type ListPublishedWorkflowsResponse = ListPublishedWorkflowsResponses[keyof ListPublishedWorkflowsResponses];
 
 export type CreateRuntimeContractData = {
     body: CreateRuntimeRequest;

@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, evaluate_with_grants};
 use steward_ports::MAX_TASK_INPUT_ARCHIVE_BYTES;
-use steward_store::{ParkRejection, PgStore, StoreError, TaskRecord, TaskReservationRequest};
+use steward_store::{
+    EnvelopeRequestRecord, ParkRejection, PgStore, StoreError, TaskRecord, TaskReservationRequest,
+    WorkflowRevisionRecord,
+};
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, Duration,
     Email, ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, RuntimeOwnership, TaskPhase,
@@ -26,6 +29,7 @@ use steward_types::{
 };
 use uuid::Uuid;
 
+use crate::WorkflowReference;
 use crate::{
     AdmissionLedger, ApiError, BoxFuture, DecisionChannel, KubernetesTokenReviewAudience,
     RuntimeCreateError, RuntimeRepository, authenticated_token_review_user,
@@ -37,6 +41,105 @@ const SERVICE_GROUP_PREFIX: &str = "agents.apelogic.ai/service-principal:";
 const ACTING_USER_GROUP_PREFIX: &str = "agents.apelogic.ai/acting-user:";
 const TASK_OWNER_GROUP_PREFIX: &str = "agents.apelogic.ai/task-owner:";
 const CANONICAL_USER_GROUP_PREFIX: &str = "agents.apelogic.ai/canonical-user:";
+const VERSIONED_WORKFLOW_NAMESPACE: &str = "steward-workflows";
+
+fn versioned_workflow_reference(
+    workflow: &str,
+    coding_agent_runtime: Option<&str>,
+) -> Result<Option<WorkflowReference>, ApiError> {
+    if !workflow.contains('@') {
+        return Ok(None);
+    }
+    let reference = WorkflowReference::parse(workflow).map_err(|_| {
+        ApiError::Admission("workflow must be an exact lowercase name@positive-version".to_owned())
+    })?;
+    if coding_agent_runtime.is_some() {
+        return Err(ApiError::Admission(
+            "codingAgentRuntime is server-selected for versioned Workflows".to_owned(),
+        ));
+    }
+    Ok(Some(reference))
+}
+
+struct VersionedTaskPlan {
+    workflow: WorkflowRevisionRecord,
+    envelope: EnvelopeRequestRecord,
+    spec: AgentRuntimeSpec,
+    command: Vec<String>,
+}
+
+fn resolve_versioned_task_plan(
+    identity: &TaskIdentity,
+    workflow: WorkflowRevisionRecord,
+    envelopes: Vec<EnvelopeRequestRecord>,
+) -> Result<VersionedTaskPlan, ApiError> {
+    let [envelope] = envelopes.as_slice() else {
+        return if envelopes.is_empty() {
+            Err(ApiError::MissingEnvelope)
+        } else {
+            Err(ApiError::Conflict(
+                "multiple active provisioned User Envelopes are ambiguous".to_owned(),
+            ))
+        };
+    };
+    if envelope.owner_user_id != identity.canonical_user_id {
+        return Err(ApiError::PrincipalMismatch);
+    }
+    if envelope.status != steward_store::EnvelopeRequestStatus::Provisioned
+        || envelope.envelope_instance_id.is_none()
+        || envelope.envelope_digest.is_none()
+    {
+        return Err(ApiError::MissingEnvelope);
+    }
+    let approved = envelope
+        .approved_envelope
+        .as_ref()
+        .ok_or(ApiError::MissingEnvelope)?;
+    let canonical_authority = CanonicalAuthorityBinding::new(
+        identity.canonical_user_id.clone(),
+        identity
+            .acting_user
+            .as_ref()
+            .map(|_| identity.canonical_user_id.clone()),
+    )
+    .map_err(ApiError::Admission)?;
+    let spec = AgentRuntimeSpec {
+        principal: Principal::Service {
+            name: identity.service.clone(),
+            acting_user: identity.acting_user.clone(),
+        },
+        owner: identity.owner.clone(),
+        canonical_authority: Some(canonical_authority),
+        agent_type: steward_types::AgentType {
+            name: workflow.agent.clone(),
+        },
+        llms: approved.spec.llms.clone(),
+        tools: approved.spec.tools.clone(),
+        budget: approved.spec.budget.clone(),
+        ttl: approved.spec.ttl.clone(),
+        runner: approved.spec.runner.clone(),
+        bindings: None,
+    };
+    let command = vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        concat!(
+            "set -eu; ",
+            "test \"$(codex --version)\" = \"codex-cli 0.117.0\"; ",
+            "codex exec --skip-git-repo-check ",
+            "--output-last-message \"$STEWARD_OUTPUT_DIR/result.txt\" -- \"$1\""
+        )
+        .to_owned(),
+        "steward-workflow".to_owned(),
+        workflow.prompt.clone(),
+    ];
+    Ok(VersionedTaskPlan {
+        workflow,
+        envelope: envelope.clone(),
+        spec,
+        command,
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskAuthenticationError {
@@ -251,6 +354,21 @@ impl TaskWorkflowCatalog for StaticTaskWorkflowCatalog {
 }
 
 pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
+    fn workflow_revision<'a>(
+        &'a self,
+        _name: &'a str,
+        _version: i64,
+    ) -> BoxFuture<'a, Result<Option<WorkflowRevisionRecord>, StoreError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn active_provisioned_user_envelopes<'a>(
+        &'a self,
+        _owner_user_id: &'a CanonicalUserId,
+    ) -> BoxFuture<'a, Result<Vec<EnvelopeRequestRecord>, StoreError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn reserve_task<'a>(
         &'a self,
         request: TaskReservationRequest<'a>,
@@ -294,6 +412,32 @@ pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
 }
 
 impl TaskSubmissionLedger for PgStore {
+    fn workflow_revision<'a>(
+        &'a self,
+        name: &'a str,
+        version: i64,
+    ) -> BoxFuture<'a, Result<Option<WorkflowRevisionRecord>, StoreError>> {
+        Box::pin(async move { PgStore::workflow_revision(self, name, version).await })
+    }
+
+    fn active_provisioned_user_envelopes<'a>(
+        &'a self,
+        owner_user_id: &'a CanonicalUserId,
+    ) -> BoxFuture<'a, Result<Vec<EnvelopeRequestRecord>, StoreError>> {
+        Box::pin(async move {
+            PgStore::envelope_requests(self, owner_user_id)
+                .await
+                .map(|records| {
+                    records
+                        .into_iter()
+                        .filter(|record| {
+                            record.status == steward_store::EnvelopeRequestStatus::Provisioned
+                        })
+                        .collect()
+                })
+        })
+    }
+
     fn reserve_task<'a>(
         &'a self,
         request: TaskReservationRequest<'a>,
@@ -364,7 +508,8 @@ impl TaskSubmissionLedger for PgStore {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskSubmissionRequest {
     pub workflow: String,
-    pub coding_agent_runtime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_agent_runtime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_runtime_uid: Option<String>,
 }
@@ -709,11 +854,19 @@ where
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::Admission("Idempotency-Key is required".to_owned()))?;
     let identity = resolve_task_identity(&state.identities, headers).await?;
+    if let Some(reference) =
+        versioned_workflow_reference(&request.workflow, request.coding_agent_runtime.as_deref())?
+    {
+        return submit_versioned_task(state, idempotency_key, identity, reference, request).await;
+    }
     let workflow = state
         .workflows
         .workflow(&request.workflow)
         .ok_or(ApiError::TaskWorkflowNotFound)?;
-    if request.coding_agent_runtime != workflow.coding_agent_runtime {
+    let coding_agent_runtime = request.coding_agent_runtime.as_deref().ok_or_else(|| {
+        ApiError::Admission("legacy workflows require codingAgentRuntime".to_owned())
+    })?;
+    if coding_agent_runtime != workflow.coding_agent_runtime {
         return Err(ApiError::Admission(
             "codingAgentRuntime is not selected by the workflow".to_owned(),
         ));
@@ -790,6 +943,12 @@ where
                 owner: &identity.owner.0,
                 owner_user_id: identity.canonical_user_id.as_str(),
                 workflow: &workflow.name,
+                workflow_name: None,
+                workflow_version: None,
+                workflow_digest: None,
+                user_envelope_instance_id: None,
+                user_envelope_revision: None,
+                user_envelope_digest: None,
                 coding_agent_runtime: &workflow.coding_agent_runtime,
                 runtime_namespace: &runtime_namespace,
                 runtime_name: &runtime_name,
@@ -833,6 +992,12 @@ where
             owner: &identity.owner.0,
             owner_user_id: identity.canonical_user_id.as_str(),
             workflow: &workflow.name,
+            workflow_name: None,
+            workflow_version: None,
+            workflow_digest: None,
+            user_envelope_instance_id: None,
+            user_envelope_revision: None,
+            user_envelope_digest: None,
             coding_agent_runtime: &workflow.coding_agent_runtime,
             runtime_namespace: &workflow.namespace,
             runtime_name: &runtime_name,
@@ -861,6 +1026,137 @@ where
             service: &identity.service,
             proposed_spec: &spec,
             envelope: &envelope,
+            decision,
+        },
+    )
+    .await?;
+    let runtime_uid = runtime
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or(ApiError::MissingRuntimeUid)?;
+    let record = state
+        .ledger
+        .bind_task_runtime(reservation.record.task_uid, runtime_uid, phase)
+        .await
+        .map_err(ApiError::Store)?;
+    task_response(record, deltas)
+}
+
+async fn submit_versioned_task<R, L, D, I, W>(
+    state: &TaskApiState<R, L, D, I, W>,
+    idempotency_key: &str,
+    identity: TaskIdentity,
+    reference: WorkflowReference,
+    request: &TaskSubmissionRequest,
+) -> Result<(StatusCode, TaskStatusResponse), ApiError>
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger + TaskSubmissionLedger,
+    D: DecisionChannel + Clone,
+    I: TaskIdentityResolver,
+    W: TaskWorkflowCatalog,
+{
+    if request.agent_runtime_uid.is_some() {
+        return Err(ApiError::Admission(
+            "versioned Workflows use a server-owned runtime path".to_owned(),
+        ));
+    }
+    let workflow = state
+        .ledger
+        .workflow_revision(&reference.name, reference.version)
+        .await
+        .map_err(ApiError::Store)?
+        .ok_or(ApiError::TaskWorkflowNotFound)?;
+    let envelopes = state
+        .ledger
+        .active_provisioned_user_envelopes(&identity.canonical_user_id)
+        .await
+        .map_err(ApiError::Store)?;
+    let plan = resolve_versioned_task_plan(&identity, workflow, envelopes)?;
+    let user_envelope = plan
+        .envelope
+        .approved_envelope
+        .as_ref()
+        .ok_or(ApiError::MissingEnvelope)?;
+    if !matches!(
+        evaluate_with_grants(&plan.spec, user_envelope, &[])
+            .map_err(|error| ApiError::Admission(format!("{error:?}")))?,
+        AdmissionDecision::Admit
+    ) {
+        return Err(ApiError::Admission(
+            "Workflow runtime exceeds its pinned User Envelope".to_owned(),
+        ));
+    }
+    let service_envelope = state
+        .ledger
+        .latest_service_envelope(&identity.service)
+        .await
+        .map_err(ApiError::Store)?
+        .ok_or(ApiError::MissingEnvelope)?;
+    let decision = evaluate_with_grants(&plan.spec, &service_envelope, &[])
+        .map_err(|error| ApiError::Admission(format!("{error:?}")))?;
+    let workflow_reference = format!("{}@{}", plan.workflow.name, plan.workflow.version);
+    let runtime_name = stable_task_runtime_name(
+        &identity.service,
+        identity.canonical_user_id.as_str(),
+        idempotency_key,
+    );
+    let envelope_instance_id = plan
+        .envelope
+        .envelope_instance_id
+        .as_deref()
+        .ok_or(ApiError::MissingEnvelope)?;
+    let envelope_digest = plan
+        .envelope
+        .envelope_digest
+        .as_deref()
+        .ok_or(ApiError::MissingEnvelope)?;
+    let reservation = state
+        .ledger
+        .reserve_task(TaskReservationRequest {
+            idempotency_key,
+            submitter_service: &identity.service,
+            acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
+            acting_user_id: identity
+                .acting_user
+                .as_ref()
+                .map(|_| identity.canonical_user_id.as_str()),
+            owner: &identity.owner.0,
+            owner_user_id: identity.canonical_user_id.as_str(),
+            workflow: &workflow_reference,
+            workflow_name: Some(&plan.workflow.name),
+            workflow_version: Some(plan.workflow.version),
+            workflow_digest: Some(&plan.workflow.content_digest),
+            user_envelope_instance_id: Some(envelope_instance_id),
+            user_envelope_revision: Some(user_envelope.revision),
+            user_envelope_digest: Some(envelope_digest),
+            coding_agent_runtime: &plan.workflow.agent,
+            runtime_namespace: VERSIONED_WORKFLOW_NAMESPACE,
+            runtime_name: &runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &plan.spec,
+            agent_command: &plan.command,
+            envelope_revision: service_envelope.revision,
+        })
+        .await
+        .map_err(ApiError::Store)?;
+    if !reservation.inserted && reservation.record.runtime_uid.is_some() {
+        return task_response(reservation.record, Vec::new());
+    }
+    if matches!(&decision, AdmissionDecision::Admit) {
+        return task_response(reservation.record, Vec::new());
+    }
+    let (runtime, phase, deltas) = create_task_runtime(
+        &state.runtimes,
+        &state.ledger,
+        &state.decisions,
+        TaskRuntimePlan {
+            namespace: VERSIONED_WORKFLOW_NAMESPACE,
+            name: &runtime_name,
+            service: &identity.service,
+            proposed_spec: &plan.spec,
+            envelope: &service_envelope,
             decision,
         },
     )
@@ -1035,4 +1331,181 @@ fn stable_task_runtime_name(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("task-{suffix}")
+}
+
+#[cfg(test)]
+mod workflow_request_tests {
+    use super::{resolve_versioned_task_plan, versioned_workflow_reference};
+    use crate::{ApiError, TaskIdentity};
+    use steward_admission::{Envelope, EnvelopeSpec};
+    use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, WorkflowRevisionRecord};
+    use steward_types::{
+        Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
+    };
+    use uuid::Uuid;
+
+    #[test]
+    fn versioned_workflow_rejects_caller_selected_coding_runtime() {
+        assert!(
+            versioned_workflow_reference("repository-review@1", Some("base")).is_err(),
+            "versioned Workflow requests must not let the caller select the coding runtime"
+        );
+    }
+
+    #[test]
+    fn malformed_versioned_workflow_does_not_fall_back_to_legacy_catalog() {
+        for workflow in [
+            "repository-review@latest",
+            "repository-review@0",
+            "repository-review@",
+            "repository-review@1@2",
+        ] {
+            assert!(
+                versioned_workflow_reference(workflow, None).is_err(),
+                "malformed versioned reference {workflow:?} must not reach the legacy path"
+            );
+        }
+    }
+
+    fn identity(user_id: &str) -> Result<TaskIdentity, String> {
+        Ok(TaskIdentity {
+            service: "steward-run".to_owned(),
+            acting_user: Some(Email("alice@example.com".to_owned())),
+            owner: Email("alice@example.com".to_owned()),
+            canonical_user_id: CanonicalUserId::parse(user_id)?,
+        })
+    }
+
+    fn workflow() -> WorkflowRevisionRecord {
+        WorkflowRevisionRecord {
+            name: "repository-review".to_owned(),
+            version: 1,
+            display_name: "Repository review".to_owned(),
+            agent: "codex@0.117.0".to_owned(),
+            prompt: "Review the repository state.".to_owned(),
+            content_digest: "workflow-digest".to_owned(),
+            published_by: "usr_abcdef0123456789abcdef0123456789".to_owned(),
+            published_at: "2026-08-24T00:00:00.000000Z".to_owned(),
+        }
+    }
+
+    fn provisioned_envelope(owner_user_id: &str) -> Result<EnvelopeRequestRecord, String> {
+        let envelope = Envelope {
+            revision: 7,
+            spec: EnvelopeSpec {
+                llms: vec![ModelRef {
+                    provider: "openai".to_owned(),
+                    model: "gpt-5.4".to_owned(),
+                }],
+                tools: vec![ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "repository".to_owned(),
+                    action: "get_file_contents".to_owned(),
+                }],
+                budget: Budget {
+                    monthly_limit: "10.00".to_owned(),
+                    single_run_limit: Some("1.00".to_owned()),
+                    currency: "USD".to_owned(),
+                },
+                ttl: Duration("15m".to_owned()),
+                runner: RunnerRequirements::default(),
+            },
+        };
+        Ok(EnvelopeRequestRecord {
+            id: Uuid::new_v4(),
+            owner_user_id: CanonicalUserId::parse(owner_user_id)?,
+            template_id: "developer".to_owned(),
+            template_revision: 2,
+            requested_envelope: envelope.clone(),
+            approved_envelope: Some(envelope),
+            status: EnvelopeRequestStatus::Provisioned,
+            approval_id: None,
+            envelope_instance_id: Some("env_instance_01".to_owned()),
+            envelope_digest: Some("envelope-digest".to_owned()),
+            reason: None,
+            created_at: "2026-08-24T00:00:00.000000Z".to_owned(),
+            status_at: "2026-08-24T00:00:01.000000Z".to_owned(),
+        })
+    }
+
+    #[test]
+    fn versioned_workflow_cannot_use_another_users_envelope() -> Result<(), String> {
+        let result = resolve_versioned_task_plan(
+            &identity("usr_0123456789abcdef0123456789abcdef")?,
+            workflow(),
+            vec![provisioned_envelope(
+                "usr_abcdef0123456789abcdef0123456789",
+            )?],
+        );
+        assert!(
+            matches!(result, Err(ApiError::PrincipalMismatch)),
+            "a versioned Task must reject an Envelope owned by another canonical user"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn zero_or_ambiguous_provisioned_user_envelopes_fail_closed() -> Result<(), String> {
+        let task_identity = identity("usr_0123456789abcdef0123456789abcdef")?;
+        assert!(matches!(
+            resolve_versioned_task_plan(&task_identity, workflow(), Vec::new()),
+            Err(ApiError::MissingEnvelope)
+        ));
+        assert!(matches!(
+            resolve_versioned_task_plan(
+                &task_identity,
+                workflow(),
+                vec![
+                    provisioned_envelope("usr_0123456789abcdef0123456789abcdef")?,
+                    provisioned_envelope("usr_0123456789abcdef0123456789abcdef")?,
+                ],
+            ),
+            Err(ApiError::Conflict(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_task_combines_workflow_agent_and_prompt_with_user_envelope_authority()
+    -> Result<(), String> {
+        let plan = resolve_versioned_task_plan(
+            &identity("usr_0123456789abcdef0123456789abcdef")?,
+            workflow(),
+            vec![provisioned_envelope(
+                "usr_0123456789abcdef0123456789abcdef",
+            )?],
+        )
+        .map_err(|error| format!("one exact owned provisioned Envelope was rejected: {error:?}"))?;
+        assert_eq!(plan.workflow.name, "repository-review");
+        assert_eq!(plan.workflow.version, 1);
+        assert_eq!(plan.spec.agent_type.name, "codex@0.117.0");
+        assert_eq!(plan.spec.llms[0].model, "gpt-5.4");
+        assert_eq!(plan.spec.tools[0].provider, "github");
+        assert_eq!(plan.spec.budget.monthly_limit, "10.00");
+        assert_eq!(plan.spec.budget.single_run_limit.as_deref(), Some("1.00"));
+        assert_eq!(plan.spec.ttl.0, "15m");
+        assert_eq!(plan.envelope.template_revision, 2);
+        assert_eq!(
+            plan.envelope.envelope_instance_id.as_deref(),
+            Some("env_instance_01")
+        );
+        assert_eq!(
+            plan.command.last().map(String::as_str),
+            Some("Review the repository state."),
+            "the immutable Workflow prompt must be a separate argument to the server-owned command"
+        );
+        assert!(
+            plan.command
+                .iter()
+                .any(|argument| argument.contains("codex-cli 0.117.0")),
+            "the server-owned command must fail closed unless the sandbox exposes the exact approved Codex version"
+        );
+        assert!(
+            plan.command
+                .iter()
+                .all(|argument| !argument.contains("example-org")),
+            "repository mechanics do not belong to the Workflow execution command"
+        );
+        Ok(())
+    }
 }

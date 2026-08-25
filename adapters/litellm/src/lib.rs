@@ -528,6 +528,7 @@ mod tests {
             }],
             budget: Budget {
                 monthly_limit: "1.00".to_owned(),
+                single_run_limit: None,
                 currency: "USD".to_owned(),
             },
         }
@@ -565,6 +566,7 @@ mod tests {
         .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
         let budget = Budget {
             monthly_limit: "1.00".to_owned(),
+            single_run_limit: None,
             currency: "EUR".to_owned(),
         };
 

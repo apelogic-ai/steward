@@ -1,22 +1,72 @@
 @import "tailwindcss";
 
 @theme inline {
-  --font-sans: "Geist", "Geist Fallback", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "Geist Mono", "Geist Mono Fallback", ui-monospace, monospace;
-  --color-canvas: oklch(0.975 0.006 255);
-  --color-ink: oklch(0.225 0.025 255);
-  --color-muted-ink: oklch(0.49 0.025 255);
-  --color-panel: oklch(0.995 0.002 255);
-  --color-line: oklch(0.88 0.018 255);
-  --color-brand: oklch(0.46 0.18 260);
-  --color-brand-strong: oklch(0.37 0.18 260);
-  --color-notice: oklch(0.94 0.035 80);
-  --radius-panel: 0.75rem;
+  --font-sans: var(--font-space-grotesk), Arial, sans-serif;
+  --font-mono: var(--font-inconsolata), ui-monospace, monospace;
+  --color-canvas: var(--steward-canvas);
+  --color-ink: var(--steward-ink);
+  --color-muted-ink: var(--steward-muted-ink);
+  --color-panel: var(--steward-panel);
+  --color-line: var(--steward-line);
+  --color-brand: #ef8626;
+  --color-brand-strong: #bf6c1e;
+  --color-notice: var(--steward-notice);
+  --radius-panel: 0.5rem;
 }
 
 :root {
+  --steward-canvas: #ffffff;
+  --steward-ink: #000000;
+  --steward-muted-ink: #333333;
+  --steward-panel: #ffffff;
+  --steward-line: #e5e5e5;
+  --steward-notice: #fff4e9;
+  --steward-provisioned-background: #eaf3ff;
+  --steward-provisioned-border: #9dc5f3;
+  --steward-provisioned-ink: #1557a0;
   color-scheme: light;
   background: var(--color-canvas);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --steward-canvas: #121212;
+    --steward-ink: #fafafa;
+    --steward-muted-ink: #cccccc;
+    --steward-panel: #171717;
+    --steward-line: #2e2e2e;
+    --steward-notice: #332416;
+    --steward-provisioned-background: #132a44;
+    --steward-provisioned-border: #2e659e;
+    --steward-provisioned-ink: #8fc5ff;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="light"] {
+  --steward-canvas: #ffffff;
+  --steward-ink: #000000;
+  --steward-muted-ink: #333333;
+  --steward-panel: #ffffff;
+  --steward-line: #e5e5e5;
+  --steward-notice: #fff4e9;
+  --steward-provisioned-background: #eaf3ff;
+  --steward-provisioned-border: #9dc5f3;
+  --steward-provisioned-ink: #1557a0;
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --steward-canvas: #121212;
+  --steward-ink: #fafafa;
+  --steward-muted-ink: #cccccc;
+  --steward-panel: #171717;
+  --steward-line: #2e2e2e;
+  --steward-notice: #332416;
+  --steward-provisioned-background: #132a44;
+  --steward-provisioned-border: #2e659e;
+  --steward-provisioned-ink: #8fc5ff;
+  color-scheme: dark;
 }
 
 * {
@@ -28,6 +78,71 @@ body {
   background: var(--color-canvas);
   color: var(--color-ink);
   font-family: var(--font-sans);
+}
+
+.apelogic-mark {
+  display: block;
+  box-sizing: border-box;
+  flex: 0 0 2rem;
+  inline-size: 2rem;
+  min-inline-size: 2rem;
+  max-inline-size: 2rem;
+  block-size: 2rem;
+  object-fit: contain;
+}
+
+.account-menu-anchor {
+  box-sizing: border-box;
+  flex: 0 0 2.5rem;
+  inline-size: 2.5rem;
+  min-inline-size: 2.5rem;
+  max-inline-size: 2.5rem;
+}
+
+.account-avatar {
+  box-sizing: border-box;
+  flex: 0 0 2.5rem;
+  inline-size: 2.5rem;
+  min-inline-size: 2.5rem;
+  max-inline-size: 2.5rem;
+  block-size: 2.5rem;
+  min-block-size: 2.5rem;
+  max-block-size: 2.5rem;
+  aspect-ratio: 1;
+  border-radius: 9999px;
+  overflow: hidden;
+  padding: 0;
+}
+
+.account-avatar-large {
+  flex-basis: 2.75rem;
+  inline-size: 2.75rem;
+  min-inline-size: 2.75rem;
+  max-inline-size: 2.75rem;
+  block-size: 2.75rem;
+  min-block-size: 2.75rem;
+  max-block-size: 2.75rem;
+}
+
+.status-badge-provisioned {
+  border-color: var(--steward-provisioned-border);
+  background: var(--steward-provisioned-background);
+  color: var(--steward-provisioned-ink);
+}
+
+input,
+select,
+textarea {
+  background: var(--color-panel);
+  color: var(--color-ink);
+}
+
+::placeholder {
+  color: color-mix(in oklab, var(--color-muted-ink) 70%, transparent);
+}
+
+::selection {
+  background: color-mix(in oklab, var(--color-brand) 55%, transparent);
 }
 
 :focus-visible {

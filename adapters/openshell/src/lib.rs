@@ -66,6 +66,8 @@ const KUBERNETES_DNS_LABEL_MAX_LENGTH: usize = 63;
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
 /// Server-authored agent type for the one-shot Connections bridge operation.
 pub const CONNECTIONS_BRIDGE_AGENT_TYPE: &str = "connections-bridge";
+/// The sole immutable Workflow agent supported by this slice.
+pub const WORKFLOW_CODEX_AGENT_TYPE: &str = "codex@0.117.0";
 #[cfg(feature = "runtime")]
 const TOOL_PROVIDER: &str = "steward-mcp-gw";
 #[cfg(feature = "runtime")]
@@ -310,7 +312,7 @@ fn bridge_image_for_agent_type(
     bridge_image: Option<&str>,
 ) -> Result<Option<String>, PortError> {
     match agent_type.name.as_str() {
-        "base" => Ok(None),
+        "base" | WORKFLOW_CODEX_AGENT_TYPE => Ok(None),
         CONNECTIONS_BRIDGE_AGENT_TYPE => bridge_image
             .filter(|image| is_digest_pinned_image(image))
             .map(str::to_owned)
@@ -322,6 +324,17 @@ fn bridge_image_for_agent_type(
         other => Err(PortError::Rejected {
             reason: format!("unsupported agent type: {other}"),
         }),
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn output_archive_command(agent_type: &AgentType) -> &'static str {
+    if agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE {
+        "set -eu; test -f /sandbox/steward-output/response.json; tar -cf - -C /sandbox/steward-output response.json"
+    } else if agent_type.name == WORKFLOW_CODEX_AGENT_TYPE {
+        "set -eu; test -s /sandbox/steward-output/result.txt; tar -cf - -C /sandbox/steward-output result.txt"
+    } else {
+        "set -eu; tar -cf - -C /sandbox/steward-output ."
     }
 }
 
@@ -1469,11 +1482,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 reason: format!("task agent exited with code {}", executed.exit_code),
             });
         }
-        let output_archive_command = if is_connections_bridge {
-            "set -eu; test -f /sandbox/steward-output/response.json; tar -cf - -C /sandbox/steward-output response.json"
-        } else {
-            "set -eu; tar -cf - -C /sandbox/steward-output ."
-        };
+        let output_archive_command = output_archive_command(&request.agent_type);
         let collected = self
             .authenticated_client()
             .await?
@@ -1574,8 +1583,8 @@ mod tests {
     use super::{
         CONNECTIONS_BRIDGE_AGENT_TYPE, OpenShellConnectionConfig, ProviderReconciliation,
         SandboxDeleteClient, WorkloadExchangeTokenProvider, delete_owned_sandbox, deletion_names,
-        load_source_credential, project_request, provider_reconciliation, sandbox_spec,
-        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
+        load_source_credential, output_archive_command, project_request, provider_reconciliation,
+        sandbox_spec, validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
     };
     #[cfg(feature = "identity")]
     use super::{IdentityResolutionError, SANDBOX_ID_LABEL, binding_from_sandbox};
@@ -2216,6 +2225,54 @@ mod tests {
         );
         assert_eq!(projection.runtime_uid, "runtime-uid-a");
         Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn approved_codex_workflow_uses_the_gateway_default_image_and_unknown_agents_fail_closed()
+    -> Result<(), String> {
+        let request = |agent_type: &str| SandboxRequest {
+            runtime: RuntimeId("runtime-uid-a".to_owned()),
+            workspace_key: "team-a".to_owned(),
+            agent_type: AgentType {
+                name: agent_type.to_owned(),
+            },
+            models: Vec::new(),
+            tools: Vec::new(),
+            refs: RuntimeRefs::default(),
+        };
+
+        let projection = project_request(&request("codex@0.117.0"), None)
+            .map_err(|error| format!("approved Workflow agent was rejected: {error:?}"))?;
+        assert!(
+            sandbox_spec(&projection).image.is_none(),
+            "the approved agent must not let Steward select an OpenShell image"
+        );
+        assert!(
+            project_request(&request("codex@latest"), None).is_err(),
+            "an unpinned agent reference must fail closed"
+        );
+        assert!(
+            project_request(&request("other-agent@1"), None).is_err(),
+            "an unpublished agent reference must fail closed"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn approved_codex_workflow_requires_one_non_empty_standard_result_artifact() {
+        let command = output_archive_command(&AgentType {
+            name: "codex@0.117.0".to_owned(),
+        });
+        assert!(
+            command.contains("test -s /sandbox/steward-output/result.txt"),
+            "the runtime must reject a missing or empty standard result"
+        );
+        assert!(
+            command.ends_with("result.txt"),
+            "the runtime must archive only the standard Workflow result"
+        );
     }
 
     #[cfg(feature = "runtime")]

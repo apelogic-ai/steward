@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 
 function contentSecurityPolicy(nonce: string): string {
+  const development = process.env.NODE_ENV === "development";
+  const developmentEval = development ? " 'unsafe-eval'" : "";
+  const styles = development
+    ? "style-src 'self' 'unsafe-inline'"
+    : `style-src 'self' 'nonce-${nonce}'`;
   return [
     "default-src 'self'",
     "base-uri 'self'",
@@ -12,8 +17,8 @@ function contentSecurityPolicy(nonce: string): string {
     "manifest-src 'self'",
     "media-src 'none'",
     "object-src 'none'",
-    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`,
-    `style-src 'self' 'nonce-${nonce}'`,
+    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${developmentEval}`,
+    styles,
     "worker-src 'self' blob:",
     "upgrade-insecure-requests",
   ].join("; ");

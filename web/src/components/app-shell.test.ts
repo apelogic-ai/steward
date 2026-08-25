@@ -22,15 +22,15 @@ describe("primary navigation", () => {
 });
 
 describe("workspace mode availability", () => {
-  test("shows both modes when an administrator has any developer member role", () => {
+  test("shows both modes to an administrator without requiring a member role", () => {
     expect(hasDualRole({
       status: "authenticated",
       value: {
         apiVersion: "steward.browser-session/v1",
         csrf: "test-csrf",
-        principal: { displayEmail: "alice@example.com", userId: "usr_abcdef0123456789abcdef0123456789" },
+        principal: { displayEmail: "alice@example.com", displayName: "Alice Example", userId: "usr_abcdef0123456789abcdef0123456789" },
         role: "admin",
-        memberRoles: ["analyst"],
+        memberRoles: [],
         surfaces: ["agentRuns"],
       },
     })).toBe(true);

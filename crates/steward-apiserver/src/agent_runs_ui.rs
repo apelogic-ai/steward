@@ -64,6 +64,12 @@ pub(crate) struct BrowserRunView {
     #[schema(value_type = String, format = "uuid")]
     task_uid: Uuid,
     workflow: String,
+    workflow_name: Option<String>,
+    workflow_version: Option<i64>,
+    workflow_digest: Option<String>,
+    user_envelope_instance_id: Option<String>,
+    user_envelope_revision: Option<i64>,
+    user_envelope_digest: Option<String>,
     coding_agent_runtime: String,
     runtime_uid: Option<String>,
     runtime_ownership: RuntimeOwnership,
@@ -481,6 +487,12 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
     BrowserRunView {
         task_uid: record.task_uid,
         workflow: record.workflow,
+        workflow_name: record.workflow_name,
+        workflow_version: record.workflow_version,
+        workflow_digest: record.workflow_digest,
+        user_envelope_instance_id: record.user_envelope_instance_id,
+        user_envelope_revision: record.user_envelope_revision,
+        user_envelope_digest: record.user_envelope_digest,
         coding_agent_runtime: record.coding_agent_runtime,
         runtime_uid: record.runtime_uid,
         runtime_ownership: record.runtime_ownership,
@@ -621,7 +633,13 @@ mod tests {
             acting_user: Some("alice@example.com".to_owned()),
             owner: "alice@example.com".to_owned(),
             owner_user_id: Some(owner_user_id.to_owned()),
-            workflow: "code-review".to_owned(),
+            workflow: "repository-review@1".to_owned(),
+            workflow_name: Some("repository-review".to_owned()),
+            workflow_version: Some(1),
+            workflow_digest: Some(format!("sha256:{}", "a".repeat(64))),
+            user_envelope_instance_id: Some("envelope-instance-1".to_owned()),
+            user_envelope_revision: Some(4),
+            user_envelope_digest: Some(format!("sha256:{}", "b".repeat(64))),
             coding_agent_runtime: "agent-v1".to_owned(),
             runtime_uid: Some(format!("runtime-{task_uid}")),
             runtime_ownership: RuntimeOwnership::Provisioned,
@@ -643,6 +661,7 @@ mod tests {
                 tools: Vec::new(),
                 budget: Budget {
                     monthly_limit: "100.00".to_owned(),
+                    single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("24h".to_owned()),
@@ -782,6 +801,21 @@ mod tests {
         assert_eq!(
             value["runs"][0]["taskUid"],
             "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(value["runs"][0]["workflowName"], "repository-review");
+        assert_eq!(value["runs"][0]["workflowVersion"], 1);
+        assert_eq!(
+            value["runs"][0]["workflowDigest"],
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert_eq!(
+            value["runs"][0]["userEnvelopeInstanceId"],
+            "envelope-instance-1"
+        );
+        assert_eq!(value["runs"][0]["userEnvelopeRevision"], 4);
+        assert_eq!(
+            value["runs"][0]["userEnvelopeDigest"],
+            format!("sha256:{}", "b".repeat(64))
         );
         assert!(value["runs"][0].get("ownerUserId").is_none());
         assert!(!value.to_string().contains("alice@example.com"));

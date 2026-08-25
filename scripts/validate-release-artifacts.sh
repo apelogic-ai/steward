@@ -16,7 +16,24 @@ web_rendered="$(mktemp)"
 web_deployment="$(mktemp)"
 mint_synthetic_kubeconfig="$(mktemp)"
 mint_startup_output="$(mktemp)"
-trap 'rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" "${stable_bridge_configmap}" "${stable_bridge_deployment}" "${stable_bridge_controller_deployment}" "${browser_auth_rendered}" "${browser_auth_deployment}" "${browser_hop1_rendered}" "${browser_hop1_deployment}" "${web_rendered}" "${web_deployment}" "${mint_synthetic_kubeconfig}" "${mint_startup_output}"' EXIT INT TERM
+web_container_id=""
+
+cleanup() {
+  status="$?"
+  trap - EXIT INT TERM
+  set +e
+  if [[ -n "${web_container_id}" ]]; then
+    docker stop --time 5 "${web_container_id}" >/dev/null 2>&1
+  fi
+  rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" \
+    "${stable_bridge_configmap}" "${stable_bridge_deployment}" \
+    "${stable_bridge_controller_deployment}" "${browser_auth_rendered}" \
+    "${browser_auth_deployment}" "${browser_hop1_rendered}" \
+    "${browser_hop1_deployment}" "${web_rendered}" "${web_deployment}" \
+    "${mint_synthetic_kubeconfig}" "${mint_startup_output}"
+  exit "${status}"
+}
+trap cleanup EXIT INT TERM
 
 digest0="sha256:0000000000000000000000000000000000000000000000000000000000000000"
 digest1="sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -485,6 +502,45 @@ if [[ "${1:-}" == "--build-images" ]]; then
     --file "${root}/build/web.Dockerfile" \
     --tag "steward-web:release-validation" \
     "${root}"
+  web_container_id="$(
+    docker run --rm --detach \
+      --read-only \
+      --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+      --publish 127.0.0.1::3000 \
+      --label "steward.test/run-id=release-web-$$" \
+      steward-web:release-validation
+  )"
+  web_runtime="$(docker inspect --format '{{.Config.User}} {{.HostConfig.ReadonlyRootfs}}' "${web_container_id}")"
+  if [[ "${web_runtime}" != "65532:65532 true" ]]; then
+    echo "web release image must run as 65532:65532 on a read-only root filesystem" >&2
+    exit 1
+  fi
+  web_address="$(docker port "${web_container_id}" 3000/tcp | head -n 1)"
+  web_port="${web_address##*:}"
+  if [[ ! "${web_port}" =~ ^[0-9]+$ ]]; then
+    echo "web release image did not publish a loopback readiness port" >&2
+    exit 1
+  fi
+  if ! web_status="$(
+    curl --fail --silent --show-error \
+      --retry 20 \
+      --retry-all-errors \
+      --retry-connrefused \
+      --retry-delay 1 \
+      --output /dev/null \
+      --write-out '%{http_code}' \
+      "http://127.0.0.1:${web_port}/health/ready"
+  )"
+  then
+    echo "web release image did not become ready" >&2
+    exit 1
+  fi
+  if [[ "${web_status}" != "204" ]]; then
+    echo "web release image did not become ready: expected 204, received ${web_status}" >&2
+    exit 1
+  fi
+  docker stop --time 5 "${web_container_id}" >/dev/null
+  web_container_id=""
   docker run --rm --entrypoint /bin/sh steward-bridge:release-validation -ceu '
     command -v tar >/dev/null
     command -v ip >/dev/null

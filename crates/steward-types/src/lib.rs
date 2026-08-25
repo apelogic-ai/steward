@@ -599,6 +599,8 @@ pub struct ToolGrant {
 #[serde(rename_all = "camelCase")]
 pub struct Budget {
     pub monthly_limit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub single_run_limit: Option<String>,
     pub currency: String,
 }
 

@@ -411,6 +411,7 @@ impl BrowserHop1AttestationConfig {
         let _binding = &session.binding;
         self.sign(&BrowserPrincipal {
             canonical_user_id: session.subject.canonical_user_id.clone(),
+            display_name: session.subject.display_email.clone(),
             display_email: Email::parse(session.subject.display_email.clone())
                 .map_err(|_| BrowserHop1AttestationError::Unavailable)?,
             role: crate::browser_auth::BrowserRole::User,
@@ -620,6 +621,7 @@ mod tests {
     fn principal(email: &str) -> Result<BrowserPrincipal, String> {
         Ok(BrowserPrincipal {
             canonical_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
+            display_name: "Alice Example".to_owned(),
             display_email: Email::parse(email.to_owned())?,
             role: BrowserRole::Admin,
             member_roles: vec!["admin".to_owned(), "unrelated-group".to_owned()],

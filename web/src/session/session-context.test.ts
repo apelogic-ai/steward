@@ -10,6 +10,7 @@ const authenticated: SessionResponse = {
   memberRoles: ["developer"],
   principal: {
     displayEmail: "alice@example.com",
+    displayName: "Alice Example",
     userId: "usr_abcdef0123456789abcdef0123456789",
   },
   role: "user",

@@ -339,6 +339,7 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
                     tools: Vec::new(),
                     budget: Budget {
                         monthly_limit: "100.00".to_owned(),
+                        single_run_limit: None,
                         currency: "USD".to_owned(),
                     },
                     ttl: RuntimeDuration("1h".to_owned()),
@@ -452,6 +453,7 @@ async fn e2e_s2_budget_exhaustion_suspends() -> Result<(), Box<dyn Error>> {
                     tools: Vec::new(),
                     budget: Budget {
                         monthly_limit: "50.00".to_owned(),
+                        single_run_limit: None,
                         currency: "USD".to_owned(),
                     },
                     ttl: RuntimeDuration("1h".to_owned()),

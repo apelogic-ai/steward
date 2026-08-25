@@ -17,7 +17,7 @@ export function ConnectionsView() {
   const state = useApiResource<ConnectionStatusResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="View real provider status and initiate server-owned OAuth actions." eyebrow="Provider access" title="Connections" />
+      <PageHeader description="View real provider status and initiate server-owned OAuth actions." title="Connections" />
       <ResourceBoundary state={state}>{(connection) => <GithubConnection connection={connection} refresh={() => setGeneration((value) => value + 1)} />}</ResourceBoundary>
     </section>
   );

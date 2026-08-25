@@ -1333,7 +1333,10 @@ pub fn neutrality_violations(content: &str) -> Vec<String> {
             }
 
             if token.contains('@') {
-                if !is_reserved_email(token) && !is_technical_package_scope(token) {
+                if !is_reserved_email(token)
+                    && !is_technical_package_scope(token)
+                    && !is_versioned_technical_identifier(token)
+                {
                     violations.push(format!("non-reserved email: {token}"));
                 }
                 continue;
@@ -1355,6 +1358,7 @@ pub fn neutrality_violations(content: &str) -> Vec<String> {
 
             if looks_like_hostname(token)
                 && !is_allowed_filename(token)
+                && !is_steward_schema_identifier(token)
                 && !is_reserved_hostname(token)
             {
                 violations.push(format!("non-reserved hostname: {token}"));
@@ -1632,10 +1636,65 @@ fn text_regions(content: &str) -> Vec<String> {
             continue;
         }
 
+        if characters[index] == '/' && is_javascript_regex_start(&characters, index) {
+            let opening = index;
+            index += 1;
+            let mut region = String::new();
+            let mut escaped = false;
+            let mut in_character_class = false;
+            let mut closed = false;
+            while index < characters.len() {
+                let character = characters[index];
+                index += 1;
+                if escaped {
+                    region.push(character);
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '[' {
+                    in_character_class = true;
+                    region.push(character);
+                } else if character == ']' {
+                    in_character_class = false;
+                    region.push(character);
+                } else if character == '/' && !in_character_class {
+                    closed = true;
+                    break;
+                } else {
+                    region.push(character);
+                }
+            }
+            if closed {
+                regions.push(region);
+                while characters
+                    .get(index)
+                    .is_some_and(|character| character.is_ascii_alphabetic())
+                {
+                    index += 1;
+                }
+            } else {
+                index = opening + 1;
+            }
+            continue;
+        }
+
         index += 1;
     }
 
     regions
+}
+
+fn is_javascript_regex_start(characters: &[char], slash: usize) -> bool {
+    characters[..slash]
+        .iter()
+        .rev()
+        .find(|character| !character.is_whitespace())
+        .is_none_or(|character| {
+            matches!(
+                character,
+                '(' | '[' | '{' | '=' | ':' | ',' | ';' | '!' | '&' | '|' | '?' | '+'
+            )
+        })
 }
 
 fn skip_template_expression(characters: &[char], mut index: usize) -> usize {
@@ -1732,6 +1791,32 @@ fn is_technical_package_scope(token: &str) -> bool {
     token == "@playwright"
 }
 
+fn is_versioned_technical_identifier(token: &str) -> bool {
+    let Some((name, version)) = token.rsplit_once('@') else {
+        return false;
+    };
+    if name.is_empty()
+        || name.contains('@')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return false;
+    }
+    if version.bytes().all(|byte| byte.is_ascii_digit()) {
+        return version.parse::<u64>().is_ok_and(|value| value > 0);
+    }
+    let parts = version.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn is_steward_schema_identifier(token: &str) -> bool {
+    token == "steward.workflows"
+}
+
 fn is_globally_routable(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => is_globally_routable_ipv4(address),
@@ -1816,7 +1901,9 @@ fn is_allowed_filename(token: &str) -> bool {
             | "config.yaml"
             | "config.yml"
             | "contributing.md"
+            | "favicon.ico"
             | "fixture.txt"
+            | "icon.svg"
             | "jwks.json"
             | "lib.rs"
             | "license.md"
@@ -2049,6 +2136,18 @@ mod tests {
     }
 
     #[test]
+    fn neutrality_allows_versioned_workflow_agent_and_schema_identifiers() {
+        let violations = neutrality_violations(
+            "\"repository-review@1\" \"codex@0.117.0\" \"steward.workflows/v1\"",
+        );
+
+        assert!(
+            violations.is_empty(),
+            "versioned product identifiers are not identity fixtures: {violations:?}"
+        );
+    }
+
+    #[test]
     fn neutrality_ignores_dotted_code_selectors() {
         let violations = neutrality_violations("let names = PORTS.iter().map(|port| port.name);");
 
@@ -2143,8 +2242,42 @@ mod tests {
     }
 
     #[test]
+    fn neutrality_skips_javascript_regex_literals_without_blinding_later_strings() {
+        let host = ["secret", "corp.invalid"].join(".");
+        let content = format!(
+            "const nonce = policy.match(/script-src 'self' 'nonce-([^']+)'/)?.[1]; \
+             session.page.locator(\"script\"); \
+             session.page.locator(\"link[rel='icon']\"); const host = \"{host}\";"
+        );
+
+        let violations = neutrality_violations(&content);
+
+        assert_eq!(
+            violations,
+            vec![format!("non-reserved hostname: {host}")],
+            "a JavaScript regex must not expose code selectors or hide later fixture identifiers"
+        );
+    }
+
+    #[test]
+    fn neutrality_scans_javascript_regex_literals_for_fixture_hostnames() {
+        let host = ["secret", "corp.invalid"].join(".");
+        let content = format!("const forbidden = /https:\\/\\/{host}\\/v1/;");
+
+        let violations = neutrality_violations(&content);
+
+        assert_eq!(
+            violations,
+            vec![format!("non-reserved hostname: {host}")],
+            "regex literals are still test data and must remain inside the neutrality boundary"
+        );
+    }
+
+    #[test]
     fn neutrality_ignores_common_filenames() {
-        let violations = neutrality_violations("\"src/main.rs\" \"config.yaml\" \"README.md\"");
+        let violations = neutrality_violations(
+            "\"src/main.rs\" \"config.yaml\" \"README.md\" \"/icon.svg\" \"favicon.ico\"",
+        );
 
         assert!(
             violations.is_empty(),

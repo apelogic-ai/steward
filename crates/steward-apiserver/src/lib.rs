@@ -24,13 +24,16 @@ pub mod user_envelopes;
 #[cfg(feature = "admin-demo")]
 pub mod user_envelopes_demo;
 mod user_ui;
+pub mod workflows;
 
 pub use github_actions::{
     GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA, GITHUB_ACTIONS_RENDER_REQUEST_SCHEMA,
     GITHUB_FILE_READ_TEMPLATE, GeneratedGithubActionsWorkflow, GithubActionsEnvelopeSelection,
     GithubActionsRenderContext, GithubActionsRenderError, GithubActionsRenderRequest,
-    GithubActionsTaskTemplate, StewardRunRelease, parse_github_actions_render_request,
-    render_github_actions_workflow, reviewed_steward_run_release_v1,
+    GithubActionsTaskTemplate, StewardRunRelease, VERSIONED_GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA,
+    VersionedGithubActionsWorkflowContext, parse_github_actions_render_request,
+    render_github_actions_workflow, render_versioned_github_actions_workflow,
+    reviewed_steward_run_release_v1, reviewed_steward_run_release_v2,
     validate_generated_github_actions_yaml,
 };
 
@@ -40,6 +43,7 @@ pub use tasks::{
     TaskStatusResponse, TaskSubmissionLedger, TaskSubmissionRequest, TaskWorkflow,
     TaskWorkflowCatalog, task_router,
 };
+pub use workflows::{WorkflowReference, WorkflowReferenceError};
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -72,7 +76,7 @@ use steward_store::{
     AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent, AgentRunTimelineKind,
     AgentRunTimelineProvenance, ApprovalCandidate, ApproveAdmission, ApprovedAdmission,
     DecisionFiling, DecisionFilingClaim, GrantApplication, GrantReversion, ParkRejection,
-    ParkedAdmission, PendingApproval, PgStore, StoreError,
+    ParkedAdmission, PendingApproval, PendingEnvelopeRequest, PgStore, StoreError,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, ModelRef,
@@ -299,6 +303,11 @@ pub struct GrantRevocationRequest {
         user_envelopes::get_request,
         user_envelopes::create_request,
         user_envelopes::render_github_actions_for_envelope,
+        user_envelopes::list_workflows,
+        workflows::list_workflows,
+        workflows::get_workflow_revision,
+        workflows::publish_initial_workflow,
+        workflows::publish_next_workflow,
         agent_runs_ui::my_runs,
         agent_runs_ui::my_run,
         agent_runs_ui::my_run_timeline,
@@ -309,6 +318,7 @@ pub struct GrantRevocationRequest {
         connections::start_connection,
         connections::disconnect_connection,
         browser_admin::get_envelope_template,
+        browser_admin::list_envelope_templates,
         browser_admin::author_envelope_template,
         browser_admin::list_approvals,
         browser_admin::approve,
@@ -1012,6 +1022,8 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         member_role: &'a str,
     ) -> BoxFuture<'a, Result<Option<Envelope>, StoreError>>;
 
+    fn latest_envelopes(&self) -> BoxFuture<'_, Result<Vec<(String, Envelope)>, StoreError>>;
+
     fn latest_service_envelope<'a>(
         &'a self,
         service: &'a str,
@@ -1023,6 +1035,10 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<ParkedAdmission, StoreError>>;
 
     fn pending_approvals(&self) -> BoxFuture<'_, Result<Vec<PendingApproval>, StoreError>>;
+
+    fn pending_envelope_requests(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<PendingEnvelopeRequest>, StoreError>>;
 
     fn retire_pending_approval_if_superseded<'a>(
         &'a self,
@@ -1178,6 +1194,10 @@ impl AdmissionLedger for PgStore {
         Box::pin(async move { PgStore::latest_envelope(self, member_role).await })
     }
 
+    fn latest_envelopes(&self) -> BoxFuture<'_, Result<Vec<(String, Envelope)>, StoreError>> {
+        Box::pin(async move { PgStore::latest_envelopes(self).await })
+    }
+
     fn latest_service_envelope<'a>(
         &'a self,
         service: &'a str,
@@ -1194,6 +1214,12 @@ impl AdmissionLedger for PgStore {
 
     fn pending_approvals(&self) -> BoxFuture<'_, Result<Vec<PendingApproval>, StoreError>> {
         Box::pin(async move { PgStore::pending_approvals(self).await })
+    }
+
+    fn pending_envelope_requests(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<PendingEnvelopeRequest>, StoreError>> {
+        Box::pin(async move { PgStore::pending_envelope_requests(self).await })
     }
 
     fn retire_pending_approval_if_superseded<'a>(
@@ -2064,7 +2090,8 @@ impl IntoResponse for ApiError {
             | Self::Store(
                 StoreError::TaskNotFound
                 | StoreError::CanonicalIdentityNotFound
-                | StoreError::EnvelopeRequestNotFound,
+                | StoreError::EnvelopeRequestNotFound
+                | StoreError::WorkflowNotFound,
             ) => StatusCode::NOT_FOUND,
             Self::Store(StoreError::CanonicalIdentityInactive) => StatusCode::FORBIDDEN,
             Self::TaskNotReady => StatusCode::SERVICE_UNAVAILABLE,
@@ -2086,6 +2113,7 @@ impl IntoResponse for ApiError {
                 | StoreError::EnvelopeRevisionNotIncreasing
                 | StoreError::TaskIdempotencyConflict
                 | StoreError::EnvelopeRequestIdempotencyConflict
+                | StoreError::WorkflowAlreadyExists
                 | StoreError::InvalidTaskTransition
                 | StoreError::InvalidEnvelopeRequestTransition
                 | StoreError::CanonicalIdentityStale
@@ -2101,7 +2129,8 @@ impl IntoResponse for ApiError {
                 | StoreError::InvalidBrowserRbacAssignment
                 | StoreError::InvalidBrowserRbacRecord
                 | StoreError::InvalidTaskIdentityBinding
-                | StoreError::InvalidEnvelopeRequest,
+                | StoreError::InvalidEnvelopeRequest
+                | StoreError::InvalidWorkflow,
             ) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Store(StoreError::InvalidRunQuery | StoreError::InvalidRunCursor) => {
                 StatusCode::BAD_REQUEST
@@ -2997,9 +3026,10 @@ mod tests {
     use steward_store::{
         AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunSpend, AgentRunTimelineEvent,
         AgentRunTimelineKind, AgentRunTimelineProvenance, ApprovalCandidate, ApproveAdmission,
-        ApprovedAdmission, DecisionFiling, DecisionFilingClaim, GrantApplication, GrantReversion,
-        ParkRejection, ParkedAdmission, PendingApproval, StoreError, TaskRecord, TaskReservation,
-        TaskReservationRequest,
+        ApprovedAdmission, DecisionFiling, DecisionFilingClaim, EnvelopeRequestRecord,
+        EnvelopeRequestStatus, GrantApplication, GrantReversion, ParkRejection, ParkedAdmission,
+        PendingApproval, PendingEnvelopeRequest, StoreError, TaskRecord, TaskReservation,
+        TaskReservationRequest, WorkflowRevisionRecord,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email,
@@ -3861,6 +3891,7 @@ mod tests {
                 "/paths/~1admin~1api~1v1~1connections~1github~1disconnect/post",
                 "204",
             ),
+            ("/paths/~1admin~1api~1v1~1envelope-templates/get", "200"),
             (
                 "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/get",
                 "200",
@@ -3982,6 +4013,32 @@ mod tests {
             .map_err(|error| format!("execute bearer approval request: {error}"))?;
         assert_eq!(bearer_only.status(), StatusCode::UNAUTHORIZED);
 
+        let templates = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/envelope-templates")
+                    .header(header::COOKIE, &admin_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build admin template list request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute admin template list request: {error}"))?;
+        assert_eq!(templates.status(), StatusCode::OK);
+        let templates_body = to_bytes(templates.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read admin template list response: {error}"))?;
+        let templates = serde_json::from_slice::<serde_json::Value>(&templates_body)
+            .map_err(|error| format!("decode admin template list response: {error}"))?;
+        assert_eq!(
+            templates.pointer("/templates/0/memberRole"),
+            Some(&serde_json::json!("engineer"))
+        );
+        assert_eq!(
+            templates.pointer("/templates/0/envelope/revision"),
+            Some(&serde_json::json!(3))
+        );
+
         let template = admin_app
             .clone()
             .oneshot(
@@ -3994,6 +4051,29 @@ mod tests {
             .await
             .map_err(|error| format!("execute admin template request: {error}"))?;
         assert_eq!(template.status(), StatusCode::OK);
+
+        let approvals = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/approvals")
+                    .header(header::COOKIE, &admin_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build admin approvals request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute admin approvals request: {error}"))?;
+        assert_eq!(approvals.status(), StatusCode::OK);
+        let approvals_body = to_bytes(approvals.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read admin approvals response: {error}"))?;
+        let approvals = serde_json::from_slice::<serde_json::Value>(&approvals_body)
+            .map_err(|error| format!("decode admin approvals response: {error}"))?;
+        assert_eq!(
+            approvals.pointer("/envelopeRequests/0/ownerDisplayEmail"),
+            Some(&serde_json::json!("alice@example.com")),
+            "the one administrator queue must publish pending user envelope requests"
+        );
 
         let mut next = admin_ledger
             .envelope
@@ -4865,6 +4945,7 @@ mod tests {
         envelope_authors: Arc<Mutex<Vec<(String, String, Envelope)>>>,
         grants: Vec<AdmissionDelta>,
         parked: ParkedRows,
+        pending_envelope_requests: Vec<PendingEnvelopeRequest>,
         decision_references: DecisionReferences,
         decision_filing_claim: Arc<Mutex<Option<Uuid>>>,
         revoke_rows: u64,
@@ -4873,6 +4954,8 @@ mod tests {
         application_committed_during_park: Arc<Mutex<Option<GrantReversion>>>,
         application_revoked_during_retirement: Arc<Mutex<bool>>,
         tasks: Arc<Mutex<Vec<TaskRecord>>>,
+        workflow_revisions: Arc<Mutex<Vec<WorkflowRevisionRecord>>>,
+        user_envelopes: Arc<Mutex<Vec<EnvelopeRequestRecord>>>,
         agent_runs: Arc<Mutex<Vec<AgentRunRecord>>>,
         agent_run_events: AgentRunEvents,
         service_envelope_authors: Arc<Mutex<Vec<(String, String)>>>,
@@ -4950,6 +5033,15 @@ mod tests {
                 self.envelope
                     .lock()
                     .map(|envelope| Some(envelope.clone()))
+                    .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))
+            })
+        }
+
+        fn latest_envelopes(&self) -> BoxFuture<'_, Result<Vec<(String, Envelope)>, StoreError>> {
+            Box::pin(async move {
+                self.envelope
+                    .lock()
+                    .map(|envelope| vec![("engineer".to_owned(), envelope.clone())])
                     .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))
             })
         }
@@ -5055,6 +5147,12 @@ mod tests {
                     })
                     .collect())
             })
+        }
+
+        fn pending_envelope_requests(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<PendingEnvelopeRequest>, StoreError>> {
+            Box::pin(async { Ok(self.pending_envelope_requests.clone()) })
         }
 
         fn retire_pending_approval_if_superseded<'a>(
@@ -5443,6 +5541,51 @@ mod tests {
     }
 
     impl TaskSubmissionLedger for FakeLedger {
+        fn workflow_revision<'a>(
+            &'a self,
+            name: &'a str,
+            version: i64,
+        ) -> BoxFuture<'a, Result<Option<WorkflowRevisionRecord>, StoreError>> {
+            Box::pin(async move {
+                self.workflow_revisions
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database("fake Workflow ledger lock was poisoned".to_owned())
+                    })
+                    .map(|workflows| {
+                        workflows
+                            .iter()
+                            .find(|workflow| workflow.name == name && workflow.version == version)
+                            .cloned()
+                    })
+            })
+        }
+
+        fn active_provisioned_user_envelopes<'a>(
+            &'a self,
+            owner_user_id: &'a CanonicalUserId,
+        ) -> BoxFuture<'a, Result<Vec<EnvelopeRequestRecord>, StoreError>> {
+            Box::pin(async move {
+                self.user_envelopes
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake User Envelope ledger lock was poisoned".to_owned(),
+                        )
+                    })
+                    .map(|envelopes| {
+                        envelopes
+                            .iter()
+                            .filter(|envelope| {
+                                envelope.owner_user_id == *owner_user_id
+                                    && envelope.status == EnvelopeRequestStatus::Provisioned
+                            })
+                            .cloned()
+                            .collect()
+                    })
+            })
+        }
+
         fn reserve_task<'a>(
             &'a self,
             request: TaskReservationRequest<'a>,
@@ -5471,6 +5614,12 @@ mod tests {
                     owner_user_id: Some(request.owner_user_id.to_owned()),
                     identity_binding_state: "bound".to_owned(),
                     workflow: request.workflow.to_owned(),
+                    workflow_name: request.workflow_name.map(str::to_owned),
+                    workflow_version: request.workflow_version,
+                    workflow_digest: request.workflow_digest.map(str::to_owned),
+                    user_envelope_instance_id: request.user_envelope_instance_id.map(str::to_owned),
+                    user_envelope_revision: request.user_envelope_revision,
+                    user_envelope_digest: request.user_envelope_digest.map(str::to_owned),
                     coding_agent_runtime: request.coding_agent_runtime.to_owned(),
                     runtime_uid: None,
                     runtime_namespace: request.runtime_namespace.to_owned(),
@@ -5648,6 +5797,7 @@ mod tests {
             tools: Vec::new(),
             budget: Budget {
                 monthly_limit: "100.00".to_owned(),
+                single_run_limit: None,
                 currency: "USD".to_owned(),
             },
             ttl: Duration("24h".to_owned()),
@@ -5677,6 +5827,7 @@ mod tests {
                     tools: Vec::new(),
                     budget: Budget {
                         monthly_limit: "200.00".to_owned(),
+                        single_run_limit: None,
                         currency: "USD".to_owned(),
                     },
                     ttl: Duration("24h".to_owned()),
@@ -5686,6 +5837,30 @@ mod tests {
             envelope_authors: Arc::new(Mutex::new(Vec::new())),
             grants: Vec::new(),
             parked: Arc::new(Mutex::new(Vec::new())),
+            pending_envelope_requests: vec![PendingEnvelopeRequest {
+                request_id: Uuid::from_u128(4),
+                owner_display_email: "alice@example.com".to_owned(),
+                template_id: "engineer".to_owned(),
+                template_revision: 3,
+                requested_envelope: Envelope {
+                    revision: 3,
+                    spec: EnvelopeSpec {
+                        llms: vec![ModelRef {
+                            provider: "provider-a".to_owned(),
+                            model: "model-a".to_owned(),
+                        }],
+                        tools: Vec::new(),
+                        budget: Budget {
+                            monthly_limit: "100.00".to_owned(),
+                            single_run_limit: None,
+                            currency: "USD".to_owned(),
+                        },
+                        ttl: Duration("24h".to_owned()),
+                        runner: steward_types::RunnerRequirements::default(),
+                    },
+                },
+                created_at: "2026-08-24T17:05:00.000000Z".to_owned(),
+            }],
             decision_references: Arc::new(Mutex::new(Vec::new())),
             decision_filing_claim: Arc::new(Mutex::new(None)),
             revoke_rows: 0,
@@ -5694,6 +5869,8 @@ mod tests {
             application_committed_during_park: Arc::new(Mutex::new(None)),
             application_revoked_during_retirement: Arc::new(Mutex::new(false)),
             tasks: Arc::new(Mutex::new(Vec::new())),
+            workflow_revisions: Arc::new(Mutex::new(Vec::new())),
+            user_envelopes: Arc::new(Mutex::new(Vec::new())),
             agent_runs: Arc::new(Mutex::new(Vec::new())),
             agent_run_events: Arc::new(Mutex::new(Vec::new())),
             service_envelope_authors: Arc::new(Mutex::new(Vec::new())),
@@ -5712,11 +5889,97 @@ mod tests {
             tools: Vec::new(),
             budget: Budget {
                 monthly_limit: monthly_limit.to_owned(),
+                single_run_limit: None,
                 currency: "USD".to_owned(),
             },
             ttl: Duration("24h".to_owned()),
             command: vec!["agent-v1".to_owned()],
         }
+    }
+
+    fn versioned_task_ledger() -> Result<FakeLedger, String> {
+        let ledger = ledger();
+        ledger
+            .workflow_revisions
+            .lock()
+            .map_err(|_| "fake Workflow ledger lock was poisoned")?
+            .push(WorkflowRevisionRecord {
+                name: "repository-review".to_owned(),
+                version: 1,
+                display_name: "Repository review".to_owned(),
+                agent: "codex@0.117.0".to_owned(),
+                prompt: "Review the repository state that triggered this run.".to_owned(),
+                content_digest: format!("sha256:{}", "a".repeat(64)),
+                published_by: "admin@example.com".to_owned(),
+                published_at: "2026-08-24T17:00:00.000000Z".to_owned(),
+            });
+        let approved = Envelope {
+            revision: 4,
+            spec: EnvelopeSpec {
+                llms: vec![ModelRef {
+                    provider: "openai".to_owned(),
+                    model: "gpt-5.4".to_owned(),
+                }],
+                tools: Vec::new(),
+                budget: Budget {
+                    monthly_limit: "25.00".to_owned(),
+                    single_run_limit: Some("5.00".to_owned()),
+                    currency: "USD".to_owned(),
+                },
+                ttl: Duration("4h".to_owned()),
+                runner: steward_types::RunnerRequirements {
+                    platforms: vec![steward_types::RunnerPlatform::Linux],
+                    memory: Some(steward_types::KubernetesQuantity("1Gi".to_owned())),
+                    compute: Some(steward_types::KubernetesQuantity("500m".to_owned())),
+                    storage: Some(steward_types::KubernetesQuantity("2Gi".to_owned())),
+                },
+            },
+        };
+        ledger
+            .user_envelopes
+            .lock()
+            .map_err(|_| "fake User Envelope ledger lock was poisoned")?
+            .push(EnvelopeRequestRecord {
+                id: Uuid::from_u128(41),
+                owner_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
+                template_id: "engineer".to_owned(),
+                template_revision: 4,
+                requested_envelope: approved.clone(),
+                approved_envelope: Some(approved),
+                status: EnvelopeRequestStatus::Provisioned,
+                approval_id: None,
+                envelope_instance_id: Some("envelope-instance-1".to_owned()),
+                envelope_digest: Some(format!("sha256:{}", "b".repeat(64))),
+                reason: None,
+                created_at: "2026-08-24T17:01:00.000000Z".to_owned(),
+                status_at: "2026-08-24T17:02:00.000000Z".to_owned(),
+            });
+        *ledger
+            .envelope
+            .lock()
+            .map_err(|_| "fake service Envelope ledger lock was poisoned")? = Envelope {
+            revision: 7,
+            spec: EnvelopeSpec {
+                llms: vec![ModelRef {
+                    provider: "openai".to_owned(),
+                    model: "gpt-5.4".to_owned(),
+                }],
+                tools: Vec::new(),
+                budget: Budget {
+                    monthly_limit: "100.00".to_owned(),
+                    single_run_limit: Some("20.00".to_owned()),
+                    currency: "USD".to_owned(),
+                },
+                ttl: Duration("24h".to_owned()),
+                runner: steward_types::RunnerRequirements {
+                    platforms: vec![steward_types::RunnerPlatform::Linux],
+                    memory: Some(steward_types::KubernetesQuantity("4Gi".to_owned())),
+                    compute: Some(steward_types::KubernetesQuantity("2".to_owned())),
+                    storage: Some(steward_types::KubernetesQuantity("10Gi".to_owned())),
+                },
+            },
+        };
+        Ok(ledger)
     }
 
     #[derive(Clone, Default)]
@@ -7783,6 +8046,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn versioned_task_route_resolves_exact_workflow_and_pins_user_envelope()
+    -> Result<(), String> {
+        let runtimes = MultiRuntimeRepository::default();
+        let ledger = versioned_task_ledger()?;
+        let task_rows = ledger.tasks.clone();
+        let app = task_router(
+            runtimes,
+            ledger,
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+        );
+
+        let unknown = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "unknown-version")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"workflow":"repository-review@2"}"#))
+                    .map_err(|error| format!("build unknown Workflow request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit unknown Workflow request: {error}"))?;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let caller_selected_agent = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "caller-selected-agent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"workflow":"repository-review@1","codingAgentRuntime":"other@9"}"#,
+                    ))
+                    .map_err(|error| format!("build caller-selected agent request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit caller-selected agent request: {error}"))?;
+        assert_eq!(
+            caller_selected_agent.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        let submitted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "repository-review-run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"workflow":"repository-review@1"}"#))
+                    .map_err(|error| format!("build versioned Workflow request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit versioned Workflow request: {error}"))?;
+        assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+
+        let rows = task_rows
+            .lock()
+            .map_err(|_| "fake task ledger lock was poisoned")?;
+        assert_eq!(rows.len(), 1);
+        let task = &rows[0];
+        assert_eq!(task.workflow, "repository-review@1");
+        assert_eq!(task.workflow_name.as_deref(), Some("repository-review"));
+        assert_eq!(task.workflow_version, Some(1));
+        assert_eq!(
+            task.workflow_digest.as_deref(),
+            Some(format!("sha256:{}", "a".repeat(64)).as_str())
+        );
+        assert_eq!(
+            task.user_envelope_instance_id.as_deref(),
+            Some("envelope-instance-1")
+        );
+        assert_eq!(task.user_envelope_revision, Some(4));
+        assert_eq!(
+            task.user_envelope_digest.as_deref(),
+            Some(format!("sha256:{}", "b".repeat(64)).as_str())
+        );
+        assert_eq!(task.coding_agent_runtime, "codex@0.117.0");
+        assert_eq!(task.runtime_spec.agent_type.name, "codex@0.117.0");
+        assert_eq!(task.runtime_spec.llms[0].model, "gpt-5.4");
+        assert_eq!(task.runtime_spec.budget.monthly_limit, "25.00");
+        assert_eq!(task.runtime_spec.ttl, Duration("4h".to_owned()));
+        assert_eq!(
+            task.runtime_spec.runner.platforms,
+            [steward_types::RunnerPlatform::Linux]
+        );
+        assert_eq!(
+            task.agent_command.last().map(String::as_str),
+            Some("Review the repository state that triggered this run.")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn versioned_task_route_applies_service_envelope_as_a_narrowing_ceiling()
+    -> Result<(), String> {
+        let runtimes = MultiRuntimeRepository::default();
+        let ledger = versioned_task_ledger()?;
+        ledger
+            .envelope
+            .lock()
+            .map_err(|_| "fake service Envelope ledger lock was poisoned")?
+            .spec
+            .budget
+            .monthly_limit = "10.00".to_owned();
+        let task_rows = ledger.tasks.clone();
+        let app = task_router(
+            runtimes,
+            ledger,
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "narrowed-versioned-workflow")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"workflow":"repository-review@1"}"#))
+                    .map_err(|error| format!("build narrowed Workflow request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit narrowed Workflow request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read narrowed Workflow response: {error}"))?;
+        let response: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse narrowed Workflow response: {error}"))?;
+        assert_eq!(response["phase"], "parked");
+        assert_eq!(response["deltas"][0]["dimension"], "budget");
+        assert_eq!(response["deltas"][0]["requested"], "25.00");
+        assert_eq!(response["deltas"][0]["ceiling"], "10.00");
+        let rows = task_rows
+            .lock()
+            .map_err(|_| "fake task ledger lock was poisoned")?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].workflow, "repository-review@1");
+        assert_eq!(rows[0].user_envelope_revision, Some(4));
+        assert_eq!(rows[0].phase, TaskPhase::Parked);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn task_submission_outside_service_envelope_returns_a_structured_delta()
     -> Result<(), String> {
         let runtimes = FakeRuntimeRepository {
@@ -7813,6 +8233,7 @@ mod tests {
                 tools: Vec::new(),
                 budget: Budget {
                     monthly_limit: "250.00".to_owned(),
+                    single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("24h".to_owned()),
@@ -9156,6 +9577,12 @@ mod tests {
             owner: "alice@example.com".to_owned(),
             owner_user_id: Some("usr_0123456789abcdef0123456789abcdef".to_owned()),
             workflow: "code-review".to_owned(),
+            workflow_name: None,
+            workflow_version: None,
+            workflow_digest: None,
+            user_envelope_instance_id: None,
+            user_envelope_revision: None,
+            user_envelope_digest: None,
             coding_agent_runtime: "agent-v1".to_owned(),
             runtime_uid: Some(format!("runtime-{task_uid}")),
             runtime_ownership: steward_types::RuntimeOwnership::Provisioned,
@@ -9180,6 +9607,7 @@ mod tests {
                 }],
                 budget: Budget {
                     monthly_limit: "100.00".to_owned(),
+                    single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("24h".to_owned()),

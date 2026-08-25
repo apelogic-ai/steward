@@ -3,6 +3,8 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 
 import { session as requestSession, type SessionResponse } from "@/api-client";
+import { client } from "@/api-client/client.gen";
+import { authStartPath } from "@/session/auth-redirect";
 
 export type SessionState =
   | { status: "loading" }
@@ -36,6 +38,12 @@ export function SessionProvider({ children }: Readonly<{ children: ReactNode }>)
 
   useEffect(() => {
     let active = true;
+    const interceptor = client.interceptors.response.use((response) => {
+      if (response.status === 401 && window.location.pathname !== "/admin/sign-in") {
+        window.location.replace(authStartPath(window.location.pathname));
+      }
+      return response;
+    });
     void requestSession({
       cache: "no-store",
       credentials: "same-origin",
@@ -46,6 +54,7 @@ export function SessionProvider({ children }: Readonly<{ children: ReactNode }>)
     });
     return () => {
       active = false;
+      client.interceptors.response.eject(interceptor);
     };
   }, []);
 

@@ -139,6 +139,21 @@ if [[ -n "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
   )
 fi
 
+sandbox_image_args=()
+if [[ -n "${STEWARD_OPENSHELL_SANDBOX_IMAGE:-}" ]]; then
+  if [[ "${STEWARD_OPENSHELL_SANDBOX_IMAGE}" != *:* || "${STEWARD_OPENSHELL_SANDBOX_IMAGE}" == *@* ]]; then
+    echo "STEWARD_OPENSHELL_SANDBOX_IMAGE must be an explicit repository:tag reference" >&2
+    exit 2
+  fi
+  kind load docker-image \
+    "${STEWARD_OPENSHELL_SANDBOX_IMAGE}" \
+    --name "${CLUSTER_NAME}"
+  sandbox_image_args=(
+    --set-string "server.sandboxImage=${STEWARD_OPENSHELL_SANDBOX_IMAGE}"
+    --set-string "server.sandboxImagePullPolicy=IfNotPresent"
+  )
+fi
+
 actual_context="$(
   kubectl --kubeconfig "${KUBECONFIG_PATH}" config current-context
 )"
@@ -340,6 +355,9 @@ openshell_helm_args+=(
   --set-string server.oidc.adminRole=openshell-admin
   --set-string server.oidc.userRole=openshell-user
 )
+if [[ -n "${STEWARD_OPENSHELL_SANDBOX_IMAGE:-}" ]]; then
+  openshell_helm_args+=("${sandbox_image_args[@]}")
+fi
 if [[ -n "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
   openshell_helm_args+=("${supervisor_image_args[@]}")
 fi

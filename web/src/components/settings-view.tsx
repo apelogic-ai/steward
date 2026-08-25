@@ -7,7 +7,7 @@ export function SettingsView({ admin = false }: Readonly<{ admin?: boolean }>) {
   const session = useSession();
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description={admin ? "Review the administrator identity and modes exposed only by the Rust session." : "Review the identity and mode exposed by the Rust session."} eyebrow={admin ? "Administration" : "Workspace"} title="Settings" />
+      <PageHeader description={admin ? "Review the administrator identity and modes exposed only by the Rust session." : "Review the identity and mode exposed by the Rust session."} title="Settings" />
       {session.status === "authenticated" ? (
         <article className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
           <div className="flex flex-wrap items-center justify-between gap-3"><h2 className="text-xl font-semibold">{admin ? "Administrator session" : "Server-owned session"}</h2><StatusBadge value={session.value.role} /></div>

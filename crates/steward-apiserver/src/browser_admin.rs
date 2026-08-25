@@ -7,7 +7,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::Serialize;
 use steward_admission::{AdmissionDecision, Envelope, validate_envelope};
-use steward_store::{PendingApproval, StoreError};
+use steward_store::{PendingApproval, PendingEnvelopeRequest, StoreError};
 use steward_types::AgentRuntimeSpec;
 use uuid::Uuid;
 
@@ -36,6 +36,20 @@ pub(crate) struct BrowserEnvelopeTemplateResponse {
     api_version: &'static str,
     member_role: String,
     envelope: BrowserEnvelope,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserEnvelopeTemplateListItem {
+    member_role: String,
+    envelope: BrowserEnvelope,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserEnvelopeTemplateListResponse {
+    api_version: &'static str,
+    templates: Vec<BrowserEnvelopeTemplateListItem>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -76,9 +90,35 @@ impl From<PendingApproval> for BrowserApprovalView {
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserEnvelopeRequestView {
+    #[schema(value_type = String, format = "uuid")]
+    request_id: Uuid,
+    owner_display_email: String,
+    template_id: String,
+    template_revision: i64,
+    requested_envelope: BrowserEnvelope,
+    created_at: String,
+}
+
+impl From<PendingEnvelopeRequest> for BrowserEnvelopeRequestView {
+    fn from(request: PendingEnvelopeRequest) -> Self {
+        Self {
+            request_id: request.request_id,
+            owner_display_email: request.owner_display_email,
+            template_id: request.template_id,
+            template_revision: request.template_revision,
+            requested_envelope: request.requested_envelope.into(),
+            created_at: request.created_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct BrowserApprovalsResponse {
     api_version: &'static str,
     approvals: Vec<BrowserApprovalView>,
+    envelope_requests: Vec<BrowserEnvelopeRequestView>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -98,6 +138,10 @@ where
     D: DecisionChannel + Clone,
 {
     Router::new()
+        .route(
+            "/admin/api/v1/envelope-templates",
+            get(list_envelope_templates::<R, L, D>),
+        )
         .route(
             "/admin/api/v1/envelope-templates/{member_role}",
             get(get_envelope_template::<R, L, D>).post(author_envelope_template::<R, L, D>),
@@ -135,6 +179,43 @@ where
     D: DecisionChannel + Clone,
 {
     protect_browser_admin_routes(inner_router(runtimes, ledger, decisions), browser_auth)
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "listAdminEnvelopeTemplates",
+    path = "/admin/api/v1/envelope-templates",
+    responses(
+        (status = 200, body = BrowserEnvelopeTemplateListResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role is required"),
+        (status = 503, description = "Envelope templates are unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn list_envelope_templates<R, L, D>(
+    Extension(_authority): Extension<BrowserAdminAuthority>,
+    State(state): State<BrowserAdminState<R, L, D>>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    match state.ledger.latest_envelopes().await {
+        Ok(templates) => Json(BrowserEnvelopeTemplateListResponse {
+            api_version: BROWSER_ADMIN_API_VERSION,
+            templates: templates
+                .into_iter()
+                .map(|(member_role, envelope)| BrowserEnvelopeTemplateListItem {
+                    member_role,
+                    envelope: envelope.into(),
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(error) => ApiError::Store(error).into_response(),
+    }
 }
 
 #[utoipa::path(
@@ -259,10 +340,15 @@ where
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
-    match state.ledger.pending_approvals().await {
-        Ok(approvals) => Json(BrowserApprovalsResponse {
+    let approvals = match state.ledger.pending_approvals().await {
+        Ok(approvals) => approvals,
+        Err(error) => return ApiError::Store(error).into_response(),
+    };
+    match state.ledger.pending_envelope_requests().await {
+        Ok(envelope_requests) => Json(BrowserApprovalsResponse {
             api_version: BROWSER_ADMIN_API_VERSION,
             approvals: approvals.into_iter().map(Into::into).collect(),
+            envelope_requests: envelope_requests.into_iter().map(Into::into).collect(),
         })
         .into_response(),
         Err(error) => ApiError::Store(error).into_response(),

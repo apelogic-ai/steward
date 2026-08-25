@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use kube::ResourceExt;
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_admission::{Envelope, EnvelopeSpec};
 use steward_apiserver::{
@@ -20,14 +21,22 @@ use steward_apiserver::{
     RequestAuthenticator, StaticTaskWorkflowCatalog, TaskAuthenticationError, TaskIdentity,
     TaskIdentityResolver, TaskWorkflow, router as api_router, task_router,
 };
-use steward_store::PgStore;
+use steward_store::{
+    EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, PgStore,
+    WorkflowPublication,
+};
 use steward_types::{
-    AgentRuntime, Budget, CanonicalPrincipal, Duration, OrganizationId, OrganizationIdentity,
-    OrganizationIdentityPolicy, RunnerRequirements, ToolGrant,
+    AgentRuntime, Budget, CanonicalPrincipal, Duration, KubernetesQuantity, ModelRef,
+    OrganizationId, OrganizationIdentity, OrganizationIdentityPolicy, RunnerPlatform,
+    RunnerRequirements, ToolGrant,
 };
 use tokio::net::TcpListener;
 
 const SCHEDULED_OWNER_EMAIL: &str = "owner@example.com";
+const VERSIONED_WORKFLOW_NAME: &str = "repository-review";
+const VERSIONED_WORKFLOW_AGENT: &str = "codex@0.117.0";
+const VERSIONED_WORKFLOW_PROMPT: &str =
+    "Review the repository state that triggered this GitHub Actions run.";
 
 #[derive(Clone)]
 struct TestTaskIdentities {
@@ -103,6 +112,101 @@ async fn seed_test_task_identities(store: &PgStore) -> Result<TestTaskIdentities
     Ok(TestTaskIdentities::from_trusted_principals(
         &alice, &scheduled,
     ))
+}
+
+async fn seed_versioned_workflow_authority(
+    store: &PgStore,
+    identity: &TaskIdentity,
+) -> Result<(), Box<dyn Error>> {
+    if store
+        .workflow_revision(VERSIONED_WORKFLOW_NAME, 1)
+        .await?
+        .is_none()
+    {
+        let digest = workflow_content_digest(VERSIONED_WORKFLOW_AGENT, VERSIONED_WORKFLOW_PROMPT);
+        store
+            .publish_initial_workflow(WorkflowPublication {
+                name: VERSIONED_WORKFLOW_NAME,
+                display_name: "Repository review",
+                agent: VERSIONED_WORKFLOW_AGENT,
+                prompt: VERSIONED_WORKFLOW_PROMPT,
+                content_digest: &digest,
+                published_by: "admin@example.com",
+            })
+            .await?;
+    }
+
+    if store
+        .envelope_requests(&identity.canonical_user_id)
+        .await?
+        .is_empty()
+    {
+        let envelope = versioned_user_envelope();
+        let reservation = store
+            .reserve_envelope_request(EnvelopeRequestReservationRequest {
+                owner_user_id: &identity.canonical_user_id,
+                template_id: "engineer",
+                template_revision: 1,
+                requested_envelope: &envelope,
+                idempotency_key: "repository-review-envelope",
+            })
+            .await?;
+        let digest = envelope_content_digest(&envelope)?;
+        store
+            .append_envelope_request_status(
+                reservation.record.id,
+                EnvelopeRequestStatusUpdate {
+                    from: EnvelopeRequestStatus::Pending,
+                    to: EnvelopeRequestStatus::Provisioned,
+                    approval_id: None,
+                    envelope_instance_id: Some("env_repository_review_1"),
+                    envelope_digest: Some(&digest),
+                    reason: None,
+                    approved_envelope: Some(&envelope),
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+fn workflow_content_digest(agent: &str, prompt: &str) -> String {
+    let mut hasher = Sha256::new();
+    for value in [agent, prompt] {
+        hasher.update(value.len().to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn envelope_content_digest(envelope: &Envelope) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(envelope)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn versioned_user_envelope() -> Envelope {
+    Envelope {
+        revision: 3,
+        spec: EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "openai".to_owned(),
+                model: "priced-model".to_owned(),
+            }],
+            tools: vec![task_tool()],
+            budget: Budget {
+                monthly_limit: "0.75".to_owned(),
+                single_run_limit: Some("0.25".to_owned()),
+                currency: "USD".to_owned(),
+            },
+            ttl: Duration("30m".to_owned()),
+            runner: RunnerRequirements {
+                platforms: vec![RunnerPlatform::Linux],
+                memory: Some(KubernetesQuantity("256Mi".to_owned())),
+                compute: Some(KubernetesQuantity("250m".to_owned())),
+                storage: Some(KubernetesQuantity("1Gi".to_owned())),
+            },
+        },
+    }
 }
 
 fn test_google_identity(
@@ -215,17 +319,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let store = PgStore::connect(&database_url).await?;
     store.migrate().await?;
     let task_identities = seed_test_task_identities(&store).await?;
+    let versioned_identity = task_identities
+        .resolve("github-assertion")
+        .await
+        .map_err(|error| io::Error::other(format!("versioned fixture identity: {error:?}")))?;
+    seed_versioned_workflow_authority(&store, &versioned_identity).await?;
     let envelope = Envelope {
         revision: 1,
         spec: EnvelopeSpec {
-            llms: Vec::new(),
+            llms: vec![ModelRef {
+                provider: "openai".to_owned(),
+                model: "priced-model".to_owned(),
+            }],
             tools: vec![task_tool()],
             budget: Budget {
                 monthly_limit: "1.00".to_owned(),
+                single_run_limit: None,
                 currency: "USD".to_owned(),
             },
             ttl: Duration("1h".to_owned()),
-            runner: RunnerRequirements::default(),
+            runner: RunnerRequirements {
+                platforms: vec![RunnerPlatform::Linux],
+                memory: Some(KubernetesQuantity("256Mi".to_owned())),
+                compute: Some(KubernetesQuantity("250m".to_owned())),
+                storage: Some(KubernetesQuantity("1Gi".to_owned())),
+            },
         },
     };
     for service in [
@@ -543,6 +661,7 @@ fn copy_workflow() -> TaskWorkflow {
         tools: Vec::new(),
         budget: Budget {
             monthly_limit: "0.00".to_owned(),
+            single_run_limit: None,
             currency: "USD".to_owned(),
         },
         ttl: Duration("1h".to_owned()),
@@ -567,6 +686,7 @@ fn workflow(name: &str, budget: &str, shell: &str) -> TaskWorkflow {
         tools: vec![task_tool()],
         budget: Budget {
             monthly_limit: budget.to_owned(),
+            single_run_limit: None,
             currency: "USD".to_owned(),
         },
         ttl: Duration("1h".to_owned()),

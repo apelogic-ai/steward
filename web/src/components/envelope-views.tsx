@@ -10,7 +10,6 @@ import {
   listRequests,
   listTemplates,
   myRuns,
-  renderGithubActionsForEnvelope,
   type AvailableEnvelopeTemplate,
   type BrowserEnvelope,
   type EnvelopeRequestResponse,
@@ -25,10 +24,15 @@ import { DefinitionList, EmptyState, PageHeader, PrimaryLink, ResourceBoundary, 
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
+import { listPublishedWorkflows, renderWorkflowForEnvelope, type PublishedWorkflowListResponse } from "@/workflows/api";
+import { workflowReference } from "@/workflows/contracts";
 
 function EnvelopeSummary({ envelope }: Readonly<{ envelope: BrowserEnvelope }>) {
   return <DefinitionList items={[
-    ["Budget", `${envelope.spec.budget.monthlyLimit} ${envelope.spec.budget.currency}`],
+    ["Monthly limit", `${envelope.spec.budget.monthlyLimit} ${envelope.spec.budget.currency}`],
+    ["Single-run limit", envelope.spec.budget.singleRunLimit
+      ? `${envelope.spec.budget.singleRunLimit} ${envelope.spec.budget.currency}`
+      : "Not set"],
     ["TTL", envelope.spec.ttl],
     ["Models", envelope.spec.llms.length ? envelope.spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ") : "None"],
     ["Tools", envelope.spec.tools.length ? envelope.spec.tools.map((tool) => `${tool.provider}:${tool.resource}:${tool.action}`).join(", ") : "None"],
@@ -40,9 +44,9 @@ export function EnvelopesView() {
   const state = useApiResource<EnvelopeRequestsResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader actions={<PrimaryLink href="/envelopes/new">Request envelope</PrimaryLink>} description="Request and inspect governed runtime authority." eyebrow="Governed authority" title="Envelopes" />
+      <PageHeader actions={<PrimaryLink href="/envelopes/new">Request envelope</PrimaryLink>} description="Request and inspect governed runtime authority." title="Envelopes" />
       <ResourceBoundary state={state}>{({ requests }) => requests.length === 0 ? (
-        <EmptyState title="No envelope requests"><p>You have not requested governed authority yet.</p></EmptyState>
+        <EmptyState title="No data" />
       ) : (
         <ul className="grid gap-4 lg:grid-cols-2">
           {requests.map((request) => <EnvelopeCard key={request.id} request={request} />)}
@@ -87,9 +91,9 @@ export function NewEnvelopeView() {
   const state = useApiResource<EnvelopeTemplatesResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Choose authority within a server-defined template ceiling." eyebrow="Envelope request" title="New envelope" />
+      <PageHeader description="Choose authority within a server-defined template ceiling." title="New envelope" />
       <ResourceBoundary state={state}>{({ templates }) => templates.length === 0 ? (
-        <EmptyState title="No templates available"><p>Your server-owned roles do not currently expose an envelope template.</p></EmptyState>
+        <EmptyState title="No data" />
       ) : <EnvelopeRequestForm templates={templates} />}</ResourceBoundary>
     </section>
   );
@@ -130,7 +134,11 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
           revision: template.revision,
           spec: {
             ...template.ceiling.spec,
-            budget: { currency: template.ceiling.spec.budget.currency, monthlyLimit: budget },
+            budget: {
+              currency: template.ceiling.spec.budget.currency,
+              monthlyLimit: budget,
+              singleRunLimit: template.ceiling.spec.budget.singleRunLimit,
+            },
             ttl,
             llms: template.ceiling.spec.llms.filter((item) => models.has(`${item.provider}\u0000${item.model}`)),
             tools: template.ceiling.spec.tools.filter((item) => tools.has(`${item.provider}\u0000${item.resource}\u0000${item.action}`)),
@@ -187,7 +195,7 @@ export function EnvelopeDetailView({ requestId }: Readonly<{ requestId: string }
   const state = useApiResource<EnvelopeRequestResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Inspect requested and approved authority without filling data gaps." eyebrow="Envelope request" title="Envelope" />
+      <PageHeader description="Inspect requested and approved authority without filling data gaps." title="Envelope" />
       <ResourceBoundary state={state}>{({ request }) => <EnvelopeDetail request={request} />}</ResourceBoundary>
     </section>
   );
@@ -209,31 +217,29 @@ function EnvelopeDetail({ request }: Readonly<{ request: UserEnvelopeRequest }>)
 
 function WorkflowGenerator({ requestId }: Readonly<{ requestId: string }>) {
   const session = useSession();
+  const load = useCallback(() => listPublishedWorkflows(), []);
+  const workflows = useApiResource<PublishedWorkflowListResponse>(load);
   const [workflow, setWorkflow] = useState<GithubActionsWorkflowResponse | null>(null);
   const [status, setStatus] = useState<"idle" | "loading" | MutationFailureState>("idle");
-  async function submit(event: FormEvent<HTMLFormElement>) {
+  async function submit(event: FormEvent<HTMLFormElement>, published: PublishedWorkflowListResponse["workflows"]) {
     event.preventDefault();
     if (session.status !== "authenticated") return;
     const data = new FormData(event.currentTarget);
+    const selected = published.find((item) => workflowReference(item) === String(data.get("workflow")));
+    if (!selected) { setStatus("rejected"); return; }
     setStatus("loading");
-    const result = await renderGithubActionsForEnvelope({
-      body: { repository: String(data.get("repository")), revision: String(data.get("revision")), path: String(data.get("path")) },
-      cache: "no-store",
-      credentials: "same-origin",
-      headers: { "X-Steward-CSRF": session.value.csrf },
-      path: { request_id: requestId },
-    });
+    const result = await renderWorkflowForEnvelope(session.value.csrf, requestId, selected);
     if (result.data && result.response?.ok) { setWorkflow(result.data); setStatus("idle"); } else setStatus(classifyMutationFailure(result.response?.status));
   }
   return (
     <section className="space-y-4 rounded-panel border bg-panel p-6 shadow-sm" aria-labelledby="workflow-title">
-      <div><h2 className="text-xl font-semibold" id="workflow-title">GitHub Actions workflow</h2><p className="mt-1 text-sm text-muted-ink">Rust renders a pinned workflow from bounded repository inputs.</p></div>
-      <form className="grid gap-4 sm:grid-cols-3" onSubmit={submit}>
-        <label className="grid gap-2 text-sm font-semibold">Repository<input className="min-h-11 rounded-md border px-3 font-normal" name="repository" placeholder="example-org/repository" required /></label>
-        <label className="grid gap-2 text-sm font-semibold">Revision<input className="min-h-11 rounded-md border px-3 font-normal" name="revision" placeholder="full commit SHA" required /></label>
-        <label className="grid gap-2 text-sm font-semibold">Path<input className="min-h-11 rounded-md border px-3 font-normal" name="path" placeholder="src/lib.rs" required /></label>
-        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 sm:col-span-3 sm:justify-self-start" disabled={status === "loading"} type="submit">{status === "loading" ? "Rendering…" : "Render workflow"}</button>
-      </form>
+      <div><h2 className="text-xl font-semibold" id="workflow-title">GitHub Actions workflow</h2><p className="mt-1 text-sm text-muted-ink">Generate a workflow using a published Steward Workflow and this Envelope.</p></div>
+      <ResourceBoundary state={workflows}>{(data) => data.workflows.length === 0 ? <EmptyState title="No data" /> : (
+        <form className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end" onSubmit={(event) => void submit(event, data.workflows)}>
+          <label className="grid gap-2 text-sm font-semibold">Workflow<select className="min-h-11 rounded-md border bg-panel px-3 font-normal" name="workflow" required>{data.workflows.map((item) => <option key={workflowReference(item)} value={workflowReference(item)}>{item.displayName} · {workflowReference(item)}</option>)}</select></label>
+          <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={status === "loading"} type="submit">{status === "loading" ? "Rendering…" : "Render workflow"}</button>
+        </form>
+      )}</ResourceBoundary>
       {status !== "idle" && status !== "loading" ? <p role="alert" className="text-sm text-red-800">{{ conflict: "The envelope changed before the workflow could be rendered. Reload before retrying.", rejected: "Rust rejected the workflow inputs.", forbidden: "The Rust authorization boundary rejected workflow rendering.", unavailable: "The authoritative workflow service is unavailable.", error: "The workflow response could not be accepted." }[status]}</p> : null}
       {workflow ? <div className="space-y-2"><p className="text-xs text-muted-ink">SHA-256: <span className="break-all font-mono">{workflow.workflow.sha256}</span></p><textarea aria-label="Generated workflow" className="min-h-80 w-full rounded-md border bg-canvas p-4 font-mono text-xs" readOnly value={workflow.workflow.yaml} /></div> : null}
     </section>
@@ -245,7 +251,7 @@ export function EnvelopeRunsView({ requestId }: Readonly<{ requestId: string }>)
   const state = useApiResource<EnvelopeRequestResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="View executions bound to this envelope instance." eyebrow="Envelope execution" title="Recent runs" />
+      <PageHeader description="View executions bound to this envelope instance." title="Recent runs" />
       <ResourceBoundary state={state}>{({ request }) => request.envelopeInstanceId ? <EnvelopeRunRecords runtimeUid={request.envelopeInstanceId} /> : <EmptyState title="No runtime instance"><p>This envelope request has not produced a runtime instance.</p></EmptyState>}</ResourceBoundary>
     </section>
   );

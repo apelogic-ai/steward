@@ -25,7 +25,7 @@ function dateTime(value: string): string {
 }
 
 export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; runs: Array<BrowserRunView> }>) {
-  if (runs.length === 0) return <EmptyState title="No runs"><p>No authoritative run records match this view.</p></EmptyState>;
+  if (runs.length === 0) return <EmptyState title="No data" />;
   return (
     <ul className="grid gap-4 lg:grid-cols-2">
       {runs.map((run) => (
@@ -58,7 +58,6 @@ export function RunsView({ admin = false }: Readonly<{ admin?: boolean }>) {
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader
         description={admin ? "Inspect the administrator-authorized run view." : "Track governed execution using the authoritative run record."}
-        eyebrow={admin ? "Administration" : "Governed execution"}
         title={admin ? "All runs" : "Runs"}
       />
       <ResourceBoundary state={state}>{(data) => <RunCards admin={admin} runs={data.runs} />}</ResourceBoundary>
@@ -77,18 +76,24 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
   const timelineState = useApiResource<BrowserRunTimelineResponse>(loadTimeline);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Inspect status, bounded spend, and the append-only timeline." eyebrow={admin ? "Administration" : "Governed execution"} title="Run detail" />
-      <ResourceBoundary state={runState}>{({ run }) => (
+      <PageHeader description="Inspect status, bounded spend, and the append-only timeline." title="Run detail" />
+      <ResourceBoundary state={runState}>{({ run }) => {
+        const pinnedWorkflow = run.workflowName && run.workflowVersion
+          ? `${run.workflowName}@${run.workflowVersion}`
+          : run.workflow;
+        return (
         <article className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div><h2 className="text-xl font-semibold">{run.workflow}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{run.taskUid}</p></div>
             <StatusBadge value={run.phase} />
           </div>
           <DefinitionList items={[
+            ["Workflow version", pinnedWorkflow],
             ["Coding agent", run.codingAgentRuntime],
             ["Runtime UID", run.runtimeUid ?? "Not assigned"],
             ["Ownership", run.runtimeOwnership],
-            ["Envelope revision", run.envelopeRevision ?? "Not reported"],
+            ["User envelope revision", run.userEnvelopeRevision ?? "Not reported"],
+            ["Service envelope revision", run.envelopeRevision ?? "Not reported"],
             ["Created", dateTime(run.createdAt)],
             ["Updated", dateTime(run.updatedAt)],
             ["Observed spend", run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "Not reported"],
@@ -96,11 +101,11 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
             ["Finalized", run.finalized ? "Yes" : run.finalizationRequested ? "Requested" : "No"],
           ]} />
         </article>
-      )}</ResourceBoundary>
+      );}}</ResourceBoundary>
       <div className="space-y-3">
         <h2 className="text-xl font-semibold">Timeline</h2>
         <ResourceBoundary state={timelineState}>{({ events }) => events.length === 0 ? (
-          <EmptyState title="No timeline events"><p>The authoritative history is empty.</p></EmptyState>
+          <EmptyState title="No data" />
         ) : (
           <ol className="space-y-3 border-s-2 ps-5">
             {events.map((event, index) => (

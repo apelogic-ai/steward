@@ -32,6 +32,62 @@ subjects:
     name: steward-poc-api
     namespace: steward-system
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: steward-task-controller-credentials
+  namespace: steward-workflows
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: steward-task-controller-credentials
+  namespace: steward-workflows
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: steward-task-controller-credentials
+subjects:
+  - kind: ServiceAccount
+    name: steward-controller
+    namespace: steward-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: steward-task-mint-credentials
+  namespace: steward-workflows
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: steward-task-mint-credentials
+  namespace: steward-workflows
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: steward-task-mint-credentials
+subjects:
+  - kind: ServiceAccount
+    name: steward-mint
+    namespace: steward-system
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:

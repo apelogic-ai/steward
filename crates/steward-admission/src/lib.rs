@@ -71,6 +71,11 @@ pub enum AdmissionDelta {
         ceiling: String,
         currency: String,
     },
+    SingleRunBudget {
+        requested: Option<String>,
+        ceiling: String,
+        currency: String,
+    },
     Ttl {
         requested: String,
         ceiling: String,
@@ -110,6 +115,14 @@ impl AdmissionDelta {
                 currency,
             } => format!(
                 "budget.monthlyLimit requested {requested} {currency}, ceiling {ceiling} {currency}"
+            ),
+            Self::SingleRunBudget {
+                requested,
+                ceiling,
+                currency,
+            } => format!(
+                "budget.singleRunLimit requested {} {currency}, ceiling {ceiling} {currency}",
+                requested.as_deref().unwrap_or("unbounded")
             ),
             Self::Ttl { requested, ceiling } => {
                 format!("ttl requested {requested}, ceiling {ceiling}")
@@ -177,6 +190,9 @@ pub enum AdmissionError {
 
 pub fn validate_envelope(envelope: &Envelope) -> Result<(), AdmissionError> {
     Decimal::parse(&envelope.spec.budget.monthly_limit)?;
+    if let Some(single_run_limit) = &envelope.spec.budget.single_run_limit {
+        Decimal::parse(single_run_limit)?;
+    }
     if envelope.spec.budget.currency.len() != 3
         || !envelope
             .spec
@@ -257,6 +273,25 @@ fn evaluate_envelope_spec(
             ceiling: envelope.spec.budget.monthly_limit.clone(),
             currency: request.budget.currency.clone(),
         });
+    }
+    let requested_single_run = request
+        .budget
+        .single_run_limit
+        .as_deref()
+        .map(Decimal::parse)
+        .transpose()?;
+    if let Some(ceiling_value) = envelope.spec.budget.single_run_limit.as_deref() {
+        let ceiling_single_run = Decimal::parse(ceiling_value)?;
+        if requested_single_run
+            .as_ref()
+            .is_none_or(|requested| requested.cmp(&ceiling_single_run) == Ordering::Greater)
+        {
+            deltas.push(AdmissionDelta::SingleRunBudget {
+                requested: request.budget.single_run_limit.clone(),
+                ceiling: ceiling_value.to_owned(),
+                currency: request.budget.currency.clone(),
+            });
+        }
     }
     let requested_ttl = duration_seconds(&request.ttl)?;
     let ceiling_ttl = duration_seconds(&envelope.spec.ttl)?;
@@ -664,6 +699,29 @@ fn grant_covers(
         ) => Ok(grant_currency == currency
             && Decimal::parse(requested)?.cmp(&Decimal::parse(granted)?) != Ordering::Greater),
         (
+            AdmissionDelta::SingleRunBudget {
+                requested: granted,
+                currency: grant_currency,
+                ..
+            },
+            AdmissionDelta::SingleRunBudget {
+                requested,
+                currency,
+                ..
+            },
+        ) => {
+            if grant_currency != currency {
+                return Ok(false);
+            }
+            match (granted.as_deref(), requested.as_deref()) {
+                (None, _) => Ok(true),
+                (Some(_), None) => Ok(false),
+                (Some(granted), Some(requested)) => Ok(Decimal::parse(requested)?
+                    .cmp(&Decimal::parse(granted)?)
+                    != Ordering::Greater),
+            }
+        }
+        (
             AdmissionDelta::Ttl {
                 requested: granted, ..
             },
@@ -742,6 +800,7 @@ mod tests {
                     tools: Vec::new(),
                     budget: Budget {
                         monthly_limit: budget.to_owned(),
+                        single_run_limit: None,
                         currency: currency.to_owned(),
                     },
                     ttl: Duration(ttl.to_owned()),
@@ -772,6 +831,7 @@ mod tests {
             tools: Vec::new(),
             budget: Budget {
                 monthly_limit: monthly_limit.to_owned(),
+                single_run_limit: None,
                 currency: "USD".to_owned(),
             },
             ttl: Duration("24h".to_owned()),
@@ -791,12 +851,107 @@ mod tests {
                 tools: Vec::new(),
                 budget: Budget {
                     monthly_limit: monthly_limit.to_owned(),
+                    single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("24h".to_owned()),
                 runner: RunnerRequirements::default(),
             },
         }
+    }
+
+    fn budget_with_single_run_limit(monthly_limit: &str, single_run_limit: &str) -> Budget {
+        Budget {
+            monthly_limit: monthly_limit.to_owned(),
+            single_run_limit: Some(single_run_limit.to_owned()),
+            currency: "USD".to_owned(),
+        }
+    }
+
+    fn envelope_with_single_run_limit(monthly_limit: &str, single_run_limit: &str) -> Envelope {
+        let mut envelope = envelope_with_budget(monthly_limit);
+        envelope.spec.budget = budget_with_single_run_limit(monthly_limit, single_run_limit);
+        envelope
+    }
+
+    fn request_with_single_run_limit(
+        monthly_limit: &str,
+        single_run_limit: &str,
+    ) -> AgentRuntimeSpec {
+        let mut request = request_with_budget(monthly_limit);
+        request.budget = budget_with_single_run_limit(monthly_limit, single_run_limit);
+        request
+    }
+
+    #[test]
+    fn malformed_single_run_limit_is_rejected_before_it_becomes_authority() {
+        let envelope = envelope_with_single_run_limit("100.00", "not-a-decimal");
+
+        assert_eq!(
+            validate_envelope(&envelope),
+            Err(AdmissionError::InvalidBudget {
+                value: "not-a-decimal".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn request_cannot_exceed_the_template_single_run_limit() -> Result<(), String> {
+        let request = request_with_single_run_limit("100.00", "3.00");
+        let envelope = envelope_with_single_run_limit("200.00", "2.00");
+
+        assert_eq!(
+            evaluate(&request, &envelope)
+                .map_err(|error| format!("evaluate request: {error:?}"))?
+                .counterexample()
+                .as_deref(),
+            Some("envelope exceeded: budget.singleRunLimit requested 3.00 USD, ceiling 2.00 USD")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn constrained_template_rejects_an_unbounded_single_run_request() -> Result<(), String> {
+        let request = request_with_budget("100.00");
+        let envelope = envelope_with_single_run_limit("200.00", "2.00");
+
+        assert_eq!(
+            evaluate(&request, &envelope)
+                .map_err(|error| format!("evaluate request: {error:?}"))?
+                .counterexample()
+                .as_deref(),
+            Some(
+                "envelope exceeded: budget.singleRunLimit requested unbounded USD, ceiling 2.00 USD"
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn single_run_grant_covers_only_its_explicit_budget_expansion() -> Result<(), String> {
+        let request = request_with_single_run_limit("100.00", "3.00");
+        let envelope = envelope_with_single_run_limit("200.00", "2.00");
+        let narrow_grant = AdmissionDelta::SingleRunBudget {
+            requested: Some("2.50".to_owned()),
+            ceiling: "2.00".to_owned(),
+            currency: "USD".to_owned(),
+        };
+        let grant = AdmissionDelta::SingleRunBudget {
+            requested: Some("3.00".to_owned()),
+            ceiling: "2.00".to_owned(),
+            currency: "USD".to_owned(),
+        };
+
+        assert!(matches!(
+            evaluate_with_grants(&request, &envelope, &[narrow_grant]),
+            Ok(AdmissionDecision::Reject { .. })
+        ));
+        assert_eq!(
+            evaluate_with_grants(&request, &envelope, &[grant])
+                .map_err(|error| format!("evaluate granted request: {error:?}"))?,
+            AdmissionDecision::Admit
+        );
+        Ok(())
     }
 
     #[test]
