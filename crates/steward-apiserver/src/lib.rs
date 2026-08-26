@@ -181,6 +181,59 @@ impl RequestAuthenticator for KubernetesTokenAuthenticator {
     }
 }
 
+/// Authenticates normal operator callers through Kubernetes TokenReview while accepting a
+/// ratified Identity task credential for the narrowly route-scoped Steward-run bootstrap
+/// authority.
+///
+/// This is required for a GitHub Actions runner: it receives an Identity-issued task JWT, not a
+/// Kubernetes service-account credential. The existing administrator middleware still permits
+/// that Identity caller only on its exact POST bootstrap route unless it carries the ordinary
+/// administrator group.
+#[derive(Clone)]
+pub struct IdentityOrKubernetesTokenAuthenticator {
+    kubernetes: KubernetesTokenAuthenticator,
+    identity: ConfiguredTaskIdentityResolver,
+    admin_group: String,
+}
+
+impl IdentityOrKubernetesTokenAuthenticator {
+    pub fn new(
+        kubernetes: KubernetesTokenAuthenticator,
+        identity: ConfiguredTaskIdentityResolver,
+        admin_group: String,
+    ) -> Self {
+        Self {
+            kubernetes,
+            identity,
+            admin_group,
+        }
+    }
+}
+
+impl RequestAuthenticator for IdentityOrKubernetesTokenAuthenticator {
+    fn authenticate<'a>(
+        &'a self,
+        bearer_token: &'a str,
+    ) -> BoxFuture<'a, Result<AuthenticatedCaller, AuthenticationError>> {
+        Box::pin(async move {
+            match self.kubernetes.authenticate(bearer_token).await {
+                Ok(caller) => Ok(caller),
+                Err(AuthenticationError::Unavailable) => Err(AuthenticationError::Unavailable),
+                Err(AuthenticationError::InvalidCredentials) => self
+                    .identity
+                    .authenticated_user(bearer_token)
+                    .map_err(|error| match error {
+                        TaskAuthenticationError::InvalidCredentials => {
+                            AuthenticationError::InvalidCredentials
+                        }
+                        TaskAuthenticationError::Unavailable => AuthenticationError::Unavailable,
+                    })
+                    .and_then(|user| caller_from_kubernetes_user(&user, &self.admin_group)),
+            }
+        })
+    }
+}
+
 pub(crate) fn token_review_request(
     bearer_token: &str,
     audience: &KubernetesTokenReviewAudience,

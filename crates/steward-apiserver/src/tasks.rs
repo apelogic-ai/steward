@@ -266,6 +266,23 @@ impl ConfiguredTaskIdentityResolver {
             )?,
         ))
     }
+
+    /// Resolve the ratified Identity claims into the authenticated username and groups without
+    /// performing task admission. This is used only by the route-scoped administrator
+    /// authenticator for the Steward-run service-envelope bootstrap path.
+    ///
+    /// Kubernetes service-account credentials still use TokenReview. A caller cannot select
+    /// this path: deployments select the configured task identity verifier, which validates the
+    /// exact Identity issuer, audience, signature, expiry and identity contract first.
+    pub(crate) fn authenticated_user(
+        &self,
+        assertion: &str,
+    ) -> Result<UserInfo, TaskAuthenticationError> {
+        match self {
+            Self::Kubernetes(_) => Err(TaskAuthenticationError::InvalidCredentials),
+            Self::Identity(resolver) => resolver.authenticated_user(assertion),
+        }
+    }
 }
 
 impl TaskIdentityResolver for ConfiguredTaskIdentityResolver {
@@ -326,6 +343,21 @@ impl IdentityTaskIdentityResolver {
             issuer,
             audience,
             canonical_identities,
+        })
+    }
+}
+
+impl IdentityTaskIdentityResolver {
+    pub(crate) fn authenticated_user(
+        &self,
+        assertion: &str,
+    ) -> Result<UserInfo, TaskAuthenticationError> {
+        let claims =
+            verify_identity_task_token(assertion, &self.jwks, &self.issuer, &self.audience)?;
+        Ok(UserInfo {
+            username: Some(claims.email),
+            groups: Some(claims.groups),
+            ..UserInfo::default()
         })
     }
 }

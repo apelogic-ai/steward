@@ -9,10 +9,11 @@ use axum::serve::Listener;
 use steward_adapter_github_artifact::GitHubArtifactVerifier;
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{
-    ConfiguredTaskIdentityResolver, KubeRuntimeRepository, KubernetesTokenAuthenticator,
-    KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog, agent_runs_ui, browser_admin,
-    browser_auth, browser_hop1_attestation, connections, google_oidc, mcp_gw_connections, router,
-    router_without_admin_dashboard, stable_runtime_bridge, task_router, user_envelopes, workflows,
+    ConfiguredTaskIdentityResolver, IdentityOrKubernetesTokenAuthenticator, KubeRuntimeRepository,
+    KubernetesTokenAuthenticator, KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog,
+    agent_runs_ui, browser_admin, browser_auth, browser_hop1_attestation, connections, google_oidc,
+    mcp_gw_connections, router, router_without_admin_dashboard, stable_runtime_bridge, task_router,
+    user_envelopes, workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
@@ -54,13 +55,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let token_review_audience = kubernetes_token_review_audience(
         env::var("STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE").ok(),
     )?;
-    let authenticator = KubernetesTokenAuthenticator::new(
+    let admin_group =
+        env::var("STEWARD_ADMIN_GROUP").unwrap_or_else(|_| "agents.apelogic.ai/admin".to_owned());
+    let kubernetes_authenticator = KubernetesTokenAuthenticator::new(
         client.clone(),
-        env::var("STEWARD_ADMIN_GROUP").unwrap_or_else(|_| "agents.apelogic.ai/admin".to_owned()),
+        admin_group.clone(),
         token_review_audience.clone(),
     );
     let task_identities =
         configured_task_identity_resolver(client.clone(), token_review_audience, store.clone())?;
+    let authenticator = IdentityOrKubernetesTokenAuthenticator::new(
+        kubernetes_authenticator,
+        task_identities.clone(),
+        admin_group,
+    );
     let task_workflows =
         StaticTaskWorkflowCatalog::from_json(&required("STEWARD_TASK_WORKFLOWS_JSON")?)
             .map_err(io::Error::other)?;
