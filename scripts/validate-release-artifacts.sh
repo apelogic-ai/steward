@@ -398,9 +398,9 @@ awk '
 ' "${browser_hop1_loopback_proxy_rendered}" > "${browser_hop1_deployment}"
 for required in \
   '        - name: mcp-loopback' \
-  '        image: example.test/local-socat@sha256:4444444444444444444444444444444444444444444444444444444444444444' \
-  '        - TCP-LISTEN:18080,bind=127.0.0.1,reuseaddr,fork' \
-  '        - TCP:mcp-gw-github-wrapper.mcp-gw.svc.cluster.local:8080'
+  '          image: example.test/local-socat@sha256:4444444444444444444444444444444444444444444444444444444444444444' \
+  '            - "TCP-LISTEN:18080,bind=127.0.0.1,reuseaddr,fork"' \
+  '            - "TCP:mcp-gw-github-wrapper.mcp-gw.svc.cluster.local:8080"'
 do
   grep -Fxq "${required}" "${browser_hop1_deployment}"
 done
