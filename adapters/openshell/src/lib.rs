@@ -334,9 +334,52 @@ fn output_archive_command(agent_type: &AgentType) -> &'static str {
     if agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE {
         "set -eu; test -f /sandbox/steward-output/response.json; tar -cf - -C /sandbox/steward-output response.json"
     } else if agent_type.name == WORKFLOW_CODEX_AGENT_TYPE {
-        "set -eu; test -s /sandbox/steward-output/result.txt; tar -cf - -C /sandbox/steward-output result.txt"
+        "set -eu; test -s /sandbox/steward-output/result.txt; test -d /sandbox/steward-output/out; tar -cf - -C /sandbox/steward-output out"
     } else {
         "set -eu; tar -cf - -C /sandbox/steward-output ."
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if stderr.contains("policy_denied") || stderr.contains("policy denied") {
+        "policy"
+    } else if stderr.contains("unauthorized")
+        || stderr.contains("forbidden")
+        || stderr.contains("status 401")
+        || stderr.contains("status 403")
+        || stderr.contains("invalid api key")
+    {
+        "authentication"
+    } else if stderr.contains("config.toml")
+        || stderr.contains("error loading configuration")
+        || stderr.contains("failed to load configuration")
+        || stderr.contains("toml parse error")
+    {
+        "configuration"
+    } else if stderr.contains("unexpected argument")
+        || stderr.contains("usage: codex exec")
+        || stderr.contains("invalid value")
+    {
+        "cli-usage"
+    } else if stderr.contains("model")
+        && (stderr.contains("not found")
+            || stderr.contains("unsupported")
+            || stderr.contains("unknown"))
+    {
+        "model"
+    } else if stderr.contains("error sending request")
+        || stderr.contains("connection refused")
+        || stderr.contains("connection reset")
+        || stderr.contains("timed out")
+        || stderr.contains("dns error")
+        || stderr.contains("failed to connect")
+        || stderr.contains("stream disconnected")
+    {
+        "network"
+    } else {
+        "agent"
     }
 }
 
@@ -1527,8 +1570,12 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             .await
             .map_err(port_failure)?;
         if executed.exit_code != 0 {
+            let category = task_agent_failure_category(&executed.stderr);
             return Err(PortError::Failed {
-                reason: format!("task agent exited with code {}", executed.exit_code),
+                reason: format!(
+                    "task agent exited with code {} (diagnostic-category={category})",
+                    executed.exit_code
+                ),
             });
         }
         let output_archive_command = output_archive_command(&request.agent_type);
@@ -1662,7 +1709,8 @@ mod tests {
         delete_owned_sandbox, deletion_names, load_source_credential, output_archive_command,
         project_request, provider_reconciliation, sandbox_spec, staging_append_command,
         staging_archive_chunks, staging_extract_command, staging_prepare_command,
-        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
+        task_agent_failure_category, validate_raw_sandbox_binding,
+        validate_workload_exchange_endpoint,
     };
     #[cfg(feature = "identity")]
     use super::{IdentityResolutionError, SANDBOX_ID_LABEL, binding_from_sandbox};
@@ -2372,7 +2420,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn approved_codex_workflow_requires_one_non_empty_standard_result_artifact() {
+    fn approved_codex_workflow_validates_the_standard_result_and_archives_declared_outputs() {
         let command = output_archive_command(&AgentType {
             name: "codex@0.117.0".to_owned(),
         });
@@ -2381,8 +2429,12 @@ mod tests {
             "the runtime must reject a missing or empty standard result"
         );
         assert!(
-            command.ends_with("result.txt"),
-            "the runtime must archive only the standard Workflow result"
+            command.contains("test -d /sandbox/steward-output/out"),
+            "the runtime must reject a missing declared output root"
+        );
+        assert!(
+            command.ends_with(" out"),
+            "the runtime must return the declared output root, not its internal result artifact"
         );
     }
 
@@ -2680,6 +2732,28 @@ mod tests {
             "an inference-bearing runtime must receive only the runtime-bound token-grant provider"
         );
         Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn task_agent_stderr_is_reduced_to_safe_categories() {
+        assert_eq!(
+            task_agent_failure_category(b"ERROR error sending request for url"),
+            "network"
+        );
+        assert_eq!(
+            task_agent_failure_category(b"Error loading configuration from config.toml"),
+            "configuration"
+        );
+        assert_eq!(
+            task_agent_failure_category(b"unexpected argument '--bad'\nUsage: codex exec"),
+            "cli-usage"
+        );
+        assert_eq!(
+            task_agent_failure_category(b"provider returned unauthorized status 401"),
+            "authentication"
+        );
+        assert_eq!(task_agent_failure_category(b"opaque failure"), "agent");
     }
 
     #[cfg(feature = "runtime")]
