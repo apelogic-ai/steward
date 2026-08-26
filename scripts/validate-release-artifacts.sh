@@ -10,15 +10,42 @@ stable_bridge_deployment="$(mktemp)"
 stable_bridge_controller_deployment="$(mktemp)"
 browser_auth_rendered="$(mktemp)"
 browser_auth_deployment="$(mktemp)"
+task_identity_rendered="$(mktemp)"
+task_identity_deployment="$(mktemp)"
 browser_hop1_rendered="$(mktemp)"
 browser_hop1_deployment="$(mktemp)"
+browser_hop1_loopback_rendered="$(mktemp)"
+browser_hop1_loopback_proxy_rendered="$(mktemp)"
+web_rendered="$(mktemp)"
+web_deployment="$(mktemp)"
 mint_synthetic_kubeconfig="$(mktemp)"
 mint_startup_output="$(mktemp)"
-trap 'rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" "${stable_bridge_configmap}" "${stable_bridge_deployment}" "${stable_bridge_controller_deployment}" "${browser_auth_rendered}" "${browser_auth_deployment}" "${browser_hop1_rendered}" "${browser_hop1_deployment}" "${mint_synthetic_kubeconfig}" "${mint_startup_output}"' EXIT INT TERM
+web_container_id=""
+
+cleanup() {
+  status="$?"
+  trap - EXIT INT TERM
+  set +e
+  if [[ -n "${web_container_id}" ]]; then
+    docker stop --time 5 "${web_container_id}" >/dev/null 2>&1
+  fi
+  rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" \
+    "${stable_bridge_configmap}" "${stable_bridge_deployment}" \
+    "${stable_bridge_controller_deployment}" "${browser_auth_rendered}" \
+    "${browser_auth_deployment}" "${task_identity_rendered}" \
+    "${task_identity_deployment}" "${browser_hop1_rendered}" \
+    "${browser_hop1_deployment}" "${browser_hop1_loopback_rendered}" \
+    "${browser_hop1_loopback_proxy_rendered}" \
+    "${web_rendered}" "${web_deployment}" \
+    "${mint_synthetic_kubeconfig}" "${mint_startup_output}"
+  exit "${status}"
+}
+trap cleanup EXIT INT TERM
 
 digest0="sha256:0000000000000000000000000000000000000000000000000000000000000000"
 digest1="sha256:1111111111111111111111111111111111111111111111111111111111111111"
 digest2="sha256:2222222222222222222222222222222222222222222222222222222222222222"
+digest3="sha256:3333333333333333333333333333333333333333333333333333333333333333"
 image_values=(
   --set images.apiserver.tag=validation-apiserver
   --set "images.apiserver.digest=${digest0}"
@@ -51,6 +78,70 @@ helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
   "${image_values[@]}" > "${rendered}"
+
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set web.enabled=true \
+  --set-string web.host=steward.example.test \
+  --set-string web.ingress.className=nginx \
+  --set-string web.ingress.tlsSecretName=steward-public-tls \
+  --set images.web.tag=validation-web \
+  --set "images.web.digest=${digest3}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' > "${web_rendered}"
+
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-web/ { print; exit }
+' "${web_rendered}" > "${web_deployment}"
+for required in \
+  'kind: Deployment' \
+  'metadata: { name: steward-web }' \
+  '      automountServiceAccountToken: false' \
+  '      securityContext: { runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: { type: RuntimeDefault } }' \
+  '          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }' \
+  '          readinessProbe: { httpGet: { path: /health/ready, port: http }, initialDelaySeconds: 2, periodSeconds: 5 }'
+do
+  grep -Fxq "${required}" "${web_deployment}"
+done
+for forbidden in STEWARD_DATABASE_URL STEWARD_JIRA_TOKEN STEWARD_LITELLM_MASTER_KEY STEWARD_MINT_SIGNING_KEY serviceAccountToken:
+do
+  if grep -Fq "${forbidden}" "${web_deployment}"; then
+    echo "web workload must not receive control-plane credentials: ${forbidden}" >&2
+    exit 1
+  fi
+done
+for required in \
+  'kind: Ingress' \
+  'name: steward-api' \
+  'name: steward-web' \
+  'path: /admin/api' \
+  'path: /admin/auth' \
+  'path: /admin/connections/github/callback' \
+  'path: /app/api' \
+  'path: /, pathType: Prefix' \
+  'metadata: { name: steward-web-egress }' \
+  '  egress: []'
+do
+  grep -Fq "${required}" "${web_rendered}"
+done
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set web.enabled=true >/dev/null 2>&1
+then
+  echo "enabled web presentation without immutable image and ingress inputs must fail chart validation" >&2
+  exit 1
+fi
 
 helm template steward "${root}/charts/steward" \
   --namespace steward \
@@ -91,9 +182,54 @@ if grep -Fq 'STEWARD_GOOGLE_OIDC_' "${rendered}" \
   || grep -Fq 'steward-google-oidc' "${rendered}" \
   || grep -Fq 'STEWARD_BROWSER_HOP1_' "${rendered}" \
   || grep -Fq 'STEWARD_IDENTITY_BROWSER_HOP1_' "${rendered}" \
-  || grep -Fq 'STEWARD_MCP_GW_ORIGIN' "${rendered}"
+  || grep -Fq 'STEWARD_MCP_GW_ORIGIN' "${rendered}" \
+  || grep -Fq 'STEWARD_IDENTITY_TASK_' "${rendered}"
 then
   echo "disabled browser features must render no browser auth or HOP-1 wiring" >&2
+  exit 1
+fi
+
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set taskIdentity.enabled=true \
+  --set-string taskIdentity.issuer=https://identity.example.test \
+  --set-string taskIdentity.audience=steward-task-api \
+  --set-string taskIdentity.publicJwksConfigMap.name=identity-task-jwks \
+  --set-string taskIdentity.publicJwksConfigMap.key=jwks.json > "${task_identity_rendered}"
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-apiserver/ { print; exit }
+' "${task_identity_rendered}" > "${task_identity_deployment}"
+for required in \
+  '            - { name: STEWARD_IDENTITY_TASK_ISSUER, value: "https://identity.example.test" }' \
+  '            - { name: STEWARD_IDENTITY_TASK_AUDIENCE, value: "steward-task-api" }' \
+  '            - { name: STEWARD_IDENTITY_TASK_JWKS_FILE, value: /run/identity-task/jwks.json }' \
+  '            - { name: identity-task, mountPath: /run/identity-task, readOnly: true }' \
+  '        - name: identity-task' \
+  '            name: identity-task-jwks' \
+  '            items: [{ key: jwks.json, path: jwks.json }]'
+do
+  grep -Fxq "${required}" "${task_identity_deployment}"
+done
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set taskIdentity.enabled=true >/dev/null 2>&1
+then
+  echo "enabled Identity task authentication without every immutable input must fail chart validation" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set taskIdentity.enabled=false \
+  --set-string taskIdentity.issuer=https://identity.example.test >/dev/null 2>&1
+then
+  echo "disabled Identity task authentication with stale configuration must fail chart validation" >&2
   exit 1
 fi
 if helm template steward "${root}/charts/steward" \
@@ -205,6 +341,127 @@ do
 done
 grep -Fxq '    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: mcp-gw } } }]' "${browser_hop1_rendered}"
 grep -Fxq '    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: identity-exchange } } }]' "${browser_hop1_rendered}"
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
+  --set browserHop1.enabled=true \
+  --set-string browserHop1.mcpGatewayOrigin=http://127.0.0.1:18080 \
+  --set-string browserHop1.identityEndpoint=https://identity.example.test:8443/v1/browser-hop1/exchange \
+  --set-string browserHop1.issuer=https://steward.example.test \
+  --set-string browserHop1.assertionAudience=identity-browser-hop1 \
+  --set-string browserHop1.keyId=steward-browser-hop1-current \
+  --set-string browserHop1.signingKeySecret.name=steward-browser-hop1 \
+  --set-string browserHop1.signingKeySecret.key=signing-key.der \
+  --set-string browserHop1.publicJwksConfigMap.name=steward-browser-hop1-jwks \
+  --set-string browserHop1.publicJwksConfigMap.key=jwks.json \
+  --set-string browserHop1.serviceAccountTokenAudience=identity-browser-hop1 > "${browser_hop1_loopback_rendered}"
+grep -Fxq '            - { name: STEWARD_MCP_GW_ORIGIN, value: "http://127.0.0.1:18080" }' "${browser_hop1_loopback_rendered}"
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
+  --set browserHop1.enabled=true \
+  --set-string browserHop1.mcpGatewayOrigin=http://127.0.0.1:18080 \
+  --set-string browserHop1.identityEndpoint=https://identity.example.test:8443/v1/browser-hop1/exchange \
+  --set-string browserHop1.issuer=https://steward.example.test \
+  --set-string browserHop1.assertionAudience=identity-browser-hop1 \
+  --set-string browserHop1.keyId=steward-browser-hop1-current \
+  --set-string browserHop1.signingKeySecret.name=steward-browser-hop1 \
+  --set-string browserHop1.signingKeySecret.key=signing-key.der \
+  --set-string browserHop1.publicJwksConfigMap.name=steward-browser-hop1-jwks \
+  --set-string browserHop1.publicJwksConfigMap.key=jwks.json \
+  --set-string browserHop1.serviceAccountTokenAudience=identity-browser-hop1 \
+  --set browserHop1.loopbackProxy.enabled=true \
+  --set-string browserHop1.loopbackProxy.image=example.test/local-socat@sha256:4444444444444444444444444444444444444444444444444444444444444444 \
+  --set-string browserHop1.loopbackProxy.targetHost=mcp-gw-github-wrapper.mcp-gw.svc.cluster.local \
+  --set browserHop1.loopbackProxy.targetPort=8080 > "${browser_hop1_loopback_proxy_rendered}"
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-apiserver/ { print; exit }
+' "${browser_hop1_loopback_proxy_rendered}" > "${browser_hop1_deployment}"
+for required in \
+  '        - name: mcp-loopback' \
+  '        image: example.test/local-socat@sha256:4444444444444444444444444444444444444444444444444444444444444444' \
+  '        - TCP-LISTEN:18080,bind=127.0.0.1,reuseaddr,fork' \
+  '        - TCP:mcp-gw-github-wrapper.mcp-gw.svc.cluster.local:8080'
+do
+  grep -Fxq "${required}" "${browser_hop1_deployment}"
+done
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
+  --set browserHop1.enabled=true \
+  --set-string browserHop1.mcpGatewayOrigin=https://mcp-gw.example.test:8080 \
+  --set-string browserHop1.identityEndpoint=https://identity.example.test:8443/v1/browser-hop1/exchange \
+  --set-string browserHop1.issuer=https://steward.example.test \
+  --set-string browserHop1.assertionAudience=identity-browser-hop1 \
+  --set-string browserHop1.keyId=steward-browser-hop1-current \
+  --set-string browserHop1.signingKeySecret.name=steward-browser-hop1 \
+  --set-string browserHop1.signingKeySecret.key=signing-key.der \
+  --set-string browserHop1.publicJwksConfigMap.name=steward-browser-hop1-jwks \
+  --set-string browserHop1.publicJwksConfigMap.key=jwks.json \
+  --set-string browserHop1.serviceAccountTokenAudience=identity-browser-hop1 \
+  --set browserHop1.loopbackProxy.enabled=true \
+  --set-string browserHop1.loopbackProxy.image=example.test/local-socat@sha256:4444444444444444444444444444444444444444444444444444444444444444 \
+  --set-string browserHop1.loopbackProxy.targetHost=mcp-gw-github-wrapper.mcp-gw.svc.cluster.local \
+  --set browserHop1.loopbackProxy.targetPort=8080 >/dev/null 2>&1
+then
+  echo "browser HOP-1 loopback proxy must require its exact localhost origin" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
+  --set browserHop1.enabled=true \
+  --set-string browserHop1.mcpGatewayOrigin=http://mcp-gw.example.test:8080 \
+  --set-string browserHop1.identityEndpoint=https://identity.example.test:8443/v1/browser-hop1/exchange \
+  --set-string browserHop1.issuer=https://steward.example.test \
+  --set-string browserHop1.assertionAudience=identity-browser-hop1 \
+  --set-string browserHop1.keyId=steward-browser-hop1-current \
+  --set-string browserHop1.signingKeySecret.name=steward-browser-hop1 \
+  --set-string browserHop1.signingKeySecret.key=signing-key.der \
+  --set-string browserHop1.publicJwksConfigMap.name=steward-browser-hop1-jwks \
+  --set-string browserHop1.publicJwksConfigMap.key=jwks.json \
+  --set-string browserHop1.serviceAccountTokenAudience=identity-browser-hop1 >/dev/null 2>&1
+then
+  echo "browser HOP-1 must reject non-loopback HTTP MCP-GW origins" >&2
+  exit 1
+fi
 if helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
@@ -414,6 +671,49 @@ if [[ "${1:-}" == "--build-images" ]]; then
     --file "${root}/build/connections-bridge.Dockerfile" \
     --tag "steward-bridge:release-validation" \
     "${root}"
+  docker build \
+    --file "${root}/build/web.Dockerfile" \
+    --tag "steward-web:release-validation" \
+    "${root}"
+  web_container_id="$(
+    docker run --rm --detach \
+      --read-only \
+      --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+      --publish 127.0.0.1::3000 \
+      --label "steward.test/run-id=release-web-$$" \
+      steward-web:release-validation
+  )"
+  web_runtime="$(docker inspect --format '{{.Config.User}} {{.HostConfig.ReadonlyRootfs}}' "${web_container_id}")"
+  if [[ "${web_runtime}" != "65532:65532 true" ]]; then
+    echo "web release image must run as 65532:65532 on a read-only root filesystem" >&2
+    exit 1
+  fi
+  web_address="$(docker port "${web_container_id}" 3000/tcp | head -n 1)"
+  web_port="${web_address##*:}"
+  if [[ ! "${web_port}" =~ ^[0-9]+$ ]]; then
+    echo "web release image did not publish a loopback readiness port" >&2
+    exit 1
+  fi
+  if ! web_status="$(
+    curl --fail --silent --show-error \
+      --retry 20 \
+      --retry-all-errors \
+      --retry-connrefused \
+      --retry-delay 1 \
+      --output /dev/null \
+      --write-out '%{http_code}' \
+      "http://127.0.0.1:${web_port}/health/ready"
+  )"
+  then
+    echo "web release image did not become ready" >&2
+    exit 1
+  fi
+  if [[ "${web_status}" != "204" ]]; then
+    echo "web release image did not become ready: expected 204, received ${web_status}" >&2
+    exit 1
+  fi
+  docker stop --time 5 "${web_container_id}" >/dev/null
+  web_container_id=""
   docker run --rm --entrypoint /bin/sh steward-bridge:release-validation -ceu '
     command -v tar >/dev/null
     command -v ip >/dev/null

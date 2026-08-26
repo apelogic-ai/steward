@@ -9,10 +9,11 @@ use axum::serve::Listener;
 use steward_adapter_github_artifact::GitHubArtifactVerifier;
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{
-    KubeRuntimeRepository, KubernetesTaskIdentityResolver, KubernetesTokenAuthenticator,
-    KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog, agent_runs_ui, browser_auth,
-    browser_hop1_attestation, connections, google_oidc, mcp_gw_connections, router,
-    router_without_admin_dashboard, stable_runtime_bridge, task_router, user_envelopes,
+    ConfiguredTaskIdentityResolver, IdentityOrKubernetesTokenAuthenticator, KubeRuntimeRepository,
+    KubernetesTokenAuthenticator, KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog,
+    agent_runs_ui, browser_admin, browser_auth, browser_hop1_attestation, connections, google_oidc,
+    mcp_gw_connections, router, router_without_admin_dashboard, stable_runtime_bridge, task_router,
+    user_envelopes, workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
@@ -54,18 +55,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let token_review_audience = kubernetes_token_review_audience(
         env::var("STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE").ok(),
     )?;
-    let authenticator = KubernetesTokenAuthenticator::new(
+    let admin_group =
+        env::var("STEWARD_ADMIN_GROUP").unwrap_or_else(|_| "agents.apelogic.ai/admin".to_owned());
+    let kubernetes_authenticator = KubernetesTokenAuthenticator::new(
         client.clone(),
-        env::var("STEWARD_ADMIN_GROUP").unwrap_or_else(|_| "agents.apelogic.ai/admin".to_owned()),
+        admin_group.clone(),
         token_review_audience.clone(),
     );
     let task_identities =
-        KubernetesTaskIdentityResolver::new(client.clone(), token_review_audience, store.clone());
+        configured_task_identity_resolver(client.clone(), token_review_audience, store.clone())?;
+    let authenticator = IdentityOrKubernetesTokenAuthenticator::new(
+        kubernetes_authenticator,
+        task_identities.clone(),
+        admin_group,
+    );
     let task_workflows =
         StaticTaskWorkflowCatalog::from_json(&required("STEWARD_TASK_WORKFLOWS_JSON")?)
             .map_err(io::Error::other)?;
     let runtimes = KubeRuntimeRepository::new(client);
-    let browser = browser_application_router(store.clone(), runtimes.clone())?;
+    let browser = browser_application_router(store.clone(), runtimes.clone(), decisions.clone())?;
     let app = if browser.is_some() {
         router_without_admin_dashboard(
             runtimes.clone(),
@@ -102,6 +110,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn configured_task_identity_resolver(
+    client: kube::Client,
+    kubernetes_audience: KubernetesTokenReviewAudience,
+    store: PgStore,
+) -> Result<ConfiguredTaskIdentityResolver, io::Error> {
+    let values = [
+        env::var("STEWARD_IDENTITY_TASK_ISSUER").ok(),
+        env::var("STEWARD_IDENTITY_TASK_AUDIENCE").ok(),
+        env::var("STEWARD_IDENTITY_TASK_JWKS_FILE").ok(),
+    ];
+    if values.iter().all(Option::is_none) {
+        return Ok(ConfiguredTaskIdentityResolver::kubernetes(
+            client,
+            kubernetes_audience,
+            store,
+        ));
+    }
+    let [issuer, audience, jwks_file] = values;
+    let required = |value: Option<String>| {
+        value
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                io::Error::other("Identity task authentication configuration must be complete")
+            })
+    };
+    ConfiguredTaskIdentityResolver::identity_from_jwks_file(
+        required(issuer)?,
+        required(audience)?,
+        std::path::Path::new(&required(jwks_file)?),
+        store,
+    )
+    .map_err(|_| io::Error::other("Identity task authentication configuration is invalid"))
+}
+
 fn install_rustls_crypto_provider() -> Result<(), io::Error> {
     use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
 
@@ -120,6 +162,7 @@ fn install_rustls_crypto_provider() -> Result<(), io::Error> {
 fn browser_application_router(
     store: PgStore,
     runtimes: KubeRuntimeRepository,
+    decisions: JiraAdapter,
 ) -> Result<Option<axum::Router>, Box<dyn Error>> {
     let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
         return Ok(None);
@@ -149,7 +192,17 @@ fn browser_application_router(
             user_envelopes::PgEnvelopeRequestBroker::new(store.clone()),
             auth.clone(),
         ))
-        .merge(agent_runs_ui::protected_router(store.clone(), auth.clone()));
+        .merge(agent_runs_ui::protected_router(store.clone(), auth.clone()))
+        .merge(browser_admin::protected_router(
+            runtimes.clone(),
+            store.clone(),
+            decisions,
+            auth.clone(),
+        ))
+        .merge(workflows::protected_admin_router(
+            store.clone(),
+            auth.clone(),
+        ));
     let app = match browser_hop1_connections_configuration(&origin)? {
         Some(broker) => app.merge(connections::protected_router(broker, auth.clone())),
         None => app,

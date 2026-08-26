@@ -51,6 +51,8 @@ struct IdTokenClaims {
     email: String,
     email_verified: bool,
     hd: String,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,6 +158,10 @@ fn validate_claims(
         && claims.sub.is_ascii()
         && !claims.sub.chars().any(char::is_whitespace);
     let email_is_bounded = !claims.email.is_empty() && claims.email.len() <= 320;
+    let display_name_is_bounded = claims.name.as_ref().is_none_or(|name| {
+        let trimmed = name.trim();
+        !trimmed.is_empty() && trimmed.len() <= 256 && !trimmed.chars().any(char::is_control)
+    });
     let nonce_is_bounded = !claims.nonce.is_empty() && claims.nonce.len() <= 512;
     let expiration_is_valid = claims.exp.saturating_add(CLOCK_SKEW_SECONDS) > now;
     let issued_at_is_valid = claims.iat <= now.saturating_add(CLOCK_SKEW_SECONDS)
@@ -169,6 +175,7 @@ fn validate_claims(
         || !nonce_is_bounded
         || !crate::browser_auth::secret_eq(&claims.nonce, expected_nonce)
         || !email_is_bounded
+        || !display_name_is_bounded
         || !claims.email_verified
         || claims.hd != hosted_domain
     {
@@ -180,6 +187,7 @@ fn validate_claims(
         hosted_domain: claims.hd,
         email: claims.email,
         email_verified: claims.email_verified,
+        display_name: claims.name.map(|name| name.trim().to_owned()),
         nonce: claims.nonce,
     })
 }
@@ -1496,6 +1504,7 @@ mod tests {
             email: "alice@example.com".to_owned(),
             email_verified: true,
             hd: "example.com".to_owned(),
+            name: Some("Alice Example".to_owned()),
         }
     }
 
@@ -1510,6 +1519,10 @@ mod tests {
                 1_100,
             )
         };
+        let verified_display_name = check(fixture_claims())
+            .ok()
+            .and_then(|claims| claims.display_name);
+        assert_eq!(verified_display_name.as_deref(), Some("Alice Example"));
         let mut cases = Vec::new();
         let mut claims = fixture_claims();
         claims.iss = "accounts.google.com".to_owned();
@@ -1532,6 +1545,12 @@ mod tests {
         cases.push(claims);
         let mut claims = fixture_claims();
         claims.iat = 799;
+        cases.push(claims);
+        let mut claims = fixture_claims();
+        claims.name = Some("\0Alice".to_owned());
+        cases.push(claims);
+        let mut claims = fixture_claims();
+        claims.name = Some("a".repeat(257));
         cases.push(claims);
         let mut claims = fixture_claims();
         claims.nonce = "other-nonce".to_owned();

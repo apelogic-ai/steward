@@ -7,8 +7,8 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use kube::api::{Api, ListParams};
-use steward_store::{AgentRunTimelineKind, PgStore};
-use steward_types::{AgentRuntime, Phase, Principal, TaskPhase};
+use steward_store::{AgentRunQuery, AgentRunTimelineKind, PgStore};
+use steward_types::{AgentRuntime, Phase, Principal, RunnerPlatform, TaskPhase};
 
 const HTTP_STATUS_MARKER: &str = "__STEWARD_HTTP_STATUS:";
 
@@ -208,6 +208,164 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
             AgentRunTimelineKind::Finalized,
         ],
         "the durable Task timeline must evidence submit, execute, output persistence, finalization request, and exact runtime cleanup"
+    );
+
+    let versioned_submission = submit_response(
+        &base_url,
+        "github-assertion",
+        "repository-review-v1-123",
+        r#"{"workflow":"repository-review@1"}"#,
+        &run_dir,
+    )?;
+    assert_eq!(
+        versioned_submission.http_status, 202,
+        "the published versioned Workflow must be admitted before controller-owned runtime creation"
+    );
+    let versioned_task_uid = json_string(&versioned_submission.body, "taskUid")?;
+    let submitted = store
+        .task(versioned_task_uid.parse()?)
+        .await?
+        .ok_or_else(|| io::Error::other("versioned Task reservation was not persisted"))?;
+    assert_eq!(submitted.workflow, "repository-review@1");
+    assert_eq!(
+        submitted.workflow_name.as_deref(),
+        Some("repository-review")
+    );
+    assert_eq!(submitted.workflow_version, Some(1));
+    assert!(
+        submitted
+            .workflow_digest
+            .as_deref()
+            .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71),
+        "the admitted Task must pin the immutable Workflow digest"
+    );
+    assert_eq!(
+        submitted.user_envelope_instance_id.as_deref(),
+        Some("env_repository_review_1")
+    );
+    assert_eq!(submitted.user_envelope_revision, Some(3));
+    assert!(
+        submitted
+            .user_envelope_digest
+            .as_deref()
+            .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71),
+        "the admitted Task must pin the provisioned User Envelope digest"
+    );
+    assert_eq!(submitted.runtime_spec.agent_type.name, "codex@0.117.0");
+    assert_eq!(submitted.runtime_spec.llms.len(), 1);
+    assert_eq!(submitted.runtime_spec.llms[0].provider, "openai");
+    assert_eq!(submitted.runtime_spec.llms[0].model, "priced-model");
+    assert_eq!(submitted.runtime_spec.tools.len(), 1);
+    assert_eq!(submitted.runtime_spec.tools[0].provider, "github");
+    assert_eq!(
+        submitted.runtime_spec.tools[0].resource,
+        "search_repositories"
+    );
+    assert_eq!(submitted.runtime_spec.budget.monthly_limit, "0.75");
+    assert_eq!(
+        submitted.runtime_spec.budget.single_run_limit.as_deref(),
+        Some("0.25")
+    );
+    assert_eq!(submitted.runtime_spec.budget.currency, "USD");
+    assert_eq!(submitted.runtime_spec.ttl.0, "30m");
+    assert_eq!(
+        submitted.runtime_spec.runner.platforms,
+        vec![RunnerPlatform::Linux]
+    );
+    assert_eq!(
+        submitted
+            .runtime_spec
+            .runner
+            .memory
+            .as_ref()
+            .map(|quantity| quantity.0.as_str()),
+        Some("256Mi")
+    );
+    assert_eq!(
+        submitted.agent_command.last().map(String::as_str),
+        Some("Review the repository state that triggered this GitHub Actions run."),
+        "the persisted server-owned command must carry the exact immutable Workflow prompt"
+    );
+    assert!(
+        submitted
+            .agent_command
+            .iter()
+            .any(|argument| argument.contains("codex-cli 0.117.0")),
+        "the persisted server-owned command must require the exact Workflow agent version"
+    );
+
+    let versioned_bound =
+        wait_for_runtime_binding(&base_url, &versioned_task_uid, "github-assertion", &run_dir)?;
+    let versioned_runtime_uid = json_string(&versioned_bound, "runtimeUid")?;
+    put_archive(
+        &base_url,
+        &versioned_task_uid,
+        "github-assertion",
+        &input_tar,
+        &run_dir,
+    )?;
+    execute(&base_url, &versioned_task_uid, "github-assertion", &run_dir)?;
+    wait_for(
+        &base_url,
+        &versioned_task_uid,
+        "github-assertion",
+        |status| status["phase"] == "succeeded",
+        &run_dir,
+    )?;
+    let versioned_output_tar = run_dir.join("repository-review-output.tar");
+    get_output(
+        &base_url,
+        &versioned_task_uid,
+        "github-assertion",
+        &versioned_output_tar,
+        &run_dir,
+    )?;
+    let versioned_output_dir = run_dir.join("repository-review-output");
+    fs::create_dir_all(&versioned_output_dir)?;
+    command(
+        Command::new("tar")
+            .args(["-xf"])
+            .arg(&versioned_output_tar)
+            .args(["-C"])
+            .arg(&versioned_output_dir),
+        "extract repository-review output tar",
+    )?;
+    assert_eq!(
+        fs::read_to_string(versioned_output_dir.join("result.txt"))?,
+        "Repository review completed by codex@0.117.0.\n",
+        "the approved Workflow agent must produce the standard non-empty result artifact"
+    );
+    let run = store
+        .agent_runs(&AgentRunQuery {
+            limit: 1,
+            cursor: None,
+            phase: None,
+            workflow: None,
+            owner_user_id: None,
+            runtime_uid: None,
+            task_uid: Some(versioned_task_uid.parse()?),
+        })
+        .await?
+        .records
+        .into_iter()
+        .next()
+        .ok_or_else(|| io::Error::other("versioned Task was absent from the Runs read model"))?;
+    assert_eq!(run.workflow_name.as_deref(), Some("repository-review"));
+    assert_eq!(run.workflow_version, Some(1));
+    assert_eq!(run.user_envelope_revision, Some(3));
+    delete_task(&base_url, &versioned_task_uid, "github-assertion", &run_dir)?;
+    wait_for(
+        &base_url,
+        &versioned_task_uid,
+        "github-assertion",
+        |status| status["finalized"] == true,
+        &run_dir,
+    )?;
+    assert!(
+        runtime_by_uid(&runtime_api, &versioned_runtime_uid)
+            .await?
+            .is_none(),
+        "finalizing the versioned Workflow Task must delete its exact provisioned runtime"
     );
 
     let stale = submit(

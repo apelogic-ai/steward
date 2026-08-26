@@ -277,24 +277,26 @@ fn e2e_postgres_tls() -> TaskResult {
 
 fn browser_e2e(browser_ready: bool) -> TaskResult {
     let browser_e2e_directory = root().join("target/browser-e2e");
-    let cache = browser_e2e_directory.join("npm-cache");
+    let cache = browser_e2e_directory.join("bun-cache");
     let browsers = browser_e2e_directory.join("browsers");
     fs::create_dir_all(&cache)
-        .map_err(|error| format!("failed to create browser E2E npm cache: {error}"))?;
+        .map_err(|error| format!("failed to create browser E2E Bun cache: {error}"))?;
     fs::create_dir_all(&browsers)
         .map_err(|error| format!("failed to create browser E2E browser directory: {error}"))?;
-    let npm_environment = [
-        ("npm_config_cache", cache.as_os_str()),
+    let bun_environment = [
+        ("BUN_INSTALL_CACHE_DIR", cache.as_os_str()),
         ("PLAYWRIGHT_BROWSERS_PATH", browsers.as_os_str()),
     ];
     if !browser_ready {
-        run_with_env("npm", &["ci"], &npm_environment)?;
+        run_with_env("bun", &["install", "--frozen-lockfile"], &bun_environment)?;
         run_with_env(
-            "npm",
-            &["exec", "playwright", "install", "chromium"],
-            &npm_environment,
+            "bunx",
+            &["playwright", "install", "chromium"],
+            &bun_environment,
         )?;
     }
+    run("bun", &["run", "web:check"])?;
+    run("bun", &["run", "--cwd", "web", "build"])?;
     run(
         "cargo",
         &[
@@ -307,7 +309,7 @@ fn browser_e2e(browser_ready: bool) -> TaskResult {
             "--examples",
         ],
     )?;
-    run_with_env("npm", &["run", "test:browser-e2e"], &npm_environment)
+    run_with_env("bun", &["run", "test:browser-e2e"], &bun_environment)
 }
 
 fn policy_test() -> TaskResult {
@@ -926,7 +928,7 @@ fn collect_files_inner(directory: &Path, files: &mut Vec<PathBuf>) -> TaskResult
 fn should_skip_directory(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(OsStr::to_str),
-        Some(".git" | "target" | ".steward-run" | ".worktrees")
+        Some(".git" | ".next" | "target" | "node_modules" | ".steward-run" | ".worktrees")
     )
 }
 
@@ -979,7 +981,8 @@ impl Drop for TemporaryTree {
 #[cfg(test)]
 mod tests {
     use super::{
-        git_command_in_repository, migration_changes, root, validate_conformance_test_result,
+        git_command_in_repository, migration_changes, root, should_skip_directory,
+        validate_conformance_test_result,
     };
     use std::fs;
     use std::io::ErrorKind;
@@ -1029,10 +1032,13 @@ mod tests {
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
         let package = fs::read_to_string(repository.join("package.json"))
             .map_err(|error| format!("pinned browser test package is required: {error}"))?;
-        let node_version = fs::read_to_string(repository.join(".node-version"))
-            .map_err(|error| format!("pinned Node version is required: {error}"))?;
+        let bun_version = fs::read_to_string(repository.join(".bun-version"))
+            .map_err(|error| format!("pinned Bun version is required: {error}"))?;
         let journey = fs::read_to_string(repository.join("tests/browser/steward-ui.spec.mjs"))
             .map_err(|error| format!("loopback browser journey is required: {error}"))?;
+        let next_journey =
+            fs::read_to_string(repository.join("tests/browser/steward-next.spec.mjs"))
+                .map_err(|error| format!("Next browser journey is required: {error}"))?;
         let xtask_source = include_str!("main.rs");
 
         let browser_job = workflow
@@ -1042,11 +1048,11 @@ mod tests {
             .ok_or_else(|| "browser E2E CI job is required".to_owned())?;
 
         assert!(
-            browser_job.contains("node-version-file: .node-version"),
-            "browser E2E CI must use the repository-pinned Node runtime"
+            browser_job.contains("bun-version-file: .bun-version"),
+            "browser E2E CI must use the repository-pinned Bun runtime"
         );
         assert!(
-            browser_job.contains("npm exec playwright install --with-deps chromium"),
+            browser_job.contains("bunx playwright install --with-deps chromium"),
             "browser E2E CI must install Playwright's pinned Chromium image"
         );
         assert!(
@@ -1064,17 +1070,24 @@ mod tests {
             "browser E2E CI must precompile loopback demos before Playwright starts"
         );
         assert!(
+            browser_job.contains("bun run web:check")
+                && browser_job.contains("bun run --cwd web build"),
+            "browser E2E CI must reject stale generated clients before building the Next application"
+        );
+        assert!(
             xtask_source.contains("\"steward-apiserver\",")
                 && xtask_source.contains("\"--examples\",")
+                && xtask_source.contains("run(\"bun\", &[\"run\", \"web:check\"])")
+                && xtask_source.contains("run(\"bun\", &[\"run\", \"--cwd\", \"web\", \"build\"])")
                 && journey.contains("exampleBinary(\"user-envelope-demo\")")
                 && journey.contains("exampleBinary(\"admin-dashboard-demo\")"),
-            "the local browser gate must build and then directly supervise its loopback demos"
+            "the local browser gate must verify and build Next before supervising its loopback demos"
         );
         assert!(
             package.contains("\"@playwright/test\": \"1.62.1\""),
             "the browser runner must be exact-version pinned in the source manifest"
         );
-        assert_eq!(node_version.trim(), "26.5.0");
+        assert_eq!(bun_version.trim(), "1.2.21");
         for required in [
             "127.0.0.1",
             "Storage.prototype",
@@ -1086,6 +1099,131 @@ mod tests {
             assert!(
                 journey.contains(required),
                 "the loopback browser journey must cover {required}"
+            );
+        }
+        for required in [
+            "content-security-policy",
+            "strict-dynamic",
+            "crossOriginRequests",
+            "Sign in required",
+            "Forbidden",
+            "Workspace view",
+            "scrollWidth",
+        ] {
+            assert!(
+                next_journey.contains(required),
+                "the Next browser journey must cover {required}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn next_presentation_foundation_is_bun_pinned_nonce_safe_and_route_complete()
+    -> Result<(), String> {
+        let repository = root();
+        let package = fs::read_to_string(repository.join("package.json"))
+            .map_err(|error| format!("Bun workspace manifest is required: {error}"))?;
+        let web_package = fs::read_to_string(repository.join("web/package.json"))
+            .map_err(|error| format!("steward-web package manifest is required: {error}"))?;
+        let proxy = fs::read_to_string(repository.join("web/src/proxy.ts"))
+            .map_err(|error| format!("nonce-compatible Next proxy is required: {error}"))?;
+        let layout = fs::read_to_string(repository.join("web/src/app/layout.tsx"))
+            .map_err(|error| format!("dynamic Next root layout is required: {error}"))?;
+        let api_config =
+            fs::read_to_string(repository.join("web/openapi-ts.config.ts")).map_err(|error| {
+                format!("typed API client generator configuration is required: {error}")
+            })?;
+        let session_provider = fs::read_to_string(
+            repository.join("web/src/session/session-context.tsx"),
+        )
+        .map_err(|error| format!("generated-client session bootstrap is required: {error}"))?;
+
+        for required in [
+            "\"packageManager\": \"bun@1.2.21\"",
+            "\"web:build\"",
+            "\"web:check\"",
+            "\"web:generate-api\"",
+        ] {
+            assert!(
+                package.contains(required),
+                "Bun workspace is missing {required}"
+            );
+        }
+        for required in [
+            "\"next\": \"16.3.2\"",
+            "\"react\": \"19.2.8\"",
+            "\"tailwindcss\": \"4.3.3\"",
+            "\"@hey-api/openapi-ts\": \"0.99.0\"",
+        ] {
+            assert!(
+                web_package.contains(required),
+                "steward-web dependencies must stay exact-version pinned: {required}"
+            );
+        }
+        for required in [
+            "crypto.randomUUID()",
+            "script-src 'self' 'nonce-${nonce}' 'strict-dynamic'",
+            "style-src 'self' 'nonce-${nonce}'",
+            "connect-src 'self'",
+            "frame-ancestors 'none'",
+            "requestHeaders.set(\"x-nonce\", nonce)",
+            "response.headers.set(\"Content-Security-Policy\"",
+        ] {
+            assert!(
+                proxy.contains(required),
+                "strict Next CSP is missing {required}"
+            );
+        }
+        assert!(
+            layout.contains("await headers()"),
+            "the root layout must opt into request rendering so Next applies the CSP nonce to framework scripts"
+        );
+        assert!(
+            api_config.contains("src/api-client") && api_config.contains("@hey-api/client-fetch"),
+            "the generated typed client must target web/src/api-client and use same-origin fetch"
+        );
+        for required in [
+            "@/api-client",
+            "credentials: \"same-origin\"",
+            "cache: \"no-store\"",
+            "status: \"loading\"",
+            "status: \"authenticated\"",
+            "status: \"unauthorized\"",
+            "status: \"unavailable\"",
+            "status: \"error\"",
+        ] {
+            assert!(
+                session_provider.contains(required),
+                "session bootstrap must preserve the explicit state {required}"
+            );
+        }
+        for forbidden in ["localStorage", "sessionStorage", "NEXT_PUBLIC_"] {
+            assert!(
+                !session_provider.contains(forbidden),
+                "session bootstrap must not use browser or public environment storage: {forbidden}"
+            );
+        }
+
+        for route in [
+            "web/src/app/envelopes/page.tsx",
+            "web/src/app/envelopes/new/page.tsx",
+            "web/src/app/envelopes/[id]/page.tsx",
+            "web/src/app/envelopes/[id]/runs/page.tsx",
+            "web/src/app/runs/page.tsx",
+            "web/src/app/runs/[id]/page.tsx",
+            "web/src/app/connections/page.tsx",
+            "web/src/app/settings/page.tsx",
+            "web/src/app/admin/envelopes/templates/page.tsx",
+            "web/src/app/admin/runs/page.tsx",
+            "web/src/app/admin/approvals/page.tsx",
+            "web/src/app/admin/settings/page.tsx",
+            "web/src/app/health/ready/route.ts",
+        ] {
+            assert!(
+                repository.join(route).is_file(),
+                "Next presentation route is required: {route}"
             );
         }
 
@@ -1174,6 +1312,43 @@ mod tests {
             image_inspect < s2_exec,
             "the post-S0 callback must inspect every local image before any kind load in S2"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_workflow_e2e_creates_a_run_owned_runtime_namespace() -> Result<(), String> {
+        let harness = fs::read_to_string(root().join("scripts/s2-inference-inside.sh"))
+            .map_err(|error| format!("in-cluster task E2E harness is required: {error}"))?;
+        let task_stack = fs::read_to_string(root().join("config/task/stack.yaml"))
+            .map_err(|error| format!("versioned Workflow E2E stack is required: {error}"))?;
+
+        assert!(
+            harness.contains("namespaces+=(steward-workflows)"),
+            "the versioned Workflow E2E must create its dedicated runtime namespace"
+        );
+        assert!(
+            harness.contains(
+                "elif [[ \"${SLICE}\" == \"task\" ]]; then\n  profile_sources=(\n    \"${ROOT}/config/s5/tool-provider-profile.yaml\"\n    \"${ROOT}/config/s5/inference-provider-profile.yaml\"\n  )"
+            ),
+            "the versioned Workflow E2E must install both Envelope-selected provider profiles"
+        );
+        assert!(
+            harness.contains("label namespace \"${namespace}\"")
+                && harness.contains("steward.test/run-id=${STEWARD_RUN_ID}"),
+            "the versioned Workflow runtime namespace must be owned by the current test run"
+        );
+        for required in [
+            "name: steward-task-controller-credentials",
+            "name: steward-task-mint-credentials",
+            "namespace: steward-workflows",
+            "resources: [\"secrets\"]",
+        ] {
+            assert!(
+                task_stack.contains(required),
+                "the versioned Workflow E2E must grant scoped runtime-credential access: missing {required}"
+            );
+        }
 
         Ok(())
     }
@@ -1914,6 +2089,137 @@ mod tests {
     }
 
     #[test]
+    fn next_web_release_is_immutable_same_origin_and_least_privileged() -> Result<(), String> {
+        let chart = root().join("charts/steward");
+        let values = fs::read_to_string(chart.join("values.yaml"))
+            .map_err(|error| format!("published Steward chart values are required: {error}"))?;
+        let schema = fs::read_to_string(chart.join("values.schema.json"))
+            .map_err(|error| format!("published Steward values schema is required: {error}"))?;
+        let templates = fs::read_to_string(chart.join("templates/all.yaml")).map_err(|error| {
+            format!("published Steward Kubernetes templates are required: {error}")
+        })?;
+        let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("published release workflow is required: {error}"))?;
+        let container = fs::read_to_string(root().join("build/web.Dockerfile"))
+            .map_err(|error| format!("production web container is required: {error}"))?;
+        let release_validation = fs::read_to_string(
+            root().join("scripts/validate-release-artifacts.sh"),
+        )
+        .map_err(|error| format!("release artifact validation script is required: {error}"))?;
+
+        for required in ["web:", "ingress:", "host:", "tlsSecretName:"] {
+            assert!(
+                values.contains(required),
+                "web chart values are missing {required}"
+            );
+            assert!(
+                schema.contains(required.trim_end_matches(':')),
+                "web values schema is missing {required}"
+            );
+        }
+        for required in [
+            "app.kubernetes.io/component: web",
+            "automountServiceAccountToken: false",
+            "readOnlyRootFilesystem: true",
+            "runAsNonRoot: true",
+            "path: /health/ready",
+            "kind: Ingress",
+            "path: /admin/api",
+            "path: /admin/auth",
+            "path: /admin/sign-in",
+            "path: /admin/connections/github/callback",
+            "path: /app/api",
+            "name: steward-apiserver",
+            "name: steward-web",
+            "metadata: { name: steward-web-egress }",
+            "egress: []",
+        ] {
+            assert!(
+                templates.contains(required),
+                "web deployment contract is missing {required}"
+            );
+        }
+        for forbidden in [
+            ".Values.secrets.database",
+            ".Values.secrets.mint",
+            ".Values.secrets.jira",
+            ".Values.secrets.litellm",
+            "serviceAccountToken:",
+        ] {
+            let web_deployment = templates
+                .split("metadata: { name: steward-web }")
+                .nth(1)
+                .and_then(|tail| tail.split("---").next())
+                .ok_or_else(|| "web Deployment template is missing".to_owned())?;
+            assert!(
+                !web_deployment.contains(forbidden),
+                "web deployment must not contain {forbidden}"
+            );
+        }
+        for required in [
+            "bun install --frozen-lockfile",
+            "bun run --cwd web build",
+            "NEXT_TELEMETRY_DISABLED=1",
+            "/workspace/web/.next/standalone",
+            "/workspace/web/.next/static",
+            "USER 65532:65532",
+        ] {
+            assert!(
+                container.contains(required),
+                "web image is missing {required}"
+            );
+        }
+        assert_eq!(
+            container.matches("FROM ").count(),
+            3,
+            "web image needs pinned Bun, build, and runtime stages"
+        );
+        assert_eq!(
+            container.matches("@sha256:").count(),
+            3,
+            "web base images must be digest pinned"
+        );
+        assert!(
+            workflow.contains("component: web"),
+            "release matrix must publish the web image"
+        );
+        assert!(
+            workflow.contains("dockerfile: build/web.Dockerfile"),
+            "release matrix must select the web Dockerfile"
+        );
+        for required in [
+            "docker run --rm --detach",
+            "--read-only",
+            "docker inspect --format",
+            "65532:65532 true",
+            "--retry-all-errors",
+            "/health/ready",
+            "web release image did not become ready",
+        ] {
+            assert!(
+                release_validation.contains(required),
+                "release validation must run the built web image and prove {required}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn repository_scans_do_not_descend_into_generated_or_dependency_trees() {
+        assert!(should_skip_directory(Path::new("/workspace/node_modules")));
+        assert!(should_skip_directory(Path::new("/workspace/web/.next")));
+    }
+
+    #[test]
+    fn next_browser_journey_uses_only_neutral_test_identifiers() -> Result<(), String> {
+        let content = fs::read_to_string(root().join("tests/browser/steward-next.spec.mjs"))
+            .map_err(|error| format!("Next browser journey is required: {error}"))?;
+        let violations = xtask::neutrality_violations(&content);
+        assert!(violations.is_empty(), "{violations:?}");
+        Ok(())
+    }
+
+    #[test]
     fn production_release_contract_is_complete_and_fail_closed() -> Result<(), String> {
         let chart = root().join("charts/steward");
         let values = fs::read_to_string(chart.join("values.yaml"))
@@ -2025,8 +2331,9 @@ mod tests {
             );
         }
         assert!(
-            !templates.contains("kind: Ingress"),
-            "Steward chart must not publish an Ingress"
+            templates.contains("{{- if .Values.web.enabled }}")
+                && templates.contains("kind: Ingress"),
+            "the same-origin Ingress must remain opt-in with the web workload"
         );
         let global_roles = templates
             .split("kind: ClusterRoleBinding")
@@ -3099,6 +3406,21 @@ esac
             String::from_utf8_lossy(&output.stdout).trim(),
             "openshell/supervisor:steward-spiffe-v0090",
             "the identity spike must use the supervisor built from the carried patch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_sandbox_image_override_is_optional_under_bash_nounset() -> Result<(), String> {
+        let script_path = root().join("scripts/s0-0-openshell-spike.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+
+        assert!(
+            script.contains(
+                "if [[ -n \"${STEWARD_OPENSHELL_SANDBOX_IMAGE:-}\" ]]; then\n  openshell_helm_args+=(\"${sandbox_image_args[@]}\")\nfi"
+            ),
+            "the optional sandbox image args must not expand an empty array under Bash nounset"
         );
         Ok(())
     }

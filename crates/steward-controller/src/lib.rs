@@ -593,6 +593,11 @@ async fn reconcile_task<R: SandboxTaskRuntime>(
                 }
                 Err(error) => {
                     let reason = task_failure_reason(&error);
+                    eprintln!(
+                        "task execution failed: task_uid={} runtime_uid={} reason={reason}",
+                        task.task_uid,
+                        task.runtime_uid.as_deref().unwrap_or("unbound")
+                    );
                     authority
                         .fail_task_execution(task.task_uid, &reason)
                         .await
@@ -3522,6 +3527,7 @@ mod tests {
                 tools: Vec::new(),
                 budget: Budget {
                     monthly_limit: "1.00".to_owned(),
+                    single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("1h".to_owned()),
@@ -3550,6 +3556,7 @@ mod tests {
                 tools: Vec::new(),
                 budget: Budget {
                     monthly_limit: monthly_limit.to_owned(),
+                    single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("1h".to_owned()),
@@ -4180,6 +4187,7 @@ mod webhook_tests {
                     tools: Vec::new(),
                     budget: Budget {
                         monthly_limit: "200.00".to_owned(),
+                        single_run_limit: None,
                         currency: "USD".to_owned(),
                     },
                     ttl: Duration("24h".to_owned()),

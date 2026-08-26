@@ -10,6 +10,15 @@ images:
   mint:
     tag: ""
     digest: ""
+  web:
+    tag: ""
+    digest: ""
+web:
+  enabled: false
+  host: ""
+  ingress:
+    className: ""
+    tlsSecretName: ""
 secrets:
   database:
     name: steward-database
@@ -55,9 +64,27 @@ browserHop1:
     name: ""
     key: ""
   serviceAccountTokenAudience: ""
+  # A local-only TCP bridge may expose an in-cluster HTTP provider endpoint
+  # to the browser-session broker's explicit 127.0.0.1 origin. It is disabled
+  # by default and every enabled input is immutable and explicit.
+  loopbackProxy:
+    enabled: false
+    image: ""
+    targetHost: ""
+    targetPort: 0
 workloadExchangeTrust:
   name: steward-workload-exchange-ca
   caCertificate: ca.crt
+taskIdentity:
+  # Default deployments authenticate task submissions with Kubernetes TokenReview.
+  # Enable this only when an external Identity service issues the exact steward-task-v2
+  # credential and its public JWKS is projected read-only into the apiserver.
+  enabled: false
+  issuer: ""
+  audience: ""
+  publicJwksConfigMap:
+    name: ""
+    key: ""
 tls:
   issuerRef:
     name: cluster-issuer
@@ -103,6 +130,7 @@ networkPolicy:
   postgresCidrs: []
   jiraCidrs: []
   browserAuthEgressCidrs: []
+  ingressNamespace: ingress-nginx
   burbleNamespace: burble
   arcNamespace: arc-runners
   mcpGatewayNamespace: mcp-gw
@@ -126,11 +154,14 @@ services:
   apiserverPort: 443
   webhookPort: 443
   mintPort: 8080
+  webPort: 3000
 replicaCount:
   apiserver: 1
   controller: 1
   mint: 1
+  web: 1
 resources:
   apiserver: {}
   controller: {}
   mint: {}
+  web: {}

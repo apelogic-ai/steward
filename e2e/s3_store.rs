@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::postgres::PgPoolOptions;
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
-use steward_store::{ParkRejection, PgStore};
+use steward_store::{ParkRejection, PgStore, WorkflowPublication};
 use steward_types::{
     AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal, RunnerRequirements,
 };
@@ -26,6 +26,113 @@ async fn s3_postgres_migrations_apply_from_empty() -> Result<(), Box<dyn Error>>
             "S3 migrations must apply cleanly to an empty Postgres database: {error}"
         ))
     })?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_revisions_are_immutable_and_task_pins_are_atomic() -> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the S3 Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let workflow_name = format!("repository-review-{suffix}");
+    let first_digest = format!("sha256:{}", "a".repeat(64));
+    let second_digest = format!("sha256:{}", "b".repeat(64));
+    let first = store
+        .publish_initial_workflow(WorkflowPublication {
+            name: &workflow_name,
+            display_name: "Repository review",
+            agent: "codex@0.117.0",
+            prompt: "Review the repository state that triggered this GitHub Actions run.",
+            content_digest: &first_digest,
+            published_by: "admin@example.com",
+        })
+        .await?;
+    let second = store
+        .publish_next_workflow(WorkflowPublication {
+            name: &workflow_name,
+            display_name: "Repository review",
+            agent: "codex@0.117.0",
+            prompt: "Review the repository state and summarize actionable findings.",
+            content_digest: &second_digest,
+            published_by: "admin@example.com",
+        })
+        .await?;
+    assert_eq!(first.version, 1);
+    assert_eq!(second.version, 2);
+
+    let mutation = sqlx::query(
+        "UPDATE workflow_revisions SET prompt = 'mutated' WHERE name = $1 AND version = 1",
+    )
+    .bind(&workflow_name)
+    .execute(store.pool())
+    .await;
+    assert!(
+        mutation.is_err(),
+        "a published Workflow revision must reject in-place mutation"
+    );
+    let deletion = sqlx::query("DELETE FROM workflow_revisions WHERE name = $1 AND version = 1")
+        .bind(&workflow_name)
+        .execute(store.pool())
+        .await;
+    assert!(
+        deletion.is_err(),
+        "a published Workflow revision must reject deletion"
+    );
+    assert_eq!(
+        store.workflow_revision(&workflow_name, 1).await?,
+        Some(first.clone()),
+        "publishing version 2 must leave version 1 unchanged"
+    );
+
+    let partial_pins = sqlx::query(
+        "INSERT INTO task_submissions \
+         (task_uid, idempotency_key, submitter_service, owner, workflow, workflow_name, \
+          coding_agent_runtime, runtime_namespace, runtime_name, runtime_ownership, phase, \
+          runtime_spec, agent_command) \
+         VALUES (gen_random_uuid(), $1, 'steward-run', \
+                 'alice@example.com', $2, $3, 'codex@0.117.0', 'steward-test', 'task-a', \
+                 'provisioned', 'submitted', '{}'::jsonb, '[]'::jsonb)",
+    )
+    .bind(format!("partial-{suffix}"))
+    .bind(format!("{workflow_name}@1"))
+    .bind(&workflow_name)
+    .execute(store.pool())
+    .await;
+    assert!(
+        partial_pins.is_err(),
+        "a Task must not persist a partial Workflow or User Envelope pin set"
+    );
+
+    let complete_pins = sqlx::query(
+        "INSERT INTO task_submissions \
+         (task_uid, idempotency_key, submitter_service, owner, workflow, workflow_name, \
+          workflow_version, workflow_digest, user_envelope_instance_id, \
+          user_envelope_revision, user_envelope_digest, coding_agent_runtime, \
+          runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, agent_command) \
+         VALUES (gen_random_uuid(), $1, 'steward-run', \
+                 'alice@example.com', $2, $3, 1, $4, 'env_test', 7, $5, 'codex@0.117.0', \
+                 'steward-test', 'task-b', 'provisioned', 'submitted', '{}'::jsonb, '[]'::jsonb)",
+    )
+    .bind(format!("complete-{suffix}"))
+    .bind(format!("{workflow_name}@1"))
+    .bind(&workflow_name)
+    .bind(&first_digest)
+    .bind(format!("sha256:{}", "c".repeat(64)))
+    .execute(store.pool())
+    .await?;
+    assert_eq!(complete_pins.rows_affected(), 1);
+
     Ok(())
 }
 
@@ -58,6 +165,7 @@ async fn s3_postgres_keeps_envelopes_immutable_and_parks_exact_rejections()
             tools: Vec::new(),
             budget: Budget {
                 monthly_limit: "200.00".to_owned(),
+                single_run_limit: None,
                 currency: "USD".to_owned(),
             },
             ttl: Duration("24h".to_owned()),
@@ -103,6 +211,7 @@ async fn s3_postgres_keeps_envelopes_immutable_and_parks_exact_rejections()
         tools: Vec::new(),
         budget: Budget {
             monthly_limit: "220.00".to_owned(),
+            single_run_limit: None,
             currency: "USD".to_owned(),
         },
         ttl: Duration("24h".to_owned()),

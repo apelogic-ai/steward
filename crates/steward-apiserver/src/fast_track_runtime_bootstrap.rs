@@ -251,6 +251,7 @@ fn fixed_runtime(email: Email) -> AgentRuntime {
         }],
         budget: Budget {
             monthly_limit: "0.00".to_owned(),
+            single_run_limit: None,
             currency: "USD".to_owned(),
         },
         ttl: Duration(FIXED_TTL.to_owned()),
@@ -413,6 +414,7 @@ mod tests {
         Ok(BrowserSessionContext {
             principal: BrowserPrincipal {
                 canonical_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
+                display_name: "Alice Example".to_owned(),
                 display_email: Email::parse("alice@example.com")?,
                 role: BrowserRole::User,
                 member_roles: Vec::new(),

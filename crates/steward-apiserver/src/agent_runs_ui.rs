@@ -27,13 +27,13 @@ use crate::{AgentRunLedger, AgentRunSpendView, bounded_task_error_category};
 pub const BROWSER_AGENT_RUNS_API_VERSION: &str = "steward.browser-runs/v1";
 
 #[derive(Clone)]
-struct BrowserRunsState<L> {
+pub(crate) struct BrowserRunsState<L> {
     ledger: L,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BrowserRunsQuery {
+pub(crate) struct BrowserRunsQuery {
     #[serde(default = "default_limit")]
     limit: u16,
     cursor: Option<Uuid>,
@@ -44,7 +44,7 @@ struct BrowserRunsQuery {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AllRunsQuery {
+pub(crate) struct AllRunsQuery {
     #[serde(default = "default_limit")]
     limit: u16,
     cursor: Option<Uuid>,
@@ -58,11 +58,18 @@ const fn default_limit() -> u16 {
     50
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct BrowserRunView {
+pub(crate) struct BrowserRunView {
+    #[schema(value_type = String, format = "uuid")]
     task_uid: Uuid,
     workflow: String,
+    workflow_name: Option<String>,
+    workflow_version: Option<i64>,
+    workflow_digest: Option<String>,
+    user_envelope_instance_id: Option<String>,
+    user_envelope_revision: Option<i64>,
+    user_envelope_digest: Option<String>,
     coding_agent_runtime: String,
     runtime_uid: Option<String>,
     runtime_ownership: RuntimeOwnership,
@@ -76,50 +83,53 @@ struct BrowserRunView {
     error_category: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct MyRunsResponse {
+pub(crate) struct MyRunsResponse {
     api_version: &'static str,
     runs: Vec<BrowserRunView>,
+    #[schema(value_type = Option<String>, format = "uuid")]
     next_cursor: Option<Uuid>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct AllRunsView {
+pub(crate) struct AllRunsView {
     #[serde(flatten)]
     run: BrowserRunView,
     /// Opaque canonical identifier only; display email and acting-user identities stay server-side.
     owner_user_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct AllRunsResponse {
+pub(crate) struct AllRunsResponse {
     api_version: &'static str,
     runs: Vec<AllRunsView>,
+    #[schema(value_type = Option<String>, format = "uuid")]
     next_cursor: Option<Uuid>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct BrowserRunResponse {
+pub(crate) struct BrowserRunResponse {
     api_version: &'static str,
     run: BrowserRunView,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", tag = "kind")]
-enum BrowserRunTimelineEvent {
+pub(crate) enum BrowserRunTimelineEvent {
     Phase { phase: TaskPhase, at: String },
     FinalizationRequested { at: String },
     Finalized { at: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct BrowserRunTimelineResponse {
+pub(crate) struct BrowserRunTimelineResponse {
     api_version: &'static str,
+    #[schema(value_type = String, format = "uuid")]
     task_uid: Uuid,
     events: Vec<BrowserRunTimelineEvent>,
 }
@@ -167,7 +177,25 @@ where
     )
 }
 
-async fn my_runs<L>(
+#[utoipa::path(
+    get,
+    path = "/app/api/v1/runs",
+    params(
+        ("limit" = Option<u16>, Query),
+        ("cursor" = Option<String>, Query),
+        ("phase" = Option<TaskPhase>, Query),
+        ("workflow" = Option<String>, Query),
+        ("runtimeUid" = Option<String>, Query)
+    ),
+    responses(
+        (status = 200, body = MyRunsResponse),
+        (status = 400, description = "Run query is invalid"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 503, description = "Run history is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn my_runs<L>(
     session: Option<Extension<BrowserSessionContext>>,
     State(state): State<BrowserRunsState<L>>,
     Query(query): Query<BrowserRunsQuery>,
@@ -201,7 +229,27 @@ where
     }
 }
 
-async fn all_runs<L>(
+#[utoipa::path(
+    get,
+    path = "/admin/api/v1/all-runs",
+    params(
+        ("limit" = Option<u16>, Query),
+        ("cursor" = Option<String>, Query),
+        ("phase" = Option<TaskPhase>, Query),
+        ("workflow" = Option<String>, Query),
+        ("ownerUserId" = Option<CanonicalUserId>, Query),
+        ("runtimeUid" = Option<String>, Query)
+    ),
+    responses(
+        (status = 200, body = AllRunsResponse),
+        (status = 400, description = "Run query is invalid"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role is required"),
+        (status = 503, description = "Run history is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn all_runs<L>(
     authority: Option<Extension<BrowserAdminAuthority>>,
     State(state): State<BrowserRunsState<L>>,
     Query(query): Query<AllRunsQuery>,
@@ -244,7 +292,19 @@ where
     }
 }
 
-async fn my_run<L>(
+#[utoipa::path(
+    get,
+    path = "/app/api/v1/runs/{task_uid}",
+    params(("task_uid" = String, Path)),
+    responses(
+        (status = 200, body = BrowserRunResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 404, description = "Run was not found in the user's scope"),
+        (status = 503, description = "Run history is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn my_run<L>(
     session: Option<Extension<BrowserSessionContext>>,
     State(state): State<BrowserRunsState<L>>,
     Path(task_uid): Path<Uuid>,
@@ -263,7 +323,20 @@ where
     .await
 }
 
-async fn all_run<L>(
+#[utoipa::path(
+    get,
+    path = "/admin/api/v1/all-runs/{task_uid}",
+    params(("task_uid" = String, Path)),
+    responses(
+        (status = 200, body = BrowserRunResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role is required"),
+        (status = 404, description = "Run was not found"),
+        (status = 503, description = "Run history is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn all_run<L>(
     authority: Option<Extension<BrowserAdminAuthority>>,
     State(state): State<BrowserRunsState<L>>,
     Path(task_uid): Path<Uuid>,
@@ -277,7 +350,19 @@ where
     single_run_response(&state.ledger, task_uid, None).await
 }
 
-async fn my_run_timeline<L>(
+#[utoipa::path(
+    get,
+    path = "/app/api/v1/runs/{task_uid}/timeline",
+    params(("task_uid" = String, Path)),
+    responses(
+        (status = 200, body = BrowserRunTimelineResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 404, description = "Run was not found in the user's scope"),
+        (status = 503, description = "Run history is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn my_run_timeline<L>(
     session: Option<Extension<BrowserSessionContext>>,
     State(state): State<BrowserRunsState<L>>,
     Path(task_uid): Path<Uuid>,
@@ -296,7 +381,20 @@ where
     .await
 }
 
-async fn all_run_timeline<L>(
+#[utoipa::path(
+    get,
+    path = "/admin/api/v1/all-runs/{task_uid}/timeline",
+    params(("task_uid" = String, Path)),
+    responses(
+        (status = 200, body = BrowserRunTimelineResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role is required"),
+        (status = 404, description = "Run was not found"),
+        (status = 503, description = "Run history is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn all_run_timeline<L>(
     authority: Option<Extension<BrowserAdminAuthority>>,
     State(state): State<BrowserRunsState<L>>,
     Path(task_uid): Path<Uuid>,
@@ -389,6 +487,12 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
     BrowserRunView {
         task_uid: record.task_uid,
         workflow: record.workflow,
+        workflow_name: record.workflow_name,
+        workflow_version: record.workflow_version,
+        workflow_digest: record.workflow_digest,
+        user_envelope_instance_id: record.user_envelope_instance_id,
+        user_envelope_revision: record.user_envelope_revision,
+        user_envelope_digest: record.user_envelope_digest,
         coding_agent_runtime: record.coding_agent_runtime,
         runtime_uid: record.runtime_uid,
         runtime_ownership: record.runtime_ownership,
@@ -529,7 +633,13 @@ mod tests {
             acting_user: Some("alice@example.com".to_owned()),
             owner: "alice@example.com".to_owned(),
             owner_user_id: Some(owner_user_id.to_owned()),
-            workflow: "code-review".to_owned(),
+            workflow: "repository-review@1".to_owned(),
+            workflow_name: Some("repository-review".to_owned()),
+            workflow_version: Some(1),
+            workflow_digest: Some(format!("sha256:{}", "a".repeat(64))),
+            user_envelope_instance_id: Some("envelope-instance-1".to_owned()),
+            user_envelope_revision: Some(4),
+            user_envelope_digest: Some(format!("sha256:{}", "b".repeat(64))),
             coding_agent_runtime: "agent-v1".to_owned(),
             runtime_uid: Some(format!("runtime-{task_uid}")),
             runtime_ownership: RuntimeOwnership::Provisioned,
@@ -551,6 +661,7 @@ mod tests {
                 tools: Vec::new(),
                 budget: Budget {
                     monthly_limit: "100.00".to_owned(),
+                    single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("24h".to_owned()),
@@ -690,6 +801,21 @@ mod tests {
         assert_eq!(
             value["runs"][0]["taskUid"],
             "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(value["runs"][0]["workflowName"], "repository-review");
+        assert_eq!(value["runs"][0]["workflowVersion"], 1);
+        assert_eq!(
+            value["runs"][0]["workflowDigest"],
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert_eq!(
+            value["runs"][0]["userEnvelopeInstanceId"],
+            "envelope-instance-1"
+        );
+        assert_eq!(value["runs"][0]["userEnvelopeRevision"], 4);
+        assert_eq!(
+            value["runs"][0]["userEnvelopeDigest"],
+            format!("sha256:{}", "b".repeat(64))
         );
         assert!(value["runs"][0].get("ownerUserId").is_none());
         assert!(!value.to_string().contains("alice@example.com"));

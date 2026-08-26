@@ -38,6 +38,9 @@ spec:
                     type: string
                   monthlyLimit:
                     type: string
+                  singleRunLimit:
+                    nullable: true
+                    type: string
                 required:
                 - currency
                 - monthlyLimit

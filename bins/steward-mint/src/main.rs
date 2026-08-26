@@ -269,6 +269,7 @@ mod tests {
                 }],
                 budget: Budget {
                     monthly_limit: "1.00".to_owned(),
+                    single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("1h".to_owned()),

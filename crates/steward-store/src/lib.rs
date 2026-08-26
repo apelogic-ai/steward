@@ -20,6 +20,29 @@ pub struct PgStore {
     pool: PgPool,
 }
 
+/// One immutable, administrator-published Workflow revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowRevisionRecord {
+    pub name: String,
+    pub version: i64,
+    pub display_name: String,
+    pub agent: String,
+    pub prompt: String,
+    pub content_digest: String,
+    pub published_by: String,
+    pub published_at: String,
+}
+
+/// Immutable Workflow content supplied to the persistence boundary.
+pub struct WorkflowPublication<'a> {
+    pub name: &'a str,
+    pub display_name: &'a str,
+    pub agent: &'a str,
+    pub prompt: &'a str,
+    pub content_digest: &'a str,
+    pub published_by: &'a str,
+}
+
 /// The current Steward-local browser authorization for one opaque canonical user.
 ///
 /// Google proves who a person is. This record proves only which Steward privileges an
@@ -136,6 +159,106 @@ impl PgStore {
             .run(&self.pool)
             .await
             .map_err(|error| StoreError::Database(error.to_string()))
+    }
+
+    pub async fn list_latest_workflows(&self) -> Result<Vec<WorkflowRevisionRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT ON (name) name, version, display_name, agent, prompt, \
+                    content_digest, published_by, \
+                    to_char(published_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS published_at \
+             FROM workflow_revisions \
+             ORDER BY name, version DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.into_iter().map(workflow_revision_record).collect()
+    }
+
+    pub async fn workflow_revision(
+        &self,
+        name: &str,
+        version: i64,
+    ) -> Result<Option<WorkflowRevisionRecord>, StoreError> {
+        if name.is_empty() || version <= 0 {
+            return Err(StoreError::InvalidWorkflow);
+        }
+        let row = sqlx::query(
+            "SELECT name, version, display_name, agent, prompt, content_digest, published_by, \
+                    to_char(published_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS published_at \
+             FROM workflow_revisions WHERE name = $1 AND version = $2",
+        )
+        .bind(name)
+        .bind(version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        row.map(workflow_revision_record).transpose()
+    }
+
+    pub async fn publish_initial_workflow(
+        &self,
+        publication: WorkflowPublication<'_>,
+    ) -> Result<WorkflowRevisionRecord, StoreError> {
+        self.publish_workflow(publication, false).await
+    }
+
+    pub async fn publish_next_workflow(
+        &self,
+        publication: WorkflowPublication<'_>,
+    ) -> Result<WorkflowRevisionRecord, StoreError> {
+        self.publish_workflow(publication, true).await
+    }
+
+    async fn publish_workflow(
+        &self,
+        publication: WorkflowPublication<'_>,
+        next: bool,
+    ) -> Result<WorkflowRevisionRecord, StoreError> {
+        if !valid_workflow_publication(&publication) {
+            return Err(StoreError::InvalidWorkflow);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("workflow:{}", publication.name))
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let current = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT max(version) FROM workflow_revisions WHERE name = $1",
+        )
+        .bind(publication.name)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let version = match (next, current) {
+            (false, None) => 1,
+            (false, Some(_)) => return Err(StoreError::WorkflowAlreadyExists),
+            (true, None) => return Err(StoreError::WorkflowNotFound),
+            (true, Some(version)) => version.checked_add(1).ok_or(StoreError::InvalidWorkflow)?,
+        };
+        let row = sqlx::query(
+            "INSERT INTO workflow_revisions \
+             (name, version, display_name, agent, prompt, content_digest, published_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             RETURNING name, version, display_name, agent, prompt, content_digest, published_by, \
+                       to_char(published_at AT TIME ZONE 'UTC', \
+                               'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS published_at",
+        )
+        .bind(publication.name)
+        .bind(version)
+        .bind(publication.display_name)
+        .bind(publication.agent)
+        .bind(publication.prompt)
+        .bind(publication.content_digest)
+        .bind(publication.published_by)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        workflow_revision_record(row)
     }
 
     /// Read the latest append-only local RBAC decisions for this exact canonical user.
@@ -968,6 +1091,50 @@ impl PgStore {
             .collect()
     }
 
+    /// List current pending user-envelope requests for the administrator approval queue.
+    pub async fn pending_envelope_requests(
+        &self,
+    ) -> Result<Vec<PendingEnvelopeRequest>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT requests.id, users.display_email AS owner_display_email, \
+                    requests.template_id, requests.template_revision, \
+                    requests.requested_envelope, \
+                    to_char(requests.created_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at \
+             FROM envelope_requests requests \
+             JOIN canonical_users users ON users.user_id = requests.owner_user_id \
+             JOIN LATERAL ( \
+                 SELECT events.status \
+                 FROM envelope_request_events events \
+                 WHERE events.request_id = requests.id \
+                 ORDER BY events.at DESC, events.id DESC \
+                 LIMIT 1 \
+             ) status ON true \
+             WHERE status.status = 'pending' \
+             ORDER BY requests.created_at, requests.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(PendingEnvelopeRequest {
+                    request_id: row.try_get("id").map_err(database_error)?,
+                    owner_display_email: row
+                        .try_get("owner_display_email")
+                        .map_err(database_error)?,
+                    template_id: row.try_get("template_id").map_err(database_error)?,
+                    template_revision: row.try_get("template_revision").map_err(database_error)?,
+                    requested_envelope: row
+                        .try_get::<Json<Envelope>, _>("requested_envelope")
+                        .map_err(database_error)?
+                        .0,
+                    created_at: row.try_get("created_at").map_err(database_error)?,
+                })
+            })
+            .collect()
+    }
+
     /// Append a server-side lifecycle transition after the approval/provisioning authority has
     /// made its decision. This API never accepts a browser session or caller-supplied owner.
     pub async fn append_envelope_request_status(
@@ -1154,6 +1321,28 @@ impl PgStore {
     pub async fn latest_envelope(&self, member_role: &str) -> Result<Option<Envelope>, StoreError> {
         self.latest_scoped_envelope(EnvelopeScopeKind::MemberRole, member_role)
             .await
+    }
+
+    pub async fn latest_envelopes(&self) -> Result<Vec<(String, Envelope)>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT ON (scope_ref) scope_ref, revision, spec \
+             FROM envelopes \
+             WHERE scope_kind = 'member_role' \
+             ORDER BY scope_ref, revision DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.into_iter()
+            .map(|row| {
+                let member_role = row.try_get("scope_ref").map_err(database_error)?;
+                let revision = row.try_get("revision").map_err(database_error)?;
+                let Json(spec) = row
+                    .try_get::<Json<EnvelopeSpec>, _>("spec")
+                    .map_err(database_error)?;
+                Ok((member_role, Envelope { revision, spec }))
+            })
+            .collect()
     }
 
     pub async fn latest_service_envelope(
@@ -2181,15 +2370,18 @@ impl PgStore {
         request: &TaskReservationRequest<'_>,
     ) -> Result<TaskReservation, StoreError> {
         validate_task_identity_binding(request)?;
+        validate_task_version_pins(request)?;
         let task_uid = Uuid::new_v4();
         let inserted = sqlx::query(
             "INSERT INTO task_submissions \
              (task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, \
               owner, owner_user_id, identity_binding_state, workflow, \
+              workflow_name, workflow_version, workflow_digest, \
+              user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
               coding_agent_runtime, runtime_namespace, runtime_name, runtime_ownership, phase, \
               runtime_spec, agent_command, envelope_revision) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, $12, \
-                     'submitted', $13, $14, $15) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, $12, $13, $14, \
+                     $15, $16, $17, $18, 'submitted', $19, $20, $21) \
              ON CONFLICT DO NOTHING",
         )
         .bind(task_uid)
@@ -2200,6 +2392,12 @@ impl PgStore {
         .bind(request.owner)
         .bind(request.owner_user_id)
         .bind(request.workflow)
+        .bind(request.workflow_name)
+        .bind(request.workflow_version)
+        .bind(request.workflow_digest)
+        .bind(request.user_envelope_instance_id)
+        .bind(request.user_envelope_revision)
+        .bind(request.user_envelope_digest)
         .bind(request.coding_agent_runtime)
         .bind(request.runtime_namespace)
         .bind(request.runtime_name)
@@ -2230,6 +2428,12 @@ impl PgStore {
             || record.owner != request.owner
             || record.owner_user_id.as_deref() != Some(request.owner_user_id)
             || record.workflow != request.workflow
+            || record.workflow_name.as_deref() != request.workflow_name
+            || record.workflow_version != request.workflow_version
+            || record.workflow_digest.as_deref() != request.workflow_digest
+            || record.user_envelope_instance_id.as_deref() != request.user_envelope_instance_id
+            || record.user_envelope_revision != request.user_envelope_revision
+            || record.user_envelope_digest.as_deref() != request.user_envelope_digest
             || record.coding_agent_runtime != request.coding_agent_runtime
             || record.runtime_namespace != request.runtime_namespace
             || record.runtime_name != request.runtime_name
@@ -2563,6 +2767,12 @@ pub struct TaskReservationRequest<'a> {
     pub owner: &'a str,
     pub owner_user_id: &'a str,
     pub workflow: &'a str,
+    pub workflow_name: Option<&'a str>,
+    pub workflow_version: Option<i64>,
+    pub workflow_digest: Option<&'a str>,
+    pub user_envelope_instance_id: Option<&'a str>,
+    pub user_envelope_revision: Option<i64>,
+    pub user_envelope_digest: Option<&'a str>,
     pub coding_agent_runtime: &'a str,
     pub runtime_namespace: &'a str,
     pub runtime_name: &'a str,
@@ -2600,6 +2810,12 @@ pub struct AgentRunRecord {
     pub owner: String,
     pub owner_user_id: Option<String>,
     pub workflow: String,
+    pub workflow_name: Option<String>,
+    pub workflow_version: Option<i64>,
+    pub workflow_digest: Option<String>,
+    pub user_envelope_instance_id: Option<String>,
+    pub user_envelope_revision: Option<i64>,
+    pub user_envelope_digest: Option<String>,
     pub coding_agent_runtime: String,
     pub runtime_uid: Option<String>,
     pub runtime_ownership: steward_types::RuntimeOwnership,
@@ -2699,6 +2915,16 @@ pub struct EnvelopeRequestReservation {
     pub record: EnvelopeRequestRecord,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingEnvelopeRequest {
+    pub request_id: Uuid,
+    pub owner_display_email: String,
+    pub template_id: String,
+    pub template_revision: i64,
+    pub requested_envelope: Envelope,
+    pub created_at: String,
+}
+
 pub struct EnvelopeRequestStatusUpdate<'a> {
     pub from: EnvelopeRequestStatus,
     pub to: EnvelopeRequestStatus,
@@ -2735,6 +2961,37 @@ fn validate_task_identity_binding(request: &TaskReservationRequest<'_>) -> Resul
     Ok(())
 }
 
+fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<(), StoreError> {
+    let workflow_pins = [
+        request.workflow_name.is_some(),
+        request.workflow_version.is_some(),
+        request.workflow_digest.is_some(),
+    ];
+    let envelope_pins = [
+        request.user_envelope_instance_id.is_some(),
+        request.user_envelope_revision.is_some(),
+        request.user_envelope_digest.is_some(),
+    ];
+    let complete = |pins: [bool; 3]| {
+        pins.iter().all(|present| *present) || pins.iter().all(|present| !*present)
+    };
+    if !complete(workflow_pins)
+        || !complete(envelope_pins)
+        || workflow_pins[0] != envelope_pins[0]
+        || request.workflow_version.is_some_and(|version| version <= 0)
+        || request
+            .user_envelope_revision
+            .is_some_and(|revision| revision <= 0)
+        || request.workflow_name.is_some_and(str::is_empty)
+        || request.workflow_digest.is_some_and(str::is_empty)
+        || request.user_envelope_instance_id.is_some_and(str::is_empty)
+        || request.user_envelope_digest.is_some_and(str::is_empty)
+    {
+        return Err(StoreError::InvalidTaskIdentityBinding);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TaskReservation {
     pub inserted: bool,
@@ -2752,6 +3009,12 @@ pub struct TaskRecord {
     pub owner_user_id: Option<String>,
     pub identity_binding_state: String,
     pub workflow: String,
+    pub workflow_name: Option<String>,
+    pub workflow_version: Option<i64>,
+    pub workflow_digest: Option<String>,
+    pub user_envelope_instance_id: Option<String>,
+    pub user_envelope_revision: Option<i64>,
+    pub user_envelope_digest: Option<String>,
     pub coding_agent_runtime: String,
     pub runtime_uid: Option<String>,
     pub runtime_namespace: String,
@@ -2923,6 +3186,9 @@ pub enum StoreError {
     EnvelopeRequestIdempotencyConflict,
     InvalidEnvelopeRequest,
     InvalidEnvelopeRequestTransition,
+    WorkflowNotFound,
+    WorkflowAlreadyExists,
+    InvalidWorkflow,
 }
 
 impl fmt::Display for StoreError {
@@ -2967,6 +3233,9 @@ impl fmt::Display for StoreError {
             Self::InvalidBrowserRbacRecord => {
                 write!(formatter, "browser RBAC record is invalid")
             }
+            Self::WorkflowNotFound => write!(formatter, "Workflow revision does not exist"),
+            Self::WorkflowAlreadyExists => write!(formatter, "Workflow already exists"),
+            Self::InvalidWorkflow => write!(formatter, "Workflow publication is invalid"),
             Self::ApprovalNotFound => write!(formatter, "approval does not exist"),
             Self::ApprovalNotPending => write!(formatter, "approval is not pending"),
             Self::MissingDecisionReference => {
@@ -3109,6 +3378,18 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
             .try_get("identity_binding_state")
             .map_err(database_error)?,
         workflow: row.try_get("workflow").map_err(database_error)?,
+        workflow_name: row.try_get("workflow_name").map_err(database_error)?,
+        workflow_version: row.try_get("workflow_version").map_err(database_error)?,
+        workflow_digest: row.try_get("workflow_digest").map_err(database_error)?,
+        user_envelope_instance_id: row
+            .try_get("user_envelope_instance_id")
+            .map_err(database_error)?,
+        user_envelope_revision: row
+            .try_get("user_envelope_revision")
+            .map_err(database_error)?,
+        user_envelope_digest: row
+            .try_get("user_envelope_digest")
+            .map_err(database_error)?,
         coding_agent_runtime: row
             .try_get("coding_agent_runtime")
             .map_err(database_error)?,
@@ -3135,7 +3416,9 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
 }
 
 const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, tasks.acting_user, tasks.owner, tasks.owner_user_id, \
-            tasks.workflow, tasks.coding_agent_runtime, tasks.runtime_uid, \
+            tasks.workflow, tasks.workflow_name, tasks.workflow_version, tasks.workflow_digest, \
+            tasks.user_envelope_instance_id, tasks.user_envelope_revision, tasks.user_envelope_digest, \
+            tasks.coding_agent_runtime, tasks.runtime_uid, \
             tasks.runtime_ownership, tasks.phase, tasks.runtime_spec, \
             tasks.envelope_revision, tasks.finalize_requested, tasks.finalized, \
             tasks.failure_reason, \
@@ -3200,6 +3483,18 @@ fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreE
         owner: row.try_get("owner").map_err(database_error)?,
         owner_user_id: row.try_get("owner_user_id").map_err(database_error)?,
         workflow: row.try_get("workflow").map_err(database_error)?,
+        workflow_name: row.try_get("workflow_name").map_err(database_error)?,
+        workflow_version: row.try_get("workflow_version").map_err(database_error)?,
+        workflow_digest: row.try_get("workflow_digest").map_err(database_error)?,
+        user_envelope_instance_id: row
+            .try_get("user_envelope_instance_id")
+            .map_err(database_error)?,
+        user_envelope_revision: row
+            .try_get("user_envelope_revision")
+            .map_err(database_error)?,
+        user_envelope_digest: row
+            .try_get("user_envelope_digest")
+            .map_err(database_error)?,
         coding_agent_runtime: row
             .try_get("coding_agent_runtime")
             .map_err(database_error)?,
@@ -3247,6 +3542,30 @@ fn agent_run_timeline_event(
         kind,
         provenance,
         at: row.try_get("at").map_err(database_error)?,
+    })
+}
+
+fn valid_workflow_publication(publication: &WorkflowPublication<'_>) -> bool {
+    !publication.name.is_empty()
+        && !publication.display_name.trim().is_empty()
+        && !publication.agent.is_empty()
+        && !publication.prompt.trim().is_empty()
+        && !publication.content_digest.is_empty()
+        && !publication.published_by.trim().is_empty()
+}
+
+fn workflow_revision_record(
+    row: sqlx::postgres::PgRow,
+) -> Result<WorkflowRevisionRecord, StoreError> {
+    Ok(WorkflowRevisionRecord {
+        name: row.try_get("name").map_err(database_error)?,
+        version: row.try_get("version").map_err(database_error)?,
+        display_name: row.try_get("display_name").map_err(database_error)?,
+        agent: row.try_get("agent").map_err(database_error)?,
+        prompt: row.try_get("prompt").map_err(database_error)?,
+        content_digest: row.try_get("content_digest").map_err(database_error)?,
+        published_by: row.try_get("published_by").map_err(database_error)?,
+        published_at: row.try_get("published_at").map_err(database_error)?,
     })
 }
 
@@ -3423,6 +3742,7 @@ async fn lock_envelope_scope(
 fn grant_dimension(delta: &AdmissionDelta) -> &'static str {
     match delta {
         AdmissionDelta::Budget { .. } => "budget",
+        AdmissionDelta::SingleRunBudget { .. } => "budget-single-run",
         AdmissionDelta::Ttl { .. } => "ttl",
         AdmissionDelta::Models { .. } => "models",
         AdmissionDelta::Tools { .. } => "tools",

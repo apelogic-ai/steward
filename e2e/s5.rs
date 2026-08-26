@@ -474,6 +474,7 @@ async fn e2e_s5_terminated_runtime_holds_nothing() -> Result<(), Box<dyn Error>>
                     }],
                     budget: Budget {
                         monthly_limit: "100.00".to_owned(),
+                        single_run_limit: None,
                         currency: "USD".to_owned(),
                     },
                     ttl: RuntimeDuration("1h".to_owned()),
@@ -597,6 +598,7 @@ async fn e2e_poc_golden_journey() -> Result<(), Box<dyn Error>> {
                     }],
                     budget: Budget {
                         monthly_limit: "10.00".to_owned(),
+                        single_run_limit: None,
                         currency: "USD".to_owned(),
                     },
                     ttl: RuntimeDuration("1h".to_owned()),

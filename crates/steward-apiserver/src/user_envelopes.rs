@@ -12,8 +12,12 @@ use serde::{Deserialize, Serialize};
 use steward_admission::{AdmissionDecision, Envelope, evaluate, validate_envelope};
 use steward_store::{
     EnvelopeRequestRecord, EnvelopeRequestReservationRequest, PgStore, StoreError,
+    WorkflowRevisionRecord,
 };
-use steward_types::{AgentRuntimeSpec, AgentType, CanonicalUserId, Email, Principal};
+use steward_types::{
+    AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email, ModelRef, Principal,
+    RunnerRequirements, ToolGrant,
+};
 use uuid::Uuid;
 
 use crate::browser_auth::{
@@ -21,9 +25,8 @@ use crate::browser_auth::{
     protect_browser_routes,
 };
 use crate::{
-    BoxFuture, GITHUB_ACTIONS_RENDER_REQUEST_SCHEMA, GITHUB_FILE_READ_TEMPLATE,
-    GithubActionsEnvelopeSelection, GithubActionsRenderContext, GithubActionsRenderRequest,
-    GithubActionsTaskTemplate, render_github_actions_workflow, reviewed_steward_run_release_v1,
+    BoxFuture, GithubActionsEnvelopeSelection, VersionedGithubActionsWorkflowContext,
+    render_versioned_github_actions_workflow, reviewed_steward_run_release_v2,
 };
 
 pub const ENVELOPE_REQUESTS_API_VERSION: &str = "steward.envelope-requests/v1";
@@ -44,7 +47,7 @@ pub struct UserEnvelopeSession<B> {
 }
 
 #[derive(Clone, Copy)]
-struct UserEnvelopeMutationProof;
+pub(crate) struct UserEnvelopeMutationProof;
 
 fn subject_from_browser_session(context: &BrowserSessionContext) -> UserEnvelopeSubject {
     UserEnvelopeSubject {
@@ -54,7 +57,7 @@ fn subject_from_browser_session(context: &BrowserSessionContext) -> UserEnvelope
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionReadiness {
     Connected,
@@ -62,18 +65,20 @@ pub enum ConnectionReadiness {
     Missing,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AvailableEnvelopeTemplate {
     pub id: String,
     pub display_name: String,
     pub revision: i64,
+    #[schema(value_type = BrowserEnvelope)]
     pub ceiling: Envelope,
+    #[schema(value_type = Option<BrowserEnvelope>)]
     pub auto_provision_threshold: Option<Envelope>,
     pub github_connection: ConnectionReadiness,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvelopeRequestStatus {
     Pending,
@@ -84,15 +89,19 @@ pub enum EnvelopeRequestStatus {
     Conflict,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UserEnvelopeRequest {
+    #[schema(value_type = String, format = "uuid")]
     pub id: Uuid,
     pub template_id: String,
     pub template_revision: i64,
+    #[schema(value_type = BrowserEnvelope)]
     pub requested_envelope: Envelope,
+    #[schema(value_type = Option<BrowserEnvelope>)]
     pub approved_envelope: Option<Envelope>,
     pub status: EnvelopeRequestStatus,
+    #[schema(value_type = Option<String>, format = "uuid")]
     pub approval_id: Option<Uuid>,
     pub envelope_instance_id: Option<String>,
     pub envelope_digest: Option<String>,
@@ -101,21 +110,122 @@ pub struct UserEnvelopeRequest {
     pub status_at: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CreateEnvelopeRequestBody {
+pub struct BrowserEnvelope {
+    pub revision: i64,
+    pub spec: BrowserEnvelopeSpec,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserEnvelopeSpec {
+    pub llms: Vec<ModelRef>,
+    pub tools: Vec<ToolGrant>,
+    pub budget: Budget,
+    pub ttl: Duration,
+    #[serde(default)]
+    pub runner: RunnerRequirements,
+}
+
+impl From<Envelope> for BrowserEnvelope {
+    fn from(envelope: Envelope) -> Self {
+        Self {
+            revision: envelope.revision,
+            spec: BrowserEnvelopeSpec {
+                llms: envelope.spec.llms,
+                tools: envelope.spec.tools,
+                budget: envelope.spec.budget,
+                ttl: envelope.spec.ttl,
+                runner: envelope.spec.runner,
+            },
+        }
+    }
+}
+
+impl From<BrowserEnvelope> for Envelope {
+    fn from(envelope: BrowserEnvelope) -> Self {
+        Self {
+            revision: envelope.revision,
+            spec: steward_admission::EnvelopeSpec {
+                llms: envelope.spec.llms,
+                tools: envelope.spec.tools,
+                budget: envelope.spec.budget,
+                ttl: envelope.spec.ttl,
+                runner: envelope.spec.runner,
+            },
+        }
+    }
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EnvelopeTemplatesResponse {
+    api_version: &'static str,
+    templates: Vec<AvailableEnvelopeTemplate>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EnvelopeRequestsResponse {
+    api_version: &'static str,
+    requests: Vec<UserEnvelopeRequest>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EnvelopeRequestResponse {
+    api_version: &'static str,
+    request: UserEnvelopeRequest,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GithubActionsWorkflowResponse {
+    api_version: &'static str,
+    workflow: crate::GeneratedGithubActionsWorkflow,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CreateEnvelopeRequestBody {
     template_id: String,
     template_revision: i64,
-    requested_envelope: Envelope,
+    requested_envelope: BrowserEnvelope,
     idempotency_key: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RenderGithubActionsWorkflowBody {
-    repository: String,
-    revision: String,
-    path: String,
+pub(crate) struct RenderGithubActionsWorkflowBody {
+    workflow: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublishedWorkflowOption {
+    name: String,
+    version: i64,
+    display_name: String,
+    agent: String,
+}
+
+impl From<WorkflowRevisionRecord> for PublishedWorkflowOption {
+    fn from(record: WorkflowRevisionRecord) -> Self {
+        Self {
+            name: record.name,
+            version: record.version,
+            display_name: record.display_name,
+            agent: record.agent,
+        }
+    }
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublishedWorkflowsResponse {
+    api_version: &'static str,
+    workflows: Vec<PublishedWorkflowOption>,
 }
 
 /// Submission passed only after the HTTP boundary has derived its canonical owner, required an
@@ -226,6 +336,32 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
             Ok(user_envelope_request(reservation.record))
         })
     }
+
+    fn workflows<'a>(
+        &'a self,
+        _session: &'a UserEnvelopeSession<BrowserSessionBinding>,
+    ) -> BoxFuture<'a, Result<Vec<WorkflowRevisionRecord>, EnvelopeRequestBrokerError>> {
+        Box::pin(async move {
+            self.store
+                .list_latest_workflows()
+                .await
+                .map_err(map_store_broker_error)
+        })
+    }
+
+    fn workflow<'a>(
+        &'a self,
+        _session: &'a UserEnvelopeSession<BrowserSessionBinding>,
+        name: &'a str,
+        version: i64,
+    ) -> BoxFuture<'a, Result<Option<WorkflowRevisionRecord>, EnvelopeRequestBrokerError>> {
+        Box::pin(async move {
+            self.store
+                .workflow_revision(name, version)
+                .await
+                .map_err(map_store_broker_error)
+        })
+    }
 }
 
 fn user_envelope_request(record: EnvelopeRequestRecord) -> UserEnvelopeRequest {
@@ -289,10 +425,26 @@ where
         session: &'a UserEnvelopeSession<B>,
         request: ValidatedEnvelopeRequest<'a>,
     ) -> BoxFuture<'a, Result<UserEnvelopeRequest, EnvelopeRequestBrokerError>>;
+
+    fn workflows<'a>(
+        &'a self,
+        _session: &'a UserEnvelopeSession<B>,
+    ) -> BoxFuture<'a, Result<Vec<WorkflowRevisionRecord>, EnvelopeRequestBrokerError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn workflow<'a>(
+        &'a self,
+        _session: &'a UserEnvelopeSession<B>,
+        _name: &'a str,
+        _version: i64,
+    ) -> BoxFuture<'a, Result<Option<WorkflowRevisionRecord>, EnvelopeRequestBrokerError>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 #[derive(Clone)]
-struct UserEnvelopeState<P> {
+pub(crate) struct UserEnvelopeState<P> {
     broker: P,
 }
 
@@ -318,7 +470,40 @@ where
             "/app/api/v1/envelope-requests/{request_id}/github-actions-workflow",
             post(render_github_actions_for_envelope::<P, B>),
         )
+        .route("/app/api/v1/workflows", get(list_workflows::<P, B>))
         .with_state(UserEnvelopeState { broker })
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "listPublishedWorkflows",
+    path = "/app/api/v1/workflows",
+    responses(
+        (status = 200, body = PublishedWorkflowsResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 503, description = "Workflow store is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn list_workflows<P, B>(
+    session: Option<Extension<UserEnvelopeSession<B>>>,
+    State(state): State<UserEnvelopeState<P>>,
+) -> Response
+where
+    P: EnvelopeRequestBroker<B>,
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match state.broker.workflows(&session).await {
+        Ok(workflows) => Json(PublishedWorkflowsResponse {
+            api_version: ENVELOPE_REQUESTS_API_VERSION,
+            workflows: workflows.into_iter().map(Into::into).collect(),
+        })
+        .into_response(),
+        Err(error) => broker_error_response(error),
+    }
 }
 
 /// Mount user envelope APIs behind the common browser-session, same-origin, CSRF and
@@ -344,7 +529,17 @@ async fn adapt_browser_context(mut request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
-async fn list_templates<P, B>(
+#[utoipa::path(
+    get,
+    path = "/app/api/v1/envelope-templates",
+    responses(
+        (status = 200, body = EnvelopeTemplatesResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 503, description = "Envelope templates are unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn list_templates<P, B>(
     session: Option<Extension<UserEnvelopeSession<B>>>,
     State(state): State<UserEnvelopeState<P>>,
 ) -> Response
@@ -356,16 +551,26 @@ where
         return StatusCode::UNAUTHORIZED.into_response();
     };
     match state.broker.templates(&session).await {
-        Ok(templates) => Json(serde_json::json!({
-            "apiVersion": ENVELOPE_REQUESTS_API_VERSION,
-            "templates": templates,
-        }))
+        Ok(templates) => Json(EnvelopeTemplatesResponse {
+            api_version: ENVELOPE_REQUESTS_API_VERSION,
+            templates,
+        })
         .into_response(),
         Err(error) => broker_error_response(error),
     }
 }
 
-async fn list_requests<P, B>(
+#[utoipa::path(
+    get,
+    path = "/app/api/v1/envelope-requests",
+    responses(
+        (status = 200, body = EnvelopeRequestsResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 503, description = "Envelope requests are unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn list_requests<P, B>(
     session: Option<Extension<UserEnvelopeSession<B>>>,
     State(state): State<UserEnvelopeState<P>>,
 ) -> Response
@@ -377,16 +582,28 @@ where
         return StatusCode::UNAUTHORIZED.into_response();
     };
     match state.broker.list(&session).await {
-        Ok(requests) => Json(serde_json::json!({
-            "apiVersion": ENVELOPE_REQUESTS_API_VERSION,
-            "requests": requests,
-        }))
+        Ok(requests) => Json(EnvelopeRequestsResponse {
+            api_version: ENVELOPE_REQUESTS_API_VERSION,
+            requests,
+        })
         .into_response(),
         Err(error) => broker_error_response(error),
     }
 }
 
-async fn get_request<P, B>(
+#[utoipa::path(
+    get,
+    path = "/app/api/v1/envelope-requests/{request_id}",
+    params(("request_id" = String, Path)),
+    responses(
+        (status = 200, body = EnvelopeRequestResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 404, description = "Envelope request was not found"),
+        (status = 503, description = "Envelope request is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn get_request<P, B>(
     session: Option<Extension<UserEnvelopeSession<B>>>,
     State(state): State<UserEnvelopeState<P>>,
     Path(request_id): Path<Uuid>,
@@ -399,10 +616,10 @@ where
         return StatusCode::UNAUTHORIZED.into_response();
     };
     match state.broker.get(&session, request_id).await {
-        Ok(Some(request)) => Json(serde_json::json!({
-            "apiVersion": ENVELOPE_REQUESTS_API_VERSION,
-            "request": request,
-        }))
+        Ok(Some(request)) => Json(EnvelopeRequestResponse {
+            api_version: ENVELOPE_REQUESTS_API_VERSION,
+            request,
+        })
         .into_response(),
         Ok(None) | Err(EnvelopeRequestBrokerError::NotFound) => {
             StatusCode::NOT_FOUND.into_response()
@@ -411,7 +628,23 @@ where
     }
 }
 
-async fn create_request<P, B>(
+#[utoipa::path(
+    post,
+    path = "/app/api/v1/envelope-requests",
+    request_body = CreateEnvelopeRequestBody,
+    params(("X-Steward-CSRF" = String, Header)),
+    responses(
+        (status = 201, body = EnvelopeRequestResponse),
+        (status = 400, description = "Request is malformed"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 409, description = "Template revision or connection state conflicts"),
+        (status = 422, description = "Requested envelope exceeds its ceiling"),
+        (status = 503, description = "Envelope requests are unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn create_request<P, B>(
     session: Option<Extension<UserEnvelopeSession<B>>>,
     proof: Option<Extension<UserEnvelopeMutationProof>>,
     State(state): State<UserEnvelopeState<P>>,
@@ -430,6 +663,7 @@ where
     if body.idempotency_key.is_empty() || body.idempotency_key.len() > 200 {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let requested_envelope: Envelope = body.requested_envelope.into();
     let templates = match state.broker.templates(&session).await {
         Ok(templates) => templates,
         Err(error) => return broker_error_response(error),
@@ -450,12 +684,12 @@ where
         )
             .into_response();
     }
-    if body.requested_envelope.revision != template.revision
-        || validate_envelope(&body.requested_envelope).is_err()
+    if requested_envelope.revision != template.revision
+        || validate_envelope(&requested_envelope).is_err()
     {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    let request_spec = envelope_as_user_runtime(&body.requested_envelope, &session.subject);
+    let request_spec = envelope_as_user_runtime(&requested_envelope, &session.subject);
     let inside_ceiling = matches!(
         evaluate(&request_spec, &template.ceiling),
         Ok(AdmissionDecision::Admit)
@@ -478,7 +712,7 @@ where
             &session,
             ValidatedEnvelopeRequest {
                 template,
-                requested_envelope: &body.requested_envelope,
+                requested_envelope: &requested_envelope,
                 idempotency_key: &body.idempotency_key,
                 auto_provision,
             },
@@ -487,17 +721,36 @@ where
     {
         Ok(request) => (
             StatusCode::CREATED,
-            Json(serde_json::json!({
-                "apiVersion": ENVELOPE_REQUESTS_API_VERSION,
-                "request": request,
-            })),
+            Json(EnvelopeRequestResponse {
+                api_version: ENVELOPE_REQUESTS_API_VERSION,
+                request,
+            }),
         )
             .into_response(),
         Err(error) => broker_error_response(error),
     }
 }
 
-async fn render_github_actions_for_envelope<P, B>(
+#[utoipa::path(
+    post,
+    path = "/app/api/v1/envelope-requests/{request_id}/github-actions-workflow",
+    params(
+        ("request_id" = String, Path),
+        ("X-Steward-CSRF" = String, Header)
+    ),
+    request_body = RenderGithubActionsWorkflowBody,
+    responses(
+        (status = 200, body = GithubActionsWorkflowResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Envelope request was not found"),
+        (status = 409, description = "Envelope request is not provisioned"),
+        (status = 422, description = "Workflow inputs are invalid"),
+        (status = 503, description = "Envelope request is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn render_github_actions_for_envelope<P, B>(
     session: Option<Extension<UserEnvelopeSession<B>>>,
     proof: Option<Extension<UserEnvelopeMutationProof>>,
     State(state): State<UserEnvelopeState<P>>,
@@ -521,56 +774,55 @@ where
         }
         Err(error) => return broker_error_response(error),
     };
-    let Some(context) = github_actions_context(&request) else {
+    let Some(envelope) = github_actions_envelope(&request) else {
         return StatusCode::CONFLICT.into_response();
     };
-    let render_request = GithubActionsRenderRequest {
-        schema_version: GITHUB_ACTIONS_RENDER_REQUEST_SCHEMA.to_owned(),
-        envelope: context.current_envelope.clone(),
-        release: context.reviewed_release.clone(),
-        task_template: GithubActionsTaskTemplate {
-            id: GITHUB_FILE_READ_TEMPLATE.to_owned(),
-            repository: body.repository,
-            revision: body.revision,
-            path: body.path,
-        },
+    let reference = match crate::WorkflowReference::parse(&body.workflow) {
+        Ok(reference) => reference,
+        Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
     };
-    match render_github_actions_workflow(&render_request, &context) {
-        Ok(workflow) => Json(serde_json::json!({
-            "apiVersion": ENVELOPE_REQUESTS_API_VERSION,
-            "workflow": workflow,
-        }))
+    let workflow = match state
+        .broker
+        .workflow(&session, &reference.name, reference.version)
+        .await
+    {
+        Ok(Some(workflow)) => workflow,
+        Ok(None) | Err(EnvelopeRequestBrokerError::NotFound) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(error) => return broker_error_response(error),
+    };
+    let context = VersionedGithubActionsWorkflowContext {
+        envelope,
+        workflow_name: workflow.name,
+        workflow_version: workflow.version,
+        workflow_digest: workflow.content_digest,
+        reviewed_release: reviewed_steward_run_release_v2(),
+    };
+    match render_versioned_github_actions_workflow(&body.workflow, &context) {
+        Ok(workflow) => Json(GithubActionsWorkflowResponse {
+            api_version: ENVELOPE_REQUESTS_API_VERSION,
+            workflow,
+        })
         .into_response(),
         Err(_) => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
     }
 }
 
-fn github_actions_context(request: &UserEnvelopeRequest) -> Option<GithubActionsRenderContext> {
+fn github_actions_envelope(
+    request: &UserEnvelopeRequest,
+) -> Option<GithubActionsEnvelopeSelection> {
     if request.status != EnvelopeRequestStatus::Provisioned {
         return None;
     }
     let approved_envelope = request.approved_envelope.as_ref()?;
     let envelope_id = request.envelope_instance_id.as_ref()?;
     let envelope_digest = request.envelope_digest.as_ref()?;
-    let revision = u64::try_from(request.template_revision).ok()?;
-    let has_github_file_read_authority = approved_envelope.spec.tools.iter().any(|tool| {
-        tool.provider == "github"
-            && tool.resource == "repository"
-            && tool.action == "get_file_contents"
-    });
-    let allowed_task_templates = if has_github_file_read_authority {
-        vec![GITHUB_FILE_READ_TEMPLATE.to_owned()]
-    } else {
-        Vec::new()
-    };
-    Some(GithubActionsRenderContext {
-        current_envelope: GithubActionsEnvelopeSelection {
-            id: envelope_id.clone(),
-            revision,
-            digest: envelope_digest.clone(),
-        },
-        reviewed_release: reviewed_steward_run_release_v1(),
-        allowed_task_templates,
+    let revision = u64::try_from(approved_envelope.revision).ok()?;
+    Some(GithubActionsEnvelopeSelection {
+        id: envelope_id.clone(),
+        revision,
+        digest: envelope_digest.clone(),
     })
 }
 
@@ -621,6 +873,7 @@ mod tests {
     };
     use crate::BoxFuture;
     use steward_admission::{Envelope, EnvelopeSpec};
+    use steward_store::WorkflowRevisionRecord;
     use steward_types::{CanonicalUserId, Email};
     use uuid::Uuid;
 
@@ -714,6 +967,40 @@ mod tests {
                 })
             })
         }
+
+        fn workflows<'a>(
+            &'a self,
+            _session: &'a UserEnvelopeSession<()>,
+        ) -> BoxFuture<'a, Result<Vec<WorkflowRevisionRecord>, EnvelopeRequestBrokerError>>
+        {
+            Box::pin(async { Ok(vec![workflow()]) })
+        }
+
+        fn workflow<'a>(
+            &'a self,
+            _session: &'a UserEnvelopeSession<()>,
+            name: &'a str,
+            version: i64,
+        ) -> BoxFuture<'a, Result<Option<WorkflowRevisionRecord>, EnvelopeRequestBrokerError>>
+        {
+            Box::pin(
+                async move { Ok((name == "repository-review" && version == 1).then(workflow)) },
+            )
+        }
+    }
+
+    fn workflow() -> WorkflowRevisionRecord {
+        WorkflowRevisionRecord {
+            name: "repository-review".to_owned(),
+            version: 1,
+            display_name: "Repository review".to_owned(),
+            agent: "codex@0.117.0".to_owned(),
+            prompt: "Review the repository state.".to_owned(),
+            content_digest:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            published_by: "usr_abcdef0123456789abcdef0123456789".to_owned(),
+            published_at: "2026-08-24T00:00:00.000000Z".to_owned(),
+        }
     }
 
     fn template() -> AvailableEnvelopeTemplate {
@@ -731,6 +1018,7 @@ mod tests {
                 }],
                 budget: Budget {
                     monthly_limit: "100.00".to_owned(),
+                    single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
                 ttl: Duration("72h".to_owned()),
@@ -746,6 +1034,7 @@ mod tests {
                 spec: EnvelopeSpec {
                     budget: Budget {
                         monthly_limit: "50.00".to_owned(),
+                        single_run_limit: None,
                         currency: "USD".to_owned(),
                     },
                     ttl: Duration("24h".to_owned()),
@@ -825,9 +1114,7 @@ mod tests {
                     .extension(UserEnvelopeMutationProof)
                     .body(Body::from(
                         serde_json::json!({
-                            "repository": "example-org/example-repository",
-                            "revision": "0123456789abcdef0123456789abcdef01234567",
-                            "path": "README.md",
+                            "workflow": "repository-review@1",
                         })
                         .to_string(),
                     ))
@@ -849,8 +1136,14 @@ mod tests {
             .as_str()
             .ok_or_else(|| "render response omitted YAML".to_owned())?;
         assert!(yaml.contains("# envelope-id: env_local_test"));
-        assert!(yaml.contains("uses: apelogic-ai/steward-run/.github/workflows/steward-task.yml@"));
+        assert!(yaml.contains("      workflow: repository-review@1"));
+        assert!(yaml.contains(
+            "uses: apelogic-ai/steward-run/.github/workflows/steward-task-self-hosted.yml@328159f3b816b8c93a9e5a8c1790243d2965aff8"
+        ));
         assert!(!yaml.contains("contents: write"));
+        assert!(!yaml.contains("coding-agent-runtime"));
+        assert!(!yaml.contains("TARGET_REVISION"));
+        assert!(!yaml.contains("TARGET_PATH"));
         Ok(())
     }
 

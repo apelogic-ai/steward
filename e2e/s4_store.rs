@@ -68,6 +68,7 @@ fn proposed_spec() -> AgentRuntimeSpec {
         tools: Vec::new(),
         budget: Budget {
             monthly_limit: "220.00".to_owned(),
+            single_run_limit: None,
             currency: "USD".to_owned(),
         },
         ttl: Duration("24h".to_owned()),
@@ -691,6 +692,12 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         owner: "alice@example.com",
         owner_user_id: canonical.user_id.as_str(),
         workflow: "code-review",
+        workflow_name: None,
+        workflow_version: None,
+        workflow_digest: None,
+        user_envelope_instance_id: None,
+        user_envelope_revision: None,
+        user_envelope_digest: None,
         coding_agent_runtime: "agent-v1",
         runtime_namespace: "team-a",
         runtime_name: &runtime_name,
@@ -1002,6 +1009,7 @@ fn envelope(member_limit: &str, revision: i64) -> Envelope {
             tools: spec.tools,
             budget: Budget {
                 monthly_limit: member_limit.to_owned(),
+                single_run_limit: None,
                 currency: spec.budget.currency,
             },
             ttl: spec.ttl,
@@ -1531,6 +1539,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
         tools: Vec::new(),
         budget: Budget {
             monthly_limit: "220.00".to_owned(),
+            single_run_limit: None,
             currency: "USD".to_owned(),
         },
         ttl: Duration("24h".to_owned()),

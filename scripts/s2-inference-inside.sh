@@ -191,7 +191,11 @@ chmod 600 \
 if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   chmod 600 "${encryption_key}"
 fi
-for namespace in steward-system team-a; do
+namespaces=(steward-system team-a)
+if [[ "${SLICE}" == "task" ]]; then
+  namespaces+=(steward-workflows)
+fi
+for namespace in "${namespaces[@]}"; do
   "${KUBECTL[@]}" create namespace "${namespace}" --dry-run=client -o yaml |
     "${KUBECTL[@]}" apply -f -
   "${KUBECTL[@]}" label namespace "${namespace}" \
@@ -299,7 +303,10 @@ if [[ "${SLICE}" == "s5" ]]; then
     "${ROOT}/config/s5/inference-provider-profile.yaml"
   )
 elif [[ "${SLICE}" == "task" ]]; then
-  profile_sources=("${ROOT}/config/s5/tool-provider-profile.yaml")
+  profile_sources=(
+    "${ROOT}/config/s5/tool-provider-profile.yaml"
+    "${ROOT}/config/s5/inference-provider-profile.yaml"
+  )
 else
   profile_sources=("${ROOT}/config/s2/provider-profile.yaml")
 fi
