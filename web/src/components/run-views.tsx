@@ -24,25 +24,37 @@ function dateTime(value: string): string {
   return Number.isNaN(parsed.valueOf()) ? value : parsed.toLocaleString();
 }
 
+function runUpdatedAt(value: BrowserRunView): number {
+  const parsed = new Date(value.updatedAt).valueOf();
+  return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+}
+
+function runtimeLabel(value: string | null | undefined): string {
+  if (!value) return "Not assigned";
+  return value.split("-", 1)[0] || value;
+}
+
 export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; runs: Array<BrowserRunView> }>) {
   if (runs.length === 0) return <EmptyState title="No data" />;
+  const newestRuns = [...runs].sort((left, right) => runUpdatedAt(right) - runUpdatedAt(left));
   return (
-    <ul className="grid gap-4 lg:grid-cols-2">
-      {runs.map((run) => (
-        <li className="rounded-panel border bg-panel p-5 shadow-sm" key={run.taskUid}>
+    <ul className="grid gap-4">
+      {newestRuns.map((run) => (
+        <li className="rounded-panel border bg-panel px-5 py-4 shadow-sm" key={run.taskUid}>
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
               <p className="truncate font-semibold">{run.workflow}</p>
-              <p className="mt-1 break-all font-mono text-xs text-muted-ink">{run.taskUid}</p>
             </div>
             <StatusBadge value={run.phase} />
           </div>
-          <DefinitionList items={[
-            ["Runtime", run.runtimeUid ?? "Not assigned"],
-            ["Updated", dateTime(run.updatedAt)],
-            ["Spend", run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "Not reported"],
-          ]} />
-          <Link className="mt-5 inline-flex min-h-11 items-center text-sm font-semibold text-brand hover:text-brand-strong" href={`${admin ? "/admin/runs" : "/runs"}/${run.taskUid}`}>View run →</Link>
+          <div className="mt-4">
+            <DefinitionList items={[
+              ["Runtime", runtimeLabel(run.runtimeUid)],
+              ["Updated", dateTime(run.updatedAt)],
+              ["Spend", run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "Not reported"],
+            ]} />
+          </div>
+          <Link className="inline-flex min-h-11 items-center text-sm font-semibold text-brand hover:text-brand-strong" href={`${admin ? "/admin/runs" : "/runs"}/${run.taskUid}`}>View run →</Link>
         </li>
       ))}
     </ul>

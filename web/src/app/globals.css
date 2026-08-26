@@ -21,9 +21,12 @@
   --steward-panel: #ffffff;
   --steward-line: #e5e5e5;
   --steward-notice: #fff4e9;
-  --steward-provisioned-background: #eaf3ff;
-  --steward-provisioned-border: #9dc5f3;
-  --steward-provisioned-ink: #1557a0;
+  --steward-success-background: #ecfdf3;
+  --steward-success-border: #86d3a2;
+  --steward-success-ink: #166534;
+  --steward-error-background: #fef2f2;
+  --steward-error-border: #fca5a5;
+  --steward-error-ink: #991b1b;
   color-scheme: light;
   background: var(--color-canvas);
 }
@@ -36,9 +39,12 @@
     --steward-panel: #171717;
     --steward-line: #2e2e2e;
     --steward-notice: #332416;
-    --steward-provisioned-background: #132a44;
-    --steward-provisioned-border: #2e659e;
-    --steward-provisioned-ink: #8fc5ff;
+    --steward-success-background: #123524;
+    --steward-success-border: #2f8055;
+    --steward-success-ink: #86efac;
+    --steward-error-background: #3b1717;
+    --steward-error-border: #9f3d3d;
+    --steward-error-ink: #fca5a5;
     color-scheme: dark;
   }
 }
@@ -50,9 +56,12 @@
   --steward-panel: #ffffff;
   --steward-line: #e5e5e5;
   --steward-notice: #fff4e9;
-  --steward-provisioned-background: #eaf3ff;
-  --steward-provisioned-border: #9dc5f3;
-  --steward-provisioned-ink: #1557a0;
+  --steward-success-background: #ecfdf3;
+  --steward-success-border: #86d3a2;
+  --steward-success-ink: #166534;
+  --steward-error-background: #fef2f2;
+  --steward-error-border: #fca5a5;
+  --steward-error-ink: #991b1b;
   color-scheme: light;
 }
 
@@ -63,9 +72,12 @@
   --steward-panel: #171717;
   --steward-line: #2e2e2e;
   --steward-notice: #332416;
-  --steward-provisioned-background: #132a44;
-  --steward-provisioned-border: #2e659e;
-  --steward-provisioned-ink: #8fc5ff;
+  --steward-success-background: #123524;
+  --steward-success-border: #2f8055;
+  --steward-success-ink: #86efac;
+  --steward-error-background: #3b1717;
+  --steward-error-border: #9f3d3d;
+  --steward-error-ink: #fca5a5;
   color-scheme: dark;
 }
 
@@ -124,10 +136,16 @@ body {
   max-block-size: 2.75rem;
 }
 
-.status-badge-provisioned {
-  border-color: var(--steward-provisioned-border);
-  background: var(--steward-provisioned-background);
-  color: var(--steward-provisioned-ink);
+.status-badge-success {
+  border-color: var(--steward-success-border);
+  background: var(--steward-success-background);
+  color: var(--steward-success-ink);
+}
+
+.status-badge-error {
+  border-color: var(--steward-error-border);
+  background: var(--steward-error-background);
+  color: var(--steward-error-ink);
 }
 
 input,

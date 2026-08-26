@@ -24,9 +24,13 @@ export function PrimaryLink({ children, href }: Readonly<{ children: ReactNode; 
 }
 
 export function StatusBadge({ value }: Readonly<{ value: string }>) {
-  const provisioned = value.toLowerCase() === "provisioned";
+  const badgeClass = {
+    failed: "status-badge-error",
+    provisioned: "status-badge-success",
+    succeeded: "status-badge-success",
+  }[value.toLowerCase()] ?? "bg-canvas text-muted-ink";
   return (
-    <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold capitalize ${provisioned ? "status-badge-provisioned" : "bg-canvas text-muted-ink"}`}>
+    <span className={`inline-flex w-fit shrink-0 self-start rounded-full border px-2.5 py-1 text-xs font-semibold capitalize ${badgeClass}`}>
       {value.replaceAll("_", " ")}
     </span>
   );
@@ -62,7 +66,7 @@ export function DefinitionList({ items }: Readonly<{ items: ReadonlyArray<readon
     <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
       {items.map(([term, value]) => (
         <div className="min-w-0" key={term}>
-          <dt className="text-xs font-semibold uppercase tracking-wide text-muted-ink">{term}</dt>
+          <dt className="text-xs font-semibold text-muted-ink">{term}</dt>
           <dd className="mt-1 break-words text-sm">{value ?? "Not reported"}</dd>
         </div>
       ))}

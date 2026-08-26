@@ -738,10 +738,10 @@ test("the account menu identifies the user and exposes only server-authorized wo
     await expect(workspace.locator("option")).toHaveText(["User", "Admin"]);
     await expect(workspace.locator("xpath=..")).toHaveCSS("border-top-style", "solid");
     await workspace.selectOption("admin");
-    await expect(dualRole.page).toHaveURL(`${origin}/admin/runs`);
+    await expect(dualRole.page).toHaveURL(`${origin}/admin/envelopes/templates`);
     await dualRole.page.getByRole("button", { name: "Account menu" }).click();
     await expect(dualRole.page.getByRole("menu", { name: "Account" }).getByLabel("Workspace view")).toHaveValue("admin");
-    await expect(dualRole.page.getByRole("link", { name: "Runs", exact: true })).toHaveAttribute("aria-current", "page");
+    await expect(dualRole.page.getByRole("link", { name: "Templates", exact: true })).toHaveAttribute("aria-current", "page");
     await dualRole.page.getByRole("button", { name: "Account menu" }).click();
     await dualRole.page.goBack();
     await expect(dualRole.page).toHaveURL(`${origin}/envelopes`);
@@ -749,7 +749,7 @@ test("the account menu identifies the user and exposes only server-authorized wo
     await expect(dualRole.page.getByRole("menu", { name: "Account" }).getByLabel("Workspace view")).toHaveValue("user");
     await dualRole.page.getByRole("button", { name: "Account menu" }).click();
     await dualRole.page.goForward();
-    await expect(dualRole.page).toHaveURL(`${origin}/admin/runs`);
+    await expect(dualRole.page).toHaveURL(`${origin}/admin/envelopes/templates`);
   } finally {
     await closeGuardedPage(dualRole);
   }
@@ -882,9 +882,9 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
     const provisioned = developer.page.getByText("provisioned", { exact: true });
-    await expect(provisioned).toHaveCSS("background-color", "rgb(19, 42, 68)");
-    await expect(provisioned).toHaveCSS("border-color", "rgb(46, 101, 158)");
-    await expect(provisioned).toHaveCSS("color", "rgb(143, 197, 255)");
+    await expect(provisioned).toHaveCSS("background-color", "rgb(18, 53, 36)");
+    await expect(provisioned).toHaveCSS("border-color", "rgb(47, 128, 85)");
+    await expect(provisioned).toHaveCSS("color", "rgb(134, 239, 172)");
     const envelopeMutation = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/envelope-requests");
     expectMutationProof(envelopeMutation);
     expect(envelopeMutation.body.requestedEnvelope.spec.budget.singleRunLimit).toBe("5.00");
