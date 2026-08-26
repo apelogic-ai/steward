@@ -38,10 +38,10 @@ pub use github_actions::{
 };
 
 pub use tasks::{
-    KubernetesTaskIdentityResolver, StaticTaskWorkflowCatalog, TaskAdmissionDelta, TaskArchive,
-    TaskAuthenticationError, TaskErrorResponse, TaskIdentity, TaskIdentityResolver,
-    TaskStatusResponse, TaskSubmissionLedger, TaskSubmissionRequest, TaskWorkflow,
-    TaskWorkflowCatalog, task_router,
+    ConfiguredTaskIdentityResolver, KubernetesTaskIdentityResolver, StaticTaskWorkflowCatalog,
+    TaskAdmissionDelta, TaskArchive, TaskAuthenticationError, TaskErrorResponse, TaskIdentity,
+    TaskIdentityResolver, TaskStatusResponse, TaskSubmissionLedger, TaskSubmissionRequest,
+    TaskWorkflow, TaskWorkflowCatalog, task_router,
 };
 pub use workflows::{WorkflowReference, WorkflowReferenceError};
 

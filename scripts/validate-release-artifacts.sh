@@ -10,6 +10,8 @@ stable_bridge_deployment="$(mktemp)"
 stable_bridge_controller_deployment="$(mktemp)"
 browser_auth_rendered="$(mktemp)"
 browser_auth_deployment="$(mktemp)"
+task_identity_rendered="$(mktemp)"
+task_identity_deployment="$(mktemp)"
 browser_hop1_rendered="$(mktemp)"
 browser_hop1_deployment="$(mktemp)"
 browser_hop1_loopback_rendered="$(mktemp)"
@@ -30,7 +32,8 @@ cleanup() {
   rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" \
     "${stable_bridge_configmap}" "${stable_bridge_deployment}" \
     "${stable_bridge_controller_deployment}" "${browser_auth_rendered}" \
-    "${browser_auth_deployment}" "${browser_hop1_rendered}" \
+    "${browser_auth_deployment}" "${task_identity_rendered}" \
+    "${task_identity_deployment}" "${browser_hop1_rendered}" \
     "${browser_hop1_deployment}" "${browser_hop1_loopback_rendered}" \
     "${browser_hop1_loopback_proxy_rendered}" \
     "${web_rendered}" "${web_deployment}" \
@@ -179,9 +182,54 @@ if grep -Fq 'STEWARD_GOOGLE_OIDC_' "${rendered}" \
   || grep -Fq 'steward-google-oidc' "${rendered}" \
   || grep -Fq 'STEWARD_BROWSER_HOP1_' "${rendered}" \
   || grep -Fq 'STEWARD_IDENTITY_BROWSER_HOP1_' "${rendered}" \
-  || grep -Fq 'STEWARD_MCP_GW_ORIGIN' "${rendered}"
+  || grep -Fq 'STEWARD_MCP_GW_ORIGIN' "${rendered}" \
+  || grep -Fq 'STEWARD_IDENTITY_TASK_' "${rendered}"
 then
   echo "disabled browser features must render no browser auth or HOP-1 wiring" >&2
+  exit 1
+fi
+
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set taskIdentity.enabled=true \
+  --set-string taskIdentity.issuer=https://identity.example.test \
+  --set-string taskIdentity.audience=steward-task-api \
+  --set-string taskIdentity.publicJwksConfigMap.name=identity-task-jwks \
+  --set-string taskIdentity.publicJwksConfigMap.key=jwks.json > "${task_identity_rendered}"
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-apiserver/ { print; exit }
+' "${task_identity_rendered}" > "${task_identity_deployment}"
+for required in \
+  '            - { name: STEWARD_IDENTITY_TASK_ISSUER, value: "https://identity.example.test" }' \
+  '            - { name: STEWARD_IDENTITY_TASK_AUDIENCE, value: "steward-task-api" }' \
+  '            - { name: STEWARD_IDENTITY_TASK_JWKS_FILE, value: /run/identity-task/jwks.json }' \
+  '            - { name: identity-task, mountPath: /run/identity-task, readOnly: true }' \
+  '        - name: identity-task' \
+  '            name: identity-task-jwks' \
+  '            items: [{ key: jwks.json, path: jwks.json }]'
+do
+  grep -Fxq "${required}" "${task_identity_deployment}"
+done
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set taskIdentity.enabled=true >/dev/null 2>&1
+then
+  echo "enabled Identity task authentication without every immutable input must fail chart validation" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set taskIdentity.enabled=false \
+  --set-string taskIdentity.issuer=https://identity.example.test >/dev/null 2>&1
+then
+  echo "disabled Identity task authentication with stale configuration must fail chart validation" >&2
   exit 1
 fi
 if helm template steward "${root}/charts/steward" \

@@ -1138,7 +1138,7 @@ mod tests {
         assert!(yaml.contains("# envelope-id: env_local_test"));
         assert!(yaml.contains("      workflow: repository-review@1"));
         assert!(yaml.contains(
-            "uses: apelogic-ai/steward-run/.github/workflows/steward-task-self-hosted.yml@be04cf3acf43237327c26a06a36d784eadfdbe7a"
+            "uses: apelogic-ai/steward-run/.github/workflows/steward-task-self-hosted.yml@328159f3b816b8c93a9e5a8c1790243d2965aff8"
         ));
         assert!(!yaml.contains("contents: write"));
         assert!(!yaml.contains("coding-agent-runtime"));

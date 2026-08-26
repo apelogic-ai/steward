@@ -9,6 +9,7 @@
     "browserAuth",
     "browserHop1",
     "workloadExchangeTrust",
+    "taskIdentity",
     "tls",
     "config",
     "runtimeNamespaces",
@@ -272,6 +273,44 @@
         "name": {"$ref": "#/definitions/nonempty"},
         "caCertificate": {"$ref": "#/definitions/nonempty"}
       }
+    },
+    "taskIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "issuer", "audience", "publicJwksConfigMap"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "issuer": {"type": "string"},
+        "audience": {"type": "string"},
+        "publicJwksConfigMap": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "key"],
+          "properties": {"name": {"type": "string"}, "key": {"type": "string"}}
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "enabled": {"const": false},
+            "issuer": {"const": ""},
+            "audience": {"const": ""},
+            "publicJwksConfigMap": {
+              "properties": {"name": {"const": ""}, "key": {"const": ""}}
+            }
+          }
+        },
+        {
+          "properties": {
+            "enabled": {"const": true},
+            "issuer": {"type": "string", "pattern": "^https://[^/?#]+(?:/[^?#]*)?$"},
+            "audience": {"$ref": "#/definitions/nonempty"},
+            "publicJwksConfigMap": {
+              "properties": {"name": {"$ref": "#/definitions/nonempty"}, "key": {"$ref": "#/definitions/nonempty"}}
+            }
+          }
+        }
+      ]
     },
     "tls": {
       "type": "object",

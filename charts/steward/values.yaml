@@ -75,6 +75,16 @@ browserHop1:
 workloadExchangeTrust:
   name: steward-workload-exchange-ca
   caCertificate: ca.crt
+taskIdentity:
+  # Default deployments authenticate task submissions with Kubernetes TokenReview.
+  # Enable this only when an external Identity service issues the exact steward-task-v2
+  # credential and its public JWKS is projected read-only into the apiserver.
+  enabled: false
+  issuer: ""
+  audience: ""
+  publicJwksConfigMap:
+    name: ""
+    key: ""
 tls:
   issuerRef:
     name: cluster-issuer

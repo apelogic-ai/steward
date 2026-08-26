@@ -9,7 +9,7 @@ use axum::serve::Listener;
 use steward_adapter_github_artifact::GitHubArtifactVerifier;
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{
-    KubeRuntimeRepository, KubernetesTaskIdentityResolver, KubernetesTokenAuthenticator,
+    ConfiguredTaskIdentityResolver, KubeRuntimeRepository, KubernetesTokenAuthenticator,
     KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog, agent_runs_ui, browser_admin,
     browser_auth, browser_hop1_attestation, connections, google_oidc, mcp_gw_connections, router,
     router_without_admin_dashboard, stable_runtime_bridge, task_router, user_envelopes, workflows,
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         token_review_audience.clone(),
     );
     let task_identities =
-        KubernetesTaskIdentityResolver::new(client.clone(), token_review_audience, store.clone());
+        configured_task_identity_resolver(client.clone(), token_review_audience, store.clone())?;
     let task_workflows =
         StaticTaskWorkflowCatalog::from_json(&required("STEWARD_TASK_WORKFLOWS_JSON")?)
             .map_err(io::Error::other)?;
@@ -100,6 +100,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn configured_task_identity_resolver(
+    client: kube::Client,
+    kubernetes_audience: KubernetesTokenReviewAudience,
+    store: PgStore,
+) -> Result<ConfiguredTaskIdentityResolver, io::Error> {
+    let values = [
+        env::var("STEWARD_IDENTITY_TASK_ISSUER").ok(),
+        env::var("STEWARD_IDENTITY_TASK_AUDIENCE").ok(),
+        env::var("STEWARD_IDENTITY_TASK_JWKS_FILE").ok(),
+    ];
+    if values.iter().all(Option::is_none) {
+        return Ok(ConfiguredTaskIdentityResolver::kubernetes(
+            client,
+            kubernetes_audience,
+            store,
+        ));
+    }
+    let [issuer, audience, jwks_file] = values;
+    let required = |value: Option<String>| {
+        value
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                io::Error::other("Identity task authentication configuration must be complete")
+            })
+    };
+    ConfiguredTaskIdentityResolver::identity_from_jwks_file(
+        required(issuer)?,
+        required(audience)?,
+        std::path::Path::new(&required(jwks_file)?),
+        store,
+    )
+    .map_err(|_| io::Error::other("Identity task authentication configuration is invalid"))
 }
 
 fn install_rustls_crypto_provider() -> Result<(), io::Error> {

@@ -17,8 +17,11 @@ const REVIEWED_STEWARD_RUN_ACTION_COMMIT: &str = "b26790e29ce9c243c6a7aa00450a2a
 // Versioned Workflow runs are executed by the separately reviewed self-hosted
 // reusable workflow. It preserves GitHub's `job_workflow_ref` OIDC claim while
 // intentionally avoiding the ARC/ECR job container used by the legacy lane.
-const VERSIONED_STEWARD_RUN_WORKFLOW_COMMIT: &str = "be04cf3acf43237327c26a06a36d784eadfdbe7a";
-const VERSIONED_STEWARD_RUN_ACTION_COMMIT: &str = "19230cc59a6b1246224912961e35c7044b0808d3";
+// The local self-hosted handoff is an immutable pair: the reusable workflow
+// invokes this exact Action commit. Keep both refs aligned so the rendered
+// document has auditable, executable provenance.
+const VERSIONED_STEWARD_RUN_WORKFLOW_COMMIT: &str = "328159f3b816b8c93a9e5a8c1790243d2965aff8";
+const VERSIONED_STEWARD_RUN_ACTION_COMMIT: &str = "5a360ce51cf2307b36c3b8ca973b6dd51c7a59a9";
 const REVIEWED_STEWARD_RUN_JOB_CONTAINER: &str = "663383948333.dkr.ecr.us-east-1.amazonaws.com/steward-run@sha256:27235891b596debb1d8bba5f7763e14a56ce4435e2fc82f3de80122b19ff8c61";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -159,7 +162,7 @@ pub fn render_versioned_github_actions_workflow(
         "      output-artifact: steward-workflow-output".to_owned(),
         "      steward-api-url: ${{ vars.STEWARD_API_URL }}".to_owned(),
         "      identity-exchange-url: ${{ vars.IDENTITY_EXCHANGE_URL }}".to_owned(),
-        "      oidc-audience: ${{ vars.IDENTITY_EXCHANGE_AUDIENCE }}".to_owned(),
+        "      identity-exchange-audience: ${{ vars.IDENTITY_EXCHANGE_AUDIENCE }}".to_owned(),
         "      steward-ca-certificate-file: ${{ vars.STEWARD_CA_CERTIFICATE_FILE }}".to_owned(),
         String::new(),
         "  verify:".to_owned(),
@@ -612,8 +615,8 @@ mod tests {
 
     const WORKFLOW_COMMIT: &str = "9c7487bd18d5e90b24b3e4b296bfdd232a3f4f5a";
     const ACTION_COMMIT: &str = "b26790e29ce9c243c6a7aa00450a2a1a98fbd250";
-    const VERSIONED_WORKFLOW_COMMIT: &str = "be04cf3acf43237327c26a06a36d784eadfdbe7a";
-    const VERSIONED_ACTION_COMMIT: &str = "19230cc59a6b1246224912961e35c7044b0808d3";
+    const VERSIONED_WORKFLOW_COMMIT: &str = "328159f3b816b8c93a9e5a8c1790243d2965aff8";
+    const VERSIONED_ACTION_COMMIT: &str = "5a360ce51cf2307b36c3b8ca973b6dd51c7a59a9";
     const JOB_CONTAINER: &str = "663383948333.dkr.ecr.us-east-1.amazonaws.com/steward-run@sha256:27235891b596debb1d8bba5f7763e14a56ce4435e2fc82f3de80122b19ff8c61";
 
     fn envelope() -> GithubActionsEnvelopeSelection {
@@ -648,7 +651,7 @@ mod tests {
         );
         assert!(
             generated.yaml.contains(
-                "uses: apelogic-ai/steward-run/.github/workflows/steward-task-self-hosted.yml@be04cf3acf43237327c26a06a36d784eadfdbe7a"
+                "uses: apelogic-ai/steward-run/.github/workflows/steward-task-self-hosted.yml@328159f3b816b8c93a9e5a8c1790243d2965aff8"
             ),
             "versioned runs must preserve reusable-workflow OIDC provenance without inheriting the ARC ECR container"
         );
@@ -659,9 +662,9 @@ mod tests {
         assert!(!generated.yaml.contains("full commit SHA"));
         assert!(!generated.yaml.contains("src/lib.rs"));
         assert!(
-            generated
-                .yaml
-                .contains("      oidc-audience: ${{ vars.IDENTITY_EXCHANGE_AUDIENCE }}"),
+            generated.yaml.contains(
+                "      identity-exchange-audience: ${{ vars.IDENTITY_EXCHANGE_AUDIENCE }}"
+            ),
             "the reusable workflow must receive the exact local Identity audience"
         );
         assert!(

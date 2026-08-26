@@ -238,6 +238,11 @@ spec:
             - { name: STEWARD_JIRA_ACCOUNT_EMAIL, value: {{ .Values.config.apiserver.jiraAccountEmail | quote }} }
             - { name: STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE, value: {{ .Values.config.apiserver.kubernetesTokenReviewAudience | quote }} }
             - { name: STEWARD_TASK_WORKFLOWS_JSON, value: {{ .Values.config.apiserver.taskWorkflowsJson | quote }} }
+{{- if .Values.taskIdentity.enabled }}
+            - { name: STEWARD_IDENTITY_TASK_ISSUER, value: {{ .Values.taskIdentity.issuer | quote }} }
+            - { name: STEWARD_IDENTITY_TASK_AUDIENCE, value: {{ .Values.taskIdentity.audience | quote }} }
+            - { name: STEWARD_IDENTITY_TASK_JWKS_FILE, value: /run/identity-task/jwks.json }
+{{- end }}
 {{- if .Values.browserAuth.enabled }}
             - { name: STEWARD_GOOGLE_OIDC_CLIENT_ID, value: {{ .Values.browserAuth.google.clientId | quote }} }
             - { name: STEWARD_BROWSER_ORIGIN, value: {{ .Values.browserAuth.google.origin | quote }} }
@@ -268,6 +273,9 @@ spec:
             - { name: STEWARD_TLS_KEY_DER, value: /run/tls/tls.key }
           volumeMounts:
             - { name: tls, mountPath: /run/tls, readOnly: true }
+{{- if .Values.taskIdentity.enabled }}
+            - { name: identity-task, mountPath: /run/identity-task, readOnly: true }
+{{- end }}
 {{- if .Values.browserHop1.enabled }}
             - { name: browser-hop1, mountPath: /run/browser-hop1, readOnly: true }
             - { name: browser-hop1-source-credential, mountPath: /var/run/secrets/steward/browser-hop1, readOnly: true }
@@ -290,6 +298,12 @@ spec:
 {{- end }}
       volumes:
         - { name: tls, secret: { secretName: steward-apiserver-tls } }
+{{- if .Values.taskIdentity.enabled }}
+        - name: identity-task
+          configMap:
+            name: {{ .Values.taskIdentity.publicJwksConfigMap.name }}
+            items: [{ key: {{ .Values.taskIdentity.publicJwksConfigMap.key }}, path: jwks.json }]
+{{- end }}
 {{- if .Values.browserHop1.enabled }}
         - name: browser-hop1
           projected:

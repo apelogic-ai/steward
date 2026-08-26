@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::future::Future;
+use std::path::Path as FilePath;
 use std::pin::Pin;
 
 use axum::body::Bytes;
@@ -9,6 +11,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use jsonwebtoken::jwk::{Jwk, JwkSet, KeyAlgorithm, PublicKeyUse};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 #[cfg(test)]
 use k8s_openapi::api::authentication::v1::TokenReviewStatus;
 use k8s_openapi::api::authentication::v1::{TokenReview, UserInfo};
@@ -42,6 +46,11 @@ const ACTING_USER_GROUP_PREFIX: &str = "agents.apelogic.ai/acting-user:";
 const TASK_OWNER_GROUP_PREFIX: &str = "agents.apelogic.ai/task-owner:";
 const CANONICAL_USER_GROUP_PREFIX: &str = "agents.apelogic.ai/canonical-user:";
 const VERSIONED_WORKFLOW_NAMESPACE: &str = "steward-workflows";
+const IDENTITY_TASK_CONTRACT: &str = "steward-task-v2";
+const MAX_IDENTITY_TASK_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_IDENTITY_JWKS_BYTES: usize = 128 * 1024;
+const MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS: u64 = 300;
+const IDENTITY_CLOCK_SKEW_SECONDS: u64 = 60;
 
 fn versioned_workflow_reference(
     workflow: &str,
@@ -208,6 +217,275 @@ impl TaskIdentityResolver for KubernetesTaskIdentityResolver {
             Ok(identity)
         })
     }
+}
+
+/// Verifies the short-lived, ES256 task credential issued by the deployed Identity service.
+///
+/// This is deliberately a distinct resolver from Kubernetes TokenReview. A GitHub Actions
+/// runner cannot present a Kubernetes service-account token, and an Identity credential must
+/// never be sent to the Kubernetes TokenReview API. Deployments select exactly one resolver.
+#[derive(Clone)]
+pub struct IdentityTaskIdentityResolver {
+    jwks: JwkSet,
+    issuer: String,
+    audience: String,
+    canonical_identities: PgStore,
+}
+
+#[derive(Clone)]
+pub enum ConfiguredTaskIdentityResolver {
+    Kubernetes(KubernetesTaskIdentityResolver),
+    Identity(IdentityTaskIdentityResolver),
+}
+
+impl ConfiguredTaskIdentityResolver {
+    pub fn kubernetes(
+        client: Client,
+        audience: KubernetesTokenReviewAudience,
+        canonical_identities: PgStore,
+    ) -> Self {
+        Self::Kubernetes(KubernetesTaskIdentityResolver::new(
+            client,
+            audience,
+            canonical_identities,
+        ))
+    }
+
+    pub fn identity_from_jwks_file(
+        issuer: String,
+        audience: String,
+        jwks_file: &FilePath,
+        canonical_identities: PgStore,
+    ) -> Result<Self, TaskAuthenticationError> {
+        Ok(Self::Identity(
+            IdentityTaskIdentityResolver::from_jwks_file(
+                issuer,
+                audience,
+                jwks_file,
+                canonical_identities,
+            )?,
+        ))
+    }
+}
+
+impl TaskIdentityResolver for ConfiguredTaskIdentityResolver {
+    fn resolve<'a>(
+        &'a self,
+        assertion: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<TaskIdentity, TaskAuthenticationError>> + Send + 'a>>
+    {
+        match self {
+            Self::Kubernetes(resolver) => resolver.resolve(assertion),
+            Self::Identity(resolver) => resolver.resolve(assertion),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+enum IdentityTaskAudience {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+#[derive(Clone, Deserialize)]
+struct IdentityTaskClaims {
+    iss: String,
+    sub: String,
+    aud: IdentityTaskAudience,
+    exp: u64,
+    iat: u64,
+    nbf: u64,
+    jti: String,
+    email: String,
+    email_verified: bool,
+    groups: Vec<String>,
+    identity_contract: String,
+}
+
+impl IdentityTaskIdentityResolver {
+    pub fn from_jwks_file(
+        issuer: String,
+        audience: String,
+        jwks_file: &FilePath,
+        canonical_identities: PgStore,
+    ) -> Result<Self, TaskAuthenticationError> {
+        if !valid_identity_issuer(&issuer) || !bounded_non_whitespace(&audience, 256) {
+            return Err(TaskAuthenticationError::InvalidCredentials);
+        }
+        let jwks =
+            fs::read_to_string(jwks_file).map_err(|_| TaskAuthenticationError::Unavailable)?;
+        if jwks.len() > MAX_IDENTITY_JWKS_BYTES {
+            return Err(TaskAuthenticationError::InvalidCredentials);
+        }
+        let jwks =
+            serde_json::from_str(&jwks).map_err(|_| TaskAuthenticationError::InvalidCredentials)?;
+        validate_identity_task_jwks(&jwks)?;
+        Ok(Self {
+            jwks,
+            issuer,
+            audience,
+            canonical_identities,
+        })
+    }
+}
+
+impl TaskIdentityResolver for IdentityTaskIdentityResolver {
+    fn resolve<'a>(
+        &'a self,
+        assertion: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<TaskIdentity, TaskAuthenticationError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let claims =
+                verify_identity_task_token(assertion, &self.jwks, &self.issuer, &self.audience)?;
+            let identity = task_identity_from_identity_claims(claims)?;
+            self.canonical_identities
+                .resolve_canonical_principal(&identity.canonical_user_id, &identity.owner)
+                .await
+                .map_err(|error| match error {
+                    StoreError::Database(_) => TaskAuthenticationError::Unavailable,
+                    _ => TaskAuthenticationError::InvalidCredentials,
+                })?;
+            Ok(identity)
+        })
+    }
+}
+
+fn verify_identity_task_token(
+    assertion: &str,
+    jwks: &JwkSet,
+    issuer: &str,
+    audience: &str,
+) -> Result<IdentityTaskClaims, TaskAuthenticationError> {
+    if assertion.is_empty() || assertion.len() > MAX_IDENTITY_TASK_TOKEN_BYTES {
+        return Err(TaskAuthenticationError::InvalidCredentials);
+    }
+    let header =
+        decode_header(assertion).map_err(|_| TaskAuthenticationError::InvalidCredentials)?;
+    if header.alg != Algorithm::ES256
+        || header.jku.is_some()
+        || header.jwk.is_some()
+        || header.x5u.is_some()
+        || header.x5c.is_some()
+        || header.x5t.is_some()
+        || header.x5t_s256.is_some()
+        || header.crit.is_some()
+    {
+        return Err(TaskAuthenticationError::InvalidCredentials);
+    }
+    let kid = header
+        .kid
+        .ok_or(TaskAuthenticationError::InvalidCredentials)?;
+    if !bounded_non_whitespace(&kid, 128) || !kid.is_ascii() {
+        return Err(TaskAuthenticationError::InvalidCredentials);
+    }
+    let key = select_identity_task_key(jwks, &kid)?;
+    let key =
+        DecodingKey::from_jwk(key).map_err(|_| TaskAuthenticationError::InvalidCredentials)?;
+    let mut validation = Validation::new(Algorithm::ES256);
+    validation.required_spec_claims.clear();
+    validation.validate_exp = false;
+    validation.validate_aud = false;
+    validation.validate_nbf = false;
+    let claims = decode::<IdentityTaskClaims>(assertion, &key, &validation)
+        .map_err(|_| TaskAuthenticationError::InvalidCredentials)?
+        .claims;
+    validate_identity_task_claims(&claims, issuer, audience)?;
+    Ok(claims)
+}
+
+fn validate_identity_task_jwks(jwks: &JwkSet) -> Result<(), TaskAuthenticationError> {
+    if jwks.keys.is_empty() || jwks.keys.len() > 16 {
+        return Err(TaskAuthenticationError::InvalidCredentials);
+    }
+    let mut kids = std::collections::HashSet::new();
+    for key in &jwks.keys {
+        let kid = key
+            .common
+            .key_id
+            .as_deref()
+            .ok_or(TaskAuthenticationError::InvalidCredentials)?;
+        if !bounded_non_whitespace(kid, 128) || !kid.is_ascii() || !kids.insert(kid) {
+            return Err(TaskAuthenticationError::InvalidCredentials);
+        }
+        if key.common.key_algorithm != Some(KeyAlgorithm::ES256)
+            || key.common.public_key_use != Some(PublicKeyUse::Signature)
+            || DecodingKey::from_jwk(key).is_err()
+        {
+            return Err(TaskAuthenticationError::InvalidCredentials);
+        }
+    }
+    Ok(())
+}
+
+fn select_identity_task_key<'a>(
+    jwks: &'a JwkSet,
+    kid: &str,
+) -> Result<&'a Jwk, TaskAuthenticationError> {
+    let mut matching = jwks
+        .keys
+        .iter()
+        .filter(|key| key.common.key_id.as_deref() == Some(kid));
+    let key = matching
+        .next()
+        .ok_or(TaskAuthenticationError::InvalidCredentials)?;
+    if matching.next().is_some() {
+        return Err(TaskAuthenticationError::InvalidCredentials);
+    }
+    Ok(key)
+}
+
+fn validate_identity_task_claims(
+    claims: &IdentityTaskClaims,
+    issuer: &str,
+    audience: &str,
+) -> Result<(), TaskAuthenticationError> {
+    let now = jsonwebtoken::get_current_timestamp();
+    let audience_matches = match &claims.aud {
+        IdentityTaskAudience::Single(value) => value == audience,
+        IdentityTaskAudience::Multiple(values) => {
+            values.len() == 1 && values.first() == Some(&audience.to_owned())
+        }
+    };
+    if claims.iss != issuer
+        || !audience_matches
+        || claims.identity_contract != IDENTITY_TASK_CONTRACT
+        || !claims.email_verified
+        || !valid_email(&claims.email)
+        || !bounded_non_whitespace(&claims.sub, 255)
+        || !bounded_non_whitespace(&claims.jti, 128)
+        || claims.exp.saturating_add(IDENTITY_CLOCK_SKEW_SECONDS) <= now
+        || claims.iat > now.saturating_add(IDENTITY_CLOCK_SKEW_SECONDS)
+        || now
+            > claims
+                .iat
+                .saturating_add(MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS)
+        || claims.nbf > now.saturating_add(IDENTITY_CLOCK_SKEW_SECONDS)
+        || claims.groups.len() > 16
+    {
+        return Err(TaskAuthenticationError::InvalidCredentials);
+    }
+    Ok(())
+}
+
+fn task_identity_from_identity_claims(
+    claims: IdentityTaskClaims,
+) -> Result<TaskIdentity, TaskAuthenticationError> {
+    let user = UserInfo {
+        username: Some(claims.email),
+        groups: Some(claims.groups),
+        ..UserInfo::default()
+    };
+    task_identity_from_kubernetes_user(&user)
+}
+
+fn valid_identity_issuer(value: &str) -> bool {
+    value.starts_with("https://") && value.len() <= 2_048 && !value.chars().any(char::is_whitespace)
+}
+
+fn bounded_non_whitespace(value: &str, maximum: usize) -> bool {
+    !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_whitespace)
 }
 
 #[cfg(test)]
@@ -1371,10 +1649,12 @@ mod workflow_request_tests {
     }
 
     #[test]
-    fn empty_legacy_catalog_allows_versioned_only_deployments() {
-        let catalog = StaticTaskWorkflowCatalog::from_json("[]")
-            .expect("a versioned-Workflow deployment may omit legacy workflows");
+    fn empty_legacy_catalog_allows_versioned_only_deployments() -> Result<(), String> {
+        let catalog = StaticTaskWorkflowCatalog::from_json("[]").map_err(|error| {
+            format!("a versioned-Workflow deployment may omit legacy workflows: {error}")
+        })?;
         assert!(catalog.workflow("legacy-smoke").is_none());
+        Ok(())
     }
 
     fn identity(user_id: &str) -> Result<TaskIdentity, String> {
@@ -1516,6 +1796,140 @@ mod workflow_request_tests {
                 .all(|argument| !argument.contains("example-org")),
             "repository mechanics do not belong to the Workflow execution command"
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod identity_task_authentication_tests {
+    use super::{
+        IdentityTaskClaims, TaskAuthenticationError, task_identity_from_identity_claims,
+        validate_identity_task_jwks, verify_identity_task_token,
+    };
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use jsonwebtoken::jwk::JwkSet;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use p256::SecretKey;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::pkcs8::EncodePrivateKey;
+    use rand_core::OsRng;
+    use serde::Serialize;
+
+    const ISSUER: &str = "https://identity.localhost:18444";
+    const AUDIENCE: &str = "steward-task-api";
+    const KID: &str = "identity-task-current";
+
+    #[derive(Serialize)]
+    struct Claims<'a> {
+        iss: &'a str,
+        sub: &'a str,
+        aud: Vec<&'a str>,
+        exp: u64,
+        iat: u64,
+        nbf: u64,
+        jti: &'a str,
+        email: &'a str,
+        email_verified: bool,
+        groups: Vec<&'a str>,
+        identity_contract: &'a str,
+    }
+
+    fn key_material() -> Result<(EncodingKey, JwkSet), String> {
+        let private = SecretKey::random(&mut OsRng);
+        let der = private
+            .to_pkcs8_der()
+            .map_err(|error| format!("encode P-256 test key: {error}"))?;
+        let point = private.public_key().to_encoded_point(false);
+        let x = point.x().ok_or("P-256 public key missing x")?;
+        let y = point.y().ok_or("P-256 public key missing y")?;
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "EC", "use": "sig", "alg": "ES256", "kid": KID,
+                "crv": "P-256", "x": URL_SAFE_NO_PAD.encode(x), "y": URL_SAFE_NO_PAD.encode(y)
+            }]
+        });
+        Ok((
+            EncodingKey::from_ec_der(der.as_bytes()),
+            serde_json::from_value(jwks).map_err(|error| format!("parse test JWKS: {error}"))?,
+        ))
+    }
+
+    fn token(
+        key: &EncodingKey,
+        issuer: &str,
+        audience: &str,
+        contract: &str,
+    ) -> Result<String, String> {
+        let now = jsonwebtoken::get_current_timestamp();
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(KID.to_owned());
+        encode(
+            &header,
+            &Claims {
+                iss: issuer,
+                sub: "github-actions:actor:16106037",
+                aud: vec![audience],
+                exp: now + 60,
+                iat: now,
+                nbf: now.saturating_sub(1),
+                jti: "identity-task-test-jti",
+                email: "leo@apelogic.ai",
+                email_verified: true,
+                groups: vec![
+                    "agents.apelogic.ai/acting-user:leo@apelogic.ai",
+                    "agents.apelogic.ai/canonical-user:usr_528fc0fed6cf400abb93a3f327d9a809",
+                    "agents.apelogic.ai/service-principal:steward-run",
+                ],
+                identity_contract: contract,
+            },
+            key,
+        )
+        .map_err(|error| format!("sign Identity task token: {error}"))
+    }
+
+    #[test]
+    fn identity_task_token_verifies_exact_claims_and_maps_existing_group_contract()
+    -> Result<(), String> {
+        let (key, jwks) = key_material()?;
+        validate_identity_task_jwks(&jwks)
+            .map_err(|error| format!("valid JWKS rejected: {error:?}"))?;
+        let assertion = token(&key, ISSUER, AUDIENCE, "steward-task-v2")?;
+        let claims: IdentityTaskClaims =
+            verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE)
+                .map_err(|error| format!("valid Identity task credential rejected: {error:?}"))?;
+        let identity = task_identity_from_identity_claims(claims)
+            .map_err(|error| format!("valid ratified Identity groups rejected: {error:?}"))?;
+        assert_eq!(identity.service, "steward-run");
+        assert_eq!(identity.owner.0, "leo@apelogic.ai");
+        assert_eq!(
+            identity.canonical_user_id.as_str(),
+            "usr_528fc0fed6cf400abb93a3f327d9a809"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn identity_task_token_rejects_wrong_issuer_audience_or_contract() -> Result<(), String> {
+        let (key, jwks) = key_material()?;
+        for (issuer, audience, contract) in [
+            (
+                "https://other.identity.invalid",
+                AUDIENCE,
+                "steward-task-v2",
+            ),
+            (ISSUER, "other-audience", "steward-task-v2"),
+            (ISSUER, AUDIENCE, "steward-task-v1"),
+        ] {
+            let assertion = token(&key, issuer, audience, contract)?;
+            assert!(
+                matches!(
+                    verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE),
+                    Err(TaskAuthenticationError::InvalidCredentials)
+                ),
+                "unratified Identity task credential must fail closed"
+            );
+        }
         Ok(())
     }
 }
