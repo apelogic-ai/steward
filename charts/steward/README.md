@@ -1,8 +1,10 @@
 # Steward Helm chart
 
-This chart installs the Steward apiserver, controller/webhook, mint, and the
-`AgentRuntime` CRD. It intentionally creates no `Ingress`; all three services
-are cluster-internal `ClusterIP` services.
+This chart installs the Steward apiserver, controller/webhook, mint, optional
+web presentation, and the `AgentRuntime` CRD. The web presentation defaults to
+disabled. When enabled, its Ingress is enabled by default for compatibility;
+set `web.ingress.enabled=false` when an environment-owned edge routes directly
+to the cluster-internal web and API services.
 
 The default values are fail-closed. A release consumer must set a non-empty tag
 and immutable digest for every component before Helm will render the chart:
@@ -67,6 +69,10 @@ name/key for the Google client secret. The chart never creates the Secret or a
 public edge. A deployment adapter supplies the HTTPS route, certificate and
 network policy appropriate to its platform (for example, a local Kind adapter
 or a DEV gateway); those controls do not belong in this portable chart.
+When `web.ingress.enabled=true`, `web.host` must exactly match the browser
+origin host and the Ingress class and TLS Secret are required. With
+`web.ingress.enabled=false`, those Ingress-only inputs may be empty and no
+Ingress resources are rendered.
 
 When `networkPolicy.enabled=true`, browser authentication additionally requires
 at least one `networkPolicy.browserAuthEgressCidrs` entry. The chart allows
