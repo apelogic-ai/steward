@@ -8195,8 +8195,12 @@ mod tests {
             [steward_types::RunnerPlatform::Linux]
         );
         assert_eq!(
-            task.agent_command.last().map(String::as_str),
+            task.agent_command.get(4).map(String::as_str),
             Some("Review the repository state that triggered this run.")
+        );
+        assert_eq!(
+            task.agent_command.get(5).map(String::as_str),
+            Some("openai/gpt-5.4")
         );
         Ok(())
     }
