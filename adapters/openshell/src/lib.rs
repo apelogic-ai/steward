@@ -24,9 +24,8 @@ use openshell_sdk::raw::proto::datamodel::v1::{ObjectMeta, Provider};
 #[cfg(feature = "runtime")]
 use openshell_sdk::raw::proto::{
     AttachSandboxProviderRequest, CreateProviderRequest, DetachSandboxProviderRequest,
-    ExecSandboxInput, ExecSandboxRequest, GetProviderRequest, GetSandboxRequest,
-    ListSandboxProvidersRequest, Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase,
-    exec_sandbox_event, exec_sandbox_input,
+    GetProviderRequest, GetSandboxRequest, ListSandboxProvidersRequest, Sandbox as RawSandbox,
+    SandboxPhase as RawSandboxPhase,
 };
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
@@ -60,7 +59,7 @@ const LOWER_BASE36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 #[cfg(feature = "runtime")]
 const TAR_BLOCK_BYTES: usize = 512;
 #[cfg(feature = "runtime")]
-const STAGING_STDIN_CHUNK_BYTES: usize = 256 * 1024;
+const STAGING_EXEC_STDIN_CHUNK_BYTES: usize = 512 * 1024;
 #[cfg(feature = "runtime")]
 const KUBERNETES_DNS_SUBDOMAIN_MAX_LENGTH: usize = 253;
 #[cfg(feature = "runtime")]
@@ -885,43 +884,73 @@ impl OpenShellRuntime {
         ))
     }
 
-    async fn exec_with_streamed_stdin(
+    async fn stage_input_archive(
         &self,
-        sandbox_id: &str,
-        command: &[String],
-        timeout: StdDuration,
-        stdin: &[u8],
-    ) -> Result<i32, PortError> {
-        let request = ExecSandboxRequest {
-            sandbox_id: sandbox_id.to_owned(),
-            command: command.to_vec(),
-            workdir: String::new(),
-            environment: HashMap::new(),
-            timeout_seconds: u32::try_from(timeout.as_secs()).unwrap_or(u32::MAX),
-            stdin: Vec::new(),
-            tty: false,
-            cols: 0,
-            rows: 0,
-        };
-        let inputs = staging_exec_inputs(request, stdin);
-        let mut client = self
-            .authenticated_client()
-            .await?
-            .raw_grpc_fresh()
+        workspace: &str,
+        sandbox: &str,
+        input_archive: &[u8],
+    ) -> Result<(), PortError> {
+        let scoped = self.authenticated_client().await?.workspace(workspace);
+        let prepare = scoped
+            .exec(
+                sandbox,
+                &[
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    staging_prepare_command().to_owned(),
+                ],
+                ExecOptions {
+                    timeout: Some(StdDuration::from_secs(120)),
+                    ..ExecOptions::default()
+                },
+            )
             .await
             .map_err(port_failure)?;
-        let mut events = client
-            .exec_sandbox_interactive(tonic::codegen::tokio_stream::iter(inputs))
-            .await
-            .map_err(raw_port_failure)?
-            .into_inner();
-        let mut exit_code = None;
-        while let Some(event) = events.message().await.map_err(raw_port_failure)? {
-            if let Some(exec_sandbox_event::Payload::Exit(exit)) = event.payload {
-                exit_code = Some(exit.exit_code);
+        if prepare.exit_code != 0 {
+            return Err(input_staging_rejected());
+        }
+
+        for chunk in staging_archive_chunks(input_archive) {
+            let append = scoped
+                .exec(
+                    sandbox,
+                    &[
+                        "/bin/sh".to_owned(),
+                        "-c".to_owned(),
+                        staging_append_command().to_owned(),
+                    ],
+                    ExecOptions {
+                        timeout: Some(StdDuration::from_secs(120)),
+                        stdin: Some(chunk.to_vec()),
+                        ..ExecOptions::default()
+                    },
+                )
+                .await
+                .map_err(port_failure)?;
+            if append.exit_code != 0 {
+                return Err(input_staging_rejected());
             }
         }
-        Ok(exit_code.unwrap_or(-1))
+
+        let extract = scoped
+            .exec(
+                sandbox,
+                &[
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    staging_extract_command().to_owned(),
+                ],
+                ExecOptions {
+                    timeout: Some(StdDuration::from_secs(120)),
+                    ..ExecOptions::default()
+                },
+            )
+            .await
+            .map_err(port_failure)?;
+        if extract.exit_code != 0 {
+            return Err(input_staging_rejected());
+        }
+        Ok(())
     }
 
     async fn verify_raw_sandbox_binding(
@@ -1465,23 +1494,8 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             true,
         )
         .await?;
-        let stage_exit_code = self
-            .exec_with_streamed_stdin(
-                &snapshot.id,
-                &[
-                    "/bin/sh".to_owned(),
-                    "-c".to_owned(),
-                    "set -eu; rm -rf /sandbox/steward-input /sandbox/steward-output; mkdir -p /sandbox/steward-input /sandbox/steward-output; tar -xf - -C /sandbox/steward-input".to_owned(),
-                ],
-                StdDuration::from_secs(120),
-                input_archive,
-            )
+        self.stage_input_archive(workspace, sandbox, input_archive)
             .await?;
-        if stage_exit_code != 0 {
-            return Err(PortError::Rejected {
-                reason: "task input archive could not be staged".to_owned(),
-            });
-        }
         let mut environment = HashMap::new();
         environment.insert(
             "STEWARD_OUTPUT_DIR".to_owned(),
@@ -1551,19 +1565,30 @@ impl SandboxTaskRuntime for OpenShellRuntime {
 }
 
 #[cfg(feature = "runtime")]
-fn staging_exec_inputs(request: ExecSandboxRequest, stdin: &[u8]) -> Vec<ExecSandboxInput> {
-    let mut inputs = Vec::with_capacity(1 + stdin.len().div_ceil(STAGING_STDIN_CHUNK_BYTES));
-    inputs.push(ExecSandboxInput {
-        payload: Some(exec_sandbox_input::Payload::Start(request)),
-    });
-    inputs.extend(
-        stdin
-            .chunks(STAGING_STDIN_CHUNK_BYTES)
-            .map(|chunk| ExecSandboxInput {
-                payload: Some(exec_sandbox_input::Payload::Stdin(chunk.to_vec())),
-            }),
-    );
-    inputs
+fn staging_archive_chunks(input_archive: &[u8]) -> std::slice::Chunks<'_, u8> {
+    input_archive.chunks(STAGING_EXEC_STDIN_CHUNK_BYTES)
+}
+
+#[cfg(feature = "runtime")]
+fn staging_prepare_command() -> &'static str {
+    "set -eu; rm -rf /sandbox/steward-input /sandbox/steward-output; rm -f /sandbox/steward-input.tar; mkdir -p /sandbox/steward-input /sandbox/steward-output; : > /sandbox/steward-input.tar"
+}
+
+#[cfg(feature = "runtime")]
+fn staging_append_command() -> &'static str {
+    "set -eu; cat >> /sandbox/steward-input.tar"
+}
+
+#[cfg(feature = "runtime")]
+fn staging_extract_command() -> &'static str {
+    "set -eu; tar -xf /sandbox/steward-input.tar -C /sandbox/steward-input; rm -f /sandbox/steward-input.tar"
+}
+
+#[cfg(feature = "runtime")]
+fn input_staging_rejected() -> PortError {
+    PortError::Rejected {
+        reason: "task input archive could not be staged".to_owned(),
+    }
 }
 
 #[cfg(feature = "runtime")]
@@ -1611,9 +1636,8 @@ mod tests {
     use openshell_sdk::raw::proto::datamodel::v1::ObjectMeta;
     #[cfg(feature = "runtime")]
     use openshell_sdk::raw::proto::{
-        ExecSandboxRequest, Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase,
-        SandboxSpec as RawSandboxSpec, SandboxStatus as RawSandboxStatus,
-        SandboxTemplate as RawSandboxTemplate, exec_sandbox_input,
+        Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase, SandboxSpec as RawSandboxSpec,
+        SandboxStatus as RawSandboxStatus, SandboxTemplate as RawSandboxTemplate,
     };
     #[cfg(feature = "runtime")]
     use reqwest::{Client as HttpClient, Url};
@@ -1634,9 +1658,10 @@ mod tests {
     #[cfg(feature = "runtime")]
     use super::{
         CONNECTIONS_BRIDGE_AGENT_TYPE, OpenShellConnectionConfig, ProviderReconciliation,
-        STAGING_STDIN_CHUNK_BYTES, SandboxDeleteClient, WorkloadExchangeTokenProvider,
+        STAGING_EXEC_STDIN_CHUNK_BYTES, SandboxDeleteClient, WorkloadExchangeTokenProvider,
         delete_owned_sandbox, deletion_names, load_source_credential, output_archive_command,
-        project_request, provider_reconciliation, sandbox_spec, staging_exec_inputs,
+        project_request, provider_reconciliation, sandbox_spec, staging_append_command,
+        staging_archive_chunks, staging_extract_command, staging_prepare_command,
         validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
     };
     #[cfg(feature = "identity")]
@@ -1785,43 +1810,35 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn task_archives_are_split_below_openshells_per_message_limit() {
+    fn task_archives_are_split_into_bounded_unary_exec_payloads() {
         let archive = vec![b'x'; 2 * 1024 * 1024 + 17];
-        let inputs = staging_exec_inputs(
-            ExecSandboxRequest {
-                sandbox_id: "sandbox-id-a".to_owned(),
-                command: vec!["tar".to_owned(), "-xf".to_owned(), "-".to_owned()],
-                ..ExecSandboxRequest::default()
-            },
-            &archive,
-        );
-
-        assert!(
-            matches!(
-                inputs.first().and_then(|input| input.payload.as_ref()),
-                Some(exec_sandbox_input::Payload::Start(request)) if request.stdin.is_empty()
-            ),
-            "the start frame must not embed the task archive"
-        );
-        let chunks = inputs
-            .iter()
-            .skip(1)
-            .map(|input| match input.payload.as_ref() {
-                Some(exec_sandbox_input::Payload::Stdin(chunk)) => chunk.as_slice(),
-                _ => &[][..],
-            })
-            .collect::<Vec<_>>();
+        let chunks = staging_archive_chunks(&archive).collect::<Vec<_>>();
         assert!(
             chunks
                 .iter()
-                .all(|chunk| !chunk.is_empty() && chunk.len() <= STAGING_STDIN_CHUNK_BYTES),
-            "every stdin frame must remain below OpenShell's decoded-message ceiling"
+                .all(|chunk| !chunk.is_empty() && chunk.len() <= STAGING_EXEC_STDIN_CHUNK_BYTES),
+            "every unary stdin payload must remain below OpenShell's decoded-message ceiling"
         );
         assert_eq!(
             chunks.concat(),
             archive,
-            "streamed stdin frames must preserve every task archive byte in order"
+            "unary staging chunks must preserve every task archive byte in order"
         );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn staging_uses_a_file_backed_archive_between_bounded_execs() {
+        assert!(staging_prepare_command().contains(": > /sandbox/steward-input.tar"));
+        assert_eq!(
+            staging_append_command(),
+            "set -eu; cat >> /sandbox/steward-input.tar"
+        );
+        assert!(
+            staging_extract_command()
+                .contains("tar -xf /sandbox/steward-input.tar -C /sandbox/steward-input")
+        );
+        assert!(staging_extract_command().contains("rm -f /sandbox/steward-input.tar"));
     }
 
     #[cfg(feature = "runtime")]
