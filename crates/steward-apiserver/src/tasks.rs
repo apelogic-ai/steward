@@ -400,6 +400,7 @@ fn validate_identity_task_jwks(jwks: &JwkSet) -> Result<(), TaskAuthenticationEr
         return Err(TaskAuthenticationError::InvalidCredentials);
     }
     let mut kids = std::collections::HashSet::new();
+    let mut identity_task_keys = 0_usize;
     for key in &jwks.keys {
         let kid = key
             .common
@@ -409,24 +410,32 @@ fn validate_identity_task_jwks(jwks: &JwkSet) -> Result<(), TaskAuthenticationEr
         if !bounded_non_whitespace(kid, 128) || !kid.is_ascii() || !kids.insert(kid) {
             return Err(TaskAuthenticationError::InvalidCredentials);
         }
-        if key.common.key_algorithm != Some(KeyAlgorithm::ES256)
-            || key.common.public_key_use != Some(PublicKeyUse::Signature)
-            || DecodingKey::from_jwk(key).is_err()
-        {
-            return Err(TaskAuthenticationError::InvalidCredentials);
+        // Identity's public JWKS can also publish keys for its separate workload
+        // exchange contract. Only ES256 signing keys participate in the
+        // steward-task-v2 trust domain; non-ES256 keys remain unselectable.
+        if key.common.key_algorithm == Some(KeyAlgorithm::ES256) {
+            if key.common.public_key_use != Some(PublicKeyUse::Signature)
+                || DecodingKey::from_jwk(key).is_err()
+            {
+                return Err(TaskAuthenticationError::InvalidCredentials);
+            }
+            identity_task_keys += 1;
         }
     }
-    Ok(())
+    (identity_task_keys > 0)
+        .then_some(())
+        .ok_or(TaskAuthenticationError::InvalidCredentials)
 }
 
 fn select_identity_task_key<'a>(
     jwks: &'a JwkSet,
     kid: &str,
 ) -> Result<&'a Jwk, TaskAuthenticationError> {
-    let mut matching = jwks
-        .keys
-        .iter()
-        .filter(|key| key.common.key_id.as_deref() == Some(kid));
+    let mut matching = jwks.keys.iter().filter(|key| {
+        key.common.key_id.as_deref() == Some(kid)
+            && key.common.key_algorithm == Some(KeyAlgorithm::ES256)
+            && key.common.public_key_use == Some(PublicKeyUse::Signature)
+    });
     let key = matching
         .next()
         .ok_or(TaskAuthenticationError::InvalidCredentials)?;
@@ -1906,6 +1915,29 @@ mod identity_task_authentication_tests {
             identity.canonical_user_id.as_str(),
             "usr_528fc0fed6cf400abb93a3f327d9a809"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn identity_task_jwks_accepts_unselectable_workload_keys() -> Result<(), String> {
+        let (key, jwks) = key_material()?;
+        let mut mixed = serde_json::to_value(jwks)
+            .map_err(|error| format!("serialize task JWKS fixture: {error}"))?;
+        mixed["keys"]
+            .as_array_mut()
+            .ok_or("task JWKS fixture keys is not an array")?
+            .push(serde_json::json!({
+                "kty": "RSA", "use": "sig", "alg": "RS256", "kid": "identity-workload-current",
+                "n": "not-used-for-task-authentication", "e": "AQAB"
+            }));
+        let mixed = serde_json::from_value(mixed)
+            .map_err(|error| format!("parse mixed Identity JWKS fixture: {error}"))?;
+
+        validate_identity_task_jwks(&mixed)
+            .map_err(|error| format!("mixed Identity JWKS rejected: {error:?}"))?;
+        let assertion = token(&key, ISSUER, AUDIENCE, "steward-task-v2")?;
+        verify_identity_task_token(&assertion, &mixed, ISSUER, AUDIENCE)
+            .map_err(|error| format!("ES256 task token rejected from mixed JWKS: {error:?}"))?;
         Ok(())
     }
 
