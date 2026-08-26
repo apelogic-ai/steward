@@ -593,6 +593,11 @@ async fn reconcile_task<R: SandboxTaskRuntime>(
                 }
                 Err(error) => {
                     let reason = task_failure_reason(&error);
+                    eprintln!(
+                        "task execution failed: task_uid={} runtime_uid={} reason={reason}",
+                        task.task_uid,
+                        task.runtime_uid.as_deref().unwrap_or("unbound")
+                    );
                     authority
                         .fail_task_execution(task.task_uid, &reason)
                         .await

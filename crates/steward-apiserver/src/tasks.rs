@@ -104,6 +104,12 @@ fn resolve_versioned_task_plan(
         .approved_envelope
         .as_ref()
         .ok_or(ApiError::MissingEnvelope)?;
+    let [model] = approved.spec.llms.as_slice() else {
+        return Err(ApiError::Admission(
+            "versioned Codex Workflows require exactly one approved model".to_owned(),
+        ));
+    };
+    let codex_model = format!("{}/{}", model.provider, model.model);
     let canonical_authority = CanonicalAuthorityBinding::new(
         identity.canonical_user_id.clone(),
         identity
@@ -133,14 +139,32 @@ fn resolve_versioned_task_plan(
         "/bin/sh".to_owned(),
         "-c".to_owned(),
         concat!(
-            "set -eu; ",
+            "set -eu; umask 077; ",
             "test \"$(codex --version)\" = \"codex-cli 0.117.0\"; ",
-            "codex exec --skip-git-repo-check ",
+            "test \"$#\" -eq 2; ",
+            "export CODEX_HOME=/sandbox/steward-codex; ",
+            "mkdir -p \"$CODEX_HOME\" \"$STEWARD_OUTPUT_DIR/out\"; ",
+            "test ! -e out; ln -s \"$STEWARD_OUTPUT_DIR/out\" out; ",
+            "printf '%s\\n' ",
+            "'model_provider = \"litellm\"' ",
+            "'approval_policy = \"never\"' ",
+            "'web_search = \"disabled\"' ",
+            "'[model_providers.litellm]' ",
+            "'name = \"LiteLLM\"' ",
+            "'base_url = \"http://litellm-litellm.litellm.svc.cluster.local:4000/v1\"' ",
+            "'env_key = \"OPENAI_API_KEY\"' ",
+            "'wire_api = \"responses\"' ",
+            "'requires_openai_auth = false' ",
+            "> \"$CODEX_HOME/config.toml\"; ",
+            "OPENAI_API_KEY=openshell-token-grant-placeholder ",
+            "codex exec --ephemeral --skip-git-repo-check ",
+            "--sandbox danger-full-access --model \"$2\" ",
             "--output-last-message \"$STEWARD_OUTPUT_DIR/result.txt\" -- \"$1\""
         )
         .to_owned(),
         "steward-workflow".to_owned(),
         workflow.prompt.clone(),
+        codex_model,
     ];
     Ok(VersionedTaskPlan {
         workflow,
@@ -1821,7 +1845,7 @@ mod workflow_request_tests {
             Some("env_instance_01")
         );
         assert_eq!(
-            plan.command.last().map(String::as_str),
+            plan.command.get(4).map(String::as_str),
             Some("Review the repository state."),
             "the immutable Workflow prompt must be a separate argument to the server-owned command"
         );
@@ -1830,6 +1854,33 @@ mod workflow_request_tests {
                 .iter()
                 .any(|argument| argument.contains("codex-cli 0.117.0")),
             "the server-owned command must fail closed unless the sandbox exposes the exact approved Codex version"
+        );
+        let shell_command = &plan.command[2];
+        assert!(
+            shell_command.contains("OPENAI_API_KEY=openshell-token-grant-placeholder"),
+            "Codex must present a non-secret placeholder for OpenShell's runtime token grant"
+        );
+        assert!(
+            shell_command.contains("litellm-litellm.litellm.svc.cluster.local:4000/v1"),
+            "Codex must send inference to the OpenShell-governed LiteLLM endpoint"
+        );
+        assert!(
+            shell_command.contains("--model \"$2\""),
+            "Codex must use the model selected by the approved envelope"
+        );
+        assert!(
+            shell_command.contains("ln -s \"$STEWARD_OUTPUT_DIR/out\" out"),
+            "the declared out binding must resolve to Steward's collected output root"
+        );
+        assert!(
+            shell_command.contains("--ephemeral")
+                && shell_command.contains("--sandbox danger-full-access"),
+            "Codex must leave persistence and sandboxing to the disposable OpenShell runtime"
+        );
+        assert_eq!(
+            plan.command.get(5).map(String::as_str),
+            Some("openai/gpt-5.4"),
+            "the approved provider and model must be passed as an opaque shell argument"
         );
         assert!(
             plan.command
