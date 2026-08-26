@@ -17,6 +17,7 @@ web:
   enabled: false
   host: ""
   ingress:
+    enabled: true
     className: ""
     tlsSecretName: ""
 secrets:

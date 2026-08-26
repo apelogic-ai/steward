@@ -18,6 +18,7 @@ browser_hop1_loopback_rendered="$(mktemp)"
 browser_hop1_loopback_proxy_rendered="$(mktemp)"
 web_rendered="$(mktemp)"
 web_deployment="$(mktemp)"
+external_edge_rendered="$(mktemp)"
 mint_synthetic_kubeconfig="$(mktemp)"
 mint_startup_output="$(mktemp)"
 web_container_id=""
@@ -36,7 +37,7 @@ cleanup() {
     "${task_identity_deployment}" "${browser_hop1_rendered}" \
     "${browser_hop1_deployment}" "${browser_hop1_loopback_rendered}" \
     "${browser_hop1_loopback_proxy_rendered}" \
-    "${web_rendered}" "${web_deployment}" \
+    "${web_rendered}" "${web_deployment}" "${external_edge_rendered}" \
     "${mint_synthetic_kubeconfig}" "${mint_startup_output}"
   exit "${status}"
 }
@@ -140,6 +141,28 @@ if helm template steward "${root}/charts/steward" \
   --set web.enabled=true >/dev/null 2>&1
 then
   echo "enabled web presentation without immutable image and ingress inputs must fail chart validation" >&2
+  exit 1
+fi
+
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set web.enabled=true \
+  --set web.ingress.enabled=false \
+  --set images.web.tag=validation-web \
+  --set "images.web.digest=${digest3}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://localhost:18443 \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' > "${external_edge_rendered}"
+grep -Fq 'metadata: { name: steward-web }' "${external_edge_rendered}"
+if grep -Fq 'kind: Ingress' "${external_edge_rendered}"; then
+  echo "environment-owned web edge must not render Steward Ingress resources" >&2
   exit 1
 fi
 

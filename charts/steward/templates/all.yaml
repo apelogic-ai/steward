@@ -1,5 +1,5 @@
 {{- $stableBridgeBundleName := printf "steward-stable-bridge-attestation-%s" (.Values.stableBridge.attestationBundle | sha256sum | trunc 12) }}
-{{- if and .Values.web.enabled (ne .Values.browserAuth.google.origin (printf "https://%s" .Values.web.host)) }}
+{{- if and .Values.web.enabled .Values.web.ingress.enabled (ne .Values.browserAuth.google.origin (printf "https://%s" .Values.web.host)) }}
 {{- fail "web.host must exactly match the HTTPS browserAuth.google.origin" }}
 {{- end }}
 {{- range $component := list "apiserver" "controller" "mint" }}
@@ -490,6 +490,7 @@ spec:
 {{ toYaml .Values.resources.web | nindent 12 }}
       volumes:
         - { name: tmp, emptyDir: {} }
+{{- if .Values.web.ingress.enabled }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -530,6 +531,7 @@ spec:
       http:
         paths:
           - { path: /, pathType: Prefix, backend: { service: { name: steward-web, port: { name: http } } } }
+{{- end }}
 {{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---

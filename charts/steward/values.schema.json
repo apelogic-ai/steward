@@ -43,8 +43,9 @@
         "ingress": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["className", "tlsSecretName"],
+          "required": ["enabled", "className", "tlsSecretName"],
           "properties": {
+            "enabled": {"type": "boolean"},
             "className": {"type": "string"},
             "tlsSecretName": {"type": "string"}
           }
@@ -571,6 +572,27 @@
           "images": {"properties": {"web": {"$ref": "#/definitions/image"}}},
           "browserAuth": {"properties": {"enabled": {"const": true}}},
           "networkPolicy": {"properties": {"enabled": {"const": true}}},
+          "web": {}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "web": {
+            "properties": {
+              "enabled": {"const": true},
+              "ingress": {
+                "properties": {"enabled": {"const": true}},
+                "required": ["enabled"]
+              }
+            },
+            "required": ["enabled", "ingress"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
           "web": {
             "properties": {
               "host": {"type": "string", "minLength": 3, "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"},
