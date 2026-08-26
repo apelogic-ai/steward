@@ -24,8 +24,9 @@ use openshell_sdk::raw::proto::datamodel::v1::{ObjectMeta, Provider};
 #[cfg(feature = "runtime")]
 use openshell_sdk::raw::proto::{
     AttachSandboxProviderRequest, CreateProviderRequest, DetachSandboxProviderRequest,
-    GetProviderRequest, GetSandboxRequest, ListSandboxProvidersRequest, Sandbox as RawSandbox,
-    SandboxPhase as RawSandboxPhase,
+    ExecSandboxInput, ExecSandboxRequest, GetProviderRequest, GetSandboxRequest,
+    ListSandboxProvidersRequest, Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase,
+    exec_sandbox_event, exec_sandbox_input,
 };
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
@@ -58,6 +59,8 @@ const HASH_CHARACTERS: usize = NAME_LENGTH - 2;
 const LOWER_BASE36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 #[cfg(feature = "runtime")]
 const TAR_BLOCK_BYTES: usize = 512;
+#[cfg(feature = "runtime")]
+const STAGING_STDIN_CHUNK_BYTES: usize = 256 * 1024;
 #[cfg(feature = "runtime")]
 const KUBERNETES_DNS_SUBDOMAIN_MAX_LENGTH: usize = 253;
 #[cfg(feature = "runtime")]
@@ -882,6 +885,45 @@ impl OpenShellRuntime {
         ))
     }
 
+    async fn exec_with_streamed_stdin(
+        &self,
+        sandbox_id: &str,
+        command: &[String],
+        timeout: StdDuration,
+        stdin: &[u8],
+    ) -> Result<i32, PortError> {
+        let request = ExecSandboxRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            command: command.to_vec(),
+            workdir: String::new(),
+            environment: HashMap::new(),
+            timeout_seconds: u32::try_from(timeout.as_secs()).unwrap_or(u32::MAX),
+            stdin: Vec::new(),
+            tty: false,
+            cols: 0,
+            rows: 0,
+        };
+        let inputs = staging_exec_inputs(request, stdin);
+        let mut client = self
+            .authenticated_client()
+            .await?
+            .raw_grpc_fresh()
+            .await
+            .map_err(port_failure)?;
+        let mut events = client
+            .exec_sandbox_interactive(tonic::codegen::tokio_stream::iter(inputs))
+            .await
+            .map_err(raw_port_failure)?
+            .into_inner();
+        let mut exit_code = None;
+        while let Some(event) = events.message().await.map_err(raw_port_failure)? {
+            if let Some(exec_sandbox_event::Payload::Exit(exit)) = event.payload {
+                exit_code = Some(exit.exit_code);
+            }
+        }
+        Ok(exit_code.unwrap_or(-1))
+    }
+
     async fn verify_raw_sandbox_binding(
         &self,
         workspace: &str,
@@ -1423,26 +1465,19 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             true,
         )
         .await?;
-        let stage = self
-            .authenticated_client()
-            .await?
-            .workspace(workspace)
-            .exec(
-                sandbox,
+        let stage_exit_code = self
+            .exec_with_streamed_stdin(
+                &snapshot.id,
                 &[
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
                     "set -eu; rm -rf /sandbox/steward-input /sandbox/steward-output; mkdir -p /sandbox/steward-input /sandbox/steward-output; tar -xf - -C /sandbox/steward-input".to_owned(),
                 ],
-                ExecOptions {
-                    timeout: Some(StdDuration::from_secs(120)),
-                    stdin: Some(input_archive.to_vec()),
-                    ..ExecOptions::default()
-                },
+                StdDuration::from_secs(120),
+                input_archive,
             )
-            .await
-            .map_err(port_failure)?;
-        if stage.exit_code != 0 {
+            .await?;
+        if stage_exit_code != 0 {
             return Err(PortError::Rejected {
                 reason: "task input archive could not be staged".to_owned(),
             });
@@ -1516,6 +1551,22 @@ impl SandboxTaskRuntime for OpenShellRuntime {
 }
 
 #[cfg(feature = "runtime")]
+fn staging_exec_inputs(request: ExecSandboxRequest, stdin: &[u8]) -> Vec<ExecSandboxInput> {
+    let mut inputs = Vec::with_capacity(1 + stdin.len().div_ceil(STAGING_STDIN_CHUNK_BYTES));
+    inputs.push(ExecSandboxInput {
+        payload: Some(exec_sandbox_input::Payload::Start(request)),
+    });
+    inputs.extend(
+        stdin
+            .chunks(STAGING_STDIN_CHUNK_BYTES)
+            .map(|chunk| ExecSandboxInput {
+                payload: Some(exec_sandbox_input::Payload::Stdin(chunk.to_vec())),
+            }),
+    );
+    inputs
+}
+
+#[cfg(feature = "runtime")]
 fn port_failure(error: SdkError) -> PortError {
     PortError::Failed {
         reason: error.to_string(),
@@ -1560,8 +1611,9 @@ mod tests {
     use openshell_sdk::raw::proto::datamodel::v1::ObjectMeta;
     #[cfg(feature = "runtime")]
     use openshell_sdk::raw::proto::{
-        Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase, SandboxSpec as RawSandboxSpec,
-        SandboxStatus as RawSandboxStatus, SandboxTemplate as RawSandboxTemplate,
+        ExecSandboxRequest, Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase,
+        SandboxSpec as RawSandboxSpec, SandboxStatus as RawSandboxStatus,
+        SandboxTemplate as RawSandboxTemplate, exec_sandbox_input,
     };
     #[cfg(feature = "runtime")]
     use reqwest::{Client as HttpClient, Url};
@@ -1582,9 +1634,10 @@ mod tests {
     #[cfg(feature = "runtime")]
     use super::{
         CONNECTIONS_BRIDGE_AGENT_TYPE, OpenShellConnectionConfig, ProviderReconciliation,
-        SandboxDeleteClient, WorkloadExchangeTokenProvider, delete_owned_sandbox, deletion_names,
-        load_source_credential, output_archive_command, project_request, provider_reconciliation,
-        sandbox_spec, validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
+        STAGING_STDIN_CHUNK_BYTES, SandboxDeleteClient, WorkloadExchangeTokenProvider,
+        delete_owned_sandbox, deletion_names, load_source_credential, output_archive_command,
+        project_request, provider_reconciliation, sandbox_spec, staging_exec_inputs,
+        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
     };
     #[cfg(feature = "identity")]
     use super::{IdentityResolutionError, SANDBOX_ID_LABEL, binding_from_sandbox};
@@ -1728,6 +1781,47 @@ mod tests {
             bridge_image: None,
             bridge_gateway_origin: None,
         }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn task_archives_are_split_below_openshells_per_message_limit() {
+        let archive = vec![b'x'; 2 * 1024 * 1024 + 17];
+        let inputs = staging_exec_inputs(
+            ExecSandboxRequest {
+                sandbox_id: "sandbox-id-a".to_owned(),
+                command: vec!["tar".to_owned(), "-xf".to_owned(), "-".to_owned()],
+                ..ExecSandboxRequest::default()
+            },
+            &archive,
+        );
+
+        assert!(
+            matches!(
+                inputs.first().and_then(|input| input.payload.as_ref()),
+                Some(exec_sandbox_input::Payload::Start(request)) if request.stdin.is_empty()
+            ),
+            "the start frame must not embed the task archive"
+        );
+        let chunks = inputs
+            .iter()
+            .skip(1)
+            .map(|input| match input.payload.as_ref() {
+                Some(exec_sandbox_input::Payload::Stdin(chunk)) => chunk.as_slice(),
+                _ => &[][..],
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| !chunk.is_empty() && chunk.len() <= STAGING_STDIN_CHUNK_BYTES),
+            "every stdin frame must remain below OpenShell's decoded-message ceiling"
+        );
+        assert_eq!(
+            chunks.concat(),
+            archive,
+            "streamed stdin frames must preserve every task archive byte in order"
+        );
     }
 
     #[cfg(feature = "runtime")]

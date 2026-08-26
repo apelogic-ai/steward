@@ -69,7 +69,10 @@ fn make_input_archive(run_dir: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
             .ok_or_else(|| "input fixture has no parent directory".to_owned())?,
     )
     .map_err(|error| format!("failed to create input fixture directory: {error}"))?;
-    let payload = b"steward-openshell-v0098\n".to_vec();
+    // OpenShell 0.0.98 caps each decoded gRPC message at 1 MiB. Keep this
+    // fixture above that boundary so the adapter proves that task archives
+    // are streamed instead of embedded in one ExecSandbox request.
+    let payload = vec![b'x'; 1_100_000];
     fs::write(&input_path, &payload)
         .map_err(|error| format!("failed to write input fixture: {error}"))?;
     let archive_path = run_dir.join("adapter-input.tar");
