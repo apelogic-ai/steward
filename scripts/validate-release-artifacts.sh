@@ -19,6 +19,7 @@ browser_hop1_loopback_proxy_rendered="$(mktemp)"
 web_rendered="$(mktemp)"
 web_deployment="$(mktemp)"
 external_edge_rendered="$(mktemp)"
+secret_trust_rendered="$(mktemp)"
 mint_synthetic_kubeconfig="$(mktemp)"
 mint_startup_output="$(mktemp)"
 web_container_id=""
@@ -38,6 +39,7 @@ cleanup() {
     "${browser_hop1_deployment}" "${browser_hop1_loopback_rendered}" \
     "${browser_hop1_loopback_proxy_rendered}" \
     "${web_rendered}" "${web_deployment}" "${external_edge_rendered}" \
+    "${secret_trust_rendered}" \
     "${mint_synthetic_kubeconfig}" "${mint_startup_output}"
   exit "${status}"
 }
@@ -79,6 +81,27 @@ helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
   "${image_values[@]}" > "${rendered}"
+
+if ! helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set-string workloadExchangeTrust.kind=Secret > "${secret_trust_rendered}"
+then
+  echo "Secret-backed workload exchange trust must be a valid chart configuration" >&2
+  exit 1
+fi
+if ! awk '
+  $0 == "        - name: workload-exchange-ca" {
+    getline
+    found = ($0 == "          secret:")
+  }
+  END { exit(found ? 0 : 1) }
+' "${secret_trust_rendered}"
+then
+  echo "Secret-backed workload exchange trust must render a Secret volume" >&2
+  exit 1
+fi
 
 helm template steward "${root}/charts/steward" \
   --namespace steward \

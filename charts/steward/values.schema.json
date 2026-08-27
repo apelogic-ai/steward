@@ -269,8 +269,9 @@
     "workloadExchangeTrust": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "caCertificate"],
+      "required": ["kind", "name", "caCertificate"],
       "properties": {
+        "kind": {"type": "string", "enum": ["ConfigMap", "Secret"]},
         "name": {"$ref": "#/definitions/nonempty"},
         "caCertificate": {"$ref": "#/definitions/nonempty"}
       }

@@ -49,9 +49,11 @@ The chart references five existing Secrets and never creates their values:
 | `steward-mint` | `signing-key`, `introspection-credential` | mint |
 | browser-auth Secret (selected only when `browserAuth.enabled=true`) | configured client-secret key | apiserver |
 
-The controller also requires the public workload-exchange CA bundle in the
-ConfigMap selected by `workloadExchangeTrust.name` and
-`workloadExchangeTrust.caCertificate`. It is trust material, not a Secret.
+The controller also requires the public workload-exchange CA bundle selected
+by `workloadExchangeTrust.kind`, `workloadExchangeTrust.name`, and
+`workloadExchangeTrust.caCertificate`. `ConfigMap` is the default; `Secret`
+supports cert-manager-managed local trust bundles while projecting only the
+named CA key into the workload.
 
 The mint Secret is not referenced by either the apiserver or controller
 Deployment. `steward-apiserver-tls` and `steward-webhook-tls` are issued by
