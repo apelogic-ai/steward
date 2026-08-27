@@ -653,13 +653,13 @@ spec:
 {{- range .Values.networkPolicy.browserAuthEgressCidrs }}
         - ipBlock: { cidr: {{ . }} }
 {{- end }}
+      ports: [{ protocol: TCP, port: 443 }]
 {{- if .Values.browserHop1.enabled }}
     - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.mcpGatewayNamespace }} } } }]
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.mcpGateway }} }]
     - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.identityExchangeNamespace }} } } }]
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.identityExchange }} }]
 {{- end }}
-      ports: [{ protocol: TCP, port: 443 }]
 {{- end }}
 {{- if .Values.networkPolicy.kubeApiCidrs }}
     - to:

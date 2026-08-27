@@ -364,6 +364,17 @@ do
 done
 grep -Fxq '    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: mcp-gw } } }]' "${browser_hop1_rendered}"
 grep -Fxq '    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: identity-exchange } } }]' "${browser_hop1_rendered}"
+if ! awk '
+  $0 == "        - ipBlock: { cidr: 203.0.113.0/24 }" {
+    getline
+    found = ($0 == "      ports: [{ protocol: TCP, port: 443 }]")
+  }
+  END { exit(found ? 0 : 1) }
+' "${browser_hop1_rendered}"
+then
+  echo "browser OAuth HTTPS ports must belong to the CIDR rule before HOP-1 egress rules" >&2
+  exit 1
+fi
 helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
