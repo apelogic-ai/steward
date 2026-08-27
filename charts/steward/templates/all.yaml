@@ -403,10 +403,11 @@ spec:
         - name: workload-exchange-ca
 {{- if eq .Values.workloadExchangeTrust.kind "Secret" }}
           secret:
+            secretName: {{ .Values.workloadExchangeTrust.name }}
 {{- else }}
           configMap:
-{{- end }}
             name: {{ .Values.workloadExchangeTrust.name }}
+{{- end }}
             items:
               - { key: {{ .Values.workloadExchangeTrust.caCertificate }}, path: ca.crt }
         - name: workload-source-credential

@@ -94,7 +94,9 @@ fi
 if ! awk '
   $0 == "        - name: workload-exchange-ca" {
     getline
-    found = ($0 == "          secret:")
+    secret = ($0 == "          secret:")
+    getline
+    found = secret && ($0 == "            secretName: steward-workload-exchange-ca")
   }
   END { exit(found ? 0 : 1) }
 ' "${secret_trust_rendered}"
