@@ -74,6 +74,7 @@ browserHop1:
     targetHost: ""
     targetPort: 0
 workloadExchangeTrust:
+  kind: ConfigMap
   name: steward-workload-exchange-ca
   caCertificate: ca.crt
 taskIdentity:

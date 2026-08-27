@@ -314,7 +314,11 @@ spec:
               - configMap:
                   name: {{ .Values.browserHop1.publicJwksConfigMap.name }}
                   items: [{ key: {{ .Values.browserHop1.publicJwksConfigMap.key }}, path: jwks.json }]
+{{- if eq .Values.workloadExchangeTrust.kind "Secret" }}
+              - secret:
+{{- else }}
               - configMap:
+{{- end }}
                   name: {{ .Values.workloadExchangeTrust.name }}
                   items: [{ key: {{ .Values.workloadExchangeTrust.caCertificate }}, path: identity-ca.crt }]
         - name: browser-hop1-source-credential
@@ -397,8 +401,13 @@ spec:
               - { key: {{ .Values.secrets.openshellClient.clientCertificate }}, path: tls.crt }
               - { key: {{ .Values.secrets.openshellClient.clientPrivateKey }}, path: tls.key }
         - name: workload-exchange-ca
+{{- if eq .Values.workloadExchangeTrust.kind "Secret" }}
+          secret:
+            secretName: {{ .Values.workloadExchangeTrust.name }}
+{{- else }}
           configMap:
             name: {{ .Values.workloadExchangeTrust.name }}
+{{- end }}
             items:
               - { key: {{ .Values.workloadExchangeTrust.caCertificate }}, path: ca.crt }
         - name: workload-source-credential
@@ -653,13 +662,13 @@ spec:
 {{- range .Values.networkPolicy.browserAuthEgressCidrs }}
         - ipBlock: { cidr: {{ . }} }
 {{- end }}
+      ports: [{ protocol: TCP, port: 443 }]
 {{- if .Values.browserHop1.enabled }}
     - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.mcpGatewayNamespace }} } } }]
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.mcpGateway }} }]
     - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.identityExchangeNamespace }} } } }]
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.identityExchange }} }]
 {{- end }}
-      ports: [{ protocol: TCP, port: 443 }]
 {{- end }}
 {{- if .Values.networkPolicy.kubeApiCidrs }}
     - to:
