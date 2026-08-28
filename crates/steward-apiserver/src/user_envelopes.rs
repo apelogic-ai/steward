@@ -254,6 +254,18 @@ pub struct PgEnvelopeRequestBroker {
     store: PgStore,
 }
 
+fn has_tools(envelope: &Envelope) -> bool {
+    !envelope.spec.tools.is_empty()
+}
+
+fn connection_readiness_for_ceiling(envelope: &Envelope) -> ConnectionReadiness {
+    if has_tools(envelope) {
+        ConnectionReadiness::Missing
+    } else {
+        ConnectionReadiness::Connected
+    }
+}
+
 impl PgEnvelopeRequestBroker {
     pub fn new(store: PgStore) -> Self {
         Self { store }
@@ -274,13 +286,14 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                     .await
                     .map_err(map_store_broker_error)?
                 {
+                    let github_connection = connection_readiness_for_ceiling(&ceiling);
                     templates.push(AvailableEnvelopeTemplate {
                         id: member_role.clone(),
                         display_name: member_role.clone(),
                         revision: ceiling.revision,
                         ceiling,
                         auto_provision_threshold: None,
-                        github_connection: ConnectionReadiness::Missing,
+                        github_connection,
                     });
                 }
             }
@@ -673,7 +686,9 @@ where
     }) else {
         return StatusCode::CONFLICT.into_response();
     };
-    if template.github_connection != ConnectionReadiness::Connected {
+    if has_tools(&requested_envelope)
+        && template.github_connection != ConnectionReadiness::Connected
+    {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -869,7 +884,7 @@ mod tests {
         AvailableEnvelopeTemplate, ConnectionReadiness, EnvelopeRequestBroker,
         EnvelopeRequestBrokerError, EnvelopeRequestStatus, UserEnvelopeMutationProof,
         UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject, ValidatedEnvelopeRequest,
-        inner_router,
+        connection_readiness_for_ceiling, inner_router,
     };
     use crate::BoxFuture;
     use steward_admission::{Envelope, EnvelopeSpec};
@@ -1045,6 +1060,26 @@ mod tests {
             ceiling,
             github_connection: ConnectionReadiness::Connected,
         }
+    }
+
+    #[test]
+    fn connection_is_not_required_for_a_toolless_envelope() {
+        let mut ceiling = template().ceiling;
+        ceiling.spec.tools.clear();
+        assert_eq!(
+            connection_readiness_for_ceiling(&ceiling),
+            ConnectionReadiness::Connected,
+        );
+    }
+
+    #[test]
+    fn connection_remains_required_for_any_tool_envelope() {
+        let mut ceiling = template().ceiling;
+        ceiling.spec.tools[0].provider = "provider-a".to_owned();
+        assert_eq!(
+            connection_readiness_for_ceiling(&ceiling),
+            ConnectionReadiness::Missing,
+        );
     }
 
     fn session() -> Result<UserEnvelopeSession<()>, String> {
