@@ -9,7 +9,7 @@ describe("first envelope template", () => {
       spec: {
         budget: { currency: "USD", monthlyLimit: "0.10", singleRunLimit: "0.10" },
         llms: [{ provider: "openai", model: "gpt-5.4" }],
-        tools: [{ provider: "github", resource: "repository", action: "get_file_contents" }],
+        tools: [],
         ttl: "15m",
         runner: { platforms: ["linux"] },
       },

@@ -1142,6 +1142,7 @@ impl PendingAuthorization {
                 | "/app/envelopes"
                 | "/app/envelopes/new"
                 | "/app/runs"
+                | "/connections"
                 | "/runs"
                 | "/settings"
         ) {
@@ -1369,6 +1370,7 @@ mod tests {
             "/app/envelopes",
             "/app/envelopes/new",
             "/app/runs",
+            "/connections",
             "/runs",
             "/settings",
         ] {
@@ -1800,6 +1802,23 @@ mod tests {
                 .len(),
             MAX_PENDING_AUTHORIZATIONS
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connections_login_return_is_accepted_at_the_router() -> Result<(), String> {
+        let service =
+            local_fake_browser_auth_service("http://127.0.0.1:33001", LocalFakeIdentity::User)?;
+        let response = browser_auth_router(service)
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/auth/login?returnTo=%2Fconnections")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build connections login request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute connections login request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
         Ok(())
     }
 
