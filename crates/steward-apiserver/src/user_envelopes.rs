@@ -254,16 +254,12 @@ pub struct PgEnvelopeRequestBroker {
     store: PgStore,
 }
 
-fn requires_github_connection(envelope: &Envelope) -> bool {
-    envelope
-        .spec
-        .tools
-        .iter()
-        .any(|tool| tool.provider == "github")
+fn has_tools(envelope: &Envelope) -> bool {
+    !envelope.spec.tools.is_empty()
 }
 
 fn connection_readiness_for_ceiling(envelope: &Envelope) -> ConnectionReadiness {
-    if requires_github_connection(envelope) {
+    if has_tools(envelope) {
         ConnectionReadiness::Missing
     } else {
         ConnectionReadiness::Connected
@@ -690,7 +686,7 @@ where
     }) else {
         return StatusCode::CONFLICT.into_response();
     };
-    if requires_github_connection(&requested_envelope)
+    if has_tools(&requested_envelope)
         && template.github_connection != ConnectionReadiness::Connected
     {
         return (
@@ -1067,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn github_connection_is_not_required_for_a_toolless_envelope() {
+    fn connection_is_not_required_for_a_toolless_envelope() {
         let mut ceiling = template().ceiling;
         ceiling.spec.tools.clear();
         assert_eq!(
@@ -1077,9 +1073,11 @@ mod tests {
     }
 
     #[test]
-    fn github_connection_remains_required_for_a_github_tool_envelope() {
+    fn connection_remains_required_for_any_tool_envelope() {
+        let mut ceiling = template().ceiling;
+        ceiling.spec.tools[0].provider = "provider-a".to_owned();
         assert_eq!(
-            connection_readiness_for_ceiling(&template().ceiling),
+            connection_readiness_for_ceiling(&ceiling),
             ConnectionReadiness::Missing,
         );
     }
