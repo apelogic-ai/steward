@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "steward/tool-binding-status/v1",
+  "capability": "github:repository.get_file_contents",
+  "provider": "github",
+  "credentialMode": "workload_identity",
+  "bindingRef": "workload:repository-review",
+  "status": "ready",
+  "disposition": "satisfied"
+}

@@ -1,5 +1,11 @@
 # Workflow and Task — the Missing Object
 
+> **M1 scope:** This is a pre-M1 design draft, not an M1 wire contract. The frozen
+> [steward.m1/v1 contract](contracts/m1/v1/README.md) is the sole authority for M1
+> public fields and authority decisions. In particular, M1 publishes TaskDefinition
+> catalog artifacts and creates one Task lifecycle; it does not expose the Workflow
+> object or planner-shaped Task model proposed below.
+
 Status: draft — proposes two new objects and one change to admission
 Audience: ApeLogic engineering
 Companions: *Solution Overview*, *Dev & Integration Spec*, *Data Plane Spec*,

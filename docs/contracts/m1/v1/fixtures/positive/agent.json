@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "steward/catalog/agent/v1",
+  "name": "coding-agent",
+  "version": 1,
+  "interface": "steward/agent/instruction-bundle/v1",
+  "accepts": [
+    "prompt",
+    "local_skill"
+  ]
+}

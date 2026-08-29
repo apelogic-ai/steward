@@ -1,0 +1,37 @@
+{
+  "contractVersion": "steward.m1/v1",
+  "taskUid": "11111111-1111-4111-8111-111111111111",
+  "workflow": "applications/repository-review@1",
+  "phase": "succeeded",
+  "runtimeUid": "runtime:abcdefghijkl",
+  "envelope": {
+    "uuid": "22222222-2222-4222-8222-222222222222",
+    "revision": 3,
+    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "admission": {
+    "verdict": "admitted",
+    "ready": true,
+    "blockers": []
+  },
+  "result": {
+    "state": "available",
+    "ref": "output:abcdefghijkl",
+    "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "mediaType": "application/x-tar",
+    "sizeBytes": 1024
+  },
+  "failureCode": null,
+  "evidence": {
+    "state": "available",
+    "ref": "evidence:abcdefghijkl",
+    "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "finalization": {
+    "state": "finalized",
+    "requestedAt": "2026-08-28T12:01:05Z",
+    "finalizedAt": "2026-08-28T12:01:07Z"
+  },
+  "createdAt": "2026-08-28T12:00:00Z",
+  "updatedAt": "2026-08-28T12:01:07Z"
+}

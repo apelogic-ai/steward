@@ -1,0 +1,6 @@
+{
+  "schemaVersion": "steward/catalog/prompt/v1",
+  "name": "repository-review",
+  "content": "prompt-body.test",
+  "mediaType": "text/markdown"
+}

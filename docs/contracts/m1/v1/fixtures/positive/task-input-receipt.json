@@ -1,0 +1,6 @@
+{
+  "ref": "input:abcdefghijkl",
+  "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "mediaType": "application/x-tar",
+  "sizeBytes": 4096
+}

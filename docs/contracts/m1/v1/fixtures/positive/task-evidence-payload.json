@@ -1,0 +1,156 @@
+{
+  "schemaVersion": "steward/evidence/task/v1",
+  "issuer": {
+    "instanceId": "44444444-4444-4444-8444-444444444444",
+    "keyId": "evidence:m1-attestation-key"
+  },
+  "issuedAt": "2026-08-28T12:01:07Z",
+  "taskUid": "11111111-1111-4111-8111-111111111111",
+  "runtimeUid": "runtime:abcdefghijkl",
+  "trigger": {
+    "transport": "github_actions",
+    "repositoryId": "123456",
+    "runId": "900001",
+    "runAttempt": 1,
+    "eventName": "pull_request",
+    "workflowPath": ".github/workflows/review.test",
+    "workflowRef": "refs/heads/main",
+    "workflowSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "triggeredSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "provenanceDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "resolvedPrincipal": {
+    "kind": "service",
+    "subject": "service:repository-review",
+    "ownerUserId": "usr_11111111111111111111111111111111"
+  },
+  "catalog": {
+    "coordinate": "applications/repository-review@1",
+    "publication": {
+      "contractVersion": "steward.m1/v1",
+      "publicationUid": "33333333-3333-4333-8333-333333333333",
+      "coordinate": "applications/repository-review@1",
+      "source": {
+        "provider": "github",
+        "repositoryId": "123456",
+        "commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "path": "packages/repository-review/workflow.test"
+      },
+      "contentDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "closureDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "publishedAt": "2026-08-28T11:00:00Z",
+      "idempotencyKeyDigest": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+    },
+    "taskDefinitionDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "closureDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "dependencies": [
+      {
+        "kind": "task_definition",
+        "ref": "applications/repository-review@1",
+        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      {
+        "kind": "prompt",
+        "ref": "prompt.test",
+        "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      {
+        "kind": "asset",
+        "ref": "prompt-body.test",
+        "digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212"
+      },
+      {
+        "kind": "local_skill",
+        "ref": "skills/inspect-repository/skill.test",
+        "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      {
+        "kind": "asset",
+        "ref": "skills/inspect-repository/instructions.test",
+        "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      {
+        "kind": "asset",
+        "ref": "skills/inspect-repository/references/checklist.test",
+        "digest": "sha256:1313131313131313131313131313131313131313131313131313131313131313"
+      },
+      {
+        "kind": "agent",
+        "ref": "coding-agent@1",
+        "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      }
+    ]
+  },
+  "input": {
+    "ref": "input:abcdefghijkl",
+    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "mediaType": "application/x-tar",
+    "sizeBytes": 4096
+  },
+  "output": {
+    "state": "available",
+    "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "mediaType": "application/x-tar",
+    "sizeBytes": 1024
+  },
+  "envelope": {
+    "uuid": "22222222-2222-4222-8222-222222222222",
+    "revision": 3,
+    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "executionBinding": {
+    "state": "created",
+    "type": "openshell",
+    "bindingRef": "openshell:m1-native-binding",
+    "release": "v0.0.98",
+    "runtimeClass": "steward-test",
+    "policyDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "imageDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "capabilitiesDigest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "admittedAuthority": {
+    "state": "admitted",
+    "requirements": {
+      "schemaVersion": "steward/catalog/authority-requirements/v1",
+      "models": [
+        {
+          "provider": "litellm",
+          "model": "review-model"
+        }
+      ],
+      "tools": [],
+      "budget": {
+        "currency": "USD",
+        "maxTaskAmount": "2.00",
+        "maxMonthlyAmount": "50.00"
+      },
+      "ttlSeconds": 3600,
+      "runnerResources": {
+        "cpuMillis": 1000,
+        "memoryMiB": 2048,
+        "ephemeralStorageMiB": 4096
+      }
+    }
+  },
+  "credentialBindings": [],
+  "admission": {
+    "verdict": "admitted",
+    "ready": true,
+    "blockers": []
+  },
+  "revocation": {
+    "state": "not_requested",
+    "targetSeconds": 60,
+    "maxDrainSeconds": 300
+  },
+  "lifecycle": {
+    "phase": "succeeded",
+    "disposition": "completed",
+    "submittedAt": "2026-08-28T12:00:00Z",
+    "admittedAt": "2026-08-28T12:00:02Z",
+    "executionStartedAt": "2026-08-28T12:00:05Z",
+    "terminalAt": "2026-08-28T12:01:00Z",
+    "finalizationRequestedAt": "2026-08-28T12:01:05Z",
+    "finalizedAt": "2026-08-28T12:01:07Z"
+  }
+}

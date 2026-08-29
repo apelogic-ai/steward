@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "steward/tool-binding-status/v1",
+  "capability": "github:repository.read_public",
+  "provider": "github",
+  "credentialMode": "none",
+  "status": "ready",
+  "disposition": "not_required"
+}

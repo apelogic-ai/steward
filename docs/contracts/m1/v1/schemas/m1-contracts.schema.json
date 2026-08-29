@@ -1,0 +1,2194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.apelogic.ai/steward/m1/v1/m1-contracts.schema.json",
+  "title": "Steward cross-product M1 contracts",
+  "description": "Frozen public wire and artifact shapes for Steward v0.2.0, steward-run v0.5.0, and Identity github-oidc-exchange v0.4.0.",
+  "$defs": {
+    "contractVersion": {
+      "const": "steward.m1/v1"
+    },
+    "qualifiedWorkflow": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}/[a-z][a-z0-9-]{0,62}@[1-9][0-9]*$"
+    },
+    "versionedName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}@[1-9][0-9]*$"
+    },
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "gitSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sourceId": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,19}$"
+    },
+    "canonicalUserId": {
+      "type": "string",
+      "pattern": "^usr_[0-9a-f]{32}$"
+    },
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}$"
+    },
+    "capability": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,31}:[a-z][a-z0-9._-]{0,95}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "pattern": "^(?!.*(?:^|/)\\.\\.?(?:/|$))[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+    },
+    "opaqueReference": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,31}:[A-Za-z0-9_-]{8,128}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:(?:[0-5][0-9]|60)(?:\\.[0-9]+)?Z$"
+    },
+    "decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$"
+    },
+    "base64url": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 10485760,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "identitySource": {
+      "type": "object",
+      "required": [
+        "provider",
+        "repositoryId",
+        "repositoryOwnerId",
+        "workflowPath",
+        "workflowRef",
+        "workflowSha",
+        "actorId"
+      ],
+      "properties": {
+        "provider": {
+          "const": "github"
+        },
+        "repositoryId": {
+          "$ref": "#/$defs/sourceId"
+        },
+        "repositoryOwnerId": {
+          "$ref": "#/$defs/sourceId"
+        },
+        "workflowPath": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "workflowRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "workflowSha": {
+          "$ref": "#/$defs/gitSha"
+        },
+        "actorId": {
+          "$ref": "#/$defs/sourceId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "resolvedPrincipal": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "subject",
+            "ownerUserId"
+          ],
+          "properties": {
+            "kind": {
+              "const": "service"
+            },
+            "subject": {
+              "$ref": "#/$defs/opaqueReference"
+            },
+            "ownerUserId": {
+              "$ref": "#/$defs/canonicalUserId"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "subject",
+            "ownerUserId",
+            "actingUserId"
+          ],
+          "properties": {
+            "kind": {
+              "const": "human_derived"
+            },
+            "subject": {
+              "$ref": "#/$defs/opaqueReference"
+            },
+            "ownerUserId": {
+              "$ref": "#/$defs/canonicalUserId"
+            },
+            "actingUserId": {
+              "$ref": "#/$defs/canonicalUserId"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "taskTrigger": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "transport",
+            "repositoryId",
+            "runId",
+            "runAttempt",
+            "eventName",
+            "workflowPath",
+            "workflowRef",
+            "workflowSha",
+            "triggeredSha",
+            "provenanceDigest"
+          ],
+          "properties": {
+            "transport": {
+              "const": "github_actions"
+            },
+            "repositoryId": {
+              "$ref": "#/$defs/sourceId"
+            },
+            "runId": {
+              "$ref": "#/$defs/sourceId"
+            },
+            "runAttempt": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "eventName": {
+              "enum": [
+                "pull_request",
+                "push",
+                "schedule",
+                "workflow_dispatch"
+              ]
+            },
+            "workflowPath": {
+              "$ref": "#/$defs/relativePath"
+            },
+            "workflowRef": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "workflowSha": {
+              "$ref": "#/$defs/gitSha"
+            },
+            "triggeredSha": {
+              "$ref": "#/$defs/gitSha"
+            },
+            "provenanceDigest": {
+              "$ref": "#/$defs/digest"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "transport",
+            "requestId",
+            "provenanceDigest"
+          ],
+          "properties": {
+            "transport": {
+              "const": "manual"
+            },
+            "requestId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "provenanceDigest": {
+              "$ref": "#/$defs/digest"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "authenticatedInput": {
+      "type": "object",
+      "required": [
+        "ref",
+        "digest",
+        "mediaType",
+        "sizeBytes"
+      ],
+      "properties": {
+        "ref": {
+          "$ref": "#/$defs/opaqueReference"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "mediaType": {
+          "const": "application/x-tar"
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 67108864
+        }
+      },
+      "additionalProperties": false
+    },
+    "taskInputReceipt": {
+      "$ref": "#/$defs/authenticatedInput"
+    },
+    "envelopeBinding": {
+      "type": "object",
+      "required": [
+        "uuid",
+        "revision",
+        "digest"
+      ],
+      "properties": {
+        "uuid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "sourceBinding": {
+      "type": "object",
+      "required": [
+        "provider",
+        "repositoryId",
+        "commitSha",
+        "path"
+      ],
+      "properties": {
+        "provider": {
+          "const": "github"
+        },
+        "repositoryId": {
+          "$ref": "#/$defs/sourceId"
+        },
+        "commitSha": {
+          "$ref": "#/$defs/gitSha"
+        },
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        }
+      },
+      "additionalProperties": false
+    },
+    "credentialMode": {
+      "enum": [
+        "none",
+        "user_connection",
+        "workload_identity",
+        "server_managed"
+      ]
+    },
+    "bindingCredentialMode": {
+      "enum": [
+        "user_connection",
+        "workload_identity",
+        "server_managed"
+      ]
+    },
+    "credentialStatus": {
+      "enum": [
+        "ready",
+        "missing",
+        "mismatched",
+        "unavailable",
+        "revoked"
+      ]
+    },
+    "toolBindingStatus": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "schemaVersion",
+            "capability",
+            "provider",
+            "credentialMode",
+            "status",
+            "disposition"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": "steward/tool-binding-status/v1"
+            },
+            "capability": {
+              "$ref": "#/$defs/capability"
+            },
+            "provider": {
+              "$ref": "#/$defs/slug"
+            },
+            "credentialMode": {
+              "const": "none"
+            },
+            "status": {
+              "const": "ready"
+            },
+            "disposition": {
+              "const": "not_required"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "schemaVersion",
+            "capability",
+            "provider",
+            "credentialMode",
+            "bindingRef",
+            "status",
+            "disposition"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": "steward/tool-binding-status/v1"
+            },
+            "capability": {
+              "$ref": "#/$defs/capability"
+            },
+            "provider": {
+              "$ref": "#/$defs/slug"
+            },
+            "credentialMode": {
+              "$ref": "#/$defs/bindingCredentialMode"
+            },
+            "bindingRef": {
+              "$ref": "#/$defs/opaqueReference"
+            },
+            "status": {
+              "const": "ready"
+            },
+            "disposition": {
+              "const": "satisfied"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "schemaVersion",
+            "capability",
+            "provider",
+            "credentialMode",
+            "bindingRef",
+            "status",
+            "disposition"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": "steward/tool-binding-status/v1"
+            },
+            "capability": {
+              "$ref": "#/$defs/capability"
+            },
+            "provider": {
+              "$ref": "#/$defs/slug"
+            },
+            "credentialMode": {
+              "$ref": "#/$defs/bindingCredentialMode"
+            },
+            "bindingRef": {
+              "$ref": "#/$defs/opaqueReference"
+            },
+            "status": {
+              "enum": [
+                "missing",
+                "mismatched",
+                "unavailable"
+              ]
+            },
+            "disposition": {
+              "const": "blocked"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "schemaVersion",
+            "capability",
+            "provider",
+            "credentialMode",
+            "bindingRef",
+            "status",
+            "disposition"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": "steward/tool-binding-status/v1"
+            },
+            "capability": {
+              "$ref": "#/$defs/capability"
+            },
+            "provider": {
+              "$ref": "#/$defs/slug"
+            },
+            "credentialMode": {
+              "$ref": "#/$defs/bindingCredentialMode"
+            },
+            "bindingRef": {
+              "$ref": "#/$defs/opaqueReference"
+            },
+            "status": {
+              "const": "revoked"
+            },
+            "disposition": {
+              "const": "revoked"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "admissionBlocker": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "code",
+            "capability",
+            "provider",
+            "credentialMode",
+            "bindingRef",
+            "status"
+          ],
+          "properties": {
+            "kind": {
+              "const": "credential_binding"
+            },
+            "code": {
+              "enum": [
+                "required_binding_missing",
+                "required_binding_mismatched",
+                "binding_status_unavailable",
+                "required_binding_revoked"
+              ]
+            },
+            "capability": {
+              "$ref": "#/$defs/capability"
+            },
+            "provider": {
+              "$ref": "#/$defs/slug"
+            },
+            "credentialMode": {
+              "$ref": "#/$defs/bindingCredentialMode"
+            },
+            "bindingRef": {
+              "$ref": "#/$defs/opaqueReference"
+            },
+            "status": {
+              "$ref": "#/$defs/credentialStatus"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "code",
+            "requirement"
+          ],
+          "properties": {
+            "kind": {
+              "const": "execution_requirement"
+            },
+            "code": {
+              "const": "capability_unavailable"
+            },
+            "requirement": {
+              "enum": [
+                "shell",
+                "python3"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "code",
+            "dimension"
+          ],
+          "properties": {
+            "kind": {
+              "const": "envelope_authority"
+            },
+            "code": {
+              "const": "outside_issued_envelope"
+            },
+            "dimension": {
+              "enum": [
+                "model",
+                "tool",
+                "budget",
+                "ttl",
+                "runner_resources"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "code",
+            "catalog"
+          ],
+          "properties": {
+            "kind": {
+              "const": "catalog_authorization"
+            },
+            "code": {
+              "enum": [
+                "scope_denied",
+                "source_denied",
+                "publication_not_found",
+                "publication_integrity_failed"
+              ]
+            },
+            "catalog": {
+              "$ref": "#/$defs/slug"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "admission": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "verdict",
+            "ready",
+            "blockers"
+          ],
+          "properties": {
+            "verdict": {
+              "enum": [
+                "pending",
+                "admitted"
+              ]
+            },
+            "ready": {
+              "const": true
+            },
+            "blockers": {
+              "type": "array",
+              "maxItems": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "verdict",
+            "ready",
+            "blockers"
+          ],
+          "properties": {
+            "verdict": {
+              "enum": [
+                "parked",
+                "rejected"
+              ]
+            },
+            "ready": {
+              "const": false
+            },
+            "blockers": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/admissionBlocker"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "modelRequirement": {
+      "type": "object",
+      "required": [
+        "provider",
+        "model"
+      ],
+      "properties": {
+        "provider": {
+          "$ref": "#/$defs/slug"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "additionalProperties": false
+    },
+    "runnerResources": {
+      "type": "object",
+      "required": [
+        "cpuMillis",
+        "memoryMiB",
+        "ephemeralStorageMiB"
+      ],
+      "properties": {
+        "cpuMillis": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "memoryMiB": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "ephemeralStorageMiB": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "executionRequirements": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "capabilities"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "steward/catalog/execution-requirements/v1"
+        },
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "shell",
+              "python3"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "authorityRequirements": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "models",
+        "tools",
+        "budget",
+        "ttlSeconds",
+        "runnerResources"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "steward/catalog/authority-requirements/v1"
+        },
+        "models": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/modelRequirement"
+          }
+        },
+        "tools": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/capability"
+          }
+        },
+        "budget": {
+          "type": "object",
+          "required": [
+            "currency",
+            "maxTaskAmount",
+            "maxMonthlyAmount"
+          ],
+          "properties": {
+            "currency": {
+              "const": "USD"
+            },
+            "maxTaskAmount": {
+              "$ref": "#/$defs/decimal"
+            },
+            "maxMonthlyAmount": {
+              "$ref": "#/$defs/decimal"
+            }
+          },
+          "additionalProperties": false
+        },
+        "ttlSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        },
+        "runnerResources": {
+          "$ref": "#/$defs/runnerResources"
+        }
+      },
+      "additionalProperties": false
+    },
+    "taskSubmission": {
+      "type": "object",
+      "required": [
+        "contractVersion",
+        "workflow",
+        "envelopeRef",
+        "trigger",
+        "input"
+      ],
+      "properties": {
+        "contractVersion": {
+          "$ref": "#/$defs/contractVersion"
+        },
+        "workflow": {
+          "$ref": "#/$defs/qualifiedWorkflow"
+        },
+        "envelopeRef": {
+          "$ref": "#/$defs/uuid"
+        },
+        "teamRef": {
+          "$ref": "#/$defs/opaqueReference"
+        },
+        "trigger": {
+          "$ref": "#/$defs/taskTrigger"
+        },
+        "input": {
+          "$ref": "#/$defs/authenticatedInput"
+        }
+      },
+      "additionalProperties": false
+    },
+    "legacyTaskSubmission": {
+      "type": "object",
+      "required": [
+        "workflow"
+      ],
+      "properties": {
+        "workflow": {
+          "$ref": "#/$defs/versionedName"
+        },
+        "agentRuntimeUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "additionalProperties": false
+    },
+    "taskCreateResponse": {
+      "type": "object",
+      "required": [
+        "contractVersion",
+        "taskUid",
+        "workflow",
+        "phase",
+        "runtimeUid",
+        "envelope",
+        "admission",
+        "statusPath"
+      ],
+      "properties": {
+        "contractVersion": {
+          "$ref": "#/$defs/contractVersion"
+        },
+        "taskUid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "workflow": {
+          "$ref": "#/$defs/qualifiedWorkflow"
+        },
+        "phase": {
+          "enum": [
+            "submitted",
+            "parked"
+          ]
+        },
+        "runtimeUid": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        },
+        "envelope": {
+          "$ref": "#/$defs/envelopeBinding"
+        },
+        "admission": {
+          "$ref": "#/$defs/admission"
+        },
+        "statusPath": {
+          "$ref": "#/$defs/relativePath"
+        }
+      },
+      "additionalProperties": false
+    },
+    "taskResult": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "state"
+          ],
+          "properties": {
+            "state": {
+              "enum": [
+                "pending",
+                "absent"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "ref",
+            "digest",
+            "mediaType",
+            "sizeBytes"
+          ],
+          "properties": {
+            "state": {
+              "const": "available"
+            },
+            "ref": {
+              "$ref": "#/$defs/opaqueReference"
+            },
+            "digest": {
+              "$ref": "#/$defs/digest"
+            },
+            "mediaType": {
+              "const": "application/x-tar"
+            },
+            "sizeBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 67108864
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "finalizationStatus": {
+      "type": "object",
+      "required": [
+        "state",
+        "requestedAt",
+        "finalizedAt"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "open",
+            "requested",
+            "enforcing",
+            "finalized"
+          ]
+        },
+        "requestedAt": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "finalizedAt": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "taskEvidenceStatus": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "state"
+          ],
+          "properties": {
+            "state": {
+              "const": "pending"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "ref",
+            "digest"
+          ],
+          "properties": {
+            "state": {
+              "const": "available"
+            },
+            "ref": {
+              "$ref": "#/$defs/opaqueReference"
+            },
+            "digest": {
+              "$ref": "#/$defs/digest"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "taskStatus": {
+      "type": "object",
+      "required": [
+        "contractVersion",
+        "taskUid",
+        "workflow",
+        "phase",
+        "runtimeUid",
+        "envelope",
+        "admission",
+        "result",
+        "failureCode",
+        "evidence",
+        "finalization",
+        "createdAt",
+        "updatedAt"
+      ],
+      "properties": {
+        "contractVersion": {
+          "$ref": "#/$defs/contractVersion"
+        },
+        "taskUid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "workflow": {
+          "$ref": "#/$defs/qualifiedWorkflow"
+        },
+        "phase": {
+          "enum": [
+            "submitted",
+            "parked",
+            "queued",
+            "running",
+            "succeeded",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "runtimeUid": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        },
+        "envelope": {
+          "$ref": "#/$defs/envelopeBinding"
+        },
+        "admission": {
+          "$ref": "#/$defs/admission"
+        },
+        "result": {
+          "$ref": "#/$defs/taskResult"
+        },
+        "failureCode": {
+          "oneOf": [
+            {
+              "enum": [
+                "catalog_resolution_failed",
+                "admission_rejected",
+                "runtime_failed",
+                "cancelled",
+                "finalization_failed"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence": {
+          "$ref": "#/$defs/taskEvidenceStatus"
+        },
+        "finalization": {
+          "$ref": "#/$defs/finalizationStatus"
+        },
+        "createdAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "updatedAt": {
+          "$ref": "#/$defs/timestamp"
+        }
+      },
+      "additionalProperties": false
+    },
+    "taskFinalizationRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "contractVersion",
+            "mode",
+            "expectedPhase"
+          ],
+          "properties": {
+            "contractVersion": {
+              "$ref": "#/$defs/contractVersion"
+            },
+            "mode": {
+              "const": "complete"
+            },
+            "expectedPhase": {
+              "enum": [
+                "succeeded",
+                "failed"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "contractVersion",
+            "mode"
+          ],
+          "properties": {
+            "contractVersion": {
+              "$ref": "#/$defs/contractVersion"
+            },
+            "mode": {
+              "const": "cancel"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "identityClaims": {
+      "type": "object",
+      "required": [
+        "iss",
+        "sub",
+        "aud",
+        "exp",
+        "iat",
+        "nbf",
+        "jti",
+        "identity_contract",
+        "source",
+        "catalog_scopes",
+        "principal"
+      ],
+      "properties": {
+        "iss": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "sub": {
+          "$ref": "#/$defs/opaqueReference"
+        },
+        "aud": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              }
+            }
+          ]
+        },
+        "exp": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "iat": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "nbf": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "jti": {
+          "$ref": "#/$defs/opaqueReference"
+        },
+        "identity_contract": {
+          "const": "steward/identity/task-claims/v1"
+        },
+        "source": {
+          "$ref": "#/$defs/identitySource"
+        },
+        "catalog_scopes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/slug"
+          }
+        },
+        "principal": {
+          "$ref": "#/$defs/resolvedPrincipal"
+        }
+      },
+      "additionalProperties": false
+    },
+    "taskDefinition": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "name",
+        "version",
+        "agent",
+        "prompt",
+        "skills",
+        "lock",
+        "requires"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "steward/catalog/task-definition/v1"
+        },
+        "name": {
+          "$ref": "#/$defs/slug"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "agent": {
+          "$ref": "#/$defs/versionedName"
+        },
+        "prompt": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "skills": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/relativePath"
+          }
+        },
+        "lock": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "requires": {
+          "type": "object",
+          "required": [
+            "execution",
+            "authority"
+          ],
+          "properties": {
+            "execution": {
+              "$ref": "#/$defs/executionRequirements"
+            },
+            "authority": {
+              "$ref": "#/$defs/authorityRequirements"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "prompt": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "name",
+        "content",
+        "mediaType"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "steward/catalog/prompt/v1"
+        },
+        "name": {
+          "$ref": "#/$defs/slug"
+        },
+        "content": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "mediaType": {
+          "const": "text/markdown"
+        }
+      },
+      "additionalProperties": false
+    },
+    "localSkill": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "name",
+        "kind",
+        "instructions",
+        "assets",
+        "requires"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "steward/catalog/local-skill/v1"
+        },
+        "name": {
+          "$ref": "#/$defs/slug"
+        },
+        "kind": {
+          "const": "instruction_only"
+        },
+        "instructions": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "assets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/relativePath"
+          }
+        },
+        "requires": {
+          "type": "object",
+          "required": [
+            "execution",
+            "authority"
+          ],
+          "properties": {
+            "execution": {
+              "$ref": "#/$defs/executionRequirements"
+            },
+            "authority": {
+              "$ref": "#/$defs/authorityRequirements"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "dependencyLockEntry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "ref",
+            "digest"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "prompt",
+                "local_skill",
+                "asset"
+              ]
+            },
+            "ref": {
+              "$ref": "#/$defs/relativePath"
+            },
+            "digest": {
+              "$ref": "#/$defs/digest"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "ref",
+            "digest"
+          ],
+          "properties": {
+            "kind": {
+              "const": "agent"
+            },
+            "ref": {
+              "$ref": "#/$defs/versionedName"
+            },
+            "digest": {
+              "$ref": "#/$defs/digest"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "dependencyLock": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "taskDefinition",
+        "entries",
+        "closureDigest"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "steward/catalog/dependency-lock/v1"
+        },
+        "taskDefinition": {
+          "type": "object",
+          "required": [
+            "path",
+            "digest"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/relativePath"
+            },
+            "digest": {
+              "$ref": "#/$defs/digest"
+            }
+          },
+          "additionalProperties": false
+        },
+        "entries": {
+          "type": "array",
+          "minItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/dependencyLockEntry"
+          }
+        },
+        "closureDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "agent": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "name",
+        "version",
+        "interface",
+        "accepts"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "steward/catalog/agent/v1"
+        },
+        "name": {
+          "$ref": "#/$defs/slug"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "interface": {
+          "const": "steward/agent/instruction-bundle/v1"
+        },
+        "accepts": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "prompt",
+              "local_skill"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "catalogPublicationRequest": {
+      "type": "object",
+      "required": [
+        "contractVersion",
+        "coordinate",
+        "source",
+        "contentDigest",
+        "closureDigest"
+      ],
+      "properties": {
+        "contractVersion": {
+          "$ref": "#/$defs/contractVersion"
+        },
+        "coordinate": {
+          "$ref": "#/$defs/qualifiedWorkflow"
+        },
+        "source": {
+          "$ref": "#/$defs/sourceBinding"
+        },
+        "contentDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "closureDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "catalogPublicationWitness": {
+      "type": "object",
+      "required": [
+        "contractVersion",
+        "publicationUid",
+        "coordinate",
+        "source",
+        "contentDigest",
+        "closureDigest",
+        "publishedAt",
+        "idempotencyKeyDigest"
+      ],
+      "properties": {
+        "contractVersion": {
+          "$ref": "#/$defs/contractVersion"
+        },
+        "publicationUid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "coordinate": {
+          "$ref": "#/$defs/qualifiedWorkflow"
+        },
+        "source": {
+          "$ref": "#/$defs/sourceBinding"
+        },
+        "contentDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "closureDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "publishedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "idempotencyKeyDigest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "toolCapability": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "schemaVersion",
+            "capability",
+            "provider",
+            "credentialMode",
+            "bindingKind"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": "steward/tool-capability/v1"
+            },
+            "capability": {
+              "$ref": "#/$defs/capability"
+            },
+            "provider": {
+              "$ref": "#/$defs/slug"
+            },
+            "credentialMode": {
+              "const": "none"
+            },
+            "bindingKind": {
+              "const": "none"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "schemaVersion",
+            "capability",
+            "provider",
+            "credentialMode",
+            "bindingKind"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": "steward/tool-capability/v1"
+            },
+            "capability": {
+              "$ref": "#/$defs/capability"
+            },
+            "provider": {
+              "$ref": "#/$defs/slug"
+            },
+            "credentialMode": {
+              "const": "user_connection"
+            },
+            "bindingKind": {
+              "const": "principal"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "schemaVersion",
+            "capability",
+            "provider",
+            "credentialMode",
+            "bindingKind"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": "steward/tool-capability/v1"
+            },
+            "capability": {
+              "$ref": "#/$defs/capability"
+            },
+            "provider": {
+              "$ref": "#/$defs/slug"
+            },
+            "credentialMode": {
+              "const": "workload_identity"
+            },
+            "bindingKind": {
+              "const": "workload"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "schemaVersion",
+            "capability",
+            "provider",
+            "credentialMode",
+            "bindingKind"
+          ],
+          "properties": {
+            "schemaVersion": {
+              "const": "steward/tool-capability/v1"
+            },
+            "capability": {
+              "$ref": "#/$defs/capability"
+            },
+            "provider": {
+              "$ref": "#/$defs/slug"
+            },
+            "credentialMode": {
+              "const": "server_managed"
+            },
+            "bindingKind": {
+              "const": "server"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "revocationRecord": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "targetSeconds",
+            "maxDrainSeconds"
+          ],
+          "properties": {
+            "state": {
+              "const": "not_requested"
+            },
+            "targetSeconds": {
+              "const": 60
+            },
+            "maxDrainSeconds": {
+              "const": 300
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "targetSeconds",
+            "maxDrainSeconds",
+            "requestedAt",
+            "observedAt",
+            "deadlineAt",
+            "authorityDisabledAt",
+            "drainStartedAt",
+            "drainDeadlineAt",
+            "teardownStartedAt",
+            "teardownCompletedAt",
+            "inFlightDisposition"
+          ],
+          "properties": {
+            "state": {
+              "enum": [
+                "enforced",
+                "deadline_missed"
+              ]
+            },
+            "targetSeconds": {
+              "const": 60
+            },
+            "maxDrainSeconds": {
+              "const": 300
+            },
+            "requestedAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "observedAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "deadlineAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "authorityDisabledAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "drainStartedAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "drainDeadlineAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "teardownStartedAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "teardownCompletedAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "inFlightDisposition": {
+              "enum": [
+                "none",
+                "completed",
+                "cancelled",
+                "failed"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "artifactEvidence": {
+      "type": "object",
+      "required": [
+        "kind",
+        "ref",
+        "digest"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "task_definition",
+            "prompt",
+            "local_skill",
+            "asset",
+            "agent"
+          ]
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidenceOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "state"
+          ],
+          "properties": {
+            "state": {
+              "const": "absent"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "digest",
+            "mediaType",
+            "sizeBytes"
+          ],
+          "properties": {
+            "state": {
+              "const": "available"
+            },
+            "digest": {
+              "$ref": "#/$defs/digest"
+            },
+            "mediaType": {
+              "const": "application/x-tar"
+            },
+            "sizeBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 67108864
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "executionBindingEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "state"
+          ],
+          "properties": {
+            "state": {
+              "const": "not_created"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "type",
+            "bindingRef",
+            "release",
+            "runtimeClass",
+            "policyDigest",
+            "imageDigest",
+            "capabilitiesDigest"
+          ],
+          "properties": {
+            "state": {
+              "const": "created"
+            },
+            "type": {
+              "const": "openshell"
+            },
+            "bindingRef": {
+              "$ref": "#/$defs/opaqueReference"
+            },
+            "release": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "runtimeClass": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 63
+            },
+            "policyDigest": {
+              "$ref": "#/$defs/digest"
+            },
+            "imageDigest": {
+              "$ref": "#/$defs/digest"
+            },
+            "capabilitiesDigest": {
+              "$ref": "#/$defs/digest"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "admittedAuthorityEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "state"
+          ],
+          "properties": {
+            "state": {
+              "const": "not_admitted"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "state",
+            "requirements"
+          ],
+          "properties": {
+            "state": {
+              "const": "admitted"
+            },
+            "requirements": {
+              "$ref": "#/$defs/authorityRequirements"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "taskEvidencePayload": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "issuer",
+        "issuedAt",
+        "taskUid",
+        "runtimeUid",
+        "trigger",
+        "resolvedPrincipal",
+        "catalog",
+        "input",
+        "output",
+        "envelope",
+        "executionBinding",
+        "admittedAuthority",
+        "credentialBindings",
+        "admission",
+        "revocation",
+        "lifecycle"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "steward/evidence/task/v1"
+        },
+        "issuer": {
+          "type": "object",
+          "required": [
+            "instanceId",
+            "keyId"
+          ],
+          "properties": {
+            "instanceId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "keyId": {
+              "$ref": "#/$defs/opaqueReference"
+            }
+          },
+          "additionalProperties": false
+        },
+        "issuedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "taskUid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "runtimeUid": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "trigger": {
+          "$ref": "#/$defs/taskTrigger"
+        },
+        "resolvedPrincipal": {
+          "$ref": "#/$defs/resolvedPrincipal"
+        },
+        "catalog": {
+          "type": "object",
+          "required": [
+            "coordinate",
+            "publication",
+            "taskDefinitionDigest",
+            "closureDigest",
+            "dependencies"
+          ],
+          "properties": {
+            "coordinate": {
+              "$ref": "#/$defs/qualifiedWorkflow"
+            },
+            "publication": {
+              "$ref": "#/$defs/catalogPublicationWitness"
+            },
+            "taskDefinitionDigest": {
+              "$ref": "#/$defs/digest"
+            },
+            "closureDigest": {
+              "$ref": "#/$defs/digest"
+            },
+            "dependencies": {
+              "type": "array",
+              "minItems": 3,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/artifactEvidence"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "input": {
+          "$ref": "#/$defs/authenticatedInput"
+        },
+        "output": {
+          "$ref": "#/$defs/evidenceOutput"
+        },
+        "envelope": {
+          "$ref": "#/$defs/envelopeBinding"
+        },
+        "executionBinding": {
+          "$ref": "#/$defs/executionBindingEvidence"
+        },
+        "admittedAuthority": {
+          "$ref": "#/$defs/admittedAuthorityEvidence"
+        },
+        "credentialBindings": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/toolBindingStatus"
+          }
+        },
+        "admission": {
+          "$ref": "#/$defs/admission"
+        },
+        "revocation": {
+          "$ref": "#/$defs/revocationRecord"
+        },
+        "lifecycle": {
+          "type": "object",
+          "required": [
+            "phase",
+            "disposition",
+            "submittedAt",
+            "admittedAt",
+            "executionStartedAt",
+            "terminalAt",
+            "finalizationRequestedAt",
+            "finalizedAt"
+          ],
+          "properties": {
+            "phase": {
+              "enum": [
+                "succeeded",
+                "failed",
+                "cancelled"
+              ]
+            },
+            "disposition": {
+              "enum": [
+                "completed",
+                "execution_failed",
+                "cancelled_by_caller",
+                "revoked"
+              ]
+            },
+            "submittedAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "admittedAt": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/timestamp"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "executionStartedAt": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/timestamp"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "terminalAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "finalizationRequestedAt": {
+              "$ref": "#/$defs/timestamp"
+            },
+            "finalizedAt": {
+              "$ref": "#/$defs/timestamp"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "signedTaskEvidence": {
+      "type": "object",
+      "required": [
+        "payloadType",
+        "payload",
+        "signatures"
+      ],
+      "properties": {
+        "payloadType": {
+          "const": "application/vnd.steward.task-evidence.v1+json"
+        },
+        "payload": {
+          "$ref": "#/$defs/base64url"
+        },
+        "signatures": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "keyid",
+              "sig"
+            ],
+            "properties": {
+              "keyid": {
+                "$ref": "#/$defs/opaqueReference"
+              },
+              "sig": {
+                "$ref": "#/$defs/base64url"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidenceVerificationMaterial": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "instanceId",
+        "payloadType",
+        "canonicalization",
+        "envelope",
+        "keys"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": "steward/evidence/verification-material/v1"
+        },
+        "instanceId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "payloadType": {
+          "const": "application/vnd.steward.task-evidence.v1+json"
+        },
+        "canonicalization": {
+          "const": "RFC8785"
+        },
+        "envelope": {
+          "const": "DSSEv1"
+        },
+        "keys": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "required": [
+              "kty",
+              "crv",
+              "use",
+              "alg",
+              "kid",
+              "x"
+            ],
+            "properties": {
+              "kty": {
+                "const": "OKP"
+              },
+              "crv": {
+                "const": "Ed25519"
+              },
+              "use": {
+                "const": "sig"
+              },
+              "alg": {
+                "const": "EdDSA"
+              },
+              "kid": {
+                "$ref": "#/$defs/opaqueReference"
+              },
+              "x": {
+                "$ref": "#/$defs/base64url"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

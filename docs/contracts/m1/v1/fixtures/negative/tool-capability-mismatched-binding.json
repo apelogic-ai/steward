@@ -1,0 +1,7 @@
+{
+  "schemaVersion": "steward/tool-capability/v1",
+  "capability": "github:repository.get_file_contents",
+  "provider": "github",
+  "credentialMode": "workload_identity",
+  "bindingKind": "principal"
+}
