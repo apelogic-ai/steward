@@ -257,7 +257,7 @@ fn validate_redirect_after(value: &str) -> Result<(), PortError> {
         || redirect.host_str().is_none()
         || !redirect.username().is_empty()
         || redirect.password().is_some()
-        || redirect.path() != "/admin/connections"
+        || redirect.path() != "/connections"
         || redirect.query().is_some()
         || !matches!(redirect.fragment(), None | Some("github-connected"))
     {
@@ -317,10 +317,22 @@ mod tests {
     #[test]
     fn start_request_rejects_non_allowlisted_redirect_and_unknown_fields() {
         let operation = GithubBridgeOperation::Start;
+        assert_eq!(
+            GithubBridgeRequest::parse(
+                operation,
+                br#"{"redirectAfter":"https://steward.example.test/connections#github-connected"}"#,
+            ),
+            Ok(GithubBridgeRequest::Start {
+                redirect_after: "https://steward.example.test/connections#github-connected"
+                    .to_owned(),
+            })
+        );
         for input in [
             br#"{}"#.as_slice(),
-            br#"{"redirectAfter":"http://steward.example.test/admin/connections"}"#.as_slice(),
-            br#"{"redirectAfter":"https://steward.example.test/admin/connections","runtimeUid":"other"}"#.as_slice(),
+            br#"{"redirectAfter":"http://steward.example.test/connections"}"#.as_slice(),
+            br#"{"redirectAfter":"https://steward.example.test/admin/connections"}"#.as_slice(),
+            br#"{"redirectAfter":"https://steward.example.test/connections","runtimeUid":"other"}"#
+                .as_slice(),
         ] {
             assert!(
                 GithubBridgeRequest::parse(operation, input).is_err(),
@@ -339,7 +351,7 @@ mod tests {
             assert!(
                 GithubBridgeRequest::parse(
                     operation,
-                    br#"{"redirectAfter":"https://steward.example.test/admin/connections"}"#
+                    br#"{"redirectAfter":"https://steward.example.test/connections"}"#
                 )
                 .is_err(),
                 "only github.start may receive one server-authored field"

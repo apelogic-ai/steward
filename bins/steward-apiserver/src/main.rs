@@ -177,9 +177,10 @@ fn browser_application_router(
         Arc::new(browser_auth::PgBrowserIdentityResolver::new(store.clone())),
     )
     .map_err(io::Error::other)?;
+    let connections = browser_hop1_connections_configuration(&origin)?;
     let app = browser_auth::browser_auth_router(auth.clone())
         .merge(user_envelopes::protected_router(
-            user_envelopes::PgEnvelopeRequestBroker::new(store.clone()),
+            user_envelopes::PgEnvelopeRequestBroker::new(store.clone(), connections.clone()),
             auth.clone(),
         ))
         .merge(agent_runs_ui::protected_router(store.clone(), auth.clone()))
@@ -193,7 +194,7 @@ fn browser_application_router(
             store.clone(),
             auth.clone(),
         ));
-    let app = match browser_hop1_connections_configuration(&origin)? {
+    let app = match connections {
         Some(broker) => app.merge(connections::protected_router(broker, auth.clone())),
         None => app,
     };

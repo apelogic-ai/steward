@@ -219,7 +219,7 @@ async fn adapt_browser_context(mut request: Request, next: Next) -> Response {
 }
 
 #[cfg(test)]
-fn test_router<P, B>(broker: P) -> Router
+pub(crate) fn test_router<P, B>(broker: P) -> Router
 where
     P: ProviderConnectionBroker<B>,
     B: Clone + Eq + Hash + Send + Sync + 'static,
