@@ -1,0 +1,27 @@
+{
+  "iss": "https://identity.example.com",
+  "sub": "service:repository-review",
+  "aud": "steward-task-api",
+  "exp": 1787933100,
+  "iat": 1787932800,
+  "nbf": 1787932800,
+  "jti": "token:abcdefghijkl",
+  "identity_contract": "steward/identity/task-claims/v1",
+  "source": {
+    "provider": "github",
+    "repository": "example-org/repository",
+    "repositoryOwnerId": "7890",
+    "workflowPath": ".github/workflows/review.test",
+    "workflowRef": "refs/heads/main",
+    "workflowSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "actorId": "24680"
+  },
+  "catalog_scopes": [
+    "applications"
+  ],
+  "principal": {
+    "kind": "service",
+    "subject": "service:repository-review",
+    "ownerUserId": "usr_11111111111111111111111111111111"
+  }
+}

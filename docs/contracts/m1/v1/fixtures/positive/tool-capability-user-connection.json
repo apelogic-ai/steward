@@ -1,0 +1,7 @@
+{
+  "schemaVersion": "steward/tool-capability/v1",
+  "capability": "drive:document.read",
+  "provider": "drive",
+  "credentialMode": "user_connection",
+  "bindingKind": "principal"
+}

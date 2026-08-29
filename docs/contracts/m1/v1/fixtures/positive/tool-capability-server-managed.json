@@ -1,0 +1,7 @@
+{
+  "schemaVersion": "steward/tool-capability/v1",
+  "capability": "jira:issue.read",
+  "provider": "jira",
+  "credentialMode": "server_managed",
+  "bindingKind": "server"
+}

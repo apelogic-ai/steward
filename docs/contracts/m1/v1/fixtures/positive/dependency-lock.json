@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "steward/catalog/dependency-lock/v1",
+  "taskDefinition": {
+    "path": "workflow.test",
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "entries": [
+    {
+      "kind": "agent",
+      "ref": "coding-agent@1",
+      "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    {
+      "kind": "asset",
+      "ref": "prompt-body.test",
+      "digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212"
+    },
+    {
+      "kind": "asset",
+      "ref": "skills/inspect-repository/instructions.test",
+      "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    {
+      "kind": "asset",
+      "ref": "skills/inspect-repository/references/checklist.test",
+      "digest": "sha256:1313131313131313131313131313131313131313131313131313131313131313"
+    },
+    {
+      "kind": "local_skill",
+      "ref": "skills/inspect-repository/skill.test",
+      "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "kind": "prompt",
+      "ref": "prompt.test",
+      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "closureDigest": "sha256:61ea74b651b8246b18a8a98d3069411e7432404f8030e91e243ae632bc8253fc"
+}

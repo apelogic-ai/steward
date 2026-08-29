@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "steward/evidence/verification-material/v1",
+  "instanceId": "44444444-4444-4444-8444-444444444444",
+  "payloadType": "application/vnd.steward.task-evidence.v1+json",
+  "canonicalization": "RFC8785",
+  "envelope": "DSSEv1",
+  "keys": [
+    {
+      "kty": "EC",
+      "crv": "P-256",
+      "use": "sig",
+      "alg": "ES256",
+      "kid": "runtime:mint-signing-key",
+      "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    }
+  ]
+}

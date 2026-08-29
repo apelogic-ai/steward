@@ -5,6 +5,10 @@ use std::path::Path;
 
 use serde_json::Value;
 
+mod m1_contracts;
+
+pub use m1_contracts::{M1ContractSummary, validate_m1_contract_directory};
+
 pub const PROVIDER_PROFILE_BUNDLE_SCHEMA: &str = "steward.provider-profile-bundle/v1";
 pub const PROVIDER_PROFILE_TEMPLATE_SCHEMA: &str = "steward.provider-profile-template/v1";
 pub const PROVIDER_PROFILE_INPUTS_SCHEMA: &str = "steward.provider-profile-inputs/v1";

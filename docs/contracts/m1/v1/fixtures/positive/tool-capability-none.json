@@ -1,0 +1,7 @@
+{
+  "schemaVersion": "steward/tool-capability/v1",
+  "capability": "github:repository.read_public",
+  "provider": "github",
+  "credentialMode": "none",
+  "bindingKind": "none"
+}

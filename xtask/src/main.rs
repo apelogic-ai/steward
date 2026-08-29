@@ -13,8 +13,8 @@ use xtask::{
     install_rendered_provider_profile_bundle, local_test_context_is_safe,
     migration_base_candidates, migration_history_violations, neutrality_violations,
     reconcile_rendered_provider_profile_bundle, render_provider_profile_bundle_directory,
-    secret_violations, select_migration_base, validate_provider_profile_bundle_directory,
-    validate_register_content,
+    secret_violations, select_migration_base, validate_m1_contract_directory,
+    validate_provider_profile_bundle_directory, validate_register_content,
 };
 
 type TaskResult = Result<(), String>;
@@ -56,6 +56,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "verify-manifests" if rest.is_empty() => verify_manifests(),
         "check-neutrality" if rest.is_empty() => check_neutrality(),
         "check-secrets" if rest.is_empty() => check_secrets(),
+        "m1-contracts" if rest == ["--check"] => m1_contracts_check(),
         "conformance" => conformance(rest),
         "register" => register(rest),
         "ports" if rest == ["--check"] => ports_check(),
@@ -93,6 +94,7 @@ fn usage() -> String {
         "  verify-manifests",
         "  check-neutrality",
         "  check-secrets",
+        "  m1-contracts --check",
         "  conformance --pinned|--latest",
         "  register --check",
         "  ports --check",
@@ -152,12 +154,31 @@ fn quality() -> TaskResult {
     policy_test()?;
     migrate_check()?;
     verify_manifests()?;
+    m1_contracts_check()?;
     check_neutrality()?;
     check_secrets()?;
     provider_profile_bundle_validate()?;
     register(&["--check".to_owned()])?;
     ports_check()?;
     layering_test()
+}
+
+fn m1_contracts_check() -> TaskResult {
+    let directory = root().join("docs/contracts/m1/v1");
+    let summary = validate_m1_contract_directory(&directory).map_err(|error| {
+        format!(
+            "M1 contract validation failed for {}: {error}",
+            directory.display()
+        )
+    })?;
+    println!(
+        "m1-contracts --check: {} definitions; {} positive, {} negative, {} compatibility fixtures",
+        summary.definitions,
+        summary.positive_fixtures,
+        summary.negative_fixtures,
+        summary.compatibility_fixtures
+    );
+    Ok(())
 }
 
 fn provider_profile_bundle_validate() -> TaskResult {

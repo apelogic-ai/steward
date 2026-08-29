@@ -1,0 +1,12 @@
+{
+  "contractVersion": "steward.m1/v1",
+  "coordinate": "applications/repository-review@1",
+  "source": {
+    "provider": "github",
+    "repositoryId": "123456",
+    "commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "path": "packages/repository-review/workflow.test"
+  },
+  "contentDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "closureDigest": "sha256:61ea74b651b8246b18a8a98d3069411e7432404f8030e91e243ae632bc8253fc"
+}

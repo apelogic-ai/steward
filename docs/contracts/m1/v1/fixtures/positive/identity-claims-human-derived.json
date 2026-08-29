@@ -1,0 +1,30 @@
+{
+  "iss": "https://identity.example.com",
+  "sub": "user:abcdefghijkl",
+  "aud": [
+    "steward-task-api"
+  ],
+  "exp": 1787933100,
+  "iat": 1787932800,
+  "nbf": 1787932800,
+  "jti": "token:mnopqrstuvwx",
+  "identity_contract": "steward/identity/task-claims/v1",
+  "source": {
+    "provider": "github",
+    "repositoryId": "123456",
+    "repositoryOwnerId": "7890",
+    "workflowPath": ".github/workflows/review.test",
+    "workflowRef": "refs/heads/main",
+    "workflowSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "actorId": "24680"
+  },
+  "catalog_scopes": [
+    "applications"
+  ],
+  "principal": {
+    "kind": "human_derived",
+    "subject": "user:abcdefghijkl",
+    "ownerUserId": "usr_11111111111111111111111111111111",
+    "actingUserId": "usr_11111111111111111111111111111111"
+  }
+}

@@ -1,0 +1,451 @@
+{
+  "schemaVersion": "steward.contracts/manifest/v1",
+  "contractVersion": "steward.m1/v1",
+  "schema": "schemas/m1-contracts.schema.json",
+  "definitions": [
+    {
+      "name": "agent",
+      "ref": "#/$defs/agent"
+    },
+    {
+      "name": "authorityRequirements",
+      "ref": "#/$defs/authorityRequirements"
+    },
+    {
+      "name": "catalogPublicationRequest",
+      "ref": "#/$defs/catalogPublicationRequest"
+    },
+    {
+      "name": "catalogPublicationWitness",
+      "ref": "#/$defs/catalogPublicationWitness"
+    },
+    {
+      "name": "dependencyLock",
+      "ref": "#/$defs/dependencyLock"
+    },
+    {
+      "name": "evidenceVerificationMaterial",
+      "ref": "#/$defs/evidenceVerificationMaterial"
+    },
+    {
+      "name": "executionRequirements",
+      "ref": "#/$defs/executionRequirements"
+    },
+    {
+      "name": "identityClaims",
+      "ref": "#/$defs/identityClaims"
+    },
+    {
+      "name": "legacyTaskSubmission",
+      "ref": "#/$defs/legacyTaskSubmission"
+    },
+    {
+      "name": "localSkill",
+      "ref": "#/$defs/localSkill"
+    },
+    {
+      "name": "prompt",
+      "ref": "#/$defs/prompt"
+    },
+    {
+      "name": "revocationRecord",
+      "ref": "#/$defs/revocationRecord"
+    },
+    {
+      "name": "signedTaskEvidence",
+      "ref": "#/$defs/signedTaskEvidence"
+    },
+    {
+      "name": "taskCreateResponse",
+      "ref": "#/$defs/taskCreateResponse"
+    },
+    {
+      "name": "taskDefinition",
+      "ref": "#/$defs/taskDefinition"
+    },
+    {
+      "name": "taskEvidencePayload",
+      "ref": "#/$defs/taskEvidencePayload"
+    },
+    {
+      "name": "taskFinalizationRequest",
+      "ref": "#/$defs/taskFinalizationRequest"
+    },
+    {
+      "name": "taskInputReceipt",
+      "ref": "#/$defs/taskInputReceipt"
+    },
+    {
+      "name": "taskStatus",
+      "ref": "#/$defs/taskStatus"
+    },
+    {
+      "name": "taskSubmission",
+      "ref": "#/$defs/taskSubmission"
+    },
+    {
+      "name": "toolBindingStatus",
+      "ref": "#/$defs/toolBindingStatus"
+    },
+    {
+      "name": "toolCapability",
+      "ref": "#/$defs/toolCapability"
+    }
+  ],
+  "fixtures": [
+    {
+      "path": "fixtures/positive/agent.json",
+      "definition": "agent",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/agent-image-injection.json",
+      "definition": "agent",
+      "valid": false,
+      "category": "privilege_injection"
+    },
+    {
+      "path": "fixtures/positive/authority-requirements.json",
+      "definition": "authorityRequirements",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/authority-requirements-credential-mode.json",
+      "definition": "authorityRequirements",
+      "valid": false,
+      "category": "privilege_injection"
+    },
+    {
+      "path": "fixtures/positive/catalog-publication-request.json",
+      "definition": "catalogPublicationRequest",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/catalog-publication-path-traversal.json",
+      "definition": "catalogPublicationRequest",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
+      "path": "fixtures/positive/catalog-publication-witness.json",
+      "definition": "catalogPublicationWitness",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/catalog-witness-mutable-name.json",
+      "definition": "catalogPublicationWitness",
+      "valid": false,
+      "category": "unknown_field"
+    },
+    {
+      "path": "fixtures/positive/dependency-lock.json",
+      "definition": "dependencyLock",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/dependency-lock-path-traversal.json",
+      "definition": "dependencyLock",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
+      "path": "fixtures/positive/evidence-verification-material.json",
+      "definition": "evidenceVerificationMaterial",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/evidence-verification-runtime-mint-key.json",
+      "definition": "evidenceVerificationMaterial",
+      "valid": false,
+      "category": "privilege_injection"
+    },
+    {
+      "path": "fixtures/positive/execution-requirements.json",
+      "definition": "executionRequirements",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/execution-requirements-policy-injection.json",
+      "definition": "executionRequirements",
+      "valid": false,
+      "category": "privilege_injection"
+    },
+    {
+      "path": "fixtures/positive/identity-claims.json",
+      "definition": "identityClaims",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/positive/identity-claims-human-derived.json",
+      "definition": "identityClaims",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/identity-claims-mutable-source.json",
+      "definition": "identityClaims",
+      "valid": false,
+      "category": "unknown_field"
+    },
+    {
+      "path": "fixtures/compatibility/legacy-task-submission.json",
+      "definition": "legacyTaskSubmission",
+      "valid": true,
+      "category": "compatibility"
+    },
+    {
+      "path": "fixtures/negative/legacy-task-submission-unknown-field.json",
+      "definition": "legacyTaskSubmission",
+      "valid": false,
+      "category": "unknown_field"
+    },
+    {
+      "path": "fixtures/positive/local-skill.json",
+      "definition": "localSkill",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/local-skill-executable.json",
+      "definition": "localSkill",
+      "valid": false,
+      "category": "privilege_injection"
+    },
+    {
+      "path": "fixtures/positive/prompt.json",
+      "definition": "prompt",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/prompt-inline-content.json",
+      "definition": "prompt",
+      "valid": false,
+      "category": "unknown_field"
+    },
+    {
+      "path": "fixtures/positive/revocation-record.json",
+      "definition": "revocationRecord",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/revocation-wrong-bound.json",
+      "definition": "revocationRecord",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
+      "path": "fixtures/negative/revocation-invalid-timestamp.json",
+      "definition": "revocationRecord",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
+      "path": "fixtures/negative/revocation-impossible-calendar-date.json",
+      "definition": "revocationRecord",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
+      "path": "fixtures/negative/revocation-impossible-leap-second.json",
+      "definition": "revocationRecord",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
+      "path": "fixtures/positive/signed-task-evidence.json",
+      "definition": "signedTaskEvidence",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/signed-task-evidence-multiple-signatures.json",
+      "definition": "signedTaskEvidence",
+      "valid": false,
+      "category": "privilege_injection"
+    },
+    {
+      "path": "fixtures/negative/signed-task-evidence-undecodable-payload.json",
+      "definition": "signedTaskEvidence",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
+      "path": "fixtures/positive/task-create-response.json",
+      "definition": "taskCreateResponse",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/task-create-response-malformed.json",
+      "definition": "taskCreateResponse",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
+      "path": "fixtures/negative/task-create-response-empty-runtime.json",
+      "definition": "taskCreateResponse",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
+      "path": "fixtures/positive/task-definition.json",
+      "definition": "taskDefinition",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/task-definition-privilege-injection.json",
+      "definition": "taskDefinition",
+      "valid": false,
+      "category": "privilege_injection"
+    },
+    {
+      "path": "fixtures/positive/task-evidence-payload.json",
+      "definition": "taskEvidencePayload",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/positive/task-evidence-payload-cancelled-before-runtime.json",
+      "definition": "taskEvidencePayload",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/task-evidence-credential-injection.json",
+      "definition": "taskEvidencePayload",
+      "valid": false,
+      "category": "privilege_injection"
+    },
+    {
+      "path": "fixtures/positive/task-finalization.json",
+      "definition": "taskFinalizationRequest",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/task-finalization-unknown-field.json",
+      "definition": "taskFinalizationRequest",
+      "valid": false,
+      "category": "unknown_field"
+    },
+    {
+      "path": "fixtures/positive/task-input-receipt.json",
+      "definition": "taskInputReceipt",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/task-input-receipt-owner-injection.json",
+      "definition": "taskInputReceipt",
+      "valid": false,
+      "category": "privilege_injection"
+    },
+    {
+      "path": "fixtures/positive/task-status.json",
+      "definition": "taskStatus",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/positive/task-status-blocked.json",
+      "definition": "taskStatus",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/task-status-malformed.json",
+      "definition": "taskStatus",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
+      "path": "fixtures/negative/task-status-empty-runtime.json",
+      "definition": "taskStatus",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
+      "path": "fixtures/positive/task-submission.json",
+      "definition": "taskSubmission",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/positive/task-submission-team-manual.json",
+      "definition": "taskSubmission",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/task-submission-privilege-injection.json",
+      "definition": "taskSubmission",
+      "valid": false,
+      "category": "privilege_injection"
+    },
+    {
+      "path": "fixtures/compatibility/m1-unqualified-workflow.json",
+      "definition": "taskSubmission",
+      "valid": false,
+      "category": "compatibility"
+    },
+    {
+      "path": "fixtures/positive/tool-binding-status.json",
+      "definition": "toolBindingStatus",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/positive/tool-binding-status-none.json",
+      "definition": "toolBindingStatus",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/tool-binding-status-secret-injection.json",
+      "definition": "toolBindingStatus",
+      "valid": false,
+      "category": "privilege_injection"
+    },
+    {
+      "path": "fixtures/positive/tool-capability.json",
+      "definition": "toolCapability",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/positive/tool-capability-none.json",
+      "definition": "toolCapability",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/positive/tool-capability-user-connection.json",
+      "definition": "toolCapability",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/positive/tool-capability-server-managed.json",
+      "definition": "toolCapability",
+      "valid": true,
+      "category": "positive"
+    },
+    {
+      "path": "fixtures/negative/tool-capability-mismatched-binding.json",
+      "definition": "toolCapability",
+      "valid": false,
+      "category": "malformed"
+    }
+  ]
+}

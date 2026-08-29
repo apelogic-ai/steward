@@ -1,0 +1,5 @@
+{
+  "state": "not_requested",
+  "targetSeconds": 300,
+  "maxDrainSeconds": 300
+}

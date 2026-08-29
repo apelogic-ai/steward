@@ -1,0 +1,145 @@
+{
+  "schemaVersion": "steward/evidence/task/v1",
+  "issuer": {
+    "instanceId": "44444444-4444-4444-8444-444444444444",
+    "keyId": "evidence:m1-attestation-key"
+  },
+  "issuedAt": "2026-08-28T12:00:15Z",
+  "taskUid": "11111111-1111-4111-8111-111111111111",
+  "runtimeUid": null,
+  "trigger": {
+    "transport": "github_actions",
+    "repositoryId": "123456",
+    "runId": "900001",
+    "runAttempt": 1,
+    "eventName": "pull_request",
+    "workflowPath": ".github/workflows/review.test",
+    "workflowRef": "refs/heads/main",
+    "workflowSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "triggeredSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "provenanceDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "resolvedPrincipal": {
+    "kind": "service",
+    "subject": "service:repository-review",
+    "ownerUserId": "usr_11111111111111111111111111111111"
+  },
+  "catalog": {
+    "coordinate": "applications/repository-review@1",
+    "publication": {
+      "contractVersion": "steward.m1/v1",
+      "publicationUid": "33333333-3333-4333-8333-333333333333",
+      "coordinate": "applications/repository-review@1",
+      "source": {
+        "provider": "github",
+        "repositoryId": "123456",
+        "commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "path": "packages/repository-review/workflow.test"
+      },
+      "contentDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "closureDigest": "sha256:61ea74b651b8246b18a8a98d3069411e7432404f8030e91e243ae632bc8253fc",
+      "publishedAt": "2026-08-28T11:00:00Z",
+      "idempotencyKeyDigest": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+    },
+    "taskDefinitionDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "closureDigest": "sha256:61ea74b651b8246b18a8a98d3069411e7432404f8030e91e243ae632bc8253fc",
+    "dependencies": [
+      {
+        "kind": "agent",
+        "ref": "coding-agent@1",
+        "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      {
+        "kind": "asset",
+        "ref": "prompt-body.test",
+        "digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212"
+      },
+      {
+        "kind": "asset",
+        "ref": "skills/inspect-repository/instructions.test",
+        "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      {
+        "kind": "asset",
+        "ref": "skills/inspect-repository/references/checklist.test",
+        "digest": "sha256:1313131313131313131313131313131313131313131313131313131313131313"
+      },
+      {
+        "kind": "local_skill",
+        "ref": "skills/inspect-repository/skill.test",
+        "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      {
+        "kind": "prompt",
+        "ref": "prompt.test",
+        "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      {
+        "kind": "task_definition",
+        "ref": "applications/repository-review@1",
+        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ]
+  },
+  "input": {
+    "ref": "input:abcdefghijkl",
+    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "mediaType": "application/x-tar",
+    "sizeBytes": 4096
+  },
+  "output": {
+    "state": "absent"
+  },
+  "envelope": {
+    "uuid": "22222222-2222-4222-8222-222222222222",
+    "revision": 3,
+    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "executionBinding": {
+    "state": "not_created"
+  },
+  "admittedAuthority": {
+    "state": "not_admitted"
+  },
+  "credentialBindings": [
+    {
+      "schemaVersion": "steward/tool-binding-status/v1",
+      "capability": "github:repository.get_file_contents",
+      "provider": "github",
+      "credentialMode": "workload_identity",
+      "bindingRef": "workload:repository-review",
+      "status": "missing",
+      "disposition": "blocked"
+    }
+  ],
+  "admission": {
+    "verdict": "parked",
+    "ready": false,
+    "blockers": [
+      {
+        "kind": "credential_binding",
+        "code": "required_binding_missing",
+        "capability": "github:repository.get_file_contents",
+        "provider": "github",
+        "credentialMode": "workload_identity",
+        "bindingRef": "workload:repository-review",
+        "status": "missing"
+      }
+    ]
+  },
+  "revocation": {
+    "state": "not_requested",
+    "targetSeconds": 60,
+    "maxDrainSeconds": 300
+  },
+  "lifecycle": {
+    "phase": "cancelled",
+    "disposition": "cancelled_by_caller",
+    "submittedAt": "2026-08-28T12:00:00Z",
+    "admittedAt": null,
+    "executionStartedAt": null,
+    "terminalAt": "2026-08-28T12:00:10Z",
+    "finalizationRequestedAt": "2026-08-28T12:00:11Z",
+    "finalizedAt": "2026-08-28T12:00:15Z"
+  }
+}

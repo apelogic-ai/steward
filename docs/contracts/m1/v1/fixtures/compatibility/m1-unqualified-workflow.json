@@ -1,0 +1,16 @@
+{
+  "contractVersion": "steward.m1/v1",
+  "workflow": "repository-review@1",
+  "envelopeRef": "22222222-2222-4222-8222-222222222222",
+  "trigger": {
+    "transport": "manual",
+    "requestId": "55555555-5555-4555-8555-555555555555",
+    "provenanceDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "input": {
+    "ref": "input:abcdefghijkl",
+    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "mediaType": "application/x-tar",
+    "sizeBytes": 1024
+  }
+}

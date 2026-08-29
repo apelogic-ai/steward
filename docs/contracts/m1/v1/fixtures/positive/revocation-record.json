@@ -1,0 +1,14 @@
+{
+  "state": "enforced",
+  "targetSeconds": 60,
+  "maxDrainSeconds": 300,
+  "requestedAt": "2026-08-28T12:00:10Z",
+  "observedAt": "2026-08-28T12:00:12Z",
+  "deadlineAt": "2026-08-28T12:01:10Z",
+  "authorityDisabledAt": "2026-08-28T12:00:20Z",
+  "drainStartedAt": "2026-08-28T12:00:20Z",
+  "drainDeadlineAt": "2026-08-28T12:05:20Z",
+  "teardownStartedAt": "2026-08-28T12:01:00Z",
+  "teardownCompletedAt": "2026-08-28T12:01:05Z",
+  "inFlightDisposition": "completed"
+}

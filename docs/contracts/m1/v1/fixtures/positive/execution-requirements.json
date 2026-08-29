@@ -1,0 +1,6 @@
+{
+  "schemaVersion": "steward/catalog/execution-requirements/v1",
+  "capabilities": [
+    "shell"
+  ]
+}

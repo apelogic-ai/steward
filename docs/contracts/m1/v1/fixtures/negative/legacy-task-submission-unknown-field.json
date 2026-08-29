@@ -1,0 +1,4 @@
+{
+  "workflow": "repository-review@1",
+  "codingAgentRuntime": "caller-selected-runtime"
+}

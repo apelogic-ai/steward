@@ -11,9 +11,10 @@ instance-bound grants.
 
 | If you want to know | Read |
 |---|---|
+| M1 cross-product delivery and frozen contracts | [M1 delivery plan](docs/m1-delivery-plan.md) |
 | What Steward is and why | `docs/solution-overview.md` |
 | What we are building, and in what order | `docs/roadmap/steward-roadmap.md` |
-| Task lifecycle, tar, and identity contract | `docs/task-submission-api.md` |
+| Implemented v0.1.x Task lifecycle and identity contract | `docs/task-submission-api.md` |
 | Canonical browser / Task person identity | `docs/canonical-user-identity-v1.md` |
 | Deploy the Task API and worker | `config/task/README.md` |
 | The rules for changing this repository | `AGENTS.md` |
@@ -60,6 +61,8 @@ crates/steward-mint/
   AGENTS.md                   holds the signing key; human review required
 
 docs/
+  m1-delivery-plan.md           M1 dependency checkpoints and frozen contract link
+  contracts/m1/v1/             M1 schemas, fixtures, ownership, compatibility
   solution-overview.md        the architecture and the position it takes
   data-plane-spec.md          tiers, gateways, the Tier 1 membership test
   task-submission-api.md      lifecycle REST, tar paths, limits, identity boundary
