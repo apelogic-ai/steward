@@ -1,0 +1,10 @@
+{
+  "payloadType": "application/vnd.steward.task-evidence.v1+json",
+  "payload": "A",
+  "signatures": [
+    {
+      "keyid": "evidence:m1-attestation-key",
+      "sig": "f8yw3RDBkwBoO1TFFtR1NtZb-EG4Dut1xdFSPm3f56VqI477rHtj0dRViLy0plMLBFs35nyl3AbvIVvUM63EAQ"
+    }
+  ]
+}

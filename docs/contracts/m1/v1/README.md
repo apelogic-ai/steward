@@ -350,8 +350,10 @@ cargo xtask m1-contracts --check
 
 The normal quality lane requires the exact definition set, supported schema keywords
 and patterns, positive and negative fixtures for every definition, and malformed,
-unknown-field, privilege-injection, and compatibility coverage. Consumers may generate
-types from definitions, but this schema and document remain authoritative.
+unknown-field, privilege-injection, and compatibility coverage. It also decodes the
+deterministic payload, compares its canonical bytes, and uses OpenSSL to verify its
+Ed25519 DSSE signature against the published key. Consumers may generate types from
+definitions, but this schema and document remain authoritative.
 
 ## Closed decisions
 

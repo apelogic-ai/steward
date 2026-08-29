@@ -250,6 +250,12 @@
       "category": "malformed"
     },
     {
+      "path": "fixtures/negative/revocation-impossible-calendar-date.json",
+      "definition": "revocationRecord",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
       "path": "fixtures/positive/signed-task-evidence.json",
       "definition": "signedTaskEvidence",
       "valid": true,
@@ -262,6 +268,12 @@
       "category": "privilege_injection"
     },
     {
+      "path": "fixtures/negative/signed-task-evidence-undecodable-payload.json",
+      "definition": "signedTaskEvidence",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
       "path": "fixtures/positive/task-create-response.json",
       "definition": "taskCreateResponse",
       "valid": true,
@@ -269,6 +281,12 @@
     },
     {
       "path": "fixtures/negative/task-create-response-malformed.json",
+      "definition": "taskCreateResponse",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
+      "path": "fixtures/negative/task-create-response-empty-runtime.json",
       "definition": "taskCreateResponse",
       "valid": false,
       "category": "malformed"
@@ -341,6 +359,12 @@
     },
     {
       "path": "fixtures/negative/task-status-malformed.json",
+      "definition": "taskStatus",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
+      "path": "fixtures/negative/task-status-empty-runtime.json",
       "definition": "taskStatus",
       "valid": false,
       "category": "malformed"

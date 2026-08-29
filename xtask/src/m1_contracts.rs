@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
@@ -22,9 +24,22 @@ const CAPABILITY_PATTERN: &str = "^[a-z][a-z0-9-]{0,31}:[a-z][a-z0-9._-]{0,95}$"
 const RELATIVE_PATH_PATTERN: &str =
     "^(?!.*(?:^|/)\\.\\.?(?:/|$))[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$";
 const OPAQUE_REFERENCE_PATTERN: &str = "^[a-z][a-z0-9-]{0,31}:[A-Za-z0-9_-]{8,128}$";
-const RFC3339_UTC_PATTERN: &str = "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:(?:[0-5][0-9]|60)(?:\\.[0-9]+)?Z$";
-const BASE64URL_PATTERN: &str = "^[A-Za-z0-9_-]+$";
+const RFC3339_UTC_PATTERN: &str = "^(?:(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8])))|(?:(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29))T(?:[01][0-9]|2[0-3]):[0-5][0-9]:(?:[0-5][0-9]|60)(?:\\.[0-9]+)?Z$";
+const BASE64URL_PATTERN: &str = "^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-]{2,3})?$";
 const DECIMAL_PATTERN: &str = "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$";
+const CREDENTIAL_INJECTION_FIXTURE: &str =
+    "fixtures/negative/task-evidence-credential-injection.json";
+const TASK_EVIDENCE_PAYLOAD_FIXTURE: &str = "fixtures/positive/task-evidence-payload.json";
+const SIGNED_TASK_EVIDENCE_FIXTURE: &str = "fixtures/positive/signed-task-evidence.json";
+const EVIDENCE_VERIFICATION_MATERIAL_FIXTURE: &str =
+    "fixtures/positive/evidence-verification-material.json";
+const TASK_EVIDENCE_PAYLOAD_TYPE: &str = "application/vnd.steward.task-evidence.v1+json";
+const EXPECTED_CANONICAL_PAYLOAD_BYTES: usize = 4_418;
+const EXPECTED_DSSE_PAE_BYTES: usize = 4_479;
+const ED25519_SPKI_PREFIX: &[u8] = &[
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+static DSSE_TEMP_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const REQUIRED_DEFINITIONS: &[&str] = &[
     "agent",
@@ -128,7 +143,8 @@ pub fn validate_m1_contract_directory(directory: &Path) -> Result<M1ContractSumm
     let mut negative_by_definition = BTreeSet::new();
     let mut positive_fixtures = 0;
     let mut negative_fixtures = 0;
-    let mut compatibility_fixtures = 0;
+    let mut valid_compatibility_fixtures = 0;
+    let mut rejected_compatibility_fixtures = 0;
     let mut fixture_paths = BTreeSet::new();
     let mut negative_categories = BTreeSet::new();
 
@@ -195,7 +211,14 @@ pub fn validate_m1_contract_directory(directory: &Path) -> Result<M1ContractSumm
             }
         }
         if category == "compatibility" {
-            compatibility_fixtures += 1;
+            if expected_valid {
+                valid_compatibility_fixtures += 1;
+            } else {
+                rejected_compatibility_fixtures += 1;
+            }
+        }
+        if relative == CREDENTIAL_INJECTION_FIXTURE {
+            validate_credential_injection_fixture(&schema, reference, &instance)?;
         }
     }
 
@@ -233,15 +256,376 @@ pub fn validate_m1_contract_directory(directory: &Path) -> Result<M1ContractSumm
             return Err(format!("M1 contracts have no {category} rejection fixture"));
         }
     }
-    if compatibility_fixtures < 2 {
-        return Err("M1 contracts require valid and rejected compatibility fixtures".to_owned());
-    }
+    validate_compatibility_outcomes(
+        valid_compatibility_fixtures,
+        rejected_compatibility_fixtures,
+    )?;
+    validate_deterministic_dsse_vector(directory)?;
+    let compatibility_fixtures = valid_compatibility_fixtures + rejected_compatibility_fixtures;
 
     Ok(M1ContractSummary {
         definitions: definitions.len(),
         positive_fixtures,
         negative_fixtures,
         compatibility_fixtures,
+    })
+}
+
+fn validate_deterministic_dsse_vector(directory: &Path) -> Result<(), String> {
+    let payload = read_json(
+        &safe_child(
+            directory,
+            TASK_EVIDENCE_PAYLOAD_FIXTURE,
+            "deterministic task evidence payload fixture",
+        )?,
+        "deterministic task evidence payload fixture",
+    )?;
+    let signed = read_json(
+        &safe_child(
+            directory,
+            SIGNED_TASK_EVIDENCE_FIXTURE,
+            "deterministic signed task evidence fixture",
+        )?,
+        "deterministic signed task evidence fixture",
+    )?;
+    let material = read_json(
+        &safe_child(
+            directory,
+            EVIDENCE_VERIFICATION_MATERIAL_FIXTURE,
+            "deterministic evidence verification material fixture",
+        )?,
+        "deterministic evidence verification material fixture",
+    )?;
+
+    let canonical_payload = canonical_json(&payload)?;
+    if canonical_payload.len() != EXPECTED_CANONICAL_PAYLOAD_BYTES {
+        return Err(format!(
+            "deterministic DSSE canonical payload must remain {EXPECTED_CANONICAL_PAYLOAD_BYTES} bytes, found {}",
+            canonical_payload.len()
+        ));
+    }
+
+    let signed = object(&signed, "deterministic signed task evidence fixture")?;
+    exact_string(
+        signed,
+        "payloadType",
+        TASK_EVIDENCE_PAYLOAD_TYPE,
+        "deterministic signed task evidence fixture",
+    )?;
+    let encoded_payload = string(
+        signed,
+        "payload",
+        "deterministic signed task evidence fixture",
+    )?;
+    let decoded_payload = decode_base64url(encoded_payload, "deterministic DSSE payload")?;
+    if decoded_payload != canonical_payload {
+        return Err(
+            "deterministic DSSE payload must equal the RFC 8785 canonical payload fixture"
+                .to_owned(),
+        );
+    }
+    let signatures = array(
+        signed,
+        "signatures",
+        "deterministic signed task evidence fixture",
+    )?;
+    if signatures.len() != 1 {
+        return Err("deterministic DSSE vector must contain exactly one signature".to_owned());
+    }
+    let signature = object(&signatures[0], "deterministic DSSE signature")?;
+    let signature_key_id = string(signature, "keyid", "deterministic DSSE signature")?;
+    let signature_bytes = decode_base64url(
+        string(signature, "sig", "deterministic DSSE signature")?,
+        "deterministic DSSE signature",
+    )?;
+    if signature_bytes.len() != 64 {
+        return Err("deterministic DSSE signature must decode to 64 bytes".to_owned());
+    }
+
+    let payload = object(&payload, "deterministic task evidence payload fixture")?;
+    let issuer = object(
+        payload
+            .get("issuer")
+            .ok_or_else(|| "deterministic task evidence payload requires issuer".to_owned())?,
+        "deterministic task evidence issuer",
+    )?;
+    let issuer_key_id = string(issuer, "keyId", "deterministic task evidence issuer")?;
+
+    let material = object(
+        &material,
+        "deterministic evidence verification material fixture",
+    )?;
+    exact_string(
+        material,
+        "payloadType",
+        TASK_EVIDENCE_PAYLOAD_TYPE,
+        "deterministic evidence verification material fixture",
+    )?;
+    exact_string(
+        material,
+        "canonicalization",
+        "RFC8785",
+        "deterministic evidence verification material fixture",
+    )?;
+    exact_string(
+        material,
+        "envelope",
+        "DSSEv1",
+        "deterministic evidence verification material fixture",
+    )?;
+    let keys = array(
+        material,
+        "keys",
+        "deterministic evidence verification material fixture",
+    )?;
+    if keys.len() != 1 {
+        return Err("deterministic DSSE vector must publish exactly one key".to_owned());
+    }
+    let key = object(&keys[0], "deterministic DSSE verification key")?;
+    for (field, expected) in [
+        ("kty", "OKP"),
+        ("crv", "Ed25519"),
+        ("use", "sig"),
+        ("alg", "EdDSA"),
+    ] {
+        exact_string(key, field, expected, "deterministic DSSE verification key")?;
+    }
+    let published_key_id = string(key, "kid", "deterministic DSSE verification key")?;
+    if signature_key_id != issuer_key_id || signature_key_id != published_key_id {
+        return Err(
+            "deterministic DSSE signature, payload issuer, and published key IDs must match"
+                .to_owned(),
+        );
+    }
+    let public_key = decode_base64url(
+        string(key, "x", "deterministic DSSE verification key")?,
+        "deterministic DSSE public key",
+    )?;
+    if public_key.len() != 32 {
+        return Err("deterministic DSSE Ed25519 public key must decode to 32 bytes".to_owned());
+    }
+
+    let pae = dsse_pae(TASK_EVIDENCE_PAYLOAD_TYPE, &canonical_payload);
+    if pae.len() != EXPECTED_DSSE_PAE_BYTES {
+        return Err(format!(
+            "deterministic DSSE PAE must remain {EXPECTED_DSSE_PAE_BYTES} bytes, found {}",
+            pae.len()
+        ));
+    }
+    verify_ed25519_with_openssl(&public_key, &pae, &signature_bytes)
+}
+
+fn canonical_json(value: &Value) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    write_canonical_json(value, &mut output)?;
+    Ok(output)
+}
+
+fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<(), String> {
+    match value {
+        Value::Null => output.extend_from_slice(b"null"),
+        Value::Bool(true) => output.extend_from_slice(b"true"),
+        Value::Bool(false) => output.extend_from_slice(b"false"),
+        Value::Number(number) if number.is_i64() || number.is_u64() => {
+            output.extend_from_slice(number.to_string().as_bytes());
+        }
+        Value::Number(_) => {
+            return Err(
+                "deterministic DSSE payload must encode non-integral quantities as strings"
+                    .to_owned(),
+            );
+        }
+        Value::String(value) => {
+            output.extend_from_slice(
+                serde_json::to_string(value)
+                    .map_err(|error| format!("failed to canonicalize JSON string: {error}"))?
+                    .as_bytes(),
+            );
+        }
+        Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(b']');
+        }
+        Value::Object(values) => {
+            output.push(b'{');
+            let mut fields = values.iter().collect::<Vec<_>>();
+            fields.sort_by(|(left, _), (right, _)| left.encode_utf16().cmp(right.encode_utf16()));
+            for (index, (field, value)) in fields.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                output.extend_from_slice(
+                    serde_json::to_string(field)
+                        .map_err(|error| {
+                            format!("failed to canonicalize JSON object key: {error}")
+                        })?
+                        .as_bytes(),
+                );
+                output.push(b':');
+                write_canonical_json(value, output)?;
+            }
+            output.push(b'}');
+        }
+    }
+    Ok(())
+}
+
+fn decode_base64url(value: &str, description: &str) -> Result<Vec<u8>, String> {
+    if value.is_empty() || value.len() % 4 == 1 {
+        return Err(format!(
+            "{description} must have a decodable unpadded base64url length"
+        ));
+    }
+    let sextets = value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' => Ok(byte - b'A'),
+            b'a'..=b'z' => Ok(byte - b'a' + 26),
+            b'0'..=b'9' => Ok(byte - b'0' + 52),
+            b'-' => Ok(62),
+            b'_' => Ok(63),
+            _ => Err(format!("{description} contains a non-base64url character")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut decoded = Vec::with_capacity(sextets.len() * 3 / 4);
+    let mut chunks = sextets.chunks_exact(4);
+    for chunk in &mut chunks {
+        decoded.push((chunk[0] << 2) | (chunk[1] >> 4));
+        decoded.push((chunk[1] << 4) | (chunk[2] >> 2));
+        decoded.push((chunk[2] << 6) | chunk[3]);
+    }
+    match chunks.remainder() {
+        [] => {}
+        [first, second] if second & 0x0f == 0 => {
+            decoded.push((first << 2) | (second >> 4));
+        }
+        [first, second, third] if third & 0x03 == 0 => {
+            decoded.push((first << 2) | (second >> 4));
+            decoded.push((second << 4) | (third >> 2));
+        }
+        [_, _] | [_, _, _] => {
+            return Err(format!(
+                "{description} has non-zero trailing bits and is not canonical base64url"
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "{description} must have a decodable unpadded base64url length"
+            ));
+        }
+    }
+    Ok(decoded)
+}
+
+fn dsse_pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
+    let mut pae = format!(
+        "DSSEv1 {} {payload_type} {} ",
+        payload_type.len(),
+        payload.len()
+    )
+    .into_bytes();
+    pae.extend_from_slice(payload);
+    pae
+}
+
+struct DsseVerificationDirectory(std::path::PathBuf);
+
+impl DsseVerificationDirectory {
+    fn create() -> Result<Self, String> {
+        let prefix = format!("steward-m1-dsse-{}-", std::process::id());
+        for _ in 0..100 {
+            let sequence = DSSE_TEMP_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("{prefix}{sequence}"));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "failed to create scoped DSSE verification directory: {error}"
+                    ));
+                }
+            }
+        }
+        Err("failed to allocate a unique scoped DSSE verification directory".to_owned())
+    }
+}
+
+impl Drop for DsseVerificationDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn verify_ed25519_with_openssl(
+    public_key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), String> {
+    let directory = DsseVerificationDirectory::create()?;
+    let public_key_path = directory.0.join("public-key.der");
+    let message_path = directory.0.join("pae.bin");
+    let signature_path = directory.0.join("signature.bin");
+    let mut spki = ED25519_SPKI_PREFIX.to_vec();
+    spki.extend_from_slice(public_key);
+    for (path, content, description) in [
+        (&public_key_path, spki.as_slice(), "public key"),
+        (&message_path, message, "PAE"),
+        (&signature_path, signature, "signature"),
+    ] {
+        fs::write(path, content).map_err(|error| {
+            format!("failed to stage deterministic DSSE {description}: {error}")
+        })?;
+    }
+    let output = Command::new("openssl")
+        .args(["pkeyutl", "-verify", "-pubin", "-inkey"])
+        .arg(&public_key_path)
+        .args(["-keyform", "DER", "-rawin", "-in"])
+        .arg(&message_path)
+        .arg("-sigfile")
+        .arg(&signature_path)
+        .output()
+        .map_err(|error| {
+            format!("deterministic DSSE signature verification requires openssl: {error}")
+        })?;
+    if !output.status.success() {
+        return Err("deterministic DSSE signature verification failed".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_compatibility_outcomes(valid: usize, rejected: usize) -> Result<(), String> {
+    if valid == 0 || rejected == 0 {
+        return Err(format!(
+            "M1 contracts require at least one accepted legacy compatibility fixture and one rejected M1 compatibility fixture; accepted={valid}, rejected={rejected}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_credential_injection_fixture(
+    schema: &Value,
+    reference: &str,
+    instance: &Value,
+) -> Result<(), String> {
+    let mut baseline = instance.clone();
+    let removed = baseline
+        .as_object_mut()
+        .and_then(|object| object.remove("credential"));
+    if removed.is_none() {
+        return Err(format!(
+            "security-negative fixture {CREDENTIAL_INJECTION_FIXTURE} must inject credential"
+        ));
+    }
+    validate_json_schema_instance(schema, reference, &baseline).map_err(|error| {
+        format!(
+            "security-negative fixture {CREDENTIAL_INJECTION_FIXTURE} must be a valid task evidence payload after removing only credential: {error}"
+        )
     })
 }
 
@@ -521,12 +905,7 @@ fn matches_supported_pattern(pattern: &str, value: &str) -> Result<bool, String>
         RELATIVE_PATH_PATTERN => valid_relative_path(value),
         OPAQUE_REFERENCE_PATTERN => valid_opaque_reference(value),
         RFC3339_UTC_PATTERN => valid_rfc3339_utc(value),
-        BASE64URL_PATTERN => {
-            !value.is_empty()
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        }
+        BASE64URL_PATTERN => valid_base64url(value),
         DECIMAL_PATTERN => valid_decimal(value),
         _ => return Err(format!("unsupported JSON Schema pattern {pattern}")),
     };
@@ -651,11 +1030,34 @@ fn valid_rfc3339_utc(value: &str) -> bool {
         return false;
     }
     let number = |range: std::ops::Range<usize>| base[range].parse::<u32>().ok();
-    matches!(number(5..7), Some(1..=12))
-        && matches!(number(8..10), Some(1..=31))
+    let Some(year) = number(0..4) else {
+        return false;
+    };
+    let Some(month @ 1..=12) = number(5..7) else {
+        return false;
+    };
+    let Some(day) = number(8..10) else {
+        return false;
+    };
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap_year => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=days_in_month).contains(&day)
         && matches!(number(11..13), Some(0..=23))
         && matches!(number(14..16), Some(0..=59))
         && matches!(number(17..19), Some(0..=60))
+}
+
+fn valid_base64url(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() % 4 != 1
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn valid_decimal(value: &str) -> bool {
@@ -1065,10 +1467,72 @@ fn instance_type(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        QUALIFIED_WORKFLOW_PATTERN, parse_unique_json, valid_relative_path, valid_versioned_name,
-        validate_json_schema_instance,
+        QUALIFIED_WORKFLOW_PATTERN, parse_unique_json, read_json, valid_base64url,
+        valid_relative_path, valid_rfc3339_utc, valid_versioned_name,
+        validate_compatibility_outcomes, validate_json_schema_instance,
+        validate_m1_contract_directory,
     };
     use serde_json::json;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TempContractDirectory(std::path::PathBuf);
+
+    impl TempContractDirectory {
+        fn copy_from(source: &Path) -> Result<Self, String> {
+            let sequence = TEMP_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let destination = std::env::temp_dir().join(format!(
+                "steward-m1-contract-test-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&destination).map_err(|error| {
+                format!("temporary contract directory must be created: {error}")
+            })?;
+            let temporary = Self(destination);
+            copy_directory_contents(source, &temporary.0)?;
+            Ok(temporary)
+        }
+    }
+
+    impl Drop for TempContractDirectory {
+        fn drop(&mut self) {
+            let expected_prefix = format!("steward-m1-contract-test-{}-", std::process::id());
+            let is_scoped_test_directory = self
+                .0
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&expected_prefix));
+            if is_scoped_test_directory {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    fn copy_directory_contents(source: &Path, destination: &Path) -> Result<(), String> {
+        for entry in fs::read_dir(source)
+            .map_err(|error| format!("source contract directory must be readable: {error}"))?
+        {
+            let entry = entry
+                .map_err(|error| format!("source contract entry must be readable: {error}"))?;
+            let target = destination.join(entry.file_name());
+            if entry
+                .file_type()
+                .map_err(|error| format!("source contract entry type must be readable: {error}"))?
+                .is_dir()
+            {
+                fs::create_dir(&target)
+                    .map_err(|error| format!("contract fixture directory must copy: {error}"))?;
+                copy_directory_contents(&entry.path(), &target)?;
+            } else {
+                fs::copy(entry.path(), target)
+                    .map_err(|error| format!("contract fixture must copy: {error}"))?;
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn schema_validation_rejects_privilege_injection_as_an_unknown_field() {
@@ -1207,5 +1671,119 @@ mod tests {
                 "the Rust checker must reject path empty segments: {path}"
             );
         }
+    }
+
+    #[test]
+    fn rfc3339_utc_rejects_impossible_calendar_dates() {
+        for timestamp in [
+            "2026-02-29T12:00:10Z",
+            "2026-02-31T12:00:10Z",
+            "2026-04-31T12:00:10Z",
+            "2100-02-29T12:00:10Z",
+        ] {
+            assert!(
+                !valid_rfc3339_utc(timestamp),
+                "RFC 3339 validation must reject impossible date {timestamp}"
+            );
+        }
+        assert!(
+            valid_rfc3339_utc("2024-02-29T12:00:10Z"),
+            "RFC 3339 validation must accept a leap day in a leap year"
+        );
+        assert!(
+            valid_rfc3339_utc("2000-02-29T12:00:10Z"),
+            "RFC 3339 validation must accept a leap day in a century divisible by 400"
+        );
+    }
+
+    #[test]
+    fn credential_injection_fixture_is_otherwise_valid() -> Result<(), String> {
+        let contract_directory =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/contracts/m1/v1");
+        let schema = read_json(
+            &contract_directory.join("schemas/m1-contracts.schema.json"),
+            "test contract schema",
+        )?;
+        let mut injected = read_json(
+            &contract_directory.join("fixtures/negative/task-evidence-credential-injection.json"),
+            "credential injection fixture",
+        )?;
+        let removed = injected
+            .as_object_mut()
+            .and_then(|object| object.remove("credential"));
+        assert!(removed.is_some(), "the fixture must inject credential");
+
+        let result =
+            validate_json_schema_instance(&schema, "#/$defs/taskEvidencePayload", &injected);
+        assert!(
+            result.is_ok(),
+            "removing only the forbidden credential must restore a valid payload: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn base64url_rejects_undecodable_final_quantum_lengths() {
+        for value in ["A", "AAAAA", "AAAAAAAAA"] {
+            assert!(
+                !valid_base64url(value),
+                "base64url length congruent to one modulo four must be rejected: {value}"
+            );
+        }
+        for value in ["AA", "AAA", "AAAA", "AAAAAA", "AAAAAAA"] {
+            assert!(
+                valid_base64url(value),
+                "decodable unpadded base64url length must be accepted: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_requires_both_accepted_and_rejected_outcomes() {
+        assert!(
+            validate_compatibility_outcomes(1, 1).is_ok(),
+            "one accepted legacy fixture and one rejected M1 fixture satisfy the boundary"
+        );
+        assert!(
+            validate_compatibility_outcomes(2, 0).is_err(),
+            "two accepted fixtures must not false-green compatibility"
+        );
+        assert!(
+            validate_compatibility_outcomes(0, 2).is_err(),
+            "two rejected fixtures must not false-green compatibility"
+        );
+    }
+
+    #[test]
+    fn contract_gate_rejects_a_tampered_deterministic_dsse_signature() -> Result<(), String> {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/contracts/m1/v1");
+        let temporary = TempContractDirectory::copy_from(&source)?;
+        let signed_path = temporary
+            .0
+            .join("fixtures/positive/signed-task-evidence.json");
+        let mut signed = read_json(&signed_path, "signed evidence fixture")?;
+        let signature = signed
+            .pointer_mut("/signatures/0/sig")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "the signed fixture must contain one signature".to_owned())?;
+        let replacement_prefix = if signature.starts_with('A') { "B" } else { "A" };
+        let tampered = format!("{replacement_prefix}{}", &signature[1..]);
+        signed["signatures"][0]["sig"] = json!(tampered);
+        let serialized = serde_json::to_vec_pretty(&signed)
+            .map_err(|error| format!("tampered fixture must serialize: {error}"))?;
+        fs::write(&signed_path, serialized)
+            .map_err(|error| format!("tampered fixture must be written: {error}"))?;
+
+        let result = validate_m1_contract_directory(&temporary.0);
+        assert!(
+            result.is_err(),
+            "the M1 contract gate must reject a schema-valid tampered DSSE signature"
+        );
+        let error = result.err().unwrap_or_default();
+        assert!(
+            error.contains("DSSE signature"),
+            "the failure must identify deterministic DSSE signature verification: {error}"
+        );
+        Ok(())
     }
 }
