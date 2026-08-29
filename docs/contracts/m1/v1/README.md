@@ -280,9 +280,9 @@ available digests, and checks lifecycle/revocation timing.
 Schema validity is not signature validity. The positive payload, signed evidence, and
 verification-material fixtures form one cryptographically valid deterministic vector. Its
 canonical payload is 4,418 bytes with SHA-256
-sha256:37393b8d4ee03b51f4dbd130f6b56c3e865bdc9b61a1efb0433f1cb3c42028dd.
+sha256:5e5cc6a6ea0fed4985715b1236155e40f9f340e149b0a7457c71214500814fcc.
 Its DSSE PAE is 4,479 bytes with SHA-256
-sha256:97380a148e8af8a40aa5317e5c4a87f4a239c75eadce0fed2bd77f1fdad22fcd.
+sha256:0465b7dddf5dcbaeaae34ebdbd95523e2f6ea361c252c72046d92f41f84f9c1c.
 The public key is the RFC 8032 Ed25519 test key; no private material is published. An
 independent implementation must decode the signed fixture payload to the exact RFC 8785
 serialization of task-evidence-payload.json and verify its signature with

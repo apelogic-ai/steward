@@ -256,6 +256,12 @@
       "category": "malformed"
     },
     {
+      "path": "fixtures/negative/revocation-impossible-leap-second.json",
+      "definition": "revocationRecord",
+      "valid": false,
+      "category": "malformed"
+    },
+    {
       "path": "fixtures/positive/signed-task-evidence.json",
       "definition": "signedTaskEvidence",
       "valid": true,

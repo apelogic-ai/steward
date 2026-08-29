@@ -24,7 +24,7 @@ const CAPABILITY_PATTERN: &str = "^[a-z][a-z0-9-]{0,31}:[a-z][a-z0-9._-]{0,95}$"
 const RELATIVE_PATH_PATTERN: &str =
     "^(?!.*(?:^|/)\\.\\.?(?:/|$))[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$";
 const OPAQUE_REFERENCE_PATTERN: &str = "^[a-z][a-z0-9-]{0,31}:[A-Za-z0-9_-]{8,128}$";
-const RFC3339_UTC_PATTERN: &str = "^(?:(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8])))|(?:(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29))T(?:[01][0-9]|2[0-3]):[0-5][0-9]:(?:[0-5][0-9]|60)(?:\\.[0-9]+)?Z$";
+const RFC3339_UTC_PATTERN: &str = "^(?:(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8])))|(?:(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29))T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]+)?Z$";
 const BASE64URL_PATTERN: &str = "^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-]{2,3})?$";
 const DECIMAL_PATTERN: &str = "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$";
 const CREDENTIAL_INJECTION_FIXTURE: &str =
@@ -37,12 +37,12 @@ const TASK_EVIDENCE_PAYLOAD_TYPE: &str = "application/vnd.steward.task-evidence.
 const EXPECTED_CANONICAL_PAYLOAD_BYTES: usize = 4_418;
 const EXPECTED_DSSE_PAE_BYTES: usize = 4_479;
 const EXPECTED_CANONICAL_PAYLOAD_SHA256: [u8; 32] = [
-    0x37, 0x39, 0x3b, 0x8d, 0x4e, 0xe0, 0x3b, 0x51, 0xf4, 0xdb, 0xd1, 0x30, 0xf6, 0xb5, 0x6c, 0x3e,
-    0x86, 0x5b, 0xdc, 0x9b, 0x61, 0xa1, 0xef, 0xb0, 0x43, 0x3f, 0x1c, 0xb3, 0xc4, 0x20, 0x28, 0xdd,
+    0x5e, 0x5c, 0xc6, 0xa6, 0xea, 0x0f, 0xed, 0x49, 0x85, 0x71, 0x5b, 0x12, 0x36, 0x15, 0x5e, 0x40,
+    0xf9, 0xf3, 0x40, 0xe1, 0x49, 0xb0, 0xa7, 0x45, 0x7c, 0x71, 0x21, 0x45, 0x00, 0x81, 0x4f, 0xcc,
 ];
 const EXPECTED_DSSE_PAE_SHA256: [u8; 32] = [
-    0x97, 0x38, 0x0a, 0x14, 0x8e, 0x8a, 0xf8, 0xa4, 0x0a, 0xa5, 0x31, 0x7e, 0x5c, 0x4a, 0x87, 0xf4,
-    0xa2, 0x39, 0xc7, 0x5e, 0xad, 0xce, 0x0f, 0xed, 0x2b, 0xd7, 0x7f, 0x1f, 0xda, 0xd2, 0x2f, 0xcd,
+    0x04, 0x65, 0xb7, 0xdd, 0xdf, 0x5d, 0xcb, 0xae, 0xaa, 0xe3, 0x4e, 0xbd, 0xbd, 0x95, 0x52, 0x3e,
+    0x2f, 0x6e, 0xa3, 0x61, 0xc2, 0x52, 0xc7, 0x20, 0x46, 0xd9, 0x2f, 0x41, 0xf8, 0x4f, 0x9c, 0x1c,
 ];
 const EXPECTED_RFC8032_PUBLIC_KEY: [u8; 32] = [
     0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
@@ -232,6 +232,9 @@ pub fn validate_m1_contract_directory(directory: &Path) -> Result<M1ContractSumm
         if relative == CREDENTIAL_INJECTION_FIXTURE {
             validate_credential_injection_fixture(&schema, reference, &instance)?;
         }
+        if expected_valid && definition == "dependencyLock" {
+            validate_dependency_lock_fixture(&instance)?;
+        }
     }
 
     let fixture_directory = directory.join("fixtures");
@@ -281,6 +284,57 @@ pub fn validate_m1_contract_directory(directory: &Path) -> Result<M1ContractSumm
         negative_fixtures,
         compatibility_fixtures,
     })
+}
+
+fn validate_dependency_lock_fixture(instance: &Value) -> Result<(), String> {
+    let lock = object(instance, "dependency lock fixture")?;
+    let entries = array(lock, "entries", "dependency lock fixture")?;
+    let mut previous: Option<(&str, &str)> = None;
+    let mut references = BTreeSet::new();
+
+    for entry in entries {
+        let entry = object(entry, "dependency lock entry")?;
+        let kind = string(entry, "kind", "dependency lock entry")?;
+        let reference = string(entry, "ref", "dependency lock entry")?;
+        if let Some((previous_kind, previous_reference)) = previous {
+            let in_order = previous_kind.as_bytes() < kind.as_bytes()
+                || (previous_kind == kind && previous_reference.as_bytes() < reference.as_bytes());
+            if !in_order {
+                return Err(
+                    "dependency lock entries must be sorted bytewise by kind and then ref"
+                        .to_owned(),
+                );
+            }
+        }
+        if !references.insert(reference) {
+            return Err(format!(
+                "dependency lock entries must not repeat ref {reference}"
+            ));
+        }
+        previous = Some((kind, reference));
+    }
+
+    let canonical_entries = canonical_json(&Value::Array(entries.to_vec()))?;
+    let digest = sha256_with_openssl(&canonical_entries, "dependency lock closure")?;
+    let actual = string(lock, "closureDigest", "dependency lock fixture")?;
+    let expected = sha256_identifier(&digest);
+    if actual != expected {
+        return Err(format!(
+            "dependency lock closure digest must equal {expected}, found {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_identifier(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut identifier = String::with_capacity(71);
+    identifier.push_str("sha256:");
+    for byte in digest {
+        identifier.push(char::from(HEX[usize::from(byte >> 4)]));
+        identifier.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    identifier
 }
 
 fn validate_deterministic_dsse_vector(directory: &Path) -> Result<(), String> {
@@ -1112,7 +1166,7 @@ fn valid_rfc3339_utc(value: &str) -> bool {
     (1..=days_in_month).contains(&day)
         && matches!(number(11..13), Some(0..=23))
         && matches!(number(14..16), Some(0..=59))
-        && matches!(number(17..19), Some(0..=60))
+        && matches!(number(17..19), Some(0..=59))
 }
 
 fn valid_base64url(value: &str) -> bool {
@@ -1781,6 +1835,7 @@ mod tests {
             "2026-02-29T12:00:10Z",
             "2026-02-31T12:00:10Z",
             "2026-04-31T12:00:10Z",
+            "2026-08-28T12:00:60Z",
             "2100-02-29T12:00:10Z",
         ] {
             assert!(
@@ -1796,6 +1851,54 @@ mod tests {
             valid_rfc3339_utc("2000-02-29T12:00:10Z"),
             "RFC 3339 validation must accept a leap day in a century divisible by 400"
         );
+    }
+
+    #[test]
+    fn contract_gate_rejects_an_unsorted_dependency_lock() -> Result<(), String> {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/contracts/m1/v1");
+        let temporary = TempContractDirectory::copy_from(&source)?;
+        let lock_path = temporary.0.join("fixtures/positive/dependency-lock.json");
+        let mut lock = read_json(&lock_path, "dependency lock fixture")?;
+        lock["entries"]
+            .as_array_mut()
+            .ok_or_else(|| "dependency lock fixture must contain entries".to_owned())?
+            .reverse();
+        write_json(&lock_path, &lock)?;
+
+        let result = validate_m1_contract_directory(&temporary.0);
+        assert!(
+            result.is_err(),
+            "the M1 contract gate must reject dependency lock entries outside canonical order"
+        );
+        let error = result.err().unwrap_or_default();
+        assert!(
+            error.contains("sorted"),
+            "the failure must identify dependency lock ordering: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn contract_gate_rejects_an_incorrect_dependency_lock_digest() -> Result<(), String> {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/contracts/m1/v1");
+        let temporary = TempContractDirectory::copy_from(&source)?;
+        let lock_path = temporary.0.join("fixtures/positive/dependency-lock.json");
+        let mut lock = read_json(&lock_path, "dependency lock fixture")?;
+        lock["closureDigest"] =
+            json!("sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        write_json(&lock_path, &lock)?;
+
+        let result = validate_m1_contract_directory(&temporary.0);
+        assert!(
+            result.is_err(),
+            "the M1 contract gate must reject a dependency lock with an incorrect digest"
+        );
+        let error = result.err().unwrap_or_default();
+        assert!(
+            error.contains("closure digest"),
+            "the failure must identify dependency lock closure semantics: {error}"
+        );
+        Ok(())
     }
 
     #[test]
