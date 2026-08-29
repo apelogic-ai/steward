@@ -10,7 +10,7 @@ use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -29,8 +29,6 @@ const SESSION_TTL_SECONDS: u64 = 3_600;
 const MAX_PENDING_AUTHORIZATIONS: usize = 256;
 const MAX_BROWSER_SESSIONS: usize = 4_096;
 const BROWSER_SESSION_API_VERSION: &str = "steward.browser-session/v1";
-const SIGN_IN_HTML: &str = include_str!("../assets/admin/sign-in.html");
-const SESSION_READY_HTML: &str = include_str!("../assets/admin/session-ready.html");
 
 pub(crate) type BrowserFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -182,7 +180,7 @@ pub struct BrowserPrincipal {
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct BrowserSessionBinding(String);
 
-#[cfg(all(test, feature = "admin-demo"))]
+#[cfg(test)]
 impl BrowserSessionBinding {
     pub(crate) fn from_test_value(value: &str) -> Self {
         Self(value.to_owned())
@@ -217,13 +215,6 @@ pub struct BrowserMutationProof(());
 #[derive(Clone, Copy, Debug, Default, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BrowserMutationRequest {}
-
-#[cfg(all(test, feature = "admin-demo"))]
-impl BrowserMutationProof {
-    pub(crate) fn for_test() -> Self {
-        Self(())
-    }
-}
 
 pub struct VerifiedOrganizationClaims {
     pub(crate) issuer: String,
@@ -437,7 +428,7 @@ impl BrowserAuthService {
         })
     }
 
-    #[cfg(any(test, feature = "admin-demo"))]
+    #[cfg(test)]
     pub fn local_fake(
         origin: &str,
         provider: Arc<dyn BrowserOidcProvider>,
@@ -470,7 +461,7 @@ impl BrowserAuthService {
     }
 }
 
-#[cfg(any(test, feature = "admin-demo"))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalFakeIdentity {
     User,
@@ -478,14 +469,14 @@ pub enum LocalFakeIdentity {
     WrongTenant,
 }
 
-#[cfg(any(test, feature = "admin-demo"))]
+#[cfg(test)]
 #[derive(Clone)]
 pub struct LocalFakeOidcProvider {
     identity: LocalFakeIdentity,
     codes: Arc<Mutex<HashMap<String, VerifiedOrganizationClaims>>>,
 }
 
-#[cfg(any(test, feature = "admin-demo"))]
+#[cfg(test)]
 impl LocalFakeOidcProvider {
     pub fn new(identity: LocalFakeIdentity) -> Self {
         Self {
@@ -495,7 +486,7 @@ impl LocalFakeOidcProvider {
     }
 }
 
-#[cfg(any(test, feature = "admin-demo"))]
+#[cfg(test)]
 impl BrowserOidcProvider for LocalFakeOidcProvider {
     fn authorization_url(
         &self,
@@ -579,11 +570,11 @@ impl BrowserOidcProvider for LocalFakeOidcProvider {
     }
 }
 
-#[cfg(any(test, feature = "admin-demo"))]
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub struct LocalFakeIdentityResolver;
 
-#[cfg(any(test, feature = "admin-demo"))]
+#[cfg(test)]
 impl BrowserIdentityResolver for LocalFakeIdentityResolver {
     fn resolve_or_register<'a>(
         &'a self,
@@ -611,7 +602,7 @@ impl BrowserIdentityResolver for LocalFakeIdentityResolver {
     }
 }
 
-#[cfg(any(test, feature = "admin-demo"))]
+#[cfg(test)]
 pub fn local_fake_browser_auth_service(
     origin: &str,
     identity: LocalFakeIdentity,
@@ -624,31 +615,16 @@ pub fn local_fake_browser_auth_service(
 }
 
 pub fn browser_auth_router(service: BrowserAuthService) -> Router {
-    let auth = Router::new()
-        .route("/admin/sign-in", get(sign_in))
-        .route("/admin/session-ready", get(session_ready))
+    Router::new()
         .route("/admin/auth/login", get(login))
         .route("/admin/auth/callback", get(callback))
         .route("/admin/auth/logout", post(logout))
         .route("/admin/api/v1/session", get(session))
         .route("/admin/auth/fake/authorize", get(local_fake_authorize))
-        .merge(crate::admin_ui::asset_router())
         .route_layer(middleware::from_fn(
-            crate::admin_ui::add_browser_security_headers,
+            crate::browser_security::add_browser_security_headers,
         ))
-        .with_state(service.clone());
-    auth.merge(protect_browser_routes(
-        crate::user_ui::router::<()>(),
-        service.clone(),
-    ))
-    .merge(protect_browser_admin_routes(
-        crate::user_ui::admin_router::<()>(),
-        service.clone(),
-    ))
-    .merge(protect_browser_admin_routes(
-        crate::admin_ui::browser_router(),
-        service,
-    ))
+        .with_state(service)
 }
 
 pub fn protect_browser_routes(routes: Router, service: BrowserAuthService) -> Router {
@@ -663,17 +639,6 @@ pub fn protect_browser_admin_routes(routes: Router, service: BrowserAuthService)
         service,
         authenticate_browser_admin,
     ))
-}
-
-async fn sign_in() -> Html<&'static str> {
-    Html(SIGN_IN_HTML)
-}
-
-async fn session_ready(State(service): State<BrowserAuthService>, headers: HeaderMap) -> Response {
-    match resolve_session(&service, &headers) {
-        Ok(_) => Html(SESSION_READY_HTML).into_response(),
-        Err(_) => Redirect::to("/admin/sign-in").into_response(),
-    }
 }
 
 #[derive(Deserialize)]
@@ -1134,17 +1099,7 @@ impl PendingAuthorization {
     fn new(return_to: &str, now: u64) -> Result<Self, BrowserAuthError> {
         if !matches!(
             return_to,
-            "/admin/connections"
-                | "/admin/session-ready"
-                | "/envelopes"
-                | "/envelopes/new"
-                | "/app"
-                | "/app/envelopes"
-                | "/app/envelopes/new"
-                | "/app/runs"
-                | "/connections"
-                | "/runs"
-                | "/settings"
+            "/envelopes" | "/envelopes/new" | "/connections" | "/runs" | "/settings"
         ) {
             return Err(BrowserAuthError::InvalidRedirect);
         }
@@ -1350,26 +1305,10 @@ mod tests {
     };
 
     #[test]
-    fn sign_in_journey_lands_on_the_envelope_workspace_instead_of_a_fixture() {
-        assert!(
-            super::SIGN_IN_HTML.contains("returnTo=%2Fenvelopes"),
-            "the user-bound journey must continue directly to Envelopes"
-        );
-        assert!(
-            !super::SIGN_IN_HTML.contains("returnTo=%2Fadmin%2Fsession-ready"),
-            "the sign-in call to action must not strand users on a fixture page"
-        );
-    }
-
-    #[test]
     fn user_workspace_return_paths_are_exactly_allowlisted() {
         for path in [
             "/envelopes",
             "/envelopes/new",
-            "/app",
-            "/app/envelopes",
-            "/app/envelopes/new",
-            "/app/runs",
             "/connections",
             "/runs",
             "/settings",
@@ -1379,7 +1318,7 @@ mod tests {
                 "the authenticated user workspace destination {path} must be a valid login return"
             );
         }
-        for path in ["/admin", "/app/unknown", "/app/runs?user=other"] {
+        for path in ["/admin", "/app", "/runs?user=other"] {
             assert_eq!(
                 PendingAuthorization::new(path, 100),
                 Err(BrowserAuthError::InvalidRedirect),
@@ -1511,7 +1450,7 @@ mod tests {
     #[test]
     fn authorization_request_contains_pkce_state_nonce_and_exact_google_tenant()
     -> Result<(), String> {
-        let flow = PendingAuthorization::new("/admin/connections", 100)
+        let flow = PendingAuthorization::new("/connections", 100)
             .map_err(|error| format!("begin flow: {error:?}"))?;
         let url = google_config()?.authorization_url(&flow);
         for component in [
@@ -1548,7 +1487,7 @@ mod tests {
             std::sync::Arc::new(super::GoogleAuthorizationOnlyProvider::new(config)),
             std::sync::Arc::new(super::LocalFakeIdentityResolver),
         )?;
-        let flow = PendingAuthorization::new("/admin/connections", 100)
+        let flow = PendingAuthorization::new("/connections", 100)
             .map_err(|error| format!("begin deployed cookie flow: {error:?}"))?;
         let flow_cookie = super::flow_cookie(&service.config, &flow.flow_id);
         assert!(flow_cookie.starts_with("__Secure-steward-oidc-flow="));
@@ -1573,7 +1512,7 @@ mod tests {
             Err(BrowserAuthError::InvalidRedirect)
         );
         let wrong_state = registry
-            .begin("/admin/connections", 100)
+            .begin("/connections", 100)
             .map_err(|error| format!("begin state-negative flow: {error:?}"))?;
         assert_eq!(
             registry.consume_flow(&wrong_state.flow_id, "wrong-state", 101),
@@ -1585,14 +1524,14 @@ mod tests {
             "a rejected callback must not leave a replayable flow"
         );
         let expired = registry
-            .begin("/admin/connections", 100)
+            .begin("/connections", 100)
             .map_err(|error| format!("begin expiry flow: {error:?}"))?;
         assert_eq!(
             registry.consume_flow(&expired.flow_id, &expired.state, expired.expires_at),
             Err(BrowserAuthError::ExpiredFlow)
         );
         let valid = registry
-            .begin("/admin/connections", 100)
+            .begin("/connections", 100)
             .map_err(|error| format!("begin valid flow: {error:?}"))?;
         assert_eq!(
             registry
@@ -1650,11 +1589,11 @@ mod tests {
         let flows = BrowserSessionRegistry::default();
         for _ in 0..MAX_PENDING_AUTHORIZATIONS {
             flows
-                .begin("/admin/connections", 100)
+                .begin("/connections", 100)
                 .map_err(|error| format!("fill pending registry: {error:?}"))?;
         }
         assert_eq!(
-            flows.begin("/admin/connections", 100),
+            flows.begin("/connections", 100),
             Err(BrowserAuthError::CapacityExceeded)
         );
         assert_eq!(
@@ -1667,7 +1606,7 @@ mod tests {
             MAX_PENDING_AUTHORIZATIONS
         );
         flows
-            .begin("/admin/connections", 100 + super::FLOW_TTL_SECONDS)
+            .begin("/connections", 100 + super::FLOW_TTL_SECONDS)
             .map_err(|error| format!("reclaim expired pending entries: {error:?}"))?;
         assert_eq!(
             flows
@@ -1718,7 +1657,7 @@ mod tests {
                 let accepted = &accepted;
                 scope.spawn(move || {
                     for _ in 0..(MAX_PENDING_AUTHORIZATIONS / 8 + 16) {
-                        if registry.begin("/admin/connections", 100).is_ok() {
+                        if registry.begin("/connections", 100).is_ok() {
                             accepted.fetch_add(1, Ordering::SeqCst);
                         }
                     }
@@ -1829,7 +1768,7 @@ mod tests {
             .issue(principal()?, 100)
             .map_err(|error| format!("issue pre-restart session: {error:?}"))?;
         let flow = before_restart
-            .begin("/admin/connections", 100)
+            .begin("/connections", 100)
             .map_err(|error| format!("begin pre-restart flow: {error:?}"))?;
 
         let after_restart = BrowserSessionRegistry::default();
@@ -2340,85 +2279,6 @@ mod tests {
             .await
             .map_err(|error| format!("execute administrator browser request: {error}"))?;
         assert_eq!(accepted.status(), StatusCode::OK);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn administrator_workspace_and_dashboard_are_not_exposed_by_a_developer_session()
-    -> Result<(), String> {
-        let service =
-            local_fake_browser_auth_service("http://127.0.0.1:33001", LocalFakeIdentity::User)?;
-        let user = service
-            .registry
-            .issue(principal()?, super::epoch_seconds())
-            .map_err(|error| format!("issue ordinary browser session: {error:?}"))?;
-        let mut administrator = principal()?;
-        administrator.role = BrowserRole::Admin;
-        administrator.member_roles = vec!["developer".to_owned()];
-        let admin = service
-            .registry
-            .issue(administrator, super::epoch_seconds())
-            .map_err(|error| format!("issue dual-role browser session: {error:?}"))?;
-
-        let routes = || browser_auth_router(service.clone());
-        for uri in ["/admin", "/admin/api/v1/bootstrap"] {
-            let bearer_only = routes()
-                .oneshot(
-                    Request::builder()
-                        .uri(uri)
-                        .header(header::AUTHORIZATION, "Bearer operator-token")
-                        .body(Body::empty())
-                        .map_err(|error| format!("build bearer-only request for {uri}: {error}"))?,
-                )
-                .await
-                .map_err(|error| format!("execute bearer-only request for {uri}: {error}"))?;
-            assert_eq!(
-                bearer_only.status(),
-                StatusCode::UNAUTHORIZED,
-                "the browser-admin dashboard must not accept a bearer token at {uri}"
-            );
-        }
-        for uri in ["/admin/workspace", "/admin", "/admin/api/v1/bootstrap"] {
-            let forbidden = routes()
-                .oneshot(
-                    Request::builder()
-                        .uri(uri)
-                        .header(
-                            header::COOKIE,
-                            format!("steward-local-session={}", user.token),
-                        )
-                        .body(Body::empty())
-                        .map_err(|error| format!("build developer request for {uri}: {error}"))?,
-                )
-                .await
-                .map_err(|error| format!("execute developer request for {uri}: {error}"))?;
-            assert_eq!(
-                forbidden.status(),
-                StatusCode::FORBIDDEN,
-                "a browser user without the server-side administrator assignment must not access {uri}"
-            );
-
-            let accepted = routes()
-                .oneshot(
-                    Request::builder()
-                        .uri(uri)
-                        .header(
-                            header::COOKIE,
-                            format!("steward-local-session={}", admin.token),
-                        )
-                        .body(Body::empty())
-                        .map_err(|error| {
-                            format!("build administrator request for {uri}: {error}")
-                        })?,
-                )
-                .await
-                .map_err(|error| format!("execute administrator request for {uri}: {error}"))?;
-            assert_eq!(
-                accepted.status(),
-                StatusCode::OK,
-                "a browser administrator must access the production dashboard route {uri}"
-            );
-        }
         Ok(())
     }
 }

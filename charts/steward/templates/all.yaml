@@ -519,7 +519,6 @@ spec:
         paths:
           - { path: /admin/api, pathType: Prefix, backend: { service: { name: steward-apiserver, port: { name: https } } } }
           - { path: /admin/auth, pathType: Prefix, backend: { service: { name: steward-apiserver, port: { name: https } } } }
-          - { path: /admin/sign-in, pathType: Exact, backend: { service: { name: steward-apiserver, port: { name: https } } } }
           - { path: /admin/connections/github/callback, pathType: Exact, backend: { service: { name: steward-apiserver, port: { name: https } } } }
           - { path: /app/api, pathType: Prefix, backend: { service: { name: steward-apiserver, port: { name: https } } } }
           - { path: /v1, pathType: Prefix, backend: { service: { name: steward-apiserver, port: { name: https } } } }

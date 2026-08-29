@@ -560,7 +560,6 @@ async fn bounded_response(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "admin-demo")]
     use std::sync::{Arc, Mutex};
 
     use base64::Engine;
@@ -579,10 +578,8 @@ mod tests {
     const AUDIENCE: &str = "identity-browser-hop1";
     const KEY_ID: &str = "steward-browser-hop1-current";
 
-    #[cfg(feature = "admin-demo")]
     struct RemoveFileOnDrop(std::path::PathBuf);
 
-    #[cfg(feature = "admin-demo")]
     impl Drop for RemoveFileOnDrop {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
@@ -757,13 +754,11 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "admin-demo")]
     #[derive(Clone, Default)]
     struct RecordingExchange {
         assertions: Arc<Mutex<Vec<String>>>,
     }
 
-    #[cfg(feature = "admin-demo")]
     impl BrowserHop1ExchangeClient for RecordingExchange {
         fn exchange<'a>(
             &'a self,
@@ -780,7 +775,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "admin-demo")]
     #[tokio::test]
     async fn exact_browser_connection_session_issues_one_internal_bearer_and_never_forwards_binding()
     -> Result<(), Box<dyn std::error::Error>> {

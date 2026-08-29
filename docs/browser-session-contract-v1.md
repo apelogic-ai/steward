@@ -57,9 +57,9 @@ exactly `/admin/auth/callback`.
 
 ## Routes
 
-- `GET /admin/sign-in` renders a self-hosted sign-in shell.
-- `GET /admin/auth/login` starts a five-minute one-time authorization flow. `returnTo` accepts only
-  `/admin/connections` or the local hand-test completion page.
+- Next.js owns `GET /admin/sign-in` and all other browser presentation routes.
+- `GET /admin/auth/login` starts a five-minute one-time authorization flow. `returnTo` accepts
+  only exact current Next.js destinations.
 - `GET /admin/auth/callback` consumes the flow cookie and state before code exchange, verifies the
   returned nonce and organization identity, resolves a canonical principal, rotates any supplied
   session cookie, and redirects to the allowlisted path.
@@ -111,30 +111,6 @@ Missing browser authentication returns 401, an authenticated ordinary user retur
 session resolved with the administrator role receives the typed authority. A Kubernetes
 TokenReview bearer cannot satisfy this browser guard, and a browser cookie cannot satisfy the
 separate operator TokenReview boundary.
-
-## Local fake OIDC hand test
-
-The fake provider is compiled only with the existing `admin-demo` feature, accepts only an explicit
-loopback bind, uses neutral deterministic identities, and drives the same login, callback, canonical
-claim policy, session, CSRF, logout, and security-header code as the production router. It performs
-no external request and holds no secret.
-
-Run the user and administrator fixtures separately:
-
-```bash
-cargo run -p steward-apiserver --locked \
-  --features admin-demo --example admin-dashboard-demo -- \
-  --mode oidc-user --bind 127.0.0.1:0
-
-cargo run -p steward-apiserver --locked \
-  --features admin-demo --example admin-dashboard-demo -- \
-  --mode oidc-admin --bind 127.0.0.1:0
-```
-
-Each process prints `/admin/sign-in`. Complete the redirect, inspect the bounded session response,
-then check that cookies are HttpOnly, browser storage is empty, requests stay on loopback, refresh
-preserves the session, and a cross-origin or missing-CSRF logout is rejected. Stop both processes
-after the hand-test decision.
 
 ## Production verifier and activation boundary
 

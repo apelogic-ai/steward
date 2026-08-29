@@ -1,29 +1,17 @@
 //! REST admission path and authenticated administrator surface.
 
-#[cfg(feature = "admin-demo")]
-pub mod admin_demo;
-mod admin_ui;
 pub mod agent_runs_ui;
 pub mod browser_admin;
 pub mod browser_auth;
 pub mod browser_hop1_attestation;
+mod browser_security;
 pub mod connections;
-#[cfg(feature = "admin-demo")]
-pub mod connections_demo;
-mod connections_ui;
-#[cfg(feature = "admin-demo")]
-pub mod fast_track_connections_bridge;
-#[cfg(feature = "admin-demo")]
-pub mod fast_track_runtime_bootstrap;
 mod github_actions;
 pub mod google_oidc;
 pub mod mcp_gw_connections;
 pub mod stable_runtime_bridge;
 mod tasks;
 pub mod user_envelopes;
-#[cfg(feature = "admin-demo")]
-pub mod user_envelopes_demo;
-mod user_ui;
 pub mod workflows;
 
 pub use github_actions::{
@@ -54,7 +42,7 @@ use std::pin::Pin;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Extension, Json, Router};
 use k8s_openapi::api::authentication::v1::{
@@ -350,7 +338,6 @@ pub struct GrantRevocationRequest {
         task_outputs_contract,
         task_delete_contract,
         browser_auth::session,
-        admin_ui::bootstrap,
         user_envelopes::list_templates,
         user_envelopes::list_requests,
         user_envelopes::get_request,
@@ -391,8 +378,6 @@ pub struct GrantRevocationRequest {
         browser_auth::BrowserRole,
         browser_auth::SessionPrincipalResponse,
         browser_auth::SessionResponse,
-        admin_ui::AdminBootstrapResponse,
-        admin_ui::AdminSurface,
         AgentRunAvailability,
         AgentRunDataStatus,
         AgentRunSpendView,
@@ -1427,43 +1412,6 @@ where
     A: RequestAuthenticator,
     D: DecisionChannel + Clone,
 {
-    router_with_admin_dashboard(runtimes, ledger, authenticator, decisions, true)
-}
-
-/// Build the TokenReview-protected operator API without the browser dashboard.
-///
-/// The production binary selects this when browser authentication is configured:
-/// `/admin` and its bootstrap endpoint are then owned exclusively by the typed
-/// browser-admin router, while all TokenReview operator APIs retain their
-/// existing paths and authorization boundary.
-pub fn router_without_admin_dashboard<R, L, A, D>(
-    runtimes: R,
-    ledger: L,
-    authenticator: A,
-    decisions: D,
-) -> Router
-where
-    R: RuntimeRepository,
-    L: AdmissionLedger + AgentRunLedger,
-    A: RequestAuthenticator,
-    D: DecisionChannel + Clone,
-{
-    router_with_admin_dashboard(runtimes, ledger, authenticator, decisions, false)
-}
-
-fn router_with_admin_dashboard<R, L, A, D>(
-    runtimes: R,
-    ledger: L,
-    authenticator: A,
-    decisions: D,
-    include_dashboard: bool,
-) -> Router
-where
-    R: RuntimeRepository,
-    L: AdmissionLedger + AgentRunLedger,
-    A: RequestAuthenticator,
-    D: DecisionChannel + Clone,
-{
     let admission = Router::new()
         .route(
             "/v1/namespaces/{namespace}/runtimes",
@@ -1487,7 +1435,6 @@ where
             "/admin/api/v1/runs/{taskUid}/timeline",
             get(agent_run_timeline_handler::<R, L, D>),
         )
-        .route("/admin/approvals", get(approval_queue_handler::<R, L, D>))
         .route(
             "/admin/envelopes/{member_role}",
             post(author_envelope_handler::<R, L, D>),
@@ -1508,11 +1455,6 @@ where
             "/admin/runtimes/{runtime_uid}/grants/revoke",
             post(revoke_grants_handler::<R, L, D>),
         );
-    let admin_routes = if include_dashboard {
-        admin_routes.merge(admin_ui::router::<AppState<R, L, D>>())
-    } else {
-        admin_routes
-    };
     let admin = protect_admin_routes(admin_routes, authenticator);
     admission.merge(admin).with_state(AppState {
         runtimes,
@@ -1531,7 +1473,9 @@ where
             authenticator,
             authenticate_admin::<A>,
         ))
-        .route_layer(middleware::from_fn(admin_ui::add_browser_security_headers))
+        .route_layer(middleware::from_fn(
+            browser_security::add_browser_security_headers,
+        ))
 }
 
 async fn agent_runs_handler<R, L, D>(
@@ -1917,21 +1861,6 @@ where
     }
 }
 
-async fn approval_queue_handler<R, L, D>(
-    State(state): State<AppState<R, L, D>>,
-    Extension(_admin): Extension<AdminContext>,
-) -> Response
-where
-    R: RuntimeRepository,
-    L: AdmissionLedger,
-    D: DecisionChannel + Clone,
-{
-    match state.ledger.pending_approvals().await {
-        Ok(approvals) => Html(render_approval_queue(&approvals)).into_response(),
-        Err(error) => ApiError::Store(error).into_response(),
-    }
-}
-
 async fn author_envelope_handler<R, L, D>(
     State(state): State<AppState<R, L, D>>,
     Extension(admin): Extension<AdminContext>,
@@ -2090,44 +2019,6 @@ where
             .into_response(),
         Err(error) => error.into_response(),
     }
-}
-
-fn render_approval_queue(approvals: &[PendingApproval]) -> String {
-    let rows = approvals
-        .iter()
-        .map(|approval| {
-            let counterexample = steward_admission::AdmissionDecision::Reject {
-                deltas: approval.deltas.clone(),
-            }
-            .counterexample()
-            .unwrap_or_else(|| "envelope exceeded".to_owned());
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape_html(&approval.runtime_uid),
-                escape_html(&approval.member_role),
-                escape_html(&approval.actor),
-                escape_html(&counterexample),
-                escape_html(approval.decision_key.as_deref().unwrap_or("unfiled")),
-                escape_html(approval.evidence_url.as_deref().unwrap_or("unfiled")),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Pending approvals</title></head>\
-         <body><main><h1>Pending approvals</h1><table><thead><tr><th>Runtime UID</th><th>Member role</th>\
-         <th>Actor</th><th>Counterexample</th><th>Decision key</th><th>Evidence</th></tr></thead>\
-         <tbody>{rows}</tbody></table></main></body></html>"
-    )
-}
-
-fn escape_html(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 impl IntoResponse for ApiError {
@@ -7773,7 +7664,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/admin/approvals")
+                    .uri("/admin/api/v1/runs")
                     .body(Body::empty())
                     .map_err(|error| format!("failed to build unauthenticated request: {error}"))?,
             )
@@ -7789,7 +7680,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/admin/approvals")
+                    .uri("/admin/api/v1/runs")
                     .header("authorization", "Bearer user-session")
                     .body(Body::empty())
                     .map_err(|error| {
@@ -7870,7 +7761,7 @@ mod tests {
         );
 
         for (method, uri, body) in [
-            ("GET", "/admin/approvals", ""),
+            ("GET", "/admin/api/v1/runs", ""),
             (
                 "POST",
                 "/admin/envelopes/engineer",
@@ -8065,36 +7956,6 @@ mod tests {
                 "https://jira.example.com/browse/PROJ-123"
             ))
         );
-        let queue = app
-            .oneshot(
-                Request::builder()
-                    .uri("/admin/approvals")
-                    .header("authorization", "Bearer admin-session")
-                    .body(Body::empty())
-                    .map_err(|error| format!("failed to build queue request: {error}"))?,
-            )
-            .await
-            .map_err(|error| format!("approval queue request failed: {error}"))?;
-        assert_eq!(queue.status(), StatusCode::OK);
-        let queue_body = to_bytes(queue.into_body(), 1024 * 1024)
-            .await
-            .map_err(|error| format!("failed to read approval queue: {error}"))?;
-        let queue_html = String::from_utf8(queue_body.to_vec())
-            .map_err(|error| format!("approval queue was not UTF-8: {error}"))?;
-        for expected in [
-            "runtime-uid-a",
-            "engineer",
-            "alice@example.com",
-            "requested 220.00 USD",
-            "ceiling 200.00 USD",
-            "PROJ-123",
-            "https://jira.example.com/browse/PROJ-123",
-        ] {
-            assert!(
-                queue_html.contains(expected),
-                "approval queue must render {expected:?} from the parked row"
-            );
-        }
         Ok(())
     }
 
@@ -9262,8 +9123,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_dashboard_shell_and_versioned_bootstrap_require_exact_admin_authority()
-    -> Result<(), String> {
+    async fn admin_api_responses_set_fail_closed_browser_headers() -> Result<(), String> {
         let app = router(
             FakeRuntimeRepository {
                 runtime: Arc::new(Mutex::new(runtime())),
@@ -9273,115 +9133,7 @@ mod tests {
             FakeDecisionChannel::default(),
         );
 
-        for (authorization, expected) in [
-            (None, StatusCode::UNAUTHORIZED),
-            (Some("Bearer user-session"), StatusCode::FORBIDDEN),
-        ] {
-            for uri in ["/admin", "/admin/api/v1/bootstrap"] {
-                let mut request = Request::builder().uri(uri);
-                if let Some(authorization) = authorization {
-                    request = request.header("authorization", authorization);
-                }
-                let response = app
-                    .clone()
-                    .oneshot(request.body(Body::empty()).map_err(|error| {
-                        format!("failed to build dashboard authorization request: {error}")
-                    })?)
-                    .await
-                    .map_err(|error| format!("dashboard authorization request failed: {error}"))?;
-                assert_eq!(
-                    response.status(),
-                    expected,
-                    "{uri} must share the existing exact Steward administrator boundary"
-                );
-            }
-        }
-
-        let shell = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/admin")
-                    .header("authorization", "Bearer admin-session")
-                    .body(Body::empty())
-                    .map_err(|error| format!("failed to build dashboard shell request: {error}"))?,
-            )
-            .await
-            .map_err(|error| format!("dashboard shell request failed: {error}"))?;
-        assert_eq!(shell.status(), StatusCode::OK);
-        assert_eq!(
-            shell
-                .headers()
-                .get("content-type")
-                .and_then(|value| value.to_str().ok()),
-            Some("text/html; charset=utf-8")
-        );
-        let shell_body = to_bytes(shell.into_body(), 1024 * 1024)
-            .await
-            .map_err(|error| format!("failed to read dashboard shell: {error}"))?;
-        let shell_html = String::from_utf8(shell_body.to_vec())
-            .map_err(|error| format!("dashboard shell was not UTF-8: {error}"))?;
-        for surface in ["Approvals", "Envelope templates", "Agent Runs"] {
-            assert!(
-                shell_html.contains(surface),
-                "the dashboard shell must expose the {surface} navigation surface"
-            );
-        }
-        for forbidden_fixture in ["leo@", "maya@", "openclaw-a1b2"] {
-            assert!(
-                !shell_html.contains(forbidden_fixture),
-                "the production shell must not embed mock operational data: {forbidden_fixture}"
-            );
-        }
-
-        let bootstrap = app
-            .oneshot(
-                Request::builder()
-                    .uri("/admin/api/v1/bootstrap")
-                    .header("authorization", "Bearer admin-session")
-                    .body(Body::empty())
-                    .map_err(|error| {
-                        format!("failed to build dashboard bootstrap request: {error}")
-                    })?,
-            )
-            .await
-            .map_err(|error| format!("dashboard bootstrap request failed: {error}"))?;
-        assert_eq!(bootstrap.status(), StatusCode::OK);
-        let bootstrap_body = to_bytes(bootstrap.into_body(), 1024 * 1024)
-            .await
-            .map_err(|error| format!("failed to read dashboard bootstrap: {error}"))?;
-        let bootstrap_json = serde_json::from_slice::<serde_json::Value>(&bootstrap_body)
-            .map_err(|error| format!("dashboard bootstrap was not JSON: {error}"))?;
-        assert_eq!(
-            bootstrap_json,
-            serde_json::json!({
-                "apiVersion": "steward.admin/v1",
-                "actor": "admin@example.com",
-                "surfaces": ["approvals", "envelope", "fleet"]
-            })
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn admin_dashboard_responses_set_fail_closed_browser_headers() -> Result<(), String> {
-        let app = router(
-            FakeRuntimeRepository {
-                runtime: Arc::new(Mutex::new(runtime())),
-            },
-            ledger(),
-            FakeAuthenticator,
-            FakeDecisionChannel::default(),
-        );
-
-        for uri in [
-            "/admin",
-            "/admin/assets/admin.css",
-            "/admin/assets/admin.js",
-            "/admin/assets/icon.svg",
-            "/admin/api/v1/bootstrap",
-            "/admin/approvals",
-        ] {
+        for uri in ["/admin/api/v1/runs"] {
             let response = app
                 .clone()
                 .oneshot(
@@ -9395,7 +9147,7 @@ mod tests {
                 )
                 .await
                 .map_err(|error| format!("dashboard header request failed: {error}"))?;
-            assert_eq!(response.status(), StatusCode::OK, "dashboard asset {uri}");
+            assert_eq!(response.status(), StatusCode::OK, "administrator API {uri}");
             assert_eq!(
                 response
                     .headers()
@@ -9419,21 +9171,25 @@ mod tests {
             );
             assert!(
                 response.headers().contains_key("content-security-policy"),
-                "dashboard asset {uri} must carry a CSP"
+                "administrator API {uri} must carry a CSP"
             );
         }
 
         let unauthenticated = app
             .oneshot(
                 Request::builder()
-                    .uri("/admin")
+                    .uri("/admin/api/v1/runs")
                     .body(Body::empty())
                     .map_err(|error| {
-                        format!("failed to build unauthenticated dashboard request: {error}")
+                        format!(
+                            "failed to build unauthenticated administrator API request: {error}"
+                        )
                     })?,
             )
             .await
-            .map_err(|error| format!("unauthenticated dashboard request failed: {error}"))?;
+            .map_err(|error| {
+                format!("unauthenticated administrator API request failed: {error}")
+            })?;
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
             unauthenticated
@@ -9444,103 +9200,6 @@ mod tests {
             "authentication failures on administrator routes must retain browser headers"
         );
         Ok(())
-    }
-
-    #[test]
-    fn admin_dashboard_static_contract_is_accessible_responsive_and_storage_free() {
-        let html = include_str!("../assets/admin/index.html");
-        let css = include_str!("../assets/admin/admin.css");
-        let javascript = include_str!("../assets/admin/admin.js");
-
-        for required in [
-            "lang=\"en\"",
-            "name=\"viewport\"",
-            "rel=\"icon\" href=\"/admin/assets/icon.svg\"",
-            "class=\"skip-link\"",
-            "aria-label=\"Steward administrator surfaces\"",
-            "role=\"tablist\"",
-            "role=\"tab\"",
-            "role=\"tabpanel\"",
-            "aria-controls=\"approvals-panel\"",
-            "aria-selected=\"true\"",
-            "role=\"alert\"",
-        ] {
-            assert!(
-                html.contains(required),
-                "dashboard shell is missing accessible contract {required:?}"
-            );
-        }
-        assert!(
-            css.contains("@media (max-width: 38rem)"),
-            "dashboard shell must define its narrow viewport layout"
-        );
-        assert!(
-            css.contains("prefers-reduced-motion"),
-            "dashboard shell must honor reduced-motion preferences"
-        );
-        for key in ["ArrowLeft", "ArrowRight", "Home", "End"] {
-            assert!(
-                javascript.contains(key),
-                "dashboard tabs must support the {key} keyboard command"
-            );
-        }
-        for forbidden in [
-            "localStorage",
-            "sessionStorage",
-            "document.cookie",
-            "Authorization",
-            "innerHTML",
-            "outerHTML",
-        ] {
-            assert!(
-                !javascript.contains(forbidden),
-                "dashboard JavaScript must not use forbidden credential or HTML sink {forbidden}"
-            );
-        }
-    }
-
-    #[test]
-    fn admin_dashboard_human_review_presents_left_aligned_navigation_links() {
-        let html = include_str!("../assets/admin/index.html");
-        let css = include_str!("../assets/admin/admin.css");
-        let javascript = include_str!("../assets/admin/admin.js");
-
-        for required in [
-            "href=\"#approvals\"",
-            "href=\"#envelope\"",
-            "href=\"#fleet\"",
-            "aria-current=\"page\"",
-            "role=\"tab\"",
-        ] {
-            assert!(
-                html.contains(required),
-                "reviewed navigation link contract is missing {required:?}"
-            );
-        }
-        for removed_presentation in [
-            "<span>administration</span>",
-            "class=\"contract\"",
-            "<button id=\"approvals-tab\"",
-        ] {
-            assert!(
-                !html.contains(removed_presentation),
-                "human-requested presentation must remove {removed_presentation:?}"
-            );
-        }
-        assert!(
-            css.contains("justify-content: flex-start"),
-            "reviewed navigation must remain left aligned"
-        );
-        for required in [
-            "setAttribute(\"aria-current\", \"page\")",
-            "removeAttribute(\"aria-current\")",
-            "window.location.hash.slice(1) || \"approvals\"",
-        ] {
-            assert!(
-                javascript.contains(required),
-                "navigation script must preserve current-page semantics with {required:?}"
-            );
-        }
     }
 
     #[tokio::test]

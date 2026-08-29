@@ -127,7 +127,7 @@ jobs:
       - name: Fail fast on the S5 Mint token-grant contract
         run: >-
           cargo test --locked --package steward-mint
-          --test fast_track_mcp_compatibility
+          --test runtime_mcp_compatibility
           s5_hop1_v3_authority_mints_and_introspects_the_required_mcp_grant
           -- --exact
 
@@ -296,11 +296,10 @@ jobs:
           bun install --frozen-lockfile
           bunx playwright install --with-deps chromium
 
-      - name: Verify and build browser presentation and loopback demos
+      - name: Verify and build browser presentation
         run: |
           bun run web:check
           bun run --cwd web build
-          cargo build -p steward-apiserver --locked --features admin-demo --examples
 
       - name: Verify loopback browser journeys
         run: cargo xtask browser-e2e --browser-ready

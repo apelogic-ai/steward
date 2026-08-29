@@ -4,14 +4,6 @@ export type ClientOptions = {
     baseUrl: `${string}://${string}` | (string & {});
 };
 
-export type AdminBootstrapResponse = {
-    actor: string;
-    apiVersion: string;
-    surfaces: Array<AdminSurface>;
-};
-
-export type AdminSurface = 'approvals' | 'envelope' | 'fleet';
-
 export type AgentRunAvailability = 'available' | 'partial' | 'unavailable';
 
 export type AgentRunDataStatus = {
@@ -762,33 +754,6 @@ export type FileAdminApprovalDecisionResponses = {
 };
 
 export type FileAdminApprovalDecisionResponse = FileAdminApprovalDecisionResponses[keyof FileAdminApprovalDecisionResponses];
-
-export type BootstrapData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/admin/api/v1/bootstrap';
-};
-
-export type BootstrapErrors = {
-    /**
-     * Missing or invalid authentication
-     */
-    401: unknown;
-    /**
-     * Administrator authority required
-     */
-    403: unknown;
-};
-
-export type BootstrapResponses = {
-    /**
-     * Authenticated administrator UI contract
-     */
-    200: AdminBootstrapResponse;
-};
-
-export type BootstrapResponse = BootstrapResponses[keyof BootstrapResponses];
 
 export type ConnectionStatusData = {
     body?: never;
