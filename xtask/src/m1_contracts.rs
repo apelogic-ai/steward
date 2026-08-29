@@ -36,6 +36,18 @@ const EVIDENCE_VERIFICATION_MATERIAL_FIXTURE: &str =
 const TASK_EVIDENCE_PAYLOAD_TYPE: &str = "application/vnd.steward.task-evidence.v1+json";
 const EXPECTED_CANONICAL_PAYLOAD_BYTES: usize = 4_418;
 const EXPECTED_DSSE_PAE_BYTES: usize = 4_479;
+const EXPECTED_CANONICAL_PAYLOAD_SHA256: [u8; 32] = [
+    0x37, 0x39, 0x3b, 0x8d, 0x4e, 0xe0, 0x3b, 0x51, 0xf4, 0xdb, 0xd1, 0x30, 0xf6, 0xb5, 0x6c, 0x3e,
+    0x86, 0x5b, 0xdc, 0x9b, 0x61, 0xa1, 0xef, 0xb0, 0x43, 0x3f, 0x1c, 0xb3, 0xc4, 0x20, 0x28, 0xdd,
+];
+const EXPECTED_DSSE_PAE_SHA256: [u8; 32] = [
+    0x97, 0x38, 0x0a, 0x14, 0x8e, 0x8a, 0xf8, 0xa4, 0x0a, 0xa5, 0x31, 0x7e, 0x5c, 0x4a, 0x87, 0xf4,
+    0xa2, 0x39, 0xc7, 0x5e, 0xad, 0xce, 0x0f, 0xed, 0x2b, 0xd7, 0x7f, 0x1f, 0xda, 0xd2, 0x2f, 0xcd,
+];
+const EXPECTED_RFC8032_PUBLIC_KEY: [u8; 32] = [
+    0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+    0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+];
 const ED25519_SPKI_PREFIX: &[u8] = &[
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
@@ -304,6 +316,14 @@ fn validate_deterministic_dsse_vector(directory: &Path) -> Result<(), String> {
             canonical_payload.len()
         ));
     }
+    let canonical_payload_sha256 =
+        sha256_with_openssl(&canonical_payload, "canonical task evidence payload")?;
+    if canonical_payload_sha256 != EXPECTED_CANONICAL_PAYLOAD_SHA256 {
+        return Err(
+            "deterministic DSSE canonical payload SHA-256 does not match the frozen vector"
+                .to_owned(),
+        );
+    }
 
     let signed = object(&signed, "deterministic signed task evidence fixture")?;
     exact_string(
@@ -350,6 +370,7 @@ fn validate_deterministic_dsse_vector(directory: &Path) -> Result<(), String> {
         "deterministic task evidence issuer",
     )?;
     let issuer_key_id = string(issuer, "keyId", "deterministic task evidence issuer")?;
+    let issuer_instance_id = string(issuer, "instanceId", "deterministic task evidence issuer")?;
 
     let material = object(
         &material,
@@ -361,6 +382,17 @@ fn validate_deterministic_dsse_vector(directory: &Path) -> Result<(), String> {
         TASK_EVIDENCE_PAYLOAD_TYPE,
         "deterministic evidence verification material fixture",
     )?;
+    let material_instance_id = string(
+        material,
+        "instanceId",
+        "deterministic evidence verification material fixture",
+    )?;
+    if material_instance_id != issuer_instance_id {
+        return Err(
+            "deterministic DSSE verification material instance ID must match the payload issuer instance ID"
+                .to_owned(),
+        );
+    }
     exact_string(
         material,
         "canonicalization",
@@ -401,8 +433,10 @@ fn validate_deterministic_dsse_vector(directory: &Path) -> Result<(), String> {
         string(key, "x", "deterministic DSSE verification key")?,
         "deterministic DSSE public key",
     )?;
-    if public_key.len() != 32 {
-        return Err("deterministic DSSE Ed25519 public key must decode to 32 bytes".to_owned());
+    if public_key.as_slice() != EXPECTED_RFC8032_PUBLIC_KEY {
+        return Err(
+            "deterministic DSSE public key must match the frozen RFC 8032 test key".to_owned(),
+        );
     }
 
     let pae = dsse_pae(TASK_EVIDENCE_PAYLOAD_TYPE, &canonical_payload);
@@ -411,6 +445,10 @@ fn validate_deterministic_dsse_vector(directory: &Path) -> Result<(), String> {
             "deterministic DSSE PAE must remain {EXPECTED_DSSE_PAE_BYTES} bytes, found {}",
             pae.len()
         ));
+    }
+    let pae_sha256 = sha256_with_openssl(&pae, "DSSE PAE")?;
+    if pae_sha256 != EXPECTED_DSSE_PAE_SHA256 {
+        return Err("deterministic DSSE PAE SHA-256 does not match the frozen vector".to_owned());
     }
     verify_ed25519_with_openssl(&public_key, &pae, &signature_bytes)
 }
@@ -597,6 +635,31 @@ fn verify_ed25519_with_openssl(
         return Err("deterministic DSSE signature verification failed".to_owned());
     }
     Ok(())
+}
+
+fn sha256_with_openssl(value: &[u8], description: &str) -> Result<[u8; 32], String> {
+    let directory = DsseVerificationDirectory::create()?;
+    let input_path = directory.0.join("input.bin");
+    fs::write(&input_path, value)
+        .map_err(|error| format!("failed to stage deterministic {description}: {error}"))?;
+    let output = Command::new("openssl")
+        .args(["dgst", "-sha256", "-binary"])
+        .arg(&input_path)
+        .output()
+        .map_err(|error| {
+            format!("deterministic {description} SHA-256 requires openssl: {error}")
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "deterministic {description} SHA-256 calculation failed"
+        ));
+    }
+    output.stdout.try_into().map_err(|output: Vec<u8>| {
+        format!(
+            "deterministic {description} SHA-256 must contain 32 bytes, found {}",
+            output.len()
+        )
+    })
 }
 
 fn validate_compatibility_outcomes(valid: usize, rejected: usize) -> Result<(), String> {
@@ -1467,7 +1530,7 @@ fn instance_type(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        QUALIFIED_WORKFLOW_PATTERN, parse_unique_json, read_json, valid_base64url,
+        QUALIFIED_WORKFLOW_PATTERN, canonical_json, parse_unique_json, read_json, valid_base64url,
         valid_relative_path, valid_rfc3339_utc, valid_versioned_name,
         validate_compatibility_outcomes, validate_json_schema_instance,
         validate_m1_contract_directory,
@@ -1532,6 +1595,45 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    fn write_json(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+        let serialized = serde_json::to_vec_pretty(value)
+            .map_err(|error| format!("temporary fixture must serialize: {error}"))?;
+        fs::write(path, serialized)
+            .map_err(|error| format!("temporary fixture must be written: {error}"))
+    }
+
+    fn encode_base64url(value: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut encoded = String::with_capacity(value.len().div_ceil(3) * 4);
+        let mut chunks = value.chunks_exact(3);
+        for chunk in &mut chunks {
+            encoded.push(char::from(ALPHABET[usize::from(chunk[0] >> 2)]));
+            encoded.push(char::from(
+                ALPHABET[usize::from(((chunk[0] & 0x03) << 4) | (chunk[1] >> 4))],
+            ));
+            encoded.push(char::from(
+                ALPHABET[usize::from(((chunk[1] & 0x0f) << 2) | (chunk[2] >> 6))],
+            ));
+            encoded.push(char::from(ALPHABET[usize::from(chunk[2] & 0x3f)]));
+        }
+        match chunks.remainder() {
+            [first] => {
+                encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
+                encoded.push(char::from(ALPHABET[usize::from((first & 0x03) << 4)]));
+            }
+            [first, second] => {
+                encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
+                encoded.push(char::from(
+                    ALPHABET[usize::from(((first & 0x03) << 4) | (second >> 4))],
+                ));
+                encoded.push(char::from(ALPHABET[usize::from((second & 0x0f) << 2)]));
+            }
+            _ => {}
+        }
+        encoded
     }
 
     #[test]
@@ -1769,10 +1871,7 @@ mod tests {
         let replacement_prefix = if signature.starts_with('A') { "B" } else { "A" };
         let tampered = format!("{replacement_prefix}{}", &signature[1..]);
         signed["signatures"][0]["sig"] = json!(tampered);
-        let serialized = serde_json::to_vec_pretty(&signed)
-            .map_err(|error| format!("tampered fixture must serialize: {error}"))?;
-        fs::write(&signed_path, serialized)
-            .map_err(|error| format!("tampered fixture must be written: {error}"))?;
+        write_json(&signed_path, &signed)?;
 
         let result = validate_m1_contract_directory(&temporary.0);
         assert!(
@@ -1783,6 +1882,85 @@ mod tests {
         assert!(
             error.contains("DSSE signature"),
             "the failure must identify deterministic DSSE signature verification: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn contract_gate_binds_verification_material_to_payload_issuer() -> Result<(), String> {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/contracts/m1/v1");
+        let temporary = TempContractDirectory::copy_from(&source)?;
+        let material_path = temporary
+            .0
+            .join("fixtures/positive/evidence-verification-material.json");
+        let mut material = read_json(&material_path, "verification material fixture")?;
+        material["instanceId"] = json!("55555555-5555-4555-8555-555555555555");
+        write_json(&material_path, &material)?;
+
+        let result = validate_m1_contract_directory(&temporary.0);
+        assert!(
+            result.is_err(),
+            "verification material for a different issuer instance must be rejected"
+        );
+        let error = result.err().unwrap_or_default();
+        assert!(
+            error.contains("instance ID"),
+            "the failure must identify the issuer instance ID binding: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn contract_gate_pins_the_frozen_rfc8032_public_key() -> Result<(), String> {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/contracts/m1/v1");
+        let temporary = TempContractDirectory::copy_from(&source)?;
+        let material_path = temporary
+            .0
+            .join("fixtures/positive/evidence-verification-material.json");
+        let mut material = read_json(&material_path, "verification material fixture")?;
+        material["keys"][0]["x"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        write_json(&material_path, &material)?;
+
+        let result = validate_m1_contract_directory(&temporary.0);
+        assert!(
+            result.is_err(),
+            "a replacement Ed25519 key must be rejected"
+        );
+        let error = result.err().unwrap_or_default();
+        assert!(
+            error.contains("RFC 8032 test key"),
+            "the failure must identify the frozen public key: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn contract_gate_pins_the_frozen_canonical_payload_sha256() -> Result<(), String> {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/contracts/m1/v1");
+        let temporary = TempContractDirectory::copy_from(&source)?;
+        let payload_path = temporary
+            .0
+            .join("fixtures/positive/task-evidence-payload.json");
+        let signed_path = temporary
+            .0
+            .join("fixtures/positive/signed-task-evidence.json");
+        let mut payload = read_json(&payload_path, "task evidence payload fixture")?;
+        payload["executionBinding"]["release"] = json!("v0.0.99");
+        let encoded_payload = encode_base64url(&canonical_json(&payload)?);
+        let mut signed = read_json(&signed_path, "signed evidence fixture")?;
+        signed["payload"] = json!(encoded_payload);
+        write_json(&payload_path, &payload)?;
+        write_json(&signed_path, &signed)?;
+
+        let result = validate_m1_contract_directory(&temporary.0);
+        assert!(
+            result.is_err(),
+            "a replacement canonical payload must be rejected"
+        );
+        let error = result.err().unwrap_or_default();
+        assert!(
+            error.contains("canonical payload SHA-256"),
+            "the failure must identify the frozen payload digest: {error}"
         );
         Ok(())
     }
