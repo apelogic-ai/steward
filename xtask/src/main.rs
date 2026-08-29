@@ -2583,12 +2583,20 @@ mod tests {
 
     impl TestRepository {
         fn create() -> Result<Self, String> {
-            let nonce = NEXT_REPOSITORY_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("steward-migration-{}-{nonce}", std::process::id()));
-            fs::create_dir_all(&path)
-                .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
-            Ok(Self { path })
+            for _ in 0..1_024 {
+                let nonce = NEXT_REPOSITORY_ID.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir()
+                    .join(format!("steward-migration-{}-{nonce}", std::process::id()));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Ok(Self { path }),
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        return Err(format!("failed to create {}: {error}", path.display()));
+                    }
+                }
+            }
+
+            Err("failed to allocate a unique migration test repository".to_owned())
         }
     }
 
