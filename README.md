@@ -81,7 +81,6 @@ docs/
     pr-1970-review-comment.md
     rfc-0011-review-comment.md
 
-  design/steward-admin-mockup.html
   diagrams/*.png
 ```
 

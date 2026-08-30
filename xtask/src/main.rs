@@ -318,18 +318,6 @@ fn browser_e2e(browser_ready: bool) -> TaskResult {
     }
     run("bun", &["run", "web:check"])?;
     run("bun", &["run", "--cwd", "web", "build"])?;
-    run(
-        "cargo",
-        &[
-            "build",
-            "-p",
-            "steward-apiserver",
-            "--locked",
-            "--features",
-            "admin-demo",
-            "--examples",
-        ],
-    )?;
     run_with_env("bun", &["run", "test:browser-e2e"], &bun_environment)
 }
 
@@ -1047,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_e2e_ci_uses_the_pinned_loopback_gate() -> Result<(), String> {
+    fn browser_e2e_ci_uses_the_pinned_nextjs_gate() -> Result<(), String> {
         let repository = root();
         let workflow = fs::read_to_string(repository.join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
@@ -1055,11 +1043,8 @@ mod tests {
             .map_err(|error| format!("pinned browser test package is required: {error}"))?;
         let bun_version = fs::read_to_string(repository.join(".bun-version"))
             .map_err(|error| format!("pinned Bun version is required: {error}"))?;
-        let journey = fs::read_to_string(repository.join("tests/browser/steward-ui.spec.mjs"))
-            .map_err(|error| format!("loopback browser journey is required: {error}"))?;
-        let next_journey =
-            fs::read_to_string(repository.join("tests/browser/steward-next.spec.mjs"))
-                .map_err(|error| format!("Next browser journey is required: {error}"))?;
+        let journey = fs::read_to_string(repository.join("tests/browser/steward-next.spec.mjs"))
+            .map_err(|error| format!("Next browser journey is required: {error}"))?;
         let xtask_source = include_str!("main.rs");
 
         let browser_job = workflow
@@ -1085,24 +1070,15 @@ mod tests {
             "browser E2E CI must use the cargo xtask gate"
         );
         assert!(
-            browser_job.contains(
-                "cargo build -p steward-apiserver --locked --features admin-demo --examples"
-            ),
-            "browser E2E CI must precompile loopback demos before Playwright starts"
-        );
-        assert!(
             browser_job.contains("bun run web:check")
                 && browser_job.contains("bun run --cwd web build"),
             "browser E2E CI must reject stale generated clients before building the Next application"
         );
         assert!(
-            xtask_source.contains("\"steward-apiserver\",")
-                && xtask_source.contains("\"--examples\",")
-                && xtask_source.contains("run(\"bun\", &[\"run\", \"web:check\"])")
+            xtask_source.contains("run(\"bun\", &[\"run\", \"web:check\"])")
                 && xtask_source.contains("run(\"bun\", &[\"run\", \"--cwd\", \"web\", \"build\"])")
-                && journey.contains("exampleBinary(\"user-envelope-demo\")")
-                && journey.contains("exampleBinary(\"admin-dashboard-demo\")"),
-            "the local browser gate must verify and build Next before supervising its loopback demos"
+                && xtask_source.contains("run_with_env(\"bun\", &[\"run\", \"test:browser-e2e\"]"),
+            "the local browser gate must verify, build, and exercise the Next.js application"
         );
         assert!(
             package.contains("\"@playwright/test\": \"1.62.1\""),
@@ -1119,7 +1095,7 @@ mod tests {
         ] {
             assert!(
                 journey.contains(required),
-                "the loopback browser journey must cover {required}"
+                "the browser journey must cover {required}"
             );
         }
         for required in [
@@ -1132,7 +1108,7 @@ mod tests {
             "scrollWidth",
         ] {
             assert!(
-                next_journey.contains(required),
+                journey.contains(required),
                 "the Next browser journey must cover {required}"
             );
         }
@@ -2147,7 +2123,6 @@ mod tests {
             "kind: Ingress",
             "path: /admin/api",
             "path: /admin/auth",
-            "path: /admin/sign-in",
             "path: /admin/connections/github/callback",
             "path: /app/api",
             "name: steward-apiserver",

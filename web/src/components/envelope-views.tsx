@@ -163,7 +163,6 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
           {templates.map((item) => <option key={item.id} value={item.id}>{item.displayName} · revision {item.revision}</option>)}
         </select>
       </label>
-      {template.githubConnection !== "connected" ? <p className="rounded-md bg-notice p-4 text-sm" role="status">This template requires a ready GitHub connection. <Link className="font-semibold underline" href="/connections">Review connections</Link>.</p> : null}
       <div className="grid gap-4 sm:grid-cols-2">
         <label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})
           <input className="min-h-11 rounded-md border px-3 font-normal" inputMode="decimal" onChange={(event) => setBudget(event.target.value)} required value={budget} />
@@ -184,8 +183,8 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
           return <label className="flex min-h-11 items-center gap-3 text-sm" key={key}><input checked={tools.has(key)} onChange={() => setTools((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next; })} type="checkbox" />{item.provider}:{item.resource}:{item.action}</label>;
         })}</div>
       </Accordion>
-      {submission !== "idle" && submission !== "submitting" ? <p className="text-sm text-red-800" role="alert">{{ conflict: "The template revision or connection state changed. Reload before retrying.", rejected: "Rust admission rejected the requested authority as outside the template ceiling.", forbidden: "The Rust authorization boundary rejected the request.", unavailable: "The authoritative request service is unavailable.", error: "The request could not be accepted." }[submission]}</p> : null}
-      <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting" || template.githubConnection !== "connected"} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
+      {submission !== "idle" && submission !== "submitting" ? <p className="text-sm text-red-800" role="alert">{{ conflict: "The template revision changed. Reload before retrying.", rejected: "Rust admission rejected the requested authority as outside the template ceiling.", forbidden: "The Rust authorization boundary rejected the request.", unavailable: "The authoritative request service is unavailable.", error: "The request could not be accepted." }[submission]}</p> : null}
+      <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
     </form>
   );
 }

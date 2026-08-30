@@ -12,8 +12,7 @@ use steward_apiserver::{
     ConfiguredTaskIdentityResolver, IdentityOrKubernetesTokenAuthenticator, KubeRuntimeRepository,
     KubernetesTokenAuthenticator, KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog,
     agent_runs_ui, browser_admin, browser_auth, browser_hop1_attestation, connections, google_oidc,
-    mcp_gw_connections, router, router_without_admin_dashboard, stable_runtime_bridge, task_router,
-    user_envelopes, workflows,
+    mcp_gw_connections, router, stable_runtime_bridge, task_router, user_envelopes, workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
@@ -74,21 +73,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .map_err(io::Error::other)?;
     let runtimes = KubeRuntimeRepository::new(client);
     let browser = browser_application_router(store.clone(), runtimes.clone(), decisions.clone())?;
-    let app = if browser.is_some() {
-        router_without_admin_dashboard(
-            runtimes.clone(),
-            store.clone(),
-            authenticator,
-            decisions.clone(),
-        )
-    } else {
-        router(
-            runtimes.clone(),
-            store.clone(),
-            authenticator,
-            decisions.clone(),
-        )
-    }
+    let app = router(
+        runtimes.clone(),
+        store.clone(),
+        authenticator,
+        decisions.clone(),
+    )
     .merge(task_router(
         runtimes.clone(),
         store.clone(),
@@ -187,6 +177,7 @@ fn browser_application_router(
         Arc::new(browser_auth::PgBrowserIdentityResolver::new(store.clone())),
     )
     .map_err(io::Error::other)?;
+    let connections = browser_hop1_connections_configuration(&origin)?;
     let app = browser_auth::browser_auth_router(auth.clone())
         .merge(user_envelopes::protected_router(
             user_envelopes::PgEnvelopeRequestBroker::new(store.clone()),
@@ -203,7 +194,7 @@ fn browser_application_router(
             store.clone(),
             auth.clone(),
         ));
-    let app = match browser_hop1_connections_configuration(&origin)? {
+    let app = match connections {
         Some(broker) => app.merge(connections::protected_router(broker, auth.clone())),
         None => app,
     };

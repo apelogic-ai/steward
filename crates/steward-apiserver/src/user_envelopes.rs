@@ -57,14 +57,6 @@ fn subject_from_browser_session(context: &BrowserSessionContext) -> UserEnvelope
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ConnectionReadiness {
-    Connected,
-    ReauthRequired,
-    Missing,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AvailableEnvelopeTemplate {
@@ -75,7 +67,6 @@ pub struct AvailableEnvelopeTemplate {
     pub ceiling: Envelope,
     #[schema(value_type = Option<BrowserEnvelope>)]
     pub auto_provision_threshold: Option<Envelope>,
-    pub github_connection: ConnectionReadiness,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -254,18 +245,6 @@ pub struct PgEnvelopeRequestBroker {
     store: PgStore,
 }
 
-fn has_tools(envelope: &Envelope) -> bool {
-    !envelope.spec.tools.is_empty()
-}
-
-fn connection_readiness_for_ceiling(envelope: &Envelope) -> ConnectionReadiness {
-    if has_tools(envelope) {
-        ConnectionReadiness::Missing
-    } else {
-        ConnectionReadiness::Connected
-    }
-}
-
 impl PgEnvelopeRequestBroker {
     pub fn new(store: PgStore) -> Self {
         Self { store }
@@ -286,19 +265,53 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                     .await
                     .map_err(map_store_broker_error)?
                 {
-                    let github_connection = connection_readiness_for_ceiling(&ceiling);
                     templates.push(AvailableEnvelopeTemplate {
                         id: member_role.clone(),
                         display_name: member_role.clone(),
                         revision: ceiling.revision,
                         ceiling,
                         auto_provision_threshold: None,
-                        github_connection,
                     });
                 }
             }
             templates.sort_by(|left, right| left.id.cmp(&right.id));
             Ok(templates)
+        })
+    }
+
+    fn template<'a>(
+        &'a self,
+        session: &'a UserEnvelopeSession<BrowserSessionBinding>,
+        template_id: &'a str,
+        revision: i64,
+    ) -> BoxFuture<'a, Result<Option<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>> {
+        Box::pin(async move {
+            if !session
+                .subject
+                .member_roles
+                .iter()
+                .any(|member_role| member_role == template_id)
+            {
+                return Ok(None);
+            }
+            let Some(ceiling) = self
+                .store
+                .latest_envelope(template_id)
+                .await
+                .map_err(map_store_broker_error)?
+            else {
+                return Ok(None);
+            };
+            if ceiling.revision != revision {
+                return Ok(None);
+            }
+            Ok(Some(AvailableEnvelopeTemplate {
+                id: template_id.to_owned(),
+                display_name: template_id.to_owned(),
+                revision,
+                ceiling,
+                auto_provision_threshold: None,
+            }))
         })
     }
 
@@ -421,6 +434,21 @@ where
         &'a self,
         session: &'a UserEnvelopeSession<B>,
     ) -> BoxFuture<'a, Result<Vec<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>>;
+
+    fn template<'a>(
+        &'a self,
+        session: &'a UserEnvelopeSession<B>,
+        template_id: &'a str,
+        revision: i64,
+    ) -> BoxFuture<'a, Result<Option<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>> {
+        Box::pin(async move {
+            self.templates(session).await.map(|templates| {
+                templates
+                    .into_iter()
+                    .find(|template| template.id == template_id && template.revision == revision)
+            })
+        })
+    }
 
     fn list<'a>(
         &'a self,
@@ -651,7 +679,7 @@ where
         (status = 400, description = "Request is malformed"),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
-        (status = 409, description = "Template revision or connection state conflicts"),
+        (status = 409, description = "Template revision conflicts"),
         (status = 422, description = "Requested envelope exceeds its ceiling"),
         (status = 503, description = "Envelope requests are unavailable")
     ),
@@ -677,28 +705,17 @@ where
         return StatusCode::BAD_REQUEST.into_response();
     }
     let requested_envelope: Envelope = body.requested_envelope.into();
-    let templates = match state.broker.templates(&session).await {
-        Ok(templates) => templates,
+    let template = match state
+        .broker
+        .template(&session, &body.template_id, body.template_revision)
+        .await
+    {
+        Ok(Some(template)) => template,
+        Ok(None) | Err(EnvelopeRequestBrokerError::NotFound) => {
+            return StatusCode::CONFLICT.into_response();
+        }
         Err(error) => return broker_error_response(error),
     };
-    let Some(template) = templates.iter().find(|template| {
-        template.id == body.template_id && template.revision == body.template_revision
-    }) else {
-        return StatusCode::CONFLICT.into_response();
-    };
-    if has_tools(&requested_envelope)
-        && template.github_connection != ConnectionReadiness::Connected
-    {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "apiVersion": ENVELOPE_REQUESTS_API_VERSION,
-                "error": "required GitHub connection is not ready",
-                "connectionsPath": "/admin/connections",
-            })),
-        )
-            .into_response();
-    }
     if requested_envelope.revision != template.revision
         || validate_envelope(&requested_envelope).is_err()
     {
@@ -726,7 +743,7 @@ where
         .create(
             &session,
             ValidatedEnvelopeRequest {
-                template,
+                template: &template,
                 requested_envelope: &requested_envelope,
                 idempotency_key: &body.idempotency_key,
                 auto_provision,
@@ -881,12 +898,15 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        AvailableEnvelopeTemplate, ConnectionReadiness, EnvelopeRequestBroker,
-        EnvelopeRequestBrokerError, EnvelopeRequestStatus, UserEnvelopeMutationProof,
-        UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject, ValidatedEnvelopeRequest,
-        connection_readiness_for_ceiling, inner_router,
+        AvailableEnvelopeTemplate, EnvelopeRequestBroker, EnvelopeRequestBrokerError,
+        EnvelopeRequestStatus, UserEnvelopeMutationProof, UserEnvelopeRequest, UserEnvelopeSession,
+        UserEnvelopeSubject, ValidatedEnvelopeRequest, inner_router,
     };
     use crate::BoxFuture;
+    use crate::connections::{
+        ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionSubject,
+        ProviderConnectionBroker, ProviderConnectionStatus,
+    };
     use steward_admission::{Envelope, EnvelopeSpec};
     use steward_store::WorkflowRevisionRecord;
     use steward_types::{CanonicalUserId, Email};
@@ -903,7 +923,17 @@ mod tests {
             _session: &'a UserEnvelopeSession<()>,
         ) -> BoxFuture<'a, Result<Vec<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>>
         {
-            Box::pin(async { Ok(vec![template()]) })
+            Box::pin(async move { Ok(vec![template()]) })
+        }
+
+        fn template<'a>(
+            &'a self,
+            _session: &'a UserEnvelopeSession<()>,
+            template_id: &'a str,
+            revision: i64,
+        ) -> BoxFuture<'a, Result<Option<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>>
+        {
+            Box::pin(async move { Ok((template_id == "engineer" && revision == 3).then(template)) })
         }
 
         fn list<'a>(
@@ -1058,28 +1088,33 @@ mod tests {
                 },
             }),
             ceiling,
-            github_connection: ConnectionReadiness::Connected,
         }
     }
 
     #[test]
-    fn connection_is_not_required_for_a_toolless_envelope() {
-        let mut ceiling = template().ceiling;
-        ceiling.spec.tools.clear();
-        assert_eq!(
-            connection_readiness_for_ceiling(&ceiling),
-            ConnectionReadiness::Connected,
-        );
+    fn envelope_template_contract_contains_authority_without_connection_state() -> Result<(), String>
+    {
+        let value = serde_json::to_value(template())
+            .map_err(|error| format!("serialize template: {error}"))?;
+        assert!(value.get("ceiling").is_some());
+        assert!(value.get("githubConnection").is_none());
+        Ok(())
     }
 
     #[test]
-    fn connection_remains_required_for_any_tool_envelope() {
-        let mut ceiling = template().ceiling;
-        ceiling.spec.tools[0].provider = "provider-a".to_owned();
-        assert_eq!(
-            connection_readiness_for_ceiling(&ceiling),
-            ConnectionReadiness::Missing,
+    fn tool_provider_does_not_select_a_credential_mode_at_the_envelope_boundary()
+    -> Result<(), String> {
+        let mut template = template();
+        template.ceiling.spec.tools[0].provider = "provider-a".to_owned();
+        let value = serde_json::to_value(template)
+            .map_err(|error| format!("serialize template: {error}"))?;
+        assert!(
+            value["ceiling"]["spec"]["tools"][0]
+                .get("provider")
+                .is_some()
         );
+        assert!(value.get("githubConnection").is_none());
+        Ok(())
     }
 
     fn session() -> Result<UserEnvelopeSession<()>, String> {
@@ -1315,6 +1350,300 @@ mod tests {
             .map_err(|error| format!("parse review-only response: {error}"))?;
         assert_eq!(value["request"]["status"], "pending");
         assert!(value["request"]["approvedEnvelope"].is_null());
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct PhaseBroker {
+        result: Arc<Mutex<Result<ConnectionPhase, ConnectionBrokerError>>>,
+    }
+
+    impl PhaseBroker {
+        fn with_phase(phase: ConnectionPhase) -> Self {
+            Self {
+                result: Arc::new(Mutex::new(Ok(phase))),
+            }
+        }
+
+        fn set(
+            &self,
+            result: Result<ConnectionPhase, ConnectionBrokerError>,
+        ) -> Result<(), String> {
+            *self
+                .result
+                .lock()
+                .map_err(|_| "lock phase broker".to_owned())? = result;
+            Ok(())
+        }
+    }
+
+    impl ProviderConnectionBroker<()> for PhaseBroker {
+        fn status<'a>(
+            &'a self,
+            _session: &'a ConnectionSession<()>,
+        ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>> {
+            let result = self
+                .result
+                .lock()
+                .map(|result| *result)
+                .unwrap_or(Err(ConnectionBrokerError::Unavailable));
+            Box::pin(async move {
+                let phase = result?;
+                Ok(ProviderConnectionStatus {
+                    phase,
+                    account_email: None,
+                    scopes_required: vec!["repo".to_owned()],
+                    scopes_granted: Vec::new(),
+                    scopes_missing: vec!["repo".to_owned()],
+                    expires_at: None,
+                })
+            })
+        }
+
+        fn start<'a>(
+            &'a self,
+            _session: &'a ConnectionSession<()>,
+        ) -> BoxFuture<'a, Result<crate::connections::AuthorizationUrl, ConnectionBrokerError>>
+        {
+            Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
+        }
+
+        fn complete<'a>(
+            &'a self,
+            _session: &'a ConnectionSession<()>,
+            _continuation: &'a crate::connections::ConnectionContinuation,
+        ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
+            Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
+        }
+
+        fn disconnect<'a>(
+            &'a self,
+            _session: &'a ConnectionSession<()>,
+        ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
+            Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
+        }
+    }
+
+    fn create_request_for(
+        requested_envelope: Envelope,
+        idempotency_key: &str,
+    ) -> Result<Request<Body>, String> {
+        Request::builder()
+            .method("POST")
+            .uri("/app/api/v1/envelope-requests")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "templateId": "engineer",
+                    "templateRevision": 3,
+                    "requestedEnvelope": requested_envelope,
+                    "idempotencyKey": idempotency_key,
+                })
+                .to_string(),
+            ))
+            .map_err(|error| format!("build envelope request: {error}"))
+    }
+
+    #[tokio::test]
+    async fn envelope_issuance_ignores_live_connection_changes() -> Result<(), String> {
+        let connections = PhaseBroker::with_phase(ConnectionPhase::Connected);
+        let broker = TestBroker::default();
+        let user_session = session()?;
+        let connection_session = ConnectionSession {
+            subject: ConnectionSubject {
+                canonical_user_id: user_session.subject.canonical_user_id.clone(),
+                display_email: user_session.subject.display_email.as_str().to_owned(),
+            },
+            binding: (),
+        };
+        let app = inner_router(broker.clone())
+            .merge(crate::connections::test_router(connections.clone()))
+            .layer(axum::Extension(user_session))
+            .layer(axum::Extension(connection_session))
+            .layer(axum::Extension(UserEnvelopeMutationProof));
+
+        let loaded = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/envelope-templates")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build template load: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("load connected templates: {error}"))?;
+        assert_eq!(loaded.status(), StatusCode::OK);
+
+        for (phase, key) in [
+            (ConnectionPhase::Disconnected, "after-disconnect"),
+            (ConnectionPhase::ReauthRequired, "after-reauth"),
+        ] {
+            connections.set(Ok(phase))?;
+            let response = app
+                .clone()
+                .oneshot(create_request_for(
+                    template()
+                        .auto_provision_threshold
+                        .ok_or_else(|| "missing requested envelope".to_owned())?,
+                    key,
+                )?)
+                .await
+                .map_err(|error| format!("submit after readiness change: {error}"))?;
+            assert_eq!(
+                response.status(),
+                StatusCode::CREATED,
+                "Envelope issuance evaluates authority without live connection readiness"
+            );
+        }
+        assert_eq!(
+            broker
+                .create_owners
+                .lock()
+                .map_err(|_| "read created owners".to_owned())?
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_free_selection_is_admitted_by_the_authority_ceiling() -> Result<(), String> {
+        let broker = TestBroker::default();
+        let mut requested = template()
+            .auto_provision_threshold
+            .ok_or_else(|| "missing requested envelope".to_owned())?;
+        requested.spec.tools.clear();
+        let response = inner_router(broker)
+            .layer(axum::Extension(session()?))
+            .layer(axum::Extension(UserEnvelopeMutationProof))
+            .oneshot(create_request_for(requested, "tool-free")?)
+            .await
+            .map_err(|error| format!("submit tool-free request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connection_outage_does_not_block_envelope_discovery_or_issuance() -> Result<(), String>
+    {
+        let connections = PhaseBroker::with_phase(ConnectionPhase::Connected);
+        connections.set(Err(ConnectionBrokerError::Unavailable))?;
+        let user_session = session()?;
+        let connection_session = ConnectionSession {
+            subject: ConnectionSubject {
+                canonical_user_id: user_session.subject.canonical_user_id.clone(),
+                display_email: user_session.subject.display_email.as_str().to_owned(),
+            },
+            binding: (),
+        };
+        let app = inner_router(TestBroker::default())
+            .merge(crate::connections::test_router(connections))
+            .layer(axum::Extension(user_session))
+            .layer(axum::Extension(connection_session))
+            .layer(axum::Extension(UserEnvelopeMutationProof));
+
+        let templates = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/envelope-templates")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build unavailable template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request unavailable templates: {error}"))?;
+        assert_eq!(
+            templates.status(),
+            StatusCode::OK,
+            "unused Envelope capacity must not query MCP-GW"
+        );
+
+        let mut tool_free = template()
+            .auto_provision_threshold
+            .ok_or_else(|| "missing requested envelope".to_owned())?;
+        tool_free.spec.tools.clear();
+        let tool_free_create = app
+            .clone()
+            .oneshot(create_request_for(tool_free, "tool-free-during-outage")?)
+            .await
+            .map_err(|error| {
+                format!("submit tool-free request during connection outage: {error}")
+            })?;
+        assert_eq!(
+            tool_free_create.status(),
+            StatusCode::CREATED,
+            "tool-free authority must not query the unavailable GitHub integration"
+        );
+
+        let create = app
+            .oneshot(create_request_for(
+                template()
+                    .auto_provision_threshold
+                    .ok_or_else(|| "missing requested envelope".to_owned())?,
+                "unavailable",
+            )?)
+            .await
+            .map_err(|error| format!("submit during connection outage: {error}"))?;
+        assert_eq!(
+            create.status(),
+            StatusCode::CREATED,
+            "tool-bearing Envelope issuance still evaluates authority only"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connection_and_template_endpoints_are_lifecycle_independent() -> Result<(), String> {
+        let phase = PhaseBroker::with_phase(ConnectionPhase::Disconnected);
+        let user_session = session()?;
+        let connection_session = ConnectionSession {
+            subject: ConnectionSubject {
+                canonical_user_id: user_session.subject.canonical_user_id.clone(),
+                display_email: user_session.subject.display_email.as_str().to_owned(),
+            },
+            binding: (),
+        };
+        let app = inner_router(TestBroker::default())
+            .merge(crate::connections::test_router(phase))
+            .layer(axum::Extension(user_session))
+            .layer(axum::Extension(connection_session));
+
+        let connection = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/connections/github")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build connection status request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request connection status: {error}"))?;
+        let connection_body = to_bytes(connection.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read connection status: {error}"))?;
+        let connection: serde_json::Value = serde_json::from_slice(&connection_body)
+            .map_err(|error| format!("parse connection status: {error}"))?;
+        assert_eq!(connection["status"]["phase"], "disconnected");
+
+        let templates = app
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/envelope-templates")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build templates request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request templates: {error}"))?;
+        let templates_body = to_bytes(templates.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read templates response: {error}"))?;
+        let templates: serde_json::Value = serde_json::from_slice(&templates_body)
+            .map_err(|error| format!("parse templates response: {error}"))?;
+        assert_eq!(templates["templates"].as_array().map(Vec::len), Some(1));
+        assert!(
+            templates["templates"][0].get("githubConnection").is_none(),
+            "Envelope discovery must not project live connection state"
+        );
         Ok(())
     }
 }

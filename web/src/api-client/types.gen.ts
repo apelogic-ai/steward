@@ -4,14 +4,6 @@ export type ClientOptions = {
     baseUrl: `${string}://${string}` | (string & {});
 };
 
-export type AdminBootstrapResponse = {
-    actor: string;
-    apiVersion: string;
-    surfaces: Array<AdminSurface>;
-};
-
-export type AdminSurface = 'approvals' | 'envelope' | 'fleet';
-
 export type AgentRunAvailability = 'available' | 'partial' | 'unavailable';
 
 export type AgentRunDataStatus = {
@@ -131,7 +123,6 @@ export type AvailableEnvelopeTemplate = {
     autoProvisionThreshold?: null | BrowserEnvelope;
     ceiling: BrowserEnvelope;
     displayName: string;
-    githubConnection: ConnectionReadiness;
     id: string;
     revision: number;
 };
@@ -281,8 +272,6 @@ export type CanonicalAuthorityBinding = {
 export type CanonicalUserId = string;
 
 export type ConnectionPhase = 'disconnected' | 'connecting' | 'connected' | 'reauth_required' | 'unavailable';
-
-export type ConnectionReadiness = 'connected' | 'reauth_required' | 'missing';
 
 export type ConnectionStatusResponse = {
     apiVersion: string;
@@ -762,33 +751,6 @@ export type FileAdminApprovalDecisionResponses = {
 };
 
 export type FileAdminApprovalDecisionResponse = FileAdminApprovalDecisionResponses[keyof FileAdminApprovalDecisionResponses];
-
-export type BootstrapData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/admin/api/v1/bootstrap';
-};
-
-export type BootstrapErrors = {
-    /**
-     * Missing or invalid authentication
-     */
-    401: unknown;
-    /**
-     * Administrator authority required
-     */
-    403: unknown;
-};
-
-export type BootstrapResponses = {
-    /**
-     * Authenticated administrator UI contract
-     */
-    200: AdminBootstrapResponse;
-};
-
-export type BootstrapResponse = BootstrapResponses[keyof BootstrapResponses];
 
 export type ConnectionStatusData = {
     body?: never;
@@ -1351,7 +1313,7 @@ export type CreateRequestErrors = {
      */
     403: unknown;
     /**
-     * Template revision or connection state conflicts
+     * Template revision conflicts
      */
     409: unknown;
     /**

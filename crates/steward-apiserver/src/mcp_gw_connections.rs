@@ -76,7 +76,7 @@ impl McpGwConnectionsConfig {
     pub fn new(mcp_gateway_origin: String, browser_origin: String) -> Result<Self, String> {
         let origin = validate_origin(&mcp_gateway_origin, "MCP-GW")?;
         let mut redirect_after = validate_origin(&browser_origin, "browser")?;
-        redirect_after.set_path("/admin/connections");
+        redirect_after.set_path("/connections");
         redirect_after.set_query(None);
         redirect_after.set_fragment(Some("github-connected"));
         Ok(Self {
@@ -501,7 +501,7 @@ mod tests {
         assert_eq!(
             start_body["redirectAfter"],
             format!(
-                "http://127.0.0.1:{}/admin/connections#github-connected",
+                "http://127.0.0.1:{}/connections#github-connected",
                 address.port()
             )
         );

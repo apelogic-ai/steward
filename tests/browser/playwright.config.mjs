@@ -6,7 +6,7 @@ export default defineConfig({
   forbidOnly: true,
   fullyParallel: false,
   workers: 1,
-  // A clean CI runner compiles two Rust loopback demos before the first journey.
+  // Keep browser journeys serial so shared mock routes and ports remain deterministic.
   timeout: 120_000,
   reporter: "list",
   use: {

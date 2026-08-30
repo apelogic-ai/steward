@@ -37,7 +37,7 @@ echo "Running S5 HOP-1 v3 MCP and inference token-grant preflight"
 cargo test \
   --locked \
   --package steward-mint \
-  --test fast_track_mcp_compatibility \
+  --test runtime_mcp_compatibility \
   s5_ \
   -- --nocapture
 
