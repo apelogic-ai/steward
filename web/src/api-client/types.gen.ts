@@ -123,7 +123,6 @@ export type AvailableEnvelopeTemplate = {
     autoProvisionThreshold?: null | BrowserEnvelope;
     ceiling: BrowserEnvelope;
     displayName: string;
-    githubConnection: ConnectionReadiness;
     id: string;
     revision: number;
 };
@@ -273,8 +272,6 @@ export type CanonicalAuthorityBinding = {
 export type CanonicalUserId = string;
 
 export type ConnectionPhase = 'disconnected' | 'connecting' | 'connected' | 'reauth_required' | 'unavailable';
-
-export type ConnectionReadiness = 'connected' | 'reauth_required' | 'missing';
 
 export type ConnectionStatusResponse = {
     apiVersion: string;
@@ -1316,7 +1313,7 @@ export type CreateRequestErrors = {
      */
     403: unknown;
     /**
-     * Template revision or connection state conflicts
+     * Template revision conflicts
      */
     409: unknown;
     /**
