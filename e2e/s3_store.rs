@@ -553,14 +553,23 @@ async fn envelope_requests_are_idempotent_audited_and_bound_to_the_exact_templat
         "provisioning must preserve one active envelope"
     );
     assert_eq!(active[0].id, replacement.record.id);
+    let superseded = owner_requests
+        .iter()
+        .find(|request| request.id == reservation.record.id)
+        .ok_or_else(|| io::Error::other("superseded envelope is missing from history"))?;
     assert_eq!(
-        owner_requests
-            .iter()
-            .find(|request| request.id == reservation.record.id)
-            .map(|request| request.status),
-        Some(EnvelopeRequestStatus::Stale),
+        superseded.status,
+        EnvelopeRequestStatus::Stale,
         "the prior active envelope must be superseded by an append-only event"
     );
+    assert_eq!(superseded.approval_id, Some(approval_id));
+    assert_eq!(
+        superseded.envelope_instance_id.as_deref(),
+        Some(instance_id.as_str()),
+        "supersession must retain the durable envelope instance for run history"
+    );
+    assert_eq!(superseded.envelope_digest.as_deref(), Some(digest.as_str()));
+    assert_eq!(superseded.approved_envelope, Some(template.clone()));
 
     let concurrent_a = store
         .reserve_envelope_request(EnvelopeRequestReservationRequest {

@@ -3572,8 +3572,12 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
 
 const ENVELOPE_REQUEST_COLUMNS: &str = "SELECT requests.id, requests.owner_user_id, requests.template_id, \
             requests.template_revision, requests.requested_envelope, \
-            status.status, status.approval_id, status.envelope_instance_id, \
-            status.envelope_digest, status.reason, status.approved_envelope, \
+            status.status, \
+            CASE WHEN status.status = 'stale' THEN provisioned.approval_id ELSE status.approval_id END AS approval_id, \
+            CASE WHEN status.status = 'stale' THEN provisioned.envelope_instance_id ELSE status.envelope_instance_id END AS envelope_instance_id, \
+            CASE WHEN status.status = 'stale' THEN provisioned.envelope_digest ELSE status.envelope_digest END AS envelope_digest, \
+            status.reason, \
+            CASE WHEN status.status = 'stale' THEN provisioned.approved_envelope ELSE status.approved_envelope END AS approved_envelope, \
             status.actor AS status_actor, \
             status.template_revision AS status_template_revision, \
             to_char(requests.created_at AT TIME ZONE 'UTC', \
@@ -3589,7 +3593,15 @@ const ENVELOPE_REQUEST_COLUMNS: &str = "SELECT requests.id, requests.owner_user_
          WHERE events.request_id = requests.id \
          ORDER BY events.at DESC, events.id DESC \
          LIMIT 1 \
-     ) status ON true ";
+     ) status ON true \
+     LEFT JOIN LATERAL ( \
+         SELECT events.approval_id, events.envelope_instance_id, \
+                events.envelope_digest, events.approved_envelope \
+         FROM envelope_request_events events \
+         WHERE events.request_id = requests.id AND events.status = 'provisioned' \
+         ORDER BY events.at DESC, events.id DESC \
+         LIMIT 1 \
+     ) provisioned ON status.status = 'stale' ";
 
 fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreError> {
     let observed_amount = row

@@ -15,8 +15,9 @@ const request: BrowserEnvelopeRequestView = {
   requestedEnvelope: {
     revision: 7,
     spec: {
-      budget: { currency: "USD", monthlyLimit: "300.00" },
+      budget: { currency: "USD", monthlyLimit: "300.00", singleRunLimit: "30.00" },
       llms: [{ model: "model-b", provider: "provider-a" }],
+      runner: { compute: "2000m", memory: "8Gi", platforms: ["linux", "mac"], storage: "20Gi" },
       tools: [],
       ttl: "36h",
     },
@@ -24,8 +25,9 @@ const request: BrowserEnvelopeRequestView = {
   templateEnvelope: {
     revision: 7,
     spec: {
-      budget: { currency: "USD", monthlyLimit: "200.00" },
+      budget: { currency: "USD", monthlyLimit: "200.00", singleRunLimit: "20.00" },
       llms: [{ model: "model-a", provider: "provider-a" }],
+      runner: { compute: "1000m", memory: "4Gi", platforms: ["linux"], storage: "10Gi" },
       tools: [],
       ttl: "24h",
     },
@@ -55,8 +57,37 @@ describe("envelope request approval controls", () => {
     expect(html).toContain("200.00 USD");
     expect(html).toContain("model-b");
     expect(html).toContain("model-a");
+    expect(html).toContain("Single-run limit");
+    expect(html).toContain("30.00 USD");
+    expect(html).toContain("20.00 USD");
+    expect(html).toContain("Runner platforms");
+    expect(html).toContain("linux, mac");
+    expect(html).toContain("Runner memory");
+    expect(html).toContain("8Gi");
+    expect(html).toContain("4Gi");
+    expect(html).toContain("Runner compute");
+    expect(html).toContain("2000m");
+    expect(html).toContain("1000m");
+    expect(html).toContain("Runner storage");
+    expect(html).toContain("20Gi");
+    expect(html).toContain("10Gi");
     expect(html).toContain("Template revision");
     expect(html).toContain(">7<");
+  });
+
+  test("labels an absent requested per-run limit as unbounded authority", () => {
+    const unboundedRequest: BrowserEnvelopeRequestView = {
+      ...request,
+      requestedEnvelope: {
+        ...request.requestedEnvelope,
+        spec: {
+          ...request.requestedEnvelope.spec,
+          budget: { ...request.requestedEnvelope.spec.budget, singleRunLimit: null },
+        },
+      },
+    };
+
+    expect(renderToStaticMarkup(<EnvelopeRequestCard request={unboundedRequest} />)).toContain("Unbounded");
   });
 
   test("does not classify a failed rejection as a completed rejection", () => {

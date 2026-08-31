@@ -11,6 +11,7 @@ import {
   type BrowserApprovalsResponse,
   type BrowserApprovalView,
   type BrowserDecisionReferenceResponse,
+  type BrowserEnvelopeSpec,
   type BrowserEnvelopeRequestDecisionResponse,
   type BrowserEnvelopeRequestView,
 } from "@/api-client";
@@ -36,6 +37,23 @@ function actionMessage(status: Exclude<ApprovalActionState, "idle" | "filing" | 
     unavailable: "The approval authority is unavailable.",
     error: "The approval response could not be accepted.",
   }[status];
+}
+
+function envelopeAuthorityItems(spec: BrowserEnvelopeSpec): [string, string][] {
+  const runner = spec.runner;
+  return [
+    ["Models", spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ") || "None"],
+    ["Tools", spec.tools.map((tool) => `${tool.provider}/${tool.resource}:${tool.action}`).join(", ") || "None"],
+    ["Monthly limit", `${spec.budget.monthlyLimit} ${spec.budget.currency}`],
+    ["Single-run limit", spec.budget.singleRunLimit
+      ? `${spec.budget.singleRunLimit} ${spec.budget.currency}`
+      : "Unbounded"],
+    ["TTL", spec.ttl],
+    ["Runner platforms", runner?.platforms?.join(", ") || "None"],
+    ["Runner memory", runner?.memory ?? "Not set"],
+    ["Runner compute", runner?.compute ?? "Not set"],
+    ["Runner storage", runner?.storage ?? "Not set"],
+  ];
 }
 
 export function AdminApprovalsView() {
@@ -128,21 +146,11 @@ export function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnve
       <div className="grid gap-5 border-t pt-5 lg:grid-cols-2">
         <section aria-label="Requested authority" className="space-y-3">
           <h3 className="font-semibold">Requested authority</h3>
-          <DefinitionList items={[
-            ["Models", requested.llms.map((model) => `${model.provider}/${model.model}`).join(", ") || "None"],
-            ["Tools", requested.tools.map((tool) => `${tool.provider}/${tool.resource}:${tool.action}`).join(", ") || "None"],
-            ["Budget", `${requested.budget.monthlyLimit} ${requested.budget.currency}`],
-            ["TTL", requested.ttl],
-          ]} />
+          <DefinitionList items={envelopeAuthorityItems(requested)} />
         </section>
         <section aria-label="Governing template" className="space-y-3">
           <h3 className="font-semibold">Governing template</h3>
-          <DefinitionList items={[
-            ["Models", governing.llms.map((model) => `${model.provider}/${model.model}`).join(", ") || "None"],
-            ["Tools", governing.tools.map((tool) => `${tool.provider}/${tool.resource}:${tool.action}`).join(", ") || "None"],
-            ["Budget", `${governing.budget.monthlyLimit} ${governing.budget.currency}`],
-            ["TTL", governing.ttl],
-          ]} />
+          <DefinitionList items={envelopeAuthorityItems(governing)} />
         </section>
       </div>
       <div className="flex flex-wrap gap-3 border-t pt-5">
