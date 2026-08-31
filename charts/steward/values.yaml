@@ -102,6 +102,7 @@ config:
     openshellEndpoint: https://gateway.example.test:8080
     openshellServerName: gateway.example.test
     openshellRuntimeClassName: kata-qemu
+    openshellTaskLogMode: "off"
     workloadExchangeEndpoint: https://identity.example.test/v1/workload/exchange
     workloadExchangeServerName: identity.example.test
     litellmUrl: http://litellm-litellm.litellm.svc.cluster.local:4000

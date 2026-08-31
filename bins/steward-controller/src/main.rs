@@ -11,7 +11,8 @@ use kube::Client;
 use steward_adapter_github_artifact::GitHubArtifactVerifier;
 use steward_adapter_litellm::{LiteLlmAdapter, LiteLlmConfig};
 use steward_adapter_openshell::{
-    OpenShellConnectionConfig, OpenShellRuntime, validate_connections_bridge_gateway_origin,
+    OpenShellConnectionConfig, OpenShellRuntime, OpenShellTaskLogMode,
+    validate_connections_bridge_gateway_origin,
 };
 use steward_store::PgStore;
 use tokio::net::{TcpListener, TcpStream};
@@ -32,8 +33,9 @@ const MAX_PENDING_TLS_HANDSHAKES: usize = 64;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider()?;
+    let openshell_config = openshell_connection_config()?;
     let client = Client::try_default().await?;
-    let sandbox_runtime = OpenShellRuntime::connect(openshell_connection_config()?)
+    let sandbox_runtime = OpenShellRuntime::connect(openshell_config)
         .await
         .map_err(|error| io::Error::other(format!("OpenShell connection failed: {error:?}")))?;
     if env::var("STEWARD_S0_BOOTSTRAP").as_deref() == Ok("1") {
@@ -100,6 +102,7 @@ fn required_file(name: &str) -> Result<Vec<u8>, io::Error> {
 }
 
 fn openshell_connection_config() -> Result<OpenShellConnectionConfig, io::Error> {
+    let task_log_mode = openshell_task_log_mode(env::var("STEWARD_OPENSHELL_TASK_LOG_MODE"))?;
     let bridge_image = verified_bridge_image_configuration()?;
     Ok(OpenShellConnectionConfig {
         endpoint: required("STEWARD_OPENSHELL_ENDPOINT")?,
@@ -116,12 +119,29 @@ fn openshell_connection_config() -> Result<OpenShellConnectionConfig, io::Error>
         )?),
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
         runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
+        task_log_mode,
         bridge_gateway_origin: bridge_gateway_origin_for_image(
             &bridge_image,
             env::var("STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN").ok(),
         )?,
         bridge_image,
     })
+}
+
+fn openshell_task_log_mode(
+    value: Result<String, env::VarError>,
+) -> Result<OpenShellTaskLogMode, io::Error> {
+    match value {
+        Err(env::VarError::NotPresent) => Ok(OpenShellTaskLogMode::Off),
+        Ok(ref value) if value == "off" => Ok(OpenShellTaskLogMode::Off),
+        Ok(ref value) if value == "full" => Ok(OpenShellTaskLogMode::Full),
+        Ok(value) => Err(io::Error::other(format!(
+            "STEWARD_OPENSHELL_TASK_LOG_MODE must be off or full, got {value:?}"
+        ))),
+        Err(env::VarError::NotUnicode(_)) => Err(io::Error::other(
+            "STEWARD_OPENSHELL_TASK_LOG_MODE must be Unicode off or full",
+        )),
+    }
 }
 
 fn bridge_gateway_origin_for_image(
@@ -344,8 +364,55 @@ mod tests {
 
     use super::{
         TlsListener, bridge_gateway_origin_for_image, decode_tls_material,
-        install_rustls_crypto_provider, verify_bridge_image_provenance,
+        install_rustls_crypto_provider, openshell_task_log_mode, verify_bridge_image_provenance,
     };
+    use steward_adapter_openshell::OpenShellTaskLogMode;
+
+    #[test]
+    fn task_log_mode_accepts_unset_off_and_full() -> Result<(), String> {
+        assert_eq!(
+            openshell_task_log_mode(Err(std::env::VarError::NotPresent))
+                .map_err(|error| error.to_string())?,
+            OpenShellTaskLogMode::Off
+        );
+        assert_eq!(
+            openshell_task_log_mode(Ok("off".to_owned())).map_err(|error| error.to_string())?,
+            OpenShellTaskLogMode::Off
+        );
+        assert_eq!(
+            openshell_task_log_mode(Ok("full".to_owned())).map_err(|error| error.to_string())?,
+            OpenShellTaskLogMode::Full
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_log_mode_rejects_every_other_value_with_the_setting_name() -> Result<(), String> {
+        for invalid in ["", "OFF", "verbose", "full "] {
+            let error = openshell_task_log_mode(Ok(invalid.to_owned()))
+                .err()
+                .ok_or_else(|| format!("unsupported task log mode {invalid:?} was accepted"))?;
+            assert!(
+                error
+                    .to_string()
+                    .contains("STEWARD_OPENSHELL_TASK_LOG_MODE")
+                    && error.to_string().contains("off or full"),
+                "the startup error must identify the setting and its accepted values"
+            );
+        }
+        let non_unicode = openshell_task_log_mode(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from("not-a-mode"),
+        )))
+        .err()
+        .ok_or_else(|| "a non-Unicode task log mode was accepted".to_owned())?;
+        assert!(
+            non_unicode
+                .to_string()
+                .contains("STEWARD_OPENSHELL_TASK_LOG_MODE"),
+            "a non-Unicode startup error must identify the setting"
+        );
+        Ok(())
+    }
 
     #[test]
     fn bridge_image_configuration_is_all_or_nothing_and_fails_closed() -> Result<(), String> {
