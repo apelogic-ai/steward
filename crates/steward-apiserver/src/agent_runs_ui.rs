@@ -40,6 +40,7 @@ pub(crate) struct BrowserRunsQuery {
     phase: Option<TaskPhase>,
     workflow: Option<String>,
     runtime_uid: Option<String>,
+    envelope_instance_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -185,7 +186,8 @@ where
         ("cursor" = Option<String>, Query),
         ("phase" = Option<TaskPhase>, Query),
         ("workflow" = Option<String>, Query),
-        ("runtimeUid" = Option<String>, Query)
+        ("runtimeUid" = Option<String>, Query),
+        ("envelopeInstanceId" = Option<String>, Query)
     ),
     responses(
         (status = 200, body = MyRunsResponse),
@@ -213,6 +215,7 @@ where
         workflow: query.workflow,
         owner_user_id: Some(session.principal.canonical_user_id.as_str().to_owned()),
         runtime_uid: query.runtime_uid,
+        user_envelope_instance_id: query.envelope_instance_id,
         task_uid: None,
     };
     match state.ledger.agent_runs(&query).await {
@@ -267,6 +270,7 @@ where
         workflow: query.workflow,
         owner_user_id: query.owner_user_id.map(|id| id.as_str().to_owned()),
         runtime_uid: query.runtime_uid,
+        user_envelope_instance_id: None,
         task_uid: None,
     };
     match state.ledger.agent_runs(&query).await {
@@ -477,6 +481,7 @@ where
             workflow: None,
             owner_user_id,
             runtime_uid: None,
+            user_envelope_instance_id: None,
             task_uid: Some(task_uid),
         })
         .await?;
@@ -567,22 +572,27 @@ mod tests {
                     .lock()
                     .map_err(|_| StoreError::InvalidRunQuery)?
                     .push(query.clone());
-                let records = self
-                    .records
-                    .lock()
-                    .map_err(|_| StoreError::InvalidRunQuery)?
-                    .iter()
-                    .filter(|record| {
-                        query.owner_user_id.as_ref().is_none_or(|owner| {
-                            record.owner_user_id.as_deref() == Some(owner.as_str())
-                        }) && query.runtime_uid.as_ref().is_none_or(|runtime_uid| {
-                            record.runtime_uid.as_deref() == Some(runtime_uid.as_str())
-                        }) && query
-                            .task_uid
-                            .is_none_or(|task_uid| record.task_uid == task_uid)
-                    })
-                    .cloned()
-                    .collect();
+                let records =
+                    self.records
+                        .lock()
+                        .map_err(|_| StoreError::InvalidRunQuery)?
+                        .iter()
+                        .filter(|record| {
+                            query.owner_user_id.as_ref().is_none_or(|owner| {
+                                record.owner_user_id.as_deref() == Some(owner.as_str())
+                            }) && query.runtime_uid.as_ref().is_none_or(|runtime_uid| {
+                                record.runtime_uid.as_deref() == Some(runtime_uid.as_str())
+                            }) && query.user_envelope_instance_id.as_ref().is_none_or(
+                                |instance_id| {
+                                    record.user_envelope_instance_id.as_deref()
+                                        == Some(instance_id.as_str())
+                                },
+                            ) && query
+                                .task_uid
+                                .is_none_or(|task_uid| record.task_uid == task_uid)
+                        })
+                        .cloned()
+                        .collect();
                 Ok(AgentRunPage {
                     records,
                     next_cursor: None,
@@ -824,6 +834,49 @@ mod tests {
                 .owner_user_id
                 .as_deref(),
             Some(owner)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn my_runs_accepts_an_envelope_instance_filter() -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let ledger = FakeLedger::default();
+        ledger.records.lock().map_err(|_| "lock records")?.push(run(
+            Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+                .map_err(|error| error.to_string())?,
+            owner,
+        ));
+        let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
+        let response = protected_router(ledger.clone(), service)
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/runs?envelopeInstanceId=envelope-instance-1")
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build envelope-runs request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute envelope-runs request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let queries = ledger.queries.lock().map_err(|_| "lock queries")?;
+            assert_eq!(
+                queries[0].user_envelope_instance_id.as_deref(),
+                Some("envelope-instance-1")
+            );
+            assert!(queries[0].runtime_uid.is_none());
+        }
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &to_bytes(response.into_body(), 16 * 1024)
+                    .await
+                    .map_err(|error| format!("read envelope-runs response: {error}"))?
+            )
+            .map_err(|error| format!("parse envelope-runs response: {error}"))?["runs"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
         );
         Ok(())
     }

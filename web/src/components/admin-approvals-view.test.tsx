@@ -58,4 +58,9 @@ describe("envelope request approval controls", () => {
     expect(html).toContain("Template revision");
     expect(html).toContain(">7<");
   });
+
+  test("does not classify a failed rejection as a completed rejection", () => {
+    expect(source).toContain('"rejection-complete"');
+    expect(source).toContain('status === "rejection-complete"');
+  });
 });

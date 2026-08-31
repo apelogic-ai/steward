@@ -843,6 +843,13 @@ impl PgStore {
         {
             return Err(StoreError::InvalidRunQuery);
         }
+        if query
+            .user_envelope_instance_id
+            .as_deref()
+            .is_some_and(|instance_id| instance_id.is_empty())
+        {
+            return Err(StoreError::InvalidRunQuery);
+        }
         if let Some(cursor) = query.cursor {
             let mut cursor_exists = QueryBuilder::<Postgres>::new(
                 "SELECT EXISTS(SELECT 1 FROM task_submissions WHERE task_uid = ",
@@ -888,6 +895,10 @@ impl PgStore {
         if let Some(runtime_uid) = query.runtime_uid.as_deref() {
             statement.push(" AND tasks.runtime_uid = ");
             statement.push_bind(runtime_uid);
+        }
+        if let Some(instance_id) = query.user_envelope_instance_id.as_deref() {
+            statement.push(" AND tasks.user_envelope_instance_id = ");
+            statement.push_bind(instance_id);
         }
         if let Some(task_uid) = query.task_uid {
             statement.push(" AND tasks.task_uid = ");
@@ -1245,6 +1256,11 @@ impl PgStore {
             return Err(StoreError::InvalidEnvelopeRequestTransition);
         }
         if update.to == EnvelopeRequestStatus::Provisioned {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(format!("active-user-envelope:{}", owner_user_id.as_str()))
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
             lock_envelope_scope(
                 &mut transaction,
                 EnvelopeScopeKind::MemberRole,
@@ -1279,6 +1295,31 @@ impl PgStore {
                     ) => {}
             (false, None) => {}
             _ => return Err(StoreError::InvalidEnvelopeRequest),
+        }
+        if update.to == EnvelopeRequestStatus::Provisioned {
+            sqlx::query(
+                "INSERT INTO envelope_request_events \
+                 (request_id, status, reason, actor, template_revision) \
+                 SELECT requests.id, 'stale', $3, $2, requests.template_revision \
+                 FROM envelope_requests requests \
+                 JOIN LATERAL ( \
+                     SELECT events.status \
+                     FROM envelope_request_events events \
+                     WHERE events.request_id = requests.id \
+                     ORDER BY events.at DESC, events.id DESC \
+                     LIMIT 1 \
+                 ) current_status ON true \
+                 WHERE requests.owner_user_id = $1 \
+                   AND requests.id <> $4 \
+                   AND current_status.status = 'provisioned'",
+            )
+            .bind(owner_user_id.as_str())
+            .bind(update.actor)
+            .bind(format!("superseded by envelope request {request_id}"))
+            .bind(request_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
         }
         sqlx::query(
             "INSERT INTO envelope_request_events \
@@ -2864,8 +2905,10 @@ pub struct AgentRunQuery {
     pub workflow: Option<String>,
     /// Exact server-derived canonical owner scope. `None` is reserved for administrator reads.
     pub owner_user_id: Option<String>,
-    /// Exact runtime binding, used for an envelope's run history.
+    /// Exact Kubernetes runtime binding.
     pub runtime_uid: Option<String>,
+    /// Exact envelope instance selected and persisted at task admission.
+    pub user_envelope_instance_id: Option<String>,
     /// Exact durable task identity, used for a single run detail read.
     pub task_uid: Option<Uuid>,
 }
@@ -3739,6 +3782,10 @@ const fn valid_envelope_request_transition(
             | (
                 EnvelopeRequestStatus::Approved,
                 EnvelopeRequestStatus::Conflict
+            )
+            | (
+                EnvelopeRequestStatus::Provisioned,
+                EnvelopeRequestStatus::Stale
             )
     )
 }

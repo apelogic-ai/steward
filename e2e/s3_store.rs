@@ -4,6 +4,7 @@ use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::postgres::PgPoolOptions;
+use sqlx::{Connection, Executor, PgConnection};
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
 use steward_store::{
     EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
@@ -31,6 +32,79 @@ async fn s3_postgres_migrations_apply_from_empty() -> Result<(), Box<dyn Error>>
             "S3 migrations must apply cleanly to an empty Postgres database: {error}"
         ))
     })?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn envelope_event_audit_migration_upgrades_history_and_accepts_old_writers()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the S3 Postgres test")
+    })?;
+    let mut connection = PgConnection::connect(&database_url).await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let schema = format!("migration_0020_{suffix}");
+    connection
+        .execute(format!("CREATE SCHEMA {schema}; SET search_path TO {schema}").as_str())
+        .await?;
+    connection
+        .execute(
+            "CREATE FUNCTION steward_reject_history_mutation() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'append-only' USING ERRCODE = '55000'; END $$; \
+             CREATE TABLE envelope_requests (id uuid PRIMARY KEY, template_revision bigint NOT NULL); \
+             CREATE TABLE envelope_request_events (\
+                 id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+                 request_id uuid NOT NULL REFERENCES envelope_requests(id), \
+                 status text NOT NULL\
+             ); \
+             CREATE TRIGGER envelope_request_events_are_append_only \
+             BEFORE UPDATE OR DELETE ON envelope_request_events \
+             FOR EACH ROW EXECUTE FUNCTION steward_reject_history_mutation(); \
+             INSERT INTO envelope_requests (id, template_revision) \
+             VALUES ('00000000-0000-4000-8000-000000000020', 7); \
+             INSERT INTO envelope_request_events (request_id, status) \
+             VALUES ('00000000-0000-4000-8000-000000000020', 'pending');",
+        )
+        .await?;
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/0020_envelope_request_transition_audit.sql"
+    ))
+    .execute(&mut connection)
+    .await?;
+
+    let migrated: (String, i64) =
+        sqlx::query_as("SELECT actor, template_revision FROM envelope_request_events WHERE id = 1")
+            .fetch_one(&mut connection)
+            .await?;
+    assert_eq!(migrated, ("steward-system/legacy-migration".to_owned(), 7));
+
+    sqlx::query(
+        "INSERT INTO envelope_request_events (request_id, status) \
+         VALUES ('00000000-0000-4000-8000-000000000020', 'pending')",
+    )
+    .execute(&mut connection)
+    .await?;
+    let old_writer: (String, i64) =
+        sqlx::query_as("SELECT actor, template_revision FROM envelope_request_events WHERE id = 2")
+            .fetch_one(&mut connection)
+            .await?;
+    assert_eq!(old_writer, ("steward-system/legacy-writer".to_owned(), 7));
+
+    let mutation =
+        sqlx::query("UPDATE envelope_request_events SET status = 'rejected' WHERE id = 1")
+            .execute(&mut connection)
+            .await;
+    assert!(
+        mutation.is_err(),
+        "migration must restore append-only enforcement"
+    );
+    connection
+        .execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
+        .await?;
     Ok(())
 }
 
@@ -441,6 +515,119 @@ async fn envelope_requests_are_idempotent_audited_and_bound_to_the_exact_templat
         .await?;
     assert_eq!(repeated_after_revision, provisioned);
 
+    let replacement_key = format!("replacement-envelope-request-{suffix}");
+    let replacement = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &principal.user_id,
+            template_id: &member_role,
+            template_revision: next_template.revision,
+            requested_envelope: &next_template,
+            idempotency_key: &replacement_key,
+            actor: principal.user_id.as_str(),
+        })
+        .await?;
+    let replacement_instance_id = format!("env_replacement_{suffix}");
+    store
+        .append_envelope_request_status(
+            replacement.record.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: None,
+                envelope_instance_id: Some(&replacement_instance_id),
+                envelope_digest: Some(&digest),
+                reason: None,
+                approved_envelope: Some(&next_template),
+                actor: principal.user_id.as_str(),
+            },
+        )
+        .await?;
+    let owner_requests = store.envelope_requests(&principal.user_id).await?;
+    let active: Vec<_> = owner_requests
+        .iter()
+        .filter(|request| request.status == EnvelopeRequestStatus::Provisioned)
+        .collect();
+    assert_eq!(
+        active.len(),
+        1,
+        "provisioning must preserve one active envelope"
+    );
+    assert_eq!(active[0].id, replacement.record.id);
+    assert_eq!(
+        owner_requests
+            .iter()
+            .find(|request| request.id == reservation.record.id)
+            .map(|request| request.status),
+        Some(EnvelopeRequestStatus::Stale),
+        "the prior active envelope must be superseded by an append-only event"
+    );
+
+    let concurrent_a = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &principal.user_id,
+            template_id: &member_role,
+            template_revision: next_template.revision,
+            requested_envelope: &next_template,
+            idempotency_key: &format!("concurrent-a-{suffix}"),
+            actor: principal.user_id.as_str(),
+        })
+        .await?;
+    let concurrent_b = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &principal.user_id,
+            template_id: &member_role,
+            template_revision: next_template.revision,
+            requested_envelope: &next_template,
+            idempotency_key: &format!("concurrent-b-{suffix}"),
+            actor: principal.user_id.as_str(),
+        })
+        .await?;
+    let concurrent_a_id = format!("env_concurrent_a_{suffix}");
+    let concurrent_b_id = format!("env_concurrent_b_{suffix}");
+    let (a_result, b_result) = tokio::join!(
+        store.append_envelope_request_status(
+            concurrent_a.record.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: None,
+                envelope_instance_id: Some(&concurrent_a_id),
+                envelope_digest: Some(&digest),
+                reason: None,
+                approved_envelope: Some(&next_template),
+                actor: principal.user_id.as_str(),
+            },
+        ),
+        store.append_envelope_request_status(
+            concurrent_b.record.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: None,
+                envelope_instance_id: Some(&concurrent_b_id),
+                envelope_digest: Some(&digest),
+                reason: None,
+                approved_envelope: Some(&next_template),
+                actor: principal.user_id.as_str(),
+            },
+        )
+    );
+    a_result?;
+    b_result?;
+    let after_concurrent = store.envelope_requests(&principal.user_id).await?;
+    let active_after_concurrent: Vec<_> = after_concurrent
+        .iter()
+        .filter(|request| request.status == EnvelopeRequestStatus::Provisioned)
+        .collect();
+    assert_eq!(
+        active_after_concurrent.len(),
+        1,
+        "concurrent provisioning must serialize to one active envelope"
+    );
+    assert!(
+        [concurrent_a.record.id, concurrent_b.record.id].contains(&active_after_concurrent[0].id)
+    );
+
     let stale_key = format!("stale-envelope-request-{suffix}");
     let stale = store
         .reserve_envelope_request(EnvelopeRequestReservationRequest {
@@ -488,8 +675,8 @@ async fn envelope_requests_are_idempotent_audited_and_bound_to_the_exact_templat
         "request retries must reserve one immutable request"
     );
     assert_eq!(
-        event_count, 2,
-        "one request and one decision must append two audit events"
+        event_count, 3,
+        "request, provisioning, and later supersession must remain append-only"
     );
     Ok(())
 }

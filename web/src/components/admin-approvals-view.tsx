@@ -20,7 +20,7 @@ import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
 type ApprovalActionState = "idle" | "filing" | "filed" | "approving" | "approved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
-type EnvelopeActionState = "idle" | "approving" | "rejecting" | "provisioned" | "rejected" | "conflict" | "forbidden" | "unavailable" | "error";
+type EnvelopeActionState = "idle" | "approving" | "rejecting" | "provisioned" | "rejection-complete" | "rejected" | "conflict" | "forbidden" | "unavailable" | "error";
 
 type BrowserApprovalQueueResponse = BrowserApprovalsResponse & {
   envelopeRequests: BrowserEnvelopeRequestView[];
@@ -107,7 +107,7 @@ export function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnve
     });
     if (result.data && result.response?.status === 200) {
       setDecision(result.data);
-      setStatus("rejected");
+      setStatus("rejection-complete");
       return;
     }
     setStatus(classifyMutationFailure(result.response?.status));
@@ -163,8 +163,8 @@ export function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnve
         ]} />
       ) : null}
       {status !== "idle" && status !== "approving" && status !== "rejecting" ? (
-        <p className={status === "provisioned" || status === "rejected" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "provisioned" || status === "rejected" ? "status" : "alert"}>
-          {status === "provisioned" ? "The exact requested envelope was provisioned." : status === "rejected" ? "The envelope request was rejected without creating an envelope." : status === "conflict" ? "This request or its template revision is stale. Reload the authoritative queue." : status === "forbidden" ? "The Rust authorization boundary rejected this mutation." : status === "unavailable" ? "The envelope request authority is unavailable." : "The envelope request response could not be accepted."}
+        <p className={status === "provisioned" || status === "rejection-complete" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "provisioned" || status === "rejection-complete" ? "status" : "alert"}>
+          {status === "provisioned" ? "The exact requested envelope was provisioned." : status === "rejection-complete" ? "The envelope request was rejected without creating an envelope." : status === "rejected" ? "The rejection reason is invalid." : status === "conflict" ? "This request or its template revision is stale. Reload the authoritative queue." : status === "forbidden" ? "The Rust authorization boundary rejected this mutation." : status === "unavailable" ? "The envelope request authority is unavailable." : "The envelope request response could not be accepted."}
         </p>
       ) : null}
     </li>

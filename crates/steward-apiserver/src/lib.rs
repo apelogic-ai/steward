@@ -1525,6 +1525,7 @@ where
         workflow: query.workflow,
         owner_user_id: None,
         runtime_uid: None,
+        user_envelope_instance_id: None,
         task_uid: None,
     };
     match state.ledger.agent_runs(&query).await {

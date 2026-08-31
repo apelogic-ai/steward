@@ -343,6 +343,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
             workflow: None,
             owner_user_id: None,
             runtime_uid: None,
+            user_envelope_instance_id: None,
             task_uid: Some(versioned_task_uid.parse()?),
         })
         .await?

@@ -908,6 +908,7 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
             workflow: Some("code-review".to_owned()),
             owner_user_id: None,
             runtime_uid: None,
+            user_envelope_instance_id: None,
             task_uid: None,
         })
         .await?;
@@ -934,6 +935,7 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
             workflow: Some("code-review".to_owned()),
             owner_user_id: Some(canonical.user_id.as_str().to_owned()),
             runtime_uid: None,
+            user_envelope_instance_id: None,
             task_uid: None,
         })
         .await?;
@@ -953,6 +955,7 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
                 workflow: None,
                 owner_user_id: Some(other.user_id.as_str().to_owned()),
                 runtime_uid: None,
+                user_envelope_instance_id: None,
                 task_uid: None,
             })
             .await,
