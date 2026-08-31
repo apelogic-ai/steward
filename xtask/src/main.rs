@@ -1575,12 +1575,17 @@ mod tests {
             adapter.contains("exec_sandbox"),
             "the OpenShell task path must consume the live sandbox execution stream"
         );
-        for required_field in ["runtime_uid", "workspace", "sandbox", "stream", "message"] {
+        for required_field in ["runtime_uid", "workspace", "sandbox", "stream", "bytes"] {
             assert!(
                 adapter.contains(required_field),
                 "each task-process log record must carry {required_field}"
             );
         }
+        assert!(
+            adapter.contains("message.len()")
+                && !adapter.contains("escaped_task_log_value(message)"),
+            "task-controlled stdout and stderr must never be copied into controller logs"
+        );
         assert!(
             values.contains("openshellTaskLogMode: \"off\""),
             "the chart must default OpenShell task-process logging to off"

@@ -542,7 +542,7 @@ fn valid_kubernetes_runtime_class_name(value: &str) -> bool {
 pub enum OpenShellTaskLogMode {
     /// Retain task output for result handling without emitting it to controller logs.
     Off,
-    /// Emit stdout and stderr chunks live while retaining the same result buffers.
+    /// Emit redacted stdout and stderr event metadata live while retaining the result buffers.
     Full,
 }
 
@@ -623,12 +623,12 @@ fn task_process_log_record(
     message: &[u8],
 ) -> String {
     format!(
-        "openshell_task_process runtime_uid=\"{}\" workspace=\"{}\" sandbox=\"{}\" stream={} message=\"{}\"",
+        "openshell_task_process runtime_uid=\"{}\" workspace=\"{}\" sandbox=\"{}\" stream={} bytes={}",
         escaped_task_log_value(context.runtime_uid.as_bytes()),
         escaped_task_log_value(context.workspace.as_bytes()),
         escaped_task_log_value(context.sandbox.as_bytes()),
         stream.as_str(),
-        escaped_task_log_value(message),
+        message.len(),
     )
 }
 
@@ -1219,14 +1219,14 @@ impl OpenShellRuntime {
         Ok(())
     }
 
-    async fn verify_raw_sandbox_binding(
+    async fn resolve_raw_sandbox_binding(
         &self,
         workspace: &str,
         sandbox: &str,
         runtime_uid: &str,
         expected_image: Option<&str>,
         require_ready: bool,
-    ) -> Result<(), PortError> {
+    ) -> Result<String, PortError> {
         let mut client = self
             .authenticated_client()
             .await?
@@ -1245,7 +1245,15 @@ impl OpenShellRuntime {
             .ok_or_else(|| PortError::Failed {
                 reason: "OpenShell returned an empty sandbox response".to_owned(),
             })?;
-        validate_raw_sandbox_binding(&snapshot, runtime_uid, expected_image, require_ready)
+        validate_raw_sandbox_binding(&snapshot, runtime_uid, expected_image, require_ready)?;
+        snapshot
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.id.clone())
+            .filter(|sandbox_id| !sandbox_id.is_empty())
+            .ok_or_else(|| PortError::Rejected {
+                reason: "OpenShell raw sandbox has no stable ID".to_owned(),
+            })
     }
 
     async fn ensure_workspace(&self, name: &str, workspace_key: &str) -> Result<(), PortError> {
@@ -1653,7 +1661,7 @@ impl SandboxRuntime for OpenShellRuntime {
                 reason: "sandbox name resolved to a different runtime UID".to_owned(),
             });
         }
-        self.verify_raw_sandbox_binding(
+        self.resolve_raw_sandbox_binding(
             &projection.workspace,
             &projection.sandbox,
             &projection.runtime_uid,
@@ -1752,7 +1760,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         }
         let expected_image =
             bridge_image_for_agent_type(&request.agent_type, self.bridge_image.as_deref())?;
-        self.verify_raw_sandbox_binding(
+        self.resolve_raw_sandbox_binding(
             workspace,
             sandbox,
             &request.runtime.0,
@@ -1761,6 +1769,15 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         )
         .await?;
         self.stage_input_archive(workspace, sandbox, input_archive)
+            .await?;
+        let sandbox_id = self
+            .resolve_raw_sandbox_binding(
+                workspace,
+                sandbox,
+                &request.runtime.0,
+                expected_image.as_deref(),
+                true,
+            )
             .await?;
         let mut environment = HashMap::new();
         environment.insert(
@@ -1778,7 +1795,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         }
         let executed = self
             .exec_task_process(
-                &snapshot.id,
+                &sandbox_id,
                 &request.command,
                 environment,
                 TaskProcessLogContext {
@@ -2203,7 +2220,7 @@ mod tests {
                 .ok_or_else(|| "task logger closed before stdout".to_owned())?;
         assert_eq!(
             stdout_record,
-            "openshell_task_process runtime_uid=\"runtime-123\" workspace=\"workspace-a\" sandbox=\"sandbox-a\" stream=stdout message=\"reasoning\\n\""
+            "openshell_task_process runtime_uid=\"runtime-123\" workspace=\"workspace-a\" sandbox=\"sandbox-a\" stream=stdout bytes=10"
         );
 
         event_sender
@@ -2216,7 +2233,7 @@ mod tests {
                 .ok_or_else(|| "task logger closed before stderr".to_owned())?;
         assert_eq!(
             stderr_record,
-            "openshell_task_process runtime_uid=\"runtime-123\" workspace=\"workspace-a\" sandbox=\"sandbox-a\" stream=stderr message=\"e\\xff\\n\""
+            "openshell_task_process runtime_uid=\"runtime-123\" workspace=\"workspace-a\" sandbox=\"sandbox-a\" stream=stderr bytes=3"
         );
 
         event_sender
@@ -2231,6 +2248,86 @@ mod tests {
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, b"reasoning\n");
         assert_eq!(result.stderr, [b'e', 0xff, b'\n']);
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn full_task_logging_never_records_task_output_material() -> Result<(), String> {
+        let secret_bearing_output =
+            b"Authorization: Bearer obviously-fake-task-credential\nrequest completed";
+        let mut stream = QueuedTaskProcessEventStream {
+            events: VecDeque::from([Ok(stdout_event(secret_bearing_output)), Ok(exit_event(0))]),
+        };
+        let mut log_sink = RecordingTaskProcessLogSink::default();
+
+        let result = collect_task_process_stream(
+            &mut stream,
+            OpenShellTaskLogMode::Full,
+            TaskProcessLogContext {
+                runtime_uid: "runtime-123",
+                workspace: "workspace-a",
+                sandbox: "sandbox-a",
+            },
+            &mut log_sink,
+        )
+        .await
+        .map_err(|error| format!("task stream collector failed: {error:?}"))?;
+
+        assert_eq!(result.stdout, secret_bearing_output);
+        assert_eq!(log_sink.records.len(), 1);
+        let record = &log_sink.records[0];
+        assert!(
+            !record.contains("Authorization")
+                && !record.contains("obviously-fake-task-credential")
+                && !record.contains("request completed"),
+            "task-controlled output must never enter controller logs: {record}"
+        );
+        assert!(
+            record.contains(&format!("bytes={}", secret_bearing_output.len())),
+            "the redacted live event should retain only a safe byte count: {record}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn task_execution_resolves_the_verified_sandbox_id_after_staging() -> Result<(), String> {
+        let source = include_str!("lib.rs");
+        let implementation = source
+            .split("impl SandboxTaskRuntime for OpenShellRuntime")
+            .nth(1)
+            .ok_or_else(|| "SandboxTaskRuntime implementation was not found".to_owned())?;
+        let run_task = implementation
+            .split("async fn run_task")
+            .nth(1)
+            .and_then(|value| value.split("async fn").next())
+            .ok_or_else(|| "run_task implementation was not found".to_owned())?;
+        let staging = run_task
+            .find(".stage_input_archive(")
+            .ok_or_else(|| "task input staging call was not found".to_owned())?;
+        let resolution = run_task
+            .rfind(".resolve_raw_sandbox_binding(")
+            .ok_or_else(|| {
+                "task sandbox ID is not re-resolved and verified after staging".to_owned()
+            })?;
+        let execution = run_task
+            .find(".exec_task_process(")
+            .ok_or_else(|| "task process execution call was not found".to_owned())?;
+
+        assert!(
+            staging < resolution && resolution < execution,
+            "the exact sandbox ID must be resolved after name-based staging and before raw execution"
+        );
+        assert!(
+            run_task[staging..resolution].contains("let sandbox_id =")
+                && run_task[execution..].contains("&sandbox_id,"),
+            "raw execution must use the post-staging verified sandbox ID"
+        );
+        assert!(
+            !run_task[execution..].contains("&snapshot.id,"),
+            "raw execution must not reuse the pre-staging sandbox ID"
+        );
         Ok(())
     }
 
