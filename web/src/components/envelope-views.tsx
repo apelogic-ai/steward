@@ -251,13 +251,13 @@ export function EnvelopeRunsView({ requestId }: Readonly<{ requestId: string }>)
   return (
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader description="View executions bound to this envelope instance." title="Recent runs" />
-      <ResourceBoundary state={state}>{({ request }) => request.envelopeInstanceId ? <EnvelopeRunRecords runtimeUid={request.envelopeInstanceId} /> : <EmptyState title="No runtime instance"><p>This envelope request has not produced a runtime instance.</p></EmptyState>}</ResourceBoundary>
+      <ResourceBoundary state={state}>{({ request }) => request.envelopeInstanceId ? <EnvelopeRunRecords envelopeInstanceId={request.envelopeInstanceId} /> : <EmptyState title="No envelope instance"><p>This envelope request has not produced an envelope instance.</p></EmptyState>}</ResourceBoundary>
     </section>
   );
 }
 
-function EnvelopeRunRecords({ runtimeUid }: Readonly<{ runtimeUid: string }>) {
-  const load = useCallback(() => myRuns({ cache: "no-store", credentials: "same-origin", query: { runtimeUid } }), [runtimeUid]);
+function EnvelopeRunRecords({ envelopeInstanceId }: Readonly<{ envelopeInstanceId: string }>) {
+  const load = useCallback(() => myRuns({ cache: "no-store", credentials: "same-origin", query: { envelopeInstanceId } }), [envelopeInstanceId]);
   const state = useApiResource<MyRunsResponse>(load);
   return <ResourceBoundary state={state}>{({ runs }) => <RunCards runs={runs} />}</ResourceBoundary>;
 }

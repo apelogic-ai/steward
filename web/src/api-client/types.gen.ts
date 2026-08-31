@@ -159,11 +159,32 @@ export type BrowserEnvelope = {
     spec: BrowserEnvelopeSpec;
 };
 
+export type BrowserEnvelopeRequestDecisionResponse = {
+    apiVersion: string;
+    request: BrowserEnvelopeRequestDecisionView;
+};
+
+export type BrowserEnvelopeRequestDecisionView = {
+    actedBy: string;
+    approvalId?: string | null;
+    approvedEnvelope?: null | BrowserEnvelope;
+    envelopeDigest?: string | null;
+    envelopeInstanceId?: string | null;
+    reason?: string | null;
+    requestId: string;
+    requestedEnvelope: BrowserEnvelope;
+    status: string;
+    statusAt: string;
+    templateId: string;
+    templateRevision: number;
+};
+
 export type BrowserEnvelopeRequestView = {
     createdAt: string;
     ownerDisplayEmail: string;
     requestId: string;
     requestedEnvelope: BrowserEnvelope;
+    templateEnvelope: BrowserEnvelope;
     templateId: string;
     templateRevision: number;
 };
@@ -388,6 +409,10 @@ export type PublishedWorkflowsResponse = {
     workflows: Array<PublishedWorkflowOption>;
 };
 
+export type RejectEnvelopeRequestBody = {
+    reason?: string | null;
+};
+
 export type RenderGithubActionsWorkflowBody = {
     workflow: string;
 };
@@ -498,7 +523,9 @@ export type UserEnvelopeRequest = {
     reason?: string | null;
     requestedEnvelope: BrowserEnvelope;
     status: EnvelopeRequestStatus;
+    statusActor: string;
     statusAt: string;
+    statusTemplateRevision: number;
     templateId: string;
     templateRevision: number;
 };
@@ -859,6 +886,92 @@ export type StartConnectionResponses = {
 };
 
 export type StartConnectionResponse2 = StartConnectionResponses[keyof StartConnectionResponses];
+
+export type ApproveAdminEnvelopeRequestData = {
+    body: BrowserMutationRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        request_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/envelope-requests/{request_id}/approve';
+};
+
+export type ApproveAdminEnvelopeRequestErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Envelope request was not found
+     */
+    404: unknown;
+    /**
+     * Envelope request or template revision is stale or already decided differently
+     */
+    409: unknown;
+    /**
+     * Envelope request authority is unavailable
+     */
+    503: unknown;
+};
+
+export type ApproveAdminEnvelopeRequestResponses = {
+    200: BrowserEnvelopeRequestDecisionResponse;
+};
+
+export type ApproveAdminEnvelopeRequestResponse = ApproveAdminEnvelopeRequestResponses[keyof ApproveAdminEnvelopeRequestResponses];
+
+export type RejectAdminEnvelopeRequestData = {
+    body: RejectEnvelopeRequestBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        request_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/envelope-requests/{request_id}/reject';
+};
+
+export type RejectAdminEnvelopeRequestErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Envelope request was not found
+     */
+    404: unknown;
+    /**
+     * Envelope request was already decided differently
+     */
+    409: unknown;
+    /**
+     * Rejection reason is invalid
+     */
+    422: unknown;
+    /**
+     * Envelope request authority is unavailable
+     */
+    503: unknown;
+};
+
+export type RejectAdminEnvelopeRequestResponses = {
+    200: BrowserEnvelopeRequestDecisionResponse;
+};
+
+export type RejectAdminEnvelopeRequestResponse = RejectAdminEnvelopeRequestResponses[keyof RejectAdminEnvelopeRequestResponses];
 
 export type ListAdminEnvelopeTemplatesData = {
     body?: never;
@@ -1317,7 +1430,7 @@ export type CreateRequestErrors = {
      */
     409: unknown;
     /**
-     * Requested envelope exceeds its ceiling
+     * Requested envelope is invalid
      */
     422: unknown;
     /**
@@ -1440,6 +1553,7 @@ export type MyRunsData = {
         phase?: TaskPhase;
         workflow?: string;
         runtimeUid?: string;
+        envelopeInstanceId?: string;
     };
     url: '/app/api/v1/runs';
 };

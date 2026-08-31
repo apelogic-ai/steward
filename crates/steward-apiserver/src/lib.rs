@@ -63,8 +63,9 @@ pub use steward_ports::{
 use steward_store::{
     AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent, AgentRunTimelineKind,
     AgentRunTimelineProvenance, ApprovalCandidate, ApproveAdmission, ApprovedAdmission,
-    DecisionFiling, DecisionFilingClaim, GrantApplication, GrantReversion, ParkRejection,
-    ParkedAdmission, PendingApproval, PendingEnvelopeRequest, PgStore, StoreError,
+    DecisionFiling, DecisionFilingClaim, EnvelopeRequestRecord, EnvelopeRequestStatusUpdate,
+    GrantApplication, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval,
+    PendingEnvelopeRequest, PgStore, StoreError,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, ModelRef,
@@ -361,6 +362,8 @@ pub struct GrantRevocationRequest {
         browser_admin::list_envelope_templates,
         browser_admin::author_envelope_template,
         browser_admin::list_approvals,
+        browser_admin::approve_envelope_request,
+        browser_admin::reject_envelope_request,
         browser_admin::approve,
         browser_admin::file_decision,
         agent_runs_contract,
@@ -1078,6 +1081,17 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         &self,
     ) -> BoxFuture<'_, Result<Vec<PendingEnvelopeRequest>, StoreError>>;
 
+    fn envelope_request_for_admin(
+        &self,
+        request_id: Uuid,
+    ) -> BoxFuture<'_, Result<Option<EnvelopeRequestRecord>, StoreError>>;
+
+    fn append_envelope_request_status<'a>(
+        &'a self,
+        request_id: Uuid,
+        update: EnvelopeRequestStatusUpdate<'a>,
+    ) -> BoxFuture<'a, Result<EnvelopeRequestRecord, StoreError>>;
+
     fn retire_pending_approval_if_superseded<'a>(
         &'a self,
         approval_id: Uuid,
@@ -1258,6 +1272,23 @@ impl AdmissionLedger for PgStore {
         &self,
     ) -> BoxFuture<'_, Result<Vec<PendingEnvelopeRequest>, StoreError>> {
         Box::pin(async move { PgStore::pending_envelope_requests(self).await })
+    }
+
+    fn envelope_request_for_admin(
+        &self,
+        request_id: Uuid,
+    ) -> BoxFuture<'_, Result<Option<EnvelopeRequestRecord>, StoreError>> {
+        Box::pin(async move { PgStore::envelope_request_for_admin(self, request_id).await })
+    }
+
+    fn append_envelope_request_status<'a>(
+        &'a self,
+        request_id: Uuid,
+        update: EnvelopeRequestStatusUpdate<'a>,
+    ) -> BoxFuture<'a, Result<EnvelopeRequestRecord, StoreError>> {
+        Box::pin(
+            async move { PgStore::append_envelope_request_status(self, request_id, update).await },
+        )
     }
 
     fn retire_pending_approval_if_superseded<'a>(
@@ -1494,6 +1525,7 @@ where
         workflow: query.workflow,
         owner_user_id: None,
         runtime_uid: None,
+        user_envelope_instance_id: None,
         task_uid: None,
     };
     match state.ledger.agent_runs(&query).await {
@@ -2057,6 +2089,7 @@ impl IntoResponse for ApiError {
                 | StoreError::EnvelopeRevisionNotIncreasing
                 | StoreError::TaskIdempotencyConflict
                 | StoreError::EnvelopeRequestIdempotencyConflict
+                | StoreError::EnvelopeRequestTemplateStale
                 | StoreError::WorkflowAlreadyExists
                 | StoreError::InvalidTaskTransition
                 | StoreError::InvalidEnvelopeRequestTransition
@@ -2971,9 +3004,9 @@ mod tests {
         AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunSpend, AgentRunTimelineEvent,
         AgentRunTimelineKind, AgentRunTimelineProvenance, ApprovalCandidate, ApproveAdmission,
         ApprovedAdmission, DecisionFiling, DecisionFilingClaim, EnvelopeRequestRecord,
-        EnvelopeRequestStatus, GrantApplication, GrantReversion, ParkRejection, ParkedAdmission,
-        PendingApproval, PendingEnvelopeRequest, StoreError, TaskRecord, TaskReservation,
-        TaskReservationRequest, WorkflowRevisionRecord,
+        EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, GrantApplication, GrantReversion,
+        ParkRejection, ParkedAdmission, PendingApproval, PendingEnvelopeRequest, StoreError,
+        TaskRecord, TaskReservation, TaskReservationRequest, WorkflowRevisionRecord,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email,
@@ -3846,6 +3879,14 @@ mod tests {
             ),
             ("/paths/~1admin~1api~1v1~1approvals/get", "200"),
             (
+                "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1approve/post",
+                "200",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1reject/post",
+                "200",
+            ),
+            (
                 "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1approve/post",
                 "204",
             ),
@@ -3893,6 +3934,8 @@ mod tests {
             "/paths/~1admin~1api~1v1~1connections~1github~1start/post",
             "/paths/~1admin~1api~1v1~1connections~1github~1disconnect/post",
             "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/post",
+            "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1approve/post",
+            "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1reject/post",
             "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1approve/post",
             "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1file/post",
         ] {
@@ -3924,16 +3967,34 @@ mod tests {
             user_auth,
         );
         let forbidden = user_app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/admin/api/v1/envelope-templates/engineer")
-                    .header(header::COOKIE, user_cookie)
+                    .header(header::COOKIE, &user_cookie)
                     .body(Body::empty())
                     .map_err(|error| format!("build user template request: {error}"))?,
             )
             .await
             .map_err(|error| format!("execute user template request: {error}"))?;
         assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let forbidden_envelope_approval = user_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                    .header(header::COOKIE, &user_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", "not-an-admin-proof")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build user envelope approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute user envelope approval: {error}"))?;
+        assert_eq!(forbidden_envelope_approval.status(), StatusCode::FORBIDDEN);
 
         let admin_ledger = ledger();
         let (admin_auth, admin_cookie, csrf) =
@@ -4019,6 +4080,165 @@ mod tests {
             "the one administrator queue must publish pending user envelope requests"
         );
 
+        let approved_request = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build envelope approval request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute envelope approval request: {error}"))?;
+        assert_eq!(
+            approved_request.status(),
+            StatusCode::OK,
+            "the authenticated admin API must expose an envelope-request approval mutation"
+        );
+        let approved_body = to_bytes(approved_request.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read envelope approval response: {error}"))?;
+        let approved: serde_json::Value = serde_json::from_slice(&approved_body)
+            .map_err(|error| format!("decode envelope approval response: {error}"))?;
+        assert_eq!(
+            approved.pointer("/request/status"),
+            Some(&serde_json::json!("provisioned"))
+        );
+        assert_eq!(
+            approved.pointer("/request/approvedEnvelope"),
+            approved.pointer("/request/requestedEnvelope"),
+            "approval must provision the exact immutable requested authority"
+        );
+        assert!(approved.pointer("/request/envelopeInstanceId").is_some());
+        assert_eq!(
+            approved.pointer("/request/actedBy"),
+            Some(&serde_json::json!("usr_abcdef0123456789abcdef0123456789")),
+            "the envelope transition must audit the canonical administrator"
+        );
+
+        let repeated_approval = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build repeated envelope approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute repeated envelope approval: {error}"))?;
+        assert_eq!(repeated_approval.status(), StatusCode::OK);
+        let repeated_body = to_bytes(repeated_approval.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read repeated envelope approval: {error}"))?;
+        let repeated: serde_json::Value = serde_json::from_slice(&repeated_body)
+            .map_err(|error| format!("decode repeated envelope approval: {error}"))?;
+        assert_eq!(
+            repeated.pointer("/request/envelopeInstanceId"),
+            approved.pointer("/request/envelopeInstanceId"),
+            "approval retries must return the one previously provisioned envelope"
+        );
+        assert_eq!(
+            repeated.pointer("/request/approvalId"),
+            approved.pointer("/request/approvalId")
+        );
+
+        let rejected_request = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000005/reject")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"reason":"not appropriate for this user"}"#))
+                    .map_err(|error| format!("build envelope rejection: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute envelope rejection: {error}"))?;
+        assert_eq!(rejected_request.status(), StatusCode::OK);
+        let rejected_body = to_bytes(rejected_request.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read envelope rejection: {error}"))?;
+        let rejected: serde_json::Value = serde_json::from_slice(&rejected_body)
+            .map_err(|error| format!("decode envelope rejection: {error}"))?;
+        assert_eq!(
+            rejected.pointer("/request/status"),
+            Some(&serde_json::json!("rejected"))
+        );
+        assert!(
+            rejected
+                .pointer("/request/envelopeInstanceId")
+                .is_none_or(serde_json::Value::is_null)
+        );
+        assert!(
+            rejected
+                .pointer("/request/approvedEnvelope")
+                .is_none_or(serde_json::Value::is_null)
+        );
+        assert_eq!(
+            rejected.pointer("/request/reason"),
+            Some(&serde_json::json!("not appropriate for this user"))
+        );
+
+        let repeated_rejection = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000005/reject")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"reason":"a retry cannot rewrite the decision"}"#))
+                    .map_err(|error| format!("build repeated envelope rejection: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute repeated envelope rejection: {error}"))?;
+        assert_eq!(repeated_rejection.status(), StatusCode::OK);
+        let repeated_rejection_body = to_bytes(repeated_rejection.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read repeated envelope rejection: {error}"))?;
+        let repeated_rejection: serde_json::Value =
+            serde_json::from_slice(&repeated_rejection_body)
+                .map_err(|error| format!("decode repeated envelope rejection: {error}"))?;
+        assert_eq!(
+            repeated_rejection.pointer("/request/reason"),
+            rejected.pointer("/request/reason"),
+            "rejection retries must return the immutable original decision"
+        );
+
+        let unproved_envelope_approval = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000006/approve")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build unproved envelope approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute unproved envelope approval: {error}"))?;
+        assert_eq!(unproved_envelope_approval.status(), StatusCode::FORBIDDEN);
+
         let mut next = admin_ledger
             .envelope
             .lock()
@@ -4043,14 +4263,15 @@ mod tests {
         assert_eq!(missing_proof.status(), StatusCode::FORBIDDEN);
 
         let created = admin_app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/admin/api/v1/envelope-templates/engineer")
-                    .header(header::COOKIE, admin_cookie)
+                    .header(header::COOKIE, &admin_cookie)
                     .header(header::ORIGIN, origin)
                     .header("sec-fetch-site", "same-origin")
-                    .header("x-steward-csrf", csrf)
+                    .header("x-steward-csrf", &csrf)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(body))
                     .map_err(|error| format!("build proved template request: {error}"))?,
@@ -4058,6 +4279,27 @@ mod tests {
             .await
             .map_err(|error| format!("execute proved template request: {error}"))?;
         assert_eq!(created.status(), StatusCode::CREATED);
+
+        let stale_approval = admin_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000006/approve")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build stale envelope approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute stale envelope approval: {error}"))?;
+        assert_eq!(
+            stale_approval.status(),
+            StatusCode::CONFLICT,
+            "an administrator must not approve against a superseded template revision"
+        );
         let authors = admin_ledger
             .envelope_authors
             .lock()
@@ -5099,6 +5341,100 @@ mod tests {
             Box::pin(async { Ok(self.pending_envelope_requests.clone()) })
         }
 
+        fn envelope_request_for_admin(
+            &self,
+            request_id: Uuid,
+        ) -> BoxFuture<'_, Result<Option<EnvelopeRequestRecord>, StoreError>> {
+            Box::pin(async move {
+                if let Some(record) = self
+                    .user_envelopes
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database("fake envelope lock was poisoned".to_owned())
+                    })?
+                    .iter()
+                    .find(|record| record.id == request_id)
+                    .cloned()
+                {
+                    return Ok(Some(record));
+                }
+                let Some(pending) = self
+                    .pending_envelope_requests
+                    .iter()
+                    .find(|pending| pending.request_id == request_id)
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(EnvelopeRequestRecord {
+                    id: pending.request_id,
+                    owner_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
+                        .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)?,
+                    template_id: pending.template_id.clone(),
+                    template_revision: pending.template_revision,
+                    requested_envelope: pending.requested_envelope.clone(),
+                    approved_envelope: None,
+                    status: EnvelopeRequestStatus::Pending,
+                    approval_id: None,
+                    envelope_instance_id: None,
+                    envelope_digest: None,
+                    reason: None,
+                    status_actor: "usr_0123456789abcdef0123456789abcdef".to_owned(),
+                    status_template_revision: pending.template_revision,
+                    created_at: pending.created_at.clone(),
+                    status_at: pending.created_at.clone(),
+                }))
+            })
+        }
+
+        fn append_envelope_request_status<'a>(
+            &'a self,
+            request_id: Uuid,
+            update: EnvelopeRequestStatusUpdate<'a>,
+        ) -> BoxFuture<'a, Result<EnvelopeRequestRecord, StoreError>> {
+            Box::pin(async move {
+                let current = self
+                    .envelope_request_for_admin(request_id)
+                    .await?
+                    .ok_or(StoreError::EnvelopeRequestNotFound)?;
+                if current.status == update.to {
+                    return Ok(current);
+                }
+                if update.to == EnvelopeRequestStatus::Provisioned {
+                    let template = self.envelope.lock().map_err(|_| {
+                        StoreError::Database("fake envelope lock was poisoned".to_owned())
+                    })?;
+                    if template.revision != current.template_revision {
+                        return Err(StoreError::EnvelopeRequestTemplateStale);
+                    }
+                    if update.approved_envelope != Some(&current.requested_envelope) {
+                        return Err(StoreError::InvalidEnvelopeRequest);
+                    }
+                }
+                if current.status != update.from {
+                    return Err(StoreError::InvalidEnvelopeRequestTransition);
+                }
+                let mut decided = current;
+                decided.status = update.to;
+                decided.approval_id = update.approval_id;
+                decided.envelope_instance_id = update.envelope_instance_id.map(str::to_owned);
+                decided.envelope_digest = update.envelope_digest.map(str::to_owned);
+                decided.reason = update.reason.map(str::to_owned);
+                decided.approved_envelope = update.approved_envelope.cloned();
+                decided.status_actor = update.actor.to_owned();
+                decided.status_template_revision = decided.template_revision;
+                decided.status_at = "2026-08-24T17:06:00.000000Z".to_owned();
+                let mut records = self.user_envelopes.lock().map_err(|_| {
+                    StoreError::Database("fake envelope lock was poisoned".to_owned())
+                })?;
+                if let Some(record) = records.iter_mut().find(|record| record.id == request_id) {
+                    *record = decided.clone();
+                } else {
+                    records.push(decided.clone());
+                }
+                Ok(decided)
+            })
+        }
+
         fn retire_pending_approval_if_superseded<'a>(
             &'a self,
             _approval_id: Uuid,
@@ -5781,30 +6117,11 @@ mod tests {
             envelope_authors: Arc::new(Mutex::new(Vec::new())),
             grants: Vec::new(),
             parked: Arc::new(Mutex::new(Vec::new())),
-            pending_envelope_requests: vec![PendingEnvelopeRequest {
-                request_id: Uuid::from_u128(4),
-                owner_display_email: "alice@example.com".to_owned(),
-                template_id: "engineer".to_owned(),
-                template_revision: 3,
-                requested_envelope: Envelope {
-                    revision: 3,
-                    spec: EnvelopeSpec {
-                        llms: vec![ModelRef {
-                            provider: "provider-a".to_owned(),
-                            model: "model-a".to_owned(),
-                        }],
-                        tools: Vec::new(),
-                        budget: Budget {
-                            monthly_limit: "100.00".to_owned(),
-                            single_run_limit: None,
-                            currency: "USD".to_owned(),
-                        },
-                        ttl: Duration("24h".to_owned()),
-                        runner: steward_types::RunnerRequirements::default(),
-                    },
-                },
-                created_at: "2026-08-24T17:05:00.000000Z".to_owned(),
-            }],
+            pending_envelope_requests: vec![
+                pending_user_envelope_request(4),
+                pending_user_envelope_request(5),
+                pending_user_envelope_request(6),
+            ],
             decision_references: Arc::new(Mutex::new(Vec::new())),
             decision_filing_claim: Arc::new(Mutex::new(None)),
             revoke_rows: 0,
@@ -5818,6 +6135,50 @@ mod tests {
             agent_runs: Arc::new(Mutex::new(Vec::new())),
             agent_run_events: Arc::new(Mutex::new(Vec::new())),
             service_envelope_authors: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn pending_user_envelope_request(request_id: u128) -> PendingEnvelopeRequest {
+        PendingEnvelopeRequest {
+            request_id: Uuid::from_u128(request_id),
+            owner_display_email: "alice@example.com".to_owned(),
+            template_id: "engineer".to_owned(),
+            template_revision: 3,
+            requested_envelope: Envelope {
+                revision: 3,
+                spec: EnvelopeSpec {
+                    llms: vec![ModelRef {
+                        provider: "provider-a".to_owned(),
+                        model: "model-a".to_owned(),
+                    }],
+                    tools: Vec::new(),
+                    budget: Budget {
+                        monthly_limit: "100.00".to_owned(),
+                        single_run_limit: None,
+                        currency: "USD".to_owned(),
+                    },
+                    ttl: Duration("24h".to_owned()),
+                    runner: steward_types::RunnerRequirements::default(),
+                },
+            },
+            template_envelope: Envelope {
+                revision: 3,
+                spec: EnvelopeSpec {
+                    llms: vec![ModelRef {
+                        provider: "provider-a".to_owned(),
+                        model: "model-a".to_owned(),
+                    }],
+                    tools: Vec::new(),
+                    budget: Budget {
+                        monthly_limit: "200.00".to_owned(),
+                        single_run_limit: None,
+                        currency: "USD".to_owned(),
+                    },
+                    ttl: Duration("24h".to_owned()),
+                    runner: steward_types::RunnerRequirements::default(),
+                },
+            },
+            created_at: "2026-08-24T17:05:00.000000Z".to_owned(),
         }
     }
 
@@ -5895,6 +6256,8 @@ mod tests {
                 envelope_instance_id: Some("envelope-instance-1".to_owned()),
                 envelope_digest: Some(format!("sha256:{}", "b".repeat(64))),
                 reason: None,
+                status_actor: "usr_0123456789abcdef0123456789abcdef".to_owned(),
+                status_template_revision: 4,
                 created_at: "2026-08-24T17:01:00.000000Z".to_owned(),
                 status_at: "2026-08-24T17:02:00.000000Z".to_owned(),
             });

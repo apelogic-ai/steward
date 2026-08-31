@@ -442,6 +442,7 @@ if [[ "${slice}" == "s3" ]]; then
   STEWARD_TEST_KUBECONFIG="${kubeconfig}" \
   STEWARD_RUN_DIR="${run_dir}" \
   STEWARD_TEST_TLS_CA="${run_dir}/tls-cert.pem" \
+  STEWARD_TEST_DATABASE_URL="${database_url}" \
   STEWARD_S3_URL="https://steward-s3.test:${port}" \
   STEWARD_S3_RESOLVE="steward-s3.test:${port}:127.0.0.1" \
     cargo test \

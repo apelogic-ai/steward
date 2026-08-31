@@ -4,11 +4,15 @@ import { useCallback, useState, type FormEvent } from "react";
 
 import {
   approveAdminApproval,
+  approveAdminEnvelopeRequest,
   fileAdminApprovalDecision,
   listAdminApprovals,
+  rejectAdminEnvelopeRequest,
   type BrowserApprovalsResponse,
   type BrowserApprovalView,
   type BrowserDecisionReferenceResponse,
+  type BrowserEnvelopeSpec,
+  type BrowserEnvelopeRequestDecisionResponse,
   type BrowserEnvelopeRequestView,
 } from "@/api-client";
 import { DefinitionList, EmptyState, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
@@ -17,6 +21,7 @@ import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
 type ApprovalActionState = "idle" | "filing" | "filed" | "approving" | "approved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
+type EnvelopeActionState = "idle" | "approving" | "rejecting" | "provisioned" | "rejection-complete" | "rejected" | "conflict" | "forbidden" | "unavailable" | "error";
 
 type BrowserApprovalQueueResponse = BrowserApprovalsResponse & {
   envelopeRequests: BrowserEnvelopeRequestView[];
@@ -32,6 +37,23 @@ function actionMessage(status: Exclude<ApprovalActionState, "idle" | "filing" | 
     unavailable: "The approval authority is unavailable.",
     error: "The approval response could not be accepted.",
   }[status];
+}
+
+function envelopeAuthorityItems(spec: BrowserEnvelopeSpec): [string, string][] {
+  const runner = spec.runner;
+  return [
+    ["Models", spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ") || "None"],
+    ["Tools", spec.tools.map((tool) => `${tool.provider}/${tool.resource}:${tool.action}`).join(", ") || "None"],
+    ["Monthly limit", `${spec.budget.monthlyLimit} ${spec.budget.currency}`],
+    ["Single-run limit", spec.budget.singleRunLimit
+      ? `${spec.budget.singleRunLimit} ${spec.budget.currency}`
+      : "Unbounded"],
+    ["TTL", spec.ttl],
+    ["Runner platforms", runner?.platforms?.join(", ") || "None"],
+    ["Runner memory", runner?.memory ?? "Not set"],
+    ["Runner compute", runner?.compute ?? "Not set"],
+    ["Runner storage", runner?.storage ?? "Not set"],
+  ];
 }
 
 export function AdminApprovalsView() {
@@ -62,22 +84,97 @@ export function AdminApprovalsView() {
   );
 }
 
-function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnvelopeRequestView }>) {
-  const spec = request.requestedEnvelope.spec;
+export function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnvelopeRequestView }>) {
+  const session = useSession();
+  const [decision, setDecision] = useState<BrowserEnvelopeRequestDecisionResponse | null>(null);
+  const [status, setStatus] = useState<EnvelopeActionState>("idle");
+  const requested = request.requestedEnvelope.spec;
+  const governing = request.templateEnvelope.spec;
+  const terminal = decision?.request.status === "provisioned" || decision?.request.status === "rejected";
+
+  async function approveRequest() {
+    if (session.status !== "authenticated" || terminal) return;
+    setStatus("approving");
+    const result = await approveAdminEnvelopeRequest({
+      body: {},
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "X-Steward-CSRF": session.value.csrf },
+      path: { request_id: request.requestId },
+    });
+    if (result.data && result.response?.status === 200) {
+      setDecision(result.data);
+      setStatus("provisioned");
+      return;
+    }
+    setStatus(classifyMutationFailure(result.response?.status));
+  }
+
+  async function rejectRequest(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (session.status !== "authenticated" || terminal) return;
+    const fields = new FormData(event.currentTarget);
+    const reason = String(fields.get("reason") ?? "").trim();
+    setStatus("rejecting");
+    const result = await rejectAdminEnvelopeRequest({
+      body: { reason: reason || null },
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "X-Steward-CSRF": session.value.csrf },
+      path: { request_id: request.requestId },
+    });
+    if (result.data && result.response?.status === 200) {
+      setDecision(result.data);
+      setStatus("rejection-complete");
+      return;
+    }
+    setStatus(classifyMutationFailure(result.response?.status));
+  }
+
   return (
     <li className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div><h2 className="text-xl font-semibold">User envelope request</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.requestId}</p></div>
-        <StatusBadge value="pending" />
+        <StatusBadge value={decision?.request.status ?? "pending"} />
       </div>
       <DefinitionList items={[
         ["Requested by", request.ownerDisplayEmail],
         ["Template", request.templateId],
         ["Template revision", request.templateRevision],
-        ["Budget", `${spec.budget.monthlyLimit} ${spec.budget.currency}`],
-        ["TTL", spec.ttl],
         ["Created", request.createdAt],
       ]} />
+      <div className="grid gap-5 border-t pt-5 lg:grid-cols-2">
+        <section aria-label="Requested authority" className="space-y-3">
+          <h3 className="font-semibold">Requested authority</h3>
+          <DefinitionList items={envelopeAuthorityItems(requested)} />
+        </section>
+        <section aria-label="Governing template" className="space-y-3">
+          <h3 className="font-semibold">Governing template</h3>
+          <DefinitionList items={envelopeAuthorityItems(governing)} />
+        </section>
+      </div>
+      <div className="flex flex-wrap gap-3 border-t pt-5">
+        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={terminal || status === "approving" || status === "rejecting"} onClick={() => void approveRequest()} type="button">{status === "approving" ? "Approving…" : "Approve request"}</button>
+      </div>
+      <form className="grid gap-3" onSubmit={rejectRequest}>
+        <label className="grid gap-2 text-sm font-semibold">Rejection reason (optional)
+          <textarea className="min-h-20 rounded-md border p-3 font-normal" disabled={terminal} maxLength={2000} name="reason" />
+        </label>
+        <button className="min-h-11 rounded-md border border-red-700 px-4 py-2 text-sm font-semibold text-red-800 disabled:opacity-50 sm:justify-self-start" disabled={terminal || status === "approving" || status === "rejecting"} type="submit">{status === "rejecting" ? "Rejecting…" : "Reject request"}</button>
+      </form>
+      {decision ? (
+        <DefinitionList items={[
+          ["Acted by", decision.request.actedBy],
+          ["Status time", decision.request.statusAt],
+          ["Envelope ID", decision.request.envelopeInstanceId ?? "Not created"],
+          ["Reason", decision.request.reason ?? "None"],
+        ]} />
+      ) : null}
+      {status !== "idle" && status !== "approving" && status !== "rejecting" ? (
+        <p className={status === "provisioned" || status === "rejection-complete" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "provisioned" || status === "rejection-complete" ? "status" : "alert"}>
+          {status === "provisioned" ? "The exact requested envelope was provisioned." : status === "rejection-complete" ? "The envelope request was rejected without creating an envelope." : status === "rejected" ? "The rejection reason is invalid." : status === "conflict" ? "This request or its template revision is stale. Reload the authoritative queue." : status === "forbidden" ? "The Rust authorization boundary rejected this mutation." : status === "unavailable" ? "The envelope request authority is unavailable." : "The envelope request response could not be accepted."}
+        </p>
+      ) : null}
     </li>
   );
 }

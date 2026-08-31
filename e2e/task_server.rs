@@ -149,6 +149,7 @@ async fn seed_versioned_workflow_authority(
                 template_revision: 1,
                 requested_envelope: &envelope,
                 idempotency_key: "repository-review-envelope",
+                actor: identity.canonical_user_id.as_str(),
             })
             .await?;
         let digest = envelope_content_digest(&envelope)?;
@@ -163,6 +164,7 @@ async fn seed_versioned_workflow_authority(
                     envelope_digest: Some(&digest),
                     reason: None,
                     approved_envelope: Some(&envelope),
+                    actor: identity.canonical_user_id.as_str(),
                 },
             )
             .await?;

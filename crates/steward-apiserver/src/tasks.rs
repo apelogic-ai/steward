@@ -1778,6 +1778,8 @@ mod workflow_request_tests {
             envelope_instance_id: Some("env_instance_01".to_owned()),
             envelope_digest: Some("envelope-digest".to_owned()),
             reason: None,
+            status_actor: owner_user_id.to_owned(),
+            status_template_revision: 2,
             created_at: "2026-08-24T00:00:00.000000Z".to_owned(),
             status_at: "2026-08-24T00:00:01.000000Z".to_owned(),
         })
