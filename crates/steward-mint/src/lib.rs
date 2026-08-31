@@ -337,10 +337,53 @@ pub enum MintError {
     AuthorityUnavailable,
     WorkloadMismatch,
     AuthorityInactive,
+    InvalidAudience,
     InvalidRequest,
     InvalidScope,
     CredentialUnavailable,
     SigningFailed,
+}
+
+/// Stable, secret-free classification for a failed OpenShell provider-token grant.
+///
+/// The value is deliberately finite and contains no request-derived material.  Mint
+/// emits only the variants it can observe after a request reaches `/token`; the
+/// caller owns `MintUnreachable` and post-response `TokenHandoffFailed` when those
+/// stages fail before or after Mint can observe the request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ProviderTokenGrantOutcome {
+    MintUnreachable,
+    MintInvalidClient,
+    MintAuthorityRejected,
+    MintAudienceRejected,
+    MintScopeRejected,
+    MintUnavailable,
+    TokenHandoffFailed,
+    Unexpected,
+}
+
+impl MintError {
+    /// Maps a Mint-side terminal failure to the cross-boundary redacted outcome.
+    ///
+    /// This deliberately does not expose SPIFFE identifiers, assertion contents,
+    /// runtime identifiers, HTTP data, or credential material.
+    pub const fn provider_token_grant_outcome(&self) -> ProviderTokenGrantOutcome {
+        match self {
+            Self::InvalidSvid => ProviderTokenGrantOutcome::MintInvalidClient,
+            Self::SvidValidatorUnavailable | Self::AuthorityUnavailable => {
+                ProviderTokenGrantOutcome::MintUnavailable
+            }
+            Self::WorkloadMismatch | Self::AuthorityInactive => {
+                ProviderTokenGrantOutcome::MintAuthorityRejected
+            }
+            Self::InvalidAudience => ProviderTokenGrantOutcome::MintAudienceRejected,
+            Self::InvalidScope => ProviderTokenGrantOutcome::MintScopeRejected,
+            Self::CredentialUnavailable => ProviderTokenGrantOutcome::TokenHandoffFailed,
+            Self::InvalidRequest | Self::SigningFailed => ProviderTokenGrantOutcome::Unexpected,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -516,9 +559,11 @@ where
     ) -> Result<TokenGrantResponse, MintError> {
         if request.grant_type != "client_credentials"
             || request.client_assertion_type != SPIFFE_CLIENT_ASSERTION_TYPE
-            || request.audience != self.config.audience
         {
             return Err(MintError::InvalidRequest);
+        }
+        if request.audience != self.config.audience {
+            return Err(MintError::InvalidAudience);
         }
         if request
             .scope
@@ -745,6 +790,8 @@ impl TokenIntrospectionResponse {
 #[derive(Serialize)]
 struct OAuthError {
     error: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steward_token_grant_outcome: Option<ProviderTokenGrantOutcome>,
 }
 
 type OAuthResult<T> = Result<Json<T>, (StatusCode, Json<OAuthError>)>;
@@ -784,7 +831,7 @@ where
     mint.exchange(request)
         .await
         .map(|response| (no_store_headers(), Json(response)))
-        .map_err(map_mint_error)
+        .map_err(map_token_grant_error)
 }
 
 async fn introspection_handler<V, R, C>(
@@ -820,25 +867,58 @@ where
 }
 
 fn map_mint_error(error: MintError) -> (StatusCode, Json<OAuthError>) {
+    let (status, error) = mint_oauth_error(error);
+    oauth_error(status, error)
+}
+
+fn map_token_grant_error(error: MintError) -> (StatusCode, Json<OAuthError>) {
+    let outcome = error.provider_token_grant_outcome();
+    let (status, error) = mint_oauth_error(error);
+    oauth_error_with_outcome(status, error, outcome)
+}
+
+fn mint_oauth_error(error: MintError) -> (StatusCode, &'static str) {
     match error {
-        MintError::InvalidSvid => oauth_error(StatusCode::UNAUTHORIZED, "invalid_client"),
+        MintError::InvalidSvid => (StatusCode::UNAUTHORIZED, "invalid_client"),
         MintError::SvidValidatorUnavailable | MintError::AuthorityUnavailable => {
-            oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
+            (StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
         }
         MintError::WorkloadMismatch | MintError::AuthorityInactive => {
-            oauth_error(StatusCode::FORBIDDEN, "invalid_grant")
+            (StatusCode::FORBIDDEN, "invalid_grant")
         }
-        MintError::InvalidRequest => oauth_error(StatusCode::BAD_REQUEST, "invalid_request"),
-        MintError::InvalidScope => oauth_error(StatusCode::BAD_REQUEST, "invalid_scope"),
+        MintError::InvalidAudience | MintError::InvalidRequest => {
+            (StatusCode::BAD_REQUEST, "invalid_request")
+        }
+        MintError::InvalidScope => (StatusCode::BAD_REQUEST, "invalid_scope"),
         MintError::CredentialUnavailable => {
-            oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
+            (StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
         }
-        MintError::SigningFailed => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+        MintError::SigningFailed => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
     }
 }
 
 fn oauth_error(status: StatusCode, error: &'static str) -> (StatusCode, Json<OAuthError>) {
-    (status, Json(OAuthError { error }))
+    (
+        status,
+        Json(OAuthError {
+            error,
+            steward_token_grant_outcome: None,
+        }),
+    )
+}
+
+fn oauth_error_with_outcome(
+    status: StatusCode,
+    error: &'static str,
+    outcome: ProviderTokenGrantOutcome,
+) -> (StatusCode, Json<OAuthError>) {
+    (
+        status,
+        Json(OAuthError {
+            error,
+            steward_token_grant_outcome: Some(outcome),
+        }),
+    )
 }
 
 fn no_store_headers() -> HeaderMap {
@@ -888,7 +968,10 @@ where
         .fallback(|| async {
             (
                 StatusCode::NOT_FOUND,
-                Json(OAuthError { error: "not_found" }),
+                Json(OAuthError {
+                    error: "not_found",
+                    steward_token_grant_outcome: None,
+                }),
             )
         })
         .with_state(mint)

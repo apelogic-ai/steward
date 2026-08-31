@@ -184,6 +184,10 @@ async fn openshell_client_assertion_form_returns_an_oauth_token_response() -> Re
     assert_eq!(body["expires_in"], 60);
     assert_eq!(body["scope"], "tools");
     assert!(
+        body.get("steward_token_grant_outcome").is_none(),
+        "a successful grant must not carry a failure classification"
+    );
+    assert!(
         body["access_token"]
             .as_str()
             .is_some_and(|token| token.split('.').count() == 3),
@@ -221,6 +225,7 @@ async fn unconfigured_scope_fails_before_reading_the_svid() -> Result<(), String
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "invalid_scope");
+    assert_eq!(body["steward_token_grant_outcome"], "mint_scope_rejected");
     assert_eq!(validator_calls.load(Ordering::SeqCst), 0);
     assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
     Ok(())
@@ -234,12 +239,48 @@ async fn rejected_svid_returns_a_sanitized_invalid_client_error() -> Result<(), 
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"], "invalid_client");
+    assert_eq!(body["steward_token_grant_outcome"], "mint_invalid_client");
     assert!(
         !body.to_string().contains("test-svid"),
         "an OAuth error must not echo the JWT-SVID"
     );
+    for forbidden in ["gateway-credential", "spiffe://", "runtime-uid-a"] {
+        assert!(
+            !body.to_string().contains(forbidden),
+            "a token-grant outcome must not expose sensitive identity or credential material: {forbidden}"
+        );
+    }
     assert_eq!(validator_calls.load(Ordering::SeqCst), 1);
     assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejected_audience_preserves_oauth_error_and_exposes_only_the_bounded_outcome()
+-> Result<(), String> {
+    let (app, validator_calls, resolver_calls) = app(Ok(ValidatedWorkload {
+        spiffe_id: WORKLOAD.to_owned(),
+    }))?;
+    let form = VALID_FORM.replace(
+        "audience=mcp-gw.example.test",
+        "audience=other.example.test",
+    );
+
+    let (status, _, body) = call(app, "POST", "/token", &form).await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_request");
+    assert_eq!(
+        body["steward_token_grant_outcome"],
+        "mint_audience_rejected"
+    );
+    assert_eq!(validator_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        body.as_object().map(|body| body.len()),
+        Some(2),
+        "the failure surface must stay limited to the OAuth error and one fixed outcome"
+    );
     Ok(())
 }
 
@@ -267,6 +308,7 @@ async fn unavailable_spire_returns_a_retryable_sanitized_error() -> Result<(), S
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["error"], "temporarily_unavailable");
+    assert_eq!(body["steward_token_grant_outcome"], "mint_unavailable");
     assert_eq!(validator_calls.load(Ordering::SeqCst), 1);
     assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
     Ok(())
