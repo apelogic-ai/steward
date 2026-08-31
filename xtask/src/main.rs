@@ -1458,6 +1458,7 @@ mod tests {
             "openshellEndpoint",
             "openshellServerName",
             "openshellRuntimeClassName",
+            "openshellTaskLogMode",
             "workloadExchangeEndpoint",
             "workloadExchangeServerName",
             "workloadExchangeTrust",
@@ -1496,6 +1497,7 @@ mod tests {
             "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
             "STEWARD_OPENSHELL_SERVER_NAME",
             "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
+            "STEWARD_OPENSHELL_TASK_LOG_MODE",
         ] {
             assert!(
                 templates.contains(environment_variable),
@@ -1547,6 +1549,50 @@ mod tests {
             !values.contains("workloadExchangeRoles")
                 && !values.contains("workloadExchangeAlgorithm"),
             "the caller must not select exchange roles or a signing algorithm"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_task_process_logging_contract_is_explicit() -> Result<(), String> {
+        let controller = fs::read_to_string(root().join("bins/steward-controller/src/main.rs"))
+            .map_err(|error| format!("Steward controller source is required: {error}"))?;
+        let adapter = fs::read_to_string(root().join("adapters/openshell/src/lib.rs"))
+            .map_err(|error| format!("OpenShell adapter source is required: {error}"))?;
+        let values = fs::read_to_string(root().join("charts/steward/values.yaml"))
+            .map_err(|error| format!("Steward chart values are required: {error}"))?;
+        let schema = fs::read_to_string(root().join("charts/steward/values.schema.json"))
+            .map_err(|error| format!("Steward values schema is required: {error}"))?;
+        let templates = fs::read_to_string(root().join("charts/steward/templates/all.yaml"))
+            .map_err(|error| format!("Steward chart templates are required: {error}"))?;
+
+        assert!(
+            controller.contains("STEWARD_OPENSHELL_TASK_LOG_MODE"),
+            "the controller must parse STEWARD_OPENSHELL_TASK_LOG_MODE at startup"
+        );
+        assert!(
+            adapter.contains("exec_sandbox"),
+            "the OpenShell task path must consume the live sandbox execution stream"
+        );
+        for required_field in ["runtime_uid", "workspace", "sandbox", "stream", "message"] {
+            assert!(
+                adapter.contains(required_field),
+                "each task-process log record must carry {required_field}"
+            );
+        }
+        assert!(
+            values.contains("openshellTaskLogMode: \"off\""),
+            "the chart must default OpenShell task-process logging to off"
+        );
+        assert!(
+            schema.contains("openshellTaskLogMode")
+                && schema.contains("\"enum\": [\"off\", \"full\"]"),
+            "the values schema must restrict openshellTaskLogMode to off or full"
+        );
+        assert!(
+            templates.contains("STEWARD_OPENSHELL_TASK_LOG_MODE"),
+            "the controller Deployment must receive STEWARD_OPENSHELL_TASK_LOG_MODE"
         );
 
         Ok(())

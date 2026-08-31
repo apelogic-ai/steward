@@ -24,8 +24,9 @@ use openshell_sdk::raw::proto::datamodel::v1::{ObjectMeta, Provider};
 #[cfg(feature = "runtime")]
 use openshell_sdk::raw::proto::{
     AttachSandboxProviderRequest, CreateProviderRequest, DetachSandboxProviderRequest,
-    GetProviderRequest, GetSandboxRequest, ListSandboxProvidersRequest, Sandbox as RawSandbox,
-    SandboxPhase as RawSandboxPhase,
+    ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest, GetSandboxRequest,
+    ListSandboxProvidersRequest, Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase,
+    exec_sandbox_event,
 };
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
@@ -49,6 +50,8 @@ use steward_ports::{
 use steward_types::{AgentType, RuntimeRefs};
 #[cfg(feature = "runtime")]
 use tokio::sync::Mutex;
+#[cfg(feature = "runtime")]
+use tonic::Streaming;
 #[cfg(feature = "runtime")]
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
@@ -534,6 +537,191 @@ fn valid_kubernetes_runtime_class_name(value: &str) -> bool {
 }
 
 #[cfg(feature = "runtime")]
+/// Controls whether a task process is mirrored into the controller's ordinary log stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenShellTaskLogMode {
+    /// Retain task output for result handling without emitting it to controller logs.
+    Off,
+    /// Emit stdout and stderr chunks live while retaining the same result buffers.
+    Full,
+}
+
+#[cfg(feature = "runtime")]
+#[derive(Debug, Eq, PartialEq)]
+struct TaskProcessResult {
+    exit_code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[cfg(feature = "runtime")]
+#[derive(Clone, Copy)]
+struct TaskProcessLogContext<'a> {
+    runtime_uid: &'a str,
+    workspace: &'a str,
+    sandbox: &'a str,
+}
+
+#[cfg(feature = "runtime")]
+#[derive(Clone, Copy)]
+enum TaskProcessStream {
+    Stdout,
+    Stderr,
+}
+
+#[cfg(feature = "runtime")]
+impl TaskProcessStream {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+#[cfg(feature = "runtime")]
+trait TaskProcessEventStream {
+    async fn next_event(&mut self) -> Result<Option<ExecSandboxEvent>, PortError>;
+}
+
+#[cfg(feature = "runtime")]
+impl TaskProcessEventStream for Streaming<ExecSandboxEvent> {
+    async fn next_event(&mut self) -> Result<Option<ExecSandboxEvent>, PortError> {
+        self.message().await.map_err(raw_port_failure)
+    }
+}
+
+#[cfg(feature = "runtime")]
+trait TaskProcessLogSink {
+    fn emit(
+        &mut self,
+        context: TaskProcessLogContext<'_>,
+        stream: TaskProcessStream,
+        message: &[u8],
+    );
+}
+
+#[cfg(feature = "runtime")]
+struct ControllerTaskProcessLogSink;
+
+#[cfg(feature = "runtime")]
+impl TaskProcessLogSink for ControllerTaskProcessLogSink {
+    fn emit(
+        &mut self,
+        context: TaskProcessLogContext<'_>,
+        stream: TaskProcessStream,
+        message: &[u8],
+    ) {
+        eprintln!("{}", task_process_log_record(context, stream, message));
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn task_process_log_record(
+    context: TaskProcessLogContext<'_>,
+    stream: TaskProcessStream,
+    message: &[u8],
+) -> String {
+    format!(
+        "openshell_task_process runtime_uid=\"{}\" workspace=\"{}\" sandbox=\"{}\" stream={} message=\"{}\"",
+        escaped_task_log_value(context.runtime_uid.as_bytes()),
+        escaped_task_log_value(context.workspace.as_bytes()),
+        escaped_task_log_value(context.sandbox.as_bytes()),
+        stream.as_str(),
+        escaped_task_log_value(message),
+    )
+}
+
+#[cfg(feature = "runtime")]
+fn escaped_task_log_value(value: &[u8]) -> String {
+    fn append_valid_utf8(output: &mut String, value: &str) {
+        for character in value.chars() {
+            match character {
+                '\\' => output.push_str("\\\\"),
+                '"' => output.push_str("\\\""),
+                '\n' => output.push_str("\\n"),
+                '\r' => output.push_str("\\r"),
+                '\t' => output.push_str("\\t"),
+                character if character.is_control() => output.extend(character.escape_default()),
+                character => output.push(character),
+            }
+        }
+    }
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                append_valid_utf8(&mut output, valid);
+                break;
+            }
+            Err(error) => {
+                let valid_bytes = &remaining[..error.valid_up_to()];
+                if let Ok(valid) = std::str::from_utf8(valid_bytes) {
+                    append_valid_utf8(&mut output, valid);
+                }
+                let invalid_length = error
+                    .error_len()
+                    .unwrap_or(remaining.len() - error.valid_up_to());
+                let invalid_end = error.valid_up_to() + invalid_length;
+                for byte in &remaining[error.valid_up_to()..invalid_end] {
+                    output.push_str("\\x");
+                    output.push(char::from(HEX[usize::from(byte >> 4)]));
+                    output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+                }
+                remaining = &remaining[invalid_end..];
+            }
+        }
+    }
+    output
+}
+
+#[cfg(feature = "runtime")]
+async fn collect_task_process_stream<S, L>(
+    stream: &mut S,
+    mode: OpenShellTaskLogMode,
+    context: TaskProcessLogContext<'_>,
+    log_sink: &mut L,
+) -> Result<TaskProcessResult, PortError>
+where
+    S: TaskProcessEventStream,
+    L: TaskProcessLogSink,
+{
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_code = None;
+
+    while let Some(event) = stream.next_event().await? {
+        match event.payload {
+            Some(exec_sandbox_event::Payload::Stdout(chunk)) => {
+                if mode == OpenShellTaskLogMode::Full {
+                    log_sink.emit(context, TaskProcessStream::Stdout, &chunk.data);
+                }
+                stdout.extend_from_slice(&chunk.data);
+            }
+            Some(exec_sandbox_event::Payload::Stderr(chunk)) => {
+                if mode == OpenShellTaskLogMode::Full {
+                    log_sink.emit(context, TaskProcessStream::Stderr, &chunk.data);
+                }
+                stderr.extend_from_slice(&chunk.data);
+            }
+            Some(exec_sandbox_event::Payload::Exit(exit)) => {
+                exit_code = Some(exit.exit_code);
+            }
+            None => {}
+        }
+    }
+
+    Ok(TaskProcessResult {
+        exit_code: exit_code.unwrap_or(-1),
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(feature = "runtime")]
 #[derive(Clone)]
 pub struct OpenShellConnectionConfig {
     pub endpoint: String,
@@ -546,6 +734,7 @@ pub struct OpenShellConnectionConfig {
     pub workload_source_credential_file: PathBuf,
     pub server_name: String,
     pub runtime_class_name: String,
+    pub task_log_mode: OpenShellTaskLogMode,
     /// Digest-pinned bridge image only. Its provenance is verified by the controller process
     /// before this adapter is constructed.
     pub bridge_image: Option<String>,
@@ -879,6 +1068,7 @@ fn workload_exchange_unavailable(_: reqwest::Error) -> PortError {
 pub struct OpenShellRuntime {
     channel: Channel,
     token_provider: WorkloadExchangeTokenProvider,
+    task_log_mode: OpenShellTaskLogMode,
     bridge_image: Option<String>,
     bridge_gateway_origin: Option<String>,
 }
@@ -906,6 +1096,7 @@ impl OpenShellRuntime {
         let runtime = Self {
             channel,
             token_provider,
+            task_log_mode: config.task_log_mode,
             bridge_image: config.bridge_image,
             bridge_gateway_origin: config.bridge_gateway_origin,
         };
@@ -925,6 +1116,38 @@ impl OpenShellRuntime {
             self.channel.clone(),
             interceptor,
         ))
+    }
+
+    async fn exec_task_process(
+        &self,
+        sandbox_id: &str,
+        command: &[String],
+        environment: HashMap<String, String>,
+        context: TaskProcessLogContext<'_>,
+    ) -> Result<TaskProcessResult, PortError> {
+        let mut client = self.authenticated_client().await?.raw_grpc();
+        let response = client
+            .exec_sandbox(ExecSandboxRequest {
+                sandbox_id: sandbox_id.to_owned(),
+                command: command.to_vec(),
+                workdir: "/sandbox/steward-input".to_owned(),
+                environment,
+                timeout_seconds: 30 * 60,
+                stdin: Vec::new(),
+                tty: false,
+                cols: 0,
+                rows: 0,
+            })
+            .await
+            .map_err(raw_port_failure)?;
+        let mut stream = response.into_inner();
+        collect_task_process_stream(
+            &mut stream,
+            self.task_log_mode,
+            context,
+            &mut ControllerTaskProcessLogSink,
+        )
+        .await
     }
 
     async fn stage_input_archive(
@@ -1554,21 +1777,17 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             environment.insert("STEWARD_MCP_GW_ORIGIN".to_owned(), origin.to_owned());
         }
         let executed = self
-            .authenticated_client()
-            .await?
-            .workspace(workspace)
-            .exec(
-                sandbox,
+            .exec_task_process(
+                &snapshot.id,
                 &request.command,
-                ExecOptions {
-                    workdir: Some("/sandbox/steward-input".to_owned()),
-                    environment,
-                    timeout: Some(StdDuration::from_secs(30 * 60)),
-                    ..ExecOptions::default()
+                environment,
+                TaskProcessLogContext {
+                    runtime_uid: &request.runtime.0,
+                    workspace,
+                    sandbox,
                 },
             )
-            .await
-            .map_err(port_failure)?;
+            .await?;
         if executed.exit_code != 0 {
             let category = task_agent_failure_category(&executed.stderr);
             return Err(PortError::Failed {
@@ -1657,7 +1876,7 @@ mod tests {
     #[cfg(feature = "identity")]
     use std::collections::BTreeMap;
     #[cfg(feature = "runtime")]
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     #[cfg(feature = "runtime")]
     use std::future::Future;
     #[cfg(feature = "runtime")]
@@ -1683,13 +1902,15 @@ mod tests {
     use openshell_sdk::raw::proto::datamodel::v1::ObjectMeta;
     #[cfg(feature = "runtime")]
     use openshell_sdk::raw::proto::{
+        ExecSandboxEvent, ExecSandboxExit, ExecSandboxStderr, ExecSandboxStdout,
         Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase, SandboxSpec as RawSandboxSpec,
         SandboxStatus as RawSandboxStatus, SandboxTemplate as RawSandboxTemplate,
+        exec_sandbox_event,
     };
     #[cfg(feature = "runtime")]
     use reqwest::{Client as HttpClient, Url};
     #[cfg(feature = "runtime")]
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, mpsc as tokio_mpsc};
 
     #[cfg(feature = "runtime")]
     use steward_ports::PortError;
@@ -1704,17 +1925,107 @@ mod tests {
     use super::validate_connections_bridge_archive;
     #[cfg(feature = "runtime")]
     use super::{
-        CONNECTIONS_BRIDGE_AGENT_TYPE, OpenShellConnectionConfig, ProviderReconciliation,
-        STAGING_EXEC_STDIN_CHUNK_BYTES, SandboxDeleteClient, WorkloadExchangeTokenProvider,
-        delete_owned_sandbox, deletion_names, load_source_credential, output_archive_command,
-        project_request, provider_reconciliation, sandbox_spec, staging_append_command,
-        staging_archive_chunks, staging_extract_command, staging_prepare_command,
-        task_agent_failure_category, validate_raw_sandbox_binding,
-        validate_workload_exchange_endpoint,
+        CONNECTIONS_BRIDGE_AGENT_TYPE, OpenShellConnectionConfig, OpenShellTaskLogMode,
+        ProviderReconciliation, STAGING_EXEC_STDIN_CHUNK_BYTES, SandboxDeleteClient,
+        TaskProcessEventStream, TaskProcessLogContext, TaskProcessLogSink, TaskProcessStream,
+        WorkloadExchangeTokenProvider, collect_task_process_stream, delete_owned_sandbox,
+        deletion_names, load_source_credential, output_archive_command, project_request,
+        provider_reconciliation, sandbox_spec, staging_append_command, staging_archive_chunks,
+        staging_extract_command, staging_prepare_command, task_agent_failure_category,
+        task_process_log_record, validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
     };
     #[cfg(feature = "identity")]
     use super::{IdentityResolutionError, SANDBOX_ID_LABEL, binding_from_sandbox};
     use super::{NameKind, stable_name};
+
+    #[cfg(feature = "runtime")]
+    struct QueuedTaskProcessEventStream {
+        events: VecDeque<Result<ExecSandboxEvent, PortError>>,
+    }
+
+    #[cfg(feature = "runtime")]
+    impl TaskProcessEventStream for QueuedTaskProcessEventStream {
+        async fn next_event(&mut self) -> Result<Option<ExecSandboxEvent>, PortError> {
+            self.events.pop_front().transpose()
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    struct ChannelTaskProcessEventStream {
+        events: tokio_mpsc::UnboundedReceiver<Result<ExecSandboxEvent, PortError>>,
+    }
+
+    #[cfg(feature = "runtime")]
+    impl TaskProcessEventStream for ChannelTaskProcessEventStream {
+        async fn next_event(&mut self) -> Result<Option<ExecSandboxEvent>, PortError> {
+            self.events.recv().await.transpose()
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[derive(Default)]
+    struct RecordingTaskProcessLogSink {
+        records: Vec<String>,
+    }
+
+    #[cfg(feature = "runtime")]
+    impl TaskProcessLogSink for RecordingTaskProcessLogSink {
+        fn emit(
+            &mut self,
+            context: TaskProcessLogContext<'_>,
+            stream: TaskProcessStream,
+            message: &[u8],
+        ) {
+            self.records
+                .push(task_process_log_record(context, stream, message));
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    struct ChannelTaskProcessLogSink {
+        records: tokio_mpsc::UnboundedSender<String>,
+    }
+
+    #[cfg(feature = "runtime")]
+    impl TaskProcessLogSink for ChannelTaskProcessLogSink {
+        fn emit(
+            &mut self,
+            context: TaskProcessLogContext<'_>,
+            stream: TaskProcessStream,
+            message: &[u8],
+        ) {
+            let _ = self
+                .records
+                .send(task_process_log_record(context, stream, message));
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    fn stdout_event(message: &[u8]) -> ExecSandboxEvent {
+        ExecSandboxEvent {
+            payload: Some(exec_sandbox_event::Payload::Stdout(ExecSandboxStdout {
+                data: message.to_vec(),
+            })),
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    fn stderr_event(message: &[u8]) -> ExecSandboxEvent {
+        ExecSandboxEvent {
+            payload: Some(exec_sandbox_event::Payload::Stderr(ExecSandboxStderr {
+                data: message.to_vec(),
+            })),
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    fn exit_event(exit_code: i32) -> ExecSandboxEvent {
+        ExecSandboxEvent {
+            payload: Some(exec_sandbox_event::Payload::Exit(ExecSandboxExit {
+                exit_code,
+            })),
+        }
+    }
 
     #[cfg(feature = "runtime")]
     struct MockExchange {
@@ -1851,9 +2162,213 @@ mod tests {
             workload_source_credential_file: PathBuf::from("/run/workload/source-credential"),
             server_name: "gateway.example.test".to_owned(),
             runtime_class_name: "kata-qemu".to_owned(),
+            task_log_mode: super::OpenShellTaskLogMode::Off,
             bridge_image: None,
             bridge_gateway_origin: None,
         }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn full_task_logging_forwards_stdout_and_stderr_before_exit() -> Result<(), String> {
+        let (event_sender, event_receiver) = tokio_mpsc::unbounded_channel();
+        let (record_sender, mut record_receiver) = tokio_mpsc::unbounded_channel();
+        let collection = tokio::spawn(async move {
+            let mut stream = ChannelTaskProcessEventStream {
+                events: event_receiver,
+            };
+            let mut log_sink = ChannelTaskProcessLogSink {
+                records: record_sender,
+            };
+            collect_task_process_stream(
+                &mut stream,
+                OpenShellTaskLogMode::Full,
+                TaskProcessLogContext {
+                    runtime_uid: "runtime-123",
+                    workspace: "workspace-a",
+                    sandbox: "sandbox-a",
+                },
+                &mut log_sink,
+            )
+            .await
+        });
+
+        event_sender
+            .send(Ok(stdout_event(b"reasoning\n")))
+            .map_err(|_| "live task stream closed before stdout".to_owned())?;
+        let stdout_record =
+            tokio::time::timeout(Duration::from_millis(250), record_receiver.recv())
+                .await
+                .map_err(|_| "stdout was buffered instead of logged live".to_owned())?
+                .ok_or_else(|| "task logger closed before stdout".to_owned())?;
+        assert_eq!(
+            stdout_record,
+            "openshell_task_process runtime_uid=\"runtime-123\" workspace=\"workspace-a\" sandbox=\"sandbox-a\" stream=stdout message=\"reasoning\\n\""
+        );
+
+        event_sender
+            .send(Ok(stderr_event(&[b'e', 0xff, b'\n'])))
+            .map_err(|_| "live task stream closed before stderr".to_owned())?;
+        let stderr_record =
+            tokio::time::timeout(Duration::from_millis(250), record_receiver.recv())
+                .await
+                .map_err(|_| "stderr was buffered instead of logged live".to_owned())?
+                .ok_or_else(|| "task logger closed before stderr".to_owned())?;
+        assert_eq!(
+            stderr_record,
+            "openshell_task_process runtime_uid=\"runtime-123\" workspace=\"workspace-a\" sandbox=\"sandbox-a\" stream=stderr message=\"e\\xff\\n\""
+        );
+
+        event_sender
+            .send(Ok(exit_event(0)))
+            .map_err(|_| "live task stream closed before exit".to_owned())?;
+        drop(event_sender);
+        let result = tokio::time::timeout(Duration::from_secs(1), collection)
+            .await
+            .map_err(|_| "task stream did not finish after exit".to_owned())?
+            .map_err(|error| format!("task stream collector failed to join: {error}"))?
+            .map_err(|error| format!("task stream collector failed: {error:?}"))?;
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, b"reasoning\n");
+        assert_eq!(result.stderr, [b'e', 0xff, b'\n']);
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn off_task_logging_preserves_output_without_emitting_records() -> Result<(), String> {
+        let mut stream = QueuedTaskProcessEventStream {
+            events: VecDeque::from([
+                Ok(stdout_event(b"collected stdout")),
+                Ok(stderr_event(b"collected stderr")),
+                Ok(exit_event(0)),
+            ]),
+        };
+        let mut log_sink = RecordingTaskProcessLogSink::default();
+        let result = collect_task_process_stream(
+            &mut stream,
+            OpenShellTaskLogMode::Off,
+            TaskProcessLogContext {
+                runtime_uid: "runtime-123",
+                workspace: "workspace-a",
+                sandbox: "sandbox-a",
+            },
+            &mut log_sink,
+        )
+        .await
+        .map_err(|error| format!("task stream collector failed: {error:?}"))?;
+
+        assert!(
+            log_sink.records.is_empty(),
+            "off mode must not mirror task-process output"
+        );
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, b"collected stdout");
+        assert_eq!(result.stderr, b"collected stderr");
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn streamed_nonzero_exit_retains_stderr_failure_classification() -> Result<(), String> {
+        let mut stream = QueuedTaskProcessEventStream {
+            events: VecDeque::from([
+                Ok(stderr_event(b"provider returned unauthorized status 401")),
+                Ok(exit_event(17)),
+            ]),
+        };
+        let mut log_sink = RecordingTaskProcessLogSink::default();
+        let result = collect_task_process_stream(
+            &mut stream,
+            OpenShellTaskLogMode::Full,
+            TaskProcessLogContext {
+                runtime_uid: "runtime-123",
+                workspace: "workspace-a",
+                sandbox: "sandbox-a",
+            },
+            &mut log_sink,
+        )
+        .await
+        .map_err(|error| format!("task stream collector failed: {error:?}"))?;
+
+        assert_eq!(result.exit_code, 17);
+        assert_eq!(
+            task_agent_failure_category(&result.stderr),
+            "authentication"
+        );
+        assert_eq!(log_sink.records.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn task_stream_timeout_drops_the_pending_stream() -> Result<(), String> {
+        let (event_sender, event_receiver) = tokio_mpsc::unbounded_channel();
+        let timed = tokio::time::timeout(Duration::from_millis(25), async move {
+            let mut stream = ChannelTaskProcessEventStream {
+                events: event_receiver,
+            };
+            let mut log_sink = RecordingTaskProcessLogSink::default();
+            collect_task_process_stream(
+                &mut stream,
+                OpenShellTaskLogMode::Full,
+                TaskProcessLogContext {
+                    runtime_uid: "runtime-123",
+                    workspace: "workspace-a",
+                    sandbox: "sandbox-a",
+                },
+                &mut log_sink,
+            )
+            .await
+        })
+        .await;
+
+        assert!(
+            timed.is_err(),
+            "a silent task stream must reach its deadline"
+        );
+        assert!(
+            event_sender.is_closed(),
+            "timing out task collection must drop the pending stream"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn task_stream_cancellation_drops_the_pending_stream() -> Result<(), String> {
+        let (event_sender, event_receiver) = tokio_mpsc::unbounded_channel();
+        let collection = tokio::spawn(async move {
+            let mut stream = ChannelTaskProcessEventStream {
+                events: event_receiver,
+            };
+            let mut log_sink = RecordingTaskProcessLogSink::default();
+            collect_task_process_stream(
+                &mut stream,
+                OpenShellTaskLogMode::Full,
+                TaskProcessLogContext {
+                    runtime_uid: "runtime-123",
+                    workspace: "workspace-a",
+                    sandbox: "sandbox-a",
+                },
+                &mut log_sink,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        collection.abort();
+        let cancelled = tokio::time::timeout(Duration::from_millis(250), collection)
+            .await
+            .map_err(|_| "cancelled task stream did not stop".to_owned())?;
+        assert!(
+            matches!(cancelled, Err(ref error) if error.is_cancelled()),
+            "the task stream collector must honor cancellation"
+        );
+        assert!(
+            event_sender.is_closed(),
+            "cancelling task collection must drop the pending stream"
+        );
+        Ok(())
     }
 
     #[cfg(feature = "runtime")]

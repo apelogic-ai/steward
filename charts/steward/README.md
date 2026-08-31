@@ -181,6 +181,10 @@ that allowlist remain inaccessible to both service accounts.
   `defaultRuntimeClassName`. Steward does not send a sandbox image or expose
   per-create driver/runtime overrides, so the gateway's configured image and
   runtime policy remain authoritative.
+- `config.controller.openshellTaskLogMode` defaults to `off`. Set it to `full`
+  to mirror task-process stdout and stderr into controller logs while the task
+  runs; each record includes `runtime_uid`, `workspace`, `sandbox`, `stream`,
+  and `message`.
 - `config.mint.issuer` is the issuer that must also be configured in MCP-GW.
   Steward publishes JWKS at `<issuer>/.well-known/jwks.json` and uses EdDSA.
 - `config.mint.audience` defaults to `steward-mcp` and

@@ -5,7 +5,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use steward_adapter_openshell::{OpenShellConnectionConfig, OpenShellRuntime};
+use steward_adapter_openshell::{
+    OpenShellConnectionConfig, OpenShellRuntime, OpenShellTaskLogMode,
+};
 use steward_ports::{
     SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskRequest, SandboxTaskRuntime,
 };
@@ -41,6 +43,7 @@ fn valid_config() -> Result<OpenShellConnectionConfig, String> {
         workload_source_credential_file: required_path("STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE")?,
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
         runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
+        task_log_mode: OpenShellTaskLogMode::Off,
         bridge_image: None,
         bridge_gateway_origin: None,
     })

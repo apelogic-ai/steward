@@ -656,6 +656,7 @@ grep -q 'failurePolicy: Fail' "${rendered}"
 grep -q 'driver: csi.spiffe.io' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_SERVER_NAME' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME' "${rendered}"
+grep -Eq 'name: STEWARD_OPENSHELL_TASK_LOG_MODE, value: "?off"?' "${rendered}"
 grep -Eq 'value: "?openshell-runc"?' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE' "${rendered}"
@@ -683,6 +684,14 @@ if helm lint "${root}/charts/steward" "${legacy_runtime_values[@]}" \
   --set-string config.controller.openshellRuntimeClassName=invalid/runtime >/dev/null 2>&1
 then
   echo "an invalid Kubernetes RuntimeClass name must fail chart validation" >&2
+  exit 1
+fi
+helm lint "${root}/charts/steward" "${image_values[@]}" \
+  --set-string config.controller.openshellTaskLogMode=full >/dev/null
+if helm lint "${root}/charts/steward" "${image_values[@]}" \
+  --set-string config.controller.openshellTaskLogMode=verbose >/dev/null 2>&1
+then
+  echo "an invalid OpenShell task log mode must fail chart validation" >&2
   exit 1
 fi
 test "$(grep -c 'secretName: steward-openshell-client' "${rendered}")" -eq 1
