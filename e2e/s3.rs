@@ -5,6 +5,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use sqlx::postgres::PgPoolOptions;
+use steward_admission::AdmissionDelta;
+use steward_store::PgStore;
+
 const NAMESPACE: &str = "team-a";
 const RUNTIME_NAME: &str = "runtime-a";
 const COUNTEREXAMPLE: &str =
@@ -170,8 +174,8 @@ impl Drop for Harness {
     }
 }
 
-#[test]
-fn e2e_s3_composed_edits_rejected() -> Result<(), Box<dyn Error>> {
+#[tokio::test]
+async fn e2e_s3_composed_edits_rejected() -> Result<(), Box<dyn Error>> {
     let harness = Harness::from_environment()?;
     harness.kubectl_ok(&["create", "namespace", NAMESPACE])?;
 
@@ -296,26 +300,27 @@ fn e2e_s3_composed_edits_rejected() -> Result<(), Box<dyn Error>> {
         "kubectl denial must contain the API's exact counterexample: {kubectl_message}"
     );
 
-    let (queue_status, queue) = harness.curl(
-        "GET",
-        "/admin/approvals",
-        None,
-        "approval-queue.html",
-        Caller::Admin,
-    )?;
-    assert_eq!(queue_status, 200);
-    for expected in [
-        runtime_uid.as_str(),
-        "engineer",
-        "alice@example.com",
-        "requested 220.00 USD",
-        "ceiling 200.00 USD",
-    ] {
-        assert!(
-            queue.contains(expected),
-            "approval queue must render {expected:?} from the parked row"
-        );
-    }
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&env::var("STEWARD_TEST_DATABASE_URL")?)
+        .await?;
+    let store = PgStore::new(pool);
+    let queue = store.pending_approvals().await?;
+    let pending = queue
+        .iter()
+        .find(|approval| approval.runtime_uid == runtime_uid)
+        .ok_or_else(|| io::Error::other("parked runtime is missing from the approval queue"))?;
+    assert_eq!(pending.member_role, "engineer");
+    assert_eq!(pending.actor, "alice@example.com");
+    assert_eq!(pending.proposed_spec.budget.monthly_limit, "220.00");
+    assert_eq!(
+        pending.deltas,
+        vec![AdmissionDelta::Budget {
+            requested: "220.00".to_owned(),
+            ceiling: "200.00".to_owned(),
+            currency: "USD".to_owned(),
+        }]
+    );
     Ok(())
 }
 

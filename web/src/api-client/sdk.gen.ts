@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { AgentRunContractData, AgentRunContractErrors, AgentRunContractResponses, AgentRunsContractData, AgentRunsContractErrors, AgentRunsContractResponses, AgentRunTimelineContractData, AgentRunTimelineContractErrors, AgentRunTimelineContractResponses, AllRunData, AllRunErrors, AllRunResponses, AllRunsData, AllRunsErrors, AllRunsResponses, AllRunTimelineData, AllRunTimelineErrors, AllRunTimelineResponses, ApproveAdminApprovalData, ApproveAdminApprovalErrors, ApproveAdminApprovalResponses, AuthorAdminEnvelopeTemplateData, AuthorAdminEnvelopeTemplateErrors, AuthorAdminEnvelopeTemplateResponses, BudgetIncreaseContractData, BudgetIncreaseContractErrors, BudgetIncreaseContractResponses, ConnectionStatusData, ConnectionStatusErrors, ConnectionStatusResponses, CreateRequestData, CreateRequestErrors, CreateRequestResponses, CreateRuntimeContractData, CreateRuntimeContractErrors, CreateRuntimeContractResponses, DisconnectConnectionData, DisconnectConnectionErrors, DisconnectConnectionResponses, FileAdminApprovalDecisionData, FileAdminApprovalDecisionErrors, FileAdminApprovalDecisionResponses, GetAdminEnvelopeTemplateData, GetAdminEnvelopeTemplateErrors, GetAdminEnvelopeTemplateResponses, GetAdminWorkflowVersionData, GetAdminWorkflowVersionErrors, GetAdminWorkflowVersionResponses, GetRequestData, GetRequestErrors, GetRequestResponses, ListAdminApprovalsData, ListAdminApprovalsErrors, ListAdminApprovalsResponses, ListAdminEnvelopeTemplatesData, ListAdminEnvelopeTemplatesErrors, ListAdminEnvelopeTemplatesResponses, ListAdminWorkflowsData, ListAdminWorkflowsErrors, ListAdminWorkflowsResponses, ListPublishedWorkflowsData, ListPublishedWorkflowsErrors, ListPublishedWorkflowsResponses, ListRequestsData, ListRequestsErrors, ListRequestsResponses, ListTemplatesData, ListTemplatesErrors, ListTemplatesResponses, MyRunData, MyRunErrors, MyRunResponses, MyRunsData, MyRunsErrors, MyRunsResponses, MyRunTimelineData, MyRunTimelineErrors, MyRunTimelineResponses, PublishAdminWorkflowData, PublishAdminWorkflowErrors, PublishAdminWorkflowResponses, PublishAdminWorkflowVersionData, PublishAdminWorkflowVersionErrors, PublishAdminWorkflowVersionResponses, RenderGithubActionsForEnvelopeData, RenderGithubActionsForEnvelopeErrors, RenderGithubActionsForEnvelopeResponses, SessionData, SessionErrors, SessionResponses, StartConnectionData, StartConnectionErrors, StartConnectionResponses, TaskDeleteContractData, TaskDeleteContractErrors, TaskDeleteContractResponses, TaskExecuteContractData, TaskExecuteContractErrors, TaskExecuteContractResponses, TaskInputsContractData, TaskInputsContractErrors, TaskInputsContractResponses, TaskOutputsContractData, TaskOutputsContractErrors, TaskOutputsContractResponses, TaskStatusContractData, TaskStatusContractErrors, TaskStatusContractResponses, TaskSubmissionContractData, TaskSubmissionContractErrors, TaskSubmissionContractResponses } from './types.gen';
+import type { AgentRunContractData, AgentRunContractErrors, AgentRunContractResponses, AgentRunsContractData, AgentRunsContractErrors, AgentRunsContractResponses, AgentRunTimelineContractData, AgentRunTimelineContractErrors, AgentRunTimelineContractResponses, AllRunData, AllRunErrors, AllRunResponses, AllRunsData, AllRunsErrors, AllRunsResponses, AllRunTimelineData, AllRunTimelineErrors, AllRunTimelineResponses, ApproveAdminApprovalData, ApproveAdminApprovalErrors, ApproveAdminApprovalResponses, ApproveAdminEnvelopeRequestData, ApproveAdminEnvelopeRequestErrors, ApproveAdminEnvelopeRequestResponses, AuthorAdminEnvelopeTemplateData, AuthorAdminEnvelopeTemplateErrors, AuthorAdminEnvelopeTemplateResponses, BudgetIncreaseContractData, BudgetIncreaseContractErrors, BudgetIncreaseContractResponses, ConnectionStatusData, ConnectionStatusErrors, ConnectionStatusResponses, CreateRequestData, CreateRequestErrors, CreateRequestResponses, CreateRuntimeContractData, CreateRuntimeContractErrors, CreateRuntimeContractResponses, DisconnectConnectionData, DisconnectConnectionErrors, DisconnectConnectionResponses, FileAdminApprovalDecisionData, FileAdminApprovalDecisionErrors, FileAdminApprovalDecisionResponses, GetAdminEnvelopeTemplateData, GetAdminEnvelopeTemplateErrors, GetAdminEnvelopeTemplateResponses, GetAdminWorkflowVersionData, GetAdminWorkflowVersionErrors, GetAdminWorkflowVersionResponses, GetRequestData, GetRequestErrors, GetRequestResponses, ListAdminApprovalsData, ListAdminApprovalsErrors, ListAdminApprovalsResponses, ListAdminEnvelopeTemplatesData, ListAdminEnvelopeTemplatesErrors, ListAdminEnvelopeTemplatesResponses, ListAdminWorkflowsData, ListAdminWorkflowsErrors, ListAdminWorkflowsResponses, ListPublishedWorkflowsData, ListPublishedWorkflowsErrors, ListPublishedWorkflowsResponses, ListRequestsData, ListRequestsErrors, ListRequestsResponses, ListTemplatesData, ListTemplatesErrors, ListTemplatesResponses, MyRunData, MyRunErrors, MyRunResponses, MyRunsData, MyRunsErrors, MyRunsResponses, MyRunTimelineData, MyRunTimelineErrors, MyRunTimelineResponses, PublishAdminWorkflowData, PublishAdminWorkflowErrors, PublishAdminWorkflowResponses, PublishAdminWorkflowVersionData, PublishAdminWorkflowVersionErrors, PublishAdminWorkflowVersionResponses, RejectAdminEnvelopeRequestData, RejectAdminEnvelopeRequestErrors, RejectAdminEnvelopeRequestResponses, RenderGithubActionsForEnvelopeData, RenderGithubActionsForEnvelopeErrors, RenderGithubActionsForEnvelopeResponses, SessionData, SessionErrors, SessionResponses, StartConnectionData, StartConnectionErrors, StartConnectionResponses, TaskDeleteContractData, TaskDeleteContractErrors, TaskDeleteContractResponses, TaskExecuteContractData, TaskExecuteContractErrors, TaskExecuteContractResponses, TaskInputsContractData, TaskInputsContractErrors, TaskInputsContractResponses, TaskOutputsContractData, TaskOutputsContractErrors, TaskOutputsContractResponses, TaskStatusContractData, TaskStatusContractErrors, TaskStatusContractResponses, TaskSubmissionContractData, TaskSubmissionContractErrors, TaskSubmissionContractResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -117,6 +117,34 @@ export const startConnection = <ThrowOnError extends boolean = false>(options: O
             type: 'apiKey'
         }],
     url: '/admin/api/v1/connections/github/start',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const approveAdminEnvelopeRequest = <ThrowOnError extends boolean = false>(options: Options<ApproveAdminEnvelopeRequestData, ThrowOnError>): RequestResult<ApproveAdminEnvelopeRequestResponses, ApproveAdminEnvelopeRequestErrors, ThrowOnError> => (options.client ?? client).post<ApproveAdminEnvelopeRequestResponses, ApproveAdminEnvelopeRequestErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: '__Host-steward-session',
+            type: 'apiKey'
+        }],
+    url: '/admin/api/v1/envelope-requests/{request_id}/approve',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+export const rejectAdminEnvelopeRequest = <ThrowOnError extends boolean = false>(options: Options<RejectAdminEnvelopeRequestData, ThrowOnError>): RequestResult<RejectAdminEnvelopeRequestResponses, RejectAdminEnvelopeRequestErrors, ThrowOnError> => (options.client ?? client).post<RejectAdminEnvelopeRequestResponses, RejectAdminEnvelopeRequestErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: '__Host-steward-session',
+            type: 'apiKey'
+        }],
+    url: '/admin/api/v1/envelope-requests/{request_id}/reject',
     ...options,
     headers: {
         'Content-Type': 'application/json',

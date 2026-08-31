@@ -5,9 +5,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::postgres::PgPoolOptions;
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
+use steward_store::{
+    EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
+    StoreError,
+};
 use steward_store::{ParkRejection, PgStore, WorkflowPublication};
 use steward_types::{
-    AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal, RunnerRequirements,
+    AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, OrganizationId,
+    OrganizationIdentityPolicy, Principal, RunnerRequirements,
 };
 
 #[tokio::test]
@@ -291,5 +296,200 @@ async fn s3_postgres_keeps_envelopes_immutable_and_parks_exact_rejections()
     assert_eq!(row.proposed_spec, proposed_spec);
     assert_eq!(row.actor, "alice@example.com");
     assert_eq!(row.member_role, member_role);
+    Ok(())
+}
+
+#[tokio::test]
+async fn envelope_requests_are_idempotent_audited_and_bound_to_the_exact_template_revision()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the S3 Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let member_role = format!("analyst-{suffix}");
+    let email = Email::parse(format!("envelope-{suffix}@example.com"))?;
+    let subject = format!("envelope-subject-{suffix}");
+    let identity = OrganizationIdentityPolicy::new(
+        "https://accounts.google.com",
+        "example.com",
+        OrganizationId::parse("org_example")?,
+    )?
+    .validate(
+        "https://accounts.google.com",
+        &subject,
+        "example.com",
+        email.as_str(),
+        true,
+    )?;
+    let principal = store
+        .register_canonical_identity(&identity, "identity-admin")
+        .await?;
+    let template = Envelope {
+        revision: 1,
+        spec: EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "provider-a".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: "200.00".to_owned(),
+                single_run_limit: None,
+                currency: "USD".to_owned(),
+            },
+            ttl: Duration("24h".to_owned()),
+            runner: RunnerRequirements::default(),
+        },
+    };
+    store
+        .insert_envelope(&member_role, &template, "admin@example.com")
+        .await?;
+
+    let idempotency_key = format!("envelope-request-{suffix}");
+    let reservation = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &principal.user_id,
+            template_id: &member_role,
+            template_revision: template.revision,
+            requested_envelope: &template,
+            idempotency_key: &idempotency_key,
+            actor: principal.user_id.as_str(),
+        })
+        .await?;
+    assert!(reservation.inserted);
+    assert_eq!(reservation.record.status, EnvelopeRequestStatus::Pending);
+    assert_eq!(reservation.record.status_actor, principal.user_id.as_str());
+    assert_eq!(
+        reservation.record.status_template_revision,
+        template.revision
+    );
+
+    let repeated = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &principal.user_id,
+            template_id: &member_role,
+            template_revision: template.revision,
+            requested_envelope: &template,
+            idempotency_key: &idempotency_key,
+            actor: principal.user_id.as_str(),
+        })
+        .await?;
+    assert!(!repeated.inserted);
+    assert_eq!(repeated.record.id, reservation.record.id);
+
+    let instance_id = format!("env_{suffix}");
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let approval_id = "00000000-0000-0000-0000-000000000031".parse()?;
+    let provisioned = store
+        .append_envelope_request_status(
+            reservation.record.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: Some(approval_id),
+                envelope_instance_id: Some(&instance_id),
+                envelope_digest: Some(&digest),
+                reason: None,
+                approved_envelope: Some(&template),
+                actor: "usr_abcdef0123456789abcdef0123456789",
+            },
+        )
+        .await?;
+    assert_eq!(provisioned.status, EnvelopeRequestStatus::Provisioned);
+    assert_eq!(provisioned.approved_envelope, Some(template.clone()));
+    assert_eq!(
+        provisioned.envelope_instance_id.as_deref(),
+        Some(instance_id.as_str())
+    );
+    assert_eq!(
+        provisioned.status_actor,
+        "usr_abcdef0123456789abcdef0123456789"
+    );
+    assert_eq!(provisioned.status_template_revision, template.revision);
+
+    let next_template = Envelope {
+        revision: 2,
+        ..template.clone()
+    };
+    store
+        .insert_envelope(&member_role, &next_template, "admin@example.com")
+        .await?;
+    let repeated_after_revision = store
+        .append_envelope_request_status(
+            reservation.record.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: Some(approval_id),
+                envelope_instance_id: Some(&instance_id),
+                envelope_digest: Some(&digest),
+                reason: None,
+                approved_envelope: Some(&template),
+                actor: "usr_abcdef0123456789abcdef0123456789",
+            },
+        )
+        .await?;
+    assert_eq!(repeated_after_revision, provisioned);
+
+    let stale_key = format!("stale-envelope-request-{suffix}");
+    let stale = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &principal.user_id,
+            template_id: &member_role,
+            template_revision: template.revision,
+            requested_envelope: &template,
+            idempotency_key: &stale_key,
+            actor: principal.user_id.as_str(),
+        })
+        .await?;
+    assert_eq!(
+        store
+            .append_envelope_request_status(
+                stale.record.id,
+                EnvelopeRequestStatusUpdate {
+                    from: EnvelopeRequestStatus::Pending,
+                    to: EnvelopeRequestStatus::Provisioned,
+                    approval_id: Some("00000000-0000-0000-0000-000000000032".parse()?),
+                    envelope_instance_id: Some("env_stale"),
+                    envelope_digest: Some(&digest),
+                    reason: None,
+                    approved_envelope: Some(&template),
+                    actor: "usr_abcdef0123456789abcdef0123456789",
+                },
+            )
+            .await,
+        Err(StoreError::EnvelopeRequestTemplateStale)
+    );
+
+    let request_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM envelope_requests WHERE owner_user_id = $1 AND idempotency_key = $2",
+    )
+    .bind(principal.user_id.as_str())
+    .bind(&idempotency_key)
+    .fetch_one(store.pool())
+    .await?;
+    let event_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM envelope_request_events WHERE request_id = $1")
+            .bind(reservation.record.id)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(
+        request_count, 1,
+        "request retries must reserve one immutable request"
+    );
+    assert_eq!(
+        event_count, 2,
+        "one request and one decision must append two audit events"
+    );
     Ok(())
 }

@@ -9,10 +9,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use steward_admission::{AdmissionDecision, Envelope, evaluate, validate_envelope};
 use steward_store::{
-    EnvelopeRequestRecord, EnvelopeRequestReservationRequest, PgStore, StoreError,
-    WorkflowRevisionRecord,
+    EnvelopeRequestRecord, EnvelopeRequestReservationRequest, EnvelopeRequestStatusUpdate, PgStore,
+    StoreError, WorkflowRevisionRecord,
 };
 use steward_types::{
     AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email, ModelRef, Principal,
@@ -97,6 +98,8 @@ pub struct UserEnvelopeRequest {
     pub envelope_instance_id: Option<String>,
     pub envelope_digest: Option<String>,
     pub reason: Option<String>,
+    pub status_actor: String,
+    pub status_template_revision: i64,
     pub created_at: String,
     pub status_at: String,
 }
@@ -220,7 +223,7 @@ pub(crate) struct PublishedWorkflowsResponse {
 }
 
 /// Submission passed only after the HTTP boundary has derived its canonical owner, required an
-/// exact template revision, verified the hard ceiling, and decided the auto-provision threshold.
+/// exact template revision and decided whether it is within the automatic-provisioning boundary.
 pub struct ValidatedEnvelopeRequest<'a> {
     pub template: &'a AvailableEnvelopeTemplate,
     pub requested_envelope: &'a Envelope,
@@ -238,8 +241,8 @@ pub enum EnvelopeRequestBrokerError {
 /// Production request broker backed by the authoritative envelope and request ledgers.
 ///
 /// A template becomes visible only through a local-RBAC member-role assignment. Its current
-/// envelope is the hard ceiling. Automatic provisioning remains absent until an independently
-/// persisted threshold and reconciler are supplied; this broker never infers either one.
+/// envelope is the hard ceiling and the automatic-provisioning boundary. Requests outside that
+/// exact revision remain pending for an explicit administrator decision.
 #[derive(Clone)]
 pub struct PgEnvelopeRequestBroker {
     store: PgStore,
@@ -269,8 +272,8 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                         id: member_role.clone(),
                         display_name: member_role.clone(),
                         revision: ceiling.revision,
+                        auto_provision_threshold: Some(ceiling.clone()),
                         ceiling,
-                        auto_provision_threshold: None,
                     });
                 }
             }
@@ -309,8 +312,8 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                 id: template_id.to_owned(),
                 display_name: template_id.to_owned(),
                 revision,
+                auto_provision_threshold: Some(ceiling.clone()),
                 ceiling,
-                auto_provision_threshold: None,
             }))
         })
     }
@@ -356,10 +359,34 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                     template_revision: request.template.revision,
                     requested_envelope: request.requested_envelope,
                     idempotency_key: request.idempotency_key,
+                    actor: session.subject.canonical_user_id.as_str(),
                 })
                 .await
                 .map_err(map_store_broker_error)?;
-            Ok(user_envelope_request(reservation.record))
+            if !request.auto_provision {
+                return Ok(user_envelope_request(reservation.record));
+            }
+            let instance_id = envelope_instance_id(reservation.record.id);
+            let digest = envelope_content_digest(request.requested_envelope)
+                .map_err(|_| EnvelopeRequestBrokerError::Unavailable)?;
+            let provisioned = self
+                .store
+                .append_envelope_request_status(
+                    reservation.record.id,
+                    EnvelopeRequestStatusUpdate {
+                        from: steward_store::EnvelopeRequestStatus::Pending,
+                        to: steward_store::EnvelopeRequestStatus::Provisioned,
+                        approval_id: None,
+                        envelope_instance_id: Some(&instance_id),
+                        envelope_digest: Some(&digest),
+                        reason: None,
+                        approved_envelope: Some(request.requested_envelope),
+                        actor: session.subject.canonical_user_id.as_str(),
+                    },
+                )
+                .await
+                .map_err(map_store_broker_error)?;
+            Ok(user_envelope_request(provisioned))
         })
     }
 
@@ -409,6 +436,8 @@ fn user_envelope_request(record: EnvelopeRequestRecord) -> UserEnvelopeRequest {
         envelope_instance_id: record.envelope_instance_id,
         envelope_digest: record.envelope_digest,
         reason: record.reason,
+        status_actor: record.status_actor,
+        status_template_revision: record.status_template_revision,
         created_at: record.created_at,
         status_at: record.status_at,
     }
@@ -417,11 +446,21 @@ fn user_envelope_request(record: EnvelopeRequestRecord) -> UserEnvelopeRequest {
 fn map_store_broker_error(error: StoreError) -> EnvelopeRequestBrokerError {
     match error {
         StoreError::EnvelopeRequestNotFound => EnvelopeRequestBrokerError::NotFound,
+        StoreError::EnvelopeRequestTemplateStale => EnvelopeRequestBrokerError::Conflict,
         StoreError::EnvelopeRequestIdempotencyConflict
         | StoreError::InvalidEnvelopeRequest
         | StoreError::InvalidEnvelopeRequestTransition => EnvelopeRequestBrokerError::Conflict,
         _ => EnvelopeRequestBrokerError::Unavailable,
     }
+}
+
+pub(crate) fn envelope_instance_id(request_id: Uuid) -> String {
+    format!("env_{}", request_id.simple())
+}
+
+pub(crate) fn envelope_content_digest(envelope: &Envelope) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(envelope)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
 /// Server-side request broker. Every method receives the canonical browser subject derived by
@@ -680,7 +719,7 @@ where
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
         (status = 409, description = "Template revision conflicts"),
-        (status = 422, description = "Requested envelope exceeds its ceiling"),
+        (status = 422, description = "Requested envelope is invalid"),
         (status = 503, description = "Envelope requests are unavailable")
     ),
     security(("browserSession" = []))
@@ -726,18 +765,7 @@ where
         evaluate(&request_spec, &template.ceiling),
         Ok(AdmissionDecision::Admit)
     );
-    if !inside_ceiling {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
-    }
-    let auto_provision = template
-        .auto_provision_threshold
-        .as_ref()
-        .is_some_and(|threshold| {
-            matches!(
-                evaluate(&request_spec, threshold),
-                Ok(AdmissionDecision::Admit)
-            )
-        });
+    let auto_provision = inside_ceiling;
     match state
         .broker
         .create(
@@ -968,6 +996,8 @@ mod tests {
                             .to_owned(),
                     ),
                     reason: None,
+                    status_actor: "usr_0123456789abcdef0123456789abcdef".to_owned(),
+                    status_template_revision: 3,
                     created_at: "2026-08-17T00:00:00Z".to_owned(),
                     status_at: "2026-08-17T00:00:00Z".to_owned(),
                 }))
@@ -981,6 +1011,7 @@ mod tests {
         ) -> BoxFuture<'a, Result<UserEnvelopeRequest, EnvelopeRequestBrokerError>> {
             let owners = self.create_owners.clone();
             let owner = session.subject.canonical_user_id.clone();
+            let status_actor = owner.as_str().to_owned();
             let template_id = request.template.id.clone();
             let template_revision = request.template.revision;
             let requested_envelope = request.requested_envelope.clone();
@@ -1007,6 +1038,8 @@ mod tests {
                     envelope_instance_id: Some("env_local_test".to_owned()),
                     envelope_digest: Some("sha256:local-test".to_owned()),
                     reason: None,
+                    status_actor,
+                    status_template_revision: template_revision,
                     created_at: "2026-08-17T00:00:00Z".to_owned(),
                     status_at: "2026-08-17T00:00:00Z".to_owned(),
                 })
@@ -1218,7 +1251,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthenticated_or_out_of_ceiling_requests_fail_closed() -> Result<(), String> {
+    async fn unauthenticated_requests_fail_closed_and_out_of_template_requests_remain_pending()
+    -> Result<(), String> {
         let app = inner_router(TestBroker::default());
         let anonymous = Request::builder()
             .uri("/app/api/v1/envelope-requests")
@@ -1251,18 +1285,27 @@ mod tests {
                 .to_string(),
             ))
             .map_err(|error| format!("build excessive request: {error}"))?;
+        let response = app
+            .oneshot(request)
+            .await
+            .map_err(|error| format!("send excessive request: {error}"))?;
         assert_eq!(
-            app.oneshot(request)
-                .await
-                .map_err(|error| format!("send excessive request: {error}"))?
-                .status(),
-            StatusCode::UNPROCESSABLE_ENTITY
+            response.status(),
+            StatusCode::CREATED,
+            "a valid over-template request must enter review rather than disappearing"
         );
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read excessive response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse excessive response: {error}"))?;
+        assert_eq!(value["request"]["status"], "pending");
+        assert!(value["request"]["approvedEnvelope"].is_null());
         Ok(())
     }
 
     #[tokio::test]
-    async fn missing_automatic_threshold_never_invents_provisioning_authority() -> Result<(), String>
+    async fn the_exact_approved_template_is_the_automatic_provisioning_limit() -> Result<(), String>
     {
         #[derive(Clone)]
         struct ReviewOnlyBroker;
@@ -1302,18 +1345,26 @@ mod tests {
             ) -> BoxFuture<'a, Result<UserEnvelopeRequest, EnvelopeRequestBrokerError>>
             {
                 let requested_envelope = request.requested_envelope.clone();
+                let auto_provision = request.auto_provision;
                 Box::pin(async move {
+                    let approved_envelope = auto_provision.then(|| requested_envelope.clone());
                     Ok(UserEnvelopeRequest {
                         id: Uuid::nil(),
                         template_id: "engineer".to_owned(),
                         template_revision: 3,
                         requested_envelope,
-                        approved_envelope: None,
-                        status: EnvelopeRequestStatus::Pending,
+                        approved_envelope,
+                        status: if auto_provision {
+                            EnvelopeRequestStatus::Provisioned
+                        } else {
+                            EnvelopeRequestStatus::Pending
+                        },
                         approval_id: None,
                         envelope_instance_id: None,
                         envelope_digest: None,
                         reason: None,
+                        status_actor: "usr_0123456789abcdef0123456789abcdef".to_owned(),
+                        status_template_revision: 3,
                         created_at: "2026-08-17T00:00:00Z".to_owned(),
                         status_at: "2026-08-17T00:00:00Z".to_owned(),
                     })
@@ -1348,8 +1399,15 @@ mod tests {
             .map_err(|error| format!("read review-only response: {error}"))?;
         let value: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|error| format!("parse review-only response: {error}"))?;
-        assert_eq!(value["request"]["status"], "pending");
-        assert!(value["request"]["approvedEnvelope"].is_null());
+        assert_eq!(
+            value["request"]["status"], "provisioned",
+            "an independently approved template revision must not require a second hidden threshold"
+        );
+        assert_eq!(
+            value["request"]["approvedEnvelope"],
+            serde_json::to_value(review_only.ceiling)
+                .map_err(|error| format!("serialize expected approved envelope: {error}"))?
+        );
         Ok(())
     }
 

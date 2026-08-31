@@ -5,9 +5,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use steward_admission::{AdmissionDecision, Envelope, validate_envelope};
-use steward_store::{PendingApproval, PendingEnvelopeRequest, StoreError};
+use steward_store::{
+    EnvelopeRequestRecord, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, PendingApproval,
+    PendingEnvelopeRequest, StoreError,
+};
 use steward_types::AgentRuntimeSpec;
 use uuid::Uuid;
 
@@ -15,7 +18,7 @@ use crate::browser_auth::{
     BrowserAdminAuthority, BrowserAuthService, BrowserMutationProof, BrowserMutationRequest,
     protect_browser_admin_routes,
 };
-use crate::user_envelopes::BrowserEnvelope;
+use crate::user_envelopes::{BrowserEnvelope, envelope_content_digest, envelope_instance_id};
 use crate::{
     AdminContext, AdmissionLedger, ApiError, ApprovalRequest, DecisionChannel, RuntimeRepository,
     approve_parked_request, file_decision_reference,
@@ -97,6 +100,7 @@ pub(crate) struct BrowserEnvelopeRequestView {
     template_id: String,
     template_revision: i64,
     requested_envelope: BrowserEnvelope,
+    template_envelope: BrowserEnvelope,
     created_at: String,
 }
 
@@ -108,9 +112,61 @@ impl From<PendingEnvelopeRequest> for BrowserEnvelopeRequestView {
             template_id: request.template_id,
             template_revision: request.template_revision,
             requested_envelope: request.requested_envelope.into(),
+            template_envelope: request.template_envelope.into(),
             created_at: request.created_at,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserEnvelopeRequestDecisionView {
+    #[schema(value_type = String, format = "uuid")]
+    request_id: Uuid,
+    template_id: String,
+    template_revision: i64,
+    requested_envelope: BrowserEnvelope,
+    approved_envelope: Option<BrowserEnvelope>,
+    status: String,
+    #[schema(value_type = Option<String>, format = "uuid")]
+    approval_id: Option<Uuid>,
+    envelope_instance_id: Option<String>,
+    envelope_digest: Option<String>,
+    reason: Option<String>,
+    acted_by: String,
+    status_at: String,
+}
+
+impl From<EnvelopeRequestRecord> for BrowserEnvelopeRequestDecisionView {
+    fn from(request: EnvelopeRequestRecord) -> Self {
+        Self {
+            request_id: request.id,
+            template_id: request.template_id,
+            template_revision: request.template_revision,
+            requested_envelope: request.requested_envelope.into(),
+            approved_envelope: request.approved_envelope.map(Into::into),
+            status: request.status.as_str().to_owned(),
+            approval_id: request.approval_id,
+            envelope_instance_id: request.envelope_instance_id,
+            envelope_digest: request.envelope_digest,
+            reason: request.reason,
+            acted_by: request.status_actor,
+            status_at: request.status_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserEnvelopeRequestDecisionResponse {
+    api_version: &'static str,
+    request: BrowserEnvelopeRequestDecisionView,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RejectEnvelopeRequestBody {
+    reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -148,6 +204,14 @@ where
         )
         .route("/admin/api/v1/approvals", get(list_approvals::<R, L, D>))
         .route(
+            "/admin/api/v1/envelope-requests/{request_id}/approve",
+            post(approve_envelope_request::<R, L, D>),
+        )
+        .route(
+            "/admin/api/v1/envelope-requests/{request_id}/reject",
+            post(reject_envelope_request::<R, L, D>),
+        )
+        .route(
             "/admin/api/v1/approvals/{approval_id}/approve",
             post(approve::<R, L, D>),
         )
@@ -160,6 +224,143 @@ where
             ledger,
             decisions,
         })
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "approveAdminEnvelopeRequest",
+    path = "/admin/api/v1/envelope-requests/{request_id}/approve",
+    params(
+        ("request_id" = String, Path),
+        ("X-Steward-CSRF" = String, Header)
+    ),
+    request_body = BrowserMutationRequest,
+    responses(
+        (status = 200, body = BrowserEnvelopeRequestDecisionResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Envelope request was not found"),
+        (status = 409, description = "Envelope request or template revision is stale or already decided differently"),
+        (status = 503, description = "Envelope request authority is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn approve_envelope_request<R, L, D>(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+    Extension(_proof): Extension<BrowserMutationProof>,
+    State(state): State<BrowserAdminState<R, L, D>>,
+    Path(request_id): Path<Uuid>,
+    Json(_request): Json<BrowserMutationRequest>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    let request = match state.ledger.envelope_request_for_admin(request_id).await {
+        Ok(Some(request)) => request,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return ApiError::Store(error).into_response(),
+    };
+    let instance_id = envelope_instance_id(request.id);
+    let digest = match envelope_content_digest(&request.requested_envelope) {
+        Ok(digest) => digest,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let approval_id = request.approval_id.unwrap_or_else(Uuid::new_v4);
+    let actor = authority.principal().canonical_user_id.as_str();
+    match state
+        .ledger
+        .append_envelope_request_status(
+            request.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: Some(approval_id),
+                envelope_instance_id: Some(&instance_id),
+                envelope_digest: Some(&digest),
+                reason: None,
+                approved_envelope: Some(&request.requested_envelope),
+                actor,
+            },
+        )
+        .await
+    {
+        Ok(request) => Json(BrowserEnvelopeRequestDecisionResponse {
+            api_version: BROWSER_ADMIN_API_VERSION,
+            request: request.into(),
+        })
+        .into_response(),
+        Err(error) => ApiError::Store(error).into_response(),
+    }
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "rejectAdminEnvelopeRequest",
+    path = "/admin/api/v1/envelope-requests/{request_id}/reject",
+    params(
+        ("request_id" = String, Path),
+        ("X-Steward-CSRF" = String, Header)
+    ),
+    request_body = RejectEnvelopeRequestBody,
+    responses(
+        (status = 200, body = BrowserEnvelopeRequestDecisionResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Envelope request was not found"),
+        (status = 409, description = "Envelope request was already decided differently"),
+        (status = 422, description = "Rejection reason is invalid"),
+        (status = 503, description = "Envelope request authority is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn reject_envelope_request<R, L, D>(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+    Extension(_proof): Extension<BrowserMutationProof>,
+    State(state): State<BrowserAdminState<R, L, D>>,
+    Path(request_id): Path<Uuid>,
+    Json(body): Json<RejectEnvelopeRequestBody>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    let reason = body
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if reason.is_some_and(|value| value.len() > 2_000) {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let actor = authority.principal().canonical_user_id.as_str();
+    match state
+        .ledger
+        .append_envelope_request_status(
+            request_id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Rejected,
+                approval_id: None,
+                envelope_instance_id: None,
+                envelope_digest: None,
+                reason,
+                approved_envelope: None,
+                actor,
+            },
+        )
+        .await
+    {
+        Ok(request) => Json(BrowserEnvelopeRequestDecisionResponse {
+            api_version: BROWSER_ADMIN_API_VERSION,
+            request: request.into(),
+        })
+        .into_response(),
+        Err(StoreError::EnvelopeRequestNotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => ApiError::Store(error).into_response(),
+    }
 }
 
 /// Mount the administrator data plane behind the shared opaque browser-session boundary.
