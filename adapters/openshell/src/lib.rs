@@ -542,7 +542,7 @@ fn valid_kubernetes_runtime_class_name(value: &str) -> bool {
 pub enum OpenShellTaskLogMode {
     /// Retain task output for result handling without emitting it to controller logs.
     Off,
-    /// Emit redacted stdout and stderr event metadata live while retaining the result buffers.
+    /// Emit escaped stdout and stderr events live while retaining the result buffers.
     Full,
 }
 
@@ -623,12 +623,12 @@ fn task_process_log_record(
     message: &[u8],
 ) -> String {
     format!(
-        "openshell_task_process runtime_uid=\"{}\" workspace=\"{}\" sandbox=\"{}\" stream={} bytes={}",
+        "openshell_task_process runtime_uid=\"{}\" workspace=\"{}\" sandbox=\"{}\" stream={} message=\"{}\"",
         escaped_task_log_value(context.runtime_uid.as_bytes()),
         escaped_task_log_value(context.workspace.as_bytes()),
         escaped_task_log_value(context.sandbox.as_bytes()),
         stream.as_str(),
-        message.len(),
+        escaped_task_log_value(message),
     )
 }
 
@@ -2220,7 +2220,7 @@ mod tests {
                 .ok_or_else(|| "task logger closed before stdout".to_owned())?;
         assert_eq!(
             stdout_record,
-            "openshell_task_process runtime_uid=\"runtime-123\" workspace=\"workspace-a\" sandbox=\"sandbox-a\" stream=stdout bytes=10"
+            "openshell_task_process runtime_uid=\"runtime-123\" workspace=\"workspace-a\" sandbox=\"sandbox-a\" stream=stdout message=\"reasoning\\n\""
         );
 
         event_sender
@@ -2233,7 +2233,7 @@ mod tests {
                 .ok_or_else(|| "task logger closed before stderr".to_owned())?;
         assert_eq!(
             stderr_record,
-            "openshell_task_process runtime_uid=\"runtime-123\" workspace=\"workspace-a\" sandbox=\"sandbox-a\" stream=stderr bytes=3"
+            "openshell_task_process runtime_uid=\"runtime-123\" workspace=\"workspace-a\" sandbox=\"sandbox-a\" stream=stderr message=\"e\\xff\\n\""
         );
 
         event_sender
@@ -2253,7 +2253,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[tokio::test]
-    async fn full_task_logging_never_records_task_output_material() -> Result<(), String> {
+    async fn full_task_logging_records_escaped_task_output_material() -> Result<(), String> {
         let secret_bearing_output =
             b"Authorization: Bearer obviously-fake-task-credential\nrequest completed";
         let mut stream = QueuedTaskProcessEventStream {
@@ -2277,15 +2277,10 @@ mod tests {
         assert_eq!(result.stdout, secret_bearing_output);
         assert_eq!(log_sink.records.len(), 1);
         let record = &log_sink.records[0];
-        assert!(
-            !record.contains("Authorization")
-                && !record.contains("obviously-fake-task-credential")
-                && !record.contains("request completed"),
-            "task-controlled output must never enter controller logs: {record}"
-        );
-        assert!(
-            record.contains(&format!("bytes={}", secret_bearing_output.len())),
-            "the redacted live event should retain only a safe byte count: {record}"
+        assert_eq!(
+            record,
+            "openshell_task_process runtime_uid=\"runtime-123\" workspace=\"workspace-a\" sandbox=\"sandbox-a\" stream=stdout message=\"Authorization: Bearer obviously-fake-task-credential\\nrequest completed\"",
+            "full logging must expose the escaped task-process event"
         );
         Ok(())
     }
