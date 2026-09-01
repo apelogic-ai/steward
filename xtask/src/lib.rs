@@ -509,6 +509,118 @@ pub fn reconcile_rendered_provider_profile_bundle(
     Ok(())
 }
 
+/// Replaces one exact installed provider-profile bundle with its explicitly
+/// supported successor. The predecessor must reconcile without drift before
+/// any filesystem state is changed.
+pub fn upgrade_rendered_provider_profile_bundle(
+    output_directory: &Path,
+    current: &RenderedProviderProfileBundle,
+    replacement: &RenderedProviderProfileBundle,
+) -> Result<(), String> {
+    reconcile_rendered_provider_profile_bundle(output_directory, current)?;
+
+    let current_identity = rendered_provider_profile_bundle_identity(current)?;
+    let replacement_identity = rendered_provider_profile_bundle_identity(replacement)?;
+    if current_identity != ("steward-runtime-providers", "1.0.0")
+        || replacement_identity != ("steward-runtime-providers", "1.1.0")
+    {
+        return Err(format!(
+            "provider profile upgrade has no supported migration from {}@{} to {}@{}",
+            current_identity.0, current_identity.1, replacement_identity.0, replacement_identity.1
+        ));
+    }
+
+    let parent = output_directory.parent().ok_or_else(|| {
+        format!(
+            "provider profile upgrade destination {} must have a parent directory",
+            output_directory.display()
+        )
+    })?;
+    let output_name = output_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "provider profile upgrade destination {} must have a UTF-8 basename",
+                output_directory.display()
+            )
+        })?;
+    let temporary = parent.join(format!(".{output_name}.upgrade-{}", std::process::id()));
+    let backup = parent.join(format!(".{output_name}.backup-{}", std::process::id()));
+    for path in [&temporary, &backup] {
+        if path.exists() {
+            return Err(format!(
+                "provider profile upgrade owner-scoped path {} already exists; classify and remove only its owner-created state",
+                path.display()
+            ));
+        }
+    }
+
+    fs::create_dir(&temporary).map_err(|error| {
+        format!(
+            "failed to create provider profile upgrade directory {}: {error}",
+            temporary.display()
+        )
+    })?;
+    let staged = write_rendered_provider_profile_bundle(&temporary, replacement)
+        .and_then(|()| reconcile_rendered_provider_profile_bundle(&temporary, replacement));
+    if let Err(error) = staged {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+
+    if let Err(error) = fs::rename(output_directory, &backup) {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(format!(
+            "failed to preserve current provider profile installation {} before upgrade: {error}",
+            output_directory.display()
+        ));
+    }
+    if let Err(error) = fs::rename(&temporary, output_directory) {
+        let rollback = fs::rename(&backup, output_directory);
+        let _ = fs::remove_dir_all(&temporary);
+        return match rollback {
+            Ok(()) => Err(format!(
+                "failed to publish provider profile upgrade to {}; the previous installation was restored: {error}",
+                output_directory.display()
+            )),
+            Err(rollback_error) => Err(format!(
+                "failed to publish provider profile upgrade to {} ({error}) and failed to restore the previous installation from {} ({rollback_error}); manual recovery is required",
+                output_directory.display(),
+                backup.display()
+            )),
+        };
+    }
+    reconcile_rendered_provider_profile_bundle(output_directory, replacement).map_err(|error| {
+        format!(
+            "provider profile upgrade publication did not verify ({error}); the previous installation is retained at {} for manual recovery",
+            backup.display()
+        )
+    })?;
+    fs::remove_dir_all(&backup).map_err(|error| {
+        format!(
+            "provider profile upgrade completed, but its owner-created backup {} could not be removed: {error}",
+            backup.display()
+        )
+    })
+}
+
+fn rendered_provider_profile_bundle_identity(
+    rendered: &RenderedProviderProfileBundle,
+) -> Result<(&str, &str), String> {
+    let id = rendered
+        .state
+        .pointer("/bundle/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "rendered provider profile state requires a bundle id".to_owned())?;
+    let version = rendered
+        .state
+        .pointer("/bundle/version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "rendered provider profile state requires a bundle version".to_owned())?;
+    Ok((id, version))
+}
+
 fn write_rendered_provider_profile_bundle(
     directory: &Path,
     rendered: &RenderedProviderProfileBundle,
@@ -2080,7 +2192,8 @@ mod tests {
         local_test_context_is_safe, migration_base_candidates, migration_history_violations,
         neutrality_violations, reconcile_rendered_provider_profile_bundle,
         render_provider_profile_bundle, secret_violations, select_migration_base,
-        validate_provider_profile_bundle, validate_register_content,
+        upgrade_rendered_provider_profile_bundle, validate_provider_profile_bundle,
+        validate_register_content,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -2605,6 +2718,65 @@ mod tests {
             let drift = reconcile_rendered_provider_profile_bundle(&output, &rendered);
             if !matches!(drift, Err(ref error) if error.contains("drift")) {
                 return Err(format!("reconcile must reject profile drift: {drift:?}"));
+            }
+            Ok(())
+        })();
+        fs::remove_dir_all(&directory).map_err(|error| format!("remove fixture: {error}"))?;
+        result
+    }
+
+    #[test]
+    fn provider_profile_upgrade_requires_an_exact_supported_predecessor() -> Result<(), String> {
+        fn rendered(version: &str, policy: &str) -> RenderedProviderProfileBundle {
+            let profile = serde_json::json!({"id": "steward-mcp-gw", "policy": policy});
+            let mut profiles = BTreeMap::new();
+            profiles.insert("steward-mcp-gw".to_owned(), profile.clone());
+            RenderedProviderProfileBundle {
+                profiles,
+                state: serde_json::json!({
+                    "schema": "steward.provider-profile-install-state/v1",
+                    "bundle": {"id": "steward-runtime-providers", "version": version},
+                    "profiles": {"steward-mcp-gw": profile}
+                }),
+            }
+        }
+
+        let current = rendered("1.0.0", "curl-only");
+        let replacement = rendered("1.1.0", "codex-and-curl");
+        let directory = std::env::temp_dir().join(format!(
+            "steward-provider-profile-upgrade-test-{}-{}",
+            std::process::id(),
+            NEXT_RENDER_INSTALL_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&directory).map_err(|error| format!("create fixture: {error}"))?;
+        let output = directory.join("installed");
+
+        let result = (|| {
+            install_rendered_provider_profile_bundle(&output, &current)?;
+            upgrade_rendered_provider_profile_bundle(&output, &current, &replacement)?;
+            reconcile_rendered_provider_profile_bundle(&output, &replacement)?;
+
+            let unsupported = rendered("1.2.0", "unsupported");
+            let unsupported_result =
+                upgrade_rendered_provider_profile_bundle(&output, &replacement, &unsupported);
+            if !matches!(unsupported_result, Err(ref error) if error.contains("supported migration"))
+            {
+                return Err(format!(
+                    "upgrade must reject an undeclared bundle transition: {unsupported_result:?}"
+                ));
+            }
+
+            fs::write(
+                output.join("profiles/steward-mcp-gw.json"),
+                "{\"id\":\"steward-mcp-gw\",\"policy\":\"drifted\"}\n",
+            )
+            .map_err(|error| format!("write drift fixture: {error}"))?;
+            let drift =
+                upgrade_rendered_provider_profile_bundle(&output, &replacement, &unsupported);
+            if !matches!(drift, Err(ref error) if error.contains("drift")) {
+                return Err(format!(
+                    "upgrade must reject predecessor drift before replacement: {drift:?}"
+                ));
             }
             Ok(())
         })();

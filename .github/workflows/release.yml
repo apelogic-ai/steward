@@ -690,6 +690,7 @@ jobs:
             printf 'Bridge attestation bundle: bridge-attestation-bundle.jsonl\n\n'
             printf '\n## Provider-profile bundle provenance inputs\n\n'
             printf 'Provider profile bundle asset: %s\n\n' "$provider_profile_bundle_asset"
+            printf 'Provider profile bundle identity: steward-runtime-providers@1.1.0\n\n'
             printf 'Provider profile bundle SHA-256: %s\n\n' "$provider_profile_bundle_digest"
             printf 'Provider profile bundle signer identity: %s\n\n' "$bridge_signer_identity"
             printf 'Provider profile bundle source repository: %s\n\n' "$bridge_source_repository"
