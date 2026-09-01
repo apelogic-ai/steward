@@ -1351,6 +1351,37 @@ mod tests {
     }
 
     #[test]
+    fn codex_provider_profiles_cover_supported_linux_architectures() -> Result<(), String> {
+        let arm64_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/codex/codex";
+        let amd64_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex";
+        for profile_path in [
+            "config/s5/tool-provider-profile.yaml",
+            "config/task/inference-provider-profile.yaml",
+            "config/provider-profile-bundle/v1/profiles/steward-mcp-gw.json",
+            "config/provider-profile-bundle/v1/profiles/steward-litellm.json",
+        ] {
+            let profile = fs::read_to_string(root().join(profile_path)).map_err(|error| {
+                format!("Codex provider profile {profile_path} is required: {error}")
+            })?;
+            for required_binary in [arm64_binary, amd64_binary] {
+                assert!(
+                    profile.contains(required_binary),
+                    "Codex provider profile {profile_path} must authorize {required_binary}"
+                );
+            }
+        }
+        let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let task_e2e = ci_job(&workflow, "e2e-controller-runtime-lifecycle")?;
+        assert!(
+            task_e2e.contains("runs-on: ubuntu-latest")
+                && task_e2e.contains("cargo xtask e2e-controller-runtime-lifecycle"),
+            "the real Codex MCP-GW E2E must exercise the linux/amd64 provider path in CI"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn release_candidate_fails_closed_on_critical_component_images() -> Result<(), String> {
         let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;

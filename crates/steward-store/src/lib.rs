@@ -2853,7 +2853,7 @@ impl PgStore {
         }
     }
 
-    async fn task_by_idempotency(
+    pub async fn task_by_idempotency(
         &self,
         submitter_service: &str,
         owner_user_id: &str,

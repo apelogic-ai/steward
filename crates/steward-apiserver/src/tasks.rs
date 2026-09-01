@@ -782,6 +782,13 @@ pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
         Box::pin(async { Ok(Vec::new()) })
     }
 
+    fn task_by_idempotency<'a>(
+        &'a self,
+        submitter_service: &'a str,
+        owner_user_id: &'a str,
+        idempotency_key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>>;
+
     fn reserve_task<'a>(
         &'a self,
         request: TaskReservationRequest<'a>,
@@ -848,6 +855,18 @@ impl TaskSubmissionLedger for PgStore {
                         })
                         .collect()
                 })
+        })
+    }
+
+    fn task_by_idempotency<'a>(
+        &'a self,
+        submitter_service: &'a str,
+        owner_user_id: &'a str,
+        idempotency_key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
+        Box::pin(async move {
+            PgStore::task_by_idempotency(self, submitter_service, owner_user_id, idempotency_key)
+                .await
         })
     }
 
@@ -1478,6 +1497,18 @@ where
             "versioned Workflows use a server-owned runtime path".to_owned(),
         ));
     }
+    if let Some(record) = state
+        .ledger
+        .task_by_idempotency(
+            &identity.service,
+            identity.canonical_user_id.as_str(),
+            idempotency_key,
+        )
+        .await
+        .map_err(ApiError::Store)?
+    {
+        return versioned_task_retry_response(&identity, &reference, record);
+    }
     let workflow = state
         .ledger
         .workflow_revision(&reference.name, reference.version)
@@ -1528,7 +1559,7 @@ where
         .envelope_digest
         .as_deref()
         .ok_or(ApiError::MissingEnvelope)?;
-    let reservation = state
+    let reservation = match state
         .ledger
         .reserve_task(TaskReservationRequest {
             idempotency_key,
@@ -1556,7 +1587,23 @@ where
             envelope_revision: service_envelope.revision,
         })
         .await
-        .map_err(ApiError::Store)?;
+    {
+        Ok(reservation) => reservation,
+        Err(StoreError::TaskIdempotencyConflict) => {
+            let record = state
+                .ledger
+                .task_by_idempotency(
+                    &identity.service,
+                    identity.canonical_user_id.as_str(),
+                    idempotency_key,
+                )
+                .await
+                .map_err(ApiError::Store)?
+                .ok_or(ApiError::Store(StoreError::TaskIdempotencyConflict))?;
+            return versioned_task_retry_response(&identity, &reference, record);
+        }
+        Err(error) => return Err(ApiError::Store(error)),
+    };
     if !reservation.inserted && reservation.record.runtime_uid.is_some() {
         return task_response(reservation.record, Vec::new());
     }
@@ -1588,6 +1635,32 @@ where
         .await
         .map_err(ApiError::Store)?;
     task_response(record, deltas)
+}
+
+fn versioned_task_retry_response(
+    identity: &TaskIdentity,
+    reference: &WorkflowReference,
+    record: TaskRecord,
+) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
+    let acting_user = identity.acting_user.as_ref().map(|email| email.0.as_str());
+    let acting_user_id = identity
+        .acting_user
+        .as_ref()
+        .map(|_| identity.canonical_user_id.as_str());
+    let workflow_reference = format!("{}@{}", reference.name, reference.version);
+    if record.identity_binding_state != "bound"
+        || record.submitter_service != identity.service
+        || record.acting_user.as_deref() != acting_user
+        || record.acting_user_id.as_deref() != acting_user_id
+        || record.owner != identity.owner.0
+        || record.owner_user_id.as_deref() != Some(identity.canonical_user_id.as_str())
+        || record.workflow != workflow_reference
+        || record.workflow_name.as_deref() != Some(reference.name.as_str())
+        || record.workflow_version != Some(reference.version)
+    {
+        return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
+    }
+    task_response(record, Vec::new())
 }
 
 async fn resolve_task_identity<I: TaskIdentityResolver>(

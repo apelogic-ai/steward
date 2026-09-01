@@ -3013,7 +3013,7 @@ mod tests {
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email,
-        ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, TaskPhase,
+        ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, TaskPhase, ToolGrant,
     };
     use tower::ServiceExt;
     use utoipa::OpenApi;
@@ -5873,6 +5873,32 @@ mod tests {
             })
         }
 
+        fn task_by_idempotency<'a>(
+            &'a self,
+            submitter_service: &'a str,
+            owner_user_id: &'a str,
+            idempotency_key: &'a str,
+        ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
+            Box::pin(async move {
+                self.tasks
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database("fake task ledger lock was poisoned".to_owned())
+                    })
+                    .map(|tasks| {
+                        tasks
+                            .iter()
+                            .find(|task| {
+                                task.submitter_service == submitter_service
+                                    && task.owner_user_id.as_deref() == Some(owner_user_id)
+                                    && task.idempotency_key == idempotency_key
+                                    && task.identity_binding_state == "bound"
+                            })
+                            .cloned()
+                    })
+            })
+        }
+
         fn reserve_task<'a>(
             &'a self,
             request: TaskReservationRequest<'a>,
@@ -8433,6 +8459,110 @@ mod tests {
         assert_eq!(
             task.agent_command.get(5).map(String::as_str),
             Some("openai/gpt-5.4")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn versioned_task_retry_uses_persisted_plan_across_runtime_contract_changes()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let tool = ToolGrant {
+            provider: "github".to_owned(),
+            resource: "get_file_contents".to_owned(),
+            action: "read".to_owned(),
+        };
+        {
+            let mut envelopes = ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+            let envelope = envelopes
+                .first_mut()
+                .ok_or_else(|| "versioned task fixture requires a User Envelope".to_owned())?;
+            envelope.requested_envelope.spec.tools = vec![tool.clone()];
+            envelope
+                .approved_envelope
+                .as_mut()
+                .ok_or_else(|| "versioned task fixture requires an approved Envelope".to_owned())?
+                .spec
+                .tools = vec![tool.clone()];
+        }
+        ledger
+            .envelope
+            .lock()
+            .map_err(|_| "fake service Envelope ledger lock was poisoned")?
+            .spec
+            .tools = vec![tool];
+        let request = |workflow: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "runtime-contract-retry")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"workflow":"{workflow}"}}"#)))
+                .map_err(|error| format!("build versioned Workflow retry: {error}"))
+        };
+        let first_app = task_router(
+            MultiRuntimeRepository::default(),
+            ledger.clone(),
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            TaskApiConfig::new(Some("https://mcp-a.example.test/mcp".to_owned()))?,
+        );
+        let first = first_app
+            .oneshot(request("repository-review@1")?)
+            .await
+            .map_err(|error| format!("submit initial versioned Workflow: {error}"))?;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_body = to_bytes(first.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read initial versioned Workflow response: {error}"))?;
+        let first_task_uid = serde_json::from_slice::<serde_json::Value>(&first_body)
+            .map_err(|error| format!("parse initial versioned Workflow response: {error}"))?
+            .get("taskUid")
+            .cloned();
+
+        let retry_app = task_router(
+            MultiRuntimeRepository::default(),
+            ledger.clone(),
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            TaskApiConfig::default(),
+        );
+        let retry = retry_app
+            .clone()
+            .oneshot(request("repository-review@1")?)
+            .await
+            .map_err(|error| format!("retry versioned Workflow without MCP config: {error}"))?;
+        assert_eq!(
+            retry.status(),
+            StatusCode::ACCEPTED,
+            "an identical retry must return the persisted plan without resolving current MCP configuration"
+        );
+        let retry_body = to_bytes(retry.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read versioned Workflow retry response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&retry_body)
+                .map_err(|error| format!("parse versioned Workflow retry response: {error}"))?
+                .get("taskUid")
+                .cloned(),
+            first_task_uid,
+            "an identical retry must return the original task"
+        );
+
+        let conflicting = retry_app
+            .oneshot(request("different-workflow@1")?)
+            .await
+            .map_err(|error| format!("submit conflicting versioned Workflow retry: {error}"))?;
+        assert_eq!(
+            conflicting.status(),
+            StatusCode::CONFLICT,
+            "the persisted retry path must still reject a different caller-owned Workflow pin"
         );
         Ok(())
     }
