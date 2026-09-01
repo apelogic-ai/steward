@@ -27,9 +27,9 @@ pub use github_actions::{
 
 pub use tasks::{
     ConfiguredTaskIdentityResolver, KubernetesTaskIdentityResolver, StaticTaskWorkflowCatalog,
-    TaskAdmissionDelta, TaskArchive, TaskAuthenticationError, TaskErrorResponse, TaskIdentity,
-    TaskIdentityResolver, TaskStatusResponse, TaskSubmissionLedger, TaskSubmissionRequest,
-    TaskWorkflow, TaskWorkflowCatalog, task_router,
+    TaskAdmissionDelta, TaskApiConfig, TaskArchive, TaskAuthenticationError, TaskErrorResponse,
+    TaskIdentity, TaskIdentityResolver, TaskStatusResponse, TaskSubmissionLedger,
+    TaskSubmissionRequest, TaskWorkflow, TaskWorkflowCatalog, task_router,
 };
 pub use workflows::{WorkflowReference, WorkflowReferenceError};
 
@@ -800,6 +800,7 @@ pub enum ApiError {
     TaskWorkflowNotFound,
     TaskNotReady,
     TaskOutputNotReady,
+    TaskRuntimeContractUnavailable(String),
 }
 
 impl fmt::Display for ApiError {
@@ -2070,7 +2071,9 @@ impl IntoResponse for ApiError {
                 | StoreError::WorkflowNotFound,
             ) => StatusCode::NOT_FOUND,
             Self::Store(StoreError::CanonicalIdentityInactive) => StatusCode::FORBIDDEN,
-            Self::TaskNotReady => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TaskNotReady | Self::TaskRuntimeContractUnavailable(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::TaskOutputNotReady => StatusCode::CONFLICT,
             Self::MissingEnvelope | Self::MissingRuntimeUid => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InvalidBudgetIncrease { .. } | Self::Admission(_) => {
@@ -3026,13 +3029,17 @@ mod tests {
         ApiError, AuthenticatedCaller, AuthenticationError, BoxFuture, BudgetIncrease,
         CreateRuntimeRequest, KubernetesTokenReviewAudience, RequestAuthenticator,
         RuntimeCreateError, RuntimeRepository, STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP,
-        StaticTaskWorkflowCatalog, SubmissionOutcome, TaskAuthenticationError, TaskIdentity,
-        TaskIdentityResolver, TaskSubmissionLedger, TaskSubmissionRequest, TaskWorkflow,
-        caller_from_kubernetes_user, caller_from_token_review, router, spec_digest,
+        StaticTaskWorkflowCatalog, SubmissionOutcome, TaskApiConfig, TaskAuthenticationError,
+        TaskIdentity, TaskIdentityResolver, TaskSubmissionLedger, TaskSubmissionRequest,
+        TaskWorkflow, caller_from_kubernetes_user, caller_from_token_review, router, spec_digest,
         submit_budget_increase, submit_runtime_request, task_router, token_review_request,
     };
 
     const KUBERNETES_TOKEN_REVIEW_AUDIENCE: &str = "https://kubernetes.default.svc";
+
+    fn task_api_config() -> Result<TaskApiConfig, String> {
+        TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))
+    }
 
     fn browser_cookie(response: &Response, name: &str) -> Result<String, String> {
         response
@@ -8334,6 +8341,7 @@ mod tests {
             FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+            task_api_config()?,
         );
 
         let unknown = app
@@ -8448,6 +8456,7 @@ mod tests {
             FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+            task_api_config()?,
         );
 
         let response = app
@@ -8520,6 +8529,7 @@ mod tests {
                 ttl: Duration("24h".to_owned()),
                 command: vec!["agent-v1".to_owned()],
             }]),
+            task_api_config()?,
         ));
 
         let response = app
@@ -8590,6 +8600,7 @@ mod tests {
             FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+            task_api_config()?,
         ));
 
         let response = app
@@ -8662,6 +8673,7 @@ mod tests {
             decisions,
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+            task_api_config()?,
         ));
         let submitted = app
             .clone()
@@ -8916,6 +8928,7 @@ mod tests {
             FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+            task_api_config()?,
         ));
         let mut submissions = Vec::new();
         for bearer in ["github-assertion", "github-bob-assertion"] {
@@ -9056,6 +9069,7 @@ mod tests {
             decisions,
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([workflow]),
+            task_api_config()?,
         ));
         let request = || {
             Request::builder()

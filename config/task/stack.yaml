@@ -6,6 +6,61 @@ metadata:
   labels:
     steward.test/run-id: STEWARD_RUN_ID
 ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-responses
+  namespace: litellm
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: steward-task-codex-responses
+  template:
+    metadata:
+      labels:
+        app: steward-task-codex-responses
+        steward.test/run-id: STEWARD_RUN_ID
+    spec:
+      containers:
+        - name: responses
+          image: oven/bun:1.2.21@sha256:5a2011bf09364b9af658ac1e66f60d08092f4291aeefbff448d58b027734fdd0
+          command: ["bun", "/fixtures/codex-responses-fixture.ts"]
+          ports:
+            - name: http
+              containerPort: 4000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 1
+          volumeMounts:
+            - name: fixture
+              mountPath: /fixtures
+              readOnly: true
+      volumes:
+        - name: fixture
+          configMap:
+            name: steward-task-codex-responses
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm-litellm
+  namespace: litellm
+  labels:
+    steward.test/run-id: STEWARD_RUN_ID
+spec:
+  selector:
+    app: steward-task-codex-responses
+  ports:
+    - name: http
+      port: 4000
+      targetPort: http
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -123,6 +178,8 @@ spec:
               value: 0.0.0.0:8082
             - name: STEWARD_TEST_RUN_ID
               value: STEWARD_RUN_ID
+            - name: STEWARD_TASK_MCP_GW_ENDPOINT
+              value: http://hop1-capture-tools.steward-system.svc.cluster.local:8085/mcp
           ports:
             - name: http
               containerPort: 8082

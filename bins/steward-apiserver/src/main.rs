@@ -11,8 +11,9 @@ use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{
     ConfiguredTaskIdentityResolver, IdentityOrKubernetesTokenAuthenticator, KubeRuntimeRepository,
     KubernetesTokenAuthenticator, KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog,
-    agent_runs_ui, browser_admin, browser_auth, browser_hop1_attestation, connections, google_oidc,
-    mcp_gw_connections, router, stable_runtime_bridge, task_router, user_envelopes, workflows,
+    TaskApiConfig, agent_runs_ui, browser_admin, browser_auth, browser_hop1_attestation,
+    connections, google_oidc, mcp_gw_connections, router, stable_runtime_bridge, task_router,
+    user_envelopes, workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
@@ -71,6 +72,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let task_workflows =
         StaticTaskWorkflowCatalog::from_json(&required("STEWARD_TASK_WORKFLOWS_JSON")?)
             .map_err(io::Error::other)?;
+    let task_mcp_gateway_endpoint = match env::var("STEWARD_TASK_MCP_GW_ENDPOINT") {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::other("STEWARD_TASK_MCP_GW_ENDPOINT must be Unicode").into());
+        }
+    };
+    let task_api_config =
+        TaskApiConfig::new(task_mcp_gateway_endpoint).map_err(io::Error::other)?;
     let runtimes = KubeRuntimeRepository::new(client);
     let browser = browser_application_router(store.clone(), runtimes.clone(), decisions.clone())?;
     let app = router(
@@ -85,6 +95,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         decisions,
         task_identities,
         task_workflows,
+        task_api_config,
     ));
     let app = match browser {
         Some(browser) => app.merge(browser),

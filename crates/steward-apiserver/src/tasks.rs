@@ -77,10 +77,48 @@ struct VersionedTaskPlan {
     command: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TaskApiConfig {
+    mcp_gateway_endpoint: Option<String>,
+}
+
+impl TaskApiConfig {
+    pub fn new(mcp_gateway_endpoint: Option<String>) -> Result<Self, String> {
+        let mcp_gateway_endpoint = match mcp_gateway_endpoint {
+            Some(value) if value.is_empty() => None,
+            Some(value) => Some(validate_mcp_gateway_endpoint(value)?),
+            None => None,
+        };
+        Ok(Self {
+            mcp_gateway_endpoint,
+        })
+    }
+}
+
+fn validate_mcp_gateway_endpoint(value: String) -> Result<String, String> {
+    if value.trim() != value || value.chars().any(char::is_control) {
+        return Err("task MCP-GW endpoint must be an exact HTTP(S) URL".to_owned());
+    }
+    let endpoint = reqwest::Url::parse(&value)
+        .map_err(|_| "task MCP-GW endpoint must be an exact HTTP(S) URL".to_owned())?;
+    if !matches!(endpoint.scheme(), "http" | "https")
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || endpoint.port() == Some(0)
+    {
+        return Err("task MCP-GW endpoint must be an exact HTTP(S) URL".to_owned());
+    }
+    Ok(endpoint.to_string())
+}
+
 fn resolve_versioned_task_plan(
     identity: &TaskIdentity,
     workflow: WorkflowRevisionRecord,
     envelopes: Vec<EnvelopeRequestRecord>,
+    config: &TaskApiConfig,
 ) -> Result<VersionedTaskPlan, ApiError> {
     let [envelope] = envelopes.as_slice() else {
         return if envelopes.is_empty() {
@@ -110,6 +148,16 @@ fn resolve_versioned_task_plan(
         ));
     };
     let codex_model = format!("{}/{}", model.provider, model.model);
+    let mcp_gateway_endpoint = if approved.spec.tools.is_empty() {
+        None
+    } else {
+        Some(config.mcp_gateway_endpoint.as_deref().ok_or_else(|| {
+            ApiError::TaskRuntimeContractUnavailable(
+                "tool-bearing versioned Codex Workflow requires the MCP-GW runtime contract"
+                    .to_owned(),
+            )
+        })?)
+    };
     let canonical_authority = CanonicalAuthorityBinding::new(
         identity.canonical_user_id.clone(),
         identity
@@ -135,36 +183,58 @@ fn resolve_versioned_task_plan(
         runner: approved.spec.runner.clone(),
         bindings: None,
     };
-    let command = vec![
-        "/bin/sh".to_owned(),
-        "-c".to_owned(),
+    let mut codex_config = concat!(
+        "model_provider = \"litellm\"\n",
+        "approval_policy = \"never\"\n",
+        "web_search = \"disabled\"\n",
+        "[model_providers.litellm]\n",
+        "name = \"LiteLLM\"\n",
+        "base_url = \"http://litellm-litellm.litellm.svc.cluster.local:4000/v1\"\n",
+        "env_key = \"OPENAI_API_KEY\"\n",
+        "wire_api = \"responses\"\n",
+        "requires_openai_auth = false\n",
+    )
+    .to_owned();
+    if let Some(endpoint) = mcp_gateway_endpoint {
+        let encoded_endpoint = serde_json::to_string(endpoint).map_err(|error| {
+            ApiError::TaskRuntimeContractUnavailable(format!(
+                "failed to render the MCP-GW endpoint: {error}"
+            ))
+        })?;
+        codex_config.push_str("[mcp_servers.steward]\nurl = ");
+        codex_config.push_str(&encoded_endpoint);
+        codex_config.push_str("\nbearer_token_env_var = \"STEWARD_MCP_GW_BEARER_TOKEN\"\n");
+    }
+    let mcp_bearer_environment = if mcp_gateway_endpoint.is_some() {
+        "STEWARD_MCP_GW_BEARER_TOKEN=openshell-token-grant-placeholder "
+    } else {
+        ""
+    };
+    let shell_command = format!(
         concat!(
             "set -eu; umask 077; ",
             "test \"$(codex --version)\" = \"codex-cli 0.117.0\"; ",
-            "test \"$#\" -eq 2; ",
+            "test \"$#\" -eq 3; ",
             "export CODEX_HOME=/sandbox/steward-codex; ",
             "mkdir -p \"$CODEX_HOME\" \"$STEWARD_OUTPUT_DIR/out\"; ",
             "test ! -e out; ln -s \"$STEWARD_OUTPUT_DIR/out\" out; ",
-            "printf '%s\\n' ",
-            "'model_provider = \"litellm\"' ",
-            "'approval_policy = \"never\"' ",
-            "'web_search = \"disabled\"' ",
-            "'[model_providers.litellm]' ",
-            "'name = \"LiteLLM\"' ",
-            "'base_url = \"http://litellm-litellm.litellm.svc.cluster.local:4000/v1\"' ",
-            "'env_key = \"OPENAI_API_KEY\"' ",
-            "'wire_api = \"responses\"' ",
-            "'requires_openai_auth = false' ",
-            "> \"$CODEX_HOME/config.toml\"; ",
+            "printf '%s' \"$3\" > \"$CODEX_HOME/config.toml\"; ",
+            "{}",
             "OPENAI_API_KEY=openshell-token-grant-placeholder ",
             "codex exec --ephemeral --skip-git-repo-check ",
             "--sandbox danger-full-access --model \"$2\" ",
             "--output-last-message \"$STEWARD_OUTPUT_DIR/result.txt\" -- \"$1\""
-        )
-        .to_owned(),
+        ),
+        mcp_bearer_environment,
+    );
+    let command = vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        shell_command,
         "steward-workflow".to_owned(),
         workflow.prompt.clone(),
         codex_model,
+        codex_config,
     ];
     Ok(VersionedTaskPlan {
         workflow,
@@ -918,6 +988,7 @@ struct TaskApiState<R, L, D, I, W> {
     decisions: D,
     identities: I,
     workflows: W,
+    config: TaskApiConfig,
 }
 
 pub fn task_router<R, L, D, I, W>(
@@ -926,6 +997,7 @@ pub fn task_router<R, L, D, I, W>(
     decisions: D,
     identities: I,
     workflows: W,
+    config: TaskApiConfig,
 ) -> Router
 where
     R: RuntimeRepository,
@@ -959,6 +1031,7 @@ where
             decisions,
             identities,
             workflows,
+            config,
         })
 }
 
@@ -1416,7 +1489,7 @@ where
         .active_provisioned_user_envelopes(&identity.canonical_user_id)
         .await
         .map_err(ApiError::Store)?;
-    let plan = resolve_versioned_task_plan(&identity, workflow, envelopes)?;
+    let plan = resolve_versioned_task_plan(&identity, workflow, envelopes, &state.config)?;
     let user_envelope = plan
         .envelope
         .approved_envelope
@@ -1679,7 +1752,7 @@ fn stable_task_runtime_name(
 #[cfg(test)]
 mod workflow_request_tests {
     use super::{
-        StaticTaskWorkflowCatalog, TaskWorkflowCatalog, resolve_versioned_task_plan,
+        StaticTaskWorkflowCatalog, TaskApiConfig, TaskWorkflowCatalog, resolve_versioned_task_plan,
         versioned_workflow_reference,
     };
     use crate::{ApiError, TaskIdentity};
@@ -1719,6 +1792,33 @@ mod workflow_request_tests {
             format!("a versioned-Workflow deployment may omit legacy workflows: {error}")
         })?;
         assert!(catalog.workflow("legacy-smoke").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn task_mcp_gateway_endpoint_rejects_ambiguous_or_credentialed_urls() -> Result<(), String> {
+        for endpoint in [
+            " https://mcp-gw.example.test/mcp",
+            "https://mcp-gw.example.test/m\tcp",
+            "https://mcp-gw.example.test/m\ncp",
+            "ftp://mcp-gw.example.test/mcp",
+            "https://alice@mcp-gw.example.test/mcp",
+            "https://mcp-gw.example.test/mcp?target=other",
+            "https://mcp-gw.example.test/mcp#fragment",
+            "https://mcp-gw.example.test:0/mcp",
+        ] {
+            assert!(
+                TaskApiConfig::new(Some(endpoint.to_owned())).is_err(),
+                "invalid task MCP-GW endpoint {endpoint:?} must fail configuration"
+            );
+        }
+
+        let normalized = TaskApiConfig::new(Some("HTTPS://MCP-GW.EXAMPLE.TEST/mcp".to_owned()))?;
+        assert_eq!(
+            normalized.mcp_gateway_endpoint.as_deref(),
+            Some("https://mcp-gw.example.test/mcp"),
+            "the rendered contract must use the URL parser's normalized representation"
+        );
         Ok(())
     }
 
@@ -1793,6 +1893,7 @@ mod workflow_request_tests {
             vec![provisioned_envelope(
                 "usr_abcdef0123456789abcdef0123456789",
             )?],
+            &TaskApiConfig::default(),
         );
         assert!(
             matches!(result, Err(ApiError::PrincipalMismatch)),
@@ -1805,7 +1906,12 @@ mod workflow_request_tests {
     fn zero_or_ambiguous_provisioned_user_envelopes_fail_closed() -> Result<(), String> {
         let task_identity = identity("usr_0123456789abcdef0123456789abcdef")?;
         assert!(matches!(
-            resolve_versioned_task_plan(&task_identity, workflow(), Vec::new()),
+            resolve_versioned_task_plan(
+                &task_identity,
+                workflow(),
+                Vec::new(),
+                &TaskApiConfig::default(),
+            ),
             Err(ApiError::MissingEnvelope)
         ));
         assert!(matches!(
@@ -1816,6 +1922,7 @@ mod workflow_request_tests {
                     provisioned_envelope("usr_0123456789abcdef0123456789abcdef")?,
                     provisioned_envelope("usr_0123456789abcdef0123456789abcdef")?,
                 ],
+                &TaskApiConfig::default(),
             ),
             Err(ApiError::Conflict(_))
         ));
@@ -1831,6 +1938,7 @@ mod workflow_request_tests {
             vec![provisioned_envelope(
                 "usr_0123456789abcdef0123456789abcdef",
             )?],
+            &TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?,
         )
         .map_err(|error| format!("one exact owned provisioned Envelope was rejected: {error:?}"))?;
         assert_eq!(plan.workflow.name, "repository-review");
@@ -1858,13 +1966,25 @@ mod workflow_request_tests {
             "the server-owned command must fail closed unless the sandbox exposes the exact approved Codex version"
         );
         let shell_command = &plan.command[2];
+        let codex_config = &plan.command[6];
         assert!(
             shell_command.contains("OPENAI_API_KEY=openshell-token-grant-placeholder"),
             "Codex must present a non-secret placeholder for OpenShell's runtime token grant"
         );
         assert!(
-            shell_command.contains("litellm-litellm.litellm.svc.cluster.local:4000/v1"),
+            codex_config.contains("litellm-litellm.litellm.svc.cluster.local:4000/v1"),
             "Codex must send inference to the OpenShell-governed LiteLLM endpoint"
+        );
+        assert!(
+            codex_config.contains("[mcp_servers.steward]")
+                && codex_config.contains("https://mcp-gw.example.test/mcp")
+                && codex_config.contains("bearer_token_env_var = \"STEWARD_MCP_GW_BEARER_TOKEN\""),
+            "tool-bearing Codex plans must configure the server-selected streamable HTTP MCP-GW endpoint"
+        );
+        assert!(
+            shell_command
+                .contains("STEWARD_MCP_GW_BEARER_TOKEN=openshell-token-grant-placeholder",),
+            "Codex must present only OpenShell's non-secret provider placeholder to MCP-GW"
         );
         assert!(
             shell_command.contains("--model \"$2\""),
@@ -1873,6 +1993,10 @@ mod workflow_request_tests {
         assert!(
             shell_command.contains("ln -s \"$STEWARD_OUTPUT_DIR/out\" out"),
             "the declared out binding must resolve to Steward's collected output root"
+        );
+        assert!(
+            !shell_command.contains("$STEWARD_OUTPUT_DIR/out/result.txt"),
+            "Steward must not overwrite a Workflow-owned declared output with Codex metadata"
         );
         assert!(
             shell_command.contains("--ephemeral")
@@ -1889,6 +2013,52 @@ mod workflow_request_tests {
                 .iter()
                 .all(|argument| !argument.contains("example-org")),
             "repository mechanics do not belong to the Workflow execution command"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tool_less_versioned_task_plan_contains_no_mcp_server() -> Result<(), String> {
+        let mut envelope = provisioned_envelope("usr_0123456789abcdef0123456789abcdef")?;
+        envelope.requested_envelope.spec.tools.clear();
+        envelope
+            .approved_envelope
+            .as_mut()
+            .ok_or_else(|| "fixture must contain an approved Envelope".to_owned())?
+            .spec
+            .tools
+            .clear();
+        let plan = resolve_versioned_task_plan(
+            &identity("usr_0123456789abcdef0123456789abcdef")?,
+            workflow(),
+            vec![envelope],
+            &TaskApiConfig::default(),
+        )
+        .map_err(|error| format!("tool-less versioned Task was rejected: {error:?}"))?;
+        let shell_command = &plan.command[2];
+        let codex_config = &plan.command[6];
+        assert!(
+            !codex_config.contains("[mcp_servers.")
+                && !codex_config.contains("STEWARD_MCP_GW_BEARER_TOKEN")
+                && !shell_command.contains("STEWARD_MCP_GW_BEARER_TOKEN"),
+            "unused Envelope capacity must not add an MCP server or bearer placeholder"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tool_bearing_versioned_task_fails_without_mcp_gateway_contract() -> Result<(), String> {
+        let result = resolve_versioned_task_plan(
+            &identity("usr_0123456789abcdef0123456789abcdef")?,
+            workflow(),
+            vec![provisioned_envelope(
+                "usr_0123456789abcdef0123456789abcdef",
+            )?],
+            &TaskApiConfig::default(),
+        );
+        assert!(
+            matches!(result, Err(ApiError::TaskRuntimeContractUnavailable(_))),
+            "tool-bearing Codex plans must fail before execution when MCP-GW is unavailable"
         );
         Ok(())
     }

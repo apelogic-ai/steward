@@ -1321,12 +1321,12 @@ mod tests {
             .map_err(|error| format!("versioned Workflow E2E stack is required: {error}"))?;
 
         assert!(
-            harness.contains("namespaces+=(steward-workflows)"),
+            harness.contains("namespaces+=(steward-workflows litellm)"),
             "the versioned Workflow E2E must create its dedicated runtime namespace"
         );
         assert!(
             harness.contains(
-                "elif [[ \"${SLICE}\" == \"task\" ]]; then\n  profile_sources=(\n    \"${ROOT}/config/s5/tool-provider-profile.yaml\"\n    \"${ROOT}/config/s5/inference-provider-profile.yaml\"\n  )"
+                "elif [[ \"${SLICE}\" == \"task\" ]]; then\n  profile_sources=(\n    \"${ROOT}/config/s5/tool-provider-profile.yaml\"\n    \"${ROOT}/config/task/inference-provider-profile.yaml\"\n  )"
             ),
             "the versioned Workflow E2E must install both Envelope-selected provider profiles"
         );

@@ -18,8 +18,8 @@ use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_admission::{Envelope, EnvelopeSpec};
 use steward_apiserver::{
     AuthenticatedCaller, AuthenticationError, BoxFuture, KubeRuntimeRepository,
-    RequestAuthenticator, StaticTaskWorkflowCatalog, TaskAuthenticationError, TaskIdentity,
-    TaskIdentityResolver, TaskWorkflow, router as api_router, task_router,
+    RequestAuthenticator, StaticTaskWorkflowCatalog, TaskApiConfig, TaskAuthenticationError,
+    TaskIdentity, TaskIdentityResolver, TaskWorkflow, router as api_router, task_router,
 };
 use steward_store::{
     EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, PgStore,
@@ -136,22 +136,23 @@ async fn seed_versioned_workflow_authority(
             .await?;
     }
 
-    if store
-        .envelope_requests(&identity.canonical_user_id)
-        .await?
-        .is_empty()
-    {
-        let envelope = versioned_user_envelope();
-        let reservation = store
-            .reserve_envelope_request(EnvelopeRequestReservationRequest {
-                owner_user_id: &identity.canonical_user_id,
-                template_id: "engineer",
-                template_revision: 1,
-                requested_envelope: &envelope,
-                idempotency_key: "repository-review-envelope",
-                actor: identity.canonical_user_id.as_str(),
-            })
+    let envelope = versioned_user_envelope();
+    if store.latest_envelope("engineer").await?.is_none() {
+        store
+            .insert_envelope("engineer", &envelope, "admin@example.com")
             .await?;
+    }
+    let reservation = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &identity.canonical_user_id,
+            template_id: "engineer",
+            template_revision: envelope.revision,
+            requested_envelope: &envelope,
+            idempotency_key: "repository-review-envelope",
+            actor: identity.canonical_user_id.as_str(),
+        })
+        .await?;
+    if reservation.record.status == EnvelopeRequestStatus::Pending {
         let digest = envelope_content_digest(&envelope)?;
         store
             .append_envelope_request_status(
@@ -194,7 +195,7 @@ fn versioned_user_envelope() -> Envelope {
                 provider: "openai".to_owned(),
                 model: "priced-model".to_owned(),
             }],
-            tools: vec![task_tool()],
+            tools: vec![task_tool(), versioned_task_tool()],
             budget: Budget {
                 monthly_limit: "0.75".to_owned(),
                 single_run_limit: Some("0.25".to_owned()),
@@ -278,6 +279,8 @@ async fn task_server_assertions_reference_persisted_canonical_principals()
         .map_err(|error| {
             io::Error::other(format!("fixture identity failed to resolve: {error:?}"))
         })?;
+    seed_versioned_workflow_authority(&store, &identity).await?;
+    seed_versioned_workflow_authority(&store, &identity).await?;
 
     assert_eq!(
         store
@@ -333,7 +336,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 provider: "openai".to_owned(),
                 model: "priced-model".to_owned(),
             }],
-            tools: vec![task_tool()],
+            tools: vec![task_tool(), versioned_task_tool()],
             budget: Budget {
                 monthly_limit: "1.00".to_owned(),
                 single_run_limit: None,
@@ -410,6 +413,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         decisions.clone(),
         task_identities,
         workflows,
+        TaskApiConfig::new(Some(env::var("STEWARD_TASK_MCP_GW_ENDPOINT").map_err(
+            |_| io::Error::other("STEWARD_TASK_MCP_GW_ENDPOINT is required"),
+        )?))
+        .map_err(io::Error::other)?,
     )
     .merge(api_router(
         runtimes,
@@ -700,6 +707,14 @@ fn task_tool() -> ToolGrant {
     ToolGrant {
         provider: "github".to_owned(),
         resource: "search_repositories".to_owned(),
+        action: "read".to_owned(),
+    }
+}
+
+fn versioned_task_tool() -> ToolGrant {
+    ToolGrant {
+        provider: "github".to_owned(),
+        resource: "get_file_contents".to_owned(),
         action: "read".to_owned(),
     }
 }
