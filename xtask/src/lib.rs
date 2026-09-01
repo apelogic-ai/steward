@@ -676,16 +676,15 @@ fn validate_provider_profile_upgrade_delta(
         let replacement_profile = replacement.profiles.get(profile_id).ok_or_else(|| {
             format!("replacement provider profile {profile_id} is required for upgrade")
         })?;
-        if current_profile.pointer("/runtime/requiredBinaries") != Some(&expected_current_binaries)
-            || replacement_profile.pointer("/runtime/requiredBinaries")
-                != Some(&expected_replacement_binaries)
+        if current_profile.get("binaries") != Some(&expected_current_binaries)
+            || replacement_profile.get("binaries") != Some(&expected_replacement_binaries)
         {
             return Err(format!(
                 "provider profile upgrade for {profile_id} permits only the declared 1.0.0 to 1.1.0 required-binary update"
             ));
         }
-        if profile_without_required_binaries(current_profile, profile_id)?
-            != profile_without_required_binaries(replacement_profile, profile_id)?
+        if profile_without_binaries(current_profile, profile_id)?
+            != profile_without_binaries(replacement_profile, profile_id)?
         {
             return Err(format!(
                 "provider profile upgrade must preserve environment bindings and policy fields for {profile_id}"
@@ -695,15 +694,13 @@ fn validate_provider_profile_upgrade_delta(
     Ok(())
 }
 
-fn profile_without_required_binaries(profile: &Value, profile_id: &str) -> Result<Value, String> {
+fn profile_without_binaries(profile: &Value, profile_id: &str) -> Result<Value, String> {
     let mut normalized = profile.clone();
-    let runtime = normalized
-        .get_mut("runtime")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| format!("rendered provider profile {profile_id} requires runtime"))?;
-    runtime.remove("requiredBinaries").ok_or_else(|| {
-        format!("rendered provider profile {profile_id} requires runtime.requiredBinaries")
-    })?;
+    normalized
+        .as_object_mut()
+        .ok_or_else(|| format!("rendered provider profile {profile_id} must be an object"))?
+        .remove("binaries")
+        .ok_or_else(|| format!("rendered provider profile {profile_id} requires binaries"))?;
     Ok(normalized)
 }
 
@@ -2277,9 +2274,9 @@ mod tests {
         RenderedProviderProfileBundle, install_rendered_provider_profile_bundle,
         local_test_context_is_safe, migration_base_candidates, migration_history_violations,
         neutrality_violations, reconcile_rendered_provider_profile_bundle,
-        render_provider_profile_bundle, secret_violations, select_migration_base,
-        upgrade_rendered_provider_profile_bundle, validate_provider_profile_bundle,
-        validate_register_content,
+        render_provider_profile_bundle, render_provider_profile_bundle_directory,
+        secret_violations, select_migration_base, upgrade_rendered_provider_profile_bundle,
+        validate_provider_profile_bundle, validate_register_content,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -2812,83 +2809,106 @@ mod tests {
     }
 
     #[test]
-    fn provider_profile_upgrade_requires_an_exact_supported_predecessor() -> Result<(), String> {
-        fn rendered(
-            version: &str,
-            gateway_origin: &str,
-            token_grant_url: &str,
-            service_cidr: &str,
-            required_binaries: &[&str],
-        ) -> RenderedProviderProfileBundle {
-            let profile = serde_json::json!({
-                "id": "steward-mcp-gw",
-                "network": {
-                    "endpoint": gateway_origin,
-                    "allowedCidrs": [service_cidr]
-                },
-                "authorization": {
-                    "tokenGrantUrl": token_grant_url
-                },
-                "runtime": {"requiredBinaries": required_binaries}
-            });
-            let mut profiles = BTreeMap::new();
-            profiles.insert("steward-mcp-gw".to_owned(), profile.clone());
-            RenderedProviderProfileBundle {
-                profiles,
-                state: serde_json::json!({
-                    "schema": "steward.provider-profile-install-state/v1",
-                    "bundle": {"id": "steward-runtime-providers", "version": version},
-                    "profiles": {"steward-mcp-gw": profile}
-                }),
-            }
-        }
-
-        let current_binaries = ["/usr/bin/curl", "/usr/local/bin/curl"];
-        let replacement_binaries = [
-            "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/codex/codex",
-            "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex",
-            "/usr/bin/curl",
-            "/usr/local/bin/curl",
-        ];
-        let current = rendered(
+    fn provider_profile_upgrade_accepts_real_rendered_bundles() -> Result<(), String> {
+        let current = render_test_provider_profile_bundle(
+            "v1",
             "1.0.0",
             "https://mcp.gateway.test",
-            "https://mint.gateway.test/token",
+            "https://inference.gateway.test",
+            "https://mint.gateway.test",
             "10.42.0.0/16",
-            &current_binaries,
-        );
-        let replacement = rendered(
+        )?;
+        let replacement = render_test_provider_profile_bundle(
+            "v1.1.0",
             "1.1.0",
             "https://mcp.gateway.test",
-            "https://mint.gateway.test/token",
+            "https://inference.gateway.test",
+            "https://mint.gateway.test",
             "10.42.0.0/16",
-            &replacement_binaries,
-        );
-        let rebounds = [
-            rendered(
-                "1.1.0",
-                "https://different.gateway.test",
-                "https://mint.gateway.test/token",
-                "10.42.0.0/16",
-                &replacement_binaries,
-            ),
-            rendered(
-                "1.1.0",
-                "https://mcp.gateway.test",
-                "https://different-mint.gateway.test/token",
-                "10.42.0.0/16",
-                &replacement_binaries,
-            ),
-            rendered(
-                "1.1.0",
-                "https://mcp.gateway.test",
-                "https://mint.gateway.test/token",
-                "10.43.0.0/16",
-                &replacement_binaries,
-            ),
-        ];
+        )?;
+        for profile in current
+            .profiles
+            .values()
+            .chain(replacement.profiles.values())
+        {
+            if profile.get("binaries").is_none() || profile.get("runtime").is_some() {
+                return Err(format!(
+                    "real provider profile renderer must emit top-level binaries: {profile}"
+                ));
+            }
+        }
         let directory = std::env::temp_dir().join(format!(
             "steward-provider-profile-upgrade-test-{}-{}",
+            std::process::id(),
+            NEXT_RENDER_INSTALL_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&directory).map_err(|error| format!("create fixture: {error}"))?;
+        let output = directory.join("installed");
+
+        let result = (|| {
+            install_rendered_provider_profile_bundle(&output, &current)?;
+            upgrade_rendered_provider_profile_bundle(&output, &current, &replacement)?;
+            reconcile_rendered_provider_profile_bundle(&output, &replacement)?;
+            Ok(())
+        })();
+        fs::remove_dir_all(&directory).map_err(|error| format!("remove fixture: {error}"))?;
+        result
+    }
+
+    #[test]
+    fn provider_profile_upgrade_requires_an_exact_supported_predecessor() -> Result<(), String> {
+        let current = render_test_provider_profile_bundle(
+            "v1",
+            "1.0.0",
+            "https://mcp.gateway.test",
+            "https://inference.gateway.test",
+            "https://mint.gateway.test",
+            "10.42.0.0/16",
+        )?;
+        let replacement = render_test_provider_profile_bundle(
+            "v1.1.0",
+            "1.1.0",
+            "https://mcp.gateway.test",
+            "https://inference.gateway.test",
+            "https://mint.gateway.test",
+            "10.42.0.0/16",
+        )?;
+        let rebounds = [
+            render_test_provider_profile_bundle(
+                "v1.1.0",
+                "1.1.0",
+                "https://different.gateway.test",
+                "https://inference.gateway.test",
+                "https://mint.gateway.test",
+                "10.42.0.0/16",
+            )?,
+            render_test_provider_profile_bundle(
+                "v1.1.0",
+                "1.1.0",
+                "https://mcp.gateway.test",
+                "https://different-inference.gateway.test",
+                "https://mint.gateway.test",
+                "10.42.0.0/16",
+            )?,
+            render_test_provider_profile_bundle(
+                "v1.1.0",
+                "1.1.0",
+                "https://mcp.gateway.test",
+                "https://inference.gateway.test",
+                "https://different-mint.gateway.test",
+                "10.42.0.0/16",
+            )?,
+            render_test_provider_profile_bundle(
+                "v1.1.0",
+                "1.1.0",
+                "https://mcp.gateway.test",
+                "https://inference.gateway.test",
+                "https://mint.gateway.test",
+                "10.43.0.0/16",
+            )?,
+        ];
+        let directory = std::env::temp_dir().join(format!(
+            "steward-provider-profile-upgrade-policy-test-{}-{}",
             std::process::id(),
             NEXT_RENDER_INSTALL_ID.fetch_add(1, Ordering::Relaxed),
         ));
@@ -2911,13 +2931,15 @@ mod tests {
             upgrade_rendered_provider_profile_bundle(&output, &current, &replacement)?;
             reconcile_rendered_provider_profile_bundle(&output, &replacement)?;
 
-            let unsupported = rendered(
-                "1.2.0",
+            let mut unsupported = render_test_provider_profile_bundle(
+                "v1.1.0",
+                "1.1.0",
                 "https://mcp.gateway.test",
-                "https://mint.gateway.test/token",
+                "https://inference.gateway.test",
+                "https://mint.gateway.test",
                 "10.42.0.0/16",
-                &replacement_binaries,
-            );
+            )?;
+            unsupported.state["bundle"]["version"] = serde_json::json!("1.2.0");
             let unsupported_result =
                 upgrade_rendered_provider_profile_bundle(&output, &replacement, &unsupported);
             if !matches!(unsupported_result, Err(ref error) if error.contains("supported migration"))
@@ -2943,6 +2965,50 @@ mod tests {
         })();
         fs::remove_dir_all(&directory).map_err(|error| format!("remove fixture: {error}"))?;
         result
+    }
+
+    fn render_test_provider_profile_bundle(
+        bundle_directory: &str,
+        version: &str,
+        mcp_gateway_origin: &str,
+        inference_gateway_origin: &str,
+        runtime_grant_origin: &str,
+        service_cidr: &str,
+    ) -> Result<RenderedProviderProfileBundle, String> {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or_else(|| "xtask manifest directory must have a repository parent".to_owned())?;
+        let inputs = serde_json::json!({
+            "schema": "steward.provider-profile-inputs/v1",
+            "bundle": {
+                "id": "steward-runtime-providers",
+                "version": version
+            },
+            "profiles": [
+                {
+                    "id": "steward-mcp-gw",
+                    "inputs": {
+                        "gateway-origin": mcp_gateway_origin,
+                        "runtime-grant-origin": runtime_grant_origin,
+                        "service-cidrs": [service_cidr]
+                    }
+                },
+                {
+                    "id": "steward-litellm",
+                    "inputs": {
+                        "gateway-origin": inference_gateway_origin,
+                        "runtime-grant-origin": runtime_grant_origin,
+                        "service-cidrs": [service_cidr]
+                    }
+                }
+            ]
+        });
+        render_provider_profile_bundle_directory(
+            &repository
+                .join("config/provider-profile-bundle")
+                .join(bundle_directory),
+            &inputs.to_string(),
+        )
     }
 
     #[test]
