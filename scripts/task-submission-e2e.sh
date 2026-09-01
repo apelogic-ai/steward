@@ -25,6 +25,13 @@ for command in bash docker; do
   fi
 done
 
+docker run --rm \
+  --entrypoint bun \
+  --volume "${root}/config/s5:/workspace/config/s5:ro" \
+  --workdir /workspace \
+  "${mcp_gw_image}" \
+  test config/s5/capture-proxy.test.ts
+
 docker build \
   --file "${root}/e2e/Dockerfile.workflow-sandbox" \
   --label "steward.test/run-id=${run_id}" \

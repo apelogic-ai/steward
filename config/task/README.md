@@ -9,6 +9,7 @@ worker is part of the normal `steward-controller` process.
 |---|---|
 | `STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE` | Required and non-empty. DEV uses `https://kubernetes.default.svc`. |
 | `STEWARD_TASK_WORKFLOWS_JSON` | Required JSON array matching `workflows.example.json`. Commands are server-selected; clients cannot supply them. |
+| `STEWARD_TASK_MCP_GW_ENDPOINT` | Exact HTTP(S) streamable MCP endpoint. Required only when a versioned Codex task resolves non-empty tool authority; otherwise the task fails before reservation or execution. |
 | `STEWARD_APISERVER_BIND` | HTTPS listener, default `0.0.0.0:8443`. Expose the existing apiserver Service port to this target port. |
 | Task API enablement | Enabled whenever the production apiserver starts. There is no bypass flag; invalid or absent Task configuration fails startup. |
 | `STEWARD_DATABASE_URL` | Existing Postgres connection reference. Keep the value in a Secret, never this repository. |
@@ -19,6 +20,13 @@ exchanged token to TokenReview with the configured Kubernetes API server audienc
 JWT still has `aud=steward-task-api`, matching the EKS external OIDC client ID; Steward does not
 parse or reinterpret that JWT. See `docs/task-submission-api.md` for the required verified
 username/groups and the external mapper boundary.
+
+For a tool-bearing versioned Codex Workflow, Steward writes the configured MCP endpoint and a
+bearer environment-variable name into the task's fresh `CODEX_HOME/config.toml`. The command sets
+that variable only to OpenShell's documented non-secret provider placeholder. OpenShell derives
+the runtime bearer at the governed egress boundary; the plan, database, and Codex configuration
+never contain a provider credential. Tool-less plans contain no MCP server entry or MCP bearer
+variable and do not require the endpoint.
 
 ## Controller inputs
 

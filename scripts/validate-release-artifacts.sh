@@ -58,6 +58,7 @@ image_values=(
   --set "images.mint.digest=${digest2}"
   --set 'runtimeNamespaces[0]=team-a'
   --set-string config.controller.openshellRuntimeClassName=openshell-runc
+  --set-string config.apiserver.mcpGatewayEndpoint=https://mcp-gw.example.test/mcp
 )
 stable_bridge_values=(
   --set stableBridge.enabled=true
@@ -656,6 +657,7 @@ grep -q 'failurePolicy: Fail' "${rendered}"
 grep -q 'driver: csi.spiffe.io' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_SERVER_NAME' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME' "${rendered}"
+grep -Fq '            - { name: STEWARD_TASK_MCP_GW_ENDPOINT, value: "https://mcp-gw.example.test/mcp" }' "${rendered}"
 grep -Eq 'name: STEWARD_OPENSHELL_TASK_LOG_MODE, value: "?off"?' "${rendered}"
 grep -Eq 'value: "?openshell-runc"?' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE' "${rendered}"
@@ -694,6 +696,18 @@ then
   echo "an invalid OpenShell task log mode must fail chart validation" >&2
   exit 1
 fi
+for invalid_task_mcp_endpoint in \
+  'ftp://mcp-gw.example.test/mcp' \
+  'https://alice@mcp-gw.example.test/mcp' \
+  'https://mcp-gw.example.test/mcp?target=other'
+do
+  if helm lint "${root}/charts/steward" "${image_values[@]}" \
+    --set-string "config.apiserver.mcpGatewayEndpoint=${invalid_task_mcp_endpoint}" >/dev/null 2>&1
+  then
+    echo "the task MCP-GW endpoint must reject non-HTTP, userinfo, and query-bearing values: ${invalid_task_mcp_endpoint}" >&2
+    exit 1
+  fi
+done
 test "$(grep -c 'secretName: steward-openshell-client' "${rendered}")" -eq 1
 grep -q 'serviceAccountToken:' "${rendered}"
 grep -q 'audience: apelogic-workload-exchange' "${rendered}"

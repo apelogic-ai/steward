@@ -1,23 +1,24 @@
-id: steward-mcp-gw
-display_name: Steward MCP gateway
-description: Runtime-scoped HOP-1 exchange through the S5 evidence proxy
-category: source_control
+id: steward-litellm
+display_name: Steward deterministic inference fixture
+description: Runtime-scoped deterministic Responses fixture for the local Task E2E
+category: inference
+inference_capable: true
 credentials:
-  - name: access_token
-    description: Short-lived HOP-1 derived from the sandbox JWT-SVID
+  - name: api_key
+    description: Runtime-bound inference credential
     required: false
     auth_style: bearer
     header_name: Authorization
     token_grant:
-      token_endpoint: http://hop1-capture-tools.steward-system.svc.cluster.local:8085/token-tools
-      audience: steward-mcp
+      token_endpoint: http://steward-mint.steward-system.svc.cluster.local:8080/token
+      audience: steward-inference
       jwt_svid_audience: steward-mint
       client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-spiffe
-      scopes: [mcp]
+      scopes: [inference]
       cache_ttl_seconds: 2
 endpoints:
-  - host: hop1-capture-tools.steward-system.svc.cluster.local
-    port: 8085
+  - host: litellm-litellm.litellm.svc.cluster.local
+    port: 4000
     protocol: rest
     tls: none
     access: read-write

@@ -193,7 +193,7 @@ if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
 fi
 namespaces=(steward-system team-a)
 if [[ "${SLICE}" == "task" ]]; then
-  namespaces+=(steward-workflows)
+  namespaces+=(steward-workflows litellm)
 fi
 for namespace in "${namespaces[@]}"; do
   "${KUBECTL[@]}" create namespace "${namespace}" --dry-run=client -o yaml |
@@ -233,6 +233,11 @@ if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   "${KUBECTL[@]}" -n steward-system create secret generic steward-s5-mcp-gw \
     --from-file="encryption-key=${encryption_key}" \
     --from-file="introspection-client=${introspection_client}" \
+    --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
+fi
+if [[ "${SLICE}" == "task" ]]; then
+  "${KUBECTL[@]}" -n litellm create configmap steward-task-codex-responses \
+    --from-file="codex-responses-fixture.ts=${ROOT}/config/task/codex-responses-fixture.ts" \
     --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
 fi
 rendered_stack="${STEWARD_RUN_DIR}/s2-stack.yaml"
@@ -283,6 +288,7 @@ if [[ "${SLICE}" == "s5" ]]; then
   "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-poc-api --timeout=180s
 fi
 if [[ "${SLICE}" == "task" ]]; then
+  "${KUBECTL[@]}" -n litellm rollout status deployment/codex-responses --timeout=180s
   "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-task-server --timeout=180s
 fi
 
@@ -305,7 +311,7 @@ if [[ "${SLICE}" == "s5" ]]; then
 elif [[ "${SLICE}" == "task" ]]; then
   profile_sources=(
     "${ROOT}/config/s5/tool-provider-profile.yaml"
-    "${ROOT}/config/s5/inference-provider-profile.yaml"
+    "${ROOT}/config/task/inference-provider-profile.yaml"
   )
 else
   profile_sources=("${ROOT}/config/s2/provider-profile.yaml")

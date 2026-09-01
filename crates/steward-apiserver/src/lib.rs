@@ -27,9 +27,9 @@ pub use github_actions::{
 
 pub use tasks::{
     ConfiguredTaskIdentityResolver, KubernetesTaskIdentityResolver, StaticTaskWorkflowCatalog,
-    TaskAdmissionDelta, TaskArchive, TaskAuthenticationError, TaskErrorResponse, TaskIdentity,
-    TaskIdentityResolver, TaskStatusResponse, TaskSubmissionLedger, TaskSubmissionRequest,
-    TaskWorkflow, TaskWorkflowCatalog, task_router,
+    TaskAdmissionDelta, TaskApiConfig, TaskArchive, TaskAuthenticationError, TaskErrorResponse,
+    TaskIdentity, TaskIdentityResolver, TaskStatusResponse, TaskSubmissionLedger,
+    TaskSubmissionRequest, TaskWorkflow, TaskWorkflowCatalog, task_router,
 };
 pub use workflows::{WorkflowReference, WorkflowReferenceError};
 
@@ -800,6 +800,7 @@ pub enum ApiError {
     TaskWorkflowNotFound,
     TaskNotReady,
     TaskOutputNotReady,
+    TaskRuntimeContractUnavailable(String),
 }
 
 impl fmt::Display for ApiError {
@@ -2070,7 +2071,9 @@ impl IntoResponse for ApiError {
                 | StoreError::WorkflowNotFound,
             ) => StatusCode::NOT_FOUND,
             Self::Store(StoreError::CanonicalIdentityInactive) => StatusCode::FORBIDDEN,
-            Self::TaskNotReady => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TaskNotReady | Self::TaskRuntimeContractUnavailable(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::TaskOutputNotReady => StatusCode::CONFLICT,
             Self::MissingEnvelope | Self::MissingRuntimeUid => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InvalidBudgetIncrease { .. } | Self::Admission(_) => {
@@ -3010,7 +3013,7 @@ mod tests {
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email,
-        ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, TaskPhase,
+        ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, TaskPhase, ToolGrant,
     };
     use tower::ServiceExt;
     use utoipa::OpenApi;
@@ -3026,13 +3029,17 @@ mod tests {
         ApiError, AuthenticatedCaller, AuthenticationError, BoxFuture, BudgetIncrease,
         CreateRuntimeRequest, KubernetesTokenReviewAudience, RequestAuthenticator,
         RuntimeCreateError, RuntimeRepository, STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP,
-        StaticTaskWorkflowCatalog, SubmissionOutcome, TaskAuthenticationError, TaskIdentity,
-        TaskIdentityResolver, TaskSubmissionLedger, TaskSubmissionRequest, TaskWorkflow,
-        caller_from_kubernetes_user, caller_from_token_review, router, spec_digest,
+        StaticTaskWorkflowCatalog, SubmissionOutcome, TaskApiConfig, TaskAuthenticationError,
+        TaskIdentity, TaskIdentityResolver, TaskSubmissionLedger, TaskSubmissionRequest,
+        TaskWorkflow, caller_from_kubernetes_user, caller_from_token_review, router, spec_digest,
         submit_budget_increase, submit_runtime_request, task_router, token_review_request,
     };
 
     const KUBERNETES_TOKEN_REVIEW_AUDIENCE: &str = "https://kubernetes.default.svc";
+
+    fn task_api_config() -> Result<TaskApiConfig, String> {
+        TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))
+    }
 
     fn browser_cookie(response: &Response, name: &str) -> Result<String, String> {
         response
@@ -5866,6 +5873,32 @@ mod tests {
             })
         }
 
+        fn task_by_idempotency<'a>(
+            &'a self,
+            submitter_service: &'a str,
+            owner_user_id: &'a str,
+            idempotency_key: &'a str,
+        ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
+            Box::pin(async move {
+                self.tasks
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database("fake task ledger lock was poisoned".to_owned())
+                    })
+                    .map(|tasks| {
+                        tasks
+                            .iter()
+                            .find(|task| {
+                                task.submitter_service == submitter_service
+                                    && task.owner_user_id.as_deref() == Some(owner_user_id)
+                                    && task.idempotency_key == idempotency_key
+                                    && task.identity_binding_state == "bound"
+                            })
+                            .cloned()
+                    })
+            })
+        }
+
         fn reserve_task<'a>(
             &'a self,
             request: TaskReservationRequest<'a>,
@@ -8334,6 +8367,7 @@ mod tests {
             FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+            task_api_config()?,
         );
 
         let unknown = app
@@ -8430,6 +8464,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn versioned_task_retry_uses_persisted_plan_across_runtime_contract_changes()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let tool = ToolGrant {
+            provider: "github".to_owned(),
+            resource: "get_file_contents".to_owned(),
+            action: "read".to_owned(),
+        };
+        {
+            let mut envelopes = ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+            let envelope = envelopes
+                .first_mut()
+                .ok_or_else(|| "versioned task fixture requires a User Envelope".to_owned())?;
+            envelope.requested_envelope.spec.tools = vec![tool.clone()];
+            envelope
+                .approved_envelope
+                .as_mut()
+                .ok_or_else(|| "versioned task fixture requires an approved Envelope".to_owned())?
+                .spec
+                .tools = vec![tool.clone()];
+        }
+        ledger
+            .envelope
+            .lock()
+            .map_err(|_| "fake service Envelope ledger lock was poisoned")?
+            .spec
+            .tools = vec![tool];
+        let request = |workflow: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "runtime-contract-retry")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"workflow":"{workflow}"}}"#)))
+                .map_err(|error| format!("build versioned Workflow retry: {error}"))
+        };
+        let first_app = task_router(
+            MultiRuntimeRepository::default(),
+            ledger.clone(),
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            TaskApiConfig::new(Some("https://mcp-a.example.test/mcp".to_owned()))?,
+        );
+        let first = first_app
+            .oneshot(request("repository-review@1")?)
+            .await
+            .map_err(|error| format!("submit initial versioned Workflow: {error}"))?;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_body = to_bytes(first.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read initial versioned Workflow response: {error}"))?;
+        let first_task_uid = serde_json::from_slice::<serde_json::Value>(&first_body)
+            .map_err(|error| format!("parse initial versioned Workflow response: {error}"))?
+            .get("taskUid")
+            .cloned();
+
+        let retry_app = task_router(
+            MultiRuntimeRepository::default(),
+            ledger.clone(),
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            TaskApiConfig::default(),
+        );
+        let retry = retry_app
+            .clone()
+            .oneshot(request("repository-review@1")?)
+            .await
+            .map_err(|error| format!("retry versioned Workflow without MCP config: {error}"))?;
+        assert_eq!(
+            retry.status(),
+            StatusCode::ACCEPTED,
+            "an identical retry must return the persisted plan without resolving current MCP configuration"
+        );
+        let retry_body = to_bytes(retry.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read versioned Workflow retry response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&retry_body)
+                .map_err(|error| format!("parse versioned Workflow retry response: {error}"))?
+                .get("taskUid")
+                .cloned(),
+            first_task_uid,
+            "an identical retry must return the original task"
+        );
+
+        let conflicting = retry_app
+            .oneshot(request("different-workflow@1")?)
+            .await
+            .map_err(|error| format!("submit conflicting versioned Workflow retry: {error}"))?;
+        assert_eq!(
+            conflicting.status(),
+            StatusCode::CONFLICT,
+            "the persisted retry path must still reject a different caller-owned Workflow pin"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn versioned_task_route_applies_service_envelope_as_a_narrowing_ceiling()
     -> Result<(), String> {
         let runtimes = MultiRuntimeRepository::default();
@@ -8448,6 +8586,7 @@ mod tests {
             FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+            task_api_config()?,
         );
 
         let response = app
@@ -8520,6 +8659,7 @@ mod tests {
                 ttl: Duration("24h".to_owned()),
                 command: vec!["agent-v1".to_owned()],
             }]),
+            task_api_config()?,
         ));
 
         let response = app
@@ -8590,6 +8730,7 @@ mod tests {
             FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+            task_api_config()?,
         ));
 
         let response = app
@@ -8662,6 +8803,7 @@ mod tests {
             decisions,
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+            task_api_config()?,
         ));
         let submitted = app
             .clone()
@@ -8916,6 +9058,7 @@ mod tests {
             FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+            task_api_config()?,
         ));
         let mut submissions = Vec::new();
         for bearer in ["github-assertion", "github-bob-assertion"] {
@@ -9056,6 +9199,7 @@ mod tests {
             decisions,
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([workflow]),
+            task_api_config()?,
         ));
         let request = || {
             Request::builder()

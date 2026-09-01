@@ -255,11 +255,14 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     assert_eq!(submitted.runtime_spec.llms.len(), 1);
     assert_eq!(submitted.runtime_spec.llms[0].provider, "openai");
     assert_eq!(submitted.runtime_spec.llms[0].model, "priced-model");
-    assert_eq!(submitted.runtime_spec.tools.len(), 1);
-    assert_eq!(submitted.runtime_spec.tools[0].provider, "github");
-    assert_eq!(
-        submitted.runtime_spec.tools[0].resource,
-        "search_repositories"
+    assert_eq!(submitted.runtime_spec.tools.len(), 2);
+    assert!(
+        submitted.runtime_spec.tools.iter().any(|tool| {
+            tool.provider == "github"
+                && tool.resource == "get_file_contents"
+                && tool.action == "read"
+        }),
+        "the versioned Task authority must include github:repository:get_file_contents"
     );
     assert_eq!(submitted.runtime_spec.budget.monthly_limit, "0.75");
     assert_eq!(
@@ -282,7 +285,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         Some("256Mi")
     );
     assert_eq!(
-        submitted.agent_command.last().map(String::as_str),
+        submitted.agent_command.get(4).map(String::as_str),
         Some("Review the repository state that triggered this GitHub Actions run."),
         "the persisted server-owned command must carry the exact immutable Workflow prompt"
     );
@@ -292,6 +295,15 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
             .iter()
             .any(|argument| argument.contains("codex-cli 0.117.0")),
         "the persisted server-owned command must require the exact Workflow agent version"
+    );
+    assert!(
+        submitted.agent_command.get(6).is_some_and(|config| {
+            config.contains("[mcp_servers.steward]")
+                && config
+                    .contains("http://hop1-capture-tools.steward-system.svc.cluster.local:8085/mcp")
+                && config.contains("bearer_token_env_var = \"STEWARD_MCP_GW_BEARER_TOKEN\"")
+        }),
+        "the persisted tool-bearing Codex plan must contain the server-configured MCP-GW contract"
     );
 
     let versioned_bound =
@@ -331,9 +343,9 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         "extract repository-review output tar",
     )?;
     assert_eq!(
-        fs::read_to_string(versioned_output_dir.join("result.txt"))?,
+        fs::read_to_string(versioned_output_dir.join("out/result.txt"))?,
         "Repository review completed by codex@0.117.0.\n",
-        "the approved Workflow agent must produce the standard non-empty result artifact"
+        "real Codex must receive github:repository:get_file_contents through MCP-GW before producing its declared output"
     );
     let run = store
         .agent_runs(&AgentRunQuery {
@@ -1172,6 +1184,7 @@ fn wait_for(
     predicate: impl Fn(&serde_json::Value) -> bool,
     run_dir: &Path,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut last_status = serde_json::Value::Null;
     for _attempt in 0..240 {
         let value = task_status(base_url, task_uid, assertion, run_dir)?;
         if predicate(&value) {
@@ -1185,9 +1198,13 @@ fn wait_for(
             ))
             .into());
         }
+        last_status = value;
         std::thread::sleep(Duration::from_secs(1));
     }
-    Err(io::Error::other(format!("Task {task_uid} did not reach expected state")).into())
+    Err(io::Error::other(format!(
+        "Task {task_uid} did not reach expected state; last status: {last_status}"
+    ))
+    .into())
 }
 
 fn task_status(

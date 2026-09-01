@@ -15,6 +15,7 @@ type CapturedRequest = {
   body: string;
   contentType: string;
   protocolVersion?: string;
+  sessionId?: string;
 };
 
 let inferenceRequest: CapturedRequest | undefined;
@@ -28,15 +29,15 @@ type TokenGrant = {
 
 let tokenGrant: TokenGrant | undefined;
 
-const forwardedResponse = async (response: Response): Promise<Response> =>
-  new Response(await response.arrayBuffer(), {
+const forwardedResponse = async (response: Response): Promise<Response> => {
+  const headers = new Headers(response.headers);
+  headers.set("cache-control", "no-store");
+  headers.set("connection", "close");
+  return new Response(response.body, {
     status: response.status,
-    headers: {
-      "cache-control": "no-store",
-      "content-type":
-        response.headers.get("content-type") ?? "application/octet-stream",
-    },
+    headers,
   });
+};
 
 const captureBearerRequest = async (
   request: Request,
@@ -55,15 +56,15 @@ const captureBearerRequest = async (
       request.headers.get("content-type") ?? "application/octet-stream",
     protocolVersion:
       request.headers.get("mcp-protocol-version") ?? undefined,
+    sessionId: request.headers.get("mcp-session-id") ?? undefined,
   };
   remember(captured);
-  return forwardedResponse(
-    await fetch(target, {
-      method: "POST",
-      headers: requestHeaders(captured),
-      body,
-    }),
-  );
+  const upstream = await fetch(target, {
+    method: "POST",
+    headers: requestHeaders(captured),
+    body,
+  });
+  return forwardedResponse(upstream);
 };
 
 const requestHeaders = (captured: CapturedRequest): Headers => {
@@ -74,6 +75,7 @@ const requestHeaders = (captured: CapturedRequest): Headers => {
   if (captured.protocolVersion) {
     headers.set("mcp-protocol-version", captured.protocolVersion);
   }
+  if (captured.sessionId) headers.set("mcp-session-id", captured.sessionId);
   return headers;
 };
 

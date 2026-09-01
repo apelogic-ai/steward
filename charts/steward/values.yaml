@@ -98,6 +98,9 @@ config:
     jiraAccountEmail: alice@example.com
     kubernetesTokenReviewAudience: https://kubernetes.default.svc
     taskWorkflowsJson: "[]"
+    # Exact streamable HTTP endpoint rendered only into tool-bearing Codex task plans.
+    # Empty keeps tool-less tasks available and makes tool-bearing submission fail closed.
+    mcpGatewayEndpoint: ""
   controller:
     openshellEndpoint: https://gateway.example.test:8080
     openshellServerName: gateway.example.test

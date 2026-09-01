@@ -23,6 +23,20 @@ Bun.serve({
       method?: string;
       params?: { name?: string };
     };
+    if (body.method === "initialize") {
+      return Response.json({
+        jsonrpc: "2.0",
+        id: body.id ?? null,
+        result: {
+          protocolVersion: "2025-06-18",
+          capabilities: { tools: {} },
+          serverInfo: { name: "neutral-github-fixture", version: "1.0.0" },
+        },
+      });
+    }
+    if (body.method === "notifications/initialized") {
+      return new Response(null, { status: 202 });
+    }
     if (body.method === "tools/list") {
       return Response.json({
         jsonrpc: "2.0",
@@ -33,6 +47,20 @@ Bun.serve({
               name: "search_repositories",
               description: "Return the neutral fixture repository.",
               inputSchema: { type: "object", additionalProperties: false },
+            },
+            {
+              name: "get_file_contents",
+              description: "Return neutral fixture file contents.",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  owner: { type: "string" },
+                  repo: { type: "string" },
+                  path: { type: "string" },
+                },
+                required: ["owner", "repo", "path"],
+                additionalProperties: false,
+              },
             },
             {
               name: "create_issue",
@@ -49,6 +77,15 @@ Bun.serve({
         id: body.id ?? null,
         result: {
           content: [{ type: "text", text: "example-org/fixture-repository" }],
+        },
+      });
+    }
+    if (body.method === "tools/call" && body.params?.name === "get_file_contents") {
+      return Response.json({
+        jsonrpc: "2.0",
+        id: body.id ?? null,
+        result: {
+          content: [{ type: "text", text: "governed fixture file contents" }],
         },
       });
     }
