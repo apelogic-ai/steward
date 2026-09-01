@@ -1726,6 +1726,8 @@ mod tests {
             .map_err(|error| format!("Steward values schema is required: {error}"))?;
         let templates = fs::read_to_string(root().join("charts/steward/templates/all.yaml"))
             .map_err(|error| format!("Steward chart templates are required: {error}"))?;
+        let chart_readme = fs::read_to_string(root().join("charts/steward/README.md"))
+            .map_err(|error| format!("Steward chart README is required: {error}"))?;
 
         assert!(
             controller.contains("STEWARD_OPENSHELL_TASK_LOG_MODE"),
@@ -1735,16 +1737,15 @@ mod tests {
             adapter.contains("exec_sandbox"),
             "the OpenShell task path must consume the live sandbox execution stream"
         );
-        for required_field in ["runtime_uid", "workspace", "sandbox", "stream", "bytes"] {
+        for required_field in ["runtime_uid", "workspace", "sandbox", "stream", "message"] {
             assert!(
                 adapter.contains(required_field),
                 "each task-process log record must carry {required_field}"
             );
         }
         assert!(
-            adapter.contains("message.len()")
-                && !adapter.contains("escaped_task_log_value(message)"),
-            "task-controlled stdout and stderr must never be copied into controller logs"
+            adapter.contains("escaped_task_log_value(message)") && !adapter.contains("bytes={}"),
+            "full task logging must copy escaped stdout and stderr into controller logs"
         );
         assert!(
             values.contains("openshellTaskLogMode: \"off\""),
@@ -1758,6 +1759,13 @@ mod tests {
         assert!(
             templates.contains("STEWARD_OPENSHELL_TASK_LOG_MODE"),
             "the controller Deployment must receive STEWARD_OPENSHELL_TASK_LOG_MODE"
+        );
+        assert!(
+            chart_readme.contains("**Warning:** `full` logging copies task-controlled output")
+                && chart_readme.contains("without redaction")
+                && chart_readme.contains("credentials, or other")
+                && chart_readme.contains("sensitive information"),
+            "the chart README must warn that full task logging may expose sensitive output"
         );
 
         Ok(())
