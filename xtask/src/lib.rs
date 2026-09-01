@@ -529,6 +529,7 @@ pub fn upgrade_rendered_provider_profile_bundle(
             current_identity.0, current_identity.1, replacement_identity.0, replacement_identity.1
         ));
     }
+    validate_provider_profile_upgrade_delta(current, replacement)?;
 
     let parent = output_directory.parent().ok_or_else(|| {
         format!(
@@ -619,6 +620,91 @@ fn rendered_provider_profile_bundle_identity(
         .and_then(Value::as_str)
         .ok_or_else(|| "rendered provider profile state requires a bundle version".to_owned())?;
     Ok((id, version))
+}
+
+fn validate_provider_profile_upgrade_delta(
+    current: &RenderedProviderProfileBundle,
+    replacement: &RenderedProviderProfileBundle,
+) -> Result<(), String> {
+    let current_state_profiles = current
+        .state
+        .get("profiles")
+        .ok_or_else(|| "current rendered provider profile state requires profiles".to_owned())?;
+    let replacement_state_profiles = replacement.state.get("profiles").ok_or_else(|| {
+        "replacement rendered provider profile state requires profiles".to_owned()
+    })?;
+    let current_profiles = Value::Object(
+        current
+            .profiles
+            .iter()
+            .map(|(id, profile)| (id.clone(), profile.clone()))
+            .collect(),
+    );
+    let replacement_profiles = Value::Object(
+        replacement
+            .profiles
+            .iter()
+            .map(|(id, profile)| (id.clone(), profile.clone()))
+            .collect(),
+    );
+    if current_state_profiles != &current_profiles
+        || replacement_state_profiles != &replacement_profiles
+    {
+        return Err(
+            "provider profile upgrade requires each install-state profile to exactly match its rendered profile"
+                .to_owned(),
+        );
+    }
+
+    if current.profiles.keys().collect::<BTreeSet<_>>()
+        != replacement.profiles.keys().collect::<BTreeSet<_>>()
+    {
+        return Err(
+            "provider profile upgrade must preserve all environment bindings and profile identities"
+                .to_owned(),
+        );
+    }
+
+    let expected_current_binaries = serde_json::json!(["/usr/bin/curl", "/usr/local/bin/curl"]);
+    let expected_replacement_binaries = serde_json::json!([
+        "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/codex/codex",
+        "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex",
+        "/usr/bin/curl",
+        "/usr/local/bin/curl"
+    ]);
+    for (profile_id, current_profile) in &current.profiles {
+        let replacement_profile = replacement.profiles.get(profile_id).ok_or_else(|| {
+            format!("replacement provider profile {profile_id} is required for upgrade")
+        })?;
+        if current_profile.pointer("/runtime/requiredBinaries") != Some(&expected_current_binaries)
+            || replacement_profile.pointer("/runtime/requiredBinaries")
+                != Some(&expected_replacement_binaries)
+        {
+            return Err(format!(
+                "provider profile upgrade for {profile_id} permits only the declared 1.0.0 to 1.1.0 required-binary update"
+            ));
+        }
+        if profile_without_required_binaries(current_profile, profile_id)?
+            != profile_without_required_binaries(replacement_profile, profile_id)?
+        {
+            return Err(format!(
+                "provider profile upgrade must preserve environment bindings and policy fields for {profile_id}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn profile_without_required_binaries(profile: &Value, profile_id: &str) -> Result<Value, String> {
+    let mut normalized = profile.clone();
+    let runtime = normalized
+        .get_mut("runtime")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| format!("rendered provider profile {profile_id} requires runtime"))?;
+    runtime.remove("requiredBinaries").ok_or_else(|| {
+        format!("rendered provider profile {profile_id} requires runtime.requiredBinaries")
+    })?;
+    Ok(normalized)
 }
 
 fn write_rendered_provider_profile_bundle(
@@ -2727,8 +2813,24 @@ mod tests {
 
     #[test]
     fn provider_profile_upgrade_requires_an_exact_supported_predecessor() -> Result<(), String> {
-        fn rendered(version: &str, policy: &str) -> RenderedProviderProfileBundle {
-            let profile = serde_json::json!({"id": "steward-mcp-gw", "policy": policy});
+        fn rendered(
+            version: &str,
+            gateway_origin: &str,
+            token_grant_url: &str,
+            service_cidr: &str,
+            required_binaries: &[&str],
+        ) -> RenderedProviderProfileBundle {
+            let profile = serde_json::json!({
+                "id": "steward-mcp-gw",
+                "network": {
+                    "endpoint": gateway_origin,
+                    "allowedCidrs": [service_cidr]
+                },
+                "authorization": {
+                    "tokenGrantUrl": token_grant_url
+                },
+                "runtime": {"requiredBinaries": required_binaries}
+            });
             let mut profiles = BTreeMap::new();
             profiles.insert("steward-mcp-gw".to_owned(), profile.clone());
             RenderedProviderProfileBundle {
@@ -2741,8 +2843,50 @@ mod tests {
             }
         }
 
-        let current = rendered("1.0.0", "curl-only");
-        let replacement = rendered("1.1.0", "codex-and-curl");
+        let current_binaries = ["/usr/bin/curl", "/usr/local/bin/curl"];
+        let replacement_binaries = [
+            "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/codex/codex",
+            "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex",
+            "/usr/bin/curl",
+            "/usr/local/bin/curl",
+        ];
+        let current = rendered(
+            "1.0.0",
+            "https://mcp.gateway.test",
+            "https://mint.gateway.test/token",
+            "10.42.0.0/16",
+            &current_binaries,
+        );
+        let replacement = rendered(
+            "1.1.0",
+            "https://mcp.gateway.test",
+            "https://mint.gateway.test/token",
+            "10.42.0.0/16",
+            &replacement_binaries,
+        );
+        let rebounds = [
+            rendered(
+                "1.1.0",
+                "https://different.gateway.test",
+                "https://mint.gateway.test/token",
+                "10.42.0.0/16",
+                &replacement_binaries,
+            ),
+            rendered(
+                "1.1.0",
+                "https://mcp.gateway.test",
+                "https://different-mint.gateway.test/token",
+                "10.42.0.0/16",
+                &replacement_binaries,
+            ),
+            rendered(
+                "1.1.0",
+                "https://mcp.gateway.test",
+                "https://mint.gateway.test/token",
+                "10.43.0.0/16",
+                &replacement_binaries,
+            ),
+        ];
         let directory = std::env::temp_dir().join(format!(
             "steward-provider-profile-upgrade-test-{}-{}",
             std::process::id(),
@@ -2753,10 +2897,27 @@ mod tests {
 
         let result = (|| {
             install_rendered_provider_profile_bundle(&output, &current)?;
+            for rebound in &rebounds {
+                let rebound_result =
+                    upgrade_rendered_provider_profile_bundle(&output, &current, rebound);
+                if !matches!(rebound_result, Err(ref error) if error.contains("environment bindings"))
+                {
+                    return Err(format!(
+                        "upgrade must reject endpoint or network-policy rebinding: {rebound_result:?}"
+                    ));
+                }
+            }
+            reconcile_rendered_provider_profile_bundle(&output, &current)?;
             upgrade_rendered_provider_profile_bundle(&output, &current, &replacement)?;
             reconcile_rendered_provider_profile_bundle(&output, &replacement)?;
 
-            let unsupported = rendered("1.2.0", "unsupported");
+            let unsupported = rendered(
+                "1.2.0",
+                "https://mcp.gateway.test",
+                "https://mint.gateway.test/token",
+                "10.42.0.0/16",
+                &replacement_binaries,
+            );
             let unsupported_result =
                 upgrade_rendered_provider_profile_bundle(&output, &replacement, &unsupported);
             if !matches!(unsupported_result, Err(ref error) if error.contains("supported migration"))
