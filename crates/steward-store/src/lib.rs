@@ -2673,26 +2673,6 @@ impl PgStore {
             .await
             .map_err(database_error)?;
             if mismatched_pending_flow {
-                sqlx::query(
-                    "UPDATE connection_operations \
-                     SET oauth_phase = 'expired', authorization_url = NULL, \
-                         cache_expires_at = NULL, result_expires_at = NULL, updated_at = now() \
-                     WHERE canonical_user_id = $1 AND provider = 'github' \
-                       AND oauth_phase = 'pending' AND flow_expires_at > now() \
-                       AND NOT (artifact_trust_mode = $2 AND bridge_image_digest = $3 \
-                         AND mcp_gw_origin = $4 AND mcp_gw_version = $5 \
-                         AND runtime_namespace = $6 AND runtime_class = $7)",
-                )
-                .bind(request.task.owner_user_id)
-                .bind(&request.bindings.artifact_trust_mode)
-                .bind(&request.bindings.bridge_image_digest)
-                .bind(&request.bindings.mcp_gw_origin)
-                .bind(&request.bindings.mcp_gw_version)
-                .bind(&request.bindings.namespace)
-                .bind(&request.bindings.runtime_class)
-                .execute(&mut *transaction)
-                .await
-                .map_err(database_error)?;
                 transaction.commit().await.map_err(database_error)?;
                 return Err(StoreError::ConnectionOAuthFlowPending);
             }

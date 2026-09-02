@@ -110,13 +110,20 @@ attestation field is rejected in this mode; this is not a general verification
 bypass and it applies only to the governed Connections bridge. `stableBridge`
 retains its existing GitHub-attestation contract.
 
-Roll trust-mode or image changes in two stages: first deploy the forward schema
-migration while old writers continue to default to `github-attestation`, then
-roll the apiserver and controller with the same new mode and digest. New
-operations use the new binding. Existing operations retain their persisted
+Switch an existing installation to `operator-pinned` in two stages. First
+deploy the new binaries and chart while retaining `github-attestation`, and
+wait until every old apiserver and controller pod has terminated. Only then
+change the configured mode and digest to `operator-pinned`. The forward schema
+migration keeps old writers compatible during the first stage; an old
+controller is not expected to understand operator-pinned configuration. Fresh
+installations may select either mode immediately.
+
+New operations use the new binding. Existing operations retain their persisted
 execution snapshot and fail closed if current controller configuration differs;
-cached status, mutation results, and pending OAuth URLs are never reused across
-that boundary.
+cached status and mutation results are never reused across that boundary. A
+pending OAuth URL from the previous binding remains conflicting until its real
+expiry or another proven terminal transition and is never returned under the
+new binding.
 
 The browser never receives a HOP-1 token and the apiserver never calls MCP-GW
 directly. OpenShell attaches MCP-GW to the one-shot runtime and obtains its

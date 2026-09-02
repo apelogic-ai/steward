@@ -2917,6 +2917,32 @@ async fn governed_connection_reuse_is_bound_to_artifact_trust_and_full_execution
         github_bindings.clone(),
     )
     .await?;
+    assert!(
+        reserve_governed_connection_with_bindings(
+            &store,
+            &principal.user_id,
+            &email,
+            ConnectionOperationKind::Status,
+            true,
+            &format!("github-active-{suffix}"),
+            operator_bindings.clone(),
+        )
+        .await
+        .is_err(),
+        "an identical retry must not reinterpret its persisted operation under a new binding"
+    );
+    let original_retry = store
+        .connection_operation(github_status.record.operation_id, &principal.user_id)
+        .await?
+        .ok_or_else(|| io::Error::other("original retry operation disappeared"))?;
+    assert_eq!(
+        original_retry.bindings.artifact_trust_mode,
+        "github-attestation"
+    );
+    assert_eq!(
+        original_retry.operation_state,
+        ConnectionOperationState::Queued
+    );
     let operator_status = reserve_governed_connection_with_bindings(
         &store,
         &principal.user_id,
@@ -3027,8 +3053,36 @@ async fn governed_connection_reuse_is_bound_to_artifact_trust_and_full_execution
         .connection_operation(github_start.record.operation_id, &principal.user_id)
         .await?
         .ok_or_else(|| io::Error::other("mismatched OAuth operation disappeared"))?;
-    assert_eq!(expired_flow.oauth_phase, ConnectionOAuthPhase::Expired);
-    assert_eq!(expired_flow.authorization_url, None);
+    assert_eq!(expired_flow.oauth_phase, ConnectionOAuthPhase::Pending);
+    assert_eq!(
+        expired_flow.authorization_url.as_deref(),
+        Some(authorization_url.as_str()),
+        "binding drift must not falsely claim that MCP-GW's outstanding OAuth state expired"
+    );
+    assert_eq!(
+        reserve_governed_connection_with_bindings(
+            &store,
+            &principal.user_id,
+            &email,
+            ConnectionOperationKind::Start,
+            true,
+            &format!("operator-start-still-conflicting-{suffix}"),
+            ConnectionExecutionBindings {
+                artifact_trust_mode: "operator-pinned".to_owned(),
+                ..github_bindings.clone()
+            },
+        )
+        .await,
+        Err(StoreError::ConnectionOAuthFlowPending),
+        "retries must remain blocked until the external OAuth flow actually expires"
+    );
+    sqlx::query(
+        "UPDATE connection_operations SET flow_expires_at = now() - interval '1 second' \
+         WHERE operation_id = $1",
+    )
+    .bind(github_start.record.operation_id)
+    .execute(&pool)
+    .await?;
     let replacement_operator_start = reserve_governed_connection_with_bindings(
         &store,
         &principal.user_id,
@@ -3043,6 +3097,12 @@ async fn governed_connection_reuse_is_bound_to_artifact_trust_and_full_execution
     )
     .await?;
     assert!(replacement_operator_start.inserted);
+    let expired_flow = store
+        .connection_operation(github_start.record.operation_id, &principal.user_id)
+        .await?
+        .ok_or_else(|| io::Error::other("expired OAuth operation disappeared"))?;
+    assert_eq!(expired_flow.oauth_phase, ConnectionOAuthPhase::Expired);
+    assert_eq!(expired_flow.authorization_url, None);
 
     let digest_email = Email::parse(format!("connection-digest-{suffix}@example.org"))?;
     let digest_identity = google_identity_for(
