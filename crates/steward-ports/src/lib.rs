@@ -131,6 +131,7 @@ pub struct SandboxRequest {
 /// configuration before provisioning or execution. They are never sourced from a browser.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderControlExecutionBindings {
+    pub artifact_trust_mode: String,
     pub bridge_image_digest: String,
     pub mcp_gw_origin: String,
     pub mcp_gw_version: String,

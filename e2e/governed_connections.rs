@@ -108,6 +108,38 @@ struct Harness {
 }
 
 impl Harness {
+    async fn runtime_for_mode(
+        bridge_image: &str,
+        artifact_trust_mode: &str,
+    ) -> Result<OpenShellRuntime, Box<dyn Error>> {
+        OpenShellRuntime::connect(OpenShellConnectionConfig {
+            endpoint: required("STEWARD_OPENSHELL_ENDPOINT")?,
+            ca_certificate_pem: required_file("STEWARD_OPENSHELL_CA_CERTIFICATE_FILE")?,
+            client_certificate_pem: required_file("STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE")?,
+            client_private_key_pem: required_file("STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE")?,
+            workload_exchange_endpoint: required("STEWARD_WORKLOAD_EXCHANGE_ENDPOINT")?,
+            workload_exchange_server_name: required("STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME")?,
+            workload_exchange_ca_certificate_pem: required_file(
+                "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
+            )?,
+            workload_source_credential_file: PathBuf::from(required(
+                "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
+            )?),
+            server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
+            runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
+            task_log_mode: OpenShellTaskLogMode::Full,
+            stable_bridge_image: None,
+            stable_bridge_gateway_origin: None,
+            bridge_image: Some(bridge_image.to_owned()),
+            bridge_artifact_trust_mode: Some(artifact_trust_mode.to_owned()),
+            bridge_gateway_origin: Some(MCP_GW_ORIGIN.to_owned()),
+            bridge_gateway_version: Some("0.3.2".to_owned()),
+            bridge_runtime_namespace: Some(CONNECTIONS_NAMESPACE.to_owned()),
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("connect OpenShell: {error:?}")).into())
+    }
+
     async fn from_environment() -> Result<Self, Box<dyn Error>> {
         if required("STEWARD_OPEN_SHELL_RELEASE")? != "v0.0.98" {
             return Err(
@@ -129,31 +161,7 @@ impl Harness {
         let store = PgStore::new(database.clone());
         store.migrate().await?;
         let bridge_image = required("STEWARD_CONNECTIONS_TEST_BRIDGE_DIGEST_IMAGE")?;
-        let runtime = OpenShellRuntime::connect(OpenShellConnectionConfig {
-            endpoint: required("STEWARD_OPENSHELL_ENDPOINT")?,
-            ca_certificate_pem: required_file("STEWARD_OPENSHELL_CA_CERTIFICATE_FILE")?,
-            client_certificate_pem: required_file("STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE")?,
-            client_private_key_pem: required_file("STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE")?,
-            workload_exchange_endpoint: required("STEWARD_WORKLOAD_EXCHANGE_ENDPOINT")?,
-            workload_exchange_server_name: required("STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME")?,
-            workload_exchange_ca_certificate_pem: required_file(
-                "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
-            )?,
-            workload_source_credential_file: PathBuf::from(required(
-                "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
-            )?),
-            server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
-            runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
-            task_log_mode: OpenShellTaskLogMode::Full,
-            stable_bridge_image: None,
-            stable_bridge_gateway_origin: None,
-            bridge_image: Some(bridge_image.clone()),
-            bridge_gateway_origin: Some(MCP_GW_ORIGIN.to_owned()),
-            bridge_gateway_version: Some("0.3.2".to_owned()),
-            bridge_runtime_namespace: Some(CONNECTIONS_NAMESPACE.to_owned()),
-        })
-        .await
-        .map_err(|error| io::Error::other(format!("connect OpenShell: {error:?}")))?;
+        let runtime = Self::runtime_for_mode(&bridge_image, "github-attestation").await?;
         let client = Client::try_default().await?;
         let mut harness = Self {
             bridge_image,
@@ -191,6 +199,18 @@ impl Harness {
         self.start_controller();
     }
 
+    async fn switch_artifact_trust_mode(
+        &mut self,
+        artifact_trust_mode: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        if let Some(controller) = self.controller.take() {
+            controller.abort();
+        }
+        self.runtime = Self::runtime_for_mode(&self.bridge_image, artifact_trust_mode).await?;
+        self.start_controller();
+        Ok(())
+    }
+
     fn start_reconciler(&mut self) {
         let reconciler = ConnectionOperationReconciler::new(self.store.clone());
         self.reconciler = Some(tokio::spawn(reconciler.run()));
@@ -203,9 +223,13 @@ impl Harness {
         self.start_reconciler();
     }
 
-    fn broker(&self) -> Result<GovernedConnectionsBroker<()>, Box<dyn Error>> {
+    fn broker_for_mode(
+        &self,
+        artifact_trust_mode: &str,
+    ) -> Result<GovernedConnectionsBroker<()>, Box<dyn Error>> {
         let config = GovernedConnectionsConfig::new(
             ConnectionExecutionBindings {
+                artifact_trust_mode: artifact_trust_mode.to_owned(),
                 bridge_image_digest: self.bridge_image.clone(),
                 mcp_gw_origin: MCP_GW_ORIGIN.to_owned(),
                 mcp_gw_version: "0.3.2".to_owned(),
@@ -216,6 +240,10 @@ impl Harness {
         )
         .map_err(|error| io::Error::other(format!("build governed broker: {error:?}")))?;
         Ok(GovernedConnectionsBroker::new(self.store.clone(), config))
+    }
+
+    fn broker(&self) -> Result<GovernedConnectionsBroker<()>, Box<dyn Error>> {
+        self.broker_for_mode("github-attestation")
     }
 
     async fn register_user(
@@ -1041,6 +1069,57 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
         .fetch_one(&harness.database)
         .await?;
     assert!(durable_audit_count >= 8);
+
+    harness
+        .switch_artifact_trust_mode("operator-pinned")
+        .await?;
+    let operator_broker = harness.broker_for_mode("operator-pinned")?;
+    let operator_status_count = harness.operation_count(&alice_id, "status").await?;
+    let operator_status_broker = operator_broker.clone();
+    let operator_status_session = alice.clone();
+    let operator_status_task = tokio::spawn(async move {
+        operator_status_broker
+            .status(&operator_status_session)
+            .await
+    });
+    let operator_status = harness
+        .latest_operation(&alice_id, "status", operator_status_count)
+        .await?;
+    let (operator_workspace, operator_sandbox, operator_runtime_uid) =
+        harness.capture_bridge_refs(operator_status).await?;
+    assert_eq!(
+        connection_result(operator_status_task.await?)?.phase,
+        ConnectionPhase::Disconnected
+    );
+    harness
+        .wait_operation_finalized(operator_status, Duration::from_secs(90))
+        .await?;
+    harness.assert_bridge_runtime_absent(
+        &operator_workspace,
+        &operator_sandbox,
+        &operator_runtime_uid,
+    )?;
+    let operator_binding: (String, String) = sqlx::query_as(
+        "SELECT artifact_trust_mode, bridge_image_digest \
+         FROM connection_operations WHERE operation_id = $1",
+    )
+    .bind(operator_status)
+    .fetch_one(&harness.database)
+    .await?;
+    assert_eq!(operator_binding.0, "operator-pinned");
+    assert_eq!(operator_binding.1, harness.bridge_image);
+    harness.wait_runtime_phase(
+        ALICE_NAMESPACE,
+        ALICE_RUNTIME,
+        "Running",
+        Duration::from_secs(5),
+    )?;
+    harness.wait_runtime_phase(
+        BOB_NAMESPACE,
+        BOB_RUNTIME,
+        "Running",
+        Duration::from_secs(5),
+    )?;
 
     harness.delete_runtime(ALICE_NAMESPACE, ALICE_AFTER_DISCONNECT_RUNTIME);
     harness.delete_runtime(BOB_NAMESPACE, BOB_RUNTIME);

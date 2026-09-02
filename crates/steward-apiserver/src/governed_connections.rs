@@ -45,6 +45,8 @@ pub const MCP_GW_OAUTH_STATE_LIFETIME_SECONDS: i64 =
     steward_connections_v1::OAUTH_STATE_LIFETIME_SECONDS;
 pub const MCP_GW_OAUTH_CLOCK_SKEW_SECONDS: i64 = steward_connections_v1::OAUTH_CLOCK_SKEW_SECONDS;
 pub const MCP_GW_CONTRACT_VERSION: &str = steward_connections_v1::MCP_GW_VERSION;
+pub const GITHUB_ATTESTATION_TRUST_MODE: &str = "github-attestation";
+pub const OPERATOR_PINNED_TRUST_MODE: &str = "operator-pinned";
 const MAX_BRIDGE_RESULT_BYTES: usize = 32 * 1024;
 const TAR_BLOCK_BYTES: usize = 512;
 const RECONCILE_INTERVAL: StdDuration = StdDuration::from_millis(100);
@@ -58,6 +60,7 @@ pub enum ConnectionOperationKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionExecutionBindings {
+    pub artifact_trust_mode: String,
     pub bridge_image_digest: String,
     pub mcp_gw_origin: String,
     pub mcp_gw_version: String,
@@ -80,6 +83,48 @@ pub enum GovernedConnectionPlanError {
     Admission,
     InvalidBindings,
     Unavailable,
+}
+
+fn valid_operator_pinned_image(value: &str) -> bool {
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || value.matches('@').count() != 1
+        || value.contains("://")
+    {
+        return false;
+    }
+    let Some((repository, digest)) = value.split_once('@') else {
+        return false;
+    };
+    let mut components = repository.split('/');
+    let Some(registry) = components.next() else {
+        return false;
+    };
+    let (registry, port) = registry
+        .split_once(':')
+        .map_or((registry, None), |(registry, port)| (registry, Some(port)));
+    let valid_component = |component: &str| {
+        !component.is_empty()
+            && component.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            })
+    };
+    if !valid_component(registry)
+        || port
+            .is_some_and(|port| port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()))
+        || components.any(|component| !valid_component(component))
+    {
+        return false;
+    }
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn provider_control_grant(action: &str) -> Result<ToolGrant, GovernedConnectionPlanError> {
@@ -111,15 +156,21 @@ impl ConnectionOperationKind {
 
 impl ConnectionExecutionBindings {
     pub fn validate(&self) -> Result<(), GovernedConnectionPlanError> {
-        let Some((repository, digest)) = self.bridge_image_digest.split_once("@sha256:") else {
-            return Err(GovernedConnectionPlanError::InvalidBindings);
-        };
-        if repository.is_empty()
-            || digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        let github_attested_image_is_digest_pinned = self
+            .bridge_image_digest
+            .split_once("@sha256:")
+            .is_some_and(|(repository, digest)| {
+                !repository.is_empty()
+                    && digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        if !match self.artifact_trust_mode.as_str() {
+            GITHUB_ATTESTATION_TRUST_MODE => github_attested_image_is_digest_pinned,
+            OPERATOR_PINNED_TRUST_MODE => valid_operator_pinned_image(&self.bridge_image_digest),
+            _ => false,
+        } {
             return Err(GovernedConnectionPlanError::InvalidBindings);
         }
         let origin = Url::parse(&self.mcp_gw_origin)
@@ -221,6 +272,7 @@ impl<B> GovernedConnectionsBroker<B> {
         let runtime_name = format!("conn-{}", operation_id.simple());
         let acting_user_id = canonical_user_id.as_str();
         let bindings = ConnectionExecutionBindingSnapshot {
+            artifact_trust_mode: plan.bindings.artifact_trust_mode.clone(),
             bridge_image_digest: plan.bindings.bridge_image_digest.clone(),
             mcp_gw_origin: plan.bindings.mcp_gw_origin.clone(),
             mcp_gw_version: plan.bindings.mcp_gw_version.clone(),
@@ -841,14 +893,15 @@ mod tests {
     use super::{
         CONNECTION_RESPONSE_DEADLINE_SECONDS, CONNECTIONS_AUTHORITY_DIGEST,
         CONNECTIONS_AUTHORITY_DOCUMENT, CONNECTIONS_AUTHORITY_VERSION, CONNECTIONS_SERVICE,
-        ConnectionExecutionBindings, ConnectionOperationKind, GovernedConnectionPlanError,
-        MCP_GW_CONTRACT_VERSION, MCP_GW_OAUTH_CLOCK_SKEW_SECONDS,
-        MCP_GW_OAUTH_STATE_LIFETIME_SECONDS, bridge_result, plan_connection_operation,
-        single_file_archive,
+        ConnectionExecutionBindings, ConnectionOperationKind, GITHUB_ATTESTATION_TRUST_MODE,
+        GovernedConnectionPlanError, MCP_GW_CONTRACT_VERSION, MCP_GW_OAUTH_CLOCK_SKEW_SECONDS,
+        MCP_GW_OAUTH_STATE_LIFETIME_SECONDS, OPERATOR_PINNED_TRUST_MODE, bridge_result,
+        plan_connection_operation, single_file_archive, valid_operator_pinned_image,
     };
 
     fn bindings() -> ConnectionExecutionBindings {
         ConnectionExecutionBindings {
+            artifact_trust_mode: GITHUB_ATTESTATION_TRUST_MODE.to_owned(),
             bridge_image_digest:
                 "ghcr.io/example-org/steward-connections-bridge@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_owned(),
@@ -857,6 +910,66 @@ mod tests {
             namespace: "steward-test".to_owned(),
             runtime_class: "kata-qemu".to_owned(),
         }
+    }
+
+    #[test]
+    fn operator_pinned_image_reference_is_exact_and_tag_free() {
+        let digest = "a".repeat(64);
+        assert!(valid_operator_pinned_image(&format!(
+            "registry.example.test:5000/team/bridge@sha256:{digest}"
+        )));
+        for invalid in [
+            "registry.example.test/team/bridge:latest".to_owned(),
+            format!("registry.example.test/team/bridge:tag@sha256:{digest}"),
+            format!("registry.example.test/team:5000/bridge@sha256:{digest}"),
+            format!("registry.example.test/team/bridge@@sha256:{digest}"),
+            format!("registry.example.test//team/bridge@sha256:{digest}"),
+            format!("https://registry.example.test/team/bridge@sha256:{digest}"),
+            format!("registry.example.test/team/bridge @sha256:{digest}"),
+            format!(
+                "registry.example.test/team/bridge@sha256:{}",
+                "A".repeat(64)
+            ),
+            format!(
+                "registry.example.test/team/bridge@sha256:{}",
+                "a".repeat(63)
+            ),
+        ] {
+            assert!(
+                !valid_operator_pinned_image(&invalid),
+                "operator-pinned validation accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trust_mode_is_explicit_and_operator_pinned_uses_the_strict_reference_contract() {
+        let mut candidate = bindings();
+        candidate.artifact_trust_mode = OPERATOR_PINNED_TRUST_MODE.to_owned();
+        candidate.bridge_image_digest = format!(
+            "registry.example.test:5000/team/bridge@sha256:{}",
+            "a".repeat(64)
+        );
+        assert_eq!(candidate.validate(), Ok(()));
+
+        candidate.bridge_image_digest = format!(
+            "registry.example.test/team/bridge:tag@sha256:{}",
+            "a".repeat(64)
+        );
+        assert_eq!(
+            candidate.validate(),
+            Err(GovernedConnectionPlanError::InvalidBindings)
+        );
+
+        candidate.artifact_trust_mode = "implicit-or-unknown".to_owned();
+        candidate.bridge_image_digest = format!(
+            "registry.example.test/team/bridge@sha256:{}",
+            "a".repeat(64)
+        );
+        assert_eq!(
+            candidate.validate(),
+            Err(GovernedConnectionPlanError::InvalidBindings)
+        );
     }
 
     #[test]

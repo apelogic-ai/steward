@@ -228,6 +228,7 @@ fn governed_connections_configuration(
     browser_origin: &str,
     store: PgStore,
 ) -> Result<Option<GovernedConnectionsBroker>, io::Error> {
+    let artifact_trust_mode = env::var("STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE").ok();
     let values = [
         env::var("STEWARD_CONNECTIONS_BRIDGE_IMAGE").ok(),
         env::var("STEWARD_CONNECTIONS_MCP_GW_ORIGIN").ok(),
@@ -235,7 +236,7 @@ fn governed_connections_configuration(
         env::var("STEWARD_CONNECTIONS_RUNTIME_NAMESPACE").ok(),
         env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME").ok(),
     ];
-    if values.iter().all(Option::is_none) {
+    if artifact_trust_mode.is_none() && values.iter().all(Option::is_none) {
         return Ok(None);
     }
     let [
@@ -252,6 +253,8 @@ fn governed_connections_configuration(
     };
     let config = governed_connections::GovernedConnectionsConfig::new(
         governed_connections::ConnectionExecutionBindings {
+            artifact_trust_mode: artifact_trust_mode
+                .unwrap_or_else(|| governed_connections::GITHUB_ATTESTATION_TRUST_MODE.to_owned()),
             bridge_image_digest: required(bridge_image_digest)?,
             mcp_gw_origin: required(mcp_gw_origin)?,
             mcp_gw_version: required(mcp_gw_version)?,
@@ -534,6 +537,7 @@ mod tests {
     -> Result<(), String> {
         let valid = steward_apiserver::governed_connections::GovernedConnectionsConfig::new(
             steward_apiserver::governed_connections::ConnectionExecutionBindings {
+                artifact_trust_mode: steward_apiserver::governed_connections::GITHUB_ATTESTATION_TRUST_MODE.to_owned(),
                 bridge_image_digest: "registry.example.test/bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
                 mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
                 mcp_gw_version: "0.3.2".to_owned(),
@@ -545,6 +549,9 @@ mod tests {
         assert!(valid.is_ok());
         let invalid = steward_apiserver::governed_connections::GovernedConnectionsConfig::new(
             steward_apiserver::governed_connections::ConnectionExecutionBindings {
+                artifact_trust_mode:
+                    steward_apiserver::governed_connections::GITHUB_ATTESTATION_TRUST_MODE
+                        .to_owned(),
                 bridge_image_digest: "registry.example.test/bridge:latest".to_owned(),
                 mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
                 mcp_gw_version: "0.3.1".to_owned(),

@@ -463,6 +463,49 @@ fn is_digest_pinned_image(value: &str) -> bool {
 }
 
 #[cfg(feature = "runtime")]
+fn is_operator_pinned_image(value: &str) -> bool {
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || value.matches('@').count() != 1
+        || value.contains("://")
+    {
+        return false;
+    }
+    let Some((repository, digest)) = value.split_once('@') else {
+        return false;
+    };
+    let mut components = repository.split('/');
+    let Some(registry) = components.next() else {
+        return false;
+    };
+    let (registry, port) = registry
+        .split_once(':')
+        .map_or((registry, None), |(registry, port)| (registry, Some(port)));
+    let valid_component = |component: &str| {
+        !component.is_empty()
+            && component.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            })
+    };
+    if !valid_component(registry)
+        || port
+            .is_some_and(|port| port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()))
+        || components.any(|component| !valid_component(component))
+    {
+        return false;
+    }
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+#[cfg(feature = "runtime")]
 fn validate_connections_bridge_archive(
     archive: &[u8],
     expected_file: &str,
@@ -823,6 +866,8 @@ pub struct OpenShellConnectionConfig {
     /// Digest-pinned governed Connections bridge image. Its provenance is verified by the
     /// controller process before this adapter is constructed.
     pub bridge_image: Option<String>,
+    /// Server-selected artifact trust mode paired with the governed Connections bridge image.
+    pub bridge_artifact_trust_mode: Option<String>,
     /// Server-configured gateway origin passed only to the fixed bridge executable.
     pub bridge_gateway_origin: Option<String>,
     /// Exact MCP-GW release whose OAuth lifetime is pinned by the immutable authority.
@@ -899,15 +944,21 @@ impl OpenShellConnectionConfig {
         }
         match (
             self.bridge_image.as_deref(),
+            self.bridge_artifact_trust_mode.as_deref(),
             self.bridge_gateway_origin.as_deref(),
             self.bridge_gateway_version.as_deref(),
             self.bridge_runtime_namespace.as_deref(),
         ) {
-            (None, None, None, None) => {}
-            (Some(image), Some(origin), Some(version), Some(namespace)) => {
-                if !is_digest_pinned_image(image) {
+            (None, None, None, None, None) => {}
+            (Some(image), Some(mode), Some(origin), Some(version), Some(namespace)) => {
+                let image_is_valid = match mode {
+                    "github-attestation" => is_digest_pinned_image(image),
+                    "operator-pinned" => is_operator_pinned_image(image),
+                    _ => false,
+                };
+                if !image_is_valid {
                     return Err(PortError::Rejected {
-                        reason: "Connections bridge image must be an immutable sha256 reference"
+                        reason: "Connections bridge trust mode and immutable image reference are invalid"
                             .to_owned(),
                     });
                 }
@@ -928,7 +979,7 @@ impl OpenShellConnectionConfig {
             _ => {
                 return Err(PortError::Rejected {
                     reason:
-                        "Connections bridge image, gateway origin/version, and runtime namespace must be configured together"
+                        "Connections bridge image, trust mode, gateway origin/version, and runtime namespace must be configured together"
                             .to_owned(),
                 });
             }
@@ -1197,6 +1248,7 @@ pub struct OpenShellRuntime {
     stable_bridge_image: Option<String>,
     stable_bridge_gateway_origin: Option<String>,
     bridge_image: Option<String>,
+    bridge_artifact_trust_mode: Option<String>,
     bridge_gateway_origin: Option<String>,
     bridge_gateway_version: Option<String>,
     runtime_class_name: String,
@@ -1208,6 +1260,7 @@ fn provider_control_execution_bindings(
     runtime: &OpenShellRuntime,
 ) -> Option<ProviderControlExecutionBindings> {
     Some(ProviderControlExecutionBindings {
+        artifact_trust_mode: runtime.bridge_artifact_trust_mode.clone()?,
         bridge_image_digest: runtime.bridge_image.clone()?,
         mcp_gw_origin: runtime.bridge_gateway_origin.clone()?,
         mcp_gw_version: runtime.bridge_gateway_version.clone()?,
@@ -1243,6 +1296,7 @@ impl OpenShellRuntime {
             stable_bridge_image: config.stable_bridge_image,
             stable_bridge_gateway_origin: config.stable_bridge_gateway_origin,
             bridge_image: config.bridge_image,
+            bridge_artifact_trust_mode: config.bridge_artifact_trust_mode,
             bridge_gateway_origin: config.bridge_gateway_origin,
             bridge_gateway_version: config.bridge_gateway_version,
             runtime_class_name: config.runtime_class_name,
@@ -2348,6 +2402,7 @@ mod tests {
             stable_bridge_image: None,
             stable_bridge_gateway_origin: None,
             bridge_image: None,
+            bridge_artifact_trust_mode: None,
             bridge_gateway_origin: None,
             bridge_gateway_version: None,
             bridge_runtime_namespace: None,
@@ -3303,6 +3358,7 @@ mod tests {
         config.bridge_image = Some(
             "registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
         );
+        config.bridge_artifact_trust_mode = Some("github-attestation".to_owned());
         assert!(
             matches!(config.validate(), Err(PortError::Rejected { .. })),
             "a bridge image without its controller-owned gateway origin must fail before a sandbox can be created"

@@ -88,19 +88,43 @@ egress policy.
 ## Governed provider connections
 
 `connectionsBridge` is disabled by default. Enabling it requires browser
-authentication plus a digest-pinned bridge image, provenance identity, source
-repository and commit, attestation bundle, exact MCP-GW origin, and dedicated
-runtime namespace. Authority v1 also requires the exact MCP-GW `0.3.2` contract;
-another configured version fails closed. The apiserver records those values on each operation; the
-controller verifies the same snapshot before creating or executing the
-short-lived `steward-connections` runtime.
+authentication, an immutable bridge image, an explicit artifact-trust contract,
+the exact MCP-GW origin, and a dedicated runtime namespace. Authority v1 also
+requires the exact MCP-GW `0.3.2` contract; another configured version fails
+closed. The apiserver records those values on each operation; the controller
+verifies the same snapshot before creating or executing the short-lived
+`steward-connections` runtime.
+
+`connectionsBridge.artifactTrust.mode` defaults to `github-attestation`, the
+recommended mode for released Steward artifacts. It requires the existing
+signer identity, GitHub source repository, exact source commit, and public
+artifact-attestation bundle; startup still fails if provenance cannot be
+verified.
+
+`operator-pinned` must be selected explicitly. It accepts only a canonical OCI
+reference ending in an exact lowercase `sha256` digest, renders no attestation
+bundle or attestation environment, and verifies immutability only. The operator
+is responsible for verifying the source revision, build system, vulnerability
+scan, and promotion policy before supplying that digest. Any non-empty GitHub
+attestation field is rejected in this mode; this is not a general verification
+bypass and it applies only to the governed Connections bridge. `stableBridge`
+retains its existing GitHub-attestation contract.
+
+Roll trust-mode or image changes in two stages: first deploy the forward schema
+migration while old writers continue to default to `github-attestation`, then
+roll the apiserver and controller with the same new mode and digest. New
+operations use the new binding. Existing operations retain their persisted
+execution snapshot and fail closed if current controller configuration differs;
+cached status, mutation results, and pending OAuth URLs are never reused across
+that boundary.
 
 The browser never receives a HOP-1 token and the apiserver never calls MCP-GW
 directly. OpenShell attaches MCP-GW to the one-shot runtime and obtains its
 ordinary Steward Mint identity. The bridge has no inference provider, uses one
 fixed provider-control grant, and is finalized through the normal controller
-lifecycle. Changing a configured image, endpoint, MCP-GW version, namespace, or runtime class
-does not reinterpret an existing operation; it fails closed.
+lifecycle. Changing a configured trust mode, image, endpoint, MCP-GW version,
+namespace, or runtime class does not reinterpret an existing operation; it
+fails closed.
 
 The globally bound controller and mint ClusterRoles have no Secret verbs.
 Runtime Secret access is granted by namespaced Roles and RoleBindings only for

@@ -13,6 +13,9 @@ connections_bridge_bundle="$(mktemp)"
 connections_bridge_configmap="$(mktemp)"
 connections_bridge_apiserver_deployment="$(mktemp)"
 connections_bridge_controller_deployment="$(mktemp)"
+operator_connections_bridge_rendered="$(mktemp)"
+operator_connections_bridge_apiserver_deployment="$(mktemp)"
+operator_connections_bridge_controller_deployment="$(mktemp)"
 browser_auth_rendered="$(mktemp)"
 browser_auth_deployment="$(mktemp)"
 task_identity_rendered="$(mktemp)"
@@ -37,7 +40,10 @@ cleanup() {
     "${stable_bridge_controller_deployment}" "${connections_bridge_rendered}" \
     "${connections_bridge_bundle}" "${connections_bridge_configmap}" \
     "${connections_bridge_apiserver_deployment}" \
-    "${connections_bridge_controller_deployment}" "${browser_auth_rendered}" \
+    "${connections_bridge_controller_deployment}" \
+    "${operator_connections_bridge_rendered}" \
+    "${operator_connections_bridge_apiserver_deployment}" \
+    "${operator_connections_bridge_controller_deployment}" "${browser_auth_rendered}" \
     "${browser_auth_deployment}" "${task_identity_rendered}" \
     "${task_identity_deployment}" \
     "${web_rendered}" "${web_deployment}" "${external_edge_rendered}" \
@@ -76,6 +82,14 @@ connections_bridge_values=(
   --set-string connectionsBridge.signerIdentity=https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.11
   --set-string connectionsBridge.sourceRepository=https://github.com/example-org/steward
   --set-string connectionsBridge.sourceCommit=0123456789abcdef0123456789abcdef01234567
+  --set-string connectionsBridge.mcpGatewayOrigin=https://mcp-gw.example.test
+  --set-string connectionsBridge.mcpGatewayVersion=0.3.2
+  --set-string connectionsBridge.runtimeNamespace=team-a
+)
+operator_connections_bridge_values=(
+  --set connectionsBridge.enabled=true
+  --set-string connectionsBridge.artifactTrust.mode=operator-pinned
+  --set-string connectionsBridge.image=registry.example.test/team-a/steward-connections-bridge@sha256:5555555555555555555555555555555555555555555555555555555555555555
   --set-string connectionsBridge.mcpGatewayOrigin=https://mcp-gw.example.test
   --set-string connectionsBridge.mcpGatewayVersion=0.3.2
   --set-string connectionsBridge.runtimeNamespace=team-a
@@ -393,6 +407,7 @@ awk '
   $0 ~ /kind: Deployment/ && $0 ~ /name: steward-controller/ { print; exit }
 ' "${connections_bridge_rendered}" > "${connections_bridge_controller_deployment}"
 for required in \
+  '            - { name: STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE, value: "github-attestation" }' \
   '            - { name: STEWARD_CONNECTIONS_BRIDGE_IMAGE, value: "ghcr.io/example-org/steward-connections-bridge@sha256:4444444444444444444444444444444444444444444444444444444444444444" }' \
   '            - { name: STEWARD_CONNECTIONS_MCP_GW_ORIGIN, value: "https://mcp-gw.example.test" }' \
   '            - { name: STEWARD_CONNECTIONS_MCP_GW_VERSION, value: "0.3.2" }' \
@@ -401,6 +416,82 @@ do
   grep -Fxq "${required}" "${connections_bridge_apiserver_deployment}"
   grep -Fxq "${required}" "${connections_bridge_controller_deployment}"
 done
+
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  "${operator_connections_bridge_values[@]}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
+  > "${operator_connections_bridge_rendered}"
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-apiserver/ { print; exit }
+' "${operator_connections_bridge_rendered}" > "${operator_connections_bridge_apiserver_deployment}"
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-controller/ { print; exit }
+' "${operator_connections_bridge_rendered}" > "${operator_connections_bridge_controller_deployment}"
+for deployment in \
+  "${operator_connections_bridge_apiserver_deployment}" \
+  "${operator_connections_bridge_controller_deployment}"
+do
+  grep -Fxq '            - { name: STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE, value: "operator-pinned" }' "${deployment}"
+  grep -Fxq '            - { name: STEWARD_CONNECTIONS_BRIDGE_IMAGE, value: "registry.example.test/team-a/steward-connections-bridge@sha256:5555555555555555555555555555555555555555555555555555555555555555" }' "${deployment}"
+done
+if grep -Fq 'connections-bridge-attestation' "${operator_connections_bridge_rendered}" \
+  || grep -Fq 'STEWARD_CONNECTIONS_BRIDGE_SIGNER_IDENTITY' "${operator_connections_bridge_rendered}" \
+  || grep -Fq 'STEWARD_CONNECTIONS_BRIDGE_SOURCE_REPOSITORY' "${operator_connections_bridge_rendered}" \
+  || grep -Fq 'STEWARD_CONNECTIONS_BRIDGE_SOURCE_COMMIT' "${operator_connections_bridge_rendered}" \
+  || grep -Fq 'STEWARD_CONNECTIONS_BRIDGE_ATTESTATION_BUNDLE_FILE' "${operator_connections_bridge_rendered}"
+then
+  echo "operator-pinned mode must render no GitHub attestation substitutes or mounts" >&2
+  exit 1
+fi
+for invalid_operator_image in \
+  'registry.example.test/team-a/bridge:latest' \
+  'registry.example.test/team-a/bridge@sha256:ABCDEF0000000000000000000000000000000000000000000000000000000000' \
+  'registry.example.test/team-a/bridge@sha256:1234' \
+  '@sha256:5555555555555555555555555555555555555555555555555555555555555555'
+do
+  if helm template steward "${root}/charts/steward" \
+    --namespace steward \
+    --include-crds \
+    "${image_values[@]}" \
+    "${operator_connections_bridge_values[@]}" \
+    --set-string "connectionsBridge.image=${invalid_operator_image}" >/dev/null 2>&1
+  then
+    echo "operator-pinned mode accepted invalid image ${invalid_operator_image}" >&2
+    exit 1
+  fi
+done
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  "${operator_connections_bridge_values[@]}" \
+  --set-string connectionsBridge.signerIdentity=https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.11 >/dev/null 2>&1
+then
+  echo "operator-pinned mode with GitHub attestation fields must fail chart validation" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set connectionsBridge.enabled=true \
+  --set-string connectionsBridge.artifactTrust.mode=unknown >/dev/null 2>&1
+then
+  echo "unknown Connections bridge trust modes must fail chart validation" >&2
+  exit 1
+fi
 for required in \
   '            - { name: STEWARD_CONNECTIONS_BRIDGE_SIGNER_IDENTITY, value: "https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.11" }' \
   '            - { name: STEWARD_CONNECTIONS_BRIDGE_SOURCE_REPOSITORY, value: "https://github.com/example-org/steward" }' \

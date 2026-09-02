@@ -106,6 +106,10 @@ connectionsBridge:
   # Disabled unless the governed Connections surface and its immutable bridge artifact are
   # configured together. This identity and lifecycle are separate from stable agent runtimes.
   enabled: false
+  artifactTrust:
+    # Released artifacts use GitHub attestations by default. Operators must explicitly select
+    # operator-pinned when their deployment system owns provenance verification.
+    mode: github-attestation
   image: ""
   signerIdentity: ""
   sourceRepository: ""

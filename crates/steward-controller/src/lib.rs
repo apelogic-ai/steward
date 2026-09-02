@@ -694,7 +694,8 @@ fn provider_control_bindings_match(
     persisted: &steward_store::ConnectionExecutionBindingSnapshot,
     current: &steward_ports::ProviderControlExecutionBindings,
 ) -> bool {
-    persisted.bridge_image_digest == current.bridge_image_digest
+    persisted.artifact_trust_mode == current.artifact_trust_mode
+        && persisted.bridge_image_digest == current.bridge_image_digest
         && persisted.mcp_gw_origin == current.mcp_gw_origin
         && persisted.mcp_gw_version == current.mcp_gw_version
         && persisted.namespace == current.namespace
@@ -2687,6 +2688,7 @@ mod tests {
     #[test]
     fn provider_control_execution_rejects_every_binding_drift_dimension() {
         let persisted = ConnectionExecutionBindingSnapshot {
+            artifact_trust_mode: "github-attestation".to_owned(),
             bridge_image_digest: "registry.example.test/bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
             mcp_gw_version: "0.3.2".to_owned(),
@@ -2694,6 +2696,7 @@ mod tests {
             runtime_class: "kata-qemu".to_owned(),
         };
         let current = ProviderControlExecutionBindings {
+            artifact_trust_mode: persisted.artifact_trust_mode.clone(),
             bridge_image_digest: persisted.bridge_image_digest.clone(),
             mcp_gw_origin: persisted.mcp_gw_origin.clone(),
             mcp_gw_version: persisted.mcp_gw_version.clone(),
@@ -2703,6 +2706,10 @@ mod tests {
         assert!(provider_control_bindings_match(&persisted, &current));
 
         for drifted in [
+            ProviderControlExecutionBindings {
+                artifact_trust_mode: "operator-pinned".to_owned(),
+                ..current.clone()
+            },
             ProviderControlExecutionBindings {
                 bridge_image_digest: "registry.example.test/bridge@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
                 ..current.clone()
@@ -2808,6 +2815,7 @@ mod tests {
         };
 
         let bindings = ConnectionExecutionBindingSnapshot {
+            artifact_trust_mode: "github-attestation".to_owned(),
             bridge_image_digest: "registry.example.test/steward-connections-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
             mcp_gw_version: "0.3.2".to_owned(),
@@ -2859,6 +2867,7 @@ mod tests {
             finalized: false,
         };
         let current = ProviderControlExecutionBindings {
+            artifact_trust_mode: bindings.artifact_trust_mode.clone(),
             bridge_image_digest: bindings.bridge_image_digest.clone(),
             mcp_gw_origin: bindings.mcp_gw_origin.clone(),
             mcp_gw_version: bindings.mcp_gw_version.clone(),

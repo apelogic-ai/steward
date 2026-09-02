@@ -1757,6 +1757,7 @@ mod tests {
             "only the controller workload projection may provide a source-token credential"
         );
         for governed_connection_contract in [
+            "STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE",
             "STEWARD_CONNECTIONS_BRIDGE_IMAGE",
             "STEWARD_CONNECTIONS_MCP_GW_ORIGIN",
             "STEWARD_CONNECTIONS_MCP_GW_VERSION",
@@ -2784,6 +2785,8 @@ mod tests {
         }
         assert!(
             values.contains("connectionsBridge:")
+                && values.contains("artifactTrust:")
+                && values.contains("mode: github-attestation")
                 && values.contains("mcpGatewayOrigin")
                 && values.contains("mcpGatewayVersion")
                 && schema.contains("connectionsBridge"),
@@ -2793,6 +2796,18 @@ mod tests {
             controller.contains("connections-bridge-attestation"),
             "Connections bridge controller must mount the immutable provenance bundle"
         );
+        for trust_contract in [
+            "github-attestation",
+            "operator-pinned",
+            "STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE",
+        ] {
+            assert!(
+                controller.contains(trust_contract)
+                    || schema.contains(trust_contract)
+                    || values.contains(trust_contract),
+                "Connections bridge artifact-trust contract is missing {trust_contract}"
+            );
+        }
         assert!(
             controller.contains("STEWARD_CONNECTIONS_MCP_GW_ORIGIN")
                 && controller.contains("STEWARD_CONNECTIONS_MCP_GW_VERSION"),

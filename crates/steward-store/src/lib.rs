@@ -2588,6 +2588,60 @@ impl PgStore {
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
+
+        sqlx::query(
+            "WITH drifted AS ( \
+               UPDATE connection_operations \
+               SET operation_state = 'failed', failure_category = 'binding_mismatch', \
+                   result = NULL, cached_status = NULL, cache_expires_at = NULL, \
+                   result_expires_at = NULL, finalization_state = 'requested', \
+                   cleanup_state = 'tearing_down', updated_at = now() \
+               WHERE canonical_user_id = $1 AND provider = 'github' \
+                 AND operation_state IN ('queued', 'provisioning', 'running') \
+                 AND finalization_state = 'not_requested' \
+                 AND NOT (artifact_trust_mode = $2 AND bridge_image_digest = $3 \
+                   AND mcp_gw_origin = $4 AND mcp_gw_version = $5 \
+                   AND runtime_namespace = $6 AND runtime_class = $7) \
+               RETURNING task_uid \
+             ) \
+             UPDATE task_submissions \
+             SET phase = CASE WHEN phase IN ('succeeded', 'failed') THEN phase ELSE 'failed' END, \
+                 output_archive = NULL, finalize_requested = true, \
+                 failure_reason = 'binding_mismatch', updated_at = now() \
+             WHERE task_uid IN (SELECT task_uid FROM drifted)",
+        )
+        .bind(request.task.owner_user_id)
+        .bind(&request.bindings.artifact_trust_mode)
+        .bind(&request.bindings.bridge_image_digest)
+        .bind(&request.bindings.mcp_gw_origin)
+        .bind(&request.bindings.mcp_gw_version)
+        .bind(&request.bindings.namespace)
+        .bind(&request.bindings.runtime_class)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+
+        sqlx::query(
+            "UPDATE connection_operations \
+             SET cached_status = NULL, cache_expires_at = NULL, result_expires_at = NULL, \
+                 updated_at = now() \
+             WHERE canonical_user_id = $1 AND provider = 'github' \
+               AND operation_state = 'succeeded' \
+               AND NOT (artifact_trust_mode = $2 AND bridge_image_digest = $3 \
+                 AND mcp_gw_origin = $4 AND mcp_gw_version = $5 \
+                 AND runtime_namespace = $6 AND runtime_class = $7)",
+        )
+        .bind(request.task.owner_user_id)
+        .bind(&request.bindings.artifact_trust_mode)
+        .bind(&request.bindings.bridge_image_digest)
+        .bind(&request.bindings.mcp_gw_origin)
+        .bind(&request.bindings.mcp_gw_version)
+        .bind(&request.bindings.namespace)
+        .bind(&request.bindings.runtime_class)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+
         sqlx::query(
             "UPDATE connection_operations \
              SET oauth_phase = 'expired', authorization_url = NULL, updated_at = now() \
@@ -2598,6 +2652,51 @@ impl PgStore {
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
+
+        if request.operation_kind == ConnectionOperationKind::Start {
+            let mismatched_pending_flow = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM connection_operations \
+                 WHERE canonical_user_id = $1 AND provider = 'github' \
+                   AND oauth_phase = 'pending' AND flow_expires_at > now() \
+                   AND NOT (artifact_trust_mode = $2 AND bridge_image_digest = $3 \
+                     AND mcp_gw_origin = $4 AND mcp_gw_version = $5 \
+                     AND runtime_namespace = $6 AND runtime_class = $7))",
+            )
+            .bind(request.task.owner_user_id)
+            .bind(&request.bindings.artifact_trust_mode)
+            .bind(&request.bindings.bridge_image_digest)
+            .bind(&request.bindings.mcp_gw_origin)
+            .bind(&request.bindings.mcp_gw_version)
+            .bind(&request.bindings.namespace)
+            .bind(&request.bindings.runtime_class)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if mismatched_pending_flow {
+                sqlx::query(
+                    "UPDATE connection_operations \
+                     SET oauth_phase = 'expired', authorization_url = NULL, \
+                         cache_expires_at = NULL, result_expires_at = NULL, updated_at = now() \
+                     WHERE canonical_user_id = $1 AND provider = 'github' \
+                       AND oauth_phase = 'pending' AND flow_expires_at > now() \
+                       AND NOT (artifact_trust_mode = $2 AND bridge_image_digest = $3 \
+                         AND mcp_gw_origin = $4 AND mcp_gw_version = $5 \
+                         AND runtime_namespace = $6 AND runtime_class = $7)",
+                )
+                .bind(request.task.owner_user_id)
+                .bind(&request.bindings.artifact_trust_mode)
+                .bind(&request.bindings.bridge_image_digest)
+                .bind(&request.bindings.mcp_gw_origin)
+                .bind(&request.bindings.mcp_gw_version)
+                .bind(&request.bindings.namespace)
+                .bind(&request.bindings.runtime_class)
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+                transaction.commit().await.map_err(database_error)?;
+                return Err(StoreError::ConnectionOAuthFlowPending);
+            }
+        }
 
         let active_mutation = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM connection_operations \
@@ -2730,11 +2829,13 @@ impl PgStore {
         };
         if let Some(row) = reusable {
             let record = connection_operation_record(row)?;
-            transaction.commit().await.map_err(database_error)?;
-            return Ok(ConnectionOperationReservation {
-                inserted: false,
-                record,
-            });
+            if connection_execution_bindings_match(&record.bindings, request.bindings) {
+                transaction.commit().await.map_err(database_error)?;
+                return Ok(ConnectionOperationReservation {
+                    inserted: false,
+                    record,
+                });
+            }
         }
 
         if active_mutation {
@@ -2812,11 +2913,11 @@ impl PgStore {
             "INSERT INTO connection_operations \
              (operation_id, task_uid, canonical_user_id, provider, operation_kind, \
               submitter_service, authority_id, authority_version, authority_digest, \
-              runtime_spec_snapshot, command_snapshot, bridge_image_digest, mcp_gw_origin, \
+              runtime_spec_snapshot, command_snapshot, artifact_trust_mode, bridge_image_digest, mcp_gw_origin, \
               mcp_gw_version, runtime_namespace, runtime_class, idempotency_identity, uncached_status, \
               response_deadline_at) \
-             VALUES ($1, $1, $2, 'github', $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-                     $12, $13, $14, $15, $16, now() + make_interval(secs => $17)) \
+             VALUES ($1, $1, $2, 'github', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                     $13, $14, $15, $16, $17, now() + make_interval(secs => $18)) \
              RETURNING *, \
                        to_char(flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
                        to_char(response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
@@ -2833,6 +2934,7 @@ impl PgStore {
         .bind(request.authority_digest)
         .bind(Json(task.runtime_spec))
         .bind(Json(task.agent_command))
+        .bind(&request.bindings.artifact_trust_mode)
         .bind(&request.bindings.bridge_image_digest)
         .bind(&request.bindings.mcp_gw_origin)
         .bind(&request.bindings.mcp_gw_version)
@@ -3791,7 +3893,13 @@ fn validate_connection_operation_request(
             .map(String::as_str)
             .ne(expected_command)
         || request.task.runtime_namespace != request.bindings.namespace
-        || !valid_digest_pinned_image(&request.bindings.bridge_image_digest)
+        || !match request.bindings.artifact_trust_mode.as_str() {
+            "github-attestation" => {
+                valid_digest_pinned_image(&request.bindings.bridge_image_digest)
+            }
+            "operator-pinned" => valid_operator_pinned_image(&request.bindings.bridge_image_digest),
+            _ => false,
+        }
         || request.bindings.mcp_gw_origin.trim().is_empty()
         || request.bindings.mcp_gw_version != "0.3.2"
         || request.bindings.namespace.trim().is_empty()
@@ -3816,6 +3924,60 @@ fn valid_digest_pinned_image(value: &str) -> bool {
     value.split_once("@").is_some_and(|(repository, digest)| {
         !repository.is_empty() && valid_sha256_reference(digest)
     })
+}
+
+fn valid_operator_pinned_image(value: &str) -> bool {
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || value.matches('@').count() != 1
+        || value.contains("://")
+    {
+        return false;
+    }
+    let Some((repository, digest)) = value.split_once('@') else {
+        return false;
+    };
+    let mut components = repository.split('/');
+    let Some(registry) = components.next() else {
+        return false;
+    };
+    let (registry, port) = registry
+        .split_once(':')
+        .map_or((registry, None), |(registry, port)| (registry, Some(port)));
+    let valid_component = |component: &str| {
+        !component.is_empty()
+            && component.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            })
+    };
+    if !valid_component(registry)
+        || port
+            .is_some_and(|port| port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()))
+        || components.any(|component| !valid_component(component))
+    {
+        return false;
+    }
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn connection_execution_bindings_match(
+    persisted: &ConnectionExecutionBindingSnapshot,
+    current: &ConnectionExecutionBindingSnapshot,
+) -> bool {
+    persisted.artifact_trust_mode == current.artifact_trust_mode
+        && persisted.bridge_image_digest == current.bridge_image_digest
+        && persisted.mcp_gw_origin == current.mcp_gw_origin
+        && persisted.mcp_gw_version == current.mcp_gw_version
+        && persisted.namespace == current.namespace
+        && persisted.runtime_class == current.runtime_class
 }
 
 fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<(), StoreError> {
@@ -3927,6 +4089,7 @@ pub enum ConnectionOAuthPhase {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionExecutionBindingSnapshot {
+    pub artifact_trust_mode: String,
     pub bridge_image_digest: String,
     pub mcp_gw_origin: String,
     pub mcp_gw_version: String,
@@ -4409,6 +4572,7 @@ fn connection_operation_record(
             .map_err(database_error)?
             .0,
         bindings: ConnectionExecutionBindingSnapshot {
+            artifact_trust_mode: row.try_get("artifact_trust_mode").map_err(database_error)?,
             bridge_image_digest: row.try_get("bridge_image_digest").map_err(database_error)?,
             mcp_gw_origin: row.try_get("mcp_gw_origin").map_err(database_error)?,
             mcp_gw_version: row.try_get("mcp_gw_version").map_err(database_error)?,
