@@ -2782,9 +2782,10 @@ impl PgStore {
              (task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, \
               owner, owner_user_id, identity_binding_state, workflow, coding_agent_runtime, \
               runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
-              agent_command, input_archive, execute_requested, envelope_revision) \
+              agent_command, input_archive, execute_requested, envelope_revision, \
+              internal_authority_id, internal_authority_version, internal_authority_digest) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, \
-                     'provisioned', 'queued', $12, $13, $14, true, $15)",
+                     'provisioned', 'queued', $12, $13, $14, true, $15, $16, $17, $18)",
         )
         .bind(request.operation_id)
         .bind(task.idempotency_key)
@@ -2801,6 +2802,9 @@ impl PgStore {
         .bind(Json(task.agent_command))
         .bind(request.input_archive)
         .bind(task.envelope_revision)
+        .bind(request.authority_id)
+        .bind(request.authority_version)
+        .bind(request.authority_digest)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -3868,6 +3872,9 @@ pub struct TaskRecord {
     pub user_envelope_instance_id: Option<String>,
     pub user_envelope_revision: Option<i64>,
     pub user_envelope_digest: Option<String>,
+    pub internal_authority_id: Option<String>,
+    pub internal_authority_version: Option<i64>,
+    pub internal_authority_digest: Option<String>,
     pub coding_agent_runtime: String,
     pub runtime_uid: Option<String>,
     pub runtime_namespace: String,
@@ -4476,6 +4483,15 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
             .map_err(database_error)?,
         user_envelope_digest: row
             .try_get("user_envelope_digest")
+            .map_err(database_error)?,
+        internal_authority_id: row
+            .try_get("internal_authority_id")
+            .map_err(database_error)?,
+        internal_authority_version: row
+            .try_get("internal_authority_version")
+            .map_err(database_error)?,
+        internal_authority_digest: row
+            .try_get("internal_authority_digest")
             .map_err(database_error)?,
         coding_agent_runtime: row
             .try_get("coding_agent_runtime")

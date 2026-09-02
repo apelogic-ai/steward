@@ -2428,16 +2428,86 @@ async fn governed_connection_operations_are_serialized_restart_safe_and_hidden_f
         .register_canonical_identity(&identity, "identity-admin")
         .await?;
 
-    let status = reserve_governed_connection(
-        &store,
-        &principal.user_id,
-        &email,
-        ConnectionOperationKind::Status,
-        true,
-        &format!("status-{suffix}"),
+    let first_status_key = format!("status-a-{suffix}");
+    let second_status_key = format!("status-b-{suffix}");
+    let (first_status, second_status) = tokio::join!(
+        reserve_governed_connection(
+            &store,
+            &principal.user_id,
+            &email,
+            ConnectionOperationKind::Status,
+            true,
+            &first_status_key,
+        ),
+        reserve_governed_connection(
+            &store,
+            &principal.user_id,
+            &email,
+            ConnectionOperationKind::Status,
+            true,
+            &second_status_key,
+        )
+    );
+    let first_status = first_status?;
+    let second_status = second_status?;
+    assert_ne!(
+        first_status.inserted, second_status.inserted,
+        "concurrent status calls must create exactly one bridge operation"
+    );
+    let (status, joined_status) = if first_status.inserted {
+        (first_status, second_status)
+    } else {
+        (second_status, first_status)
+    };
+    assert_eq!(joined_status.record.operation_id, status.record.operation_id);
+    let task_authority: (Option<String>, Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT internal_authority_id, internal_authority_version, internal_authority_digest \
+         FROM task_submissions WHERE task_uid = $1",
     )
+    .bind(status.record.task_uid)
+    .fetch_one(&pool)
     .await?;
-    assert!(status.inserted);
+    assert_eq!(
+        task_authority,
+        (
+            Some("steward-connections".to_owned()),
+            Some(1),
+            Some(steward_admission::internal_authorities::steward_connections_v1::AUTHORITY_DIGEST.to_owned()),
+        ),
+        "the internal task must persist the same exact authority pins as its operation projection"
+    );
+    let divergent_authority = sqlx::query(
+        "UPDATE task_submissions SET internal_authority_digest = $2 WHERE task_uid = $1",
+    )
+    .bind(status.record.task_uid)
+    .bind(format!("sha256:{}", "b".repeat(64)))
+    .execute(&pool)
+    .await;
+    assert!(
+        divergent_authority.is_err(),
+        "the task authority pins must not diverge from the connection-operation projection"
+    );
+    let partial_authority = sqlx::query(
+        "INSERT INTO task_submissions \
+         (task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, owner, \
+          owner_user_id, identity_binding_state, workflow, coding_agent_runtime, \
+          runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
+          agent_command, input_archive, execute_requested, envelope_revision, \
+          internal_authority_id) \
+         SELECT gen_random_uuid(), idempotency_key || '-partial-authority', \
+                submitter_service, acting_user, acting_user_id, owner, owner_user_id, \
+                identity_binding_state, workflow, coding_agent_runtime, runtime_namespace, \
+                runtime_name, runtime_ownership, phase, runtime_spec, agent_command, \
+                input_archive, execute_requested, envelope_revision, 'partial-authority' \
+         FROM task_submissions WHERE task_uid = $1",
+    )
+    .bind(status.record.task_uid)
+    .execute(&pool)
+    .await;
+    assert!(
+        partial_authority.is_err(),
+        "internal task authority pins must be either all absent or all present"
+    );
     let bridge_runtime_uid = format!("bridge-runtime-{suffix}");
     store
         .bind_task_runtime(
@@ -2464,21 +2534,6 @@ async fn governed_connection_operations_are_serialized_restart_safe_and_hidden_f
             .is_none(),
         "an unrelated or long-running runtime UID must not resolve bridge authority"
     );
-    let joined_status = reserve_governed_connection(
-        &store,
-        &principal.user_id,
-        &email,
-        ConnectionOperationKind::Status,
-        true,
-        &format!("status-duplicate-{suffix}"),
-    )
-    .await?;
-    assert!(!joined_status.inserted);
-    assert_eq!(
-        joined_status.record.operation_id,
-        status.record.operation_id
-    );
-
     let disconnect = reserve_governed_connection(
         &store,
         &principal.user_id,
@@ -2581,15 +2636,38 @@ async fn governed_connection_operations_are_serialized_restart_safe_and_hidden_f
         "connection operations must not appear in generic task APIs"
     );
 
-    let start = reserve_governed_connection(
-        &store,
-        &principal.user_id,
-        &email,
-        ConnectionOperationKind::Start,
-        true,
-        &format!("start-{suffix}"),
-    )
-    .await?;
+    let first_start_key = format!("start-a-{suffix}");
+    let second_start_key = format!("start-b-{suffix}");
+    let (first_start, second_start) = tokio::join!(
+        reserve_governed_connection(
+            &store,
+            &principal.user_id,
+            &email,
+            ConnectionOperationKind::Start,
+            true,
+            &first_start_key,
+        ),
+        reserve_governed_connection(
+            &store,
+            &principal.user_id,
+            &email,
+            ConnectionOperationKind::Start,
+            true,
+            &second_start_key,
+        )
+    );
+    let first_start = first_start?;
+    let second_start = second_start?;
+    assert_ne!(
+        first_start.inserted, second_start.inserted,
+        "concurrent starts must create exactly one OAuth bridge operation"
+    );
+    let (start, joined_start) = if first_start.inserted {
+        (first_start, second_start)
+    } else {
+        (second_start, first_start)
+    };
+    assert_eq!(joined_start.record.operation_id, start.record.operation_id);
     let authorization_url =
         format!("https://github.example.test/login/oauth/authorize?state={suffix}");
     store

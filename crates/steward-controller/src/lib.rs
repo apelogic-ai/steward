@@ -681,6 +681,9 @@ fn connection_operation_bindings_match(
     operation.authority_id == "steward-connections"
         && operation.authority_version == 1
         && operation.authority_digest == steward_connections_v1::AUTHORITY_DIGEST
+        && task.internal_authority_id.as_deref() == Some(operation.authority_id.as_str())
+        && task.internal_authority_version == Some(operation.authority_version)
+        && task.internal_authority_digest.as_deref() == Some(operation.authority_digest.as_str())
         && operation.runtime_spec_snapshot == task.runtime_spec
         && operation.command_snapshot == task.agent_command
         && provider_control_bindings_match(&operation.bindings, current)
