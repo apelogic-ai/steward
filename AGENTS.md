@@ -33,6 +33,14 @@ No direct pushes to `main`. Every change, no matter how small:
    is informational and does not block.
 6. Squash-merge (§6).
 
+Once a human requests a repository change, the agent may perform the normal
+steps above without asking separately for permission to sync or switch to
+`main`, create or switch to the task branch, commit, push that branch, or open
+its PR. Before switching, the agent must inspect the worktree and preserve
+unrelated work; this autonomy never authorises data loss, a force-push, a push
+to `main`, or any human-only PR action in §1.2. The push announcement required
+by §1.3 is coordination for the hardware approval, not a permission request.
+
 ### 1.1 Force pushes
 
 **Never force-push.** Not with `--force`, not with `--force-with-lease`, not by
@@ -414,10 +422,11 @@ work and a stray `checkout`. Withholding it does not make anything safer.
   is unprotected work; a long unattended run that ends with a full slice in the
   working tree has produced nothing durable.
 - **Never commit to `main`.** §1.
-- **Never switch branches unless explicitly told to.** Stay on the current
-  branch for the whole session. If a task appears to need a different branch,
-  ask first — and see §1.4 before reaching for a worktree to get around it.
-- **Never push without announcing it first.** §1.3.
+- **Switch only for the requested workflow, and never move or discard unrelated
+  work.** Inspect the worktree first; when it is not safe to switch in place,
+  use an in-repository worktree for a legitimate §1.4 case or stop and report.
+- **Announce a push before running it.** This coordinates the hardware approval;
+  it does not require a separate permission grant. §1.3.
 - **Never merge or close.** §1.2.
 The distinction matters most in exactly the case where the old wording failed:
 an unattended run. Attended, a withheld commit costs a moment. Unattended, it
@@ -425,9 +434,26 @@ risks the whole session.
 
 ## 7. Gates
 
-Green before requesting review. Every one of these runs in CI. Run them locally
-first — they are the *same* commands, invoked the same way, because task logic
-lives in `xtask/` rather than in a CI workflow file.
+Green before requesting review. Select the local gate from the actual diff.
+
+For a **documentation-only change**, run:
+
+```bash
+git diff --check origin/main...HEAD
+cargo xtask check-neutrality
+cargo xtask check-secrets
+```
+
+Documentation-only means Markdown and static documentation images, with no
+change to source, tests, executable scripts, build or deployment configuration,
+policies, dependencies, migrations, generated artifacts, schemas, contract
+fixtures, or executable examples. Anything under `docs/contracts/` or
+`docs/examples/` is a contract/test artifact rather than documentation-only. A
+mixed or uncertain diff uses the full gate.
+
+For every other change, run the full gate below. Every command runs in CI. Run
+it locally first — task logic lives in `xtask/` rather than being reimplemented
+in a CI workflow file.
 
 ```bash
 cargo fmt --all -- --check
@@ -495,7 +521,7 @@ issue.
   issue link.
 - Anything under `crates/steward-mint/`. It holds the signing key.
 - Deploying to, or running anything against, a manual DEV environment (§5.4).
-- Force-pushing (§1.1), committing, or switching branches (§6).
+- Force-pushing (§1.1).
 
 Never, with or without asking: merging or closing a PR (§1.2), working around a
 push failure (§1.3), rewriting history to scrub a committed secret (§11.3) —
