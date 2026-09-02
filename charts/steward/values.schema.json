@@ -357,6 +357,7 @@
       "additionalProperties": false,
       "required": [
         "enabled",
+        "artifactTrust",
         "image",
         "signerIdentity",
         "sourceRepository",
@@ -368,6 +369,17 @@
       ],
       "properties": {
         "enabled": {"type": "boolean"},
+        "artifactTrust": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["github-attestation", "operator-pinned"]
+            }
+          }
+        },
         "image": {"type": "string"},
         "signerIdentity": {"type": "string"},
         "sourceRepository": {"type": "string"},
@@ -382,22 +394,58 @@
           "if": {"properties": {"enabled": {"const": true}}},
           "then": {
             "properties": {
-              "image": {"type": "string", "pattern": "^.+@sha256:[a-f0-9]{64}$"},
-              "signerIdentity": {"$ref": "#/definitions/nonempty"},
-              "sourceRepository": {
-                "type": "string",
-                "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
-              },
-              "sourceCommit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
               "mcpGatewayOrigin": {
                 "type": "string",
                 "pattern": "^https?://[^\\s/@?#:]+(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$",
                 "minLength": 10
               },
               "mcpGatewayVersion": {"const": "0.3.2"},
-              "runtimeNamespace": {"$ref": "#/definitions/nonempty"},
-              "attestationBundle": {"$ref": "#/definitions/nonempty"}
-            }
+              "runtimeNamespace": {"$ref": "#/definitions/nonempty"}
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "artifactTrust": {
+                      "properties": {"mode": {"const": "github-attestation"}}
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "image": {"type": "string", "pattern": "^.+@sha256:[a-f0-9]{64}$"},
+                    "signerIdentity": {"$ref": "#/definitions/nonempty"},
+                    "sourceRepository": {
+                      "type": "string",
+                      "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+                    },
+                    "sourceCommit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+                    "attestationBundle": {"$ref": "#/definitions/nonempty"}
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "artifactTrust": {
+                      "properties": {"mode": {"const": "operator-pinned"}}
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "image": {
+                      "type": "string",
+                      "pattern": "^[a-z0-9._-]+(?::[0-9]+)?(?:/[a-z0-9._-]+)*@sha256:[a-f0-9]{64}$"
+                    },
+                    "signerIdentity": {"maxLength": 0},
+                    "sourceRepository": {"maxLength": 0},
+                    "sourceCommit": {"maxLength": 0},
+                    "attestationBundle": {"maxLength": 0}
+                  }
+                }
+              }
+            ]
           }
         }
       ]

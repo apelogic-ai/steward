@@ -29,6 +29,15 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_PENDING_TLS_HANDSHAKES: usize = 64;
+const GITHUB_ATTESTATION_TRUST_MODE: &str = "github-attestation";
+const OPERATOR_PINNED_TRUST_MODE: &str = "operator-pinned";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VerifiedConnectionsBridgeArtifact {
+    image_reference: String,
+    trust_mode: String,
+    digest: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -104,7 +113,16 @@ fn required_file(name: &str) -> Result<Vec<u8>, io::Error> {
 fn openshell_connection_config() -> Result<OpenShellConnectionConfig, io::Error> {
     let task_log_mode = openshell_task_log_mode(env::var("STEWARD_OPENSHELL_TASK_LOG_MODE"))?;
     let stable_bridge_image = verified_stable_bridge_image_configuration()?;
-    let bridge_image = verified_connections_bridge_image_configuration()?;
+    let bridge_artifact = verified_connections_bridge_image_configuration()?;
+    if let Some(artifact) = bridge_artifact.as_ref() {
+        eprintln!("{}", connections_bridge_startup_log(artifact));
+    }
+    let bridge_image = bridge_artifact
+        .as_ref()
+        .map(|artifact| artifact.image_reference.clone());
+    let bridge_artifact_trust_mode = bridge_artifact
+        .as_ref()
+        .map(|artifact| artifact.trust_mode.clone());
     Ok(OpenShellConnectionConfig {
         endpoint: required("STEWARD_OPENSHELL_ENDPOINT")?,
         ca_certificate_pem: required_file("STEWARD_OPENSHELL_CA_CERTIFICATE_FILE")?,
@@ -141,7 +159,15 @@ fn openshell_connection_config() -> Result<OpenShellConnectionConfig, io::Error>
             .map(|_| required("STEWARD_CONNECTIONS_RUNTIME_NAMESPACE"))
             .transpose()?,
         bridge_image,
+        bridge_artifact_trust_mode,
     })
+}
+
+fn connections_bridge_startup_log(artifact: &VerifiedConnectionsBridgeArtifact) -> String {
+    format!(
+        "connections bridge artifact: trust_mode={} digest={}",
+        artifact.trust_mode, artifact.digest
+    )
 }
 
 fn openshell_task_log_mode(
@@ -203,22 +229,149 @@ fn bridge_gateway_version_for_image(
     }
 }
 
-/// Reads one all-or-nothing provenance configuration set. The controller never accepts a bridge
-/// image directly from an environment value: this function returns it only after offline GitHub
-/// provenance verification binds the digest to the configured source and workflow signer.
-fn verified_connections_bridge_image_configuration() -> Result<Option<String>, io::Error> {
+/// Reads one all-or-nothing artifact trust configuration. GitHub-attestation mode retains offline
+/// provenance verification; operator-pinned mode accepts only an explicit canonical digest and
+/// delegates provenance responsibility to the deployment system.
+fn verified_connections_bridge_image_configuration()
+-> Result<Option<VerifiedConnectionsBridgeArtifact>, io::Error> {
+    let trust_mode = env::var("STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE").ok();
     let image = env::var("STEWARD_CONNECTIONS_BRIDGE_IMAGE").ok();
     let signer_identity = env::var("STEWARD_CONNECTIONS_BRIDGE_SIGNER_IDENTITY").ok();
     let source_repository = env::var("STEWARD_CONNECTIONS_BRIDGE_SOURCE_REPOSITORY").ok();
     let source_commit = env::var("STEWARD_CONNECTIONS_BRIDGE_SOURCE_COMMIT").ok();
     let bundle_file = env::var("STEWARD_CONNECTIONS_BRIDGE_ATTESTATION_BUNDLE_FILE").ok();
-    verified_bridge_image_configuration(
+    verify_connections_bridge_image_configuration(
+        trust_mode,
         image,
         signer_identity,
         source_repository,
         source_commit,
         bundle_file,
     )
+}
+
+fn verify_connections_bridge_image_configuration(
+    trust_mode: Option<String>,
+    image: Option<String>,
+    signer_identity: Option<String>,
+    source_repository: Option<String>,
+    source_commit: Option<String>,
+    bundle_file: Option<String>,
+) -> Result<Option<VerifiedConnectionsBridgeArtifact>, io::Error> {
+    let configured = [
+        image.as_ref(),
+        signer_identity.as_ref(),
+        source_repository.as_ref(),
+        source_commit.as_ref(),
+        bundle_file.as_ref(),
+    ]
+    .iter()
+    .any(|value| value.is_some());
+    if !configured {
+        return match trust_mode {
+            None => Ok(None),
+            Some(_) => Err(io::Error::other(
+                "connections bridge trust mode requires a complete bridge configuration",
+            )),
+        };
+    }
+    let normalized_mode = trust_mode.unwrap_or_else(|| GITHUB_ATTESTATION_TRUST_MODE.to_owned());
+    match normalized_mode.as_str() {
+        GITHUB_ATTESTATION_TRUST_MODE => verified_bridge_image_configuration(
+            image,
+            signer_identity,
+            source_repository,
+            source_commit,
+            bundle_file,
+        )
+        .map(|verified| {
+            verified.map(|image_reference| VerifiedConnectionsBridgeArtifact {
+                digest: image_digest(&image_reference).to_owned(),
+                image_reference,
+                trust_mode: GITHUB_ATTESTATION_TRUST_MODE.to_owned(),
+            })
+        }),
+        OPERATOR_PINNED_TRUST_MODE => {
+            if [
+                signer_identity.as_deref(),
+                source_repository.as_deref(),
+                source_commit.as_deref(),
+                bundle_file.as_deref(),
+            ]
+            .iter()
+            .flatten()
+            .any(|value| !value.is_empty())
+            {
+                return Err(io::Error::other(
+                    "operator-pinned connections bridge cannot include attestation configuration",
+                ));
+            }
+            let image_reference = image.ok_or_else(|| {
+                io::Error::other("operator-pinned connections bridge image is required")
+            })?;
+            if !valid_operator_pinned_image(&image_reference) {
+                return Err(io::Error::other(
+                    "operator-pinned connections bridge image must be an exact canonical sha256 OCI reference",
+                ));
+            }
+            Ok(Some(VerifiedConnectionsBridgeArtifact {
+                digest: image_digest(&image_reference).to_owned(),
+                image_reference,
+                trust_mode: OPERATOR_PINNED_TRUST_MODE.to_owned(),
+            }))
+        }
+        _ => Err(io::Error::other(
+            "STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE must be github-attestation or operator-pinned",
+        )),
+    }
+}
+
+fn image_digest(image_reference: &str) -> &str {
+    image_reference
+        .rsplit_once('@')
+        .map_or("invalid", |(_, digest)| digest)
+}
+
+fn valid_operator_pinned_image(value: &str) -> bool {
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || value.matches('@').count() != 1
+        || value.contains("://")
+    {
+        return false;
+    }
+    let Some((repository, digest)) = value.split_once('@') else {
+        return false;
+    };
+    let mut components = repository.split('/');
+    let Some(registry) = components.next() else {
+        return false;
+    };
+    let (registry, port) = registry
+        .split_once(':')
+        .map_or((registry, None), |(registry, port)| (registry, Some(port)));
+    let valid_component = |component: &str| {
+        !component.is_empty()
+            && component.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'_' | b'-')
+            })
+    };
+    if !valid_component(registry)
+        || port
+            .is_some_and(|port| port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()))
+        || components.any(|component| !valid_component(component))
+    {
+        return false;
+    }
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn verified_stable_bridge_image_configuration() -> Result<Option<String>, io::Error> {
@@ -425,9 +578,11 @@ mod tests {
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
     use super::{
-        TlsListener, bridge_gateway_origin_for_image, bridge_gateway_version_for_image,
-        decode_tls_material, install_rustls_crypto_provider, openshell_task_log_mode,
-        verify_bridge_image_provenance,
+        GITHUB_ATTESTATION_TRUST_MODE, OPERATOR_PINNED_TRUST_MODE, TlsListener,
+        bridge_gateway_origin_for_image, bridge_gateway_version_for_image,
+        connections_bridge_startup_log, decode_tls_material, install_rustls_crypto_provider,
+        openshell_task_log_mode, verify_bridge_image_provenance,
+        verify_connections_bridge_image_configuration,
     };
     use steward_adapter_openshell::OpenShellTaskLogMode;
 
@@ -506,6 +661,118 @@ mod tests {
             .is_err(),
             "an unverifiable configured bridge is rejected before OpenShell is contacted"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn connections_bridge_operator_pinned_mode_is_explicit_strict_and_unattested()
+    -> Result<(), String> {
+        let digest = "a".repeat(64);
+        let image = format!("registry.example.test:5000/team/bridge@sha256:{digest}");
+        let verified = verify_connections_bridge_image_configuration(
+            Some(OPERATOR_PINNED_TRUST_MODE.to_owned()),
+            Some(image.clone()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "operator-pinned configuration was treated as disabled".to_owned())?;
+        assert_eq!(verified.image_reference, image);
+        assert_eq!(verified.trust_mode, OPERATOR_PINNED_TRUST_MODE);
+        assert_eq!(verified.digest, format!("sha256:{digest}"));
+
+        for invalid in [
+            "registry.example.test/team/bridge:latest".to_owned(),
+            format!("registry.example.test/team/bridge:tag@sha256:{digest}"),
+            format!("registry.example.test/team/bridge@@sha256:{digest}"),
+            format!("registry.example.test//team/bridge@sha256:{digest}"),
+            format!("https://registry.example.test/team/bridge@sha256:{digest}"),
+            format!("registry.example.test/team/bridge @sha256:{digest}"),
+            format!(
+                "registry.example.test/team/bridge@sha256:{}",
+                "A".repeat(64)
+            ),
+        ] {
+            assert!(
+                verify_connections_bridge_image_configuration(
+                    Some(OPERATOR_PINNED_TRUST_MODE.to_owned()),
+                    Some(invalid.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .is_err(),
+                "operator-pinned startup accepted {invalid:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn connections_bridge_trust_mode_defaults_to_github_and_rejects_contradictions() {
+        let image = Some(
+            "registry.example.test/team/bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+        );
+        let default_result = verify_connections_bridge_image_configuration(
+            None,
+            image.clone(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(
+            default_result,
+            Err(ref error) if error.to_string().contains("provenance")
+        ));
+
+        assert!(
+            verify_connections_bridge_image_configuration(
+                Some(OPERATOR_PINNED_TRUST_MODE.to_owned()),
+                image.clone(),
+                Some("configured-signer".to_owned()),
+                None,
+                None,
+                None,
+            )
+            .is_err(),
+            "operator trust must reject even partial attestation configuration"
+        );
+        assert!(
+            verify_connections_bridge_image_configuration(
+                Some("unknown".to_owned()),
+                image,
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(GITHUB_ATTESTATION_TRUST_MODE, "github-attestation");
+    }
+
+    #[test]
+    fn connections_bridge_startup_log_contains_only_mode_and_digest() -> Result<(), String> {
+        let image = "private-registry.example.test/team/bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let artifact = verify_connections_bridge_image_configuration(
+            Some(OPERATOR_PINNED_TRUST_MODE.to_owned()),
+            Some(image.to_owned()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "operator artifact is missing".to_owned())?;
+        let log = connections_bridge_startup_log(&artifact);
+        assert!(log.contains("trust_mode=operator-pinned"));
+        assert!(log.contains("digest=sha256:"));
+        assert!(!log.contains("private-registry") && !log.contains("team/bridge"));
         Ok(())
     }
 

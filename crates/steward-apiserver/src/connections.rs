@@ -609,7 +609,7 @@ mod tests {
             .layer(axum::Extension(ConnectionMutationProof))
             .layer(axum::Extension(session()?))
             .oneshot(request(
-                r#"{"userId":"usr_hostile","issuer":"https://other.example.test","bearer":"hostile","runtime":"adopted","image":"hostile:latest","command":["sh"],"endpoint":"https://other.example.test","toolGrant":{"provider":"github","resource":"repository","action":"get_file_contents"}}"#,
+                r#"{"userId":"usr_hostile","issuer":"https://other.example.test","bearer":"hostile","runtime":"adopted","image":"hostile:latest","artifactTrust":{"mode":"operator-pinned"},"command":["sh"],"endpoint":"https://other.example.test","toolGrant":{"provider":"github","resource":"repository","action":"get_file_contents"}}"#,
             )?)
             .await
             .map_err(|error| format!("request browser-supplied runtime fields: {error}"))?;

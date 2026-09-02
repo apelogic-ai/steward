@@ -48,6 +48,7 @@ fn valid_config() -> Result<OpenShellConnectionConfig, String> {
         stable_bridge_image: None,
         stable_bridge_gateway_origin: None,
         bridge_image: None,
+        bridge_artifact_trust_mode: None,
         bridge_gateway_origin: None,
         bridge_gateway_version: None,
         bridge_runtime_namespace: None,

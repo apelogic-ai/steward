@@ -152,7 +152,7 @@ data:
   bundle.jsonl: |-
 {{ .Values.stableBridge.attestationBundle | indent 4 }}
 {{- end }}
-{{- if .Values.connectionsBridge.enabled }}
+{{- if and .Values.connectionsBridge.enabled (eq .Values.connectionsBridge.artifactTrust.mode "github-attestation") }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -266,6 +266,7 @@ spec:
             - { name: STEWARD_GOOGLE_OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: {{ .Values.browserAuth.google.clientSecret.name }}, key: {{ .Values.browserAuth.google.clientSecret.key }} } } }
 {{- end }}
 {{- if .Values.connectionsBridge.enabled }}
+            - { name: STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE, value: {{ .Values.connectionsBridge.artifactTrust.mode | quote }} }
             - { name: STEWARD_CONNECTIONS_BRIDGE_IMAGE, value: {{ .Values.connectionsBridge.image | quote }} }
             - { name: STEWARD_CONNECTIONS_MCP_GW_ORIGIN, value: {{ .Values.connectionsBridge.mcpGatewayOrigin | quote }} }
             - { name: STEWARD_CONNECTIONS_MCP_GW_VERSION, value: {{ .Values.connectionsBridge.mcpGatewayVersion | quote }} }
@@ -344,11 +345,14 @@ spec:
             - { name: STEWARD_CONTROLLER_USERNAME, value: {{ printf "system:serviceaccount:%s:steward-controller" .Release.Namespace | quote }} }
             - { name: STEWARD_APISERVER_USERNAME, value: {{ printf "system:serviceaccount:%s:steward-apiserver" .Release.Namespace | quote }} }
 {{- if .Values.connectionsBridge.enabled }}
+            - { name: STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE, value: {{ .Values.connectionsBridge.artifactTrust.mode | quote }} }
             - { name: STEWARD_CONNECTIONS_BRIDGE_IMAGE, value: {{ .Values.connectionsBridge.image | quote }} }
+{{- if eq .Values.connectionsBridge.artifactTrust.mode "github-attestation" }}
             - { name: STEWARD_CONNECTIONS_BRIDGE_SIGNER_IDENTITY, value: {{ .Values.connectionsBridge.signerIdentity | quote }} }
             - { name: STEWARD_CONNECTIONS_BRIDGE_SOURCE_REPOSITORY, value: {{ .Values.connectionsBridge.sourceRepository | quote }} }
             - { name: STEWARD_CONNECTIONS_BRIDGE_SOURCE_COMMIT, value: {{ .Values.connectionsBridge.sourceCommit | quote }} }
             - { name: STEWARD_CONNECTIONS_BRIDGE_ATTESTATION_BUNDLE_FILE, value: /run/connections-bridge-attestation/bundle.jsonl }
+{{- end }}
             - { name: STEWARD_CONNECTIONS_MCP_GW_ORIGIN, value: {{ .Values.connectionsBridge.mcpGatewayOrigin | quote }} }
             - { name: STEWARD_CONNECTIONS_MCP_GW_VERSION, value: {{ .Values.connectionsBridge.mcpGatewayVersion | quote }} }
             - { name: STEWARD_CONNECTIONS_RUNTIME_NAMESPACE, value: {{ .Values.connectionsBridge.runtimeNamespace | quote }} }
@@ -360,7 +364,7 @@ spec:
             - { name: openshell-client, mountPath: /run/openshell, readOnly: true }
             - { name: workload-exchange-ca, mountPath: /run/workload-exchange, readOnly: true }
             - { name: workload-source-credential, mountPath: /var/run/secrets/steward/workload, readOnly: true }
-{{- if .Values.connectionsBridge.enabled }}
+{{- if and .Values.connectionsBridge.enabled (eq .Values.connectionsBridge.artifactTrust.mode "github-attestation") }}
             - { name: connections-bridge-attestation, mountPath: /run/connections-bridge-attestation, readOnly: true }
 {{- end }}
           resources:
@@ -391,7 +395,7 @@ spec:
                   audience: apelogic-workload-exchange
                   expirationSeconds: 600
                   path: source-token
-{{- if .Values.connectionsBridge.enabled }}
+{{- if and .Values.connectionsBridge.enabled (eq .Values.connectionsBridge.artifactTrust.mode "github-attestation") }}
         - name: connections-bridge-attestation
           configMap:
             name: {{ $connectionsBridgeBundleName }}

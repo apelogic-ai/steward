@@ -1,5 +1,6 @@
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,6 +30,7 @@ use steward_types::{
 
 fn governed_connection_bindings() -> ConnectionExecutionBindings {
     ConnectionExecutionBindings {
+        artifact_trust_mode: "github-attestation".to_owned(),
         bridge_image_digest:
             "ghcr.io/example-org/steward-connections-bridge@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_owned(),
@@ -55,17 +57,38 @@ async fn reserve_governed_connection(
     allow_status_cache: bool,
     idempotency_identity: &str,
 ) -> Result<ConnectionOperationReservation, StoreError> {
+    reserve_governed_connection_with_bindings(
+        store,
+        user_id,
+        email,
+        operation_kind,
+        allow_status_cache,
+        idempotency_identity,
+        governed_connection_bindings(),
+    )
+    .await
+}
+
+async fn reserve_governed_connection_with_bindings(
+    store: &PgStore,
+    user_id: &CanonicalUserId,
+    email: &Email,
+    operation_kind: ConnectionOperationKind,
+    allow_status_cache: bool,
+    idempotency_identity: &str,
+    bindings: ConnectionExecutionBindings,
+) -> Result<ConnectionOperationReservation, StoreError> {
     let planned_kind = match operation_kind {
         ConnectionOperationKind::Status => PlannedConnectionOperationKind::Status,
         ConnectionOperationKind::Start => PlannedConnectionOperationKind::Start,
         ConnectionOperationKind::Disconnect => PlannedConnectionOperationKind::Disconnect,
     };
-    let plan =
-        plan_connection_operation(user_id, email, planned_kind, governed_connection_bindings())
-            .map_err(|_| StoreError::InvalidConnectionOperation)?;
+    let plan = plan_connection_operation(user_id, email, planned_kind, bindings)
+        .map_err(|_| StoreError::InvalidConnectionOperation)?;
     let operation_id = sqlx::types::Uuid::new_v4();
     let runtime_name = format!("conn-{}", operation_id.simple());
     let binding_snapshot = ConnectionExecutionBindingSnapshot {
+        artifact_trust_mode: plan.bindings.artifact_trust_mode.clone(),
         bridge_image_digest: plan.bindings.bridge_image_digest.clone(),
         mcp_gw_origin: plan.bindings.mcp_gw_origin.clone(),
         mcp_gw_version: plan.bindings.mcp_gw_version.clone(),
@@ -2849,5 +2872,446 @@ async fn governed_connection_operations_are_serialized_restart_safe_and_hidden_f
         .ok_or_else(|| io::Error::other("expired start audit record disappeared"))?;
     assert_eq!(expired_start.oauth_phase, ConnectionOAuthPhase::Expired);
     assert_eq!(expired_start.authorization_url, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn governed_connection_reuse_is_bound_to_artifact_trust_and_full_execution_snapshot()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other(
+            "STEWARD_TEST_DATABASE_URL is required for the connection binding Postgres test",
+        )
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool.clone());
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let email = Email::parse(format!("connection-binding-{suffix}@example.com"))?;
+    let identity = google_identity(
+        format!("connection-binding-subject-{suffix}"),
+        email.as_str(),
+    )?;
+    let principal = store
+        .register_canonical_identity(&identity, "identity-admin")
+        .await?;
+    let github_bindings = governed_connection_bindings();
+    let operator_bindings = ConnectionExecutionBindings {
+        artifact_trust_mode: "operator-pinned".to_owned(),
+        ..github_bindings.clone()
+    };
+
+    let github_status = reserve_governed_connection_with_bindings(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Status,
+        true,
+        &format!("github-active-{suffix}"),
+        github_bindings.clone(),
+    )
+    .await?;
+    assert!(
+        reserve_governed_connection_with_bindings(
+            &store,
+            &principal.user_id,
+            &email,
+            ConnectionOperationKind::Status,
+            true,
+            &format!("github-active-{suffix}"),
+            operator_bindings.clone(),
+        )
+        .await
+        .is_err(),
+        "an identical retry must not reinterpret its persisted operation under a new binding"
+    );
+    let original_retry = store
+        .connection_operation(github_status.record.operation_id, &principal.user_id)
+        .await?
+        .ok_or_else(|| io::Error::other("original retry operation disappeared"))?;
+    assert_eq!(
+        original_retry.bindings.artifact_trust_mode,
+        "github-attestation"
+    );
+    assert_eq!(
+        original_retry.operation_state,
+        ConnectionOperationState::Queued
+    );
+    let operator_status = reserve_governed_connection_with_bindings(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Status,
+        true,
+        &format!("operator-replacement-{suffix}"),
+        operator_bindings.clone(),
+    )
+    .await?;
+    assert!(operator_status.inserted);
+    assert_ne!(
+        operator_status.record.operation_id, github_status.record.operation_id,
+        "an active operation must never be reused under a different trust mode"
+    );
+    let drifted = store
+        .connection_operation(github_status.record.operation_id, &principal.user_id)
+        .await?
+        .ok_or_else(|| io::Error::other("drifted operation disappeared"))?;
+    assert_eq!(drifted.operation_state, ConnectionOperationState::Failed);
+    assert_eq!(
+        drifted.failure_category.as_deref(),
+        Some("binding_mismatch")
+    );
+    assert_eq!(drifted.finalization_state, "requested");
+    assert!(drifted.finalize_requested);
+    assert_eq!(
+        operator_status.record.bindings.artifact_trust_mode,
+        "operator-pinned"
+    );
+
+    store
+        .complete_connection_operation(
+            operator_status.record.operation_id,
+            &serde_json::json!({"connected": true}),
+            None,
+            None,
+            connection_operation_retention(),
+        )
+        .await?;
+    let replacement_github_status = reserve_governed_connection_with_bindings(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Status,
+        true,
+        &format!("github-after-cache-{suffix}"),
+        github_bindings.clone(),
+    )
+    .await?;
+    assert!(
+        replacement_github_status.inserted,
+        "a cached status must not survive an execution-binding change"
+    );
+    let invalidated_cache: bool = sqlx::query_scalar(
+        "SELECT cache_expires_at IS NULL FROM connection_operations WHERE operation_id = $1",
+    )
+    .bind(operator_status.record.operation_id)
+    .fetch_one(&pool)
+    .await?;
+    assert!(invalidated_cache);
+    store
+        .complete_connection_operation(
+            replacement_github_status.record.operation_id,
+            &serde_json::json!({"connected": false}),
+            None,
+            None,
+            connection_operation_retention(),
+        )
+        .await?;
+
+    let github_start = reserve_governed_connection_with_bindings(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Start,
+        true,
+        &format!("github-start-{suffix}"),
+        github_bindings.clone(),
+    )
+    .await?;
+    let authorization_url =
+        format!("https://github.example.test/login/oauth/authorize?state={suffix}");
+    store
+        .complete_connection_operation(
+            github_start.record.operation_id,
+            &serde_json::json!({"authorizationUrl": authorization_url}),
+            Some(&authorization_url),
+            Some(&format!("sha256:{}", "c".repeat(64))),
+            connection_operation_retention(),
+        )
+        .await?;
+    assert_eq!(
+        reserve_governed_connection_with_bindings(
+            &store,
+            &principal.user_id,
+            &email,
+            ConnectionOperationKind::Start,
+            true,
+            &format!("operator-start-{suffix}"),
+            operator_bindings,
+        )
+        .await,
+        Err(StoreError::ConnectionOAuthFlowPending),
+        "an outstanding OAuth URL must never be returned under changed execution bindings"
+    );
+    let expired_flow = store
+        .connection_operation(github_start.record.operation_id, &principal.user_id)
+        .await?
+        .ok_or_else(|| io::Error::other("mismatched OAuth operation disappeared"))?;
+    assert_eq!(expired_flow.oauth_phase, ConnectionOAuthPhase::Pending);
+    assert_eq!(
+        expired_flow.authorization_url.as_deref(),
+        Some(authorization_url.as_str()),
+        "binding drift must not falsely claim that MCP-GW's outstanding OAuth state expired"
+    );
+    assert_eq!(
+        reserve_governed_connection_with_bindings(
+            &store,
+            &principal.user_id,
+            &email,
+            ConnectionOperationKind::Start,
+            true,
+            &format!("operator-start-still-conflicting-{suffix}"),
+            ConnectionExecutionBindings {
+                artifact_trust_mode: "operator-pinned".to_owned(),
+                ..github_bindings.clone()
+            },
+        )
+        .await,
+        Err(StoreError::ConnectionOAuthFlowPending),
+        "retries must remain blocked until the external OAuth flow actually expires"
+    );
+    sqlx::query(
+        "UPDATE connection_operations SET flow_expires_at = now() - interval '1 second' \
+         WHERE operation_id = $1",
+    )
+    .bind(github_start.record.operation_id)
+    .execute(&pool)
+    .await?;
+    let replacement_operator_start = reserve_governed_connection_with_bindings(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Start,
+        true,
+        &format!("operator-start-retry-{suffix}"),
+        ConnectionExecutionBindings {
+            artifact_trust_mode: "operator-pinned".to_owned(),
+            ..github_bindings
+        },
+    )
+    .await?;
+    assert!(replacement_operator_start.inserted);
+    let expired_flow = store
+        .connection_operation(github_start.record.operation_id, &principal.user_id)
+        .await?
+        .ok_or_else(|| io::Error::other("expired OAuth operation disappeared"))?;
+    assert_eq!(expired_flow.oauth_phase, ConnectionOAuthPhase::Expired);
+    assert_eq!(expired_flow.authorization_url, None);
+
+    let digest_email = Email::parse(format!("connection-digest-{suffix}@example.org"))?;
+    let digest_identity = google_identity_for(
+        "example.org",
+        OrganizationId::parse("org_example")?,
+        format!("connection-digest-subject-{suffix}"),
+        digest_email.as_str(),
+    )?;
+    let digest_principal = store
+        .register_canonical_identity(&digest_identity, "identity-admin")
+        .await?;
+    let first_operator_bindings = ConnectionExecutionBindings {
+        artifact_trust_mode: "operator-pinned".to_owned(),
+        ..governed_connection_bindings()
+    };
+    let first_disconnect = reserve_governed_connection_with_bindings(
+        &store,
+        &digest_principal.user_id,
+        &digest_email,
+        ConnectionOperationKind::Disconnect,
+        true,
+        &format!("operator-disconnect-a-{suffix}"),
+        first_operator_bindings.clone(),
+    )
+    .await?;
+    store
+        .complete_connection_operation(
+            first_disconnect.record.operation_id,
+            &serde_json::json!({"disconnected": true}),
+            None,
+            None,
+            connection_operation_retention(),
+        )
+        .await?;
+    let changed_digest_bindings = ConnectionExecutionBindings {
+        bridge_image_digest:
+            "ghcr.io/example-org/steward-connections-bridge@sha256:1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+        ..first_operator_bindings
+    };
+    let replacement_disconnect = reserve_governed_connection_with_bindings(
+        &store,
+        &digest_principal.user_id,
+        &digest_email,
+        ConnectionOperationKind::Disconnect,
+        true,
+        &format!("operator-disconnect-b-{suffix}"),
+        changed_digest_bindings,
+    )
+    .await?;
+    assert!(
+        replacement_disconnect.inserted,
+        "a completed mutation result must not be reused after only the image digest changes"
+    );
+    let invalidated_result: bool = sqlx::query_scalar(
+        "SELECT result_expires_at IS NULL FROM connection_operations WHERE operation_id = $1",
+    )
+    .bind(first_disconnect.record.operation_id)
+    .fetch_one(&pool)
+    .await?;
+    assert!(invalidated_result);
+
+    let default_expression: Option<String> = sqlx::query_scalar(
+        "SELECT column_default FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'connection_operations' \
+           AND column_name = 'artifact_trust_mode'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        default_expression.as_deref(),
+        Some("'github-attestation'::text"),
+        "the forward migration must preserve old writers during rollout"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn connection_artifact_trust_migration_backfills_populated_state_and_keeps_old_writers()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other(
+            "STEWARD_TEST_DATABASE_URL is required for the connection migration Postgres test",
+        )
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool.clone());
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let email = Email::parse(format!("migration-{suffix}@example.com"))?;
+    let identity = google_identity(format!("migration-subject-{suffix}"), email.as_str())?;
+    let principal = store
+        .register_canonical_identity(&identity, "identity-admin")
+        .await?;
+    let source = reserve_governed_connection(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Status,
+        true,
+        &format!("migration-source-{suffix}"),
+    )
+    .await?;
+
+    let schema = format!("connection_migration_{suffix}");
+    let mut transaction = pool.begin().await?;
+    sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query(&format!("SET LOCAL search_path TO \"{schema}\""))
+        .execute(&mut *transaction)
+        .await?;
+    let migration_directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../migrations");
+    let mut migrations = fs::read_dir(&migration_directory)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("sql"))
+        .collect::<Vec<_>>();
+    migrations.sort();
+    for migration in migrations.iter().filter(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name < "0024_")
+    }) {
+        let sql = fs::read_to_string(migration)?;
+        sqlx::raw_sql(&sql).execute(&mut *transaction).await?;
+    }
+    sqlx::query(
+        "INSERT INTO canonical_users SELECT * FROM public.canonical_users WHERE user_id = $1",
+    )
+    .bind(principal.user_id.as_str())
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO task_submissions SELECT * FROM public.task_submissions WHERE task_uid = $1",
+    )
+    .bind(source.record.task_uid)
+    .execute(&mut *transaction)
+    .await?;
+    let prechange_columns = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = $1 AND table_name = 'connection_operations' \
+         ORDER BY ordinal_position",
+    )
+    .bind(&schema)
+    .fetch_all(&mut *transaction)
+    .await?;
+    let columns = prechange_columns
+        .iter()
+        .map(|column| format!("\"{column}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sqlx::query(&format!(
+        "INSERT INTO connection_operations ({columns}) \
+         SELECT {columns} FROM public.connection_operations WHERE operation_id = $1"
+    ))
+    .bind(source.record.operation_id)
+    .execute(&mut *transaction)
+    .await?;
+    let forward_migration = fs::read_to_string(
+        migration_directory.join("0024_connection_operation_artifact_trust.sql"),
+    )?;
+    sqlx::raw_sql(&forward_migration)
+        .execute(&mut *transaction)
+        .await?;
+    let backfilled: String = sqlx::query_scalar(
+        "SELECT artifact_trust_mode FROM connection_operations WHERE operation_id = $1",
+    )
+    .bind(source.record.operation_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    assert_eq!(backfilled, "github-attestation");
+
+    sqlx::query("DELETE FROM connection_operations WHERE operation_id = $1")
+        .bind(source.record.operation_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query(&format!(
+        "INSERT INTO connection_operations ({columns}) \
+         SELECT {columns} FROM public.connection_operations WHERE operation_id = $1"
+    ))
+    .bind(source.record.operation_id)
+    .execute(&mut *transaction)
+    .await?;
+    let old_writer_default: String = sqlx::query_scalar(
+        "SELECT artifact_trust_mode FROM connection_operations WHERE operation_id = $1",
+    )
+    .bind(source.record.operation_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    assert_eq!(old_writer_default, "github-attestation");
+    assert!(
+        sqlx::query(
+            "UPDATE connection_operations SET artifact_trust_mode = 'unknown' \
+             WHERE operation_id = $1",
+        )
+        .bind(source.record.operation_id)
+        .execute(&mut *transaction)
+        .await
+        .is_err(),
+        "the forward constraint must reject unknown persisted trust modes"
+    );
+    drop(transaction);
     Ok(())
 }
