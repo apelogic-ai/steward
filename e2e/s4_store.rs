@@ -2459,7 +2459,10 @@ async fn governed_connection_operations_are_serialized_restart_safe_and_hidden_f
     } else {
         (second_status, first_status)
     };
-    assert_eq!(joined_status.record.operation_id, status.record.operation_id);
+    assert_eq!(
+        joined_status.record.operation_id,
+        status.record.operation_id
+    );
     let task_authority: (Option<String>, Option<i64>, Option<String>) = sqlx::query_as(
         "SELECT internal_authority_id, internal_authority_version, internal_authority_digest \
          FROM task_submissions WHERE task_uid = $1",
@@ -2472,7 +2475,10 @@ async fn governed_connection_operations_are_serialized_restart_safe_and_hidden_f
         (
             Some("steward-connections".to_owned()),
             Some(1),
-            Some(steward_admission::internal_authorities::steward_connections_v1::AUTHORITY_DIGEST.to_owned()),
+            Some(
+                steward_admission::internal_authorities::steward_connections_v1::AUTHORITY_DIGEST
+                    .to_owned()
+            ),
         ),
         "the internal task must persist the same exact authority pins as its operation projection"
     );
