@@ -20,9 +20,10 @@ use xtask::{
 
 type TaskResult = Result<(), String>;
 
-const PROVIDER_PROFILE_BUNDLE_CATALOG: [(&str, &str); 2] = [
+const PROVIDER_PROFILE_BUNDLE_CATALOG: [(&str, &str); 3] = [
     ("1.0.0", "config/provider-profile-bundle/v1"),
     ("1.1.0", "config/provider-profile-bundle/v1.1.0"),
+    ("1.2.0", "config/provider-profile-bundle/v1.2.0"),
 ];
 
 fn main() -> ExitCode {
@@ -53,6 +54,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "e2e-task" if rest.is_empty() => e2e_task(),
         "e2e-controller-runtime-lifecycle" if rest.is_empty() => e2e_controller_runtime_lifecycle(),
         "e2e-openshell-adapter" if rest.is_empty() => e2e_openshell_adapter(),
+        "e2e-governed-connections" if rest.is_empty() => e2e_governed_connections(),
         "e2e-postgres-tls" if rest.is_empty() => e2e_postgres_tls(),
         "browser-e2e" if rest.is_empty() => browser_e2e(false),
         "browser-e2e" if rest == ["--browser-ready"] => browser_e2e(true),
@@ -92,6 +94,7 @@ fn usage() -> String {
         "  e2e-task",
         "  e2e-controller-runtime-lifecycle",
         "  e2e-openshell-adapter",
+        "  e2e-governed-connections",
         "  e2e-postgres-tls",
         "  browser-e2e [--browser-ready]",
         "  policy-test",
@@ -266,8 +269,18 @@ fn provider_profile_bundle(arguments: &[String]) -> TaskResult {
                 &current,
                 &replacement,
             )?;
+            let current_identity = current
+                .state
+                .pointer("/bundle/version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let replacement_identity = replacement
+                .state
+                .pointer("/bundle/version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
             println!(
-                "provider-profile-bundle: upgraded exact steward-runtime-providers@1.0.0 installation to 1.1.0 in {output_directory}"
+                "provider-profile-bundle: upgraded exact steward-runtime-providers@{current_identity} installation to {replacement_identity} in {output_directory}"
             );
             Ok(())
         }
@@ -349,6 +362,10 @@ fn e2e_controller_runtime_lifecycle() -> TaskResult {
 
 fn e2e_openshell_adapter() -> TaskResult {
     run("bash", &["scripts/openshell-adapter-e2e.sh"])
+}
+
+fn e2e_governed_connections() -> TaskResult {
+    run("bash", &["scripts/governed-connections-e2e.sh"])
 }
 
 fn e2e_postgres_tls() -> TaskResult {
@@ -1418,6 +1435,8 @@ mod tests {
             "config/task/inference-provider-profile.yaml",
             "config/provider-profile-bundle/v1.1.0/profiles/steward-mcp-gw.json",
             "config/provider-profile-bundle/v1.1.0/profiles/steward-litellm.json",
+            "config/provider-profile-bundle/v1.2.0/profiles/steward-mcp-gw.json",
+            "config/provider-profile-bundle/v1.2.0/profiles/steward-litellm.json",
         ] {
             let profile = fs::read_to_string(root().join(profile_path)).map_err(|error| {
                 format!("Codex provider profile {profile_path} is required: {error}")
@@ -1487,8 +1506,56 @@ mod tests {
     }
 
     #[test]
+    fn released_provider_profile_bundle_1_1_0_remains_immutable() -> Result<(), String> {
+        for (released_path, expected_sha256) in [
+            (
+                "config/provider-profile-bundle/v1.1.0/README.md",
+                "0fad547a4d77bfaca6e2497dc990dad00e4465da4aef0b8e16b0b4891b2def04",
+            ),
+            (
+                "config/provider-profile-bundle/v1.1.0/bundle.json",
+                "ced8f21b81737c7ed411fdc5f985d11e30b5513effd58a5ae7187d0d32268dfb",
+            ),
+            (
+                "config/provider-profile-bundle/v1.1.0/profiles/steward-litellm.json",
+                "575c361f126601e1882f3634a1193ca731810f9b512ad0e305990cf7f91d577b",
+            ),
+            (
+                "config/provider-profile-bundle/v1.1.0/profiles/steward-mcp-gw.json",
+                "b2f5883be97fa4ede9e32260c487c1eb4cf0ea3ad94d6f9a6b9450da4f6eb6c1",
+            ),
+        ] {
+            let output = Command::new("sha256sum")
+                .arg(root().join(released_path))
+                .output()
+                .map_err(|error| {
+                    format!("sha256sum is required to verify {released_path}: {error}")
+                })?;
+            if !output.status.success() {
+                return Err(format!(
+                    "sha256sum failed for released provider-profile file {released_path}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            let actual_sha256 = String::from_utf8(output.stdout)
+                .map_err(|error| format!("sha256sum output for {released_path} is UTF-8: {error}"))?
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| format!("sha256sum returned no digest for {released_path}"))?
+                .to_owned();
+            assert_eq!(
+                actual_sha256, expected_sha256,
+                "released steward-runtime-providers@1.1.0 file {released_path} must remain byte-for-byte immutable"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn provider_profile_inputs_select_their_exact_immutable_bundle() -> Result<(), String> {
-        for (version, expected_suffix) in [("1.0.0", "/v1"), ("1.1.0", "/v1.1.0")] {
+        for (version, expected_suffix) in
+            [("1.0.0", "/v1"), ("1.1.0", "/v1.1.0"), ("1.2.0", "/v1.2.0")]
+        {
             let inputs = serde_json::json!({
                 "bundle": {"id": "steward-runtime-providers", "version": version}
             });
@@ -1500,11 +1567,11 @@ mod tests {
             );
         }
         let unsupported = serde_json::json!({
-            "bundle": {"id": "steward-runtime-providers", "version": "1.2.0"}
+            "bundle": {"id": "steward-runtime-providers", "version": "1.3.0"}
         });
         let result = provider_profile_bundle_directory_for_inputs(&unsupported.to_string());
         assert!(
-            matches!(result, Err(ref error) if error.contains("unsupported") && error.contains("1.2.0")),
+            matches!(result, Err(ref error) if error.contains("unsupported") && error.contains("1.3.0")),
             "unknown bundle identities must fail closed: {result:?}"
         );
         Ok(())
@@ -1684,22 +1751,23 @@ mod tests {
                 "the controller must consume the rotating OpenShell workload token contract {projected_token_contract}"
             );
         }
-        for projected_token_contract in [
-            "name: browser-hop1-source-credential",
-            "audience: {{ .Values.browserHop1.serviceAccountTokenAudience | quote }}",
-            "mountPath: /var/run/secrets/steward/browser-hop1",
-            "value: /var/run/secrets/steward/browser-hop1/source-token",
-        ] {
-            assert!(
-                templates.contains(projected_token_contract),
-                "the browser HOP-1 path must use its own bounded projected service-account token contract {projected_token_contract}"
-            );
-        }
         assert_eq!(
             templates.matches("path: source-token").count(),
-            2,
-            "only the controller workload and browser HOP-1 projections may provide source-token credentials"
+            1,
+            "only the controller workload projection may provide a source-token credential"
         );
+        for governed_connection_contract in [
+            "STEWARD_CONNECTIONS_BRIDGE_IMAGE",
+            "STEWARD_CONNECTIONS_MCP_GW_ORIGIN",
+            "STEWARD_CONNECTIONS_MCP_GW_VERSION",
+            "STEWARD_CONNECTIONS_RUNTIME_NAMESPACE",
+            "connections-bridge-attestation",
+        ] {
+            assert!(
+                templates.contains(governed_connection_contract),
+                "the governed Connections path must render {governed_connection_contract}"
+            );
+        }
         assert!(
             !templates.contains("STEWARD_OPENSHELL_BEARER_TOKEN_FILE")
                 && !templates.contains("audience: openshell-api"),
@@ -2029,6 +2097,89 @@ mod tests {
     }
 
     #[test]
+    fn governed_connections_real_stack_is_a_required_pinned_ci_lane() -> Result<(), String> {
+        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let xtask_source = fs::read_to_string(root().join("xtask/src/main.rs"))
+            .map_err(|error| format!("xtask source is required: {error}"))?;
+        let outer = fs::read_to_string(root().join("scripts/governed-connections-e2e.sh"))
+            .map_err(|error| format!("governed Connections outer harness is required: {error}"))?;
+        let inner = fs::read_to_string(root().join("scripts/governed-connections-inside.sh"))
+            .map_err(|error| format!("governed Connections inner harness is required: {error}"))?;
+        let test = fs::read_to_string(root().join("e2e/governed_connections.rs"))
+            .map_err(|error| format!("governed Connections E2E is required: {error}"))?;
+        let stack = fs::read_to_string(root().join("config/connections-e2e/stack.yaml"))
+            .map_err(|error| format!("governed Connections stack is required: {error}"))?;
+        let sandbox = fs::read_to_string(root().join("e2e/Dockerfile.workflow-sandbox"))
+            .map_err(|error| format!("pinned workflow sandbox is required: {error}"))?;
+
+        for required in [
+            "governed-connections:",
+            "cargo xtask e2e-governed-connections",
+            "- governed-connections",
+            "GOVERNED_CONNECTIONS: ${{ needs.governed-connections.result }}",
+        ] {
+            assert!(ci.contains(required), "pinned CI is missing {required}");
+        }
+        assert!(
+            xtask_source.contains("\"e2e-governed-connections\" if rest.is_empty()")
+                && xtask_source.contains("scripts/governed-connections-e2e.sh"),
+            "xtask must expose the governed Connections real-stack harness"
+        );
+        for required in [
+            "STEWARD_OPEN_SHELL_RELEASE=v0.0.98",
+            "sha256:f2ad2353a0445b8a89d7da2028a7a42f52bc538f9e63d66c07d242834553d96f",
+            "sha256:6e7da4111d3e46aeac82eaad7a022e18c8cfb007f6024194049f0fe24b54e341",
+            "e2e/Dockerfile.workflow-sandbox",
+            "STEWARD_OPENSHELL_SANDBOX_IMAGE",
+        ] {
+            assert!(
+                outer.contains(required),
+                "outer harness is missing {required}"
+            );
+        }
+        for required in [
+            "--test governed_connections",
+            "STEWARD_CONNECTIONS_TEST_BRIDGE_DIGEST_IMAGE",
+            "STEWARD_TEST_KUBE_CONTEXT",
+            "ctr -n k8s.io images list",
+            "$1 == image { print $3 }",
+            "ctr -n k8s.io images tag \"${bridge_containerd_name}\" \"${bridge_digest_image}\"",
+        ] {
+            assert!(
+                inner.contains(required),
+                "inner harness is missing {required}"
+            );
+        }
+        for required in [
+            "real MCP-GW 0.3.2 OAuth state must have its pinned 600-second lifetime",
+            "connection operations must remain structurally absent from generic run history",
+            "harness.wait_runtime_phase(",
+            "ALICE_RUNTIME,\n        \"Running\"",
+        ] {
+            assert!(
+                test.contains(required),
+                "real-stack test is missing {required}"
+            );
+        }
+        assert!(
+            stack.contains("steward-connections-e2e-mint-runtime")
+                && stack.contains("steward-connections-e2e-mint-credentials"),
+            "Mint runtime reads and namespace-scoped Secret reads must be separate"
+        );
+        assert!(
+            !outer.contains("STEWARD_USE_CHART_SUPERVISOR=1"),
+            "the real-stack lane must use the repository's pinned supervisor patch contract"
+        );
+        assert!(
+            sandbox.contains("ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:")
+                && sandbox.contains("codex-cli 0.117.0"),
+            "the real-stack lane must use the existing digest-pinned workflow sandbox contract"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tls_required_postgres_is_a_ci_and_release_gate() -> Result<(), String> {
         let workspace = fs::read_to_string(root().join("Cargo.toml"))
             .map_err(|error| format!("workspace manifest is required: {error}"))?;
@@ -2263,9 +2414,9 @@ mod tests {
             "--numeric-owner",
             "--format=ustar",
             "gzip -n",
-            "provider-profile-bundle/v1.1.0/bundle.json",
-            "provider-profile-bundle/v1.1.0/profiles/steward-litellm.json",
-            "provider-profile-bundle/v1.1.0/profiles/steward-mcp-gw.json",
+            "provider-profile-bundle/v1.2.0/bundle.json",
+            "provider-profile-bundle/v1.2.0/profiles/steward-litellm.json",
+            "provider-profile-bundle/v1.2.0/profiles/steward-mcp-gw.json",
             "sha256sum",
         ] {
             assert!(
@@ -2285,7 +2436,7 @@ mod tests {
             );
         }
         let bundle_readme =
-            fs::read_to_string(root().join("config/provider-profile-bundle/v1.1.0/README.md"))
+            fs::read_to_string(root().join("config/provider-profile-bundle/v1.2.0/README.md"))
                 .map_err(|error| format!("provider-profile bundle README is required: {error}"))?;
         for required in [
             "Verify a released bundle before rendering or installation",
@@ -2484,6 +2635,9 @@ mod tests {
             root().join("build/connections-bridge.Dockerfile"),
         )
         .map_err(|error| format!("Connections bridge sandbox image build is required: {error}"))?;
+        let controller_binary =
+            fs::read_to_string(root().join("bins/steward-controller/src/main.rs"))
+                .map_err(|error| format!("Steward controller source is required: {error}"))?;
 
         for required in [
             "apiserver:",
@@ -2629,17 +2783,32 @@ mod tests {
             );
         }
         assert!(
-            values.contains("mcpGatewayOrigin") && schema.contains("mcpGatewayOrigin"),
-            "stable bridge chart values must require the controller-owned MCP-GW origin"
+            values.contains("connectionsBridge:")
+                && values.contains("mcpGatewayOrigin")
+                && values.contains("mcpGatewayVersion")
+                && schema.contains("connectionsBridge"),
+            "governed Connections chart values must require the controller-owned MCP-GW origin"
         );
         assert!(
-            controller.contains("stable-bridge-attestation"),
-            "stable bridge controller must mount the immutable provenance bundle"
+            controller.contains("connections-bridge-attestation"),
+            "Connections bridge controller must mount the immutable provenance bundle"
         );
         assert!(
-            controller.contains("STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN"),
-            "stable bridge controller must receive the server-owned MCP-GW origin"
+            controller.contains("STEWARD_CONNECTIONS_MCP_GW_ORIGIN")
+                && controller.contains("STEWARD_CONNECTIONS_MCP_GW_VERSION"),
+            "Connections bridge controller must receive the server-owned MCP-GW origin and pinned version"
         );
+        for isolated_bridge_configuration in [
+            "STEWARD_STABLE_BRIDGE_IMAGE",
+            "STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN",
+            "STEWARD_CONNECTIONS_BRIDGE_IMAGE",
+            "STEWARD_CONNECTIONS_MCP_GW_ORIGIN",
+        ] {
+            assert!(
+                controller_binary.contains(isolated_bridge_configuration),
+                "controller must preserve the independent stable and governed Connections bridge configuration: missing {isolated_bridge_configuration}"
+            );
+        }
         assert!(
             workflow.matches("exit-code: \"1\"").count() >= 2,
             "image and chart vulnerability scans must fail releases on critical findings"
@@ -2690,15 +2859,20 @@ mod tests {
             "production images must run as a numeric non-root user"
         );
         for required in [
-            "FROM busybox:1.37.0-musl@sha256:",
-            "FROM gcr.io/distroless/cc-debian12:nonroot@sha256:",
-            "COPY --from=toolbox /bin/busybox /bin/busybox",
-            "COPY --from=toolbox /bin/tar /bin/tar",
-            "COPY --from=toolbox /bin/ip /bin/ip",
-            "COPY --from=toolbox /bin/id /bin/id",
-            "COPY --from=toolbox /bin/mkdir /bin/mkdir",
-            "COPY --from=toolbox /bin/rm /bin/rm",
-            "COPY --chown=65532:65532 --from=toolbox /sandbox /sandbox",
+            "FROM debian:bookworm-slim@sha256:",
+            "apt-get install --yes --no-install-recommends iproute2",
+            "rm -rf /var/lib/apt/lists/*",
+            "test -x /bin/cat",
+            "test -x /bin/find",
+            "test -x /bin/id",
+            "test -x /bin/ip",
+            "test -x /bin/mkdir",
+            "test -x /bin/mktemp",
+            "test -x /bin/rm",
+            "test -x /bin/sh",
+            "test -x /bin/sleep",
+            "test -x /bin/tar",
+            "test -x /bin/touch",
             "mkdir -p /sandbox",
             "chown 65532:65532 /sandbox",
             "USER 65532:65532",

@@ -3,26 +3,26 @@ WORKDIR /workspace
 COPY . .
 RUN cargo build --locked --release --bin steward-connections-bridge
 
-FROM busybox:1.37.0-musl@sha256:fc6dddc4c44b1bfe37f41cae8e67d1693828e8f42a91862816d7953e2c9d3f23 AS toolbox
-RUN mkdir -p /sandbox \
-  && chown 65532:65532 /sandbox \
-  && ln -sf busybox /bin/tar \
-  && ln -sf busybox /bin/ip \
-  && ln -sf busybox /bin/id \
-  && ln -sf busybox /bin/mkdir \
-  && ln -sf busybox /bin/rm
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
+RUN apt-get update \
+  && apt-get install --yes --no-install-recommends iproute2 \
+  && rm -rf /var/lib/apt/lists/* \
+  && test -x /bin/cat \
+  && test -x /bin/find \
+  && test -x /bin/id \
+  && test -x /bin/ip \
+  && test -x /bin/mkdir \
+  && test -x /bin/mktemp \
+  && test -x /bin/rm \
+  && test -x /bin/sh \
+  && test -x /bin/sleep \
+  && test -x /bin/tar \
+  && test -x /bin/touch \
+  && mkdir -p /sandbox \
+  && chown 65532:65532 /sandbox
 
-COPY --from=toolbox /bin/busybox /bin/busybox
-COPY --from=toolbox /bin/sh /bin/sh
-COPY --from=toolbox /bin/tar /bin/tar
-COPY --from=toolbox /bin/ip /bin/ip
-COPY --from=toolbox /bin/id /bin/id
-COPY --from=toolbox /bin/mkdir /bin/mkdir
-COPY --from=toolbox /bin/rm /bin/rm
 COPY --from=build /workspace/target/release/steward-connections-bridge /usr/local/bin/steward-connections-bridge
-COPY --chown=65532:65532 --from=toolbox /sandbox /sandbox
 
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/steward-connections-bridge"]

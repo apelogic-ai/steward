@@ -7,11 +7,11 @@
     "web",
     "secrets",
     "browserAuth",
-    "browserHop1",
     "workloadExchangeTrust",
     "taskIdentity",
     "tls",
     "config",
+    "connectionsBridge",
     "runtimeNamespaces",
     "networkPolicy",
     "spire",
@@ -152,116 +152,6 @@
                 }
               }
             }
-          }
-        }
-      ]
-    },
-    "browserHop1": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "enabled",
-        "mcpGatewayOrigin",
-        "identityEndpoint",
-        "issuer",
-        "assertionAudience",
-        "keyId",
-        "signingKeySecret",
-        "publicJwksConfigMap",
-        "serviceAccountTokenAudience",
-        "loopbackProxy"
-      ],
-      "properties": {
-        "enabled": {"type": "boolean"},
-        "mcpGatewayOrigin": {"type": "string"},
-        "identityEndpoint": {"type": "string"},
-        "issuer": {"type": "string"},
-        "assertionAudience": {"type": "string"},
-        "keyId": {"type": "string"},
-        "signingKeySecret": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["name", "key"],
-          "properties": {"name": {"type": "string"}, "key": {"type": "string"}}
-        },
-        "publicJwksConfigMap": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["name", "key"],
-          "properties": {"name": {"type": "string"}, "key": {"type": "string"}}
-        },
-        "serviceAccountTokenAudience": {"type": "string"},
-        "loopbackProxy": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["enabled", "image", "targetHost", "targetPort"],
-          "properties": {
-            "enabled": {"type": "boolean"},
-            "image": {"type": "string"},
-            "targetHost": {"type": "string"},
-            "targetPort": {"type": "integer"}
-          },
-          "oneOf": [
-            {
-              "properties": {
-                "enabled": {"const": false},
-                "image": {"const": ""},
-                "targetHost": {"const": ""},
-                "targetPort": {"const": 0}
-              }
-            },
-            {
-              "properties": {
-                "enabled": {"const": true},
-                "image": {"type": "string", "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"},
-                "targetHost": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$"},
-                "targetPort": {"type": "integer", "minimum": 1, "maximum": 65535}
-              }
-            }
-          ]
-        }
-      },
-      "oneOf": [
-        {
-          "properties": {
-            "enabled": {"const": false},
-            "mcpGatewayOrigin": {"const": ""},
-            "identityEndpoint": {"const": ""},
-            "issuer": {"const": ""},
-            "assertionAudience": {"const": ""},
-            "keyId": {"const": ""},
-            "signingKeySecret": {
-              "properties": {"name": {"const": ""}, "key": {"const": ""}}
-            },
-            "publicJwksConfigMap": {
-              "properties": {"name": {"const": ""}, "key": {"const": ""}}
-            },
-            "serviceAccountTokenAudience": {"const": ""},
-            "loopbackProxy": {
-              "properties": {
-                "enabled": {"const": false},
-                "image": {"const": ""},
-                "targetHost": {"const": ""},
-                "targetPort": {"const": 0}
-              }
-            }
-          }
-        },
-        {
-          "properties": {
-            "enabled": {"const": true},
-            "mcpGatewayOrigin": {"type": "string", "pattern": "^(?:https://[^\\s/@?#:]+(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?|http://127\\.0\\.0\\.1(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?)$"},
-            "identityEndpoint": {"type": "string", "pattern": "^https://[^/?#]+(?::[0-9]+)?/v1/browser-hop1/exchange$"},
-            "issuer": {"type": "string", "pattern": "^https://[^/?#]+(?:/[^?#]*)?$"},
-            "assertionAudience": {"$ref": "#/definitions/nonempty"},
-            "keyId": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"},
-            "signingKeySecret": {
-              "properties": {"name": {"$ref": "#/definitions/nonempty"}, "key": {"$ref": "#/definitions/nonempty"}}
-            },
-            "publicJwksConfigMap": {
-              "properties": {"name": {"$ref": "#/definitions/nonempty"}, "key": {"$ref": "#/definitions/nonempty"}}
-            },
-            "serviceAccountTokenAudience": {"$ref": "#/definitions/nonempty"}
           }
         }
       ]
@@ -426,7 +316,6 @@
         "sourceRepository",
         "sourceCommit",
         "service",
-        "mcpGatewayOrigin",
         "attestationBundle"
       ],
       "properties": {
@@ -436,7 +325,6 @@
         "sourceRepository": {"type": "string"},
         "sourceCommit": {"type": "string"},
         "service": {"type": "string"},
-        "mcpGatewayOrigin": {"type": "string"},
         "attestationBundle": {"type": "string"}
       },
       "allOf": [
@@ -458,11 +346,56 @@
                 "pattern": "^[a-f0-9]{40}$"
               },
               "service": {"$ref": "#/definitions/nonempty"},
+              "attestationBundle": {"$ref": "#/definitions/nonempty"}
+            }
+          }
+        }
+      ]
+    },
+    "connectionsBridge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "image",
+        "signerIdentity",
+        "sourceRepository",
+        "sourceCommit",
+        "mcpGatewayOrigin",
+        "mcpGatewayVersion",
+        "runtimeNamespace",
+        "attestationBundle"
+      ],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "image": {"type": "string"},
+        "signerIdentity": {"type": "string"},
+        "sourceRepository": {"type": "string"},
+        "sourceCommit": {"type": "string"},
+        "mcpGatewayOrigin": {"type": "string"},
+        "mcpGatewayVersion": {"type": "string"},
+        "runtimeNamespace": {"type": "string"},
+        "attestationBundle": {"type": "string"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"enabled": {"const": true}}},
+          "then": {
+            "properties": {
+              "image": {"type": "string", "pattern": "^.+@sha256:[a-f0-9]{64}$"},
+              "signerIdentity": {"$ref": "#/definitions/nonempty"},
+              "sourceRepository": {
+                "type": "string",
+                "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+              },
+              "sourceCommit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
               "mcpGatewayOrigin": {
                 "type": "string",
                 "pattern": "^https?://[^\\s/@?#:]+(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$",
                 "minLength": 10
               },
+              "mcpGatewayVersion": {"const": "0.3.2"},
+              "runtimeNamespace": {"$ref": "#/definitions/nonempty"},
               "attestationBundle": {"$ref": "#/definitions/nonempty"}
             }
           }
@@ -587,6 +520,21 @@
     {
       "if": {
         "properties": {
+          "connectionsBridge": {
+            "properties": {"enabled": {"const": true}},
+            "required": ["enabled"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "browserAuth": {"properties": {"enabled": {"const": true}}}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
           "web": {
             "properties": {
               "enabled": {"const": true},
@@ -611,45 +559,6 @@
                 }
               }
             }
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "browserHop1": {
-            "properties": {
-              "loopbackProxy": {
-                "properties": {"enabled": {"const": true}}
-              }
-            }
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "browserHop1": {
-            "properties": {
-              "mcpGatewayOrigin": {"const": "http://127.0.0.1:18080"}
-            }
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "browserHop1": {
-            "properties": {"enabled": {"const": true}},
-            "required": ["enabled"]
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "browserAuth": {
-            "properties": {"enabled": {"const": true}}
           }
         }
       }

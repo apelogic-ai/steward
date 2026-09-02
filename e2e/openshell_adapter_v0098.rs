@@ -9,7 +9,8 @@ use steward_adapter_openshell::{
     OpenShellConnectionConfig, OpenShellRuntime, OpenShellTaskLogMode,
 };
 use steward_ports::{
-    SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskRequest, SandboxTaskRuntime,
+    SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskRequest,
+    SandboxTaskRuntime,
 };
 use steward_types::{AgentType, RuntimeId, RuntimeRefs};
 use tokio::time::sleep;
@@ -44,8 +45,12 @@ fn valid_config() -> Result<OpenShellConnectionConfig, String> {
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
         runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
         task_log_mode: OpenShellTaskLogMode::Off,
+        stable_bridge_image: None,
+        stable_bridge_gateway_origin: None,
         bridge_image: None,
         bridge_gateway_origin: None,
+        bridge_gateway_version: None,
+        bridge_runtime_namespace: None,
     })
 }
 
@@ -250,6 +255,7 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
     let mut request = SandboxRequest {
         runtime: RuntimeId("runtime-adapter-v0098".to_owned()),
         workspace_key: "team-a".to_owned(),
+        execution_class: SandboxExecutionClass::Agent,
         agent_type: AgentType {
             name: "base".to_owned(),
         },
@@ -277,6 +283,7 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
             &SandboxTaskRequest {
                 runtime: request.runtime.clone(),
                 refs,
+                execution_class: SandboxExecutionClass::Agent,
                 agent_type: request.agent_type.clone(),
                 command: vec![
                     "/bin/sh".to_owned(),

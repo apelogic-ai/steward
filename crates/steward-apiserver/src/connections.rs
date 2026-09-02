@@ -2,12 +2,13 @@
 
 use std::hash::Hash;
 
-use axum::extract::{Query, Request, State};
-use axum::http::{Method, StatusCode, header};
+use axum::extract::{Request, State};
+use axum::http::{Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use steward_types::CanonicalUserId;
 
@@ -68,12 +69,6 @@ pub(crate) struct ConnectionStatusResponse {
     status: ProviderConnectionStatus,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConnectionCallbackQuery {
-    continuation: String,
-}
-
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DisconnectConnectionRequest {
@@ -87,6 +82,15 @@ pub(crate) struct StartConnectionResponse {
     provider: &'static str,
     /// One-time HTTPS destination. It must not be persisted or logged by clients.
     authorization_url: String,
+    /// Conservative expiry for MCP-GW's pinned OAuth state lifetime plus clock skew.
+    expires_at: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConnectionOperationErrorResponse {
+    api_version: &'static str,
+    error: &'static str,
 }
 
 /// One-time browser destination. It intentionally implements neither `Debug` nor `Display`.
@@ -94,8 +98,17 @@ pub struct AuthorizationUrl(String);
 
 impl AuthorizationUrl {
     pub fn new(value: String) -> Result<Self, &'static str> {
-        if !value.starts_with("https://") {
-            return Err("provider authorization URL must use HTTPS");
+        if value.len() > 4096 || value.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err("provider authorization URL is not a bounded URL scalar");
+        }
+        let parsed = Url::parse(&value)
+            .map_err(|_| "provider authorization URL must be an absolute HTTPS URL")?;
+        if parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err("provider authorization URL must be an absolute HTTPS URL");
         }
         Ok(Self(value))
     }
@@ -105,27 +118,14 @@ impl AuthorizationUrl {
     }
 }
 
-/// Opaque one-time continuation returned after the provider callback boundary.
-/// It intentionally implements neither `Debug` nor `Display`.
-pub struct ConnectionContinuation(String);
-
-impl ConnectionContinuation {
-    pub fn new(value: String) -> Result<Self, &'static str> {
-        if value.is_empty() || value.len() > 512 {
-            return Err("provider continuation must be bounded");
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+pub struct StartedConnection {
+    pub authorization_url: AuthorizationUrl,
+    pub expires_at: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectionBrokerError {
-    InvalidOrExpiredContinuation,
-    SessionMismatch,
+    OAuthFlowPending,
     Unavailable,
 }
 
@@ -141,13 +141,7 @@ where
     fn start<'a>(
         &'a self,
         session: &'a ConnectionSession<B>,
-    ) -> BoxFuture<'a, Result<AuthorizationUrl, ConnectionBrokerError>>;
-
-    fn complete<'a>(
-        &'a self,
-        session: &'a ConnectionSession<B>,
-        continuation: &'a ConnectionContinuation,
-    ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>>;
+    ) -> BoxFuture<'a, Result<StartedConnection, ConnectionBrokerError>>;
 
     fn disconnect<'a>(
         &'a self,
@@ -173,10 +167,6 @@ where
         .route(
             "/admin/api/v1/connections/github/start",
             post(start_connection::<P, B>),
-        )
-        .route(
-            "/admin/connections/github/callback",
-            get(complete_connection::<P, B>),
         )
         .route(
             "/admin/api/v1/connections/github/disconnect",
@@ -259,46 +249,16 @@ where
         return StatusCode::FORBIDDEN.into_response();
     }
     match state.broker.start(&session).await {
-        Ok(authorization_url) => Json(StartConnectionResponse {
+        Ok(started) => Json(StartConnectionResponse {
             api_version: CONNECTIONS_API_VERSION,
             provider: "github",
-            authorization_url: authorization_url.as_str().to_owned(),
+            authorization_url: started.authorization_url.as_str().to_owned(),
+            expires_at: started.expires_at,
         })
         .into_response(),
-        Err(ConnectionBrokerError::Unavailable) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(
-            ConnectionBrokerError::InvalidOrExpiredContinuation
-            | ConnectionBrokerError::SessionMismatch,
-        ) => StatusCode::BAD_GATEWAY.into_response(),
-    }
-}
-
-async fn complete_connection<P, B>(
-    session: Option<Extension<ConnectionSession<B>>>,
-    State(state): State<ConnectionsState<P>>,
-    Query(query): Query<ConnectionCallbackQuery>,
-) -> Response
-where
-    P: ProviderConnectionBroker<B>,
-    B: Clone + Eq + Hash + Send + Sync + 'static,
-{
-    let Some(Extension(session)) = session else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let Ok(continuation) = ConnectionContinuation::new(query.continuation) else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    match state.broker.complete(&session, &continuation).await {
-        Ok(()) => (
-            StatusCode::SEE_OTHER,
-            [(header::LOCATION, "/connections#github-connected")],
-        )
-            .into_response(),
-        Err(ConnectionBrokerError::InvalidOrExpiredContinuation) => {
-            StatusCode::BAD_REQUEST.into_response()
+        Err(ConnectionBrokerError::OAuthFlowPending | ConnectionBrokerError::Unavailable) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
-        Err(ConnectionBrokerError::SessionMismatch) => StatusCode::FORBIDDEN.into_response(),
-        Err(ConnectionBrokerError::Unavailable) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
@@ -312,6 +272,7 @@ where
         (status = 400, description = "Explicit confirmation is required"),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 409, body = ConnectionOperationErrorResponse, description = "An OAuth flow is still pending"),
         (status = 502, description = "Provider state is invalid"),
         (status = 503, description = "Connection broker is unavailable")
     ),
@@ -338,11 +299,8 @@ where
     }
     match state.broker.disconnect(&session).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(ConnectionBrokerError::OAuthFlowPending) => oauth_flow_pending_response(),
         Err(ConnectionBrokerError::Unavailable) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(
-            ConnectionBrokerError::InvalidOrExpiredContinuation
-            | ConnectionBrokerError::SessionMismatch,
-        ) => StatusCode::BAD_GATEWAY.into_response(),
     }
 }
 
@@ -375,12 +333,21 @@ where
             status,
         })
         .into_response(),
-        Err(ConnectionBrokerError::Unavailable) => unavailable_status_response(),
-        Err(
-            ConnectionBrokerError::InvalidOrExpiredContinuation
-            | ConnectionBrokerError::SessionMismatch,
-        ) => StatusCode::BAD_GATEWAY.into_response(),
+        Err(ConnectionBrokerError::OAuthFlowPending | ConnectionBrokerError::Unavailable) => {
+            unavailable_status_response()
+        }
     }
+}
+
+fn oauth_flow_pending_response() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(ConnectionOperationErrorResponse {
+            api_version: CONNECTIONS_API_VERSION,
+            error: "oauth_flow_pending",
+        }),
+    )
+        .into_response()
 }
 
 fn unavailable_status_response() -> Response {
@@ -412,6 +379,36 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn authorization_url_is_a_bounded_absolute_https_destination_without_userinfo() {
+        assert!(
+            AuthorizationUrl::new(
+                "https://github.test/login/oauth/authorize?state=one-time".to_owned()
+            )
+            .is_ok()
+        );
+        for invalid in [
+            "https://".to_owned(),
+            "https://alice@github.test/login/oauth/authorize".to_owned(),
+            [
+                "https://alice:",
+                "not-a-secret",
+                "@github.test/login/oauth/authorize",
+            ]
+            .concat(),
+            "https://github.test/login/oauth/authorize\nX-Header: injected".to_owned(),
+        ] {
+            assert!(
+                AuthorizationUrl::new(invalid.clone()).is_err(),
+                "malformed authorization destination must fail closed: {invalid:?}"
+            );
+        }
+        assert!(
+            AuthorizationUrl::new(format!("https://github.test/{}", "a".repeat(4096))).is_err(),
+            "authorization continuation must have a strict size bound"
+        );
+    }
+
     fn router<P, B>(broker: P) -> Router
     where
         P: ProviderConnectionBroker<B>,
@@ -427,6 +424,7 @@ mod tests {
     struct FakeBrokerState {
         flow: Option<(CanonicalUserId, TestSessionBinding)>,
         connected_user: Option<CanonicalUserId>,
+        oauth_pending: bool,
         unavailable: bool,
     }
 
@@ -471,7 +469,7 @@ mod tests {
         fn start<'a>(
             &'a self,
             session: &'a ConnectionSession<TestSessionBinding>,
-        ) -> BoxFuture<'a, Result<AuthorizationUrl, ConnectionBrokerError>> {
+        ) -> BoxFuture<'a, Result<StartedConnection, ConnectionBrokerError>> {
             Box::pin(async move {
                 let mut state = self
                     .state
@@ -484,38 +482,14 @@ mod tests {
                     session.subject.canonical_user_id.clone(),
                     session.binding.clone(),
                 ));
-                AuthorizationUrl::new(
+                let authorization_url = AuthorizationUrl::new(
                     "https://github.test/login/oauth/authorize?state=one-time".to_owned(),
                 )
-                .map_err(|_| ConnectionBrokerError::Unavailable)
-            })
-        }
-
-        fn complete<'a>(
-            &'a self,
-            session: &'a ConnectionSession<TestSessionBinding>,
-            continuation: &'a ConnectionContinuation,
-        ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
-            Box::pin(async move {
-                let mut state = self
-                    .state
-                    .lock()
-                    .map_err(|_| ConnectionBrokerError::Unavailable)?;
-                if state.unavailable {
-                    return Err(ConnectionBrokerError::Unavailable);
-                }
-                if continuation.as_str() != "continuation-1" {
-                    return Err(ConnectionBrokerError::InvalidOrExpiredContinuation);
-                }
-                let Some((user_id, binding)) = state.flow.as_ref() else {
-                    return Err(ConnectionBrokerError::InvalidOrExpiredContinuation);
-                };
-                if user_id != &session.subject.canonical_user_id || binding != &session.binding {
-                    return Err(ConnectionBrokerError::SessionMismatch);
-                }
-                state.flow = None;
-                state.connected_user = Some(session.subject.canonical_user_id.clone());
-                Ok(())
+                .map_err(|_| ConnectionBrokerError::Unavailable)?;
+                Ok(StartedConnection {
+                    authorization_url,
+                    expires_at: "2026-09-01T12:10:30Z".to_owned(),
+                })
             })
         }
 
@@ -530,6 +504,9 @@ mod tests {
                     .map_err(|_| ConnectionBrokerError::Unavailable)?;
                 if state.unavailable {
                     return Err(ConnectionBrokerError::Unavailable);
+                }
+                if state.oauth_pending {
+                    return Err(ConnectionBrokerError::OAuthFlowPending);
                 }
                 if state.connected_user.as_ref() == Some(&session.subject.canonical_user_id) {
                     state.connected_user = None;
@@ -606,32 +583,46 @@ mod tests {
     -> Result<(), String> {
         let broker = FakeBroker::default();
         let uri = "/admin/api/v1/connections/github/start";
-        let request = || {
+        let request = |body: &'static str| {
             Request::builder()
                 .method("POST")
                 .uri(uri)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from("{}"))
+                .body(Body::from(body))
                 .map_err(|error| format!("build connection start request: {error}"))
         };
 
         let unauthenticated = router(broker.clone())
-            .oneshot(request()?)
+            .oneshot(request("{}")?)
             .await
             .map_err(|error| format!("request unauthenticated connection start: {error}"))?;
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
 
         let missing_mutation_proof = router(broker.clone())
             .layer(axum::Extension(session()?))
-            .oneshot(request()?)
+            .oneshot(request("{}")?)
             .await
             .map_err(|error| format!("request unproved connection start: {error}"))?;
         assert_eq!(missing_mutation_proof.status(), StatusCode::FORBIDDEN);
 
+        let hostile_runtime_fields = router(broker.clone())
+            .layer(axum::Extension(ConnectionMutationProof))
+            .layer(axum::Extension(session()?))
+            .oneshot(request(
+                r#"{"userId":"usr_hostile","issuer":"https://other.example.test","bearer":"hostile","runtime":"adopted","image":"hostile:latest","command":["sh"],"endpoint":"https://other.example.test","toolGrant":{"provider":"github","resource":"repository","action":"get_file_contents"}}"#,
+            )?)
+            .await
+            .map_err(|error| format!("request browser-supplied runtime fields: {error}"))?;
+        assert_eq!(
+            hostile_runtime_fields.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the browser may select only the fixed provider-control operation"
+        );
+
         let allowed = router(broker)
             .layer(axum::Extension(ConnectionMutationProof))
             .layer(axum::Extension(session()?))
-            .oneshot(request()?)
+            .oneshot(request("{}")?)
             .await
             .map_err(|error| format!("request proved connection start: {error}"))?;
         assert_eq!(allowed.status(), StatusCode::OK);
@@ -657,58 +648,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_continuation_is_one_time_and_bound_to_canonical_user_and_browser_session()
+    async fn steward_callback_route_is_unreachable_because_mcp_gw_owns_oauth_completion()
     -> Result<(), String> {
         let broker = FakeBroker::default();
-        let start = Request::builder()
-            .method("POST")
-            .uri("/admin/api/v1/connections/github/start")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from("{}"))
-            .map_err(|error| format!("build callback setup request: {error}"))?;
-        let started = router(broker.clone())
-            .layer(axum::Extension(ConnectionMutationProof))
+        let response = router(broker)
             .layer(axum::Extension(session()?))
-            .oneshot(start)
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/connections/github/callback?continuation=hostile")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build obsolete callback request: {error}"))?,
+            )
             .await
-            .map_err(|error| format!("start callback setup flow: {error}"))?;
-        assert_eq!(started.status(), StatusCode::OK);
-
-        let callback = || {
-            Request::builder()
-                .uri("/admin/connections/github/callback?continuation=continuation-1")
-                .body(Body::empty())
-                .map_err(|error| format!("build connection callback request: {error}"))
-        };
-        let mut wrong_session = session()?;
-        wrong_session.binding = TestSessionBinding("session-b");
-        let rejected = router(broker.clone())
-            .layer(axum::Extension(wrong_session))
-            .oneshot(callback()?)
-            .await
-            .map_err(|error| format!("request wrong-session callback: {error}"))?;
-        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
-
-        let accepted = router(broker.clone())
-            .layer(axum::Extension(session()?))
-            .oneshot(callback()?)
-            .await
-            .map_err(|error| format!("request same-session callback: {error}"))?;
-        assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            accepted.headers().get(header::LOCATION),
-            Some(&header::HeaderValue::from_static(
-                "/connections#github-connected"
-            )),
-            "success must clear the continuation query from browser history"
-        );
-
-        let replay = router(broker)
-            .layer(axum::Extension(session()?))
-            .oneshot(callback()?)
-            .await
-            .map_err(|error| format!("replay connection callback: {error}"))?;
-        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+            .map_err(|error| format!("request obsolete callback route: {error}"))?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         Ok(())
     }
 
@@ -777,6 +730,42 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|error| format!("parse post-disconnect status: {error}"))?;
         assert_eq!(value["status"]["phase"], "disconnected");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect_reports_a_bounded_pending_oauth_conflict() -> Result<(), String> {
+        let broker = FakeBroker::default();
+        broker
+            .state
+            .lock()
+            .map_err(|_| "fake broker state lock was poisoned".to_owned())?
+            .oauth_pending = true;
+        let response = router(broker)
+            .layer(axum::Extension(ConnectionMutationProof))
+            .layer(axum::Extension(session()?))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/connections/github/disconnect")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{\"confirm\":true}"))
+                    .map_err(|error| format!("build pending-flow disconnect request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request pending-flow disconnect: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .map_err(|error| format!("read pending-flow response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("parse pending-flow response: {error}"))?,
+            serde_json::json!({
+                "apiVersion": CONNECTIONS_API_VERSION,
+                "error": "oauth_flow_pending"
+            })
+        );
         Ok(())
     }
 

@@ -106,14 +106,36 @@ pub enum SvidValidationError {
 /// Desired identity for one sandbox runtime.
 ///
 /// This is the class-B OpenShell seam, not a ninth replaceable-plane port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxExecutionClass {
+    /// An ordinary or long-running agent runtime.
+    Agent,
+    /// A short-lived, server-authored provider-control operation.
+    ProviderControl,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxRequest {
     pub runtime: RuntimeId,
     pub workspace_key: String,
+    pub execution_class: SandboxExecutionClass,
     pub agent_type: AgentType,
     pub models: Vec<ModelRef>,
     pub tools: Vec<ToolGrant>,
     pub refs: RuntimeRefs,
+}
+
+/// Controller-owned execution bindings for a short-lived provider-control runtime.
+///
+/// These values are persisted with the operation and compared with the live adapter
+/// configuration before provisioning or execution. They are never sourced from a browser.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderControlExecutionBindings {
+    pub bridge_image_digest: String,
+    pub mcp_gw_origin: String,
+    pub mcp_gw_version: String,
+    pub namespace: String,
+    pub runtime_class: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -124,6 +146,10 @@ pub enum SandboxObservation {
 }
 
 pub trait SandboxRuntime: Send + Sync + 'static {
+    fn provider_control_bindings(&self) -> Option<ProviderControlExecutionBindings> {
+        None
+    }
+
     fn ensure(
         &self,
         request: &SandboxRequest,
@@ -142,6 +168,8 @@ pub trait SandboxRuntime: Send + Sync + 'static {
 pub struct SandboxTaskRequest {
     pub runtime: RuntimeId,
     pub refs: RuntimeRefs,
+    /// Server-derived execution class. Browsers and task payloads cannot select it.
+    pub execution_class: SandboxExecutionClass,
     /// The controller reads this only from the persisted runtime spec; callers cannot choose it.
     pub agent_type: AgentType,
     pub command: Vec<String>,
@@ -153,6 +181,10 @@ pub struct SandboxTaskOutput {
 }
 
 pub trait SandboxTaskRuntime: Send + Sync + 'static {
+    fn provider_control_bindings(&self) -> Option<ProviderControlExecutionBindings> {
+        None
+    }
+
     fn run_task(
         &self,
         request: &SandboxTaskRequest,

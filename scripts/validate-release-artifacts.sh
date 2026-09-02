@@ -8,14 +8,15 @@ stable_bridge_bundle="$(mktemp)"
 stable_bridge_configmap="$(mktemp)"
 stable_bridge_deployment="$(mktemp)"
 stable_bridge_controller_deployment="$(mktemp)"
+connections_bridge_rendered="$(mktemp)"
+connections_bridge_bundle="$(mktemp)"
+connections_bridge_configmap="$(mktemp)"
+connections_bridge_apiserver_deployment="$(mktemp)"
+connections_bridge_controller_deployment="$(mktemp)"
 browser_auth_rendered="$(mktemp)"
 browser_auth_deployment="$(mktemp)"
 task_identity_rendered="$(mktemp)"
 task_identity_deployment="$(mktemp)"
-browser_hop1_rendered="$(mktemp)"
-browser_hop1_deployment="$(mktemp)"
-browser_hop1_loopback_rendered="$(mktemp)"
-browser_hop1_loopback_proxy_rendered="$(mktemp)"
 web_rendered="$(mktemp)"
 web_deployment="$(mktemp)"
 external_edge_rendered="$(mktemp)"
@@ -33,11 +34,12 @@ cleanup() {
   fi
   rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" \
     "${stable_bridge_configmap}" "${stable_bridge_deployment}" \
-    "${stable_bridge_controller_deployment}" "${browser_auth_rendered}" \
+    "${stable_bridge_controller_deployment}" "${connections_bridge_rendered}" \
+    "${connections_bridge_bundle}" "${connections_bridge_configmap}" \
+    "${connections_bridge_apiserver_deployment}" \
+    "${connections_bridge_controller_deployment}" "${browser_auth_rendered}" \
     "${browser_auth_deployment}" "${task_identity_rendered}" \
-    "${task_identity_deployment}" "${browser_hop1_rendered}" \
-    "${browser_hop1_deployment}" "${browser_hop1_loopback_rendered}" \
-    "${browser_hop1_loopback_proxy_rendered}" \
+    "${task_identity_deployment}" \
     "${web_rendered}" "${web_deployment}" "${external_edge_rendered}" \
     "${secret_trust_rendered}" \
     "${mint_synthetic_kubeconfig}" "${mint_startup_output}"
@@ -67,7 +69,16 @@ stable_bridge_values=(
   --set-string stableBridge.sourceRepository=https://github.com/example-org/steward
   --set-string stableBridge.sourceCommit=0123456789abcdef0123456789abcdef01234567
   --set-string stableBridge.service=steward-run
-  --set-string stableBridge.mcpGatewayOrigin=https://mcp-gw.example.test
+)
+connections_bridge_values=(
+  --set connectionsBridge.enabled=true
+  --set-string connectionsBridge.image=ghcr.io/example-org/steward-connections-bridge@sha256:4444444444444444444444444444444444444444444444444444444444444444
+  --set-string connectionsBridge.signerIdentity=https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.11
+  --set-string connectionsBridge.sourceRepository=https://github.com/example-org/steward
+  --set-string connectionsBridge.sourceCommit=0123456789abcdef0123456789abcdef01234567
+  --set-string connectionsBridge.mcpGatewayOrigin=https://mcp-gw.example.test
+  --set-string connectionsBridge.mcpGatewayVersion=0.3.2
+  --set-string connectionsBridge.runtimeNamespace=team-a
 )
 
 printf '%s\n%s' \
@@ -76,6 +87,12 @@ printf '%s\n%s' \
 stable_bridge_bundle_content="$(<"${stable_bridge_bundle}")"
 stable_bridge_bundle_hash="$(printf '%s' "${stable_bridge_bundle_content}" | shasum -a 256 | awk '{print $1}')"
 stable_bridge_configmap_name="steward-stable-bridge-attestation-${stable_bridge_bundle_hash:0:12}"
+printf '%s\n%s' \
+  '{"statement":"connections provenance record one"}' \
+  '{"statement":"connections provenance record two"}' > "${connections_bridge_bundle}"
+connections_bridge_bundle_content="$(<"${connections_bridge_bundle}")"
+connections_bridge_bundle_hash="$(printf '%s' "${connections_bridge_bundle_content}" | shasum -a 256 | awk '{print $1}')"
+connections_bridge_configmap_name="steward-connections-bridge-attestation-${connections_bridge_bundle_hash:0:12}"
 
 helm lint "${root}/charts/steward" "${image_values[@]}"
 helm template steward "${root}/charts/steward" \
@@ -229,12 +246,10 @@ grep -Fxq '        - ipBlock: { cidr: 203.0.113.0/24 }' "${browser_auth_rendered
 if grep -Fq 'STEWARD_GOOGLE_OIDC_' "${rendered}" \
   || grep -Fq 'STEWARD_BROWSER_ORIGIN' "${rendered}" \
   || grep -Fq 'steward-google-oidc' "${rendered}" \
-  || grep -Fq 'STEWARD_BROWSER_HOP1_' "${rendered}" \
-  || grep -Fq 'STEWARD_IDENTITY_BROWSER_HOP1_' "${rendered}" \
-  || grep -Fq 'STEWARD_MCP_GW_ORIGIN' "${rendered}" \
+  || grep -Fq 'STEWARD_CONNECTIONS_' "${rendered}" \
   || grep -Fq 'STEWARD_IDENTITY_TASK_' "${rendered}"
 then
-  echo "disabled browser features must render no browser auth or HOP-1 wiring" >&2
+  echo "disabled browser features must render no browser auth or governed Connections wiring" >&2
   exit 1
 fi
 
@@ -343,6 +358,7 @@ helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
   "${image_values[@]}" \
+  "${connections_bridge_values[@]}" \
   --set browserAuth.enabled=true \
   --set-string browserAuth.google.clientId=google-client-id \
   --set-string browserAuth.google.origin=https://steward.example.test \
@@ -351,123 +367,85 @@ helm template steward "${root}/charts/steward" \
   --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
   --set-string browserAuth.google.clientSecret.key=client-secret \
   --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
-  --set browserHop1.enabled=true \
-  --set-string browserHop1.mcpGatewayOrigin=https://mcp-gw.example.test:8080 \
-  --set-string browserHop1.identityEndpoint=https://identity.example.test:8443/v1/browser-hop1/exchange \
-  --set-string browserHop1.issuer=https://steward.example.test \
-  --set-string browserHop1.assertionAudience=identity-browser-hop1 \
-  --set-string browserHop1.keyId=steward-browser-hop1-current \
-  --set-string browserHop1.signingKeySecret.name=steward-browser-hop1 \
-  --set-string browserHop1.signingKeySecret.key=signing-key.der \
-  --set-string browserHop1.publicJwksConfigMap.name=steward-browser-hop1-jwks \
-  --set-string browserHop1.publicJwksConfigMap.key=jwks.json \
-  --set-string browserHop1.serviceAccountTokenAudience=identity-browser-hop1 > "${browser_hop1_rendered}"
-
-awk '
+  --set-file "connectionsBridge.attestationBundle=${connections_bridge_bundle}" > "${connections_bridge_rendered}"
+awk -v name="${connections_bridge_configmap_name}" '
   BEGIN { RS = "---\\n" }
-  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-apiserver/ { print; exit }
-' "${browser_hop1_rendered}" > "${browser_hop1_deployment}"
-for required in \
-  '            - { name: STEWARD_MCP_GW_ORIGIN, value: "https://mcp-gw.example.test:8080" }' \
-  '            - { name: STEWARD_IDENTITY_BROWSER_HOP1_ENDPOINT, value: "https://identity.example.test:8443/v1/browser-hop1/exchange" }' \
-  '            - { name: STEWARD_IDENTITY_BROWSER_HOP1_CA_CERTIFICATE_FILE, value: /run/browser-hop1/identity-ca.crt }' \
-  '            - { name: STEWARD_BROWSER_HOP1_ISSUER, value: "https://steward.example.test" }' \
-  '            - { name: STEWARD_BROWSER_HOP1_ASSERTION_AUDIENCE, value: "identity-browser-hop1" }' \
-  '            - { name: STEWARD_BROWSER_HOP1_KEY_ID, value: "steward-browser-hop1-current" }' \
-  '            - { name: STEWARD_BROWSER_HOP1_SIGNING_KEY_FILE, value: /run/browser-hop1/signing-key.der }' \
-  '            - { name: STEWARD_BROWSER_HOP1_JWKS_FILE, value: /run/browser-hop1/jwks.json }' \
-  '            - { name: STEWARD_BROWSER_HOP1_SERVICE_ACCOUNT_TOKEN_FILE, value: /var/run/secrets/steward/browser-hop1/source-token }' \
-  '            - { name: browser-hop1, mountPath: /run/browser-hop1, readOnly: true }' \
-  '            - { name: browser-hop1-source-credential, mountPath: /var/run/secrets/steward/browser-hop1, readOnly: true }' \
-  '                  audience: "identity-browser-hop1"' \
-  '                  expirationSeconds: 600' \
-  '                  path: source-token' \
-  '                  name: steward-browser-hop1' \
-  '                  name: steward-browser-hop1-jwks' \
-  '                  name: steward-workload-exchange-ca'
-do
-  grep -Fxq "${required}" "${browser_hop1_deployment}"
-done
-grep -Fxq '    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: mcp-gw } } }]' "${browser_hop1_rendered}"
-grep -Fxq '    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: identity-exchange } } }]' "${browser_hop1_rendered}"
-if ! awk '
-  $0 == "        - ipBlock: { cidr: 203.0.113.0/24 }" {
-    getline
-    found = ($0 == "      ports: [{ protocol: TCP, port: 443 }]")
-  }
-  END { exit(found ? 0 : 1) }
-' "${browser_hop1_rendered}"
-then
-  echo "browser OAuth HTTPS ports must belong to the CIDR rule before HOP-1 egress rules" >&2
+  $0 ~ ("kind: ConfigMap\\nmetadata: \\{ name: " name " \\}") { print; exit }
+' "${connections_bridge_rendered}" > "${connections_bridge_configmap}"
+grep -Fxq 'kind: ConfigMap' "${connections_bridge_configmap}"
+grep -Fxq "metadata: { name: ${connections_bridge_configmap_name} }" "${connections_bridge_configmap}"
+grep -Fxq 'immutable: true' "${connections_bridge_configmap}"
+rendered_connections_bridge_bundle="$(awk '
+  $0 == "  bundle.jsonl: |-" { capture = 1; next }
+  capture && /^    / { line = $0; sub(/^    /, "", line); print line; next }
+  capture { exit }
+' "${connections_bridge_configmap}")"
+if [[ "${rendered_connections_bridge_bundle}" != "${connections_bridge_bundle_content}" ]]; then
+  echo "Connections bridge attestation ConfigMap bytes must exactly match the configured bundle" >&2
   exit 1
 fi
-helm template steward "${root}/charts/steward" \
-  --namespace steward \
-  --include-crds \
-  "${image_values[@]}" \
-  --set browserAuth.enabled=true \
-  --set-string browserAuth.google.clientId=google-client-id \
-  --set-string browserAuth.google.origin=https://steward.example.test \
-  --set-string browserAuth.google.workspaceDomain=example.test \
-  --set-string browserAuth.google.organizationId=org_example \
-  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
-  --set-string browserAuth.google.clientSecret.key=client-secret \
-  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
-  --set browserHop1.enabled=true \
-  --set-string browserHop1.mcpGatewayOrigin=http://127.0.0.1:18080 \
-  --set-string browserHop1.identityEndpoint=https://identity.example.test:8443/v1/browser-hop1/exchange \
-  --set-string browserHop1.issuer=https://steward.example.test \
-  --set-string browserHop1.assertionAudience=identity-browser-hop1 \
-  --set-string browserHop1.keyId=steward-browser-hop1-current \
-  --set-string browserHop1.signingKeySecret.name=steward-browser-hop1 \
-  --set-string browserHop1.signingKeySecret.key=signing-key.der \
-  --set-string browserHop1.publicJwksConfigMap.name=steward-browser-hop1-jwks \
-  --set-string browserHop1.publicJwksConfigMap.key=jwks.json \
-  --set-string browserHop1.serviceAccountTokenAudience=identity-browser-hop1 > "${browser_hop1_loopback_rendered}"
-grep -Fxq '            - { name: STEWARD_MCP_GW_ORIGIN, value: "http://127.0.0.1:18080" }' "${browser_hop1_loopback_rendered}"
-helm template steward "${root}/charts/steward" \
-  --namespace steward \
-  --include-crds \
-  "${image_values[@]}" \
-  --set browserAuth.enabled=true \
-  --set-string browserAuth.google.clientId=google-client-id \
-  --set-string browserAuth.google.origin=https://steward.example.test \
-  --set-string browserAuth.google.workspaceDomain=example.test \
-  --set-string browserAuth.google.organizationId=org_example \
-  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
-  --set-string browserAuth.google.clientSecret.key=client-secret \
-  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
-  --set browserHop1.enabled=true \
-  --set-string browserHop1.mcpGatewayOrigin=http://127.0.0.1:18080 \
-  --set-string browserHop1.identityEndpoint=https://identity.example.test:8443/v1/browser-hop1/exchange \
-  --set-string browserHop1.issuer=https://steward.example.test \
-  --set-string browserHop1.assertionAudience=identity-browser-hop1 \
-  --set-string browserHop1.keyId=steward-browser-hop1-current \
-  --set-string browserHop1.signingKeySecret.name=steward-browser-hop1 \
-  --set-string browserHop1.signingKeySecret.key=signing-key.der \
-  --set-string browserHop1.publicJwksConfigMap.name=steward-browser-hop1-jwks \
-  --set-string browserHop1.publicJwksConfigMap.key=jwks.json \
-  --set-string browserHop1.serviceAccountTokenAudience=identity-browser-hop1 \
-  --set browserHop1.loopbackProxy.enabled=true \
-  --set-string browserHop1.loopbackProxy.image=example.test/local-socat@sha256:4444444444444444444444444444444444444444444444444444444444444444 \
-  --set-string browserHop1.loopbackProxy.targetHost=mcp-gw-github-wrapper.mcp-gw.svc.cluster.local \
-  --set browserHop1.loopbackProxy.targetPort=8080 > "${browser_hop1_loopback_proxy_rendered}"
 awk '
   BEGIN { RS = "---\\n" }
   $0 ~ /kind: Deployment/ && $0 ~ /name: steward-apiserver/ { print; exit }
-' "${browser_hop1_loopback_proxy_rendered}" > "${browser_hop1_deployment}"
+' "${connections_bridge_rendered}" > "${connections_bridge_apiserver_deployment}"
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-controller/ { print; exit }
+' "${connections_bridge_rendered}" > "${connections_bridge_controller_deployment}"
 for required in \
-  '        - name: mcp-loopback' \
-  '          image: example.test/local-socat@sha256:4444444444444444444444444444444444444444444444444444444444444444' \
-  '            - "TCP-LISTEN:18080,bind=127.0.0.1,reuseaddr,fork"' \
-  '            - "TCP:mcp-gw-github-wrapper.mcp-gw.svc.cluster.local:8080"'
+  '            - { name: STEWARD_CONNECTIONS_BRIDGE_IMAGE, value: "ghcr.io/example-org/steward-connections-bridge@sha256:4444444444444444444444444444444444444444444444444444444444444444" }' \
+  '            - { name: STEWARD_CONNECTIONS_MCP_GW_ORIGIN, value: "https://mcp-gw.example.test" }' \
+  '            - { name: STEWARD_CONNECTIONS_MCP_GW_VERSION, value: "0.3.2" }' \
+  '            - { name: STEWARD_CONNECTIONS_RUNTIME_NAMESPACE, value: "team-a" }'
 do
-  grep -Fxq "${required}" "${browser_hop1_deployment}"
+  grep -Fxq "${required}" "${connections_bridge_apiserver_deployment}"
+  grep -Fxq "${required}" "${connections_bridge_controller_deployment}"
+done
+for required in \
+  '            - { name: STEWARD_CONNECTIONS_BRIDGE_SIGNER_IDENTITY, value: "https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.11" }' \
+  '            - { name: STEWARD_CONNECTIONS_BRIDGE_SOURCE_REPOSITORY, value: "https://github.com/example-org/steward" }' \
+  '            - { name: STEWARD_CONNECTIONS_BRIDGE_SOURCE_COMMIT, value: "0123456789abcdef0123456789abcdef01234567" }' \
+  '            - { name: STEWARD_CONNECTIONS_BRIDGE_ATTESTATION_BUNDLE_FILE, value: /run/connections-bridge-attestation/bundle.jsonl }' \
+  '            - { name: connections-bridge-attestation, mountPath: /run/connections-bridge-attestation, readOnly: true }'
+do
+  grep -Fxq "${required}" "${connections_bridge_controller_deployment}"
 done
 if helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
   "${image_values[@]}" \
+  --set connectionsBridge.enabled=true >/dev/null 2>&1
+then
+  echo "an enabled Connections bridge without immutable bindings must fail chart validation" >&2
+  exit 1
+fi
+for invalid_connections_version in '' '0.3.1' 'v0.3.2'; do
+  if helm template steward "${root}/charts/steward" \
+    --namespace steward \
+    --include-crds \
+    "${image_values[@]}" \
+    "${connections_bridge_values[@]}" \
+    --set-string "connectionsBridge.mcpGatewayVersion=${invalid_connections_version}" \
+    --set browserAuth.enabled=true \
+    --set-string browserAuth.google.clientId=google-client-id \
+    --set-string browserAuth.google.origin=https://steward.example.test \
+    --set-string browserAuth.google.workspaceDomain=example.test \
+    --set-string browserAuth.google.organizationId=org_example \
+    --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+    --set-string browserAuth.google.clientSecret.key=client-secret \
+    --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
+    --set-file "connectionsBridge.attestationBundle=${connections_bridge_bundle}" >/dev/null 2>&1
+  then
+    echo "Connections authority v1 must reject MCP-GW contract ${invalid_connections_version:-<empty>}" >&2
+    exit 1
+  fi
+done
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  "${connections_bridge_values[@]}" \
+  --set-string connectionsBridge.runtimeNamespace=not-authorized \
   --set browserAuth.enabled=true \
   --set-string browserAuth.google.clientId=google-client-id \
   --set-string browserAuth.google.origin=https://steward.example.test \
@@ -476,59 +454,15 @@ if helm template steward "${root}/charts/steward" \
   --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
   --set-string browserAuth.google.clientSecret.key=client-secret \
   --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
-  --set browserHop1.enabled=true \
-  --set-string browserHop1.mcpGatewayOrigin=https://mcp-gw.example.test:8080 \
-  --set-string browserHop1.identityEndpoint=https://identity.example.test:8443/v1/browser-hop1/exchange \
-  --set-string browserHop1.issuer=https://steward.example.test \
-  --set-string browserHop1.assertionAudience=identity-browser-hop1 \
-  --set-string browserHop1.keyId=steward-browser-hop1-current \
-  --set-string browserHop1.signingKeySecret.name=steward-browser-hop1 \
-  --set-string browserHop1.signingKeySecret.key=signing-key.der \
-  --set-string browserHop1.publicJwksConfigMap.name=steward-browser-hop1-jwks \
-  --set-string browserHop1.publicJwksConfigMap.key=jwks.json \
-  --set-string browserHop1.serviceAccountTokenAudience=identity-browser-hop1 \
-  --set browserHop1.loopbackProxy.enabled=true \
-  --set-string browserHop1.loopbackProxy.image=example.test/local-socat@sha256:4444444444444444444444444444444444444444444444444444444444444444 \
-  --set-string browserHop1.loopbackProxy.targetHost=mcp-gw-github-wrapper.mcp-gw.svc.cluster.local \
-  --set browserHop1.loopbackProxy.targetPort=8080 >/dev/null 2>&1
+  --set-file "connectionsBridge.attestationBundle=${connections_bridge_bundle}" >/dev/null 2>&1
 then
-  echo "browser HOP-1 loopback proxy must require its exact localhost origin" >&2
+  echo "Connections bridge namespace must be in the runtime namespace allowlist" >&2
   exit 1
 fi
-if helm template steward "${root}/charts/steward" \
-  --namespace steward \
-  --include-crds \
-  "${image_values[@]}" \
-  --set browserAuth.enabled=true \
-  --set-string browserAuth.google.clientId=google-client-id \
-  --set-string browserAuth.google.origin=https://steward.example.test \
-  --set-string browserAuth.google.workspaceDomain=example.test \
-  --set-string browserAuth.google.organizationId=org_example \
-  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
-  --set-string browserAuth.google.clientSecret.key=client-secret \
-  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
-  --set browserHop1.enabled=true \
-  --set-string browserHop1.mcpGatewayOrigin=http://mcp-gw.example.test:8080 \
-  --set-string browserHop1.identityEndpoint=https://identity.example.test:8443/v1/browser-hop1/exchange \
-  --set-string browserHop1.issuer=https://steward.example.test \
-  --set-string browserHop1.assertionAudience=identity-browser-hop1 \
-  --set-string browserHop1.keyId=steward-browser-hop1-current \
-  --set-string browserHop1.signingKeySecret.name=steward-browser-hop1 \
-  --set-string browserHop1.signingKeySecret.key=signing-key.der \
-  --set-string browserHop1.publicJwksConfigMap.name=steward-browser-hop1-jwks \
-  --set-string browserHop1.publicJwksConfigMap.key=jwks.json \
-  --set-string browserHop1.serviceAccountTokenAudience=identity-browser-hop1 >/dev/null 2>&1
+if grep -Fq 'STEWARD_CONNECTIONS_' "${rendered}" \
+  || grep -Fq 'steward-connections-bridge-attestation-' "${rendered}"
 then
-  echo "browser HOP-1 must reject non-loopback HTTP MCP-GW origins" >&2
-  exit 1
-fi
-if helm template steward "${root}/charts/steward" \
-  --namespace steward \
-  --include-crds \
-  "${image_values[@]}" \
-  --set browserHop1.enabled=true >/dev/null 2>&1
-then
-  echo "browser HOP-1 must reject partial or browser-auth-disabled configuration" >&2
+  echo "a disabled Connections bridge must render no operation wiring" >&2
   exit 1
 fi
 
@@ -564,26 +498,6 @@ grep -Fxq '        - name: stable-bridge-attestation' "${stable_bridge_deploymen
 grep -Fxq "            name: ${stable_bridge_configmap_name}" "${stable_bridge_deployment}"
 grep -Fxq '            items: [{ key: bundle.jsonl, path: bundle.jsonl }]' "${stable_bridge_deployment}"
 
-awk '
-  BEGIN { RS = "---\\n" }
-  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-controller/ { print; exit }
-' "${stable_bridge_rendered}" > "${stable_bridge_controller_deployment}"
-grep -Fxq 'kind: Deployment' "${stable_bridge_controller_deployment}"
-for required in \
-  '            - { name: STEWARD_STABLE_BRIDGE_IMAGE, value: "ghcr.io/example-org/steward-bridge@sha256:3333333333333333333333333333333333333333333333333333333333333333" }' \
-  '            - { name: STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY, value: "https://github.com/example-org/steward/.github/workflows/release.yml@refs/tags/v0.1.11" }' \
-  '            - { name: STEWARD_STABLE_BRIDGE_SOURCE_REPOSITORY, value: "https://github.com/example-org/steward" }' \
-  '            - { name: STEWARD_STABLE_BRIDGE_SOURCE_COMMIT, value: "0123456789abcdef0123456789abcdef01234567" }' \
-  '            - { name: STEWARD_STABLE_BRIDGE_ATTESTATION_BUNDLE_FILE, value: /run/stable-bridge-attestation/bundle.jsonl }' \
-  '            - { name: STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN, value: "https://mcp-gw.example.test" }' \
-  '            - { name: stable-bridge-attestation, mountPath: /run/stable-bridge-attestation, readOnly: true }' \
-  '        - name: stable-bridge-attestation' \
-  "            name: ${stable_bridge_configmap_name}" \
-  '            items: [{ key: bundle.jsonl, path: bundle.jsonl }]'
-do
-  grep -Fxq "${required}" "${stable_bridge_controller_deployment}"
-done
-
 if grep -Fq 'steward-stable-bridge-attestation-' "${rendered}" \
   || grep -Fq 'STEWARD_STABLE_BRIDGE_' "${rendered}"
 then
@@ -610,34 +524,6 @@ then
   echo "a mutable stable bridge image must fail chart validation" >&2
   exit 1
 fi
-if helm template steward "${root}/charts/steward" \
-  --namespace steward \
-  --include-crds \
-  "${image_values[@]}" \
-  "${stable_bridge_values[@]}" \
-  --set-string stableBridge.mcpGatewayOrigin= \
-  --set-file "stableBridge.attestationBundle=${stable_bridge_bundle}" >/dev/null 2>&1
-then
-  echo "a stable bridge image without its controller-owned MCP-GW origin must fail chart validation" >&2
-  exit 1
-fi
-for invalid_bridge_origin in \
-  'https://bridge-user@mcp-gw.example.test' \
-  'https://mcp-gw.example.test:70000' \
-  'https://mcp gw.example.test'
-do
-  if helm template steward "${root}/charts/steward" \
-    --namespace steward \
-    --include-crds \
-    "${image_values[@]}" \
-    "${stable_bridge_values[@]}" \
-    --set-string "stableBridge.mcpGatewayOrigin=${invalid_bridge_origin}" \
-    --set-file "stableBridge.attestationBundle=${stable_bridge_bundle}" >/dev/null 2>&1
-  then
-    echo "a stable bridge origin must reject userinfo, invalid ports, and whitespace: ${invalid_bridge_origin}" >&2
-    exit 1
-  fi
-done
 if helm lint "${root}/charts/steward" "${image_values[@]}" \
   --set stableBridge.enabled=true >/dev/null 2>&1
 then

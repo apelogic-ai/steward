@@ -1,0 +1,50 @@
+{
+  "schemaVersion": "steward/internal-authority/v1",
+  "authorityId": "steward-connections",
+  "authorityVersion": 1,
+  "service": "steward-connections",
+  "agentType": "connections-bridge",
+  "llms": [],
+  "tools": [
+    {
+      "provider": "github",
+      "resource": "provider-control",
+      "action": "status"
+    },
+    {
+      "provider": "github",
+      "resource": "provider-control",
+      "action": "start"
+    },
+    {
+      "provider": "github",
+      "resource": "provider-control",
+      "action": "disconnect"
+    }
+  ],
+  "budget": {
+    "monthlyLimit": "0.00",
+    "singleRunLimit": "0.00",
+    "currency": "USD"
+  },
+  "ttl": "2m",
+  "runner": {
+    "platforms": [
+      "linux"
+    ],
+    "memory": "128Mi",
+    "compute": "100m",
+    "storage": "64Mi"
+  },
+  "execution": {
+    "binary": "/usr/local/bin/steward-connections-bridge",
+    "input": "request.json",
+    "output": "response.json",
+    "responseDeadlineSeconds": 40
+  },
+  "oauthContract": {
+    "mcpGwVersion": "0.3.2",
+    "stateLifetimeSeconds": 600,
+    "clockSkewSeconds": 30
+  }
+}

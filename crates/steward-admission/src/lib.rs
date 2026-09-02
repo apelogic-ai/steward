@@ -8,6 +8,69 @@ use steward_types::{
     RunnerRequirements, SpendSummary, ToolGrant,
 };
 
+/// Product-owned authorities that are versioned independently from mutable user and service
+/// envelopes. A published version is immutable; changed authority requires a new module/version.
+pub mod internal_authorities {
+    use super::{Envelope, EnvelopeSpec};
+    use steward_types::{
+        Budget, Duration, KubernetesQuantity, RunnerPlatform, RunnerRequirements, ToolGrant,
+    };
+
+    pub mod steward_connections_v1 {
+        use super::{
+            Budget, Duration, Envelope, EnvelopeSpec, KubernetesQuantity, RunnerPlatform,
+            RunnerRequirements, ToolGrant,
+        };
+
+        pub const AUTHORITY_ID: &str = "steward-connections";
+        pub const AUTHORITY_VERSION: i64 = 1;
+        pub const AUTHORITY_DIGEST: &str =
+            "sha256:7735d22e083daef4bdbd51bb63a652720ef06f5499422e7a8eef4930a6c58663";
+        pub const SERVICE: &str = "steward-connections";
+        pub const AGENT_TYPE: &str = "connections-bridge";
+        pub const BRIDGE_BINARY: &str = "/usr/local/bin/steward-connections-bridge";
+        pub const INPUT_FILE: &str = "request.json";
+        pub const OUTPUT_FILE: &str = "response.json";
+        pub const RESPONSE_DEADLINE_SECONDS: i64 = 40;
+        pub const MCP_GW_VERSION: &str = "0.3.2";
+        pub const OAUTH_STATE_LIFETIME_SECONDS: i64 = 600;
+        pub const OAUTH_CLOCK_SKEW_SECONDS: i64 = 30;
+
+        pub fn provider_control_grant(action: &str) -> Option<ToolGrant> {
+            matches!(action, "status" | "start" | "disconnect").then(|| ToolGrant {
+                provider: "github".to_owned(),
+                resource: "provider-control".to_owned(),
+                action: action.to_owned(),
+            })
+        }
+
+        pub fn envelope() -> Envelope {
+            Envelope {
+                revision: AUTHORITY_VERSION,
+                spec: EnvelopeSpec {
+                    llms: Vec::new(),
+                    tools: ["status", "start", "disconnect"]
+                        .into_iter()
+                        .filter_map(provider_control_grant)
+                        .collect(),
+                    budget: Budget {
+                        monthly_limit: "0.00".to_owned(),
+                        single_run_limit: Some("0.00".to_owned()),
+                        currency: "USD".to_owned(),
+                    },
+                    ttl: Duration("2m".to_owned()),
+                    runner: RunnerRequirements {
+                        platforms: vec![RunnerPlatform::Linux],
+                        memory: Some(KubernetesQuantity("128Mi".to_owned())),
+                        compute: Some(KubernetesQuantity("100m".to_owned())),
+                        storage: Some(KubernetesQuantity("64Mi".to_owned())),
+                    },
+                },
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvelopeScopeKind {

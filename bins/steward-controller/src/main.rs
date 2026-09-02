@@ -103,7 +103,8 @@ fn required_file(name: &str) -> Result<Vec<u8>, io::Error> {
 
 fn openshell_connection_config() -> Result<OpenShellConnectionConfig, io::Error> {
     let task_log_mode = openshell_task_log_mode(env::var("STEWARD_OPENSHELL_TASK_LOG_MODE"))?;
-    let bridge_image = verified_bridge_image_configuration()?;
+    let stable_bridge_image = verified_stable_bridge_image_configuration()?;
+    let bridge_image = verified_connections_bridge_image_configuration()?;
     Ok(OpenShellConnectionConfig {
         endpoint: required("STEWARD_OPENSHELL_ENDPOINT")?,
         ca_certificate_pem: required_file("STEWARD_OPENSHELL_CA_CERTIFICATE_FILE")?,
@@ -120,10 +121,25 @@ fn openshell_connection_config() -> Result<OpenShellConnectionConfig, io::Error>
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
         runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
         task_log_mode,
+        stable_bridge_gateway_origin: bridge_gateway_origin_for_image(
+            &stable_bridge_image,
+            env::var("STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN").ok(),
+            "STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN",
+        )?,
+        stable_bridge_image,
         bridge_gateway_origin: bridge_gateway_origin_for_image(
             &bridge_image,
-            env::var("STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN").ok(),
+            env::var("STEWARD_CONNECTIONS_MCP_GW_ORIGIN").ok(),
+            "STEWARD_CONNECTIONS_MCP_GW_ORIGIN",
         )?,
+        bridge_gateway_version: bridge_gateway_version_for_image(
+            &bridge_image,
+            env::var("STEWARD_CONNECTIONS_MCP_GW_VERSION").ok(),
+        )?,
+        bridge_runtime_namespace: bridge_image
+            .as_ref()
+            .map(|_| required("STEWARD_CONNECTIONS_RUNTIME_NAMESPACE"))
+            .transpose()?,
         bridge_image,
     })
 }
@@ -147,22 +163,42 @@ fn openshell_task_log_mode(
 fn bridge_gateway_origin_for_image(
     bridge_image: &Option<String>,
     configured_origin: Option<String>,
+    variable_name: &str,
 ) -> Result<Option<String>, io::Error> {
     match (bridge_image, configured_origin) {
         (None, None) => Ok(None),
         (Some(_), Some(origin)) => {
             validate_connections_bridge_gateway_origin(&origin).map_err(|error| {
                 io::Error::other(format!(
-                    "STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN must be an exact HTTP(S) origin: {error:?}"
+                    "{variable_name} must be an exact HTTP(S) origin: {error:?}"
                 ))
             })?;
             Ok(Some(origin))
         }
+        (Some(_), None) => Err(io::Error::other(format!(
+            "bridge image provenance requires {variable_name}"
+        ))),
+        (None, Some(_)) => Err(io::Error::other(format!(
+            "{variable_name} requires bridge image provenance"
+        ))),
+    }
+}
+
+fn bridge_gateway_version_for_image(
+    bridge_image: &Option<String>,
+    configured_version: Option<String>,
+) -> Result<Option<String>, io::Error> {
+    match (bridge_image, configured_version) {
+        (None, None) => Ok(None),
+        (Some(_), Some(version)) if version == "0.3.2" => Ok(Some(version)),
+        (Some(_), Some(_)) => Err(io::Error::other(
+            "STEWARD_CONNECTIONS_MCP_GW_VERSION must be the authority-pinned 0.3.2 release",
+        )),
         (Some(_), None) => Err(io::Error::other(
-            "bridge image provenance requires STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN",
+            "bridge image provenance requires STEWARD_CONNECTIONS_MCP_GW_VERSION",
         )),
         (None, Some(_)) => Err(io::Error::other(
-            "STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN requires bridge image provenance",
+            "STEWARD_CONNECTIONS_MCP_GW_VERSION requires bridge image provenance",
         )),
     }
 }
@@ -170,12 +206,38 @@ fn bridge_gateway_origin_for_image(
 /// Reads one all-or-nothing provenance configuration set. The controller never accepts a bridge
 /// image directly from an environment value: this function returns it only after offline GitHub
 /// provenance verification binds the digest to the configured source and workflow signer.
-fn verified_bridge_image_configuration() -> Result<Option<String>, io::Error> {
-    let image = env::var("STEWARD_STABLE_BRIDGE_IMAGE").ok();
-    let signer_identity = env::var("STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY").ok();
-    let source_repository = env::var("STEWARD_STABLE_BRIDGE_SOURCE_REPOSITORY").ok();
-    let source_commit = env::var("STEWARD_STABLE_BRIDGE_SOURCE_COMMIT").ok();
-    let bundle_file = env::var("STEWARD_STABLE_BRIDGE_ATTESTATION_BUNDLE_FILE").ok();
+fn verified_connections_bridge_image_configuration() -> Result<Option<String>, io::Error> {
+    let image = env::var("STEWARD_CONNECTIONS_BRIDGE_IMAGE").ok();
+    let signer_identity = env::var("STEWARD_CONNECTIONS_BRIDGE_SIGNER_IDENTITY").ok();
+    let source_repository = env::var("STEWARD_CONNECTIONS_BRIDGE_SOURCE_REPOSITORY").ok();
+    let source_commit = env::var("STEWARD_CONNECTIONS_BRIDGE_SOURCE_COMMIT").ok();
+    let bundle_file = env::var("STEWARD_CONNECTIONS_BRIDGE_ATTESTATION_BUNDLE_FILE").ok();
+    verified_bridge_image_configuration(
+        image,
+        signer_identity,
+        source_repository,
+        source_commit,
+        bundle_file,
+    )
+}
+
+fn verified_stable_bridge_image_configuration() -> Result<Option<String>, io::Error> {
+    verified_bridge_image_configuration(
+        env::var("STEWARD_STABLE_BRIDGE_IMAGE").ok(),
+        env::var("STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY").ok(),
+        env::var("STEWARD_STABLE_BRIDGE_SOURCE_REPOSITORY").ok(),
+        env::var("STEWARD_STABLE_BRIDGE_SOURCE_COMMIT").ok(),
+        env::var("STEWARD_STABLE_BRIDGE_ATTESTATION_BUNDLE_FILE").ok(),
+    )
+}
+
+fn verified_bridge_image_configuration(
+    image: Option<String>,
+    signer_identity: Option<String>,
+    source_repository: Option<String>,
+    source_commit: Option<String>,
+    bundle_file: Option<String>,
+) -> Result<Option<String>, io::Error> {
     let values = [
         image.as_ref(),
         signer_identity.as_ref(),
@@ -363,8 +425,9 @@ mod tests {
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
     use super::{
-        TlsListener, bridge_gateway_origin_for_image, decode_tls_material,
-        install_rustls_crypto_provider, openshell_task_log_mode, verify_bridge_image_provenance,
+        TlsListener, bridge_gateway_origin_for_image, bridge_gateway_version_for_image,
+        decode_tls_material, install_rustls_crypto_provider, openshell_task_log_mode,
+        verify_bridge_image_provenance,
     };
     use steward_adapter_openshell::OpenShellTaskLogMode;
 
@@ -452,14 +515,39 @@ mod tests {
             "registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
         );
         assert!(
-            bridge_gateway_origin_for_image(&image, None).is_err(),
+            bridge_gateway_origin_for_image(&image, None, "STEWARD_CONNECTIONS_MCP_GW_ORIGIN",)
+                .is_err(),
             "the controller must not construct a bridge-capable runtime without its server-owned gateway origin"
         );
         assert!(
-            bridge_gateway_origin_for_image(&None, Some("https://mcp-gw.example.test".to_owned()))
-                .is_err(),
+            bridge_gateway_origin_for_image(
+                &None,
+                Some("https://mcp-gw.example.test".to_owned()),
+                "STEWARD_CONNECTIONS_MCP_GW_ORIGIN",
+            )
+            .is_err(),
             "a gateway origin cannot turn on the bridge without verified image provenance"
         );
+    }
+
+    #[test]
+    fn bridge_gateway_version_is_paired_and_exactly_pinned() {
+        let image = Some(
+            "registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        );
+        assert!(
+            matches!(
+                bridge_gateway_version_for_image(&image, Some("0.3.2".to_owned())),
+                Ok(Some(ref version)) if version == "0.3.2"
+            ),
+            "the exact authority-pinned gateway version must be retained"
+        );
+        assert!(
+            bridge_gateway_version_for_image(&image, Some("0.3.1".to_owned())).is_err(),
+            "an incompatible deployed OAuth contract must fail controller startup"
+        );
+        assert!(bridge_gateway_version_for_image(&image, None).is_err());
+        assert!(bridge_gateway_version_for_image(&None, Some("0.3.2".to_owned())).is_err());
     }
 
     #[test]
@@ -477,13 +565,19 @@ mod tests {
             "https://mcp-gw.example.test#fragment",
         ] {
             assert!(
-                bridge_gateway_origin_for_image(&image, Some(invalid_origin.to_owned())).is_err(),
+                bridge_gateway_origin_for_image(
+                    &image,
+                    Some(invalid_origin.to_owned()),
+                    "STEWARD_CONNECTIONS_MCP_GW_ORIGIN",
+                )
+                .is_err(),
                 "controller startup must reject non-exact bridge origin {invalid_origin:?}"
             );
         }
         let accepted_origin = bridge_gateway_origin_for_image(
             &image,
             Some("https://mcp-gw.example.test:8443".to_owned()),
+            "STEWARD_CONNECTIONS_MCP_GW_ORIGIN",
         );
         assert!(
             matches!(accepted_origin, Ok(Some(ref origin)) if origin == "https://mcp-gw.example.test:8443"),

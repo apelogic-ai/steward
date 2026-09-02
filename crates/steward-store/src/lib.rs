@@ -852,9 +852,13 @@ impl PgStore {
         }
         if let Some(cursor) = query.cursor {
             let mut cursor_exists = QueryBuilder::<Postgres>::new(
-                "SELECT EXISTS(SELECT 1 FROM task_submissions WHERE task_uid = ",
+                "SELECT EXISTS(SELECT 1 FROM task_submissions tasks WHERE task_uid = ",
             );
             cursor_exists.push_bind(cursor);
+            cursor_exists.push(
+                " AND NOT EXISTS (SELECT 1 FROM connection_operations operations \
+                   WHERE operations.task_uid = tasks.task_uid)",
+            );
             if let Some(owner_user_id) = query.owner_user_id.as_deref() {
                 cursor_exists.push(" AND owner_user_id = ");
                 cursor_exists.push_bind(owner_user_id);
@@ -871,7 +875,10 @@ impl PgStore {
         }
 
         let mut statement = QueryBuilder::<Postgres>::new(AGENT_RUN_SELECT);
-        statement.push(" WHERE true");
+        statement.push(
+            " WHERE NOT EXISTS (SELECT 1 FROM connection_operations operations \
+               WHERE operations.task_uid = tasks.task_uid)",
+        );
         if let Some(cursor) = query.cursor {
             statement.push(
                 " AND (tasks.created_at, tasks.task_uid) < \
@@ -929,7 +936,10 @@ impl PgStore {
 
     pub async fn agent_run(&self, task_uid: Uuid) -> Result<Option<AgentRunRecord>, StoreError> {
         let mut statement = QueryBuilder::<Postgres>::new(AGENT_RUN_SELECT);
-        statement.push(" WHERE tasks.task_uid = ");
+        statement.push(
+            " WHERE NOT EXISTS (SELECT 1 FROM connection_operations operations \
+               WHERE operations.task_uid = tasks.task_uid) AND tasks.task_uid = ",
+        );
         statement.push_bind(task_uid);
         statement
             .build()
@@ -945,7 +955,10 @@ impl PgStore {
         task_uid: Uuid,
     ) -> Result<Option<Vec<AgentRunTimelineEvent>>, StoreError> {
         if !sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM task_submissions WHERE task_uid = $1)",
+            "SELECT EXISTS(SELECT 1 FROM task_submissions tasks \
+             WHERE tasks.task_uid = $1 \
+               AND NOT EXISTS (SELECT 1 FROM connection_operations operations \
+                   WHERE operations.task_uid = tasks.task_uid))",
         )
         .bind(task_uid)
         .fetch_one(&self.pool)
@@ -2561,6 +2574,402 @@ impl PgStore {
         Ok(TaskReservation { inserted, record })
     }
 
+    /// Atomically reserves one internal provider-control task and its dedicated projection.
+    /// Durable advisory locking makes coalescing and mutation serialization work across
+    /// apiserver replicas and process restarts.
+    pub async fn reserve_connection_operation(
+        &self,
+        request: &ConnectionOperationReservationRequest<'_>,
+    ) -> Result<ConnectionOperationReservation, StoreError> {
+        validate_connection_operation_request(request)?;
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("connection:{}:github", request.task.owner_user_id))
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        sqlx::query(
+            "UPDATE connection_operations \
+             SET oauth_phase = 'expired', authorization_url = NULL, updated_at = now() \
+             WHERE canonical_user_id = $1 AND provider = 'github' \
+               AND oauth_phase = 'pending' AND flow_expires_at <= now()",
+        )
+        .bind(request.task.owner_user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+
+        let active_mutation = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM connection_operations \
+             WHERE canonical_user_id = $1 AND provider = 'github' \
+               AND operation_kind IN ('start', 'disconnect') \
+               AND operation_state IN ('queued', 'provisioning', 'running') \
+               AND finalization_state = 'not_requested')",
+        )
+        .bind(request.task.owner_user_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if active_mutation && request.operation_kind == ConnectionOperationKind::Status {
+            return Err(StoreError::ConnectionOperationConflict);
+        }
+
+        let reusable = match request.operation_kind {
+            ConnectionOperationKind::Status => sqlx::query(
+                "SELECT operations.*, \
+                        to_char(operations.flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
+                        to_char(operations.response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
+                        tasks.phase AS task_phase, tasks.runtime_uid, \
+                        tasks.output_archive, tasks.finalize_requested, tasks.finalized \
+                 FROM connection_operations operations \
+                 JOIN task_submissions tasks ON tasks.task_uid = operations.task_uid \
+                 WHERE operations.canonical_user_id = $1 AND operations.provider = 'github' \
+                   AND operations.operation_kind = 'status' \
+                   AND ( \
+                     (operations.operation_state IN ('queued', 'provisioning', 'running') \
+                        AND operations.finalization_state = 'not_requested') \
+                     OR (operations.operation_state = 'succeeded' \
+                        AND operations.cache_expires_at > now() AND $2 \
+                        AND NOT (operations.cached_status->>'connected' = 'false' \
+                          AND EXISTS (SELECT 1 FROM connection_operations pending \
+                            WHERE pending.canonical_user_id = operations.canonical_user_id \
+                              AND pending.provider = operations.provider \
+                              AND pending.oauth_phase = 'pending' \
+                              AND pending.flow_expires_at > now()))) \
+                   ) \
+                 ORDER BY operations.created_at DESC LIMIT 1",
+            )
+            .bind(request.task.owner_user_id)
+            .bind(request.allow_status_cache)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?,
+            ConnectionOperationKind::Start => sqlx::query(
+                "SELECT operations.*, \
+                        to_char(operations.flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
+                        to_char(operations.response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
+                        tasks.phase AS task_phase, tasks.runtime_uid, \
+                        tasks.output_archive, tasks.finalize_requested, tasks.finalized \
+                 FROM connection_operations operations \
+                 JOIN task_submissions tasks ON tasks.task_uid = operations.task_uid \
+                 WHERE operations.canonical_user_id = $1 AND operations.provider = 'github' \
+                   AND operations.operation_kind = 'start' \
+                   AND (operations.oauth_phase = 'pending' AND operations.flow_expires_at > now() \
+                     OR operations.operation_state IN ('queued', 'provisioning', 'running')) \
+                 ORDER BY operations.created_at DESC LIMIT 1",
+            )
+            .bind(request.task.owner_user_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?,
+            ConnectionOperationKind::Disconnect => {
+                let pending = sqlx::query_scalar::<_, Option<Uuid>>(
+                    "SELECT operation_id FROM connection_operations \
+                     WHERE canonical_user_id = $1 AND provider = 'github' \
+                       AND oauth_phase = 'pending' AND flow_expires_at > now() \
+                     ORDER BY created_at DESC LIMIT 1",
+                )
+                .bind(request.task.owner_user_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(database_error)?
+                .flatten();
+                if let Some(pending_operation_id) = pending {
+                    let connected_after_start = sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS( \
+                           SELECT 1 FROM connection_operations status \
+                           JOIN connection_operations pending \
+                             ON pending.operation_id = $2 \
+                           WHERE status.canonical_user_id = $1 \
+                             AND status.provider = 'github' \
+                             AND status.operation_kind = 'status' \
+                             AND status.uncached_status \
+                             AND status.operation_state = 'succeeded' \
+                             AND status.created_at >= pending.flow_created_at \
+                             AND status.result->>'connected' = 'true')",
+                    )
+                    .bind(request.task.owner_user_id)
+                    .bind(pending_operation_id)
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(database_error)?;
+                    if !connected_after_start {
+                        return Err(StoreError::ConnectionOAuthFlowPending);
+                    }
+                    sqlx::query(
+                        "UPDATE connection_operations \
+                         SET oauth_phase = 'completed', authorization_url = NULL, \
+                             cache_expires_at = NULL, updated_at = now() \
+                         WHERE operation_id = $1 AND oauth_phase = 'pending'",
+                    )
+                    .bind(pending_operation_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(database_error)?;
+                }
+                sqlx::query(
+                    "SELECT operations.*, \
+                            to_char(operations.flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
+                            to_char(operations.response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
+                            tasks.phase AS task_phase, tasks.runtime_uid, \
+                            tasks.output_archive, tasks.finalize_requested, tasks.finalized \
+                     FROM connection_operations operations \
+                     JOIN task_submissions tasks ON tasks.task_uid = operations.task_uid \
+                     WHERE operations.canonical_user_id = $1 AND operations.provider = 'github' \
+                       AND operations.operation_kind = 'disconnect' \
+                       AND (operations.operation_state IN ('queued', 'provisioning', 'running') \
+                         OR (operations.operation_state = 'succeeded' \
+                            AND operations.result_expires_at > now())) \
+                     ORDER BY operations.created_at DESC LIMIT 1",
+                )
+                .bind(request.task.owner_user_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(database_error)?
+            }
+        };
+        if let Some(row) = reusable {
+            let record = connection_operation_record(row)?;
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(ConnectionOperationReservation {
+                inserted: false,
+                record,
+            });
+        }
+
+        if active_mutation {
+            return Err(StoreError::ConnectionOperationConflict);
+        }
+        if request.operation_kind != ConnectionOperationKind::Status {
+            sqlx::query(
+                "WITH preempted AS ( \
+                   UPDATE connection_operations \
+                   SET operation_state = 'failed', failure_category = 'superseded_by_mutation', \
+                       result = NULL, cached_status = NULL, cache_expires_at = NULL, \
+                       finalization_state = 'requested', cleanup_state = 'tearing_down', \
+                       updated_at = now() \
+                   WHERE canonical_user_id = $1 AND provider = 'github' \
+                     AND operation_kind = 'status' \
+                     AND operation_state IN ('queued', 'provisioning', 'running') \
+                     AND finalization_state = 'not_requested' \
+                   RETURNING task_uid \
+                 ) \
+                 UPDATE task_submissions tasks \
+                 SET phase = CASE WHEN tasks.phase IN ('succeeded', 'failed') \
+                         THEN tasks.phase ELSE 'failed' END, \
+                     output_archive = NULL, finalize_requested = true, \
+                     failure_reason = 'superseded_by_mutation', updated_at = now() \
+                 FROM preempted WHERE tasks.task_uid = preempted.task_uid",
+            )
+            .bind(request.task.owner_user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            sqlx::query(
+                "UPDATE connection_operations \
+                 SET cache_expires_at = NULL, result_expires_at = NULL, updated_at = now() \
+                 WHERE canonical_user_id = $1 AND provider = 'github'",
+            )
+            .bind(request.task.owner_user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        }
+
+        let task = &request.task;
+        sqlx::query(
+            "INSERT INTO task_submissions \
+             (task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, \
+              owner, owner_user_id, identity_binding_state, workflow, coding_agent_runtime, \
+              runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
+              agent_command, input_archive, execute_requested, envelope_revision) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, \
+                     'provisioned', 'queued', $12, $13, $14, true, $15)",
+        )
+        .bind(request.operation_id)
+        .bind(task.idempotency_key)
+        .bind(task.submitter_service)
+        .bind(task.acting_user)
+        .bind(task.acting_user_id)
+        .bind(task.owner)
+        .bind(task.owner_user_id)
+        .bind(task.workflow)
+        .bind(task.coding_agent_runtime)
+        .bind(task.runtime_namespace)
+        .bind(task.runtime_name)
+        .bind(Json(task.runtime_spec))
+        .bind(Json(task.agent_command))
+        .bind(request.input_archive)
+        .bind(task.envelope_revision)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let row = sqlx::query(
+            "INSERT INTO connection_operations \
+             (operation_id, task_uid, canonical_user_id, provider, operation_kind, \
+              submitter_service, authority_id, authority_version, authority_digest, \
+              runtime_spec_snapshot, command_snapshot, bridge_image_digest, mcp_gw_origin, \
+              mcp_gw_version, runtime_namespace, runtime_class, idempotency_identity, uncached_status, \
+              response_deadline_at) \
+             VALUES ($1, $1, $2, 'github', $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                     $12, $13, $14, $15, $16, now() + make_interval(secs => $17)) \
+             RETURNING *, \
+                       to_char(flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
+                       to_char(response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
+                       'queued' AS task_phase, NULL::text AS runtime_uid, \
+                       NULL::bytea AS output_archive, false AS finalize_requested, \
+                       false AS finalized",
+        )
+        .bind(request.operation_id)
+        .bind(task.owner_user_id)
+        .bind(request.operation_kind.as_str())
+        .bind(task.submitter_service)
+        .bind(request.authority_id)
+        .bind(request.authority_version)
+        .bind(request.authority_digest)
+        .bind(Json(task.runtime_spec))
+        .bind(Json(task.agent_command))
+        .bind(&request.bindings.bridge_image_digest)
+        .bind(&request.bindings.mcp_gw_origin)
+        .bind(&request.bindings.mcp_gw_version)
+        .bind(&request.bindings.namespace)
+        .bind(&request.bindings.runtime_class)
+        .bind(request.idempotency_identity)
+        .bind(
+            request.operation_kind == ConnectionOperationKind::Status
+                && !request.allow_status_cache,
+        )
+        .bind(request.response_deadline_seconds as f64)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let record = connection_operation_record(row)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(ConnectionOperationReservation {
+            inserted: true,
+            record,
+        })
+    }
+
+    pub async fn connection_operation(
+        &self,
+        operation_id: Uuid,
+        canonical_user_id: &CanonicalUserId,
+    ) -> Result<Option<ConnectionOperationRecord>, StoreError> {
+        sqlx::query(
+            "SELECT operations.*, \
+                    to_char(operations.flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
+                    to_char(operations.response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
+                    tasks.phase AS task_phase, tasks.runtime_uid, \
+                    tasks.output_archive, tasks.finalize_requested, tasks.finalized \
+             FROM connection_operations operations \
+             JOIN task_submissions tasks ON tasks.task_uid = operations.task_uid \
+             WHERE operations.operation_id = $1 AND operations.canonical_user_id = $2",
+        )
+        .bind(operation_id)
+        .bind(canonical_user_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .map(connection_operation_record)
+            .transpose()
+    }
+
+    /// Internal controller lookup. Dedicated connection operations are never exposed through
+    /// generic task or run read models, but the controller must recover their immutable binding
+    /// snapshot before it provisions or executes the referenced task.
+    pub async fn connection_operation_for_task(
+        &self,
+        task_uid: Uuid,
+    ) -> Result<Option<ConnectionOperationRecord>, StoreError> {
+        sqlx::query(
+            "SELECT operations.*, \
+                    to_char(operations.flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
+                    to_char(operations.response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
+                    tasks.phase AS task_phase, tasks.runtime_uid, \
+                    tasks.output_archive, tasks.finalize_requested, tasks.finalized \
+             FROM connection_operations operations \
+             JOIN task_submissions tasks ON tasks.task_uid = operations.task_uid \
+             WHERE operations.task_uid = $1",
+        )
+        .bind(task_uid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .map(connection_operation_record)
+        .transpose()
+    }
+
+    /// Internal runtime-controller lookup. The runtime UID comes from Kubernetes and is matched
+    /// through the dedicated task projection; caller-visible task/run queries remain unable to
+    /// discover connection operations.
+    pub async fn connection_operation_for_runtime(
+        &self,
+        runtime_uid: &str,
+    ) -> Result<Option<ConnectionOperationRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT operations.*, \
+                    to_char(operations.flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
+                    to_char(operations.response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
+                    tasks.phase AS task_phase, tasks.runtime_uid, \
+                    tasks.output_archive, tasks.finalize_requested, tasks.finalized \
+             FROM connection_operations operations \
+             JOIN task_submissions tasks ON tasks.task_uid = operations.task_uid \
+             WHERE tasks.runtime_uid = $1 \
+             ORDER BY operations.created_at DESC LIMIT 2",
+        )
+        .bind(runtime_uid)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if rows.len() > 1 {
+            return Err(StoreError::InvalidConnectionOperation);
+        }
+        rows.into_iter()
+            .next()
+            .map(connection_operation_record)
+            .transpose()
+    }
+
+    pub async fn connection_operations_requiring_reconcile(
+        &self,
+    ) -> Result<Vec<ConnectionOperationRecord>, StoreError> {
+        sqlx::query(
+            "SELECT operations.*, \
+                    to_char(operations.flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
+                    to_char(operations.response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
+                    tasks.phase AS task_phase, tasks.runtime_uid, \
+                    tasks.output_archive, tasks.finalize_requested, tasks.finalized \
+             FROM connection_operations operations \
+             JOIN task_submissions tasks ON tasks.task_uid = operations.task_uid \
+             WHERE (operations.operation_state NOT IN ('succeeded', 'failed')) \
+                OR (operations.finalization_state <> 'finalized') \
+                OR (operations.oauth_phase = 'pending' AND operations.flow_expires_at <= now()) \
+             ORDER BY operations.created_at, operations.operation_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(connection_operation_record)
+            .collect()
+    }
+
+    pub async fn connection_operation_deadline_elapsed(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        sqlx::query_scalar(
+            "SELECT response_deadline_at <= now() FROM connection_operations \
+             WHERE operation_id = $1",
+        )
+        .bind(operation_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::ConnectionOperationNotFound)
+    }
+
     pub async fn bind_task_runtime(
         &self,
         task_uid: Uuid,
@@ -2663,7 +3072,9 @@ impl PgStore {
         let row = sqlx::query(
             "SELECT * FROM task_submissions \
              WHERE task_uid = $1 AND submitter_service = $2 \
-               AND owner_user_id = $3 AND identity_binding_state = 'bound'",
+               AND owner_user_id = $3 AND identity_binding_state = 'bound' \
+               AND NOT EXISTS (SELECT 1 FROM connection_operations operations \
+                   WHERE operations.task_uid = task_submissions.task_uid)",
         )
         .bind(task_uid)
         .bind(submitter_service)
@@ -2735,6 +3146,8 @@ impl PgStore {
              WHERE owner_user_id = $1 AND submitter_service = $2 \
                AND identity_binding_state = 'bound' AND runtime_uid IS NOT NULL \
                AND phase = 'running' AND NOT finalized \
+               AND NOT EXISTS (SELECT 1 FROM connection_operations operations \
+                   WHERE operations.task_uid = task_submissions.task_uid) \
              ORDER BY created_at, task_uid \
              LIMIT 2",
         )
@@ -2835,6 +3248,247 @@ impl PgStore {
         } else {
             Err(StoreError::InvalidTaskTransition)
         }
+    }
+
+    /// Commits a validated provider-control result and finalization request together. Raw bridge
+    /// output is cleared in the same transaction so OAuth continuation material cannot remain in
+    /// generic task storage after extraction.
+    pub async fn complete_connection_operation(
+        &self,
+        operation_id: Uuid,
+        result: &serde_json::Value,
+        authorization_url: Option<&str>,
+        authorization_url_digest: Option<&str>,
+        retention: ConnectionOperationRetention,
+    ) -> Result<(), StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let row = sqlx::query(
+            "SELECT operation_kind FROM connection_operations \
+             WHERE operation_id = $1 FOR UPDATE",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::ConnectionOperationNotFound)?;
+        let operation_kind = connection_operation_kind_from_text(
+            &row.try_get::<String, _>("operation_kind")
+                .map_err(database_error)?,
+        )?;
+        if matches!(operation_kind, ConnectionOperationKind::Start) != authorization_url.is_some()
+            || authorization_url.is_some() != authorization_url_digest.is_some()
+            || retention.cache_ttl_seconds < 0
+            || retention.result_ttl_seconds < 0
+            || retention.oauth_lifetime_seconds < 0
+        {
+            return Err(StoreError::InvalidConnectionOperation);
+        }
+        let updated = sqlx::query(
+            "UPDATE connection_operations \
+             SET operation_state = 'succeeded', \
+                 result = CASE WHEN operation_kind = 'start' \
+                     THEN '{\"started\":true}'::jsonb ELSE $2 END, \
+                 cached_status = CASE WHEN operation_kind = 'status' THEN $2 ELSE cached_status END, \
+                 cache_expires_at = CASE WHEN operation_kind = 'status' \
+                     THEN now() + make_interval(secs => $5) ELSE NULL END, \
+                 result_expires_at = CASE WHEN operation_kind = 'disconnect' \
+                     THEN now() + make_interval(secs => $6) ELSE result_expires_at END, \
+                 oauth_phase = CASE WHEN operation_kind = 'start' THEN 'pending' ELSE oauth_phase END, \
+                 authorization_url = $3, authorization_url_digest = $4, \
+                 flow_created_at = CASE WHEN operation_kind = 'start' THEN now() ELSE flow_created_at END, \
+                 flow_expires_at = CASE WHEN operation_kind = 'start' \
+                     THEN now() + make_interval(secs => $7) ELSE flow_expires_at END, \
+                 finalization_state = 'requested', cleanup_state = 'tearing_down', \
+                 failure_category = NULL, updated_at = now() \
+             WHERE operation_id = $1 AND operation_state NOT IN ('succeeded', 'failed')",
+        )
+        .bind(operation_id)
+        .bind(Json(result))
+        .bind(authorization_url)
+        .bind(authorization_url_digest)
+        .bind(retention.cache_ttl_seconds as f64)
+        .bind(retention.result_ttl_seconds as f64)
+        .bind(retention.oauth_lifetime_seconds as f64)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::InvalidConnectionOperation);
+        }
+        if operation_kind != ConnectionOperationKind::Status {
+            sqlx::query(
+                "UPDATE connection_operations \
+                 SET cached_status = NULL, cache_expires_at = NULL, updated_at = now() \
+                 WHERE canonical_user_id = (SELECT canonical_user_id \
+                         FROM connection_operations WHERE operation_id = $1) \
+                   AND provider = 'github' AND operation_kind = 'status'",
+            )
+            .bind(operation_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        }
+        let finalized = sqlx::query(
+            "UPDATE task_submissions \
+             SET output_archive = NULL, finalize_requested = true, updated_at = now() \
+             WHERE task_uid = $1",
+        )
+        .bind(operation_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if finalized.rows_affected() != 1 {
+            return Err(StoreError::ConnectionOperationNotFound);
+        }
+        transaction.commit().await.map_err(database_error)
+    }
+
+    pub async fn fail_connection_operation(
+        &self,
+        operation_id: Uuid,
+        category: &str,
+    ) -> Result<(), StoreError> {
+        if category.trim().is_empty() {
+            return Err(StoreError::InvalidConnectionOperation);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let operation = sqlx::query(
+            "UPDATE connection_operations \
+             SET operation_state = 'failed', failure_category = $2, result = NULL, \
+                 authorization_url = NULL, finalization_state = 'requested', \
+                 cleanup_state = 'tearing_down', updated_at = now() \
+             WHERE operation_id = $1 AND operation_state NOT IN ('succeeded', 'failed') \
+             RETURNING task_uid",
+        )
+        .bind(operation_id)
+        .bind(category)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::InvalidConnectionOperation)?;
+        let task_uid = operation
+            .try_get::<Uuid, _>("task_uid")
+            .map_err(database_error)?;
+        sqlx::query(
+            "UPDATE task_submissions \
+             SET phase = CASE WHEN phase IN ('succeeded', 'failed') THEN phase ELSE 'failed' END, \
+                 output_archive = NULL, finalize_requested = true, failure_reason = $2, \
+                 updated_at = now() WHERE task_uid = $1",
+        )
+        .bind(task_uid)
+        .bind(category)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)
+    }
+
+    pub async fn expire_connection_oauth_flow(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        sqlx::query(
+            "UPDATE connection_operations \
+             SET oauth_phase = 'expired', authorization_url = NULL, updated_at = now() \
+             WHERE operation_id = $1 AND oauth_phase = 'pending' \
+               AND flow_expires_at <= now()",
+        )
+        .bind(operation_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(database_error)
+    }
+
+    pub async fn complete_pending_connection_oauth_flow(
+        &self,
+        canonical_user_id: &CanonicalUserId,
+    ) -> Result<bool, StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("connection:{}:github", canonical_user_id.as_str()))
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let updated = sqlx::query(
+            "UPDATE connection_operations \
+             SET oauth_phase = 'completed', authorization_url = NULL, updated_at = now() \
+             WHERE operation_id = ( \
+               SELECT operation_id FROM connection_operations \
+               WHERE canonical_user_id = $1 AND provider = 'github' \
+                 AND oauth_phase = 'pending' AND flow_expires_at > now() \
+               ORDER BY created_at DESC LIMIT 1 FOR UPDATE)",
+        )
+        .bind(canonical_user_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if updated.rows_affected() == 1 {
+            sqlx::query(
+                "UPDATE connection_operations \
+                 SET cached_status = NULL, cache_expires_at = NULL, updated_at = now() \
+                 WHERE canonical_user_id = $1 AND provider = 'github' \
+                   AND operation_kind = 'status'",
+            )
+            .bind(canonical_user_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        }
+        transaction.commit().await.map_err(database_error)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    pub async fn reconcile_connection_cleanup_state(
+        &self,
+        operation_id: Uuid,
+        task_finalized: bool,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            "UPDATE connection_operations \
+             SET finalization_state = CASE WHEN $2 THEN 'finalized' ELSE 'requested' END, \
+                 cleanup_state = CASE WHEN $2 THEN 'clean' ELSE 'tearing_down' END, \
+                 updated_at = now() \
+             WHERE operation_id = $1",
+        )
+        .bind(operation_id)
+        .bind(task_finalized)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if result.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::ConnectionOperationNotFound)
+        }
+    }
+
+    pub async fn mark_stalled_connection_cleanup(
+        &self,
+        operation_id: Uuid,
+        grace_seconds: i64,
+    ) -> Result<bool, StoreError> {
+        if grace_seconds <= 0 {
+            return Err(StoreError::InvalidConnectionOperation);
+        }
+        sqlx::query(
+            "UPDATE connection_operations operations \
+             SET cleanup_state = 'stalled', cleanup_finding = 'teardown_stalled', \
+                 updated_at = now() \
+             FROM task_submissions tasks \
+             WHERE operations.operation_id = $1 \
+               AND tasks.task_uid = operations.task_uid \
+               AND operations.finalization_state = 'requested' \
+               AND operations.cleanup_state = 'tearing_down' \
+               AND NOT tasks.finalized \
+               AND operations.updated_at + make_interval(secs => $2) <= now()",
+        )
+        .bind(operation_id)
+        .bind(grace_seconds as f64)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(database_error)
     }
 
     pub async fn mark_task_finalized(&self, task_uid: Uuid) -> Result<(), StoreError> {
@@ -3083,6 +3737,83 @@ fn validate_task_identity_binding(request: &TaskReservationRequest<'_>) -> Resul
     Ok(())
 }
 
+fn validate_connection_operation_request(
+    request: &ConnectionOperationReservationRequest<'_>,
+) -> Result<(), StoreError> {
+    validate_task_identity_binding(&request.task)?;
+    validate_task_version_pins(&request.task)?;
+    let expected_action = request.operation_kind.as_str();
+    let [tool] = request.task.runtime_spec.tools.as_slice() else {
+        return Err(StoreError::InvalidConnectionOperation);
+    };
+    let expected_command = [
+        "/usr/local/bin/steward-connections-bridge",
+        "--operation",
+        match request.operation_kind {
+            ConnectionOperationKind::Status => "github.status",
+            ConnectionOperationKind::Start => "github.start",
+            ConnectionOperationKind::Disconnect => "github.disconnect",
+        },
+        "--input",
+        "request.json",
+    ];
+    let principal_is_bound = matches!(
+        &request.task.runtime_spec.principal,
+        steward_types::Principal::Service { name, acting_user }
+            if name == "steward-connections"
+                && acting_user.as_ref().map(|email| email.as_str()) == request.task.acting_user
+    );
+    if request.task.submitter_service != "steward-connections"
+        || request.authority_id != "steward-connections"
+        || request.authority_version != 1
+        || request.authority_digest
+            != steward_admission::internal_authorities::steward_connections_v1::AUTHORITY_DIGEST
+        || request.response_deadline_seconds <= 0
+        || request.response_deadline_seconds > 60
+        || request.idempotency_identity.trim().is_empty()
+        || (request.operation_kind != ConnectionOperationKind::Status
+            && !request.allow_status_cache)
+        || request.input_archive.is_empty()
+        || request.task.runtime_ownership != steward_types::RuntimeOwnership::Provisioned
+        || request.task.runtime_spec.agent_type.name != "connections-bridge"
+        || !request.task.runtime_spec.llms.is_empty()
+        || tool.provider != "github"
+        || tool.resource != "provider-control"
+        || tool.action != expected_action
+        || request
+            .task
+            .agent_command
+            .iter()
+            .map(String::as_str)
+            .ne(expected_command)
+        || request.task.runtime_namespace != request.bindings.namespace
+        || !valid_digest_pinned_image(&request.bindings.bridge_image_digest)
+        || request.bindings.mcp_gw_origin.trim().is_empty()
+        || request.bindings.mcp_gw_version != "0.3.2"
+        || request.bindings.namespace.trim().is_empty()
+        || request.bindings.runtime_class.trim().is_empty()
+        || !principal_is_bound
+    {
+        return Err(StoreError::InvalidConnectionOperation);
+    }
+    Ok(())
+}
+
+fn valid_sha256_reference(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn valid_digest_pinned_image(value: &str) -> bool {
+    value.split_once("@").is_some_and(|(repository, digest)| {
+        !repository.is_empty() && valid_sha256_reference(digest)
+    })
+}
+
 fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<(), StoreError> {
     let workflow_pins = [
         request.workflow_name.is_some(),
@@ -3151,6 +3882,113 @@ pub struct TaskRecord {
     pub finalize_requested: bool,
     pub finalized: bool,
     pub failure_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionOperationKind {
+    Status,
+    Start,
+    Disconnect,
+}
+
+impl ConnectionOperationKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Start => "start",
+            Self::Disconnect => "disconnect",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionOperationState {
+    Queued,
+    Provisioning,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionOAuthPhase {
+    None,
+    Pending,
+    Completed,
+    Expired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectionExecutionBindingSnapshot {
+    pub bridge_image_digest: String,
+    pub mcp_gw_origin: String,
+    pub mcp_gw_version: String,
+    pub namespace: String,
+    pub runtime_class: String,
+}
+
+pub struct ConnectionOperationReservationRequest<'a> {
+    pub operation_id: Uuid,
+    pub operation_kind: ConnectionOperationKind,
+    pub authority_id: &'a str,
+    pub authority_version: i64,
+    pub authority_digest: &'a str,
+    pub bindings: &'a ConnectionExecutionBindingSnapshot,
+    pub idempotency_identity: &'a str,
+    pub response_deadline_seconds: i64,
+    /// Status-only cache control. False forces a new status operation while still joining an
+    /// identical in-flight status. Mutating operations must always set this to true.
+    pub allow_status_cache: bool,
+    pub input_archive: &'a [u8],
+    pub task: TaskReservationRequest<'a>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionOperationRetention {
+    pub cache_ttl_seconds: i64,
+    pub result_ttl_seconds: i64,
+    pub oauth_lifetime_seconds: i64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConnectionOperationRecord {
+    pub operation_id: Uuid,
+    pub task_uid: Uuid,
+    pub canonical_user_id: String,
+    pub provider: String,
+    pub operation_kind: ConnectionOperationKind,
+    pub authority_id: String,
+    pub authority_version: i64,
+    pub authority_digest: String,
+    pub runtime_spec_snapshot: AgentRuntimeSpec,
+    pub command_snapshot: Vec<String>,
+    pub bindings: ConnectionExecutionBindingSnapshot,
+    pub idempotency_identity: String,
+    pub uncached_status: bool,
+    pub operation_state: ConnectionOperationState,
+    pub oauth_phase: ConnectionOAuthPhase,
+    /// Sensitive transient continuation. Never expose through generic read models or logs.
+    pub authorization_url: Option<String>,
+    pub authorization_url_digest: Option<String>,
+    pub flow_expires_at: Option<String>,
+    pub cached_status: Option<serde_json::Value>,
+    pub result: Option<serde_json::Value>,
+    pub failure_category: Option<String>,
+    pub finalization_state: String,
+    pub cleanup_state: String,
+    pub cleanup_finding: Option<String>,
+    pub response_deadline_at: String,
+    pub task_phase: steward_types::TaskPhase,
+    pub runtime_uid: Option<String>,
+    pub output_archive: Option<Vec<u8>>,
+    pub finalize_requested: bool,
+    pub finalized: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConnectionOperationReservation {
+    pub inserted: bool,
+    pub record: ConnectionOperationRecord,
 }
 
 /// The sole durable candidate a stable bridge may inspect before it validates the live object.
@@ -3302,6 +4140,10 @@ pub enum StoreError {
     TaskIdempotencyConflict,
     InvalidTaskIdentityBinding,
     InvalidTaskTransition,
+    ConnectionOperationNotFound,
+    ConnectionOperationConflict,
+    ConnectionOAuthFlowPending,
+    InvalidConnectionOperation,
     InvalidRunQuery,
     InvalidRunCursor,
     EnvelopeRequestNotFound,
@@ -3407,6 +4249,21 @@ impl fmt::Display for StoreError {
             Self::InvalidTaskTransition => {
                 write!(formatter, "task lifecycle transition is invalid")
             }
+            Self::ConnectionOperationNotFound => {
+                write!(formatter, "connection operation does not exist")
+            }
+            Self::ConnectionOperationConflict => {
+                write!(
+                    formatter,
+                    "connection operation conflicts with an active mutation"
+                )
+            }
+            Self::ConnectionOAuthFlowPending => {
+                write!(formatter, "OAuth flow remains pending")
+            }
+            Self::InvalidConnectionOperation => {
+                write!(formatter, "connection operation is invalid")
+            }
             Self::InvalidRunQuery => write!(formatter, "agent-run query is invalid"),
             Self::InvalidRunCursor => write!(formatter, "agent-run cursor is invalid"),
             Self::EnvelopeRequestNotFound => write!(formatter, "envelope request does not exist"),
@@ -3487,6 +4344,110 @@ fn canonical_principal_from_row(
         })?;
     CanonicalPrincipal::new(user_id, user_organization_id, Email(display_email))
         .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+}
+
+fn connection_operation_kind_from_text(value: &str) -> Result<ConnectionOperationKind, StoreError> {
+    match value {
+        "status" => Ok(ConnectionOperationKind::Status),
+        "start" => Ok(ConnectionOperationKind::Start),
+        "disconnect" => Ok(ConnectionOperationKind::Disconnect),
+        _ => Err(StoreError::InvalidConnectionOperation),
+    }
+}
+
+fn connection_operation_state_from_text(
+    value: &str,
+) -> Result<ConnectionOperationState, StoreError> {
+    match value {
+        "queued" => Ok(ConnectionOperationState::Queued),
+        "provisioning" => Ok(ConnectionOperationState::Provisioning),
+        "running" => Ok(ConnectionOperationState::Running),
+        "succeeded" => Ok(ConnectionOperationState::Succeeded),
+        "failed" => Ok(ConnectionOperationState::Failed),
+        _ => Err(StoreError::InvalidConnectionOperation),
+    }
+}
+
+fn connection_oauth_phase_from_text(value: &str) -> Result<ConnectionOAuthPhase, StoreError> {
+    match value {
+        "none" => Ok(ConnectionOAuthPhase::None),
+        "pending" => Ok(ConnectionOAuthPhase::Pending),
+        "completed" => Ok(ConnectionOAuthPhase::Completed),
+        "expired" => Ok(ConnectionOAuthPhase::Expired),
+        _ => Err(StoreError::InvalidConnectionOperation),
+    }
+}
+
+fn connection_operation_record(
+    row: sqlx::postgres::PgRow,
+) -> Result<ConnectionOperationRecord, StoreError> {
+    Ok(ConnectionOperationRecord {
+        operation_id: row.try_get("operation_id").map_err(database_error)?,
+        task_uid: row.try_get("task_uid").map_err(database_error)?,
+        canonical_user_id: row.try_get("canonical_user_id").map_err(database_error)?,
+        provider: row.try_get("provider").map_err(database_error)?,
+        operation_kind: connection_operation_kind_from_text(
+            &row.try_get::<String, _>("operation_kind")
+                .map_err(database_error)?,
+        )?,
+        authority_id: row.try_get("authority_id").map_err(database_error)?,
+        authority_version: row.try_get("authority_version").map_err(database_error)?,
+        authority_digest: row.try_get("authority_digest").map_err(database_error)?,
+        runtime_spec_snapshot: row
+            .try_get::<Json<AgentRuntimeSpec>, _>("runtime_spec_snapshot")
+            .map_err(database_error)?
+            .0,
+        command_snapshot: row
+            .try_get::<Json<Vec<String>>, _>("command_snapshot")
+            .map_err(database_error)?
+            .0,
+        bindings: ConnectionExecutionBindingSnapshot {
+            bridge_image_digest: row.try_get("bridge_image_digest").map_err(database_error)?,
+            mcp_gw_origin: row.try_get("mcp_gw_origin").map_err(database_error)?,
+            mcp_gw_version: row.try_get("mcp_gw_version").map_err(database_error)?,
+            namespace: row.try_get("runtime_namespace").map_err(database_error)?,
+            runtime_class: row.try_get("runtime_class").map_err(database_error)?,
+        },
+        idempotency_identity: row
+            .try_get("idempotency_identity")
+            .map_err(database_error)?,
+        uncached_status: row.try_get("uncached_status").map_err(database_error)?,
+        operation_state: connection_operation_state_from_text(
+            &row.try_get::<String, _>("operation_state")
+                .map_err(database_error)?,
+        )?,
+        oauth_phase: connection_oauth_phase_from_text(
+            &row.try_get::<String, _>("oauth_phase")
+                .map_err(database_error)?,
+        )?,
+        authorization_url: row.try_get("authorization_url").map_err(database_error)?,
+        authorization_url_digest: row
+            .try_get("authorization_url_digest")
+            .map_err(database_error)?,
+        flow_expires_at: row
+            .try_get("flow_expires_at_text")
+            .map_err(database_error)?,
+        cached_status: row
+            .try_get::<Option<Json<serde_json::Value>>, _>("cached_status")
+            .map_err(database_error)?
+            .map(|value| value.0),
+        result: row
+            .try_get::<Option<Json<serde_json::Value>>, _>("result")
+            .map_err(database_error)?
+            .map(|value| value.0),
+        failure_category: row.try_get("failure_category").map_err(database_error)?,
+        finalization_state: row.try_get("finalization_state").map_err(database_error)?,
+        cleanup_state: row.try_get("cleanup_state").map_err(database_error)?,
+        cleanup_finding: row.try_get("cleanup_finding").map_err(database_error)?,
+        response_deadline_at: row
+            .try_get("response_deadline_at_text")
+            .map_err(database_error)?,
+        task_phase: task_phase_from_row(&row, "task_phase")?,
+        runtime_uid: row.try_get("runtime_uid").map_err(database_error)?,
+        output_archive: row.try_get("output_archive").map_err(database_error)?,
+        finalize_requested: row.try_get("finalize_requested").map_err(database_error)?,
+        finalized: row.try_get("finalized").map_err(database_error)?,
+    })
 }
 
 fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {

@@ -245,6 +245,32 @@ jobs:
       - name: Verify the authenticated OpenShell adapter
         run: cargo xtask e2e-openshell-adapter
 
+  governed-connections:
+    name: integration / governed MCP provider connections
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Restore shared Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: steward-rust-1.95.0
+
+      - name: Install Kubernetes tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+
+      - name: Verify governed provider connections against the pinned real stack
+        run: cargo xtask e2e-governed-connections
+
   postgres-tls:
     name: integration / TLS-required PostgreSQL
     runs-on: ubuntu-latest
@@ -378,6 +404,7 @@ jobs:
       - e2e-admission
       - e2e-escalation
       - openshell-adapter
+      - governed-connections
       - postgres-tls
       - browser-e2e
       - release-candidate
@@ -395,6 +422,7 @@ jobs:
           ADMISSION: ${{ needs.e2e-admission.result }}
           ESCALATION: ${{ needs.e2e-escalation.result }}
           OPENSHELL_ADAPTER: ${{ needs.openshell-adapter.result }}
+          GOVERNED_CONNECTIONS: ${{ needs.governed-connections.result }}
           POSTGRES_TLS: ${{ needs.postgres-tls.result }}
           BROWSER_E2E: ${{ needs.browser-e2e.result }}
           RELEASE_CANDIDATE: ${{ needs.release-candidate.result }}
@@ -409,6 +437,7 @@ jobs:
             "${ADMISSION}" \
             "${ESCALATION}" \
             "${OPENSHELL_ADAPTER}" \
+            "${GOVERNED_CONNECTIONS}" \
             "${POSTGRES_TLS}" \
             "${BROWSER_E2E}" \
             "${RELEASE_CANDIDATE}"

@@ -43,8 +43,8 @@ use sha2::{Digest, Sha256};
 use steward_ports::PortError;
 #[cfg(feature = "runtime")]
 use steward_ports::{
-    SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskOutput, SandboxTaskRequest,
-    SandboxTaskRuntime,
+    ProviderControlExecutionBindings, SandboxExecutionClass, SandboxObservation, SandboxRequest,
+    SandboxRuntime, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
 };
 #[cfg(feature = "runtime")]
 use steward_types::{AgentType, RuntimeRefs};
@@ -312,22 +312,32 @@ fn deletion_names(request: &SandboxRequest) -> (String, String) {
 }
 
 #[cfg(feature = "runtime")]
-fn bridge_image_for_agent_type(
+fn bridge_image_for_execution(
     agent_type: &AgentType,
-    bridge_image: Option<&str>,
+    execution_class: SandboxExecutionClass,
+    stable_bridge_image: Option<&str>,
+    connections_bridge_image: Option<&str>,
 ) -> Result<Option<String>, PortError> {
-    match agent_type.name.as_str() {
-        "base" | WORKFLOW_CODEX_AGENT_TYPE => Ok(None),
-        CONNECTIONS_BRIDGE_AGENT_TYPE => bridge_image
+    match (agent_type.name.as_str(), execution_class) {
+        ("base" | WORKFLOW_CODEX_AGENT_TYPE, SandboxExecutionClass::Agent) => Ok(None),
+        (CONNECTIONS_BRIDGE_AGENT_TYPE, SandboxExecutionClass::Agent) => stable_bridge_image
             .filter(|image| is_digest_pinned_image(image))
             .map(str::to_owned)
             .map(Some)
             .ok_or_else(|| PortError::Rejected {
-                reason: "Connections bridge requires a provenance-verified digest-pinned image"
+                reason: "Stable connections bridge requires its own provenance-verified digest-pinned image"
                     .to_owned(),
             }),
-        other => Err(PortError::Rejected {
-            reason: format!("unsupported agent type: {other}"),
+        (CONNECTIONS_BRIDGE_AGENT_TYPE, SandboxExecutionClass::ProviderControl) => connections_bridge_image
+            .filter(|image| is_digest_pinned_image(image))
+            .map(str::to_owned)
+            .map(Some)
+            .ok_or_else(|| PortError::Rejected {
+                reason: "Governed Connections bridge requires its own provenance-verified digest-pinned image"
+                    .to_owned(),
+            }),
+        (other, _) => Err(PortError::Rejected {
+            reason: format!("unsupported agent type and execution class: {other}"),
         }),
     }
 }
@@ -346,7 +356,60 @@ fn output_archive_command(agent_type: &AgentType) -> &'static str {
 #[cfg(feature = "runtime")]
 fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
     let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
-    if stderr.contains("policy_denied") || stderr.contains("policy denied") {
+    if stderr.contains("steward-connections-bridge:")
+        && stderr.contains("mcp-gw rejected runtime authentication")
+    {
+        "bridge-runtime-authentication"
+    } else if stderr.contains("steward-connections-bridge:")
+        && stderr.contains("mcp-gw rejected runtime authorization")
+    {
+        "bridge-runtime-authorization"
+    } else if stderr.contains("steward-connections-bridge:")
+        && stderr.contains("mcp-gw response violated its bounded contract")
+    {
+        "bridge-response-contract"
+    } else if stderr.contains("steward-connections-bridge:")
+        && stderr.contains("mcp-gw transport is unavailable")
+    {
+        "bridge-gateway-transport"
+    } else if stderr.contains("steward-connections-bridge:")
+        && stderr.contains("mcp-gw returned an unexpected status")
+    {
+        "bridge-gateway-status"
+    } else if stderr.contains("steward-connections-bridge:")
+        && stderr.contains("mcp-gw response body is unavailable")
+    {
+        "bridge-gateway-body"
+    } else if stderr.contains("steward-connections-bridge:")
+        && stderr.contains("mcp-gw is unavailable")
+    {
+        "bridge-gateway-unavailable"
+    } else if stderr.contains("steward-connections-bridge:")
+        && (stderr.contains("request.json input is unavailable")
+            || stderr.contains("request.json input is invalid")
+            || stderr.contains("request.json input is unreadable"))
+    {
+        "bridge-input"
+    } else if stderr.contains("steward-connections-bridge:")
+        && (stderr.contains("invocation must contain")
+            || stderr.contains("operation is not allowlisted")
+            || stderr.contains("request.json violates the operation contract"))
+    {
+        "bridge-contract"
+    } else if stderr.contains("steward-connections-bridge:")
+        && (stderr.contains("steward_mcp_gw_origin") || stderr.contains("steward_output_dir"))
+    {
+        "bridge-configuration"
+    } else if stderr.contains("steward-connections-bridge:")
+        && stderr.contains("did not receive a valid mcp-gw response")
+    {
+        "bridge-gateway"
+    } else if stderr.contains("steward-connections-bridge:")
+        && (stderr.contains("response could not be serialized")
+            || stderr.contains("response.json could not be persisted"))
+    {
+        "bridge-output"
+    } else if stderr.contains("policy_denied") || stderr.contains("policy denied") {
         "policy"
     } else if stderr.contains("unauthorized")
         || stderr.contains("forbidden")
@@ -485,9 +548,15 @@ fn tar_string(field: &[u8]) -> Option<&str> {
 #[cfg(feature = "runtime")]
 fn project_request(
     request: &SandboxRequest,
-    bridge_image: Option<&str>,
+    stable_bridge_image: Option<&str>,
+    connections_bridge_image: Option<&str>,
 ) -> Result<OpenShellProjection, PortError> {
-    let image = bridge_image_for_agent_type(&request.agent_type, bridge_image)?;
+    let image = bridge_image_for_execution(
+        &request.agent_type,
+        request.execution_class,
+        stable_bridge_image,
+        connections_bridge_image,
+    )?;
     Ok(OpenShellProjection {
         workspace: stable_name(NameKind::Workspace, request.workspace_key.as_bytes()),
         workspace_key: request.workspace_key.clone(),
@@ -544,6 +613,18 @@ pub enum OpenShellTaskLogMode {
     Off,
     /// Emit escaped stdout and stderr events live while retaining the result buffers.
     Full,
+}
+
+#[cfg(feature = "runtime")]
+fn task_log_mode_for_execution(
+    configured: OpenShellTaskLogMode,
+    execution_class: SandboxExecutionClass,
+) -> OpenShellTaskLogMode {
+    if execution_class == SandboxExecutionClass::ProviderControl {
+        OpenShellTaskLogMode::Off
+    } else {
+        configured
+    }
 }
 
 #[cfg(feature = "runtime")]
@@ -735,11 +816,20 @@ pub struct OpenShellConnectionConfig {
     pub server_name: String,
     pub runtime_class_name: String,
     pub task_log_mode: OpenShellTaskLogMode,
-    /// Digest-pinned bridge image only. Its provenance is verified by the controller process
-    /// before this adapter is constructed.
+    /// Existing stable-runtime bridge image. It remains isolated from one-shot provider control.
+    pub stable_bridge_image: Option<String>,
+    /// Existing stable-runtime bridge MCP-GW origin.
+    pub stable_bridge_gateway_origin: Option<String>,
+    /// Digest-pinned governed Connections bridge image. Its provenance is verified by the
+    /// controller process before this adapter is constructed.
     pub bridge_image: Option<String>,
     /// Server-configured gateway origin passed only to the fixed bridge executable.
     pub bridge_gateway_origin: Option<String>,
+    /// Exact MCP-GW release whose OAuth lifetime is pinned by the immutable authority.
+    pub bridge_gateway_version: Option<String>,
+    /// Namespace pinned into governed provider-control operations. It is paired with the bridge
+    /// image and gateway origin so persisted operations can fail closed on rollout drift.
+    pub bridge_runtime_namespace: Option<String>,
 }
 
 #[cfg(feature = "runtime")]
@@ -787,11 +877,34 @@ impl OpenShellConnectionConfig {
             });
         }
         match (
-            self.bridge_image.as_deref(),
-            self.bridge_gateway_origin.as_deref(),
+            self.stable_bridge_image.as_deref(),
+            self.stable_bridge_gateway_origin.as_deref(),
         ) {
             (None, None) => {}
             (Some(image), Some(origin)) => {
+                if !is_digest_pinned_image(image) {
+                    return Err(PortError::Rejected {
+                        reason: "Stable bridge image must be an immutable sha256 reference"
+                            .to_owned(),
+                    });
+                }
+                validate_connections_bridge_gateway_origin(origin)?;
+            }
+            _ => {
+                return Err(PortError::Rejected {
+                    reason: "Stable bridge image and gateway origin must be configured together"
+                        .to_owned(),
+                });
+            }
+        }
+        match (
+            self.bridge_image.as_deref(),
+            self.bridge_gateway_origin.as_deref(),
+            self.bridge_gateway_version.as_deref(),
+            self.bridge_runtime_namespace.as_deref(),
+        ) {
+            (None, None, None, None) => {}
+            (Some(image), Some(origin), Some(version), Some(namespace)) => {
                 if !is_digest_pinned_image(image) {
                     return Err(PortError::Rejected {
                         reason: "Connections bridge image must be an immutable sha256 reference"
@@ -799,11 +912,23 @@ impl OpenShellConnectionConfig {
                     });
                 }
                 validate_connections_bridge_gateway_origin(origin)?;
+                if version != "0.3.2" {
+                    return Err(PortError::Rejected {
+                        reason: "Connections bridge requires the pinned MCP-GW 0.3.2 contract"
+                            .to_owned(),
+                    });
+                }
+                if namespace.trim().is_empty() || namespace.trim() != namespace {
+                    return Err(PortError::Rejected {
+                        reason: "Connections bridge runtime namespace must be exact and non-empty"
+                            .to_owned(),
+                    });
+                }
             }
-            (Some(_), None) | (None, Some(_)) => {
+            _ => {
                 return Err(PortError::Rejected {
                     reason:
-                        "Connections bridge image and gateway origin must be configured together"
+                        "Connections bridge image, gateway origin/version, and runtime namespace must be configured together"
                             .to_owned(),
                 });
             }
@@ -1069,8 +1194,26 @@ pub struct OpenShellRuntime {
     channel: Channel,
     token_provider: WorkloadExchangeTokenProvider,
     task_log_mode: OpenShellTaskLogMode,
+    stable_bridge_image: Option<String>,
+    stable_bridge_gateway_origin: Option<String>,
     bridge_image: Option<String>,
     bridge_gateway_origin: Option<String>,
+    bridge_gateway_version: Option<String>,
+    runtime_class_name: String,
+    bridge_runtime_namespace: Option<String>,
+}
+
+#[cfg(feature = "runtime")]
+fn provider_control_execution_bindings(
+    runtime: &OpenShellRuntime,
+) -> Option<ProviderControlExecutionBindings> {
+    Some(ProviderControlExecutionBindings {
+        bridge_image_digest: runtime.bridge_image.clone()?,
+        mcp_gw_origin: runtime.bridge_gateway_origin.clone()?,
+        mcp_gw_version: runtime.bridge_gateway_version.clone()?,
+        namespace: runtime.bridge_runtime_namespace.clone()?,
+        runtime_class: runtime.runtime_class_name.clone(),
+    })
 }
 
 #[cfg(feature = "runtime")]
@@ -1097,8 +1240,13 @@ impl OpenShellRuntime {
             channel,
             token_provider,
             task_log_mode: config.task_log_mode,
+            stable_bridge_image: config.stable_bridge_image,
+            stable_bridge_gateway_origin: config.stable_bridge_gateway_origin,
             bridge_image: config.bridge_image,
             bridge_gateway_origin: config.bridge_gateway_origin,
+            bridge_gateway_version: config.bridge_gateway_version,
+            runtime_class_name: config.runtime_class_name,
+            bridge_runtime_namespace: config.bridge_runtime_namespace,
         };
         runtime.authenticated_client().await?;
         Ok(runtime)
@@ -1123,6 +1271,7 @@ impl OpenShellRuntime {
         sandbox_id: &str,
         command: &[String],
         environment: HashMap<String, String>,
+        execution_class: SandboxExecutionClass,
         context: TaskProcessLogContext<'_>,
     ) -> Result<TaskProcessResult, PortError> {
         let mut client = self.authenticated_client().await?.raw_grpc();
@@ -1143,7 +1292,7 @@ impl OpenShellRuntime {
         let mut stream = response.into_inner();
         collect_task_process_stream(
             &mut stream,
-            self.task_log_mode,
+            task_log_mode_for_execution(self.task_log_mode, execution_class),
             context,
             &mut ControllerTaskProcessLogSink,
         )
@@ -1619,8 +1768,16 @@ where
 
 #[cfg(feature = "runtime")]
 impl SandboxRuntime for OpenShellRuntime {
+    fn provider_control_bindings(&self) -> Option<ProviderControlExecutionBindings> {
+        provider_control_execution_bindings(self)
+    }
+
     async fn ensure(&self, request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
-        let projection = project_request(request, self.bridge_image.as_deref())?;
+        let projection = project_request(
+            request,
+            self.stable_bridge_image.as_deref(),
+            self.bridge_image.as_deref(),
+        )?;
         self.ensure_workspace(&projection.workspace, &projection.workspace_key)
             .await?;
         for provider in &projection.providers {
@@ -1714,6 +1871,10 @@ impl SandboxRuntime for OpenShellRuntime {
 
 #[cfg(feature = "runtime")]
 impl SandboxTaskRuntime for OpenShellRuntime {
+    fn provider_control_bindings(&self) -> Option<ProviderControlExecutionBindings> {
+        provider_control_execution_bindings(self)
+    }
+
     async fn run_task(
         &self,
         request: &SandboxTaskRequest,
@@ -1758,8 +1919,12 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 reason: "task sandbox is bound to a different runtime UID".to_owned(),
             });
         }
-        let expected_image =
-            bridge_image_for_agent_type(&request.agent_type, self.bridge_image.as_deref())?;
+        let expected_image = bridge_image_for_execution(
+            &request.agent_type,
+            request.execution_class,
+            self.stable_bridge_image.as_deref(),
+            self.bridge_image.as_deref(),
+        )?;
         self.resolve_raw_sandbox_binding(
             workspace,
             sandbox,
@@ -1785,12 +1950,13 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             "/sandbox/steward-output".to_owned(),
         );
         if is_connections_bridge {
-            let origin =
-                self.bridge_gateway_origin
-                    .as_deref()
-                    .ok_or_else(|| PortError::Rejected {
-                        reason: "Connections bridge gateway origin is not configured".to_owned(),
-                    })?;
+            let origin = match request.execution_class {
+                SandboxExecutionClass::Agent => self.stable_bridge_gateway_origin.as_deref(),
+                SandboxExecutionClass::ProviderControl => self.bridge_gateway_origin.as_deref(),
+            }
+            .ok_or_else(|| PortError::Rejected {
+                reason: "Selected bridge gateway origin is not configured".to_owned(),
+            })?;
             environment.insert("STEWARD_MCP_GW_ORIGIN".to_owned(), origin.to_owned());
         }
         let executed = self
@@ -1798,6 +1964,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 &sandbox_id,
                 &request.command,
                 environment,
+                request.execution_class,
                 TaskProcessLogContext {
                     runtime_uid: &request.runtime.0,
                     workspace,
@@ -1930,9 +2097,7 @@ mod tests {
     use tokio::sync::{Mutex, mpsc as tokio_mpsc};
 
     #[cfg(feature = "runtime")]
-    use steward_ports::PortError;
-    #[cfg(feature = "runtime")]
-    use steward_ports::SandboxRequest;
+    use steward_ports::{PortError, SandboxExecutionClass, SandboxRequest};
     #[cfg(feature = "runtime")]
     use steward_types::{AgentType, RuntimeId, RuntimeRefs, ToolGrant};
 
@@ -2180,8 +2345,12 @@ mod tests {
             server_name: "gateway.example.test".to_owned(),
             runtime_class_name: "kata-qemu".to_owned(),
             task_log_mode: super::OpenShellTaskLogMode::Off,
+            stable_bridge_image: None,
+            stable_bridge_gateway_origin: None,
             bridge_image: None,
             bridge_gateway_origin: None,
+            bridge_gateway_version: None,
+            bridge_runtime_namespace: None,
         }
     }
 
@@ -2283,6 +2452,27 @@ mod tests {
             "full logging must expose the escaped task-process event"
         );
         Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn connections_bridge_structurally_disables_full_task_output_logging() {
+        assert_eq!(
+            super::task_log_mode_for_execution(
+                OpenShellTaskLogMode::Full,
+                SandboxExecutionClass::ProviderControl,
+            ),
+            OpenShellTaskLogMode::Off,
+            "OAuth continuation material must remain unloggable even when full task logging is enabled"
+        );
+        assert_eq!(
+            super::task_log_mode_for_execution(
+                OpenShellTaskLogMode::Full,
+                SandboxExecutionClass::Agent,
+            ),
+            OpenShellTaskLogMode::Full,
+            "the provider-control logging override must not change long-running agent logging"
+        );
     }
 
     #[cfg(feature = "runtime")]
@@ -2971,6 +3161,7 @@ mod tests {
             &SandboxRequest {
                 runtime: RuntimeId("runtime-uid-a".to_owned()),
                 workspace_key: "team-a".to_owned(),
+                execution_class: SandboxExecutionClass::Agent,
                 agent_type: AgentType {
                     name: "base".to_owned(),
                 },
@@ -2978,6 +3169,7 @@ mod tests {
                 tools: Vec::new(),
                 refs: RuntimeRefs::default(),
             },
+            None,
             None,
         )
         .map_err(|error| format!("runtime projection failed: {error:?}"))?;
@@ -3000,6 +3192,7 @@ mod tests {
         let request = |agent_type: &str| SandboxRequest {
             runtime: RuntimeId("runtime-uid-a".to_owned()),
             workspace_key: "team-a".to_owned(),
+            execution_class: SandboxExecutionClass::Agent,
             agent_type: AgentType {
                 name: agent_type.to_owned(),
             },
@@ -3008,18 +3201,18 @@ mod tests {
             refs: RuntimeRefs::default(),
         };
 
-        let projection = project_request(&request("codex@0.117.0"), None)
+        let projection = project_request(&request("codex@0.117.0"), None, None)
             .map_err(|error| format!("approved Workflow agent was rejected: {error:?}"))?;
         assert!(
             sandbox_spec(&projection).image.is_none(),
             "the approved agent must not let Steward select an OpenShell image"
         );
         assert!(
-            project_request(&request("codex@latest"), None).is_err(),
+            project_request(&request("codex@latest"), None, None).is_err(),
             "an unpinned agent reference must fail closed"
         );
         assert!(
-            project_request(&request("other-agent@1"), None).is_err(),
+            project_request(&request("other-agent@1"), None, None).is_err(),
             "an unpublished agent reference must fail closed"
         );
         Ok(())
@@ -3051,6 +3244,7 @@ mod tests {
         let request = SandboxRequest {
             runtime: RuntimeId("runtime-uid-a".to_owned()),
             workspace_key: "team-a".to_owned(),
+            execution_class: SandboxExecutionClass::ProviderControl,
             agent_type: AgentType {
                 name: CONNECTIONS_BRIDGE_AGENT_TYPE.to_owned(),
             },
@@ -3059,12 +3253,13 @@ mod tests {
             refs: RuntimeRefs::default(),
         };
         assert!(
-            project_request(&request, None).is_err(),
+            project_request(&request, None, None).is_err(),
             "the bridge must not create a sandbox without a verified image"
         );
         assert!(
             project_request(
                 &request,
+                None,
                 Some("registry.example.test/steward-bridge:latest")
             )
             .is_err(),
@@ -3072,6 +3267,7 @@ mod tests {
         );
         let projection = project_request(
             &request,
+            Some("registry.example.test/stable-bridge@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
             Some("registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         )
         .map_err(|error| format!("verified bridge image rejected: {error:?}"))?;
@@ -3081,6 +3277,21 @@ mod tests {
                 "registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
             "only the exact digest that passed configuration may reach OpenShell"
+        );
+        let mut stable_request = request;
+        stable_request.execution_class = SandboxExecutionClass::Agent;
+        let stable_projection = project_request(
+            &stable_request,
+            Some("registry.example.test/stable-bridge@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            Some("registry.example.test/steward-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )
+        .map_err(|error| format!("stable bridge image rejected: {error:?}"))?;
+        assert_eq!(
+            sandbox_spec(&stable_projection).image.as_deref(),
+            Some(
+                "registry.example.test/stable-bridge@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ),
+            "a long-running bridge runtime must retain its independent stable image"
         );
         Ok(())
     }
@@ -3096,6 +3307,19 @@ mod tests {
             matches!(config.validate(), Err(PortError::Rejected { .. })),
             "a bridge image without its controller-owned gateway origin must fail before a sandbox can be created"
         );
+        config.bridge_gateway_origin = Some("https://mcp-gw.example.test".to_owned());
+        config.bridge_runtime_namespace = Some("steward-test".to_owned());
+        assert!(
+            matches!(config.validate(), Err(PortError::Rejected { .. })),
+            "a bridge binding without the authority-pinned gateway version must fail closed"
+        );
+        config.bridge_gateway_version = Some("0.3.1".to_owned());
+        assert!(
+            matches!(config.validate(), Err(PortError::Rejected { .. })),
+            "an incompatible gateway OAuth contract must fail closed"
+        );
+        config.bridge_gateway_version = Some("0.3.2".to_owned());
+        assert!(config.validate().is_ok());
     }
 
     #[cfg(feature = "runtime")]
@@ -3260,6 +3484,7 @@ mod tests {
         let request = SandboxRequest {
             runtime: RuntimeId("runtime-uid-a".to_owned()),
             workspace_key: "team-a".to_owned(),
+            execution_class: SandboxExecutionClass::Agent,
             agent_type: AgentType {
                 name: "base".to_owned(),
             },
@@ -3289,6 +3514,7 @@ mod tests {
             &SandboxRequest {
                 runtime: RuntimeId("runtime-uid-a".to_owned()),
                 workspace_key: "team-a".to_owned(),
+                execution_class: SandboxExecutionClass::Agent,
                 agent_type: AgentType {
                     name: "base".to_owned(),
                 },
@@ -3300,6 +3526,7 @@ mod tests {
                 }],
                 refs: RuntimeRefs::default(),
             },
+            None,
             None,
         )
         .map_err(|error| format!("runtime projection failed: {error:?}"))?;
@@ -3319,6 +3546,7 @@ mod tests {
             &SandboxRequest {
                 runtime: RuntimeId("runtime-uid-a".to_owned()),
                 workspace_key: "team-a".to_owned(),
+                execution_class: SandboxExecutionClass::Agent,
                 agent_type: AgentType {
                     name: "base".to_owned(),
                 },
@@ -3329,6 +3557,7 @@ mod tests {
                 tools: Vec::new(),
                 refs: RuntimeRefs::default(),
             },
+            None,
             None,
         )
         .map_err(|error| format!("runtime projection failed: {error:?}"))?;
@@ -3344,6 +3573,50 @@ mod tests {
     #[cfg(feature = "runtime")]
     #[test]
     fn task_agent_stderr_is_reduced_to_safe_categories() {
+        assert_eq!(
+            task_agent_failure_category(
+                b"steward-connections-bridge: bridge operation did not receive a valid MCP-GW response"
+            ),
+            "bridge-gateway",
+            "the bridge failure boundary must expose only an allowlisted non-secret category"
+        );
+        assert_eq!(
+            task_agent_failure_category(
+                b"steward-connections-bridge: bridge MCP-GW rejected runtime authentication"
+            ),
+            "bridge-runtime-authentication"
+        );
+        assert_eq!(
+            task_agent_failure_category(
+                b"steward-connections-bridge: bridge MCP-GW response violated its bounded contract"
+            ),
+            "bridge-response-contract"
+        );
+        assert_eq!(
+            task_agent_failure_category(
+                b"steward-connections-bridge: bridge MCP-GW transport is unavailable"
+            ),
+            "bridge-gateway-transport"
+        );
+        assert_eq!(
+            task_agent_failure_category(
+                b"steward-connections-bridge: bridge MCP-GW returned an unexpected status"
+            ),
+            "bridge-gateway-status"
+        );
+        assert_eq!(
+            task_agent_failure_category(
+                b"steward-connections-bridge: bridge MCP-GW response body is unavailable"
+            ),
+            "bridge-gateway-body"
+        );
+        assert_eq!(
+            task_agent_failure_category(
+                b"steward-connections-bridge: bridge request.json input is unreadable"
+            ),
+            "bridge-input",
+            "bridge input failures must remain distinguishable without logging raw stderr"
+        );
         assert_eq!(
             task_agent_failure_category(b"ERROR error sending request for url"),
             "network"

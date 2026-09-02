@@ -1,0 +1,33 @@
+{
+  "schema": "steward.provider-profile-template/v1",
+  "id": "steward-litellm",
+  "metadata": {
+    "displayName": "Steward inference gateway",
+    "description": "Runtime-scoped inference gateway access",
+    "category": "inference"
+  },
+  "capabilities": ["inference.completions"],
+  "network": {
+    "endpointInput": "gateway-origin",
+    "allowedCidrsInput": "service-cidrs",
+    "protocol": "https"
+  },
+  "authorization": {
+    "authName": "api_key",
+    "authDescription": "Runtime-bound inference access",
+    "tokenGrantOriginInput": "runtime-grant-origin",
+    "tokenPath": "/token",
+    "audience": "steward-inference",
+    "jwtSvidAudience": "steward-mint",
+    "scopes": ["inference"],
+    "cacheTtlSeconds": 2
+  },
+  "runtime": {
+    "requiredBinaries": [
+      "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/codex/codex",
+      "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex",
+      "/usr/bin/curl",
+      "/usr/local/bin/curl"
+    ]
+  }
+}

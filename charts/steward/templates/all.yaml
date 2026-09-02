@@ -1,6 +1,10 @@
 {{- $stableBridgeBundleName := printf "steward-stable-bridge-attestation-%s" (.Values.stableBridge.attestationBundle | sha256sum | trunc 12) }}
+{{- $connectionsBridgeBundleName := printf "steward-connections-bridge-attestation-%s" (.Values.connectionsBridge.attestationBundle | sha256sum | trunc 12) }}
 {{- if and .Values.web.enabled .Values.web.ingress.enabled (ne .Values.browserAuth.google.origin (printf "https://%s" .Values.web.host)) }}
 {{- fail "web.host must exactly match the HTTPS browserAuth.google.origin" }}
+{{- end }}
+{{- if and .Values.connectionsBridge.enabled (not (has .Values.connectionsBridge.runtimeNamespace .Values.runtimeNamespaces)) }}
+{{- fail "connectionsBridge.runtimeNamespace must be one of runtimeNamespaces" }}
 {{- end }}
 {{- range $component := list "apiserver" "controller" "mint" }}
 ---
@@ -148,6 +152,16 @@ data:
   bundle.jsonl: |-
 {{ .Values.stableBridge.attestationBundle | indent 4 }}
 {{- end }}
+{{- if .Values.connectionsBridge.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: {{ $connectionsBridgeBundleName }} }
+immutable: true
+data:
+  bundle.jsonl: |-
+{{ .Values.connectionsBridge.attestationBundle | indent 4 }}
+{{- end }}
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -251,16 +265,12 @@ spec:
             - { name: STEWARD_ORGANIZATION_ID, value: {{ .Values.browserAuth.google.organizationId | quote }} }
             - { name: STEWARD_GOOGLE_OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: {{ .Values.browserAuth.google.clientSecret.name }}, key: {{ .Values.browserAuth.google.clientSecret.key }} } } }
 {{- end }}
-{{- if .Values.browserHop1.enabled }}
-            - { name: STEWARD_MCP_GW_ORIGIN, value: {{ .Values.browserHop1.mcpGatewayOrigin | quote }} }
-            - { name: STEWARD_IDENTITY_BROWSER_HOP1_ENDPOINT, value: {{ .Values.browserHop1.identityEndpoint | quote }} }
-            - { name: STEWARD_IDENTITY_BROWSER_HOP1_CA_CERTIFICATE_FILE, value: /run/browser-hop1/identity-ca.crt }
-            - { name: STEWARD_BROWSER_HOP1_ISSUER, value: {{ .Values.browserHop1.issuer | quote }} }
-            - { name: STEWARD_BROWSER_HOP1_ASSERTION_AUDIENCE, value: {{ .Values.browserHop1.assertionAudience | quote }} }
-            - { name: STEWARD_BROWSER_HOP1_KEY_ID, value: {{ .Values.browserHop1.keyId | quote }} }
-            - { name: STEWARD_BROWSER_HOP1_SIGNING_KEY_FILE, value: /run/browser-hop1/signing-key.der }
-            - { name: STEWARD_BROWSER_HOP1_JWKS_FILE, value: /run/browser-hop1/jwks.json }
-            - { name: STEWARD_BROWSER_HOP1_SERVICE_ACCOUNT_TOKEN_FILE, value: /var/run/secrets/steward/browser-hop1/source-token }
+{{- if .Values.connectionsBridge.enabled }}
+            - { name: STEWARD_CONNECTIONS_BRIDGE_IMAGE, value: {{ .Values.connectionsBridge.image | quote }} }
+            - { name: STEWARD_CONNECTIONS_MCP_GW_ORIGIN, value: {{ .Values.connectionsBridge.mcpGatewayOrigin | quote }} }
+            - { name: STEWARD_CONNECTIONS_MCP_GW_VERSION, value: {{ .Values.connectionsBridge.mcpGatewayVersion | quote }} }
+            - { name: STEWARD_CONNECTIONS_RUNTIME_NAMESPACE, value: {{ .Values.connectionsBridge.runtimeNamespace | quote }} }
+            - { name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME, value: {{ .Values.config.controller.openshellRuntimeClassName | quote }} }
 {{- end }}
 {{- if .Values.stableBridge.enabled }}
             - { name: STEWARD_STABLE_BRIDGE_IMAGE, value: {{ .Values.stableBridge.image | quote }} }
@@ -277,26 +287,11 @@ spec:
 {{- if .Values.taskIdentity.enabled }}
             - { name: identity-task, mountPath: /run/identity-task, readOnly: true }
 {{- end }}
-{{- if .Values.browserHop1.enabled }}
-            - { name: browser-hop1, mountPath: /run/browser-hop1, readOnly: true }
-            - { name: browser-hop1-source-credential, mountPath: /var/run/secrets/steward/browser-hop1, readOnly: true }
-{{- end }}
 {{- if .Values.stableBridge.enabled }}
             - { name: stable-bridge-attestation, mountPath: /run/stable-bridge-attestation, readOnly: true }
 {{- end }}
           resources:
 {{ toYaml .Values.resources.apiserver | nindent 12 }}
-{{- if and .Values.browserHop1.enabled .Values.browserHop1.loopbackProxy.enabled }}
-        - name: mcp-loopback
-          image: {{ .Values.browserHop1.loopbackProxy.image }}
-          imagePullPolicy: {{ .Values.images.pullPolicy }}
-          command: ["socat"]
-          args:
-            - {{ printf "TCP-LISTEN:18080,bind=127.0.0.1,reuseaddr,fork" | quote }}
-            - {{ printf "TCP:%s:%d" .Values.browserHop1.loopbackProxy.targetHost (int .Values.browserHop1.loopbackProxy.targetPort) | quote }}
-          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] }, runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532 }
-          resources: {}
-{{- end }}
       volumes:
         - { name: tls, secret: { secretName: steward-apiserver-tls } }
 {{- if .Values.taskIdentity.enabled }}
@@ -304,31 +299,6 @@ spec:
           configMap:
             name: {{ .Values.taskIdentity.publicJwksConfigMap.name }}
             items: [{ key: {{ .Values.taskIdentity.publicJwksConfigMap.key }}, path: jwks.json }]
-{{- end }}
-{{- if .Values.browserHop1.enabled }}
-        - name: browser-hop1
-          projected:
-            sources:
-              - secret:
-                  name: {{ .Values.browserHop1.signingKeySecret.name }}
-                  items: [{ key: {{ .Values.browserHop1.signingKeySecret.key }}, path: signing-key.der }]
-              - configMap:
-                  name: {{ .Values.browserHop1.publicJwksConfigMap.name }}
-                  items: [{ key: {{ .Values.browserHop1.publicJwksConfigMap.key }}, path: jwks.json }]
-{{- if eq .Values.workloadExchangeTrust.kind "Secret" }}
-              - secret:
-{{- else }}
-              - configMap:
-{{- end }}
-                  name: {{ .Values.workloadExchangeTrust.name }}
-                  items: [{ key: {{ .Values.workloadExchangeTrust.caCertificate }}, path: identity-ca.crt }]
-        - name: browser-hop1-source-credential
-          projected:
-            sources:
-              - serviceAccountToken:
-                  audience: {{ .Values.browserHop1.serviceAccountTokenAudience | quote }}
-                  expirationSeconds: 600
-                  path: source-token
 {{- end }}
 {{- if .Values.stableBridge.enabled }}
         - name: stable-bridge-attestation
@@ -373,13 +343,15 @@ spec:
             - { name: STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE, value: /var/run/secrets/steward/workload/source-token }
             - { name: STEWARD_CONTROLLER_USERNAME, value: {{ printf "system:serviceaccount:%s:steward-controller" .Release.Namespace | quote }} }
             - { name: STEWARD_APISERVER_USERNAME, value: {{ printf "system:serviceaccount:%s:steward-apiserver" .Release.Namespace | quote }} }
-{{- if .Values.stableBridge.enabled }}
-            - { name: STEWARD_STABLE_BRIDGE_IMAGE, value: {{ .Values.stableBridge.image | quote }} }
-            - { name: STEWARD_STABLE_BRIDGE_SIGNER_IDENTITY, value: {{ .Values.stableBridge.signerIdentity | quote }} }
-            - { name: STEWARD_STABLE_BRIDGE_SOURCE_REPOSITORY, value: {{ .Values.stableBridge.sourceRepository | quote }} }
-            - { name: STEWARD_STABLE_BRIDGE_SOURCE_COMMIT, value: {{ .Values.stableBridge.sourceCommit | quote }} }
-            - { name: STEWARD_STABLE_BRIDGE_ATTESTATION_BUNDLE_FILE, value: /run/stable-bridge-attestation/bundle.jsonl }
-            - { name: STEWARD_STABLE_BRIDGE_MCP_GW_ORIGIN, value: {{ .Values.stableBridge.mcpGatewayOrigin | quote }} }
+{{- if .Values.connectionsBridge.enabled }}
+            - { name: STEWARD_CONNECTIONS_BRIDGE_IMAGE, value: {{ .Values.connectionsBridge.image | quote }} }
+            - { name: STEWARD_CONNECTIONS_BRIDGE_SIGNER_IDENTITY, value: {{ .Values.connectionsBridge.signerIdentity | quote }} }
+            - { name: STEWARD_CONNECTIONS_BRIDGE_SOURCE_REPOSITORY, value: {{ .Values.connectionsBridge.sourceRepository | quote }} }
+            - { name: STEWARD_CONNECTIONS_BRIDGE_SOURCE_COMMIT, value: {{ .Values.connectionsBridge.sourceCommit | quote }} }
+            - { name: STEWARD_CONNECTIONS_BRIDGE_ATTESTATION_BUNDLE_FILE, value: /run/connections-bridge-attestation/bundle.jsonl }
+            - { name: STEWARD_CONNECTIONS_MCP_GW_ORIGIN, value: {{ .Values.connectionsBridge.mcpGatewayOrigin | quote }} }
+            - { name: STEWARD_CONNECTIONS_MCP_GW_VERSION, value: {{ .Values.connectionsBridge.mcpGatewayVersion | quote }} }
+            - { name: STEWARD_CONNECTIONS_RUNTIME_NAMESPACE, value: {{ .Values.connectionsBridge.runtimeNamespace | quote }} }
 {{- end }}
             - { name: STEWARD_TLS_CERT_DER, value: /run/tls/tls.crt }
             - { name: STEWARD_TLS_KEY_DER, value: /run/tls/tls.key }
@@ -388,8 +360,8 @@ spec:
             - { name: openshell-client, mountPath: /run/openshell, readOnly: true }
             - { name: workload-exchange-ca, mountPath: /run/workload-exchange, readOnly: true }
             - { name: workload-source-credential, mountPath: /var/run/secrets/steward/workload, readOnly: true }
-{{- if .Values.stableBridge.enabled }}
-            - { name: stable-bridge-attestation, mountPath: /run/stable-bridge-attestation, readOnly: true }
+{{- if .Values.connectionsBridge.enabled }}
+            - { name: connections-bridge-attestation, mountPath: /run/connections-bridge-attestation, readOnly: true }
 {{- end }}
           resources:
 {{ toYaml .Values.resources.controller | nindent 12 }}
@@ -419,10 +391,10 @@ spec:
                   audience: apelogic-workload-exchange
                   expirationSeconds: 600
                   path: source-token
-{{- if .Values.stableBridge.enabled }}
-        - name: stable-bridge-attestation
+{{- if .Values.connectionsBridge.enabled }}
+        - name: connections-bridge-attestation
           configMap:
-            name: {{ $stableBridgeBundleName }}
+            name: {{ $connectionsBridgeBundleName }}
             items: [{ key: bundle.jsonl, path: bundle.jsonl }]
 {{- end }}
 ---
@@ -642,7 +614,7 @@ metadata: { name: steward-apiserver-egress }
 spec:
   podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
   policyTypes: [Egress]
-{{- if or .Values.networkPolicy.postgresCidrs .Values.networkPolicy.jiraCidrs .Values.networkPolicy.kubeApiCidrs (and .Values.browserAuth.enabled .Values.networkPolicy.browserAuthEgressCidrs) .Values.browserHop1.enabled }}
+{{- if or .Values.networkPolicy.postgresCidrs .Values.networkPolicy.jiraCidrs .Values.networkPolicy.kubeApiCidrs (and .Values.browserAuth.enabled .Values.networkPolicy.browserAuthEgressCidrs) }}
   egress:
 {{- if .Values.networkPolicy.postgresCidrs }}
     - to:
@@ -664,12 +636,6 @@ spec:
         - ipBlock: { cidr: {{ . }} }
 {{- end }}
       ports: [{ protocol: TCP, port: 443 }]
-{{- if .Values.browserHop1.enabled }}
-    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.mcpGatewayNamespace }} } } }]
-      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.mcpGateway }} }]
-    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.identityExchangeNamespace }} } } }]
-      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.identityExchange }} }]
-{{- end }}
 {{- end }}
 {{- if .Values.networkPolicy.kubeApiCidrs }}
     - to:

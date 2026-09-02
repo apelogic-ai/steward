@@ -26,7 +26,7 @@ export function ConnectionsView() {
 function GithubConnection({ connection, refresh }: Readonly<{ connection: ConnectionStatusResponse; refresh: () => void }>) {
   const session = useSession();
   const [confirmDisconnect, setConfirmDisconnect] = useState(false);
-  const [action, setAction] = useState<"idle" | "working" | MutationFailureState>("idle");
+  const [action, setAction] = useState<"idle" | "working" | "oauth-pending" | MutationFailureState>("idle");
   const status = connection.status;
 
   async function connect() {
@@ -55,6 +55,10 @@ function GithubConnection({ connection, refresh }: Readonly<{ connection: Connec
       refresh();
       return;
     }
+    if (result.response?.status === 409 && (result.error as { error?: string } | undefined)?.error === "oauth_flow_pending") {
+      setAction("oauth-pending");
+      return;
+    }
     setAction(classifyMutationFailure(result.response?.status));
   }
 
@@ -70,13 +74,14 @@ function GithubConnection({ connection, refresh }: Readonly<{ connection: Connec
       ]} />
       {status.phase === "connected" ? (
         <div className="space-y-3 border-t pt-5">
-          <label className="flex min-h-11 items-center gap-3 text-sm"><input checked={confirmDisconnect} onChange={(event) => setConfirmDisconnect(event.target.checked)} type="checkbox" />I understand this revokes the Steward connection.</label>
+          <p className="text-sm text-muted-ink">Disconnecting GitHub affects all present and future agent runtimes using the same Steward identity.</p>
+          <label className="flex min-h-11 items-center gap-3 text-sm"><input checked={confirmDisconnect} onChange={(event) => setConfirmDisconnect(event.target.checked)} type="checkbox" />I understand this revokes the shared Steward connection.</label>
           <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!confirmDisconnect || action === "working"} onClick={() => void disconnect()} type="button">Disconnect GitHub</button>
         </div>
       ) : (
         <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={action === "working" || status.phase === "unavailable"} onClick={() => void connect()} type="button">{status.phase === "reauth_required" ? "Reconnect GitHub" : "Connect GitHub"}</button>
       )}
-      {action !== "idle" && action !== "working" ? <p className="text-sm text-red-800" role="alert">{{ conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "Rust rejected the connection action.", forbidden: "The Rust authorization boundary rejected the connection action.", unavailable: "The authoritative connection service is unavailable.", error: "The server-owned connection action could not be completed." }[action]}</p> : null}
+      {action !== "idle" && action !== "working" ? <p className="text-sm text-red-800" role="alert">{{ "oauth-pending": "Finish or wait for the pending GitHub authorization before disconnecting.", conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "Rust rejected the connection action.", forbidden: "The Rust authorization boundary rejected the connection action.", unavailable: "The authoritative connection service is unavailable.", error: "The server-owned connection action could not be completed." }[action]}</p> : null}
     </article>
   );
 }

@@ -5,18 +5,111 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
+use steward_admission::internal_authorities::steward_connections_v1;
 use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
+use steward_apiserver::governed_connections::{
+    CONNECTIONS_AUTHORITY_DIGEST, CONNECTIONS_AUTHORITY_VERSION, CONNECTIONS_SERVICE,
+    ConnectionExecutionBindings, ConnectionOperationKind as PlannedConnectionOperationKind,
+    plan_connection_operation,
+};
 use steward_store::{
     AgentRunQuery, AgentRunTimelineKind, AgentRunTimelineProvenance, ApproveAdmission,
-    BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, ParkRejection,
-    PgStore, StoreError, TaskReservationRequest,
+    BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
+    ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase, ConnectionOperationKind,
+    ConnectionOperationReservation, ConnectionOperationReservationRequest,
+    ConnectionOperationRetention, ConnectionOperationState, ParkRejection, PgStore, StoreError,
+    TaskReservationRequest,
 };
 use steward_types::{
-    AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding, Duration, Email, ModelRef,
-    OrganizationId, OrganizationIdentity, OrganizationIdentityMigration,
+    AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding, CanonicalUserId, Duration,
+    Email, ModelRef, OrganizationId, OrganizationIdentity, OrganizationIdentityMigration,
     OrganizationIdentityPolicy, Principal, RunnerRequirements, RuntimeOwnership, SpendSummary,
     TaskPhase,
 };
+
+fn governed_connection_bindings() -> ConnectionExecutionBindings {
+    ConnectionExecutionBindings {
+        bridge_image_digest:
+            "ghcr.io/example-org/steward-connections-bridge@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+        mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
+        mcp_gw_version: "0.3.2".to_owned(),
+        namespace: "steward-test".to_owned(),
+        runtime_class: "kata-qemu".to_owned(),
+    }
+}
+
+fn connection_operation_retention() -> ConnectionOperationRetention {
+    ConnectionOperationRetention {
+        cache_ttl_seconds: 5,
+        result_ttl_seconds: 30,
+        oauth_lifetime_seconds: 630,
+    }
+}
+
+async fn reserve_governed_connection(
+    store: &PgStore,
+    user_id: &CanonicalUserId,
+    email: &Email,
+    operation_kind: ConnectionOperationKind,
+    allow_status_cache: bool,
+    idempotency_identity: &str,
+) -> Result<ConnectionOperationReservation, StoreError> {
+    let planned_kind = match operation_kind {
+        ConnectionOperationKind::Status => PlannedConnectionOperationKind::Status,
+        ConnectionOperationKind::Start => PlannedConnectionOperationKind::Start,
+        ConnectionOperationKind::Disconnect => PlannedConnectionOperationKind::Disconnect,
+    };
+    let plan =
+        plan_connection_operation(user_id, email, planned_kind, governed_connection_bindings())
+            .map_err(|_| StoreError::InvalidConnectionOperation)?;
+    let operation_id = sqlx::types::Uuid::new_v4();
+    let runtime_name = format!("conn-{}", operation_id.simple());
+    let binding_snapshot = ConnectionExecutionBindingSnapshot {
+        bridge_image_digest: plan.bindings.bridge_image_digest.clone(),
+        mcp_gw_origin: plan.bindings.mcp_gw_origin.clone(),
+        mcp_gw_version: plan.bindings.mcp_gw_version.clone(),
+        namespace: plan.bindings.namespace.clone(),
+        runtime_class: plan.bindings.runtime_class.clone(),
+    };
+    let task = TaskReservationRequest {
+        idempotency_key: idempotency_identity,
+        submitter_service: CONNECTIONS_SERVICE,
+        acting_user: Some(email.as_str()),
+        acting_user_id: Some(user_id.as_str()),
+        owner: email.as_str(),
+        owner_user_id: user_id.as_str(),
+        workflow: "internal:steward-connections/v1",
+        workflow_name: None,
+        workflow_version: None,
+        workflow_digest: None,
+        user_envelope_instance_id: None,
+        user_envelope_revision: None,
+        user_envelope_digest: None,
+        coding_agent_runtime: "connections-bridge",
+        runtime_namespace: &binding_snapshot.namespace,
+        runtime_name: &runtime_name,
+        runtime_ownership: RuntimeOwnership::Provisioned,
+        runtime_spec: &plan.spec,
+        agent_command: &plan.command,
+        envelope_revision: CONNECTIONS_AUTHORITY_VERSION,
+    };
+    store
+        .reserve_connection_operation(&ConnectionOperationReservationRequest {
+            operation_id,
+            operation_kind,
+            authority_id: CONNECTIONS_SERVICE,
+            authority_version: CONNECTIONS_AUTHORITY_VERSION,
+            authority_digest: CONNECTIONS_AUTHORITY_DIGEST,
+            bindings: &binding_snapshot,
+            idempotency_identity,
+            response_deadline_seconds: steward_connections_v1::RESPONSE_DEADLINE_SECONDS,
+            allow_status_cache,
+            input_archive: &[1],
+            task,
+        })
+        .await
+}
 
 fn google_identity(
     subject: impl AsRef<str>,
@@ -2308,5 +2401,369 @@ async fn s4_pending_create_provenance_survives_every_authority_transition()
         empty_marker.is_err(),
         "the migration must reject empty pending-marker provenance"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn governed_connection_operations_are_serialized_restart_safe_and_hidden_from_agent_runs()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other(
+            "STEWARD_TEST_DATABASE_URL is required for the connection-operation Postgres test",
+        )
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool.clone());
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let email = Email::parse(format!("connections-{suffix}@example.com"))?;
+    let identity = google_identity(format!("connections-subject-{suffix}"), email.as_str())?;
+    let principal = store
+        .register_canonical_identity(&identity, "identity-admin")
+        .await?;
+
+    let status = reserve_governed_connection(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Status,
+        true,
+        &format!("status-{suffix}"),
+    )
+    .await?;
+    assert!(status.inserted);
+    let bridge_runtime_uid = format!("bridge-runtime-{suffix}");
+    store
+        .bind_task_runtime(
+            status.record.task_uid,
+            &bridge_runtime_uid,
+            TaskPhase::Submitted,
+        )
+        .await?;
+    let by_runtime = store
+        .connection_operation_for_runtime(&bridge_runtime_uid)
+        .await?
+        .ok_or_else(|| {
+            io::Error::other("exact bridge runtime UID did not resolve its internal authority")
+        })?;
+    assert_eq!(by_runtime.operation_id, status.record.operation_id);
+    assert_eq!(
+        by_runtime.runtime_uid.as_deref(),
+        Some(bridge_runtime_uid.as_str())
+    );
+    assert!(
+        store
+            .connection_operation_for_runtime(&format!("unrelated-{suffix}"))
+            .await?
+            .is_none(),
+        "an unrelated or long-running runtime UID must not resolve bridge authority"
+    );
+    let joined_status = reserve_governed_connection(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Status,
+        true,
+        &format!("status-duplicate-{suffix}"),
+    )
+    .await?;
+    assert!(!joined_status.inserted);
+    assert_eq!(
+        joined_status.record.operation_id,
+        status.record.operation_id
+    );
+
+    let disconnect = reserve_governed_connection(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Disconnect,
+        true,
+        &format!("disconnect-{suffix}"),
+    )
+    .await?;
+    assert!(
+        disconnect.inserted,
+        "a mutation must preempt an in-flight status read"
+    );
+    assert_eq!(
+        store
+            .connection_operation(status.record.operation_id, &principal.user_id)
+            .await?
+            .ok_or_else(|| io::Error::other("preempted status operation disappeared"))?
+            .operation_state,
+        ConnectionOperationState::Failed,
+        "mutation precedence must durably stop the in-flight status operation"
+    );
+    assert_eq!(
+        reserve_governed_connection(
+            &store,
+            &principal.user_id,
+            &email,
+            ConnectionOperationKind::Status,
+            false,
+            &format!("status-during-disconnect-{suffix}"),
+        )
+        .await,
+        Err(StoreError::ConnectionOperationConflict),
+        "polling must not create a second runtime while a mutation is active"
+    );
+    store
+        .complete_connection_operation(
+            disconnect.record.operation_id,
+            &serde_json::json!({"disconnected": true}),
+            None,
+            None,
+            connection_operation_retention(),
+        )
+        .await?;
+    assert_eq!(
+        store
+            .fail_connection_operation(disconnect.record.operation_id, "late_failure")
+            .await,
+        Err(StoreError::InvalidConnectionOperation),
+        "a stale reconciler must never overwrite an atomically persisted success"
+    );
+    assert_eq!(
+        store
+            .connection_operation(disconnect.record.operation_id, &principal.user_id)
+            .await?
+            .ok_or_else(|| io::Error::other("completed disconnect disappeared"))?
+            .operation_state,
+        ConnectionOperationState::Succeeded
+    );
+    sqlx::query(
+        "UPDATE connection_operations SET updated_at = now() - interval '151 seconds' \
+         WHERE operation_id = $1",
+    )
+    .bind(disconnect.record.operation_id)
+    .execute(&pool)
+    .await?;
+    assert!(
+        store
+            .mark_stalled_connection_cleanup(disconnect.record.operation_id, 150)
+            .await?,
+        "teardown beyond the fixed grace period must create a durable finding"
+    );
+    let stalled = store
+        .connection_operation(disconnect.record.operation_id, &principal.user_id)
+        .await?
+        .ok_or_else(|| io::Error::other("stalled cleanup audit record disappeared"))?;
+    assert_eq!(stalled.cleanup_state, "stalled");
+    assert_eq!(stalled.cleanup_finding.as_deref(), Some("teardown_stalled"));
+
+    assert!(
+        store.agent_run(disconnect.record.task_uid).await?.is_none(),
+        "connection operations must not appear in agent-run detail"
+    );
+    assert!(
+        store
+            .agent_run_timeline(disconnect.record.task_uid)
+            .await?
+            .is_none(),
+        "connection operations must not appear in agent-run timelines"
+    );
+    assert!(
+        store
+            .task_for_submitter(
+                disconnect.record.task_uid,
+                CONNECTIONS_SERVICE,
+                principal.user_id.as_str(),
+            )
+            .await?
+            .is_none(),
+        "connection operations must not appear in generic task APIs"
+    );
+
+    let start = reserve_governed_connection(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Start,
+        true,
+        &format!("start-{suffix}"),
+    )
+    .await?;
+    let authorization_url =
+        format!("https://github.example.test/login/oauth/authorize?state={suffix}");
+    store
+        .complete_connection_operation(
+            start.record.operation_id,
+            &serde_json::json!({"authorizationUrl": authorization_url}),
+            Some(&authorization_url),
+            Some(&format!("sha256:{}", "a".repeat(64))),
+            connection_operation_retention(),
+        )
+        .await?;
+    let reused_start = reserve_governed_connection(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Start,
+        true,
+        &format!("start-duplicate-{suffix}"),
+    )
+    .await?;
+    assert!(!reused_start.inserted);
+    assert_eq!(reused_start.record.operation_id, start.record.operation_id);
+    assert_eq!(
+        reused_start.record.oauth_phase,
+        ConnectionOAuthPhase::Pending
+    );
+    assert_eq!(
+        reserve_governed_connection(
+            &store,
+            &principal.user_id,
+            &email,
+            ConnectionOperationKind::Disconnect,
+            true,
+            &format!("disconnect-pending-{suffix}"),
+        )
+        .await,
+        Err(StoreError::ConnectionOAuthFlowPending)
+    );
+
+    let pending_disconnected_status = reserve_governed_connection(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Status,
+        false,
+        &format!("pending-disconnected-status-{suffix}"),
+    )
+    .await?;
+    assert!(pending_disconnected_status.record.uncached_status);
+    store
+        .complete_connection_operation(
+            pending_disconnected_status.record.operation_id,
+            &serde_json::json!({"connected": false}),
+            None,
+            None,
+            connection_operation_retention(),
+        )
+        .await?;
+    let post_callback_status = reserve_governed_connection(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Status,
+        true,
+        &format!("post-callback-status-{suffix}"),
+    )
+    .await?;
+    assert!(
+        post_callback_status.inserted,
+        "a disconnected cache cannot hide an OAuth callback while its flow remains pending"
+    );
+    assert_ne!(
+        post_callback_status.record.operation_id,
+        pending_disconnected_status.record.operation_id
+    );
+    store
+        .complete_connection_operation(
+            post_callback_status.record.operation_id,
+            &serde_json::json!({
+                "connected": true,
+                "email": email.as_str(),
+                "scopesRequired": [],
+                "scopesGranted": [],
+                "missingScopes": []
+            }),
+            None,
+            None,
+            connection_operation_retention(),
+        )
+        .await?;
+    store
+        .complete_pending_connection_oauth_flow(&principal.user_id)
+        .await?;
+    let post_callback_disconnect = reserve_governed_connection(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Disconnect,
+        true,
+        &format!("disconnect-after-callback-{suffix}"),
+    )
+    .await?;
+    assert!(post_callback_disconnect.inserted);
+    let redacted_start = store
+        .connection_operation(start.record.operation_id, &principal.user_id)
+        .await?
+        .ok_or_else(|| io::Error::other("start audit record disappeared"))?;
+    assert_eq!(redacted_start.oauth_phase, ConnectionOAuthPhase::Completed);
+    assert_eq!(redacted_start.authorization_url, None);
+    store
+        .complete_connection_operation(
+            post_callback_disconnect.record.operation_id,
+            &serde_json::json!({"disconnected": true}),
+            None,
+            None,
+            connection_operation_retention(),
+        )
+        .await?;
+
+    let expiring_start = reserve_governed_connection(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Start,
+        true,
+        &format!("expiring-start-{suffix}"),
+    )
+    .await?;
+    store
+        .complete_connection_operation(
+            expiring_start.record.operation_id,
+            &serde_json::json!({"authorizationUrl": authorization_url}),
+            Some(&authorization_url),
+            Some(&format!("sha256:{}", "b".repeat(64))),
+            connection_operation_retention(),
+        )
+        .await?;
+    let lifetime_seconds: f64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM (flow_expires_at - flow_created_at))::float8 \
+         FROM connection_operations WHERE operation_id = $1",
+    )
+    .bind(expiring_start.record.operation_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        lifetime_seconds, 630.0,
+        "the 600-second upstream lifetime must retain the 30-second conservative skew buffer"
+    );
+    sqlx::query(
+        "UPDATE connection_operations SET flow_expires_at = now() - interval '1 second' \
+         WHERE operation_id = $1",
+    )
+    .bind(expiring_start.record.operation_id)
+    .execute(&pool)
+    .await?;
+    let replacement_start = reserve_governed_connection(
+        &store,
+        &principal.user_id,
+        &email,
+        ConnectionOperationKind::Start,
+        true,
+        &format!("replacement-start-{suffix}"),
+    )
+    .await?;
+    assert!(replacement_start.inserted);
+    assert_ne!(
+        replacement_start.record.operation_id,
+        expiring_start.record.operation_id
+    );
+    let expired_start = store
+        .connection_operation(expiring_start.record.operation_id, &principal.user_id)
+        .await?
+        .ok_or_else(|| io::Error::other("expired start audit record disappeared"))?;
+    assert_eq!(expired_start.oauth_phase, ConnectionOAuthPhase::Expired);
+    assert_eq!(expired_start.authorization_url, None);
     Ok(())
 }
