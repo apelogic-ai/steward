@@ -1461,16 +1461,8 @@ mod tests {
         fn start<'a>(
             &'a self,
             _session: &'a ConnectionSession<()>,
-        ) -> BoxFuture<'a, Result<crate::connections::AuthorizationUrl, ConnectionBrokerError>>
+        ) -> BoxFuture<'a, Result<crate::connections::StartedConnection, ConnectionBrokerError>>
         {
-            Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
-        }
-
-        fn complete<'a>(
-            &'a self,
-            _session: &'a ConnectionSession<()>,
-            _continuation: &'a crate::connections::ConnectionContinuation,
-        ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
             Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
         }
 

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use steward_adapter_mcp_gw::{GithubBridgeOperation, GithubBridgeRequest, GithubMcpGateway};
+use steward_ports::PortError;
 
 const REQUEST_FILE: &str = "request.json";
 const RESPONSE_FILE: &str = "response.json";
@@ -52,6 +53,42 @@ fn response_path() -> Result<PathBuf, String> {
     Ok(output_directory.join(RESPONSE_FILE))
 }
 
+fn gateway_failure(error: &PortError) -> &'static str {
+    match error {
+        PortError::Failed { reason } if reason == "MCP-GW rejected runtime authentication" => {
+            "bridge MCP-GW rejected runtime authentication"
+        }
+        PortError::Failed { reason } if reason == "MCP-GW rejected runtime authorization" => {
+            "bridge MCP-GW rejected runtime authorization"
+        }
+        PortError::Failed { reason }
+            if reason == "MCP-GW unavailable while attempting to call MCP-GW" =>
+        {
+            "bridge MCP-GW transport is unavailable"
+        }
+        PortError::Failed { reason }
+            if reason == "MCP-GW unavailable while attempting to read MCP-GW response"
+                || reason
+                    == "MCP-GW unavailable while attempting to read bounded MCP-GW response" =>
+        {
+            "bridge MCP-GW response body is unavailable"
+        }
+        PortError::Failed { reason }
+            if matches!(
+                reason.as_str(),
+                "MCP-GW unavailable while attempting to read GitHub connection status"
+                    | "MCP-GW unavailable while attempting to start GitHub connection"
+                    | "MCP-GW unavailable while attempting to disconnect GitHub connection"
+            ) =>
+        {
+            "bridge MCP-GW returned an unexpected status"
+        }
+        PortError::Rejected { .. } => "bridge MCP-GW response violated its bounded contract",
+        PortError::Failed { .. } | PortError::Unsupported { .. } => "bridge MCP-GW is unavailable",
+        _ => "bridge MCP-GW is unavailable",
+    }
+}
+
 async fn execute(arguments: &[String]) -> Result<(), String> {
     let origin = required_environment("STEWARD_MCP_GW_ORIGIN")?;
     execute_at(
@@ -77,7 +114,7 @@ async fn execute_at(
     let response = gateway
         .execute(invocation.operation, request)
         .await
-        .map_err(|_| "bridge operation did not receive a valid MCP-GW response".to_owned())?;
+        .map_err(|error| gateway_failure(&error).to_owned())?;
     let response = serde_json::to_vec(&response)
         .map_err(|_| "bridge response could not be serialized".to_owned())?;
     fs::write(response_path, response)
@@ -95,13 +132,16 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::{ErrorKind, Read, Write};
     use std::net::TcpListener;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::thread;
+    use std::time::Duration;
 
-    use super::{GithubBridgeOperation, Invocation, execute_at, parse_invocation};
+    use super::{GithubBridgeOperation, Invocation, execute_at, gateway_failure, parse_invocation};
+    use steward_ports::PortError;
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -228,5 +268,104 @@ mod tests {
         );
         fs::remove_dir_all(directory).map_err(|error| format!("remove bridge fixture: {error}"))?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_authentication_failure_is_reported_as_only_a_safe_category()
+    -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind MCP-GW fixture: {error}"))?;
+        let origin = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .map_err(|error| format!("read MCP-GW fixture address: {error}"))?
+        );
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("make MCP-GW fixture nonblocking: {error}"))?;
+        let finished = Arc::new(AtomicBool::new(false));
+        let server_finished = Arc::clone(&finished);
+        let server = thread::spawn(move || -> Result<(), String> {
+            while !server_finished.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).map_err(|error| {
+                            format!("make MCP-GW fixture request blocking: {error}")
+                        })?;
+                        let mut bytes = [0_u8; 2048];
+                        stream
+                            .read(&mut bytes)
+                            .map_err(|error| format!("read MCP-GW fixture request: {error}"))?;
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                            )
+                            .map_err(|error| {
+                                format!("write MCP-GW fixture response: {error}")
+                            })?;
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => {
+                        return Err(format!("accept MCP-GW fixture request: {error}"));
+                    }
+                }
+            }
+            Ok(())
+        });
+        let directory = test_directory()?;
+        let input = directory.join("request.json");
+        let output = directory.join("response.json");
+        fs::write(&input, b"{}").map_err(|error| format!("write bridge request: {error}"))?;
+        let arguments = vec![
+            "steward-connections-bridge".to_owned(),
+            "--operation".to_owned(),
+            "github.status".to_owned(),
+            "--input".to_owned(),
+            "request.json".to_owned(),
+        ];
+
+        let error = match execute_at(&arguments, input, origin, output).await {
+            Err(error) => error,
+            Ok(()) => {
+                return Err("the bridge must reject runtime authentication failure".to_owned());
+            }
+        };
+
+        finished.store(true, Ordering::Release);
+        server
+            .join()
+            .map_err(|_| "MCP-GW fixture thread panicked".to_owned())??;
+        assert_eq!(
+            error, "bridge MCP-GW rejected runtime authentication",
+            "bridge diagnostics must preserve only the fixed non-secret failure category"
+        );
+        fs::remove_dir_all(directory).map_err(|error| format!("remove bridge fixture: {error}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn gateway_failures_preserve_only_actionable_non_secret_categories() {
+        assert_eq!(
+            gateway_failure(&PortError::Failed {
+                reason: "MCP-GW unavailable while attempting to call MCP-GW".to_owned(),
+            }),
+            "bridge MCP-GW transport is unavailable"
+        );
+        assert_eq!(
+            gateway_failure(&PortError::Failed {
+                reason: "MCP-GW unavailable while attempting to read GitHub connection status"
+                    .to_owned(),
+            }),
+            "bridge MCP-GW returned an unexpected status"
+        );
+        assert_eq!(
+            gateway_failure(&PortError::Failed {
+                reason: "MCP-GW unavailable while attempting to read MCP-GW response".to_owned(),
+            }),
+            "bridge MCP-GW response body is unavailable"
+        );
     }
 }

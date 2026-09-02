@@ -11,9 +11,8 @@ use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{
     ConfiguredTaskIdentityResolver, IdentityOrKubernetesTokenAuthenticator, KubeRuntimeRepository,
     KubernetesTokenAuthenticator, KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog,
-    TaskApiConfig, agent_runs_ui, browser_admin, browser_auth, browser_hop1_attestation,
-    connections, google_oidc, mcp_gw_connections, router, stable_runtime_bridge, task_router,
-    user_envelopes, workflows,
+    TaskApiConfig, agent_runs_ui, browser_admin, browser_auth, connections, google_oidc,
+    governed_connections, router, stable_runtime_bridge, task_router, user_envelopes, workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
@@ -43,6 +42,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client = kube::Client::try_default().await?;
     let store = PgStore::connect(&required("STEWARD_DATABASE_URL")?).await?;
     store.migrate().await?;
+    tokio::spawn(
+        steward_apiserver::governed_connections::ConnectionOperationReconciler::new(store.clone())
+            .run(),
+    );
     let decisions = JiraAdapter::new(
         JiraConfig {
             base_url: required("STEWARD_JIRA_BASE_URL")?,
@@ -188,7 +191,7 @@ fn browser_application_router(
         Arc::new(browser_auth::PgBrowserIdentityResolver::new(store.clone())),
     )
     .map_err(io::Error::other)?;
-    let connections = browser_hop1_connections_configuration(&origin)?;
+    let connections = governed_connections_configuration(&origin, store.clone())?;
     let app = browser_auth::browser_auth_router(auth.clone())
         .merge(user_envelopes::protected_router(
             user_envelopes::PgEnvelopeRequestBroker::new(store.clone()),
@@ -218,121 +221,49 @@ fn browser_application_router(
     Ok(Some(app))
 }
 
-type BrowserHop1ConnectionsBroker = mcp_gw_connections::McpGwConnectionsBroker<
-    browser_auth::BrowserSessionBinding,
-    browser_hop1_attestation::BrowserHop1AttestationIssuer<
-        browser_hop1_attestation::IdentityBrowserHop1Client,
-    >,
->;
+type GovernedConnectionsBroker =
+    governed_connections::GovernedConnectionsBroker<browser_auth::BrowserSessionBinding>;
 
-fn browser_hop1_connections_configuration(
+fn governed_connections_configuration(
     browser_origin: &str,
-) -> Result<Option<BrowserHop1ConnectionsBroker>, io::Error> {
-    let values = BrowserHop1Environment::from_process()?;
-    let Some(values) = values else {
+    store: PgStore,
+) -> Result<Option<GovernedConnectionsBroker>, io::Error> {
+    let values = [
+        env::var("STEWARD_CONNECTIONS_BRIDGE_IMAGE").ok(),
+        env::var("STEWARD_CONNECTIONS_MCP_GW_ORIGIN").ok(),
+        env::var("STEWARD_CONNECTIONS_MCP_GW_VERSION").ok(),
+        env::var("STEWARD_CONNECTIONS_RUNTIME_NAMESPACE").ok(),
+        env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME").ok(),
+    ];
+    if values.iter().all(Option::is_none) {
         return Ok(None);
+    }
+    let [
+        bridge_image_digest,
+        mcp_gw_origin,
+        mcp_gw_version,
+        namespace,
+        runtime_class,
+    ] = values;
+    let required = |value: Option<String>| {
+        value
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| io::Error::other("governed Connections configuration must be complete"))
     };
-    let signing = browser_hop1_attestation::BrowserHop1AttestationConfig::from_files(
-        values.issuer,
-        values.assertion_audience,
-        values.key_id,
-        &values.signing_key_file,
-        &values.public_jwks_file,
+    let config = governed_connections::GovernedConnectionsConfig::new(
+        governed_connections::ConnectionExecutionBindings {
+            bridge_image_digest: required(bridge_image_digest)?,
+            mcp_gw_origin: required(mcp_gw_origin)?,
+            mcp_gw_version: required(mcp_gw_version)?,
+            namespace: required(namespace)?,
+            runtime_class: required(runtime_class)?,
+        },
+        browser_origin,
     )
-    .map_err(|_| io::Error::other("browser HOP-1 signer configuration is invalid"))?;
-    let service_account_token = browser_hop1_attestation::ProjectedServiceAccountTokenFile::new(
-        values.service_account_token_file,
-    )
-    .map_err(|_| io::Error::other("browser HOP-1 workload token configuration is invalid"))?;
-    let endpoint =
-        browser_hop1_attestation::IdentityBrowserHop1Endpoint::new(values.identity_endpoint)
-            .map_err(|_| io::Error::other("browser HOP-1 Identity endpoint is invalid"))?;
-    let identity_ca_certificate_pem = fs::read(values.identity_ca_certificate_file)
-        .map_err(|_| io::Error::other("read browser HOP-1 Identity CA certificate"))?;
-    let client = browser_hop1_attestation::IdentityBrowserHop1Client::new(
-        endpoint,
-        identity_ca_certificate_pem,
-    )
-    .map_err(|_| io::Error::other("browser HOP-1 Identity client is unavailable"))?;
-    let issuer = browser_hop1_attestation::BrowserHop1AttestationIssuer::new(
-        signing,
-        service_account_token,
-        client,
-    );
-    let mcp_gateway_origin = values.mcp_gateway_origin;
-    let config = mcp_gw_connections::McpGwConnectionsConfig::new(
-        mcp_gateway_origin,
-        browser_origin.to_owned(),
-    )
-    .map_err(|_| io::Error::other("browser MCP-GW connection origin is invalid"))?;
-    mcp_gw_connections::McpGwConnectionsBroker::new(config, issuer)
-        .map(Some)
-        .map_err(io::Error::other)
-}
-
-struct BrowserHop1Environment {
-    mcp_gateway_origin: String,
-    identity_endpoint: String,
-    identity_ca_certificate_file: std::path::PathBuf,
-    issuer: String,
-    assertion_audience: String,
-    key_id: String,
-    signing_key_file: std::path::PathBuf,
-    public_jwks_file: std::path::PathBuf,
-    service_account_token_file: std::path::PathBuf,
-}
-
-impl BrowserHop1Environment {
-    fn from_process() -> Result<Option<Self>, io::Error> {
-        Self::from_values([
-            env::var("STEWARD_MCP_GW_ORIGIN").ok(),
-            env::var("STEWARD_IDENTITY_BROWSER_HOP1_ENDPOINT").ok(),
-            env::var("STEWARD_IDENTITY_BROWSER_HOP1_CA_CERTIFICATE_FILE").ok(),
-            env::var("STEWARD_BROWSER_HOP1_ISSUER").ok(),
-            env::var("STEWARD_BROWSER_HOP1_ASSERTION_AUDIENCE").ok(),
-            env::var("STEWARD_BROWSER_HOP1_KEY_ID").ok(),
-            env::var("STEWARD_BROWSER_HOP1_SIGNING_KEY_FILE").ok(),
-            env::var("STEWARD_BROWSER_HOP1_JWKS_FILE").ok(),
-            env::var("STEWARD_BROWSER_HOP1_SERVICE_ACCOUNT_TOKEN_FILE").ok(),
-        ])
-    }
-
-    fn from_values(values: [Option<String>; 9]) -> Result<Option<Self>, io::Error> {
-        if values.iter().all(Option::is_none) {
-            return Ok(None);
-        }
-        let [
-            mcp_gateway_origin,
-            identity_endpoint,
-            identity_ca_certificate_file,
-            issuer,
-            assertion_audience,
-            key_id,
-            signing_key_file,
-            public_jwks_file,
-            service_account_token_file,
-        ] = values;
-        let required = |value: Option<String>| {
-            value
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| io::Error::other("browser HOP-1 configuration must be complete"))
-        };
-        Ok(Some(Self {
-            mcp_gateway_origin: required(mcp_gateway_origin)?,
-            identity_endpoint: required(identity_endpoint)?,
-            identity_ca_certificate_file: std::path::PathBuf::from(required(
-                identity_ca_certificate_file,
-            )?),
-            issuer: required(issuer)?,
-            assertion_audience: required(assertion_audience)?,
-            key_id: required(key_id)?,
-            signing_key_file: std::path::PathBuf::from(required(signing_key_file)?),
-            public_jwks_file: std::path::PathBuf::from(required(public_jwks_file)?),
-            service_account_token_file: std::path::PathBuf::from(required(
-                service_account_token_file,
-            )?),
-        }))
-    }
+    .map_err(|_| io::Error::other("governed Connections configuration is invalid"))?;
+    Ok(Some(governed_connections::GovernedConnectionsBroker::new(
+        store, config,
+    )))
 }
 
 fn stable_bridge_configuration()
@@ -593,43 +524,36 @@ mod tests {
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
     use super::{
-        BrowserHop1Environment, KubernetesTokenReviewAudience, TlsListener,
-        bootstrap_rbac_arguments, decode_tls_material, install_rustls_crypto_provider,
-        kubernetes_token_review_audience, stable_bridge_configuration_from_values,
+        KubernetesTokenReviewAudience, TlsListener, bootstrap_rbac_arguments, decode_tls_material,
+        install_rustls_crypto_provider, kubernetes_token_review_audience,
+        stable_bridge_configuration_from_values,
     };
 
     #[test]
-    fn browser_hop1_connections_configuration_is_all_or_nothing() -> Result<(), String> {
-        let mut partial = std::array::from_fn(|_| None);
-        partial[0] = Some("https://mcp-gw.example.test".to_owned());
-        assert!(BrowserHop1Environment::from_values(partial).is_err());
-        assert!(
-            BrowserHop1Environment::from_values(std::array::from_fn(|_| None))
-                .map_err(|error| error.to_string())?
-                .is_none()
+    fn governed_connections_configuration_rejects_unpinned_or_partial_bindings()
+    -> Result<(), String> {
+        let valid = steward_apiserver::governed_connections::GovernedConnectionsConfig::new(
+            steward_apiserver::governed_connections::ConnectionExecutionBindings {
+                bridge_image_digest: "registry.example.test/bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
+                mcp_gw_version: "0.3.2".to_owned(),
+                namespace: "steward-test".to_owned(),
+                runtime_class: "kata-qemu".to_owned(),
+            },
+            "https://steward.example.test/",
         );
-        let configured = BrowserHop1Environment::from_values([
-            Some("https://mcp-gw.example.test".to_owned()),
-            Some("https://identity.example.test/v1/browser-hop1/exchange".to_owned()),
-            Some("/run/browser-hop1/identity-ca.crt".to_owned()),
-            Some("https://steward.example.test".to_owned()),
-            Some("identity-browser-hop1".to_owned()),
-            Some("steward-browser-hop1-current".to_owned()),
-            Some("/run/steward-browser-hop1/signing-key.der".to_owned()),
-            Some("/run/steward-browser-hop1/jwks.json".to_owned()),
-            Some("/var/run/secrets/tokens/identity-exchange".to_owned()),
-        ])
-        .map_err(|error| error.to_string())?
-        .ok_or("complete browser HOP-1 configuration was disabled")?;
-        assert_eq!(configured.assertion_audience, "identity-browser-hop1");
-        assert_eq!(
-            configured.identity_ca_certificate_file.to_string_lossy(),
-            "/run/browser-hop1/identity-ca.crt"
+        assert!(valid.is_ok());
+        let invalid = steward_apiserver::governed_connections::GovernedConnectionsConfig::new(
+            steward_apiserver::governed_connections::ConnectionExecutionBindings {
+                bridge_image_digest: "registry.example.test/bridge:latest".to_owned(),
+                mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
+                mcp_gw_version: "0.3.1".to_owned(),
+                namespace: "steward-test".to_owned(),
+                runtime_class: "kata-qemu".to_owned(),
+            },
+            "https://steward.example.test/",
         );
-        assert_eq!(
-            configured.signing_key_file.to_string_lossy(),
-            "/run/steward-browser-hop1/signing-key.der"
-        );
+        assert!(invalid.is_err());
         Ok(())
     }
 

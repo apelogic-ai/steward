@@ -1,0 +1,386 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: steward-connections
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-b
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: steward-mint
+  namespace: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: steward-connections-e2e-mint-runtime
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+rules:
+  - apiGroups: ["agents.apelogic.ai"]
+    resources: ["agentruntimes"]
+    verbs: ["get", "list"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: steward-connections-e2e-mint-runtime
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: steward-connections-e2e-mint-runtime
+subjects:
+  - kind: ServiceAccount
+    name: steward-mint
+    namespace: steward-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: steward-connections-e2e-mint-credentials
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: steward-connections-e2e-mint-credentials
+  namespace: steward-connections
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: steward-connections-e2e-mint-credentials
+subjects:
+  - kind: ServiceAccount
+    name: steward-mint
+    namespace: steward-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: steward-connections-e2e-mint-credentials
+  namespace: team-a
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: steward-connections-e2e-mint-credentials
+subjects:
+  - kind: ServiceAccount
+    name: steward-mint
+    namespace: steward-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: steward-connections-e2e-mint-credentials
+  namespace: team-b
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: steward-connections-e2e-mint-credentials
+subjects:
+  - kind: ServiceAccount
+    name: steward-mint
+    namespace: steward-system
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: steward-connections-e2e-mint
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+spec:
+  spiffeIDTemplate: spiffe://openshell.local/steward/mint
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: steward-system
+  podSelector:
+    matchLabels:
+      app: steward-connections-e2e-mint
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: steward-connections-e2e-postgres }
+  template:
+    metadata:
+      labels:
+        app: steward-connections-e2e-postgres
+        steward.test/run-id: RUN_ID_PLACEHOLDER
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+          env:
+            - { name: POSTGRES_DB, value: steward }
+            - { name: POSTGRES_HOST_AUTH_METHOD, value: trust }
+            - { name: POSTGRES_USER, value: steward }
+          ports: [{ name: postgres, containerPort: 5432 }]
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "steward", "-d", "steward"] }
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+      volumes: [{ name: data, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+spec:
+  selector: { app: steward-connections-e2e-postgres }
+  ports: [{ name: postgres, port: 5432, targetPort: postgres }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: steward-opa
+  namespace: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: steward-connections-e2e-opa }
+  template:
+    metadata:
+      labels:
+        app: steward-connections-e2e-opa
+        steward.test/run-id: RUN_ID_PLACEHOLDER
+    spec:
+      containers:
+        - name: opa
+          image: openpolicyagent/opa:1.18.2-static@sha256:57f7d06808fff6de3ea1d698e6430990973ca1370be0e54975f0083d615521da
+          args: ["run", "--server", "--addr=0.0.0.0:8181", "/policy/mcp_tools.rego"]
+          ports: [{ name: http, containerPort: 8181 }]
+          readinessProbe: { httpGet: { path: /health, port: http } }
+          volumeMounts:
+            - { name: policy, mountPath: /policy/mcp_tools.rego, subPath: mcp_tools.rego, readOnly: true }
+      volumes:
+        - name: policy
+          configMap: { name: steward-connections-e2e-fixtures }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: steward-opa
+  namespace: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+spec:
+  selector: { app: steward-connections-e2e-opa }
+  ports: [{ name: http, port: 8181, targetPort: http }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: provider-fixture
+  namespace: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: steward-connections-e2e-provider }
+  template:
+    metadata:
+      labels:
+        app: steward-connections-e2e-provider
+        steward.test/run-id: RUN_ID_PLACEHOLDER
+    spec:
+      containers:
+        - name: provider
+          image: MCP_GW_IMAGE_PLACEHOLDER
+          imagePullPolicy: Never
+          command: ["bun", "run", "/fixture/provider-fixture.ts"]
+          env:
+            - { name: PORT, value: "8090" }
+            - { name: FIXTURE_EMAIL, value: alice@example.com }
+            - { name: FIXTURE_GITHUB_SCOPES, value: repo }
+          ports: [{ name: http, containerPort: 8090 }]
+          readinessProbe: { httpGet: { path: /health, port: http } }
+          volumeMounts: [{ name: fixture, mountPath: /fixture, readOnly: true }]
+      volumes:
+        - name: fixture
+          configMap: { name: steward-connections-e2e-fixtures }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: provider-fixture
+  namespace: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+spec:
+  selector: { app: steward-connections-e2e-provider }
+  ports: [{ name: http, port: 8090, targetPort: http }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: steward-mint
+  namespace: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: steward-connections-e2e-mint }
+  template:
+    metadata:
+      labels:
+        app: steward-connections-e2e-mint
+        steward.test/run-id: RUN_ID_PLACEHOLDER
+    spec:
+      serviceAccountName: steward-mint
+      containers:
+        - name: mint
+          image: MINT_IMAGE_PLACEHOLDER
+          imagePullPolicy: Never
+          env:
+            - { name: SPIFFE_ENDPOINT_SOCKET, value: unix:///spiffe-workload-api/spire-agent.sock }
+            - { name: STEWARD_AUTHORITY_TTL, value: "10" }
+            - { name: STEWARD_MINT_ALLOWED_SCOPES, value: mcp }
+            - { name: STEWARD_MINT_AUDIENCE, value: steward-mcp }
+            - { name: STEWARD_MINT_BIND, value: "0.0.0.0:8080" }
+            - { name: STEWARD_MINT_ISSUER, value: http://steward-mint.steward-system.svc.cluster.local:8080 }
+            - { name: STEWARD_MINT_SVID_AUDIENCE, value: steward-mint }
+            - { name: STEWARD_MINT_INTROSPECTION_CLIENT_CREDENTIAL_FILE, value: /run/steward/introspection-client }
+            - { name: STEWARD_MINT_SIGNING_KEY_FILE, value: /run/steward/signing-key }
+            - { name: STEWARD_OPENSHELL_NAMESPACE, value: openshell }
+            - { name: STEWARD_SPIFFE_TRUST_DOMAIN, value: openshell.local }
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /.well-known/jwks.json, port: http } }
+          volumeMounts:
+            - { name: mint-secrets, mountPath: /run/steward, readOnly: true }
+            - { name: spiffe-workload-api, mountPath: /spiffe-workload-api, readOnly: true }
+      volumes:
+        - name: mint-secrets
+          secret: { secretName: steward-connections-e2e-mint }
+        - name: spiffe-workload-api
+          csi: { driver: csi.spiffe.io, readOnly: true }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: steward-mint
+  namespace: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+spec:
+  selector: { app: steward-connections-e2e-mint }
+  ports: [{ name: http, port: 8080, targetPort: http }]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oauth-migrations
+  namespace: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+          command:
+            - sh
+            - -c
+            - until pg_isready -h postgres.steward-system.svc.cluster.local -U steward -d steward; do sleep 1; done
+      containers:
+        - name: migrations
+          image: MCP_GW_IMAGE_PLACEHOLDER
+          imagePullPolicy: Never
+          command: ["bun", "shared/oauth/migrate.ts"]
+          env:
+            - { name: TOKEN_STORE_DSN, value: postgres://steward@postgres.steward-system.svc.cluster.local:5432/steward }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-gw
+  namespace: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: steward-connections-e2e-mcp-gw }
+  template:
+    metadata:
+      labels:
+        app: steward-connections-e2e-mcp-gw
+        steward.test/run-id: RUN_ID_PLACEHOLDER
+    spec:
+      containers:
+        - name: mcp-gw
+          image: MCP_GW_IMAGE_PLACEHOLDER
+          imagePullPolicy: Never
+          env:
+            - { name: PORT, value: "8080" }
+            - { name: TOKEN_STORE_DSN, value: postgres://steward@postgres.steward-system.svc.cluster.local:5432/steward }
+            - { name: GITHUB_MCP_UPSTREAM_URL, value: http://provider-fixture.steward-system.svc.cluster.local:8090/github-mcp }
+            - { name: GITHUB_OAUTH_CLIENT_ID, value: obviously-fake-client }
+            - { name: GITHUB_OAUTH_CLIENT_SECRET, value: obviously-fake-client-secret }
+            - { name: GITHUB_OAUTH_REDIRECT_URI, value: http://mcp-gw.steward-system.svc.cluster.local:8080/oauth/github/callback }
+            - { name: GITHUB_OAUTH_AUTHORIZATION_URL, value: https://provider.example.test/github/authorize }
+            - { name: GITHUB_OAUTH_TOKEN_URL, value: http://provider-fixture.steward-system.svc.cluster.local:8090/github/token }
+            - { name: GITHUB_OAUTH_USER_EMAILS_URL, value: http://provider-fixture.steward-system.svc.cluster.local:8090/github/emails }
+            - { name: GITHUB_OAUTH_TOKEN_REVOCATION_URL, value: http://provider-fixture.steward-system.svc.cluster.local:8090/github/revoke }
+            - { name: GITHUB_OAUTH_SCOPES, value: repo }
+            - { name: GITHUB_OAUTH_REDIRECT_AFTER_ALLOWED_ORIGINS, value: https://steward.example.test }
+            - name: GITHUB_TOKEN_ENCRYPTION_KEY
+              valueFrom: { secretKeyRef: { name: steward-connections-e2e-mcp-gw, key: encryption-key } }
+            - { name: HOP1_PROFILE, value: steward }
+            - { name: HOP1_ISSUER, value: http://steward-mint.steward-system.svc.cluster.local:8080 }
+            - { name: HOP1_JWKS_URL, value: http://steward-mint.steward-system.svc.cluster.local:8080/.well-known/jwks.json }
+            - { name: HOP1_AUDIENCE, value: steward-mcp }
+            - { name: HOP1_ALLOWED_ALGORITHMS, value: EdDSA }
+            - { name: HOP1_EMAIL_CLAIM, value: email }
+            - { name: HOP1_SUBJECT_CLAIM, value: sub }
+            - { name: HOP1_INTROSPECTION_URL, value: http://steward-mint.steward-system.svc.cluster.local:8080/introspect }
+            - name: HOP1_INTROSPECTION_CLIENT_CREDENTIAL
+              valueFrom: { secretKeyRef: { name: steward-connections-e2e-mcp-gw, key: introspection-client } }
+            - { name: OPA_POLICY_URL, value: http://steward-opa.steward-system.svc.cluster.local:8181/v1/data/steward/mcp/decision }
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { tcpSocket: { port: http } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-gw
+  namespace: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+spec:
+  selector: { app: steward-connections-e2e-mcp-gw }
+  ports: [{ name: http, port: 8080, targetPort: http }]

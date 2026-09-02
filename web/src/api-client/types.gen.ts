@@ -292,6 +292,11 @@ export type CanonicalAuthorityBinding = {
  */
 export type CanonicalUserId = string;
 
+export type ConnectionOperationErrorResponse = {
+    apiVersion: string;
+    error: string;
+};
+
 export type ConnectionPhase = 'disconnected' | 'connecting' | 'connected' | 'reauth_required' | 'unavailable';
 
 export type ConnectionStatusResponse = {
@@ -452,6 +457,10 @@ export type StartConnectionResponse = {
      * One-time HTTPS destination. It must not be persisted or logged by clients.
      */
     authorizationUrl: string;
+    /**
+     * Conservative expiry for MCP-GW's pinned OAuth state lifetime plus clock skew.
+     */
+    expiresAt: string;
     provider: string;
 };
 
@@ -830,6 +839,10 @@ export type DisconnectConnectionErrors = {
      */
     403: unknown;
     /**
+     * An OAuth flow is still pending
+     */
+    409: ConnectionOperationErrorResponse;
+    /**
      * Provider state is invalid
      */
     502: unknown;
@@ -838,6 +851,8 @@ export type DisconnectConnectionErrors = {
      */
     503: unknown;
 };
+
+export type DisconnectConnectionError = DisconnectConnectionErrors[keyof DisconnectConnectionErrors];
 
 export type DisconnectConnectionResponses = {
     /**

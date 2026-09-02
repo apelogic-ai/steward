@@ -3717,6 +3717,7 @@ dependencies = [
  "steward-ports",
  "steward-store",
  "steward-types",
+ "tokio",
  "utoipa",
  "uuid",
 ]

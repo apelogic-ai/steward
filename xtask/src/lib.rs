@@ -521,15 +521,28 @@ pub fn upgrade_rendered_provider_profile_bundle(
 
     let current_identity = rendered_provider_profile_bundle_identity(current)?;
     let replacement_identity = rendered_provider_profile_bundle_identity(replacement)?;
-    if current_identity != ("steward-runtime-providers", "1.0.0")
-        || replacement_identity != ("steward-runtime-providers", "1.1.0")
-    {
+    let supported_transition = matches!(
+        (current_identity, replacement_identity),
+        (
+            ("steward-runtime-providers", "1.0.0"),
+            ("steward-runtime-providers", "1.1.0")
+        ) | (
+            ("steward-runtime-providers", "1.1.0"),
+            ("steward-runtime-providers", "1.2.0")
+        )
+    );
+    if !supported_transition {
         return Err(format!(
             "provider profile upgrade has no supported migration from {}@{} to {}@{}",
             current_identity.0, current_identity.1, replacement_identity.0, replacement_identity.1
         ));
     }
-    validate_provider_profile_upgrade_delta(current, replacement)?;
+    validate_provider_profile_upgrade_delta(
+        current,
+        replacement,
+        current_identity.1,
+        replacement_identity.1,
+    )?;
 
     let parent = output_directory.parent().ok_or_else(|| {
         format!(
@@ -625,6 +638,8 @@ fn rendered_provider_profile_bundle_identity(
 fn validate_provider_profile_upgrade_delta(
     current: &RenderedProviderProfileBundle,
     replacement: &RenderedProviderProfileBundle,
+    current_version: &str,
+    replacement_version: &str,
 ) -> Result<(), String> {
     let current_state_profiles = current
         .state
@@ -665,22 +680,43 @@ fn validate_provider_profile_upgrade_delta(
         );
     }
 
-    let expected_current_binaries = serde_json::json!(["/usr/bin/curl", "/usr/local/bin/curl"]);
-    let expected_replacement_binaries = serde_json::json!([
+    let base_binaries = serde_json::json!(["/usr/bin/curl", "/usr/local/bin/curl"]);
+    let agent_binaries = serde_json::json!([
         "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/codex/codex",
         "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex",
         "/usr/bin/curl",
         "/usr/local/bin/curl"
     ]);
+    let governed_mcp_binaries = serde_json::json!([
+        "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/codex/codex",
+        "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex",
+        "/usr/bin/curl",
+        "/usr/local/bin/curl",
+        "/usr/local/bin/steward-connections-bridge"
+    ]);
     for (profile_id, current_profile) in &current.profiles {
         let replacement_profile = replacement.profiles.get(profile_id).ok_or_else(|| {
             format!("replacement provider profile {profile_id} is required for upgrade")
         })?;
-        if current_profile.get("binaries") != Some(&expected_current_binaries)
-            || replacement_profile.get("binaries") != Some(&expected_replacement_binaries)
+        let (expected_current_binaries, expected_replacement_binaries) = match (
+            current_version,
+            replacement_version,
+            profile_id.as_str(),
+        ) {
+            ("1.0.0", "1.1.0", _) => (&base_binaries, &agent_binaries),
+            ("1.1.0", "1.2.0", "steward-mcp-gw") => (&agent_binaries, &governed_mcp_binaries),
+            ("1.1.0", "1.2.0", "steward-litellm") => (&agent_binaries, &agent_binaries),
+            _ => {
+                return Err(format!(
+                    "provider profile upgrade has no declared binary delta for {profile_id} in {current_version} to {replacement_version}"
+                ));
+            }
+        };
+        if current_profile.get("binaries") != Some(expected_current_binaries)
+            || replacement_profile.get("binaries") != Some(expected_replacement_binaries)
         {
             return Err(format!(
-                "provider profile upgrade for {profile_id} permits only the declared 1.0.0 to 1.1.0 required-binary update"
+                "provider profile upgrade for {profile_id} permits only the declared {current_version} to {replacement_version} required-binary update"
             ));
         }
         if profile_without_binaries(current_profile, profile_id)?
@@ -2273,10 +2309,11 @@ mod tests {
     use super::{
         RenderedProviderProfileBundle, install_rendered_provider_profile_bundle,
         local_test_context_is_safe, migration_base_candidates, migration_history_violations,
-        neutrality_violations, reconcile_rendered_provider_profile_bundle,
-        render_provider_profile_bundle, render_provider_profile_bundle_directory,
-        secret_violations, select_migration_base, upgrade_rendered_provider_profile_bundle,
-        validate_provider_profile_bundle, validate_register_content,
+        neutrality_violations, profile_without_binaries,
+        reconcile_rendered_provider_profile_bundle, render_provider_profile_bundle,
+        render_provider_profile_bundle_directory, secret_violations, select_migration_base,
+        upgrade_rendered_provider_profile_bundle, validate_provider_profile_bundle,
+        validate_register_content,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -2856,6 +2893,67 @@ mod tests {
     }
 
     #[test]
+    fn provider_profile_upgrade_to_1_2_adds_only_the_connections_bridge_binary()
+    -> Result<(), String> {
+        let current = render_test_provider_profile_bundle(
+            "v1.1.0",
+            "1.1.0",
+            "https://mcp.gateway.test",
+            "https://inference.gateway.test",
+            "https://mint.gateway.test",
+            "10.42.0.0/16",
+        )?;
+        let replacement = render_test_provider_profile_bundle(
+            "v1.2.0",
+            "1.2.0",
+            "https://mcp.gateway.test",
+            "https://inference.gateway.test",
+            "https://mint.gateway.test",
+            "10.42.0.0/16",
+        )?;
+        let current_mcp = current
+            .profiles
+            .get("steward-mcp-gw")
+            .ok_or_else(|| "1.1.0 MCP profile is required".to_owned())?;
+        let replacement_mcp = replacement
+            .profiles
+            .get("steward-mcp-gw")
+            .ok_or_else(|| "1.2.0 MCP profile is required".to_owned())?;
+        assert_eq!(
+            replacement_mcp
+                .pointer("/binaries/4")
+                .and_then(serde_json::Value::as_str),
+            Some("/usr/local/bin/steward-connections-bridge"),
+            "1.2.0 must authorize the fixed governed bridge through the MCP provider only"
+        );
+        assert_eq!(
+            current.profiles.get("steward-litellm"),
+            replacement.profiles.get("steward-litellm"),
+            "the governed provider-control bridge must not change the inference profile"
+        );
+        assert_eq!(
+            profile_without_binaries(current_mcp, "steward-mcp-gw")?,
+            profile_without_binaries(replacement_mcp, "steward-mcp-gw")?,
+            "the migration must preserve MCP environment bindings and policy"
+        );
+
+        let directory = std::env::temp_dir().join(format!(
+            "steward-provider-profile-upgrade-1-2-test-{}-{}",
+            std::process::id(),
+            NEXT_RENDER_INSTALL_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&directory).map_err(|error| format!("create fixture: {error}"))?;
+        let output = directory.join("installed");
+        let result = (|| {
+            install_rendered_provider_profile_bundle(&output, &current)?;
+            upgrade_rendered_provider_profile_bundle(&output, &current, &replacement)?;
+            reconcile_rendered_provider_profile_bundle(&output, &replacement)
+        })();
+        fs::remove_dir_all(&directory).map_err(|error| format!("remove fixture: {error}"))?;
+        result
+    }
+
+    #[test]
     fn provider_profile_upgrade_requires_an_exact_supported_predecessor() -> Result<(), String> {
         let current = render_test_provider_profile_bundle(
             "v1",
@@ -2939,7 +3037,7 @@ mod tests {
                 "https://mint.gateway.test",
                 "10.42.0.0/16",
             )?;
-            unsupported.state["bundle"]["version"] = serde_json::json!("1.2.0");
+            unsupported.state["bundle"]["version"] = serde_json::json!("1.3.0");
             let unsupported_result =
                 upgrade_rendered_provider_profile_bundle(&output, &replacement, &unsupported);
             if !matches!(unsupported_result, Err(ref error) if error.contains("supported migration"))
@@ -3343,5 +3441,28 @@ id = "G-6"
                 "{path} must route AgentRuntime DELETE requests through validating admission"
             );
         }
+    }
+
+    #[test]
+    fn governed_connections_bridge_image_contains_openshell_runtime_utilities() {
+        let dockerfile = include_str!("../../build/connections-bridge.Dockerfile");
+        let required = [
+            "cat", "find", "id", "ip", "mkdir", "mktemp", "rm", "sh", "sleep", "tar", "touch",
+        ];
+
+        for utility in required {
+            assert!(
+                dockerfile.contains(&format!("/bin/{utility}")),
+                "the governed bridge image must contain /bin/{utility} because OpenShell's workspace init, supervisor, and Steward archive protocol invoke it"
+            );
+        }
+        assert!(
+            dockerfile.contains("iproute2"),
+            "the governed bridge image must install real iproute2 for OpenShell network-namespace isolation"
+        );
+        assert!(
+            !dockerfile.contains("ln -sf busybox /bin/ip"),
+            "BusyBox ip cannot implement OpenShell's required `ip netns add` isolation"
+        );
     }
 }

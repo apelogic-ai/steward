@@ -180,13 +180,6 @@ pub struct BrowserPrincipal {
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct BrowserSessionBinding(String);
 
-#[cfg(test)]
-impl BrowserSessionBinding {
-    pub(crate) fn from_test_value(value: &str) -> Self {
-        Self(value.to_owned())
-    }
-}
-
 #[derive(Clone)]
 pub struct BrowserSessionContext {
     pub principal: BrowserPrincipal,

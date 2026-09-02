@@ -23,17 +23,21 @@ use kube::runtime::finalizer::{Event, finalizer};
 use kube::runtime::watcher;
 use kube::{Client, Resource, ResourceExt};
 use sha2::{Digest, Sha256};
+use steward_admission::internal_authorities::steward_connections_v1;
 use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, budget_is_exhausted,
-    duration_seconds, evaluate_with_grants,
+    duration_seconds, evaluate, evaluate_with_grants,
 };
 use steward_ports::{
     InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
-    InferenceRequest, MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProvisionedInference, SandboxTaskOutput,
-    SandboxTaskRequest, SandboxTaskRuntime,
+    InferenceRequest, MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProvisionedInference, SandboxExecutionClass,
+    SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
 };
 pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
-use steward_store::{GrantReversion, PgStore, StoreError, TaskRecord};
+use steward_store::{
+    ConnectionOperationKind, ConnectionOperationRecord, GrantReversion, PgStore, StoreError,
+    TaskRecord,
+};
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, Duration, PENDING_APPROVAL_ANNOTATION,
     Phase, RuntimeId, RuntimeOwnership, RuntimeRefs, TaskPhase, runtime_activated_condition,
@@ -358,6 +362,7 @@ pub async fn reconcile_once<R: SandboxRuntime>(
     let request = SandboxRequest {
         runtime: runtime_id,
         workspace_key,
+        execution_class: sandbox_execution_class(&runtime.spec),
         agent_type: runtime.spec.agent_type.clone(),
         models: runtime.spec.llms.clone(),
         tools: runtime.spec.tools.clone(),
@@ -524,6 +529,20 @@ async fn reconcile_task<R: SandboxTaskRuntime>(
     authority: &PgStore,
     task: &TaskRecord,
 ) -> Result<(), TaskControllerError> {
+    if let Some(operation) = authority
+        .connection_operation_for_task(task.task_uid)
+        .await
+        .map_err(TaskControllerError::Store)?
+    {
+        let current = sandbox_runtime.provider_control_bindings();
+        if !connection_operation_bindings_match(&operation, task, current.as_ref()) {
+            authority
+                .fail_connection_operation(operation.operation_id, "binding_mismatch")
+                .await
+                .map_err(TaskControllerError::Store)?;
+            return Ok(());
+        }
+    }
     let runtime = task_runtime(client, task).await?;
     match task_runtime_action(
         task.phase,
@@ -571,6 +590,7 @@ async fn reconcile_task<R: SandboxTaskRuntime>(
                             )
                         })?),
                         refs,
+                        execution_class: sandbox_execution_class(&task.runtime_spec),
                         agent_type: task.runtime_spec.agent_type.clone(),
                         command: task.agent_command.clone(),
                     },
@@ -635,6 +655,142 @@ async fn reconcile_task<R: SandboxTaskRuntime>(
             .await
             .map_err(TaskControllerError::Store),
     }
+}
+
+fn sandbox_execution_class(spec: &AgentRuntimeSpec) -> SandboxExecutionClass {
+    if spec.agent_type.name == "connections-bridge"
+        && matches!(
+            &spec.principal,
+            steward_types::Principal::Service { name, .. } if name == "steward-connections"
+        )
+    {
+        SandboxExecutionClass::ProviderControl
+    } else {
+        SandboxExecutionClass::Agent
+    }
+}
+
+fn connection_operation_bindings_match(
+    operation: &ConnectionOperationRecord,
+    task: &TaskRecord,
+    current: Option<&steward_ports::ProviderControlExecutionBindings>,
+) -> bool {
+    let Some(current) = current else {
+        return false;
+    };
+    operation.authority_id == "steward-connections"
+        && operation.authority_version == 1
+        && operation.authority_digest == steward_connections_v1::AUTHORITY_DIGEST
+        && task.internal_authority_id.as_deref() == Some(operation.authority_id.as_str())
+        && task.internal_authority_version == Some(operation.authority_version)
+        && task.internal_authority_digest.as_deref() == Some(operation.authority_digest.as_str())
+        && operation.runtime_spec_snapshot == task.runtime_spec
+        && operation.command_snapshot == task.agent_command
+        && provider_control_bindings_match(&operation.bindings, current)
+        && task.runtime_namespace == operation.bindings.namespace
+}
+
+fn provider_control_bindings_match(
+    persisted: &steward_store::ConnectionExecutionBindingSnapshot,
+    current: &steward_ports::ProviderControlExecutionBindings,
+) -> bool {
+    persisted.bridge_image_digest == current.bridge_image_digest
+        && persisted.mcp_gw_origin == current.mcp_gw_origin
+        && persisted.mcp_gw_version == current.mcp_gw_version
+        && persisted.namespace == current.namespace
+        && persisted.runtime_class == current.runtime_class
+}
+
+fn connection_operation_authority_action(
+    runtime: &AgentRuntime,
+    operation: &ConnectionOperationRecord,
+    current: Option<&steward_ports::ProviderControlExecutionBindings>,
+) -> Result<AuthorityAction, ReconcileError> {
+    let runtime_uid = runtime
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or(ReconcileError::MissingRuntimeUid)?;
+    let namespace = runtime
+        .metadata
+        .namespace
+        .as_deref()
+        .ok_or(ReconcileError::MissingNamespace)?;
+    let expected_action = operation.operation_kind.as_str();
+    let expected_bridge_operation = match operation.operation_kind {
+        ConnectionOperationKind::Status => "github.status",
+        ConnectionOperationKind::Start => "github.start",
+        ConnectionOperationKind::Disconnect => "github.disconnect",
+    };
+    let expected_command = [
+        steward_connections_v1::BRIDGE_BINARY,
+        "--operation",
+        expected_bridge_operation,
+        "--input",
+        steward_connections_v1::INPUT_FILE,
+    ];
+    let expected_grant = steward_connections_v1::provider_control_grant(expected_action)
+        .ok_or_else(|| {
+            ReconcileError::Authority(
+                "connection operation has an unsupported provider-control action".to_owned(),
+            )
+        })?;
+    let canonical_authority = runtime.spec.canonical_authority.as_ref();
+    let identity_matches = canonical_authority.is_some_and(|binding| {
+        binding.owner_user_id.as_str() == operation.canonical_user_id
+            && binding.acting_user_id.as_ref().map(|id| id.as_str())
+                == Some(operation.canonical_user_id.as_str())
+    });
+    let principal_matches = matches!(
+        &runtime.spec.principal,
+        steward_types::Principal::Service {
+            name,
+            acting_user: Some(acting_user),
+        } if name == steward_connections_v1::SERVICE && acting_user == &runtime.spec.owner
+    );
+    let authority = steward_connections_v1::envelope();
+    let fixed_limits_match = runtime.spec.budget == authority.spec.budget
+        && runtime.spec.ttl == authority.spec.ttl
+        && runtime.spec.runner == authority.spec.runner;
+    let admitted =
+        evaluate(&runtime.spec, &authority).map_err(|error| ReconcileError::InvalidSpec {
+            reason: format!("{error:?}"),
+        })? == AdmissionDecision::Admit;
+    let current_matches = current
+        .is_some_and(|bindings| provider_control_bindings_match(&operation.bindings, bindings));
+
+    if operation.operation_id != operation.task_uid
+        || operation.provider != "github"
+        || operation.authority_id != steward_connections_v1::AUTHORITY_ID
+        || operation.authority_version != steward_connections_v1::AUTHORITY_VERSION
+        || operation.authority_digest != steward_connections_v1::AUTHORITY_DIGEST
+        || operation.runtime_uid.as_deref() != Some(runtime_uid)
+        || operation.runtime_spec_snapshot != runtime.spec
+        || operation
+            .command_snapshot
+            .iter()
+            .map(String::as_str)
+            .ne(expected_command)
+        || namespace != operation.bindings.namespace
+        || runtime.spec.agent_type.name != steward_connections_v1::AGENT_TYPE
+        || !runtime.spec.llms.is_empty()
+        || runtime.spec.tools.as_slice() != [expected_grant]
+        || runtime.spec.bindings.is_some()
+        || !fixed_limits_match
+        || !identity_matches
+        || !principal_matches
+        || runtime
+            .annotations()
+            .get(SERVICE_PRINCIPAL_ANNOTATION)
+            .map(String::as_str)
+            != Some(steward_connections_v1::SERVICE)
+        || runtime.annotations().contains_key(MEMBER_ROLE_ANNOTATION)
+        || !current_matches
+        || !admitted
+    {
+        return Ok(AuthorityAction::Suspend);
+    }
+    Ok(AuthorityAction::Continue)
 }
 
 async fn create_task_runtime(
@@ -1194,20 +1350,164 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     return Ok(Action::requeue(ttl_requeue));
                 }
                 if let Some(authority) = &context.authority {
-                    if let Some(reversion) = authority
-                        .grant_reversion(runtime.metadata.uid.as_deref().ok_or(
-                            ControllerError::Reconcile(ReconcileError::MissingRuntimeUid),
-                        )?)
+                    let runtime_uid =
+                        runtime
+                            .metadata
+                            .uid
+                            .as_deref()
+                            .ok_or(ControllerError::Reconcile(
+                                ReconcileError::MissingRuntimeUid,
+                            ))?;
+                    let connection_operation = authority
+                        .connection_operation_for_runtime(runtime_uid)
                         .await
                         .map_err(|error| {
                             ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
-                        })?
-                    {
-                        let (scope_kind, scope_ref) = authority_envelope_scope(
-                            &reversion.proposed_spec,
-                            &reversion.member_role,
-                        )
-                        .map_err(ControllerError::Reconcile)?;
+                        })?;
+                    if let Some(operation) = connection_operation {
+                        if matches!(
+                            connection_operation_authority_action(
+                                &runtime,
+                                &operation,
+                                context.sandbox_runtime.provider_control_bindings().as_ref(),
+                            )
+                            .map_err(ControllerError::Reconcile)?,
+                            AuthorityAction::Suspend
+                        ) {
+                            return suspend_runtime_with_inference_cleanup(
+                                &runtime,
+                                &api,
+                                &context.sandbox_runtime,
+                                context.client.clone(),
+                                &context.inference,
+                                None,
+                            )
+                            .await;
+                        }
+                    } else {
+                        if let Some(reversion) = authority
+                            .grant_reversion(runtime.metadata.uid.as_deref().ok_or(
+                                ControllerError::Reconcile(ReconcileError::MissingRuntimeUid),
+                            )?)
+                            .await
+                            .map_err(|error| {
+                                ControllerError::Reconcile(ReconcileError::Authority(
+                                    error.to_string(),
+                                ))
+                            })?
+                        {
+                            let (scope_kind, scope_ref) = authority_envelope_scope(
+                                &reversion.proposed_spec,
+                                &reversion.member_role,
+                            )
+                            .map_err(ControllerError::Reconcile)?;
+                            let latest_envelope = authority
+                                .latest_scoped_envelope(scope_kind, scope_ref)
+                                .await
+                                .map_err(|error| {
+                                    ControllerError::Reconcile(ReconcileError::Authority(
+                                        error.to_string(),
+                                    ))
+                                })?
+                                .ok_or_else(|| {
+                                    ControllerError::Reconcile(ReconcileError::Authority(
+                                        "grant principal no longer has an envelope".to_owned(),
+                                    ))
+                                })?;
+                            let surviving_grants = authority
+                                .grants_for_runtime_scoped(
+                                    runtime.metadata.uid.as_deref().ok_or(
+                                        ControllerError::Reconcile(
+                                            ReconcileError::MissingRuntimeUid,
+                                        ),
+                                    )?,
+                                    scope_kind,
+                                    scope_ref,
+                                    latest_envelope.revision,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    ControllerError::Reconcile(ReconcileError::Authority(
+                                        error.to_string(),
+                                    ))
+                                })?;
+                            match authority_action(
+                                &runtime,
+                                &reversion,
+                                &latest_envelope,
+                                &surviving_grants,
+                            )
+                            .map_err(ControllerError::Reconcile)?
+                            {
+                                AuthorityAction::Continue => {}
+                                AuthorityAction::Restore(mut restored) => {
+                                    restored.metadata = runtime.metadata.clone();
+                                    replace_grant_as_authority(
+                                        &context.client,
+                                        &restored,
+                                        &reversion.actor,
+                                        &reversion.member_role,
+                                    )
+                                    .await?;
+                                    return Ok(Action::requeue(StdDuration::from_secs(2)));
+                                }
+                                AuthorityAction::Suspend => {
+                                    return suspend_runtime_with_inference_cleanup(
+                                        &runtime,
+                                        &api,
+                                        &context.sandbox_runtime,
+                                        context.client.clone(),
+                                        &context.inference,
+                                        None,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        if let Some(application) = authority
+                            .grant_application(runtime.metadata.uid.as_deref().ok_or(
+                                ControllerError::Reconcile(ReconcileError::MissingRuntimeUid),
+                            )?)
+                            .await
+                            .map_err(|error| {
+                                ControllerError::Reconcile(ReconcileError::Authority(
+                                    error.to_string(),
+                                ))
+                            })?
+                        {
+                            match authority_application_action(&runtime, &application.application)
+                                .map_err(ControllerError::Reconcile)?
+                            {
+                                AuthorityAction::Restore(mut proposed) => {
+                                    proposed.metadata = runtime.metadata.clone();
+                                    proposed
+                                        .metadata
+                                        .annotations
+                                        .get_or_insert_default()
+                                        .remove(PENDING_APPROVAL_ANNOTATION);
+                                    replace_grant_as_authority(
+                                        &context.client,
+                                        &proposed,
+                                        &application.application.actor,
+                                        &application.application.member_role,
+                                    )
+                                    .await?;
+                                    return Ok(Action::requeue(StdDuration::from_secs(2)));
+                                }
+                                AuthorityAction::Continue | AuthorityAction::Suspend => {}
+                            }
+                        }
+                        let Ok((scope_kind, scope_ref)) = runtime_envelope_scope(&runtime) else {
+                            return suspend_runtime_with_inference_cleanup(
+                                &runtime,
+                                &api,
+                                &context.sandbox_runtime,
+                                context.client.clone(),
+                                &context.inference,
+                                None,
+                            )
+                            .await;
+                        };
                         let latest_envelope = authority
                             .latest_scoped_envelope(scope_kind, scope_ref)
                             .await
@@ -1218,10 +1518,10 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             })?
                             .ok_or_else(|| {
                                 ControllerError::Reconcile(ReconcileError::Authority(
-                                    "grant principal no longer has an envelope".to_owned(),
+                                    "runtime principal no longer has an envelope".to_owned(),
                                 ))
                             })?;
-                        let surviving_grants = authority
+                        let grants = authority
                             .grants_for_runtime_scoped(
                                 runtime.metadata.uid.as_deref().ok_or(
                                     ControllerError::Reconcile(ReconcileError::MissingRuntimeUid),
@@ -1236,133 +1536,30 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                     error.to_string(),
                                 ))
                             })?;
-                        match authority_action(
-                            &runtime,
-                            &reversion,
-                            &latest_envelope,
-                            &surviving_grants,
-                        )
-                        .map_err(ControllerError::Reconcile)?
-                        {
-                            AuthorityAction::Continue => {}
-                            AuthorityAction::Restore(mut restored) => {
-                                restored.metadata = runtime.metadata.clone();
-                                replace_grant_as_authority(
-                                    &context.client,
-                                    &restored,
-                                    &reversion.actor,
-                                    &reversion.member_role,
-                                )
-                                .await?;
-                                return Ok(Action::requeue(StdDuration::from_secs(2)));
-                            }
-                            AuthorityAction::Suspend => {
-                                return suspend_runtime_with_inference_cleanup(
-                                    &runtime,
-                                    &api,
-                                    &context.sandbox_runtime,
-                                    context.client.clone(),
-                                    &context.inference,
-                                    None,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    if let Some(application) = authority
-                        .grant_application(runtime.metadata.uid.as_deref().ok_or(
-                            ControllerError::Reconcile(ReconcileError::MissingRuntimeUid),
-                        )?)
-                        .await
-                        .map_err(|error| {
-                            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
-                        })?
-                    {
-                        match authority_application_action(&runtime, &application.application)
-                            .map_err(ControllerError::Reconcile)?
-                        {
-                            AuthorityAction::Restore(mut proposed) => {
-                                proposed.metadata = runtime.metadata.clone();
-                                proposed
-                                    .metadata
-                                    .annotations
-                                    .get_or_insert_default()
-                                    .remove(PENDING_APPROVAL_ANNOTATION);
-                                replace_grant_as_authority(
-                                    &context.client,
-                                    &proposed,
-                                    &application.application.actor,
-                                    &application.application.member_role,
-                                )
-                                .await?;
-                                return Ok(Action::requeue(StdDuration::from_secs(2)));
-                            }
-                            AuthorityAction::Continue | AuthorityAction::Suspend => {}
-                        }
-                    }
-                    let Ok((scope_kind, scope_ref)) = runtime_envelope_scope(&runtime) else {
-                        return suspend_runtime_with_inference_cleanup(
-                            &runtime,
-                            &api,
-                            &context.sandbox_runtime,
-                            context.client.clone(),
-                            &context.inference,
-                            None,
-                        )
-                        .await;
-                    };
-                    let latest_envelope = authority
-                        .latest_scoped_envelope(scope_kind, scope_ref)
-                        .await
-                        .map_err(|error| {
-                            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
-                        })?
-                        .ok_or_else(|| {
-                            ControllerError::Reconcile(ReconcileError::Authority(
-                                "runtime principal no longer has an envelope".to_owned(),
-                            ))
-                        })?;
-                    let grants =
-                        authority
-                            .grants_for_runtime_scoped(
-                                runtime.metadata.uid.as_deref().ok_or(
-                                    ControllerError::Reconcile(ReconcileError::MissingRuntimeUid),
-                                )?,
-                                scope_kind,
-                                scope_ref,
-                                latest_envelope.revision,
+                        if matches!(
+                            runtime_authority_action(&runtime, &latest_envelope, &grants)
+                                .map_err(ControllerError::Reconcile)?,
+                            AuthorityAction::Suspend
+                        ) {
+                            return suspend_runtime_with_inference_cleanup(
+                                &runtime,
+                                &api,
+                                &context.sandbox_runtime,
+                                context.client.clone(),
+                                &context.inference,
+                                None,
                             )
-                            .await
-                            .map_err(|error| {
-                                ControllerError::Reconcile(ReconcileError::Authority(
-                                    error.to_string(),
-                                ))
-                            })?;
-                    if matches!(
-                        runtime_authority_action(&runtime, &latest_envelope, &grants)
-                            .map_err(ControllerError::Reconcile)?,
-                        AuthorityAction::Suspend
-                    ) {
-                        return suspend_runtime_with_inference_cleanup(
-                            &runtime,
-                            &api,
-                            &context.sandbox_runtime,
-                            context.client.clone(),
-                            &context.inference,
-                            None,
-                        )
-                        .await;
-                    }
-                    let runtime_uid =
-                        runtime
-                            .metadata
-                            .uid
-                            .as_deref()
-                            .ok_or(ControllerError::Reconcile(
-                                ReconcileError::MissingRuntimeUid,
-                            ))?;
-                    if let Some(spend) =
-                        authority
+                            .await;
+                        }
+                        let runtime_uid =
+                            runtime
+                                .metadata
+                                .uid
+                                .as_deref()
+                                .ok_or(ControllerError::Reconcile(
+                                    ReconcileError::MissingRuntimeUid,
+                                ))?;
+                        if let Some(spend) = authority
                             .inference_exhaustion(runtime_uid)
                             .await
                             .map_err(|error| {
@@ -1370,18 +1567,19 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                     error.to_string(),
                                 ))
                             })?
-                        && let Some(spend) = spend_still_exhausts_runtime(&runtime, spend)
-                            .map_err(ControllerError::Reconcile)?
-                    {
-                        return suspend_runtime_with_inference_cleanup(
-                            &runtime,
-                            &api,
-                            &context.sandbox_runtime,
-                            context.client.clone(),
-                            &context.inference,
-                            Some(spend),
-                        )
-                        .await;
+                            && let Some(spend) = spend_still_exhausts_runtime(&runtime, spend)
+                                .map_err(ControllerError::Reconcile)?
+                        {
+                            return suspend_runtime_with_inference_cleanup(
+                                &runtime,
+                                &api,
+                                &context.sandbox_runtime,
+                                context.client.clone(),
+                                &context.inference,
+                                Some(spend),
+                            )
+                            .await;
+                        }
                     }
                 }
                 if let Some(spend) =
@@ -2455,13 +2653,18 @@ mod tests {
     use axum::http::{Method, Request, Response, StatusCode};
     use kube::client::Body as KubeBody;
     use kube::{Client, ResourceExt};
+    use steward_admission::internal_authorities::steward_connections_v1;
     use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
     use steward_ports::{
         InferenceCapabilities, InferenceObservation, InferencePlane, InferenceRequest,
-        MAX_TASK_OUTPUT_ARCHIVE_BYTES, PortError, ProvisionedInference, SandboxObservation,
-        SandboxRequest, SandboxRuntime,
+        MAX_TASK_OUTPUT_ARCHIVE_BYTES, PortError, ProviderControlExecutionBindings,
+        ProvisionedInference, SandboxExecutionClass, SandboxObservation, SandboxRequest,
+        SandboxRuntime,
     };
-    use steward_store::GrantReversion;
+    use steward_store::{
+        ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase, ConnectionOperationKind,
+        ConnectionOperationRecord, ConnectionOperationState, GrantReversion,
+    };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
         CanonicalAuthorityBinding, CanonicalUserId, Duration, Email, ModelRef,
@@ -2473,11 +2676,243 @@ mod tests {
         Action, AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ReconcileDecision,
         ReconcileIntent, SERVICE_PRINCIPAL_ANNOTATION, TaskRuntimeAction, TaskRuntimeBinding,
         authority_action, authority_application_action, cleanup_runtime,
-        exhausted_spend_to_preserve, inference_action, reconcile_once, replace_as_authority,
-        runtime_authority_action, runtime_ttl_action, server_task_runtime_manifest,
-        status_merge_patch, suspend_runtime, suspend_runtime_with_inference_cleanup,
-        task_output_archive_failure, task_runtime_action, ttl_action,
+        connection_operation_authority_action, exhausted_spend_to_preserve, inference_action,
+        provider_control_bindings_match, reconcile_once, replace_as_authority,
+        runtime_authority_action, runtime_ttl_action, sandbox_execution_class,
+        server_task_runtime_manifest, status_merge_patch, suspend_runtime,
+        suspend_runtime_with_inference_cleanup, task_output_archive_failure, task_runtime_action,
+        ttl_action,
     };
+
+    #[test]
+    fn provider_control_execution_rejects_every_binding_drift_dimension() {
+        let persisted = ConnectionExecutionBindingSnapshot {
+            bridge_image_digest: "registry.example.test/bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
+            mcp_gw_version: "0.3.2".to_owned(),
+            namespace: "steward-test".to_owned(),
+            runtime_class: "kata-qemu".to_owned(),
+        };
+        let current = ProviderControlExecutionBindings {
+            bridge_image_digest: persisted.bridge_image_digest.clone(),
+            mcp_gw_origin: persisted.mcp_gw_origin.clone(),
+            mcp_gw_version: persisted.mcp_gw_version.clone(),
+            namespace: persisted.namespace.clone(),
+            runtime_class: persisted.runtime_class.clone(),
+        };
+        assert!(provider_control_bindings_match(&persisted, &current));
+
+        for drifted in [
+            ProviderControlExecutionBindings {
+                bridge_image_digest: "registry.example.test/bridge@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                ..current.clone()
+            },
+            ProviderControlExecutionBindings {
+                mcp_gw_origin: "https://other-mcp-gw.example.test".to_owned(),
+                ..current.clone()
+            },
+            ProviderControlExecutionBindings {
+                mcp_gw_version: "0.3.1".to_owned(),
+                ..current.clone()
+            },
+            ProviderControlExecutionBindings {
+                namespace: "other-test".to_owned(),
+                ..current.clone()
+            },
+            ProviderControlExecutionBindings {
+                runtime_class: "other-runtime".to_owned(),
+                ..current.clone()
+            },
+        ] {
+            assert!(
+                !provider_control_bindings_match(&persisted, &drifted),
+                "a retry must not reinterpret any persisted connection-operation binding"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_control_execution_class_is_exact_and_does_not_capture_long_running_services()
+    -> Result<(), String> {
+        let acting_user = Email::parse("alice@example.com")
+            .map_err(|error| format!("neutral email is invalid: {error}"))?;
+        let mut governed = fixture().spec;
+        governed.agent_type.name = "connections-bridge".to_owned();
+        governed.principal = Principal::Service {
+            name: "steward-connections".to_owned(),
+            acting_user: Some(acting_user.clone()),
+        };
+        assert_eq!(
+            sandbox_execution_class(&governed),
+            SandboxExecutionClass::ProviderControl
+        );
+
+        let mut long_running = governed.clone();
+        long_running.principal = Principal::Service {
+            name: "steward-run".to_owned(),
+            acting_user: Some(acting_user),
+        };
+        assert_eq!(
+            sandbox_execution_class(&long_running),
+            SandboxExecutionClass::Agent,
+            "stable and long-running services must never inherit one-shot bridge behavior"
+        );
+
+        let mut ordinary = governed;
+        ordinary.agent_type.name = "codex@0.117.0".to_owned();
+        assert_eq!(
+            sandbox_execution_class(&ordinary),
+            SandboxExecutionClass::Agent
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_governed_connection_runtime_uses_immutable_authority_without_service_envelope()
+    -> Result<(), String> {
+        let mut runtime = fixture();
+        runtime.metadata.namespace = Some("steward-connections".to_owned());
+        runtime.metadata.uid = Some("bridge-runtime-uid".to_owned());
+        runtime.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            SERVICE_PRINCIPAL_ANNOTATION.to_owned(),
+            "steward-connections".to_owned(),
+        )]));
+        runtime.spec.principal = Principal::Service {
+            name: "steward-connections".to_owned(),
+            acting_user: Some(Email::parse("alice@example.com")?),
+        };
+        runtime.spec.owner = Email::parse("alice@example.com")?;
+        let user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        runtime.spec.canonical_authority = Some(CanonicalAuthorityBinding::new(
+            user_id.clone(),
+            Some(user_id),
+        )?);
+        runtime.spec.agent_type.name = "connections-bridge".to_owned();
+        runtime.spec.llms.clear();
+        runtime.spec.tools = vec![steward_types::ToolGrant {
+            provider: "github".to_owned(),
+            resource: "provider-control".to_owned(),
+            action: "status".to_owned(),
+        }];
+        runtime.spec.budget = Budget {
+            monthly_limit: "0.00".to_owned(),
+            single_run_limit: Some("0.00".to_owned()),
+            currency: "USD".to_owned(),
+        };
+        runtime.spec.ttl = Duration("2m".to_owned());
+        runtime.spec.runner = steward_types::RunnerRequirements {
+            platforms: vec![steward_types::RunnerPlatform::Linux],
+            memory: Some(steward_types::KubernetesQuantity("128Mi".to_owned())),
+            compute: Some(steward_types::KubernetesQuantity("100m".to_owned())),
+            storage: Some(steward_types::KubernetesQuantity("64Mi".to_owned())),
+        };
+
+        let bindings = ConnectionExecutionBindingSnapshot {
+            bridge_image_digest: "registry.example.test/steward-connections-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
+            mcp_gw_version: "0.3.2".to_owned(),
+            namespace: "steward-connections".to_owned(),
+            runtime_class: "kata-qemu".to_owned(),
+        };
+        let operation = ConnectionOperationRecord {
+            operation_id: serde_json::from_value(serde_json::json!(
+                "00000000-0000-0000-0000-000000000001"
+            ))
+            .map_err(|error| error.to_string())?,
+            task_uid: serde_json::from_value(serde_json::json!(
+                "00000000-0000-0000-0000-000000000001"
+            ))
+            .map_err(|error| error.to_string())?,
+            canonical_user_id: "usr_0123456789abcdef0123456789abcdef".to_owned(),
+            provider: "github".to_owned(),
+            operation_kind: ConnectionOperationKind::Status,
+            authority_id: "steward-connections".to_owned(),
+            authority_version: 1,
+            authority_digest: steward_connections_v1::AUTHORITY_DIGEST.to_owned(),
+            runtime_spec_snapshot: runtime.spec.clone(),
+            command_snapshot: vec![
+                "/usr/local/bin/steward-connections-bridge".to_owned(),
+                "--operation".to_owned(),
+                "github.status".to_owned(),
+                "--input".to_owned(),
+                "request.json".to_owned(),
+            ],
+            bindings: bindings.clone(),
+            idempotency_identity: "status:alice".to_owned(),
+            uncached_status: false,
+            operation_state: ConnectionOperationState::Provisioning,
+            oauth_phase: ConnectionOAuthPhase::None,
+            authorization_url: None,
+            authorization_url_digest: None,
+            flow_expires_at: None,
+            cached_status: None,
+            result: None,
+            failure_category: None,
+            finalization_state: "not_requested".to_owned(),
+            cleanup_state: "not_started".to_owned(),
+            cleanup_finding: None,
+            response_deadline_at: "2026-09-01T00:00:40Z".to_owned(),
+            task_phase: TaskPhase::Submitted,
+            runtime_uid: Some("bridge-runtime-uid".to_owned()),
+            output_archive: None,
+            finalize_requested: false,
+            finalized: false,
+        };
+        let current = ProviderControlExecutionBindings {
+            bridge_image_digest: bindings.bridge_image_digest.clone(),
+            mcp_gw_origin: bindings.mcp_gw_origin.clone(),
+            mcp_gw_version: bindings.mcp_gw_version.clone(),
+            namespace: bindings.namespace.clone(),
+            runtime_class: bindings.runtime_class.clone(),
+        };
+
+        assert!(
+            matches!(
+                connection_operation_authority_action(&runtime, &operation, Some(&current))
+                    .map_err(|error| format!("immutable authority evaluation failed: {error:?}"))?,
+                AuthorityAction::Continue
+            ),
+            "an exact persisted connection operation must pass immutable internal admission without a mutable service envelope"
+        );
+        let mut unrelated_runtime = runtime.clone();
+        unrelated_runtime.metadata.uid = Some("long-running-runtime-uid".to_owned());
+        assert!(
+            matches!(
+                connection_operation_authority_action(
+                    &unrelated_runtime,
+                    &operation,
+                    Some(&current)
+                )
+                .map_err(|error| format!("exact-UID rejection failed: {error:?}"))?,
+                AuthorityAction::Suspend
+            ),
+            "internal authority must never attach to a different or long-running runtime UID"
+        );
+        let mut ordinary_tool_runtime = runtime.clone();
+        ordinary_tool_runtime.spec.tools[0].resource = "repository".to_owned();
+        ordinary_tool_runtime.spec.tools[0].action = "get_file_contents".to_owned();
+        assert!(
+            matches!(
+                connection_operation_authority_action(
+                    &ordinary_tool_runtime,
+                    &operation,
+                    Some(&current)
+                )
+                .map_err(|error| format!("ordinary-tool rejection failed: {error:?}"))?,
+                AuthorityAction::Suspend
+            ),
+            "provider-control authority must not authorize an ordinary GitHub MCP tool"
+        );
+        assert!(
+            matches!(
+                connection_operation_authority_action(&runtime, &operation, None)
+                    .map_err(|error| format!("missing-binding rejection failed: {error:?}"))?,
+                AuthorityAction::Suspend
+            ),
+            "missing current execution bindings must fail closed"
+        );
+        Ok(())
+    }
 
     #[test]
     fn task_state_table_releases_holds_executes_running_runtimes_and_preserves_ownership()

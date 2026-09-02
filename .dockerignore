@@ -4,7 +4,7 @@
 build
 charts
 target
-e2e/target
+e2e
 node_modules
 web/.next
 test-results

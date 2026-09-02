@@ -3,12 +3,11 @@
 pub mod agent_runs_ui;
 pub mod browser_admin;
 pub mod browser_auth;
-pub mod browser_hop1_attestation;
 mod browser_security;
 pub mod connections;
 mod github_actions;
 pub mod google_oidc;
-pub mod mcp_gw_connections;
+pub mod governed_connections;
 pub mod stable_runtime_bridge;
 mod tasks;
 pub mod user_envelopes;
@@ -2068,7 +2067,8 @@ impl IntoResponse for ApiError {
                 StoreError::TaskNotFound
                 | StoreError::CanonicalIdentityNotFound
                 | StoreError::EnvelopeRequestNotFound
-                | StoreError::WorkflowNotFound,
+                | StoreError::WorkflowNotFound
+                | StoreError::ConnectionOperationNotFound,
             ) => StatusCode::NOT_FOUND,
             Self::Store(StoreError::CanonicalIdentityInactive) => StatusCode::FORBIDDEN,
             Self::TaskNotReady | Self::TaskRuntimeContractUnavailable(_) => {
@@ -2098,7 +2098,9 @@ impl IntoResponse for ApiError {
                 | StoreError::InvalidEnvelopeRequestTransition
                 | StoreError::CanonicalIdentityStale
                 | StoreError::CanonicalIdentityAmbiguousEmail
-                | StoreError::CanonicalIdentityConflict,
+                | StoreError::CanonicalIdentityConflict
+                | StoreError::ConnectionOperationConflict
+                | StoreError::ConnectionOAuthFlowPending,
             ) => StatusCode::CONFLICT,
             Self::Store(
                 StoreError::InvalidGrantExpiry
@@ -2110,7 +2112,8 @@ impl IntoResponse for ApiError {
                 | StoreError::InvalidBrowserRbacRecord
                 | StoreError::InvalidTaskIdentityBinding
                 | StoreError::InvalidEnvelopeRequest
-                | StoreError::InvalidWorkflow,
+                | StoreError::InvalidWorkflow
+                | StoreError::InvalidConnectionOperation,
             ) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Store(StoreError::InvalidRunQuery | StoreError::InvalidRunCursor) => {
                 StatusCode::BAD_REQUEST
@@ -5933,6 +5936,9 @@ mod tests {
                     user_envelope_instance_id: request.user_envelope_instance_id.map(str::to_owned),
                     user_envelope_revision: request.user_envelope_revision,
                     user_envelope_digest: request.user_envelope_digest.map(str::to_owned),
+                    internal_authority_id: None,
+                    internal_authority_version: None,
+                    internal_authority_digest: None,
                     coding_agent_runtime: request.coding_agent_runtime.to_owned(),
                     runtime_uid: None,
                     runtime_namespace: request.runtime_namespace.to_owned(),

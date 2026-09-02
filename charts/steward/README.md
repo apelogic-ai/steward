@@ -85,31 +85,22 @@ Google's endpoints evolve. A local isolated lane may instead set
 `networkPolicy.enabled=false`; that is not a substitute for a production
 egress policy.
 
-## Browser-to-MCP HOP-1
+## Governed provider connections
 
-`browserHop1` is separately disabled by default. When enabled, it can be used
-only with enabled `browserAuth`; every MCP-GW origin, private Identity exchange
-endpoint, assertion issuer/audience/key ID, signer Secret reference, public
-JWKS ConfigMap reference, and projected service-account-token audience is
-required together. The apiserver receives the signer and public JWKS read-only,
-and projects a short-lived service-account token only for the private Identity
-exchange. It mounts the configured `workloadExchangeTrust` CA bundle to verify
-that Identity TLS endpoint; certificate verification is never disabled.
+`connectionsBridge` is disabled by default. Enabling it requires browser
+authentication plus a digest-pinned bridge image, provenance identity, source
+repository and commit, attestation bundle, exact MCP-GW origin, and dedicated
+runtime namespace. Authority v1 also requires the exact MCP-GW `0.3.2` contract;
+another configured version fails closed. The apiserver records those values on each operation; the
+controller verifies the same snapshot before creating or executing the
+short-lived `steward-connections` runtime.
 
-The chart grants apiserver egress only to the configured MCP-GW and Identity
-namespaces/ports while this feature is enabled. The deployment must configure
-Identity's private workload policy to grant `browser-hop1-issuer` exclusively
-to the rendered apiserver service account and must project the same public
-JWKS into Identity. The chart does not create signing keys, JWKS, Identity
-policy, an OAuth client, or a public edge.
-
-For a local topology whose MCP-GW provider wrapper is HTTP-only inside the
-cluster, `browserHop1.loopbackProxy` can explicitly add one immutable
-`socat` sidecar. It is disabled by default. When enabled it accepts traffic
-only on the apiserver pod's `127.0.0.1:18080`, forwards only to the configured
-Kubernetes service host/port, and requires `mcpGatewayOrigin` to be exactly
-`http://127.0.0.1:18080`. This is a local network adapter—not a browser
-endpoint, credential store, or relaxed production TLS mode.
+The browser never receives a HOP-1 token and the apiserver never calls MCP-GW
+directly. OpenShell attaches MCP-GW to the one-shot runtime and obtains its
+ordinary Steward Mint identity. The bridge has no inference provider, uses one
+fixed provider-control grant, and is finalized through the normal controller
+lifecycle. Changing a configured image, endpoint, MCP-GW version, namespace, or runtime class
+does not reinterpret an existing operation; it fails closed.
 
 The globally bound controller and mint ClusterRoles have no Secret verbs.
 Runtime Secret access is granted by namespaced Roles and RoleBindings only for

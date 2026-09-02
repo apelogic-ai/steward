@@ -4,7 +4,7 @@
 //! supervisor replaces it at the governed egress boundary; this adapter never
 //! accepts or reads a credential, provider origin, or caller identity.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::header::AUTHORIZATION;
 use reqwest::{Client, Method, StatusCode, Url};
@@ -14,6 +14,8 @@ use steward_ports::PortError;
 pub const IMPLEMENTED_PORTS: [&str; 0] = [];
 const OPEN_SHELL_BEARER_PLACEHOLDER: &str = "openshell-token-grant-placeholder";
 const MAX_RESPONSE_BYTES: usize = 32 * 1024;
+const PROVIDER_TRANSPORT_READY_TIMEOUT: Duration = Duration::from_secs(12);
+const PROVIDER_TRANSPORT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_PATH: &str = "/oauth/github/status";
 const START_PATH: &str = "/oauth/github/start";
 const DISCONNECT_PATH: &str = "/oauth/github/disconnect";
@@ -121,18 +123,57 @@ impl GithubMcpGateway {
         }
         let (method, path) = operation.method_and_path();
         let target = endpoint(&self.origin, path)?;
-        let mut http = self.client.request(method, target).header(
-            AUTHORIZATION,
-            format!("Bearer {OPEN_SHELL_BEARER_PLACEHOLDER}"),
-        );
-        if let Some(body) = request.body() {
-            http = http.json(&body);
-        }
-        let response = http.send().await.map_err(|_| unavailable("call MCP-GW"))?;
-        let status = response.status();
-        let body = read_bounded(response).await?;
+        let body = request.body();
+        let started = Instant::now();
+        let (status, body) = loop {
+            let mut http = self.client.request(method.clone(), target.clone()).header(
+                AUTHORIZATION,
+                format!("Bearer {OPEN_SHELL_BEARER_PLACEHOLDER}"),
+            );
+            if let Some(body) = &body {
+                http = http.json(body);
+            }
+            let response = match http.send().await {
+                Ok(response) => response,
+                Err(error)
+                    if error.is_connect()
+                        && started.elapsed() < PROVIDER_TRANSPORT_READY_TIMEOUT =>
+                {
+                    tokio::time::sleep(PROVIDER_TRANSPORT_RETRY_INTERVAL).await;
+                    continue;
+                }
+                Err(_) => return Err(unavailable("call MCP-GW")),
+            };
+            let status = response.status();
+            let body = read_bounded(response).await?;
+            if pre_dispatch_provider_failure(status, &body)
+                && started.elapsed() < PROVIDER_TRANSPORT_READY_TIMEOUT
+            {
+                tokio::time::sleep(PROVIDER_TRANSPORT_RETRY_INTERVAL).await;
+                continue;
+            }
+            break (status, body);
+        };
         parse_response(operation, status, &body)
     }
+}
+
+fn pre_dispatch_provider_failure(status: StatusCode, body: &[u8]) -> bool {
+    if status == StatusCode::UNAUTHORIZED {
+        return true;
+    }
+    if status != StatusCode::BAD_GATEWAY {
+        return false;
+    }
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|object| {
+            object.len() == 2
+                && object.get("error").and_then(Value::as_str) == Some("token_grant_failed")
+                && object.get("detail").and_then(Value::as_str)
+                    == Some("dynamic token grant failed")
+        })
 }
 
 fn parse_response(
@@ -142,28 +183,45 @@ fn parse_response(
 ) -> Result<Value, PortError> {
     match operation {
         GithubBridgeOperation::Status => {
-            if status != StatusCode::OK {
-                return Err(unavailable("read GitHub connection status"));
-            }
+            require_status(status, StatusCode::OK, "read GitHub connection status")?;
             let object = json_object(body, "GitHub status response")?;
             validate_status_response(&object)?;
             Ok(Value::Object(object))
         }
         GithubBridgeOperation::Start => {
-            if status != StatusCode::OK {
-                return Err(unavailable("start GitHub connection"));
-            }
+            require_status(status, StatusCode::OK, "start GitHub connection")?;
             let object = json_object(body, "GitHub start response")?;
             let authorization_url = exact_string_field(&object, "authorizationUrl")?;
             validate_authorization_url(&authorization_url)?;
             Ok(json!({"authorizationUrl": authorization_url}))
         }
         GithubBridgeOperation::Disconnect => {
-            if status != StatusCode::NO_CONTENT || !body.is_empty() {
+            require_status(
+                status,
+                StatusCode::NO_CONTENT,
+                "disconnect GitHub connection",
+            )?;
+            if !body.is_empty() {
                 return Err(unavailable("disconnect GitHub connection"));
             }
             Ok(json!({"disconnected": true}))
         }
+    }
+}
+
+fn require_status(
+    actual: StatusCode,
+    expected: StatusCode,
+    operation: &str,
+) -> Result<(), PortError> {
+    if actual == expected {
+        Ok(())
+    } else if actual == StatusCode::UNAUTHORIZED {
+        Err(failed("MCP-GW rejected runtime authentication"))
+    } else if actual == StatusCode::FORBIDDEN {
+        Err(failed("MCP-GW rejected runtime authorization"))
+    } else {
+        Err(unavailable(operation))
     }
 }
 
@@ -304,15 +362,30 @@ fn rejected(reason: &str) -> PortError {
 }
 
 fn unavailable(operation: &str) -> PortError {
+    failed(&format!(
+        "MCP-GW unavailable while attempting to {operation}"
+    ))
+}
+
+fn failed(reason: &str) -> PortError {
     PortError::Failed {
-        reason: format!("MCP-GW unavailable while attempting to {operation}"),
+        reason: reason.to_owned(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GithubBridgeOperation, GithubBridgeRequest, parse_response};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    use super::{
+        GithubBridgeOperation, GithubBridgeRequest, GithubMcpGateway, parse_response,
+        pre_dispatch_provider_failure,
+    };
     use reqwest::StatusCode;
+    use steward_ports::PortError;
 
     #[test]
     fn start_request_rejects_non_allowlisted_redirect_and_unknown_fields() {
@@ -401,5 +474,157 @@ mod tests {
             parse_response(GithubBridgeOperation::Disconnect, StatusCode::OK, b"").is_err(),
             "disconnect is only complete on the exact MCP-GW no-content response"
         );
+    }
+
+    #[test]
+    fn provider_control_http_failures_are_reduced_to_non_secret_runtime_categories() {
+        assert_eq!(
+            parse_response(
+                GithubBridgeOperation::Status,
+                StatusCode::UNAUTHORIZED,
+                b"ignored",
+            ),
+            Err(PortError::Failed {
+                reason: "MCP-GW rejected runtime authentication".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse_response(
+                GithubBridgeOperation::Status,
+                StatusCode::FORBIDDEN,
+                b"ignored",
+            ),
+            Err(PortError::Failed {
+                reason: "MCP-GW rejected runtime authorization".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse_response(
+                GithubBridgeOperation::Status,
+                StatusCode::BAD_GATEWAY,
+                b"ignored",
+            ),
+            Err(PortError::Failed {
+                reason: "MCP-GW unavailable while attempting to read GitHub connection status"
+                    .to_owned(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_control_waits_for_the_openshell_provider_transport_to_become_ready()
+    -> Result<(), String> {
+        let reservation = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("reserve a loopback MCP-GW fixture address: {error}"))?;
+        let address = reservation
+            .local_addr()
+            .map_err(|error| format!("read the loopback fixture address: {error}"))?;
+        drop(reservation);
+        let server = thread::spawn(move || -> Result<(), String> {
+            thread::sleep(Duration::from_millis(300));
+            let listener = TcpListener::bind(address).map_err(|error| {
+                format!("bind the delayed MCP-GW fixture at its reserved address: {error}")
+            })?;
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("accept the retried request: {error}"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|error| format!("bound the fixture read: {error}"))?;
+            let mut request = [0_u8; 2048];
+            let read = stream
+                .read(&mut request)
+                .map_err(|error| format!("read the retried request: {error}"))?;
+            assert!(
+                String::from_utf8_lossy(&request[..read]).starts_with("GET /oauth/github/status "),
+                "the readiness retry must preserve the exact provider-control request"
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 19\r\nConnection: close\r\n\r\n{\"connected\":false}",
+                )
+                .map_err(|error| format!("write the delayed MCP-GW response: {error}"))?;
+            Ok(())
+        });
+        let gateway = GithubMcpGateway::new(&format!("http://{address}"))
+            .map_err(|error| format!("build the MCP-GW fixture adapter: {error:?}"))?;
+
+        let response = gateway
+            .execute(GithubBridgeOperation::Status, GithubBridgeRequest::Empty)
+            .await
+            .map_err(|error| {
+                format!("the bridge must tolerate the bounded provider-readiness race: {error:?}")
+            })?;
+
+        server
+            .join()
+            .map_err(|_| "MCP-GW fixture thread panicked".to_owned())??;
+        assert_eq!(response, serde_json::json!({"connected": false}));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_control_retries_only_a_pre_dispatch_token_grant_failure() -> Result<(), String>
+    {
+        let exact = br#"{"error":"token_grant_failed","detail":"dynamic token grant failed"}"#;
+        assert!(pre_dispatch_provider_failure(
+            StatusCode::BAD_GATEWAY,
+            exact
+        ));
+        assert!(
+            !pre_dispatch_provider_failure(StatusCode::BAD_GATEWAY, b""),
+            "an indistinguishable generic upstream 502 must not retry a mutation"
+        );
+        assert!(
+            !pre_dispatch_provider_failure(
+                StatusCode::BAD_GATEWAY,
+                br#"{"error":"upstream_unreachable","detail":"connection failed"}"#,
+            ),
+            "a different OpenShell 502 must not retry a mutation"
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind the OpenShell token-grant fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read the token-grant fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            for response in [
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: 68\r\nConnection: close\r\n\r\n{\"error\":\"token_grant_failed\",\"detail\":\"dynamic token grant failed\"}"
+                    .as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 19\r\nConnection: close\r\n\r\n{\"connected\":false}"
+                    .as_slice(),
+            ] {
+                let (mut stream, _) = listener
+                    .accept()
+                    .map_err(|error| format!("accept provider request: {error}"))?;
+                let mut request = [0_u8; 2048];
+                stream
+                    .read(&mut request)
+                    .map_err(|error| format!("read provider request: {error}"))?;
+                stream
+                    .write_all(response)
+                    .map_err(|error| format!("write provider response: {error}"))?;
+            }
+            Ok(())
+        });
+        let gateway = GithubMcpGateway::new(&format!("http://{address}"))
+            .map_err(|error| format!("build the MCP-GW fixture adapter: {error:?}"))?;
+
+        let result = gateway
+            .execute(GithubBridgeOperation::Status, GithubBridgeRequest::Empty)
+            .await;
+        if result.is_err() {
+            let _ = TcpStream::connect(address);
+        }
+        server
+            .join()
+            .map_err(|_| "token-grant fixture thread panicked".to_owned())??;
+
+        assert_eq!(
+            result,
+            Ok(serde_json::json!({"connected": false})),
+            "OpenShell's exact synthetic token-grant 502 produced before dispatch must be retried"
+        );
+        Ok(())
     }
 }

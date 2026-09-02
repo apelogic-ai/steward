@@ -23,6 +23,7 @@ steward-adapter-github-artifact = { path = "../../adapters/github-artifact", ver
 steward-ports = { path = "../steward-ports", version = "=0.0.0" }
 steward-store = { path = "../steward-store", version = "=0.0.0" }
 steward-types = { path = "../steward-types", version = "=0.0.0" }
+tokio = { workspace = true, features = ["time"] }
 utoipa.workspace = true
 uuid.workspace = true
 

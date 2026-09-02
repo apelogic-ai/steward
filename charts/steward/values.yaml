@@ -49,30 +49,6 @@ browserAuth:
     clientSecret:
       name: ""
       key: ""
-browserHop1:
-  # Disabled unless browser authentication, a private Identity exchange endpoint,
-  # and every signer/projection input are supplied together.
-  enabled: false
-  mcpGatewayOrigin: ""
-  identityEndpoint: ""
-  issuer: ""
-  assertionAudience: ""
-  keyId: ""
-  signingKeySecret:
-    name: ""
-    key: ""
-  publicJwksConfigMap:
-    name: ""
-    key: ""
-  serviceAccountTokenAudience: ""
-  # A local-only TCP bridge may expose an in-cluster HTTP provider endpoint
-  # to the browser-session broker's explicit 127.0.0.1 origin. It is disabled
-  # by default and every enabled input is immutable and explicit.
-  loopbackProxy:
-    enabled: false
-    image: ""
-    targetHost: ""
-    targetPort: 0
 workloadExchangeTrust:
   kind: ConfigMap
   name: steward-workload-exchange-ca
@@ -124,9 +100,20 @@ stableBridge:
   sourceRepository: ""
   sourceCommit: ""
   service: ""
-  # Exact MCP-GW origin injected only into the one-shot bridge runtime by the controller.
-  mcpGatewayOrigin: ""
   # A public GitHub artifact-attestation bundle; it is mounted read-only, not stored as a Secret.
+  attestationBundle: ""
+connectionsBridge:
+  # Disabled unless the governed Connections surface and its immutable bridge artifact are
+  # configured together. This identity and lifecycle are separate from stable agent runtimes.
+  enabled: false
+  image: ""
+  signerIdentity: ""
+  sourceRepository: ""
+  sourceCommit: ""
+  mcpGatewayOrigin: ""
+  # Authority v1 is valid only for the exact MCP-GW OAuth contract in release 0.3.2.
+  mcpGatewayVersion: ""
+  runtimeNamespace: ""
   attestationBundle: ""
 runtimeNamespaces: []
 networkPolicy:

@@ -56,6 +56,10 @@ path = "openshell_adapter_v0098.rs"
 name = "postgres_tls"
 path = "postgres_tls.rs"
 
+[[test]]
+name = "governed_connections"
+path = "governed_connections.rs"
+
 [[bin]]
 name = "s3-server"
 path = "s3_server.rs"
