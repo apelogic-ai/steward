@@ -11,13 +11,14 @@ instance-bound grants.
 
 | If you want to know | Read |
 |---|---|
-| M1 cross-product delivery and frozen contracts | [M1 delivery plan](docs/m1-delivery-plan.md) |
-| What Steward is and why | `docs/solution-overview.md` |
-| What we are building, and in what order | `docs/roadmap/steward-roadmap.md` |
-| Implemented v0.1.x Task lifecycle and identity contract | `docs/task-submission-api.md` |
-| Canonical browser / Task person identity | `docs/canonical-user-identity-v1.md` |
-| Deploy the Task API and worker | `config/task/README.md` |
-| The rules for changing this repository | `AGENTS.md` |
+| Documentation authority, status, and navigation | [Documentation index](docs/README.md) |
+| Normative M1 fields, ownership, and compatibility | [Frozen `steward.m1/v1` contract](docs/contracts/m1/v1/README.md) |
+| Accepted post-M1 Agent, Task, session, and runtime semantics | [Post-M1 architecture baseline](docs/v2/README.md) |
+| Post-M1 contracts that remain unresolved | [Deferred-contract register](docs/v2/deferred-implementation-contracts.md) |
+| Implemented v0.1.x Task lifecycle and identity contract | [Task submission API](docs/task-submission-api.md) |
+| Canonical browser / Task person identity | [Canonical user identity](docs/canonical-user-identity-v1.md) |
+| Deploy the Task API and worker | [Task deployment](config/task/README.md) |
+| The rules for changing this repository | [Agent rules](AGENTS.md) |
 | Run the complete local gate | `cargo xtask ci` |
 
 ## Layout
@@ -61,20 +62,25 @@ crates/steward-mint/
   AGENTS.md                   holds the signing key; human review required
 
 docs/
-  m1-delivery-plan.md           M1 dependency checkpoints and frozen contract link
+  README.md                     documentation authority, status, and navigation
   contracts/m1/v1/             M1 schemas, fixtures, ownership, compatibility
-  solution-overview.md        the architecture and the position it takes
-  data-plane-spec.md          tiers, gateways, the Tier 1 membership test
+  v2/README.md                 accepted post-M1 semantics; not a wire contract
+  v2/deferred-implementation-contracts.md
+                               the sole current post-M1 deferred-contract register
   task-submission-api.md      lifecycle REST, tar paths, limits, identity boundary
   canonical-user-identity-v1.md
                               immutable user ID, Google OIDC mapping, reconnect contract
-  workflow-and-task-spec.md   Plane B object model — Workflow, Task, journal
-  steward-ai-workflows-fit.md charter fit; where the gaps are
+  m1-delivery-plan.md         historical M1 delivery dependency index
+  solution-overview.md       historical long-running-agent exploration
+  data-plane-spec.md         historical multi-step data-plane exploration
+  workflow-and-task-spec.md  redirect from the superseded Workflow proposal
+  steward-ai-workflows-fit.md
+                              historical workload-mapping exploration
   guarantee-register-generation.md
-                              how the register's status column is derived
+                              historical register-generation design note
 
   roadmap/
-    steward-roadmap.md        stack, slices S0–S5, dependency posture, cadence
+    steward-roadmap.md        historical v0.1 roadmap
 
   upstream/
     openshell-upstream-strategy.md
@@ -86,14 +92,18 @@ docs/
 
 ## Reading order for someone new
 
-1. `docs/solution-overview.md` — the shape of the thing
-2. `docs/data-plane-spec.md` §Tier 1 membership test — the rule that decides
-   where any new capability belongs
-3. `docs/roadmap/steward-roadmap.md` §1 (definition of done) and §6 (the slices)
-4. `AGENTS.md` — before touching anything
+1. [`docs/README.md`](docs/README.md) — choose the authoritative document for the
+   question and understand its status.
+2. For M1 integration, read the
+   [frozen `steward.m1/v1` contract](docs/contracts/m1/v1/README.md). For accepted
+   post-M1 architecture, read [`docs/v2/README.md`](docs/v2/README.md). For current
+   implementation, follow the surface-specific documents from the index.
+3. [`AGENTS.md`](AGENTS.md) — before touching anything.
 
-Plane B (`docs/workflow-and-task-spec.md`) is out of scope for v0.1.0. Read it
-for the object model it commits to, not as a build plan.
+The solution overview, data-plane specification, original roadmap, AI-workflow fit
+analysis, and Workflow proposal are historical context. They are not current contracts,
+implementation status, or committed post-M1 object models. In particular, Steward has
+no accepted domain object named `Workflow`.
 
 ## What is deliberately not here yet
 
@@ -103,13 +113,13 @@ for the object model it commits to, not as a build plan.
   supervisor-identity patch until its upstream exit condition lands. The
   ephemeral identity spike builds that patched supervisor from its immutable
   source revision; S3 and S4 run independently of it.
-- **`dev-integration-spec.md`** — referenced as a companion by the roadmap but
-  not present in this package. Add it if it is still current; the roadmap
-  supersedes its sequencing but not its detail.
-- **Connector-specific plans.** Burble is named in the roadmap as the worked
-  example of a frontend connector (§2.6.7) — an API client that bridges Steward
-  to Slack. Its own roadmap and migration plan live with the connector, not
-  here.
+- **Post-M1 wire contracts.** The accepted semantic boundaries are documented, but
+  their unresolved schemas and protocols remain in the
+  [deferred-contract register](docs/v2/deferred-implementation-contracts.md).
+- **Connector-specific plans.** Burble is the worked example of a frontend connector.
+  The accepted boundary is documented in the
+  [post-M1 architecture baseline](docs/v2/README.md); its own roadmap and migration
+  plan live with the connector, not here.
 - **A filled-in push escalation** (`AGENTS.md` §1.3) — left blank on purpose.
   Guessing it produces exactly the retry loop the section prevents. Record it
   the first time someone resolves it.
