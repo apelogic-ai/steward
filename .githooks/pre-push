@@ -16,7 +16,7 @@ while IFS= read -r path; do
     AGENTS.md|CLAUDE.md|*/AGENTS.md|*/CLAUDE.md|docs/contracts/*|docs/examples/*)
       docs_only=0
       ;;
-    *.md|docs/*.png|docs/*.jpg|docs/*.jpeg|docs/*.gif|docs/*.svg|docs/*.webp)
+    README.md|docs/*.md|docs/*.png|docs/*.jpg|docs/*.jpeg|docs/*.gif|docs/*.svg|docs/*.webp)
       ;;
     *)
       docs_only=0

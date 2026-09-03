@@ -138,11 +138,13 @@ cargo xtask check-neutrality
 cargo xtask check-secrets
 ```
 
-Documentation-only means Markdown and static images under `docs/`. It excludes
-agent instructions, executable examples, `docs/contracts/`, schemas, fixtures,
+Documentation-only means Markdown and static images under `docs/`. The
+repository-root `README.md` is the sole path exception and uses the same
+documentation-only gate. Other Markdown outside `docs/` does not qualify. Agent
+instructions, executable examples, `docs/contracts/`, schemas, fixtures,
 generated artifacts, source, tests, scripts, dependencies, policy, build,
-deployment, CI, hooks, and migrations. A mixed or uncertain diff uses the full
-gate.
+deployment, CI, hooks, and migrations remain excluded. A mixed or uncertain diff
+uses the full gate.
 
 For every other change, run:
 
