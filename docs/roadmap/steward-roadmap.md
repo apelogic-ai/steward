@@ -1,9 +1,15 @@
 # Steward Roadmap — Zero to PoC v0.1.0
 
-Status: draft — stack decisions, slice plan, and upstream dependency schedule
+Status: historical v0.1 roadmap; not current implementation status or contract authority
 Audience: ApeLogic engineering
-Companions: *Solution Overview*, *Dev & Integration Spec*, *Data Plane Spec*,
-*Workflow and Task*, *AI-Workflow Charter Fit*, *OpenShell Upstream Strategy*
+
+> Slice states, implementation claims, decisions, and open items below describe the
+> roadmap when it was written. They are not evidence of current repository behavior.
+> The multi-step Steward `Workflow` proposal was not adopted, and this document's use of
+> `AgentRuntime` for a persistent desired-state object is superseded by `AgentInstance`.
+> Use the [documentation index](../README.md), [post-M1 baseline](../v2/README.md),
+> [deferred-contract register](../v2/deferred-implementation-contracts.md), and
+> [frozen M1 contract](../contracts/m1/v1/README.md) instead.
 
 > **Thesis.** The specs have accreted into two systems. **Plane A** is the provisioning
 > and governance control plane — manifest, envelope, admission, escalation, identity,
@@ -1054,35 +1060,13 @@ gRPC surface would be inventing them.
 
 ---
 
-## 10. Open decisions carried
+## 10. Historical decision notes
 
-**Status.** Sixteen of seventeen resolved or ratified. D11 is open by design. D17 is parked
-until a customer deployment. D16 was opened and closed during the same review — narrowing an
-envelope beneath a running agent had no defined behaviour at all.
-
-**Naming.** Slices are `S-1`…`S5`. Decisions are `D1`…`D17`. They collided in an earlier
-draft and the collision was live — §8.1 read "measured in S3 … (S8)" with one meaning a
-slice and one a decision.
-
-| # | Decision | Resolution | Cost of deferring | Blocks |
-|---|---|---|---|---|
-| **D1** | **RESOLVED — workspace-per-`AgentRuntime`** | **No. `Team = workspace` (*Data Plane Spec* §6); envelopes layer within. Per-agent workspaces would be the third boundary both that spec and *Upstream Strategy* position 4 refuse. The one argument for it — per-agent model routing at Tier 0 — fails on its own terms: routes are workspace-scoped since #2243, but B1 stands and a route pins *one* model, while `spec.llms` is a list. What remains is blast radius without isolation, since isolation is name-based until Phase 2** | — | **S0.0, S0** |
-| **D2** | **RESOLVED — LiteLLM key delivery** | **Token-grant exchange, with the Steward mint as the `token_endpoint`. The supervisor pulls a per-sandbox JWT-SVID (`ClusterSPIFFEID` from `openshell.io/sandbox-id`), exchanges it at the mint, and injects the returned per-runtime virtual key — nothing is delivered into the sandbox. Revocation becomes a property of the mechanism, attribution is structural, and it reuses S1's exchanger. The #1970 uniform-scope concern applies to third-party endpoints, not to one we operate: what returns is derived from the SVID identity, not the requested scope** | — | **S2** |
-| **D3** | **RATIFIED — session recording granularity** | **At the relay, one tap, typed events. Not inside the sandbox (that breaks role-implementation purity), not per-frontend (that fragments it). Access to recordings is a **separate authorization path** from live subscription — see D4 point 5** | deferred with the plane | — |
-| **D4** | **RESOLVED — break-glass admin access** | **Yes, and defensible because it is loud. (1) A distinct named operation, never an admin role that quietly passes the entitlement check — otherwise there is no line between routine and emergency and no signal that anything happened. (2) The acting user is **always** notified, immediately; this is the property that makes it acceptable. (3) Recorded in `runtime_events` with a reason, visible in the fleet view. (4) Time-bounded to T; continuing means re-invoking, which re-notifies. (5) **Never retroactive** — a live subscription only. Recordings are a separate authorization path, because "watch during an incident" and "read everything this person's agent has done" are different powers. The requirement is narrower than it looks: most incident response is *suspend or terminate*, which needs no session access at all** | deferred with the plane | — |
-| **D5** | **RESOLVED — envelope granularity** | **Member-role envelopes shipped in S3; Phase C adds service envelopes on the same `(scope_kind, scope_ref, revision)` key. Equal role and service names remain isolated by `scope_kind`. Team and cost-centre composition is still unimplemented: when it arrives, envelopes intersect, never union. Widening remains the job of instance-bound `grants`, never envelope mutation.** | — | **S3, Phase C** |
-| **D6** | **RESOLVED — HOP-1 signing algorithm** | **EdDSA (Ed25519). The premise for RS256 was false: `mcp-gw`'s `validateHop1Jwt` passes no `algorithms` option to `jwtVerify`, so it accepts whatever the trusted issuer's JWKS advertises. Ed25519 costs zero verifier changes. `validateHop1JwtForIssuers` already iterates issuers with independent JWKS, so the Steward mint is added beside the proto-mint with a different algorithm — no cutover. Algorithm is mint-side config as a closed enum (`Ed25519 \| RS256`), never a free string, never `none`, never an HMAC family** | — | **S1** |
-| **D7** | **RESOLVED — `steward-admission` vs #2109** | **Split by role, decided in advance. **Containment** (manifest vs. ceiling — pure, stateless, no Steward concepts) is *deletable*: if #2109's managed maximum can express our four envelope dimensions (models, tools, budget, TTL), we delete ours and call theirs. **Composition and consequence** (envelope revisions, structured deltas, parking, instance grants, the queue) never goes upstream — it is the product. If containment moves, G-1/G-5 mechanism lines change from ours to upstream's and gain conformance tests, because we would then depend on a behaviour rather than implement it. Build nothing toward it: a separable crate is deletable, and that is all the preparation an unmerged draft warrants** | — | — |
-| **D8** | **RESOLVED — authority re-verification interval** | **G-3 restated: not "a policy change propagates within N seconds" but **an agent's authority is re-verified at most every T seconds.** The enforcement clock is the HOP-1 TTL — a number we set, not a latency we measure. `STEWARD_AUTHORITY_TTL`, default **60s**, with the token-grant access-token cache aligned to it so the two clocks cannot disagree. Revocation does not wait for T: suspend and terminate delete the LiteLLM key and refuse at the mint immediately (G-4, different mechanism, faster)** | — | **S3** |
-| **D9** | **RATIFIED — publishing the conformance suite** | **Not in v0.1.0. Leverage in the #1613 conversation later — an integrator's conformance suite is close to what RFC 0014 is reaching for. Kept publishable by default: neutral by rule (`AGENTS.md` §12) and generated with provenance, so publishing is a render rather than a project** | **low — pure upside, no urgency** | — |
-| **D10** | **RESOLVED — `main` vs `master`** | **`main`. Greenfield repo, git's default since 2.28, what every tool assumes. Other repos are not renamed; each repo's `AGENTS.md` states its own branch and the nearest file wins** | — | **S-1** |
-| **D11** | **OPEN BY DESIGN — push escalation for the biometric-key socket failure** | **Unresolvable in advance, deliberately. Guessing the command produces exactly the retry loop `AGENTS.md` §1.3 exists to prevent. Record it there the first time someone resolves it** | **low per occurrence; recurs until written down** | — |
-| **D12** | **RESOLVED — shared/manual DEV** | **DEV exists (AWS, one EC2 per product, Terraform + Ansible + docker compose) and holds real credentials. Steward cannot use it as-is: no API server means no CRD, no operator, no admission webhook. Steward's DEV is Kubernetes — **k3s or kind on the existing EC2** first; EKS when there is a customer deployment to mirror. Test infrastructure stays local-ephemeral regardless (§5). The §5.4 guard becomes mechanical in S-1: the harness asserts the kube context matches the local pattern and refuses otherwise** | — | **S-1** |
-| **D13** | **RESOLVED — which ports exist in v0.1.0** | **all eight, defined in S-1. Five reach `proven`, three stay `provisional` (§2.5.4). Traits are not versioned; the two wire contracts that cross a boundary are** | — | **S-1** |
-| **D14** | **RESOLVED — a second OpenShell adapter** | **No. Class B is a deliberate bet. The seam bounds the blast radius to one crate if it ever needs unwinding, but nothing is built toward portability we are not buying — an ambiguous "maybe" invites a half-built abstraction that constrains the design without ever being exercised (R14). If OpenShell is abandoned, we rewrite `adapters/openshell`; §8 and the upstream lane are the mitigation, and §8.8 already says GA timing is coupled** | — | — |
-| **D15** | **RATIFIED — GitHub as an input channel** | **Not in v0.1.0, and not until §2.6.5's principal resolution is built and tested. Our upstream work is on public repositories, so comment authorship is not identity: the adapter must resolve an authenticated org member with a verified corporate email mapping and reject everything else** | **high if built carelessly — R6 with an internet-facing front door** | — |
-| **D16** | **RESOLVED — a running agent whose envelope is narrowed beneath it** | **Suspend at next re-verify (≤ T). The envelope edit carries `enforcement`: `immediate` (default — running agents outside the new envelope suspend) or `on_next_admission` (they continue; the narrower envelope binds new requests and any spec change), which requires a reason recorded in `runtime_events`. Suspension is not termination: state is kept and the agent resumes if the envelope is restored or an instance-bound grant is issued. The editor's blast-radius view must show the count of agents and owners a narrowing will suspend *before* the click, or admins will choose `on_next_admission` out of fear and defeat the default** | — | **S3** |
-| **D17** | **EKS for Steward's shared DEV, and org-wide** | **Not now, and not coupled. k3s/kind on the existing EC2 gives a real API server, real CRDs, a real webhook and a real `helm install` at near-zero incremental cost — most of the parity that matters for a PoC. EKS adds IRSA, managed control plane, LoadBalancer services, storage classes and cert-manager DNS: deployment concerns that matter when deploying *for* a customer. Migrating the other products is a separate question; coupling it makes a platform migration a blocker for the PoC** | **low — revisit at first customer deployment** | — |
+The former D1-D17 ledger recorded roadmap-era choices and status. It is not a current
+decision register and must not be used to infer implementation. Accepted post-M1
+constraints are in the [post-M1 baseline](../v2/README.md); genuinely unresolved
+contracts are maintained only in the
+[deferred-contract register](../v2/deferred-implementation-contracts.md).
 
 ---
 

@@ -1,6 +1,6 @@
 # Ticket: Reconcile Steward documentation for M1 and long-running agents
 
-Status: ready for documentation implementation
+Status: accepted documentation reconciliation decision record
 
 ## Problem
 
@@ -380,19 +380,10 @@ Connectors never own admission, credentials, runtime lifecycle, or approval deci
 
 ## Deferred implementation contracts
 
-These do not reopen existing M1 or current public contracts. They are new post-M1 wire
-contracts to be designed separately:
-
-- exact AgentInstance CRD group, version, fields, conditions, and compatibility path;
-- exact AgentSession HTTP and streaming schemas;
-- resident-agent Task dispatch protocol;
-- durable storage implementation, quotas, retention, and state compatibility;
-- exact managed-agent Mint service identifier and any additional claims;
-- queue bounds, timeouts, drain periods, and idle policy;
-- team/shared AgentInstances;
-- cross-user collaboration;
-- TaskGraph orchestration; and
-- a future state migration or checkpoint format, if one is justified.
+The current set is maintained only in the
+[consolidated deferred-contract register](deferred-implementation-contracts.md). Those
+items do not reopen an existing M1 or public contract and require separate design and
+acceptance.
 
 ## Non-goals
 

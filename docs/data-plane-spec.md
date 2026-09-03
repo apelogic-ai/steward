@@ -1,9 +1,14 @@
 # Steward Data Plane — Task State, Storage, and the Tier 1 Block Inventory
 
-Status: draft — discussion record converted to positions
+Status: historical multi-step data-plane exploration; not implementation or contract authority
 Audience: ApeLogic engineering
-Companions: *Solution Overview*, *Dev & Integration Spec*, *OpenShell Upstream Strategy*
 Scope: where task state lives between steps, what earns a Tier 1 block, and what does not
+
+> This document preserves an earlier multi-step Workflow/data-plane proposal. It does
+> not establish an implemented executor, storage service, TaskGraph, or wire contract.
+> Use the [post-M1 baseline](v2/README.md) for accepted Task and durable-execution
+> semantics, the [deferred-contract register](v2/deferred-implementation-contracts.md)
+> for unresolved work, and the [frozen M1 contract](contracts/m1/v1/README.md) for M1.
 
 > **Framing.** The control plane question ("who may do what") is settled in the
 > companion specs. This document covers the **data plane**: what the agent reads and
@@ -375,18 +380,13 @@ routed to the approval queue that already exists. Not a background job, not a he
 
 ---
 
-## 12. Open decisions
+## 12. Historical decision notes
 
-| # | Decision | Position | Cost of deferring |
-|---|---|---|---|
-| D1 | Sandbox granularity default | per-segment; parking points are the boundary | low — SHA discipline keeps it tunable |
-| D2 | Git gateway now, or Tier 0 → `github.com` with PVC scratch | defer is acceptable at single-org scale | low, **if** the remote URL stays out of the step contract |
-| D3 | Registry proxy | build first; same box as the git gateway | **high** — agents cannot install packages today |
-| D4 | Mid-task reassignment semantics | new delegation, re-enters admission | **high** — retrofit is painful once owner is mutable |
-| D5 | Fetch proxy as `mcp-gw` tool vs. own block | own block if per-domain policy is wanted | medium |
-| D6 | Knowledge-layer labeling granularity (item / chunk / field) | undecided | **high** — schema-level, hard to change later |
-| D7 | Do test/build artifacts and dependency caches ride the PVC or the blob CAS | undecided; they are the actual reason to keep the PVC | medium |
-| D8 | Team rosters synced from GitHub teams | yes — roster in GitHub, authority in Steward | low |
+The former D1–D8 table belonged to this unadopted multi-step data-plane exploration and
+is not a current decision register. Accepted durability and isolation constraints are
+in the [post-M1 baseline](v2/README.md); remaining wire and implementation contracts are
+maintained only in the
+[deferred-contract register](v2/deferred-implementation-contracts.md).
 
 ---
 

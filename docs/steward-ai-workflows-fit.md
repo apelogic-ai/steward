@@ -1,10 +1,15 @@
 # Steward as Substrate for the AI-Workflow Charter
 
-Status: draft — mapping analysis, positions, and two gaps
+Status: historical workload-mapping exploration; not implementation or contract authority
 Audience: ApeLogic engineering
 Subject document: *AI-driven workflows — draft plan (what / where / why)*
-Companions: *Solution Overview*, *Data Plane Spec*, *Dev & Integration Spec*,
-*OpenShell Upstream Strategy*
+
+> This analysis predates the accepted Task atom and long-running-agent boundaries. Its
+> `Workflow`, planner, step, and `AgentRuntime` terminology is retained only as historical
+> context and must not be used to infer current objects or capabilities. Use the
+> [post-M1 baseline](v2/README.md), [deferred-contract register](v2/deferred-implementation-contracts.md),
+> [documentation index](README.md), and [upstream reference](upstream/openshell-upstream-strategy.md)
+> for current authority.
 
 > **Thesis.** The fit is one-directional. The workflow plan is a **workload catalog**;
 > Steward is the **substrate**. Nothing in the plan competes with anything in Steward,
@@ -385,19 +390,12 @@ No new tier, no new boundary, no new policy engine.
 
 ---
 
-## 11. Open decisions
+## 11. Historical decision notes
 
-| # | Decision | Position | Cost of deferring |
-|---|---|---|---|
-| A1 | Wave 0 / Wave 1 as authored envelopes | author both now; approving Wave 1 *is* the phase transition | low, high payoff |
-| A2 | Graph as artifact vs service | **artifact authoritative**, service is a read-only view | **high** — the plan's own hard-to-reverse call |
-| A3 | Service principal class | add before `actingUser` is assumed non-null | **high** — retrofit touches mint, projections, teams |
-| A4 | One approval queue for every human gate | mandatory constraint | **high** — unmeasurable and fragmenting once shipped |
-| A5 | Role-implementation portability CI check | one test per image, runs outside Steward | medium — coupling is gradual and hard to reverse |
-| A6 | Knowledge-layer labeling granularity (D6) | still undecided; now on the critical path | **high** — schema-level |
-| A7 | Deterministic steps as role implementations with no model call | yes — keeps the journal complete | low |
-| A8 | Security PR reviewer's acting user (author / reviewer / service principal) | undecided; likely service principal with repo-scoped read | medium |
-| A9 | Rename "provider" → "role implementation"; qualify member role vs step role | do it before the next upstream comment | low now, confusing later |
+The former A1–A9 table mixed conclusions from this workload analysis with unresolved
+product contracts. It is not a current register. Accepted post-M1 constraints are in
+the [post-M1 baseline](v2/README.md), and remaining contract work is maintained only in
+the [deferred-contract register](v2/deferred-implementation-contracts.md).
 
 ---
 

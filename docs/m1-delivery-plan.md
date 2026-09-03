@@ -1,7 +1,11 @@
 # M1 delivery plan
 
-Status: contract dependency index
+Status: historical M1 delivery dependency index; not current implementation status
 Outcome: first catalog-backed governed Task through GitHub Actions
+
+Authority: the [frozen `steward.m1/v1` contract](contracts/m1/v1/README.md) is the sole
+normative M1 source. See the [documentation index](README.md) for the complete authority
+order and the [post-M1 baseline](v2/README.md) for later accepted semantics.
 
 All M1 producers and consumers implement against the frozen
 [steward.m1/v1 contract](contracts/m1/v1/README.md). It is checkpoint A and the sole

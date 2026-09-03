@@ -1,8 +1,16 @@
 # Self-Service Agent Provisioning — Solution Overview
 
-Status: draft for internal review and convergence
+Status: historical long-running-agent exploration; not implementation or contract authority
 Audience: engineering leadership, IT / security, platform, product
-Companion document: *Development & Integration Spec* (implementation detail)
+
+> This document preserves the original product exploration. Its present-tense language
+> describes a proposal, not capabilities known to exist. It also uses `AgentRuntime`
+> for the persistent desired-state object; the accepted model calls that object
+> `AgentInstance` and reserves `AgentRuntime` for its replaceable execution incarnation.
+> Use the [post-M1 baseline](v2/README.md) for current semantics, the
+> [deferred-contract register](v2/deferred-implementation-contracts.md) for unresolved
+> implementation contracts, and the [frozen M1 contract](contracts/m1/v1/README.md) for
+> normative M1 behavior.
 
 > **Naming note.** *Steward* is a **temporary working name** for the control plane
 > described here, pending a final brand + availability/trademark check. It is not an
@@ -201,34 +209,12 @@ user's provider credential.
 - Not a home for inference keys or provider secrets. Those stay custodied in
   LiteLLM and `mcp-gw` respectively; the runtime holds neither.
 
-## 8. Decisions to converge on
+## 8. Historical decision notes
 
-These are the choices that change the build materially. The companion spec takes a
-position on each; this section exists so we agree before we commit.
-
-1. **Manifest as a real Kubernetes CRD with an Steward controller, or an Steward-owned
-   object that is merely CRD-shaped?** A real CRD gives us Kubernetes-native audit,
-   GitOps, and admission-webhook gating for free, and fits OpenShell's existing k8s
-   driver — at the cost of committing the whole lifecycle to the operator pattern.
-   *Spec position: real CRD + controller.*
-
-2. **Provider-credential custody consolidating into `mcp-gw`.** `mcp-gw` now holds
-   per-user provider tokens and resolves them by email. This moves custody out of
-   the Burble app. We should confirm that consolidation and the email-as-join-key
-   model, since it is load-bearing for correctness (wrong email → wrong user's
-   access).
-
-3. **Model allowlist: split or single-source?** Current position is a split —
-   per-agent allowlist enforced non-bypassably at the sandbox, catalog + budget at
-   LiteLLM. Single-sourcing it anywhere other than the sandbox loses
-   non-bypassability. Confirm the split is acceptable operationally.
-
-4. **Escalation channel = Jira, firmly.** Confirm Jira is the org's canonical
-   channel and that Steward-files-async / admin-approves-in-Steward (rather than
-   Jira-transition-auto-approves) is the accepted division of authority.
-
-5. **Envelope granularity.** Per-role ceilings are the starting model. Do we need
-   per-team or per-cost-center envelopes on day one, or can that wait?
+The former decision list reflected questions at the time of this exploration and is no
+longer a current decision register. Accepted post-M1 constraints are summarized in the
+[post-M1 baseline](v2/README.md); genuinely unresolved contracts are maintained only in
+the [deferred-contract register](v2/deferred-implementation-contracts.md).
 
 ## 9. Glossary
 
