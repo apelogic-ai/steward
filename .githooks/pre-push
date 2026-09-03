@@ -1,6 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Keep the local push boundary identical to the CI quality job. In particular,
-# the root formatter does not cover the nested e2e Cargo project.
-cargo xtask quality
+base_ref="${STEWARD_PRE_PUSH_BASE_REF:-origin/main}"
+
+if ! git rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null; then
+  echo "pre-push: cannot resolve ${base_ref}; run the repository sync workflow first" >&2
+  exit 1
+fi
+
+docs_only=1
+saw_change=0
+while IFS= read -r path; do
+  saw_change=1
+  case "${path}" in
+    AGENTS.md|CLAUDE.md|*/AGENTS.md|*/CLAUDE.md|docs/contracts/*|docs/examples/*)
+      docs_only=0
+      ;;
+    *.md|docs/*.png|docs/*.jpg|docs/*.jpeg|docs/*.gif|docs/*.svg|docs/*.webp)
+      ;;
+    *)
+      docs_only=0
+      ;;
+  esac
+done < <(git diff --name-only --no-renames --diff-filter=ACDMRTUXB "${base_ref}...HEAD")
+
+if [[ "${saw_change}" == "1" && "${docs_only}" == "1" ]]; then
+  echo "pre-push: documentation-only diff; running documentation gates"
+  git diff --check "${base_ref}...HEAD"
+  cargo xtask check-neutrality
+  cargo xtask check-secrets
+else
+  echo "pre-push: code, contract, rule, or mixed diff; running full quality gate"
+  cargo xtask quality
+fi

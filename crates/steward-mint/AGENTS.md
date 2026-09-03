@@ -18,10 +18,10 @@ here as part of a larger change — split it out.
    every consumer that keys off it — `mcp-gw` HOP-1 config, the git gateway, the
    notification block. Re-cutting this contract is expensive and has already
    been paid for twice.
-3. **The mint takes a `Principal`, never a bare email.** The `Service` arm is
-   `unimplemented!()` in v0.1.0 and stays that way until the service-principal
-   work is scheduled. Do not implement it opportunistically because a test
-   needed it.
+3. **The mint takes a `Principal`, never a bare email.** `User`, `Service`, and
+   `service_for_user` claim semantics are part of the HOP-1 contract. Any change
+   to them requires the contract documentation, every claim consumer, and the
+   positive and negative mint tests to change together.
 4. **TTLs are short and never widened to make a test pass.** If a test needs a
    longer life, the test is wrong.
 5. **Negative tests first, without exception here.** Forged SVID, expired SVID,
