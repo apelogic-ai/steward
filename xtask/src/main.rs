@@ -1312,6 +1312,10 @@ mod tests {
             .map_err(|error| format!("task lifecycle wrapper is required: {error}"))?;
         let task_callback = fs::read_to_string(root().join("scripts/task-submission-inside.sh"))
             .map_err(|error| format!("task lifecycle image callback is required: {error}"))?;
+        let s2_harness = fs::read_to_string(root().join("scripts/s2-inference-inside.sh"))
+            .map_err(|error| format!("S2 lifecycle harness is required: {error}"))?;
+        let task_dockerfile = fs::read_to_string(root().join("e2e/Dockerfile.task"))
+            .map_err(|error| format!("task lifecycle Dockerfile is required: {error}"))?;
 
         let lifecycle_job = ci_job(&workflow, "e2e-controller-runtime-lifecycle")?;
         let pinned_job = ci_job(&workflow, "pinned")?;
@@ -1348,9 +1352,14 @@ mod tests {
             !task_wrapper.contains("build-patched-mcp-gw.sh"),
             "the task lifecycle wrapper must not build mcp-gw before the long S0 setup gap"
         );
+        assert!(
+            !task_wrapper.contains("capture-proxy.test.ts"),
+            "the task lifecycle wrapper must not require the post-S0 mcp-gw image during preflight"
+        );
         for required in [
             "build-steward-mint-image.sh",
             "build-patched-mcp-gw.sh",
+            "capture-proxy.test.ts",
             "e2e/Dockerfile.task",
             "docker image inspect",
             "exec bash \"${ROOT}/scripts/s2-inference-inside.sh\"",
@@ -1376,6 +1385,10 @@ mod tests {
             .find("exec bash \"${ROOT}/scripts/s2-inference-inside.sh\"")
             .ok_or_else(|| "task callback must enter S2 after image checks".to_owned())?;
         assert!(
+            task_build < mint_build && task_build < mcp_gw_build,
+            "the run-scoped task image must build before the fixed dependency tags are refreshed"
+        );
+        assert!(
             mint_build < image_inspect
                 && mcp_gw_build < image_inspect
                 && task_build < image_inspect,
@@ -1384,6 +1397,29 @@ mod tests {
         assert!(
             image_inspect < s2_exec,
             "the post-S0 callback must inspect every local image before any kind load in S2"
+        );
+        assert!(
+            task_dockerfile
+                .contains("COPY config/internal-authorities ./config/internal-authorities"),
+            "the task lifecycle image must carry the immutable internal authority documents needed by the apiserver library"
+        );
+        assert!(
+            s2_harness.contains(".status.conditions[]?"),
+            "the S2 harness must tolerate a newly created CRD whose status.conditions is temporarily absent"
+        );
+        assert!(
+            !s2_harness.contains("wait --for=condition=Established"),
+            "the S2 harness must not use kubectl wait's nil-conditions race for CRD establishment"
+        );
+        assert!(
+            s2_harness
+                .contains("s#STEWARD_TASK_EXECUTION_BINDING_IMAGE_VALUE#${sandbox_digest_image}#g"),
+            "the S2 harness must replace a value-only execution-binding image placeholder"
+        );
+        assert!(
+            !s2_harness
+                .contains("s#STEWARD_TASK_EXECUTION_BINDING_IMAGE#${sandbox_digest_image}#g"),
+            "the S2 harness must not replace the execution-binding environment variable name"
         );
 
         Ok(())
@@ -1427,16 +1463,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_provider_profiles_cover_supported_linux_architectures() -> Result<(), String> {
-        let arm64_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/codex/codex";
-        let amd64_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex";
+    fn task_codex_provider_profiles_cover_supported_linux_architectures() -> Result<(), String> {
+        let arm64_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/bin/codex";
+        let amd64_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex";
         for profile_path in [
             "config/s5/tool-provider-profile.yaml",
             "config/task/inference-provider-profile.yaml",
-            "config/provider-profile-bundle/v1.1.0/profiles/steward-mcp-gw.json",
-            "config/provider-profile-bundle/v1.1.0/profiles/steward-litellm.json",
-            "config/provider-profile-bundle/v1.2.0/profiles/steward-mcp-gw.json",
-            "config/provider-profile-bundle/v1.2.0/profiles/steward-litellm.json",
         ] {
             let profile = fs::read_to_string(root().join(profile_path)).map_err(|error| {
                 format!("Codex provider profile {profile_path} is required: {error}")
@@ -2174,8 +2206,9 @@ mod tests {
         );
         assert!(
             sandbox.contains("ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:")
-                && sandbox.contains("codex-cli 0.117.0"),
-            "the real-stack lane must use the existing digest-pinned workflow sandbox contract"
+                && sandbox.contains("@openai/codex@0.140.0")
+                && sandbox.contains("codex-cli 0.140.0"),
+            "the real-stack lane must install and verify the exact approved Workflow agent"
         );
         Ok(())
     }

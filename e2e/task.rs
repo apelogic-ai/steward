@@ -251,7 +251,26 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
             .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71),
         "the admitted Task must pin the provisioned User Envelope digest"
     );
-    assert_eq!(submitted.runtime_spec.agent_type.name, "codex@0.117.0");
+    assert_eq!(submitted.runtime_spec.agent_type.name, "codex@0.140.0");
+    let execution_binding = submitted
+        .execution_binding
+        .as_ref()
+        .and_then(steward_types::TaskExecutionBinding::disposable)
+        .ok_or_else(|| io::Error::other("versioned Task omitted its execution binding"))?;
+    assert_eq!(execution_binding.agent_ref, "codex@0.140.0");
+    assert_eq!(execution_binding.executable, "/usr/bin/codex");
+    assert_eq!(execution_binding.expected_version, "codex-cli 0.140.0");
+    assert!(
+        execution_binding
+            .image
+            .starts_with("docker.io/steward/workflow-sandbox@sha256:")
+            && execution_binding.image.contains("@sha256:"),
+        "the Task must persist the exact digest-addressed sandbox image"
+    );
+    assert_eq!(
+        execution_binding.native_profile,
+        "steward-runtime-providers@1.2.0"
+    );
     assert_eq!(submitted.runtime_spec.llms.len(), 1);
     assert_eq!(submitted.runtime_spec.llms[0].provider, "openai");
     assert_eq!(submitted.runtime_spec.llms[0].model, "priced-model");
@@ -293,7 +312,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         submitted
             .agent_command
             .iter()
-            .any(|argument| argument.contains("codex-cli 0.117.0")),
+            .any(|argument| argument.contains("codex-cli 0.140.0")),
         "the persisted server-owned command must require the exact Workflow agent version"
     );
     assert!(
@@ -344,7 +363,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     )?;
     assert_eq!(
         fs::read_to_string(versioned_output_dir.join("out/result.txt"))?,
-        "Repository review completed by codex@0.117.0.\n",
+        "Repository review completed by codex@0.140.0.\n",
         "real Codex must receive github:repository:get_file_contents through MCP-GW before producing its declared output"
     );
     let run = store

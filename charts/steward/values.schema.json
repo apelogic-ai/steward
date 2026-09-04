@@ -235,6 +235,7 @@
             "jiraAccountEmail",
             "kubernetesTokenReviewAudience",
             "taskWorkflowsJson",
+            "taskExecutionBindingsJson",
             "mcpGatewayEndpoint"
           ],
           "properties": {
@@ -247,6 +248,11 @@
               "pattern": "\\S"
             },
             "taskWorkflowsJson": {"type": "string", "pattern": "^\\s*\\[", "minLength": 2},
+            "taskExecutionBindingsJson": {
+              "type": "string",
+              "pattern": "^$|^\\s*\\[",
+              "maxLength": 1048576
+            },
             "mcpGatewayEndpoint": {
               "type": "string",
               "pattern": "^$|^https?://[^\\s/@?#:]+(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?:/[^\\s?#]*)?$"

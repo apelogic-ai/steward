@@ -74,6 +74,9 @@ config:
     jiraAccountEmail: alice@example.com
     kubernetesTokenReviewAudience: https://kubernetes.default.svc
     taskWorkflowsJson: "[]"
+    # Optional deployment-owned catalog of exact logical agent execution bindings.
+    # Empty preserves legacy/default-image behavior for existing Workflow revisions.
+    taskExecutionBindingsJson: ""
     # Exact streamable HTTP endpoint rendered only into tool-bearing Codex task plans.
     # Empty keeps tool-less tasks available and makes tool-bearing submission fail closed.
     mcpGatewayEndpoint: ""

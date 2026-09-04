@@ -252,6 +252,9 @@ spec:
             - { name: STEWARD_JIRA_ACCOUNT_EMAIL, value: {{ .Values.config.apiserver.jiraAccountEmail | quote }} }
             - { name: STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE, value: {{ .Values.config.apiserver.kubernetesTokenReviewAudience | quote }} }
             - { name: STEWARD_TASK_WORKFLOWS_JSON, value: {{ .Values.config.apiserver.taskWorkflowsJson | quote }} }
+{{- if .Values.config.apiserver.taskExecutionBindingsJson }}
+            - { name: STEWARD_TASK_EXECUTION_BINDINGS_JSON, value: {{ .Values.config.apiserver.taskExecutionBindingsJson | quote }} }
+{{- end }}
             - { name: STEWARD_TASK_MCP_GW_ENDPOINT, value: {{ .Values.config.apiserver.mcpGatewayEndpoint | quote }} }
 {{- if .Values.taskIdentity.enabled }}
             - { name: STEWARD_IDENTITY_TASK_ISSUER, value: {{ .Values.taskIdentity.issuer | quote }} }

@@ -1,7 +1,7 @@
 type JsonObject = Record<string, unknown>;
 
 const encoder = new TextEncoder();
-const declaredOutput = "Repository review completed by codex@0.117.0.";
+const declaredOutput = "Repository review completed by codex@0.140.0.";
 const governedContents = "governed fixture file contents";
 
 function responseEnvelope(id: string, output: JsonObject[], status: string): JsonObject {
@@ -57,6 +57,7 @@ function functionCall(
   callId: string,
   name: string,
   args: JsonObject,
+  namespace?: string,
 ): Response {
   const argumentsJson = JSON.stringify(args);
   const pending = {
@@ -66,6 +67,7 @@ function functionCall(
     name,
     call_id: callId,
     arguments: "",
+    ...(namespace ? { namespace } : {}),
   };
   const completed = { ...pending, status: "completed", arguments: argumentsJson };
   return stream([
@@ -175,6 +177,21 @@ function functionName(tool: JsonObject): string {
   return typeof tool.name === "string" ? tool.name : "";
 }
 
+function mcpFunctionTarget(tool: JsonObject): { name: string; namespace?: string } | null {
+  if (tool.type === "function" && functionName(tool).endsWith("get_file_contents")) {
+    return { name: functionName(tool) };
+  }
+  if (tool.type !== "namespace" || !functionName(tool).startsWith("mcp__")) return null;
+  if (!Array.isArray(tool.tools)) return null;
+  const nested = tool.tools.find(
+    (candidate): candidate is JsonObject =>
+      typeof candidate === "object" &&
+      candidate !== null &&
+      functionName(candidate).endsWith("get_file_contents"),
+  );
+  return nested ? { name: functionName(nested), namespace: functionName(tool) } : null;
+}
+
 function shellArguments(tool: JsonObject): JsonObject | null {
   const parameters = tool.parameters;
   if (typeof parameters !== "object" || parameters === null) return null;
@@ -214,16 +231,15 @@ Bun.serve({
     const advertisedTools = tools(body);
 
     if (!encodedInput.includes(governedContents)) {
-      const mcpTool = advertisedTools.find((tool) =>
-        functionName(tool).endsWith("get_file_contents"),
-      );
+      const mcpTool = advertisedTools.map(mcpFunctionTarget).find((tool) => tool !== null);
       if (!mcpTool) return new Response("Codex did not advertise the MCP tool\n", { status: 422 });
       return functionCall(
         "resp_steward_mcp",
         "fc_steward_mcp",
         "call_steward_mcp",
-        functionName(mcpTool),
+        mcpTool.name,
         { owner: "example-org", repo: "fixture-repository", path: "README.md" },
+        mcpTool.namespace,
       );
     }
 

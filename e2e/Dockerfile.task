@@ -9,6 +9,7 @@ COPY migrations ./migrations
 COPY xtask ./xtask
 COPY e2e ./e2e
 RUN cargo build --locked -p steward-controller-bin --release
+COPY config/internal-authorities ./config/internal-authorities
 RUN cargo build --locked --manifest-path e2e/Cargo.toml --bin task-server --release
 
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818

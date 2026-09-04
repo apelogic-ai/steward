@@ -34,7 +34,7 @@ use tokio::net::TcpListener;
 
 const SCHEDULED_OWNER_EMAIL: &str = "owner@example.com";
 const VERSIONED_WORKFLOW_NAME: &str = "repository-review";
-const VERSIONED_WORKFLOW_AGENT: &str = "codex@0.117.0";
+const VERSIONED_WORKFLOW_AGENT: &str = "codex@0.140.0";
 const VERSIONED_WORKFLOW_PROMPT: &str =
     "Review the repository state that triggered this GitHub Actions run.";
 
@@ -180,6 +180,34 @@ fn workflow_content_digest(agent: &str, prompt: &str) -> String {
         hasher.update(value.as_bytes());
     }
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn execution_binding_catalog(image: &str) -> Result<String, Box<dyn Error>> {
+    let executable = "/usr/bin/codex";
+    let expected_version = "codex-cli 0.140.0";
+    let native_profile = "steward-runtime-providers@1.2.0";
+    let mut hasher = Sha256::new();
+    for value in [
+        steward_types::TASK_EXECUTION_BINDING_SCHEMA_VERSION,
+        VERSIONED_WORKFLOW_AGENT,
+        image,
+        executable,
+        expected_version,
+        native_profile,
+    ] {
+        hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let binding_digest = format!("sha256:{:x}", hasher.finalize());
+    Ok(serde_json::to_string(&json!([{
+        "bindingId": binding_digest,
+        "bindingDigest": binding_digest,
+        "agentRef": VERSIONED_WORKFLOW_AGENT,
+        "image": image,
+        "executable": executable,
+        "expectedVersion": expected_version,
+        "nativeProfile": native_profile
+    }]))?)
 }
 
 fn envelope_content_digest(envelope: &Envelope) -> Result<String, serde_json::Error> {
@@ -416,6 +444,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         TaskApiConfig::new(Some(env::var("STEWARD_TASK_MCP_GW_ENDPOINT").map_err(
             |_| io::Error::other("STEWARD_TASK_MCP_GW_ENDPOINT is required"),
         )?))
+        .and_then(|config| {
+            let image = env::var("STEWARD_TASK_EXECUTION_BINDING_IMAGE")
+                .map_err(|_| "STEWARD_TASK_EXECUTION_BINDING_IMAGE is required".to_owned())?;
+            let catalog = execution_binding_catalog(&image).map_err(|error| error.to_string())?;
+            config.with_execution_bindings_json(Some(&catalog))
+        })
         .map_err(io::Error::other)?,
     )
     .merge(api_router(

@@ -155,6 +155,10 @@ that allowlist remain inaccessible to both service accounts.
 - `config.apiserver.taskWorkflowsJson` is the complete Task workflow catalog as
   a JSON array. Invalid JSON or a missing, empty, or whitespace-only Kubernetes
   TokenReview audience stops the apiserver.
+- `config.apiserver.taskExecutionBindingsJson` is optional. When non-empty it is
+  the deployment-owned catalog that resolves authorized logical agent references
+  to immutable, digest-pinned sandbox execution bindings. Existing deployments
+  may leave it empty to retain documented legacy/default-image behavior.
 - `config.apiserver.jiraBaseUrl`, `jiraProjectKey`, and `jiraAccountEmail` are
   mandatory startup inputs. The base URL is the public HTTPS Jira tenant root,
   the project must already exist, and the account email must correspond to the

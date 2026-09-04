@@ -71,7 +71,7 @@ if [[ "${SLICE}" == "task" && -z "${STEWARD_TASK_IMAGE:-}" ]]; then
   echo "STEWARD_TASK_IMAGE is required from the ephemeral Task harness" >&2
   exit 2
 fi
-for command in cargo curl docker jq kind kubectl openssl sed tar; do
+for command in awk cargo curl docker jq kind kubectl openssl sed tar; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is missing: ${command}" >&2
     exit 2
@@ -129,8 +129,19 @@ if [[ "${SLICE}" == "s5" ]]; then
 fi
 KUBECTL=(kubectl --kubeconfig "${STEWARD_TEST_KUBECONFIG}" --context "${STEWARD_TEST_KUBE_CONTEXT}")
 "${KUBECTL[@]}" apply -f "${ROOT}/manifests/agents.apelogic.ai_agentruntimes.yaml"
-"${KUBECTL[@]}" wait --for=condition=Established \
-  crd/agentruntimes.agents.apelogic.ai --timeout=120s
+crd_established="false"
+for _attempt in {1..120}; do
+  if "${KUBECTL[@]}" get crd/agentruntimes.agents.apelogic.ai -o json |
+    jq -e 'any(.status.conditions[]?; .type == "Established" and .status == "True")' >/dev/null; then
+    crd_established="true"
+    break
+  fi
+  sleep 1
+done
+if [[ "${crd_established}" != "true" ]]; then
+  echo "AgentRuntime CRD was not established within 120 seconds" >&2
+  exit 1
+fi
 
 signing_key="${STEWARD_RUN_DIR}/s2-signing-key"
 introspection_client="${STEWARD_RUN_DIR}/s2-introspection-client"
@@ -265,9 +276,26 @@ if [[ "${SLICE}" == "s5" ]]; then
   "${KUBECTL[@]}" apply -f "${rendered_poc_stack}"
 fi
 if [[ "${SLICE}" == "task" ]]; then
+  if [[ -z "${STEWARD_OPENSHELL_SANDBOX_IMAGE:-}" ]]; then
+    echo "STEWARD_OPENSHELL_SANDBOX_IMAGE is required for the bound Task sandbox" >&2
+    exit 2
+  fi
+  sandbox_containerd_name="docker.io/${STEWARD_OPENSHELL_SANDBOX_IMAGE}"
+  sandbox_digest="$(
+    docker exec "${cluster_name}-control-plane" ctr -n k8s.io images list |
+      awk -v image="${sandbox_containerd_name}" '$1 == image { print $3 }'
+  )"
+  if [[ ! "${sandbox_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "loaded Task sandbox image has no exact containerd manifest digest" >&2
+    exit 1
+  fi
+  sandbox_digest_image="docker.io/${STEWARD_OPENSHELL_SANDBOX_IMAGE%:*}@${sandbox_digest}"
+  docker exec "${cluster_name}-control-plane" \
+    ctr -n k8s.io images tag "${sandbox_containerd_name}" "${sandbox_digest_image}"
   rendered_task_stack="${STEWARD_RUN_DIR}/task-stack.yaml"
   sed \
     -e "s#STEWARD_TASK_IMAGE#${STEWARD_TASK_IMAGE}#g" \
+    -e "s#STEWARD_TASK_EXECUTION_BINDING_IMAGE_VALUE#${sandbox_digest_image}#g" \
     -e "s#STEWARD_RUN_ID#${STEWARD_RUN_ID}#g" \
     "${ROOT}/config/task/stack.yaml" >"${rendered_task_stack}"
   "${KUBECTL[@]}" apply -f "${rendered_task_stack}"

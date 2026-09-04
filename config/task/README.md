@@ -9,6 +9,7 @@ worker is part of the normal `steward-controller` process.
 |---|---|
 | `STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE` | Required and non-empty. DEV uses `https://kubernetes.default.svc`. |
 | `STEWARD_TASK_WORKFLOWS_JSON` | Required JSON array matching `workflows.example.json`. Commands are server-selected; clients cannot supply them. |
+| `STEWARD_TASK_EXECUTION_BINDINGS_JSON` | Optional non-empty JSON array of deployment-owned immutable execution bindings. When configured, every newly submitted versioned Workflow must resolve an exact logical agent reference from this catalog. |
 | `STEWARD_TASK_MCP_GW_ENDPOINT` | Exact HTTP(S) streamable MCP endpoint. Required only when a versioned Codex task resolves non-empty tool authority; otherwise the task fails before reservation or execution. |
 | `STEWARD_APISERVER_BIND` | HTTPS listener, default `0.0.0.0:8443`. Expose the existing apiserver Service port to this target port. |
 | Task API enablement | Enabled whenever the production apiserver starts. There is no bypass flag; invalid or absent Task configuration fails startup. |
@@ -27,6 +28,19 @@ that variable only to OpenShell's documented non-secret provider placeholder. Op
 the runtime bearer at the governed egress boundary; the plan, database, and Codex configuration
 never contain a provider credential. Tool-less plans contain no MCP server entry or MCP bearer
 variable and do not require the endpoint.
+
+An execution-binding catalog entry maps only a bounded logical reference such as
+`codex@0.140.0` to server-owned deployment data: a content-bound binding identity and SHA-256
+digest, digest-pinned OCI image, absolute executable, expected version output, and exact native
+provider-profile reference. Steward resolves and persists that complete binding before Task
+reservation. Retries use the persisted binding and do not reinterpret existing work under a
+changed catalog. The browser and Task APIs expose or accept only the logical reference; they do
+not accept any image, executable, namespace, runtime class, endpoint, or credential override.
+`bindingDigest` is `sha256:<lowercase hex>` over this length-prefixed UTF-8 sequence, in order:
+schema version `steward/task-execution-binding/v1`, `agentRef`, `image`, `executable`,
+`expectedVersion`, and `nativeProfile`. Each value is prefixed by its unsigned 64-bit big-endian
+byte length. `bindingId` must equal that digest. The content-addressed identity therefore changes
+if any execution byte or compatibility pin changes, and cannot be reused with different content.
 
 ## Controller inputs
 

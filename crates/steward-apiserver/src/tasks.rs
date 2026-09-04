@@ -28,12 +28,13 @@ use steward_store::{
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, Duration,
-    Email, ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, RuntimeOwnership, TaskPhase,
-    ToolGrant,
+    Email, ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, RuntimeOwnership,
+    TASK_EXECUTION_BINDING_ANNOTATION, TaskExecutionBinding, TaskPhase, ToolGrant,
 };
 use uuid::Uuid;
 
 use crate::WorkflowReference;
+use crate::execution_bindings::ExecutionBindingCatalog;
 use crate::{
     AdmissionLedger, ApiError, BoxFuture, DecisionChannel, KubernetesTokenReviewAudience,
     RuntimeCreateError, RuntimeRepository, authenticated_token_review_user,
@@ -75,11 +76,13 @@ struct VersionedTaskPlan {
     envelope: EnvelopeRequestRecord,
     spec: AgentRuntimeSpec,
     command: Vec<String>,
+    execution_binding: Option<TaskExecutionBinding>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TaskApiConfig {
     mcp_gateway_endpoint: Option<String>,
+    execution_bindings: Option<ExecutionBindingCatalog>,
 }
 
 impl TaskApiConfig {
@@ -91,7 +94,20 @@ impl TaskApiConfig {
         };
         Ok(Self {
             mcp_gateway_endpoint,
+            execution_bindings: None,
         })
+    }
+
+    pub fn with_execution_bindings_json(mut self, value: Option<&str>) -> Result<Self, String> {
+        self.execution_bindings = value.map(ExecutionBindingCatalog::from_json).transpose()?;
+        Ok(self)
+    }
+
+    pub fn execution_binding_refs(&self) -> Vec<String> {
+        self.execution_bindings
+            .as_ref()
+            .map(ExecutionBindingCatalog::agent_refs)
+            .unwrap_or_else(|| vec![crate::workflows::SUPPORTED_WORKFLOW_AGENT.to_owned()])
     }
 }
 
@@ -147,6 +163,18 @@ fn resolve_versioned_task_plan(
             "versioned Codex Workflows require exactly one approved model".to_owned(),
         ));
     };
+    let execution_binding = config
+        .execution_bindings
+        .as_ref()
+        .map(|catalog| {
+            catalog.resolve(&workflow.agent).cloned().ok_or_else(|| {
+                ApiError::TaskRuntimeContractUnavailable(format!(
+                    "logical agent {} has no deployment execution binding",
+                    workflow.agent
+                ))
+            })
+        })
+        .transpose()?;
     let codex_model = format!("{}/{}", model.provider, model.model);
     let mcp_gateway_endpoint = if approved.spec.tools.is_empty() {
         None
@@ -213,20 +241,24 @@ fn resolve_versioned_task_plan(
     let shell_command = format!(
         concat!(
             "set -eu; umask 077; ",
-            "test \"$(codex --version)\" = \"codex-cli 0.117.0\"; ",
-            "test \"$#\" -eq 3; ",
+            "test \"$#\" -eq 5; ",
+            "test \"$(\"$4\" --version)\" = \"$5\"; ",
             "export CODEX_HOME=/sandbox/steward-codex; ",
             "mkdir -p \"$CODEX_HOME\" \"$STEWARD_OUTPUT_DIR/out\"; ",
             "test ! -e out; ln -s \"$STEWARD_OUTPUT_DIR/out\" out; ",
             "printf '%s' \"$3\" > \"$CODEX_HOME/config.toml\"; ",
             "{}",
             "OPENAI_API_KEY=openshell-token-grant-placeholder ",
-            "codex exec --ephemeral --skip-git-repo-check ",
+            "\"$4\" exec --ephemeral --skip-git-repo-check ",
             "--sandbox danger-full-access --model \"$2\" ",
             "--output-last-message \"$STEWARD_OUTPUT_DIR/result.txt\" -- \"$1\""
         ),
         mcp_bearer_environment,
     );
+    let (executable, expected_version) = execution_binding
+        .as_ref()
+        .map(|binding| (binding.executable.clone(), binding.expected_version.clone()))
+        .unwrap_or_else(|| ("codex".to_owned(), "codex-cli 0.117.0".to_owned()));
     let command = vec![
         "/bin/sh".to_owned(),
         "-c".to_owned(),
@@ -235,12 +267,15 @@ fn resolve_versioned_task_plan(
         workflow.prompt.clone(),
         codex_model,
         codex_config,
+        executable,
+        expected_version,
     ];
     Ok(VersionedTaskPlan {
         workflow,
         envelope: envelope.clone(),
         spec,
         command,
+        execution_binding: execution_binding.map(TaskExecutionBinding::Disposable),
     })
 }
 
@@ -1437,6 +1472,7 @@ where
                     runtime_ownership: RuntimeOwnership::Adopted,
                     runtime_spec: &spec,
                     agent_command: &workflow.command,
+                    execution_binding: None,
                     envelope_revision: envelope.revision,
                 })
                 .await
@@ -1485,6 +1521,7 @@ where
                 runtime_ownership: RuntimeOwnership::Provisioned,
                 runtime_spec: &spec,
                 agent_command: &workflow.command,
+                execution_binding: None,
                 envelope_revision: envelope.revision,
             })
             .await
@@ -1508,6 +1545,7 @@ where
                 proposed_spec: &spec,
                 envelope: &envelope,
                 decision,
+                execution_binding: None,
             },
         )
         .await?;
@@ -1618,6 +1656,7 @@ where
             runtime_ownership: RuntimeOwnership::Provisioned,
             runtime_spec: &plan.spec,
             agent_command: &plan.command,
+            execution_binding: plan.execution_binding.as_ref(),
             envelope_revision: service_envelope.revision,
         })
         .await
@@ -1655,6 +1694,7 @@ where
             proposed_spec: &plan.spec,
             envelope: &service_envelope,
             decision,
+            execution_binding: plan.execution_binding.as_ref(),
         },
     )
     .await?;
@@ -1753,6 +1793,7 @@ struct TaskRuntimePlan<'a> {
     proposed_spec: &'a AgentRuntimeSpec,
     envelope: &'a Envelope,
     decision: AdmissionDecision,
+    execution_binding: Option<&'a TaskExecutionBinding>,
 }
 
 async fn create_task_runtime<R, L, D>(
@@ -1772,6 +1813,21 @@ where
         SERVICE_PRINCIPAL_ANNOTATION.to_owned(),
         plan.service.to_owned(),
     )]));
+    if let Some(binding) = plan.execution_binding {
+        let disposable = binding.disposable().ok_or_else(|| {
+            ApiError::TaskRuntimeContractUnavailable(
+                "resident bindings cannot create disposable Task runtimes".to_owned(),
+            )
+        })?;
+        runtime.metadata.annotations.get_or_insert_default().insert(
+            TASK_EXECUTION_BINDING_ANNOTATION.to_owned(),
+            serde_json::to_string(disposable).map_err(|_| {
+                ApiError::TaskRuntimeContractUnavailable(
+                    "resolved Task execution binding cannot be serialized".to_owned(),
+                )
+            })?,
+        );
+    }
     let AdmissionDecision::Reject { deltas } = plan.decision else {
         let created = create_or_get_matching_runtime(runtimes, plan.namespace, &runtime).await?;
         return Ok((created, TaskPhase::Submitted, Vec::new()));
@@ -1893,12 +1949,51 @@ mod workflow_request_tests {
         versioned_workflow_reference,
     };
     use crate::{ApiError, TaskIdentity};
+    use sha2::{Digest, Sha256};
     use steward_admission::{Envelope, EnvelopeSpec};
     use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, WorkflowRevisionRecord};
     use steward_types::{
         Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
     };
     use uuid::Uuid;
+
+    fn execution_catalog(agent_ref: &str, image_byte: char) -> Result<String, String> {
+        let image = format!(
+            "registry.example.test/steward/agent@sha256:{}",
+            image_byte.to_string().repeat(64)
+        );
+        let executable = "/opt/steward/agent";
+        let expected_version = format!(
+            "codex-cli {}",
+            agent_ref
+                .rsplit_once('@')
+                .map_or("", |(_, version)| version)
+        );
+        let native_profile = "steward-runtime-providers@1.2.0";
+        let mut digest = Sha256::new();
+        for value in [
+            steward_types::TASK_EXECUTION_BINDING_SCHEMA_VERSION,
+            agent_ref,
+            &image,
+            executable,
+            &expected_version,
+            native_profile,
+        ] {
+            digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        let binding_digest = format!("sha256:{:x}", digest.finalize());
+        serde_json::to_string(&serde_json::json!([{
+            "bindingId": binding_digest,
+            "bindingDigest": binding_digest,
+            "agentRef": agent_ref,
+            "image": image,
+            "executable": executable,
+            "expectedVersion": expected_version,
+            "nativeProfile": native_profile
+        }]))
+        .map_err(|error| error.to_string())
+    }
 
     #[test]
     fn versioned_workflow_rejects_caller_selected_coding_runtime() {
@@ -2151,6 +2246,50 @@ mod workflow_request_tests {
                 .all(|argument| !argument.contains("example-org")),
             "repository mechanics do not belong to the Workflow execution command"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_task_persists_the_exact_deployment_binding_before_reservation()
+    -> Result<(), String> {
+        let mut selected_workflow = workflow();
+        selected_workflow.agent = "codex@0.140.0".to_owned();
+        let catalog = execution_catalog(&selected_workflow.agent, 'b')?;
+        let config = TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
+            .with_execution_bindings_json(Some(&catalog))?;
+        let plan = resolve_versioned_task_plan(
+            &identity("usr_0123456789abcdef0123456789abcdef")?,
+            selected_workflow,
+            vec![provisioned_envelope(
+                "usr_0123456789abcdef0123456789abcdef",
+            )?],
+            &config,
+        )
+        .map_err(|error| format!("approved exact binding was rejected: {error:?}"))?;
+
+        let binding = plan
+            .execution_binding
+            .as_ref()
+            .and_then(steward_types::TaskExecutionBinding::disposable)
+            .ok_or_else(|| "resolved Task did not retain its deployment binding".to_owned())?;
+        assert_eq!(binding.agent_ref, "codex@0.140.0");
+        assert_eq!(plan.command.get(7), Some(&binding.executable));
+        assert_eq!(plan.command.get(8), Some(&binding.expected_version));
+        assert_eq!(config.execution_binding_refs(), ["codex@0.140.0"]);
+
+        let mut unavailable = workflow();
+        unavailable.agent = "codex@0.139.0".to_owned();
+        assert!(matches!(
+            resolve_versioned_task_plan(
+                &identity("usr_0123456789abcdef0123456789abcdef")?,
+                unavailable,
+                vec![provisioned_envelope(
+                    "usr_0123456789abcdef0123456789abcdef",
+                )?],
+                &config,
+            ),
+            Err(ApiError::TaskRuntimeContractUnavailable(_))
+        ));
         Ok(())
     }
 

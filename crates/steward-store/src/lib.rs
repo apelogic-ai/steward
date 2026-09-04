@@ -11,7 +11,7 @@ use steward_admission::{
 };
 use steward_types::{
     AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
-    OrganizationIdentity, OrganizationIdentityMigration,
+    OrganizationIdentity, OrganizationIdentityMigration, TaskExecutionBinding,
 };
 use uuid::Uuid;
 
@@ -2507,9 +2507,9 @@ impl PgStore {
               workflow_name, workflow_version, workflow_digest, \
               user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
               coding_agent_runtime, runtime_namespace, runtime_name, runtime_ownership, phase, \
-              runtime_spec, agent_command, envelope_revision) \
+              runtime_spec, agent_command, execution_binding, envelope_revision) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, $12, $13, $14, \
-                     $15, $16, $17, $18, 'submitted', $19, $20, $21) \
+                     $15, $16, $17, $18, 'submitted', $19, $20, $21, $22) \
              ON CONFLICT DO NOTHING",
         )
         .bind(task_uid)
@@ -2532,6 +2532,7 @@ impl PgStore {
         .bind(ownership_text(request.runtime_ownership))
         .bind(Json(request.runtime_spec))
         .bind(Json(request.agent_command))
+        .bind(request.execution_binding.map(Json))
         .bind(request.envelope_revision)
         .execute(&self.pool)
         .await
@@ -2568,6 +2569,7 @@ impl PgStore {
             || record.runtime_ownership != request.runtime_ownership
             || record.runtime_spec != *request.runtime_spec
             || record.agent_command != request.agent_command
+            || record.execution_binding.as_ref() != request.execution_binding
         {
             return Err(StoreError::TaskIdempotencyConflict);
         }
@@ -3634,6 +3636,7 @@ pub struct TaskReservationRequest<'a> {
     pub runtime_ownership: steward_types::RuntimeOwnership,
     pub runtime_spec: &'a AgentRuntimeSpec,
     pub agent_command: &'a [String],
+    pub execution_binding: Option<&'a TaskExecutionBinding>,
     pub envelope_revision: i64,
 }
 
@@ -3974,7 +3977,26 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
     let complete = |pins: [bool; 3]| {
         pins.iter().all(|present| *present) || pins.iter().all(|present| !*present)
     };
-    if !complete(workflow_pins)
+    if request
+        .execution_binding
+        .is_some_and(|binding| binding.validate().is_err())
+        || request.execution_binding.is_some_and(|binding| {
+            binding
+                .disposable()
+                .is_some_and(|disposable| disposable.agent_ref != request.coding_agent_runtime)
+        })
+        || request
+            .execution_binding
+            .is_some_and(|binding| match binding {
+                TaskExecutionBinding::Disposable(_) => {
+                    request.runtime_ownership != steward_types::RuntimeOwnership::Provisioned
+                }
+                TaskExecutionBinding::Resident(resident) => {
+                    request.runtime_ownership != steward_types::RuntimeOwnership::Adopted
+                        || resident.owner_user_id.as_str() != request.owner_user_id
+                }
+            })
+        || !complete(workflow_pins)
         || !complete(envelope_pins)
         || workflow_pins[0] != envelope_pins[0]
         || request.workflow_version.is_some_and(|version| version <= 0)
@@ -4025,6 +4047,7 @@ pub struct TaskRecord {
     pub phase: steward_types::TaskPhase,
     pub runtime_spec: AgentRuntimeSpec,
     pub agent_command: Vec<String>,
+    pub execution_binding: Option<TaskExecutionBinding>,
     pub input_archive: Option<Vec<u8>>,
     pub output_archive: Option<Vec<u8>>,
     pub execute_requested: bool,
@@ -4653,6 +4676,10 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
             .try_get::<Json<Vec<String>>, _>("agent_command")
             .map_err(database_error)?
             .0,
+        execution_binding: row
+            .try_get::<Option<Json<TaskExecutionBinding>>, _>("execution_binding")
+            .map_err(database_error)?
+            .map(|binding| binding.0),
         input_archive: row.try_get("input_archive").map_err(database_error)?,
         output_archive: row.try_get("output_archive").map_err(database_error)?,
         execute_requested: row.try_get("execute_requested").map_err(database_error)?,

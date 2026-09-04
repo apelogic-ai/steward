@@ -540,6 +540,10 @@ export type UserEnvelopeRequest = {
 };
 
 export type WorkflowListResponse = {
+    /**
+     * Exact logical agent references from the deployment-owned execution catalog.
+     */
+    agents: Array<string>;
     apiVersion: string;
     workflows: Array<WorkflowRevisionView>;
 };

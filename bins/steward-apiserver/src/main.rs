@@ -82,10 +82,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
             return Err(io::Error::other("STEWARD_TASK_MCP_GW_ENDPOINT must be Unicode").into());
         }
     };
-    let task_api_config =
-        TaskApiConfig::new(task_mcp_gateway_endpoint).map_err(io::Error::other)?;
+    let task_execution_bindings_json = match env::var("STEWARD_TASK_EXECUTION_BINDINGS_JSON") {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(
+                io::Error::other("STEWARD_TASK_EXECUTION_BINDINGS_JSON must be Unicode").into(),
+            );
+        }
+    };
+    let task_api_config = TaskApiConfig::new(task_mcp_gateway_endpoint)
+        .and_then(|config| {
+            config.with_execution_bindings_json(task_execution_bindings_json.as_deref())
+        })
+        .map_err(io::Error::other)?;
+    let workflow_agents = task_api_config.execution_binding_refs();
     let runtimes = KubeRuntimeRepository::new(client);
-    let browser = browser_application_router(store.clone(), runtimes.clone(), decisions.clone())?;
+    let browser = browser_application_router(
+        store.clone(),
+        runtimes.clone(),
+        decisions.clone(),
+        workflow_agents,
+    )?;
     let app = router(
         runtimes.clone(),
         store.clone(),
@@ -167,6 +185,7 @@ fn browser_application_router(
     store: PgStore,
     runtimes: KubeRuntimeRepository,
     decisions: JiraAdapter,
+    workflow_agents: Vec<String>,
 ) -> Result<Option<axum::Router>, Box<dyn Error>> {
     let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
         return Ok(None);
@@ -204,9 +223,10 @@ fn browser_application_router(
             decisions,
             auth.clone(),
         ))
-        .merge(workflows::protected_admin_router(
+        .merge(workflows::protected_admin_router_with_agents(
             store.clone(),
             auth.clone(),
+            workflow_agents,
         ));
     let app = match connections {
         Some(broker) => app.merge(connections::protected_router(broker, auth.clone())),

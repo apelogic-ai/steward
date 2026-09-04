@@ -20,6 +20,7 @@ browser_auth_rendered="$(mktemp)"
 browser_auth_deployment="$(mktemp)"
 task_identity_rendered="$(mktemp)"
 task_identity_deployment="$(mktemp)"
+task_execution_bindings_rendered="$(mktemp)"
 web_rendered="$(mktemp)"
 web_deployment="$(mktemp)"
 external_edge_rendered="$(mktemp)"
@@ -45,7 +46,7 @@ cleanup() {
     "${operator_connections_bridge_apiserver_deployment}" \
     "${operator_connections_bridge_controller_deployment}" "${browser_auth_rendered}" \
     "${browser_auth_deployment}" "${task_identity_rendered}" \
-    "${task_identity_deployment}" \
+    "${task_identity_deployment}" "${task_execution_bindings_rendered}" \
     "${web_rendered}" "${web_deployment}" "${external_edge_rendered}" \
     "${secret_trust_rendered}" \
     "${mint_synthetic_kubeconfig}" "${mint_startup_output}"
@@ -113,6 +114,21 @@ helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
   "${image_values[@]}" > "${rendered}"
+if grep -q 'STEWARD_TASK_EXECUTION_BINDINGS_JSON' "${rendered}"; then
+  echo "disabled execution binding catalog must render no workload environment" >&2
+  exit 1
+fi
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set-string 'config.apiserver.taskExecutionBindingsJson=[{"agentRef":"codex@0.140.0"}]' \
+  > "${task_execution_bindings_rendered}"
+if [[ "$(grep -c 'name: STEWARD_TASK_EXECUTION_BINDINGS_JSON' \
+  "${task_execution_bindings_rendered}")" != "1" ]]; then
+  echo "configured execution binding catalog must reach only the apiserver environment" >&2
+  exit 1
+fi
 
 if ! helm template steward "${root}/charts/steward" \
   --namespace steward \

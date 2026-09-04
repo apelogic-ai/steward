@@ -299,6 +299,7 @@ impl<B> GovernedConnectionsBroker<B> {
             runtime_ownership: steward_types::RuntimeOwnership::Provisioned,
             runtime_spec: &plan.spec,
             agent_command: &plan.command,
+            execution_binding: None,
             envelope_revision: CONNECTIONS_AUTHORITY_VERSION,
         };
         self.store

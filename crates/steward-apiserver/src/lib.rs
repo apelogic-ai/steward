@@ -5,6 +5,7 @@ pub mod browser_admin;
 pub mod browser_auth;
 mod browser_security;
 pub mod connections;
+mod execution_bindings;
 mod github_actions;
 pub mod google_oidc;
 pub mod governed_connections;
@@ -5947,6 +5948,7 @@ mod tests {
                     phase: TaskPhase::Submitted,
                     runtime_spec: request.runtime_spec.clone(),
                     agent_command: request.agent_command.to_vec(),
+                    execution_binding: request.execution_binding.cloned(),
                     input_archive: None,
                     output_archive: None,
                     execute_requested: false,

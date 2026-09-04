@@ -115,6 +115,7 @@ async fn reserve_governed_connection_with_bindings(
         runtime_ownership: RuntimeOwnership::Provisioned,
         runtime_spec: &plan.spec,
         agent_command: &plan.command,
+        execution_binding: None,
         envelope_revision: CONNECTIONS_AUTHORITY_VERSION,
     };
     store
@@ -820,6 +821,7 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         runtime_ownership: RuntimeOwnership::Provisioned,
         runtime_spec: &spec,
         agent_command: &command,
+        execution_binding: None,
         envelope_revision: 1,
     };
     let first = store.reserve_task(&request).await?;
