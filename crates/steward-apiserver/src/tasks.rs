@@ -1002,10 +1002,17 @@ pub struct TaskArchive(pub Vec<u8>);
 
 #[derive(Clone)]
 struct TaskApiState<R, L, D, I, W> {
+    identities: I,
+    application: TaskApplicationService<R, L, D, W>,
+}
+
+/// The single internal application boundary for Task resolution, admission, reservation,
+/// and immutable execution-plan snapshotting.
+#[derive(Clone)]
+struct TaskApplicationService<R, L, D, W> {
     runtimes: R,
     ledger: L,
     decisions: D,
-    identities: I,
     workflows: W,
     config: TaskApiConfig,
 }
@@ -1045,12 +1052,14 @@ where
         )
         .layer(DefaultBodyLimit::max(MAX_TASK_INPUT_ARCHIVE_BYTES))
         .with_state(TaskApiState {
-            runtimes,
-            ledger,
-            decisions,
             identities,
-            workflows,
-            config,
+            application: TaskApplicationService {
+                runtimes,
+                ledger,
+                decisions,
+                workflows,
+                config,
+            },
         })
 }
 
@@ -1071,6 +1080,7 @@ where
         Err(error) => return error.into_response(),
     };
     let record = match state
+        .application
         .ledger
         .task_for_submitter(
             task_uid,
@@ -1114,6 +1124,7 @@ where
         Err(error) => return error.into_response(),
     };
     match state
+        .application
         .ledger
         .request_task_finalization(
             task_uid,
@@ -1147,6 +1158,7 @@ where
         Err(error) => return error.into_response(),
     };
     match state
+        .application
         .ledger
         .request_task_execution(
             task_uid,
@@ -1180,6 +1192,7 @@ where
         Err(error) => return error.into_response(),
     };
     let record = match state
+        .application
         .ledger
         .task_for_submitter(
             task_uid,
@@ -1239,6 +1252,7 @@ where
         Err(error) => return error.into_response(),
     };
     match state
+        .application
         .ledger
         .put_task_inputs(
             task_uid,
@@ -1265,107 +1279,188 @@ where
     I: TaskIdentityResolver,
     W: TaskWorkflowCatalog,
 {
-    match submit_task_inner(&state, &headers, &request).await {
+    let idempotency_key = match headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value,
+        None => {
+            return ApiError::Admission("Idempotency-Key is required".to_owned()).into_response();
+        }
+    };
+    let identity = match resolve_task_identity(&state.identities, &headers).await {
+        Ok(identity) => identity,
+        Err(error) => return error.into_response(),
+    };
+    match state
+        .application
+        .submit(idempotency_key, identity, &request)
+        .await
+    {
         Ok((status, response)) => (status, Json(response)).into_response(),
         Err(error) => error.into_response(),
     }
 }
 
-async fn submit_task_inner<R, L, D, I, W>(
-    state: &TaskApiState<R, L, D, I, W>,
-    headers: &HeaderMap,
-    request: &TaskSubmissionRequest,
-) -> Result<(StatusCode, TaskStatusResponse), ApiError>
+impl<R, L, D, W> TaskApplicationService<R, L, D, W>
 where
     R: RuntimeRepository,
     L: AdmissionLedger + TaskSubmissionLedger,
     D: DecisionChannel + Clone,
-    I: TaskIdentityResolver,
     W: TaskWorkflowCatalog,
 {
-    let idempotency_key = headers
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::Admission("Idempotency-Key is required".to_owned()))?;
-    let identity = resolve_task_identity(&state.identities, headers).await?;
-    if let Some(reference) =
-        versioned_workflow_reference(&request.workflow, request.coding_agent_runtime.as_deref())?
-    {
-        return submit_versioned_task(state, idempotency_key, identity, reference, request).await;
-    }
-    let workflow = state
-        .workflows
-        .workflow(&request.workflow)
-        .ok_or(ApiError::TaskWorkflowNotFound)?;
-    let coding_agent_runtime = request.coding_agent_runtime.as_deref().ok_or_else(|| {
-        ApiError::Admission("legacy workflows require codingAgentRuntime".to_owned())
-    })?;
-    if coding_agent_runtime != workflow.coding_agent_runtime {
-        return Err(ApiError::Admission(
-            "codingAgentRuntime is not selected by the workflow".to_owned(),
-        ));
-    }
-    let spec = AgentRuntimeSpec {
-        principal: Principal::Service {
-            name: identity.service.clone(),
-            acting_user: identity.acting_user.clone(),
-        },
-        owner: identity.owner.clone(),
-        canonical_authority: Some(
-            CanonicalAuthorityBinding::new(
-                identity.canonical_user_id.clone(),
-                identity
-                    .acting_user
-                    .as_ref()
-                    .map(|_| identity.canonical_user_id.clone()),
-            )
-            .map_err(ApiError::Admission)?,
-        ),
-        agent_type: steward_types::AgentType {
-            name: workflow.coding_agent_runtime.clone(),
-        },
-        llms: workflow.llms.clone(),
-        tools: workflow.tools.clone(),
-        budget: workflow.budget.clone(),
-        ttl: workflow.ttl.clone(),
-        runner: steward_types::RunnerRequirements::default(),
-        bindings: None,
-    };
-    let envelope = state
-        .ledger
-        .latest_service_envelope(&identity.service)
-        .await
-        .map_err(ApiError::Store)?
-        .ok_or(ApiError::MissingEnvelope)?;
-    let decision = evaluate_with_grants(&spec, &envelope, &[])
-        .map_err(|error| ApiError::Admission(format!("{error:?}")))?;
-    if let Some(runtime_uid) = request.agent_runtime_uid.as_deref() {
-        if !matches!(decision, AdmissionDecision::Admit) {
+    async fn submit(
+        &self,
+        idempotency_key: &str,
+        identity: TaskIdentity,
+        request: &TaskSubmissionRequest,
+    ) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
+        let reference = versioned_workflow_reference(
+            &request.workflow,
+            request.coding_agent_runtime.as_deref(),
+        )?;
+        if reference.is_none() && request.coding_agent_runtime.is_none() {
             return Err(ApiError::Admission(
-                "adopted runtime is outside the current service envelope".to_owned(),
+                "legacy workflows require codingAgentRuntime".to_owned(),
             ));
         }
-        let runtime = state
-            .runtimes
-            .get_by_uid(runtime_uid)
+        if let Some(record) = self
+            .ledger
+            .task_by_idempotency(
+                &identity.service,
+                identity.canonical_user_id.as_str(),
+                idempotency_key,
+            )
             .await
-            .map_err(ApiError::Runtime)?;
-        let runtime_namespace = runtime
-            .namespace()
-            .ok_or_else(|| ApiError::Runtime("adopted runtime has no namespace".to_owned()))?;
-        if runtime_namespace != workflow.namespace
-            || runtime.spec != spec
-            || runtime
-                .annotations()
-                .contains_key(PENDING_APPROVAL_ANNOTATION)
+            .map_err(ApiError::Store)?
         {
-            return Err(ApiError::Conflict(
-                "adopted runtime does not match the resolved workflow and principal".to_owned(),
+            return task_retry_response(&identity, reference.as_ref(), request, record);
+        }
+        if let Some(reference) = reference {
+            return submit_versioned_task(self, idempotency_key, identity, reference, request)
+                .await;
+        }
+        let workflow = self
+            .workflows
+            .workflow(&request.workflow)
+            .ok_or(ApiError::TaskWorkflowNotFound)?;
+        let coding_agent_runtime = request.coding_agent_runtime.as_deref().ok_or_else(|| {
+            ApiError::Admission("legacy workflows require codingAgentRuntime".to_owned())
+        })?;
+        if coding_agent_runtime != workflow.coding_agent_runtime {
+            return Err(ApiError::Admission(
+                "codingAgentRuntime is not selected by the workflow".to_owned(),
             ));
         }
-        let runtime_name = runtime.name_any();
-        let reservation = state
+        let spec = AgentRuntimeSpec {
+            principal: Principal::Service {
+                name: identity.service.clone(),
+                acting_user: identity.acting_user.clone(),
+            },
+            owner: identity.owner.clone(),
+            canonical_authority: Some(
+                CanonicalAuthorityBinding::new(
+                    identity.canonical_user_id.clone(),
+                    identity
+                        .acting_user
+                        .as_ref()
+                        .map(|_| identity.canonical_user_id.clone()),
+                )
+                .map_err(ApiError::Admission)?,
+            ),
+            agent_type: steward_types::AgentType {
+                name: workflow.coding_agent_runtime.clone(),
+            },
+            llms: workflow.llms.clone(),
+            tools: workflow.tools.clone(),
+            budget: workflow.budget.clone(),
+            ttl: workflow.ttl.clone(),
+            runner: steward_types::RunnerRequirements::default(),
+            bindings: None,
+        };
+        let envelope = self
+            .ledger
+            .latest_service_envelope(&identity.service)
+            .await
+            .map_err(ApiError::Store)?
+            .ok_or(ApiError::MissingEnvelope)?;
+        let decision = evaluate_with_grants(&spec, &envelope, &[])
+            .map_err(|error| ApiError::Admission(format!("{error:?}")))?;
+        if let Some(runtime_uid) = request.agent_runtime_uid.as_deref() {
+            if !matches!(decision, AdmissionDecision::Admit) {
+                return Err(ApiError::Admission(
+                    "adopted runtime is outside the current service envelope".to_owned(),
+                ));
+            }
+            let runtime = self
+                .runtimes
+                .get_by_uid(runtime_uid)
+                .await
+                .map_err(ApiError::Runtime)?;
+            let runtime_namespace = runtime
+                .namespace()
+                .ok_or_else(|| ApiError::Runtime("adopted runtime has no namespace".to_owned()))?;
+            if runtime_namespace != workflow.namespace
+                || runtime.spec != spec
+                || runtime
+                    .annotations()
+                    .contains_key(PENDING_APPROVAL_ANNOTATION)
+            {
+                return Err(ApiError::Conflict(
+                    "adopted runtime does not match the resolved workflow and principal".to_owned(),
+                ));
+            }
+            let runtime_name = runtime.name_any();
+            let reservation = self
+                .ledger
+                .reserve_task(TaskReservationRequest {
+                    idempotency_key,
+                    submitter_service: &identity.service,
+                    acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
+                    acting_user_id: identity
+                        .acting_user
+                        .as_ref()
+                        .map(|_| identity.canonical_user_id.as_str()),
+                    owner: &identity.owner.0,
+                    owner_user_id: identity.canonical_user_id.as_str(),
+                    workflow: &workflow.name,
+                    workflow_name: None,
+                    workflow_version: None,
+                    workflow_digest: None,
+                    user_envelope_instance_id: None,
+                    user_envelope_revision: None,
+                    user_envelope_digest: None,
+                    coding_agent_runtime: &workflow.coding_agent_runtime,
+                    runtime_namespace: &runtime_namespace,
+                    runtime_name: &runtime_name,
+                    runtime_ownership: RuntimeOwnership::Adopted,
+                    runtime_spec: &spec,
+                    agent_command: &workflow.command,
+                    envelope_revision: envelope.revision,
+                })
+                .await
+                .map_err(ApiError::Store)?;
+            let record = if reservation.record.runtime_uid.is_none() {
+                self.ledger
+                    .bind_task_runtime(
+                        reservation.record.task_uid,
+                        runtime_uid,
+                        TaskPhase::Submitted,
+                    )
+                    .await
+                    .map_err(ApiError::Store)?
+            } else {
+                reservation.record
+            };
+            return task_response(record, Vec::new());
+        }
+        let runtime_name = stable_task_runtime_name(
+            &identity.service,
+            identity.canonical_user_id.as_str(),
+            idempotency_key,
+        );
+        let reservation = self
             .ledger
             .reserve_task(TaskReservationRequest {
                 idempotency_key,
@@ -1385,101 +1480,53 @@ where
                 user_envelope_revision: None,
                 user_envelope_digest: None,
                 coding_agent_runtime: &workflow.coding_agent_runtime,
-                runtime_namespace: &runtime_namespace,
+                runtime_namespace: &workflow.namespace,
                 runtime_name: &runtime_name,
-                runtime_ownership: RuntimeOwnership::Adopted,
+                runtime_ownership: RuntimeOwnership::Provisioned,
                 runtime_spec: &spec,
                 agent_command: &workflow.command,
                 envelope_revision: envelope.revision,
             })
             .await
             .map_err(ApiError::Store)?;
-        let record = if reservation.record.runtime_uid.is_none() {
-            state
-                .ledger
-                .bind_task_runtime(
-                    reservation.record.task_uid,
-                    runtime_uid,
-                    TaskPhase::Submitted,
-                )
-                .await
-                .map_err(ApiError::Store)?
-        } else {
-            reservation.record
-        };
-        return task_response(record, Vec::new());
-    }
-    let runtime_name = stable_task_runtime_name(
-        &identity.service,
-        identity.canonical_user_id.as_str(),
-        idempotency_key,
-    );
-    let reservation = state
-        .ledger
-        .reserve_task(TaskReservationRequest {
-            idempotency_key,
-            submitter_service: &identity.service,
-            acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
-            acting_user_id: identity
-                .acting_user
-                .as_ref()
-                .map(|_| identity.canonical_user_id.as_str()),
-            owner: &identity.owner.0,
-            owner_user_id: identity.canonical_user_id.as_str(),
-            workflow: &workflow.name,
-            workflow_name: None,
-            workflow_version: None,
-            workflow_digest: None,
-            user_envelope_instance_id: None,
-            user_envelope_revision: None,
-            user_envelope_digest: None,
-            coding_agent_runtime: &workflow.coding_agent_runtime,
-            runtime_namespace: &workflow.namespace,
-            runtime_name: &runtime_name,
-            runtime_ownership: RuntimeOwnership::Provisioned,
-            runtime_spec: &spec,
-            agent_command: &workflow.command,
-            envelope_revision: envelope.revision,
-        })
-        .await
-        .map_err(ApiError::Store)?;
-    if !reservation.inserted && reservation.record.runtime_uid.is_some() {
-        return task_response(reservation.record, Vec::new());
-    }
+        if !reservation.inserted && reservation.record.runtime_uid.is_some() {
+            return task_response(reservation.record, Vec::new());
+        }
 
-    if matches!(&decision, AdmissionDecision::Admit) {
-        return task_response(reservation.record, Vec::new());
-    }
+        if matches!(&decision, AdmissionDecision::Admit) {
+            return task_response(reservation.record, Vec::new());
+        }
 
-    let (runtime, phase, deltas) = create_task_runtime(
-        &state.runtimes,
-        &state.ledger,
-        &state.decisions,
-        TaskRuntimePlan {
-            namespace: &workflow.namespace,
-            name: &runtime_name,
-            service: &identity.service,
-            proposed_spec: &spec,
-            envelope: &envelope,
-            decision,
-        },
-    )
-    .await?;
-    let runtime_uid = runtime
-        .metadata
-        .uid
-        .as_deref()
-        .ok_or(ApiError::MissingRuntimeUid)?;
-    let record = state
-        .ledger
-        .bind_task_runtime(reservation.record.task_uid, runtime_uid, phase)
-        .await
-        .map_err(ApiError::Store)?;
-    task_response(record, deltas)
+        let (runtime, phase, deltas) = create_task_runtime(
+            &self.runtimes,
+            &self.ledger,
+            &self.decisions,
+            TaskRuntimePlan {
+                namespace: &workflow.namespace,
+                name: &runtime_name,
+                service: &identity.service,
+                proposed_spec: &spec,
+                envelope: &envelope,
+                decision,
+            },
+        )
+        .await?;
+        let runtime_uid = runtime
+            .metadata
+            .uid
+            .as_deref()
+            .ok_or(ApiError::MissingRuntimeUid)?;
+        let record = self
+            .ledger
+            .bind_task_runtime(reservation.record.task_uid, runtime_uid, phase)
+            .await
+            .map_err(ApiError::Store)?;
+        task_response(record, deltas)
+    }
 }
 
-async fn submit_versioned_task<R, L, D, I, W>(
-    state: &TaskApiState<R, L, D, I, W>,
+async fn submit_versioned_task<R, L, D, W>(
+    application: &TaskApplicationService<R, L, D, W>,
     idempotency_key: &str,
     identity: TaskIdentity,
     reference: WorkflowReference,
@@ -1489,7 +1536,6 @@ where
     R: RuntimeRepository,
     L: AdmissionLedger + TaskSubmissionLedger,
     D: DecisionChannel + Clone,
-    I: TaskIdentityResolver,
     W: TaskWorkflowCatalog,
 {
     if request.agent_runtime_uid.is_some() {
@@ -1497,30 +1543,18 @@ where
             "versioned Workflows use a server-owned runtime path".to_owned(),
         ));
     }
-    if let Some(record) = state
-        .ledger
-        .task_by_idempotency(
-            &identity.service,
-            identity.canonical_user_id.as_str(),
-            idempotency_key,
-        )
-        .await
-        .map_err(ApiError::Store)?
-    {
-        return versioned_task_retry_response(&identity, &reference, record);
-    }
-    let workflow = state
+    let workflow = application
         .ledger
         .workflow_revision(&reference.name, reference.version)
         .await
         .map_err(ApiError::Store)?
         .ok_or(ApiError::TaskWorkflowNotFound)?;
-    let envelopes = state
+    let envelopes = application
         .ledger
         .active_provisioned_user_envelopes(&identity.canonical_user_id)
         .await
         .map_err(ApiError::Store)?;
-    let plan = resolve_versioned_task_plan(&identity, workflow, envelopes, &state.config)?;
+    let plan = resolve_versioned_task_plan(&identity, workflow, envelopes, &application.config)?;
     let user_envelope = plan
         .envelope
         .approved_envelope
@@ -1535,7 +1569,7 @@ where
             "Workflow runtime exceeds its pinned User Envelope".to_owned(),
         ));
     }
-    let service_envelope = state
+    let service_envelope = application
         .ledger
         .latest_service_envelope(&identity.service)
         .await
@@ -1559,7 +1593,7 @@ where
         .envelope_digest
         .as_deref()
         .ok_or(ApiError::MissingEnvelope)?;
-    let reservation = match state
+    let reservation = match application
         .ledger
         .reserve_task(TaskReservationRequest {
             idempotency_key,
@@ -1590,7 +1624,7 @@ where
     {
         Ok(reservation) => reservation,
         Err(StoreError::TaskIdempotencyConflict) => {
-            let record = state
+            let record = application
                 .ledger
                 .task_by_idempotency(
                     &identity.service,
@@ -1600,7 +1634,7 @@ where
                 .await
                 .map_err(ApiError::Store)?
                 .ok_or(ApiError::Store(StoreError::TaskIdempotencyConflict))?;
-            return versioned_task_retry_response(&identity, &reference, record);
+            return task_retry_response(&identity, Some(&reference), request, record);
         }
         Err(error) => return Err(ApiError::Store(error)),
     };
@@ -1611,9 +1645,9 @@ where
         return task_response(reservation.record, Vec::new());
     }
     let (runtime, phase, deltas) = create_task_runtime(
-        &state.runtimes,
-        &state.ledger,
-        &state.decisions,
+        &application.runtimes,
+        &application.ledger,
+        &application.decisions,
         TaskRuntimePlan {
             namespace: VERSIONED_WORKFLOW_NAMESPACE,
             name: &runtime_name,
@@ -1629,7 +1663,7 @@ where
         .uid
         .as_deref()
         .ok_or(ApiError::MissingRuntimeUid)?;
-    let record = state
+    let record = application
         .ledger
         .bind_task_runtime(reservation.record.task_uid, runtime_uid, phase)
         .await
@@ -1637,9 +1671,10 @@ where
     task_response(record, deltas)
 }
 
-fn versioned_task_retry_response(
+fn task_retry_response(
     identity: &TaskIdentity,
-    reference: &WorkflowReference,
+    reference: Option<&WorkflowReference>,
+    request: &TaskSubmissionRequest,
     record: TaskRecord,
 ) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
     let acting_user = identity.acting_user.as_ref().map(|email| email.0.as_str());
@@ -1647,18 +1682,47 @@ fn versioned_task_retry_response(
         .acting_user
         .as_ref()
         .map(|_| identity.canonical_user_id.as_str());
-    let workflow_reference = format!("{}@{}", reference.name, reference.version);
     if record.identity_binding_state != "bound"
         || record.submitter_service != identity.service
         || record.acting_user.as_deref() != acting_user
         || record.acting_user_id.as_deref() != acting_user_id
         || record.owner != identity.owner.0
         || record.owner_user_id.as_deref() != Some(identity.canonical_user_id.as_str())
-        || record.workflow != workflow_reference
-        || record.workflow_name.as_deref() != Some(reference.name.as_str())
-        || record.workflow_version != Some(reference.version)
     {
         return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
+    }
+    match reference {
+        Some(reference) => {
+            let workflow_reference = format!("{}@{}", reference.name, reference.version);
+            if request.agent_runtime_uid.is_some()
+                || record.workflow != workflow_reference
+                || record.workflow_name.as_deref() != Some(reference.name.as_str())
+                || record.workflow_version != Some(reference.version)
+                || record.runtime_ownership != RuntimeOwnership::Provisioned
+            {
+                return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
+            }
+        }
+        None => {
+            let requested_runtime = request.coding_agent_runtime.as_deref().ok_or_else(|| {
+                ApiError::Admission("legacy workflows require codingAgentRuntime".to_owned())
+            })?;
+            let runtime_binding_matches = match request.agent_runtime_uid.as_deref() {
+                Some(runtime_uid) => {
+                    record.runtime_ownership == RuntimeOwnership::Adopted
+                        && record.runtime_uid.as_deref() == Some(runtime_uid)
+                }
+                None => record.runtime_ownership == RuntimeOwnership::Provisioned,
+            };
+            if record.workflow != request.workflow
+                || record.workflow_name.is_some()
+                || record.workflow_version.is_some()
+                || record.coding_agent_runtime != requested_runtime
+                || !runtime_binding_matches
+            {
+                return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
+            }
+        }
     }
     task_response(record, Vec::new())
 }

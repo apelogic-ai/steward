@@ -8574,6 +8574,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_task_retry_uses_persisted_plan_across_workflow_catalog_changes()
+    -> Result<(), String> {
+        let ledger = ledger();
+        let request = |workflow: &'static str, runtime: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "legacy-catalog-retry")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"workflow":"{workflow}","codingAgentRuntime":"{runtime}"}}"#
+                )))
+                .map_err(|error| format!("build legacy Task retry: {error}"))
+        };
+        let first_app = task_router(
+            MultiRuntimeRepository::default(),
+            ledger.clone(),
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+            task_api_config()?,
+        );
+        let first = first_app
+            .oneshot(request("code-review", "agent-v1")?)
+            .await
+            .map_err(|error| format!("submit initial legacy Task: {error}"))?;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_body = to_bytes(first.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read initial legacy Task response: {error}"))?;
+        let first_task_uid = serde_json::from_slice::<serde_json::Value>(&first_body)
+            .map_err(|error| format!("parse initial legacy Task response: {error}"))?
+            .get("taskUid")
+            .cloned();
+
+        let retry_app = task_router(
+            MultiRuntimeRepository::default(),
+            ledger,
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            TaskApiConfig::default(),
+        );
+        let retry = retry_app
+            .clone()
+            .oneshot(request("code-review", "agent-v1")?)
+            .await
+            .map_err(|error| format!("retry legacy Task after catalog change: {error}"))?;
+        assert_eq!(
+            retry.status(),
+            StatusCode::ACCEPTED,
+            "an identical retry must return the persisted Task before consulting the current catalog"
+        );
+        let retry_body = to_bytes(retry.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read legacy Task retry response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&retry_body)
+                .map_err(|error| format!("parse legacy Task retry response: {error}"))?
+                .get("taskUid")
+                .cloned(),
+            first_task_uid,
+            "the application service must return the original Task"
+        );
+
+        let conflicting = retry_app
+            .oneshot(request("different-workflow", "agent-v1")?)
+            .await
+            .map_err(|error| format!("submit conflicting legacy Task retry: {error}"))?;
+        assert_eq!(
+            conflicting.status(),
+            StatusCode::CONFLICT,
+            "a retry with changed caller-owned pins must conflict without live catalog resolution"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn versioned_task_route_applies_service_envelope_as_a_narrowing_ceiling()
     -> Result<(), String> {
         let runtimes = MultiRuntimeRepository::default();
