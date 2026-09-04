@@ -1969,7 +1969,7 @@ mod workflow_request_tests {
                 .rsplit_once('@')
                 .map_or("", |(_, version)| version)
         );
-        let native_profile = "steward-runtime-providers@1.2.0";
+        let native_profile = "steward-runtime-providers@1.3.0";
         let mut digest = Sha256::new();
         for value in [
             steward_types::TASK_EXECUTION_BINDING_SCHEMA_VERSION,

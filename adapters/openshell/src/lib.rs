@@ -82,6 +82,12 @@ const TOOL_PROVIDER: &str = "steward-mcp-gw";
 #[cfg(feature = "runtime")]
 const INFERENCE_PROVIDER: &str = "steward-litellm";
 #[cfg(feature = "runtime")]
+const TASK_NATIVE_PROFILE_V1_3_0: &str = "steward-runtime-providers@1.3.0";
+#[cfg(feature = "runtime")]
+const TASK_TOOL_PROVIDER_V1_3_0: &str = "steward-mcp-gw-v1-3-0";
+#[cfg(feature = "runtime")]
+const TASK_INFERENCE_PROVIDER_V1_3_0: &str = "steward-litellm-v1-3-0";
+#[cfg(feature = "runtime")]
 const GRPC_NOT_FOUND: i32 = 5;
 #[cfg(feature = "runtime")]
 const GRPC_ALREADY_EXISTS: i32 = 6;
@@ -107,6 +113,16 @@ fn provider_reconciliation(attached: bool, desired: bool) -> Option<ProviderReco
         (true, false) => Some(ProviderReconciliation::Detach),
         (false, false) | (true, true) => None,
     }
+}
+
+#[cfg(feature = "runtime")]
+fn managed_provider_names() -> [&'static str; 4] {
+    [
+        TOOL_PROVIDER,
+        INFERENCE_PROVIDER,
+        TASK_TOOL_PROVIDER_V1_3_0,
+        TASK_INFERENCE_PROVIDER_V1_3_0,
+    ]
 }
 #[cfg(feature = "identity")]
 const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
@@ -631,13 +647,26 @@ fn project_request(
         stable_bridge_image,
         connections_bridge_image,
     )?;
+    let (tool_provider, inference_provider) = match request.execution_binding.as_ref() {
+        Some(binding) if binding.native_profile == TASK_NATIVE_PROFILE_V1_3_0 => {
+            (TASK_TOOL_PROVIDER_V1_3_0, TASK_INFERENCE_PROVIDER_V1_3_0)
+        }
+        Some(_) => {
+            return Err(PortError::Rejected {
+                reason:
+                    "persisted native provider profile is not installed by this Steward release"
+                        .to_owned(),
+            });
+        }
+        None => (TOOL_PROVIDER, INFERENCE_PROVIDER),
+    };
     Ok(OpenShellProjection {
         workspace: stable_name(NameKind::Workspace, request.workspace_key.as_bytes()),
         workspace_key: request.workspace_key.clone(),
         sandbox: stable_name(NameKind::Sandbox, request.runtime.0.as_bytes()),
         providers: [
-            (!request.tools.is_empty()).then(|| TOOL_PROVIDER.to_owned()),
-            (!request.models.is_empty()).then(|| INFERENCE_PROVIDER.to_owned()),
+            (!request.tools.is_empty()).then(|| tool_provider.to_owned()),
+            (!request.models.is_empty()).then(|| inference_provider.to_owned()),
         ]
         .into_iter()
         .flatten()
@@ -1932,7 +1961,7 @@ impl SandboxRuntime for OpenShellRuntime {
             false,
         )
         .await?;
-        for provider_name in [TOOL_PROVIDER, INFERENCE_PROVIDER] {
+        for provider_name in managed_provider_names() {
             self.reconcile_provider(
                 &projection.workspace,
                 &projection.sandbox,
@@ -2217,7 +2246,7 @@ mod tests {
     use steward_ports::{PortError, SandboxExecutionClass, SandboxRequest};
     #[cfg(feature = "runtime")]
     use steward_types::{
-        AgentType, DisposableExecutionBinding, RuntimeId, RuntimeRefs,
+        AgentType, DisposableExecutionBinding, ModelRef, RuntimeId, RuntimeRefs,
         TASK_EXECUTION_BINDING_SCHEMA_VERSION, ToolGrant,
     };
 
@@ -3352,7 +3381,7 @@ mod tests {
             image: format!("registry.example.test/codex@sha256:{}", "b".repeat(64)),
             executable: "/opt/codex/bin/codex".to_owned(),
             expected_version: "codex-cli 0.140.0".to_owned(),
-            native_profile: "steward-runtime-providers@1.2.0".to_owned(),
+            native_profile: "steward-runtime-providers@1.3.0".to_owned(),
         };
         let projection = project_request(
             &SandboxRequest {
@@ -3362,8 +3391,15 @@ mod tests {
                 agent_type: AgentType {
                     name: binding.agent_ref.clone(),
                 },
-                models: Vec::new(),
-                tools: Vec::new(),
+                models: vec![ModelRef {
+                    provider: "litellm".to_owned(),
+                    model: "test-model".to_owned(),
+                }],
+                tools: vec![ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "repository".to_owned(),
+                    action: "get_file_contents".to_owned(),
+                }],
                 refs: RuntimeRefs::default(),
                 execution_binding: Some(binding.clone()),
             },
@@ -3373,6 +3409,11 @@ mod tests {
         .map_err(|error| format!("persisted binding was rejected: {error:?}"))?;
 
         assert_eq!(projection.image.as_deref(), Some(binding.image.as_str()));
+        assert_eq!(
+            projection.providers,
+            ["steward-mcp-gw-v1-3-0", "steward-litellm-v1-3-0"],
+            "the persisted native profile must select the exact versioned OpenShell profiles used by execution"
+        );
         let native_profile_label = sandbox_spec(&projection)
             .labels
             .get(NATIVE_PROFILE_LABEL)
@@ -3396,6 +3437,36 @@ mod tests {
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
             "the digest label must use only OpenShell-compatible characters"
+        );
+
+        let mut unsupported = binding.clone();
+        unsupported.native_profile = "arbitrary-profile@9.9.9".to_owned();
+        assert!(
+            project_request(
+                &SandboxRequest {
+                    runtime: RuntimeId("runtime-uid-b".to_owned()),
+                    workspace_key: "team-a".to_owned(),
+                    execution_class: SandboxExecutionClass::Agent,
+                    agent_type: AgentType {
+                        name: unsupported.agent_ref.clone(),
+                    },
+                    models: vec![ModelRef {
+                        provider: "litellm".to_owned(),
+                        model: "test-model".to_owned(),
+                    }],
+                    tools: vec![ToolGrant {
+                        provider: "github".to_owned(),
+                        resource: "repository".to_owned(),
+                        action: "get_file_contents".to_owned(),
+                    }],
+                    refs: RuntimeRefs::default(),
+                    execution_binding: Some(unsupported),
+                },
+                None,
+                None,
+            )
+            .is_err(),
+            "an arbitrary well-formed native-profile reference must fail before sandbox creation"
         );
         Ok(())
     }
@@ -3850,6 +3921,21 @@ mod tests {
             provider_reconciliation(false, true),
             Some(ProviderReconciliation::Attach),
             "a newly granted tool capability must attach the gateway provider"
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn versioned_task_profiles_are_managed_during_reconciliation() {
+        let managed = super::managed_provider_names();
+
+        assert!(
+            managed.contains(&super::TASK_TOOL_PROVIDER_V1_3_0),
+            "the exact tool profile selected by the persisted native-profile pin must be reconciled"
+        );
+        assert!(
+            managed.contains(&super::TASK_INFERENCE_PROVIDER_V1_3_0),
+            "the exact inference profile selected by the persisted native-profile pin must be reconciled"
         );
     }
 

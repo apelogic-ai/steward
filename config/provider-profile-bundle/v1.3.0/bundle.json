@@ -1,0 +1,49 @@
+{
+  "schema": "steward.provider-profile-bundle/v1",
+  "bundle": {
+    "id": "steward-runtime-providers",
+    "version": "1.3.0"
+  },
+  "transitions": {
+    "install": ["absent"],
+    "reconcile": ["same-bundle"]
+  },
+  "profiles": [
+    {
+      "id": "steward-mcp-gw",
+      "template": "profiles/steward-mcp-gw.json",
+      "inputs": [
+        {"name": "gateway-origin", "kind": "https-origin"},
+        {"name": "runtime-grant-origin", "kind": "https-origin"},
+        {"name": "service-cidrs", "kind": "cidr-list"}
+      ]
+    },
+    {
+      "id": "steward-litellm",
+      "template": "profiles/steward-litellm.json",
+      "inputs": [
+        {"name": "gateway-origin", "kind": "https-origin"},
+        {"name": "runtime-grant-origin", "kind": "https-origin"},
+        {"name": "service-cidrs", "kind": "cidr-list"}
+      ]
+    },
+    {
+      "id": "steward-mcp-gw-v1-3-0",
+      "template": "profiles/steward-mcp-gw-v1-3-0.json",
+      "inputs": [
+        {"name": "gateway-origin", "kind": "https-origin"},
+        {"name": "runtime-grant-origin", "kind": "https-origin"},
+        {"name": "service-cidrs", "kind": "cidr-list"}
+      ]
+    },
+    {
+      "id": "steward-litellm-v1-3-0",
+      "template": "profiles/steward-litellm-v1-3-0.json",
+      "inputs": [
+        {"name": "gateway-origin", "kind": "https-origin"},
+        {"name": "runtime-grant-origin", "kind": "https-origin"},
+        {"name": "service-cidrs", "kind": "cidr-list"}
+      ]
+    }
+  ]
+}

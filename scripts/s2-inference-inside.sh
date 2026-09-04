@@ -128,6 +128,33 @@ if [[ "${SLICE}" == "s5" ]]; then
   kind load docker-image "${STEWARD_POC_API_IMAGE}" --name "${cluster_name}"
 fi
 KUBECTL=(kubectl --kubeconfig "${STEWARD_TEST_KUBECONFIG}" --context "${STEWARD_TEST_KUBE_CONTEXT}")
+
+wait_for_spire_admission_webhook() {
+  for _attempt in {1..120}; do
+    if "${KUBECTL[@]}" create --dry-run=server -f - >/dev/null 2>&1 <<'YAML'
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: steward-spire-webhook-readiness
+spec:
+  spiffeIDTemplate: spiffe://openshell.local/steward/readiness
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: steward-system
+  podSelector:
+    matchLabels:
+      app: steward-spire-webhook-readiness
+YAML
+    then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "SPIRE admission webhook did not accept a server-side dry run within 120 seconds" >&2
+  return 1
+}
+
+wait_for_spire_admission_webhook
 "${KUBECTL[@]}" apply -f "${ROOT}/manifests/agents.apelogic.ai_agentruntimes.yaml"
 crd_established="false"
 for _attempt in {1..120}; do
@@ -338,7 +365,7 @@ if [[ "${SLICE}" == "s5" ]]; then
   )
 elif [[ "${SLICE}" == "task" ]]; then
   profile_sources=(
-    "${ROOT}/config/s5/tool-provider-profile.yaml"
+    "${ROOT}/config/task/tool-provider-profile.yaml"
     "${ROOT}/config/task/inference-provider-profile.yaml"
   )
 else

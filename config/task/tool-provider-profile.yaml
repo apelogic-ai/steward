@@ -1,24 +1,23 @@
-id: steward-litellm-v1-3-0
-display_name: Steward deterministic inference fixture 1.3.0
-description: Immutable runtime-scoped deterministic Responses policy for the local Task E2E
-category: inference
-inference_capable: true
+id: steward-mcp-gw-v1-3-0
+display_name: Steward Task MCP gateway 1.3.0
+description: Immutable runtime-scoped MCP policy for the local Task E2E
+category: source_control
 credentials:
-  - name: api_key
-    description: Runtime-bound inference credential
+  - name: access_token
+    description: Short-lived HOP-1 derived from the sandbox JWT-SVID
     required: false
     auth_style: bearer
     header_name: Authorization
     token_grant:
-      token_endpoint: http://steward-mint.steward-system.svc.cluster.local:8080/token
-      audience: steward-inference
+      token_endpoint: http://hop1-capture-tools.steward-system.svc.cluster.local:8085/token-tools
+      audience: steward-mcp
       jwt_svid_audience: steward-mint
       client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-spiffe
-      scopes: [inference]
+      scopes: [mcp]
       cache_ttl_seconds: 2
 endpoints:
-  - host: litellm-litellm.litellm.svc.cluster.local
-    port: 4000
+  - host: hop1-capture-tools.steward-system.svc.cluster.local
+    port: 8085
     protocol: rest
     tls: none
     access: read-write

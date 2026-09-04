@@ -25,6 +25,14 @@ for command in bash docker; do
   fi
 done
 
+if [[ "${STEWARD_USE_CHART_SUPERVISOR:-0}" != "1" \
+  && -z "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]
+then
+  if ! "${root}/scripts/build-patched-openshell-supervisor.sh" --image-is-current; then
+    "${root}/scripts/build-patched-openshell-supervisor.sh"
+  fi
+fi
+
 docker build \
   --file "${root}/e2e/Dockerfile.workflow-sandbox" \
   --label "steward.test/run-id=${run_id}" \

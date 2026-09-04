@@ -120,7 +120,7 @@ mod tests {
                     .rsplit_once('@')
                     .map_or("", |(_, version)| version)
             ),
-            native_profile: "steward-runtime-providers@1.2.0".to_owned(),
+            native_profile: "steward-runtime-providers@1.3.0".to_owned(),
         };
         entry.binding_digest = entry.content_digest();
         entry.binding_id = entry.binding_digest.clone();

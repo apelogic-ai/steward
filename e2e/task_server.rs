@@ -185,7 +185,7 @@ fn workflow_content_digest(agent: &str, prompt: &str) -> String {
 fn execution_binding_catalog(image: &str) -> Result<String, Box<dyn Error>> {
     let executable = "/usr/bin/codex";
     let expected_version = "codex-cli 0.140.0";
-    let native_profile = "steward-runtime-providers@1.2.0";
+    let native_profile = "steward-runtime-providers@1.3.0";
     let mut hasher = Sha256::new();
     for value in [
         steward_types::TASK_EXECUTION_BINDING_SCHEMA_VERSION,

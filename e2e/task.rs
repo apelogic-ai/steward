@@ -269,7 +269,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     );
     assert_eq!(
         execution_binding.native_profile,
-        "steward-runtime-providers@1.2.0"
+        "steward-runtime-providers@1.3.0"
     );
     assert_eq!(submitted.runtime_spec.llms.len(), 1);
     assert_eq!(submitted.runtime_spec.llms[0].provider, "openai");

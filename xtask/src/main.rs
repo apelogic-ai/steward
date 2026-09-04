@@ -20,10 +20,11 @@ use xtask::{
 
 type TaskResult = Result<(), String>;
 
-const PROVIDER_PROFILE_BUNDLE_CATALOG: [(&str, &str); 3] = [
+const PROVIDER_PROFILE_BUNDLE_CATALOG: [(&str, &str); 4] = [
     ("1.0.0", "config/provider-profile-bundle/v1"),
     ("1.1.0", "config/provider-profile-bundle/v1.1.0"),
     ("1.2.0", "config/provider-profile-bundle/v1.2.0"),
+    ("1.3.0", "config/provider-profile-bundle/v1.3.0"),
 ];
 
 fn main() -> ExitCode {
@@ -1344,6 +1345,19 @@ mod tests {
             task_wrapper.contains("scripts/task-submission-inside.sh"),
             "the task lifecycle wrapper must defer image provision until the post-S0 callback"
         );
+        let supervisor_preflight = task_wrapper
+            .find("build-patched-openshell-supervisor.sh")
+            .ok_or_else(|| {
+                "the task lifecycle wrapper must establish the pinned supervisor before building run-scoped images"
+                    .to_owned()
+            })?;
+        let workflow_image_build = task_wrapper.find("docker build").ok_or_else(|| {
+            "the task lifecycle wrapper must build its run-scoped workflow image".to_owned()
+        })?;
+        assert!(
+            supervisor_preflight < workflow_image_build,
+            "the pinned supervisor build must complete before the run-scoped workflow image is built"
+        );
         assert!(
             !task_wrapper.contains("build-steward-mint-image.sh"),
             "the task lifecycle wrapper must not build the mint image before the long S0 setup gap"
@@ -1437,8 +1451,14 @@ mod tests {
             "the versioned Workflow E2E must create its dedicated runtime namespace"
         );
         assert!(
+            harness.contains("wait_for_spire_admission_webhook")
+                && harness.contains("--dry-run=server")
+                && harness.contains("steward-spire-webhook-readiness"),
+            "the versioned Workflow E2E must prove the SPIRE admission webhook accepts requests before applying ClusterSPIFFEID resources"
+        );
+        assert!(
             harness.contains(
-                "elif [[ \"${SLICE}\" == \"task\" ]]; then\n  profile_sources=(\n    \"${ROOT}/config/s5/tool-provider-profile.yaml\"\n    \"${ROOT}/config/task/inference-provider-profile.yaml\"\n  )"
+                "elif [[ \"${SLICE}\" == \"task\" ]]; then\n  profile_sources=(\n    \"${ROOT}/config/task/tool-provider-profile.yaml\"\n    \"${ROOT}/config/task/inference-provider-profile.yaml\"\n  )"
             ),
             "the versioned Workflow E2E must install both Envelope-selected provider profiles"
         );
@@ -1467,8 +1487,10 @@ mod tests {
         let arm64_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/bin/codex";
         let amd64_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex";
         for profile_path in [
-            "config/s5/tool-provider-profile.yaml",
+            "config/task/tool-provider-profile.yaml",
             "config/task/inference-provider-profile.yaml",
+            "config/provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw-v1-3-0.json",
+            "config/provider-profile-bundle/v1.3.0/profiles/steward-litellm-v1-3-0.json",
         ] {
             let profile = fs::read_to_string(root().join(profile_path)).map_err(|error| {
                 format!("Codex provider profile {profile_path} is required: {error}")
@@ -1585,9 +1607,12 @@ mod tests {
 
     #[test]
     fn provider_profile_inputs_select_their_exact_immutable_bundle() -> Result<(), String> {
-        for (version, expected_suffix) in
-            [("1.0.0", "/v1"), ("1.1.0", "/v1.1.0"), ("1.2.0", "/v1.2.0")]
-        {
+        for (version, expected_suffix) in [
+            ("1.0.0", "/v1"),
+            ("1.1.0", "/v1.1.0"),
+            ("1.2.0", "/v1.2.0"),
+            ("1.3.0", "/v1.3.0"),
+        ] {
             let inputs = serde_json::json!({
                 "bundle": {"id": "steward-runtime-providers", "version": version}
             });
@@ -1599,11 +1624,11 @@ mod tests {
             );
         }
         let unsupported = serde_json::json!({
-            "bundle": {"id": "steward-runtime-providers", "version": "1.3.0"}
+            "bundle": {"id": "steward-runtime-providers", "version": "1.4.0"}
         });
         let result = provider_profile_bundle_directory_for_inputs(&unsupported.to_string());
         assert!(
-            matches!(result, Err(ref error) if error.contains("unsupported") && error.contains("1.3.0")),
+            matches!(result, Err(ref error) if error.contains("unsupported") && error.contains("1.4.0")),
             "unknown bundle identities must fail closed: {result:?}"
         );
         Ok(())
@@ -2448,9 +2473,11 @@ mod tests {
             "--numeric-owner",
             "--format=ustar",
             "gzip -n",
-            "provider-profile-bundle/v1.2.0/bundle.json",
-            "provider-profile-bundle/v1.2.0/profiles/steward-litellm.json",
-            "provider-profile-bundle/v1.2.0/profiles/steward-mcp-gw.json",
+            "provider-profile-bundle/v1.3.0/bundle.json",
+            "provider-profile-bundle/v1.3.0/profiles/steward-litellm.json",
+            "provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw.json",
+            "provider-profile-bundle/v1.3.0/profiles/steward-litellm-v1-3-0.json",
+            "provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw-v1-3-0.json",
             "sha256sum",
         ] {
             assert!(
@@ -2470,7 +2497,7 @@ mod tests {
             );
         }
         let bundle_readme =
-            fs::read_to_string(root().join("config/provider-profile-bundle/v1.2.0/README.md"))
+            fs::read_to_string(root().join("config/provider-profile-bundle/v1.3.0/README.md"))
                 .map_err(|error| format!("provider-profile bundle README is required: {error}"))?;
         for required in [
             "Verify a released bundle before rendering or installation",

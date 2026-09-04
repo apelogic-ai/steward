@@ -42,6 +42,15 @@ schema version `steward/task-execution-binding/v1`, `agentRef`, `image`, `execut
 byte length. `bindingId` must equal that digest. The content-addressed identity therefore changes
 if any execution byte or compatibility pin changes, and cannot be reused with different content.
 
+`steward-runtime-providers@1.3.0` is the first executable native-profile pin. The
+OpenShell adapter maps it only to the co-installable versioned provider IDs
+`steward-mcp-gw-v1-3-0` and `steward-litellm-v1-3-0`; it never substitutes the
+unversioned profiles. Any other persisted native-profile reference fails before sandbox
+creation. Operators must install or explicitly upgrade to the immutable 1.3.0 bundle
+before admitting bindings that reference it. The bundle retains the unversioned profiles
+for legacy and governed Connections runtimes while the versioned Task profiles authorize
+the exact Codex 0.140 native binaries.
+
 ## Controller inputs
 
 Task execution is enabled in the normal controller composition root when
