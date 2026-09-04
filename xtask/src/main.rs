@@ -2423,7 +2423,7 @@ mod tests {
             "Verify authenticated OpenShell adapter on linux/amd64",
             "cargo xtask e2e-openshell-adapter",
             "Provider profile bundle asset:",
-            "Provider profile bundle identity:",
+            "Provider profile bundle identity: steward-runtime-providers@1.3.0",
             "Provider profile bundle SHA-256:",
             "Provider profile bundle signer identity:",
             "Provider profile bundle source repository:",
