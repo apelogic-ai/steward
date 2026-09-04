@@ -3016,8 +3016,9 @@ mod tests {
         TaskRecord, TaskReservation, TaskReservationRequest, WorkflowRevisionRecord,
     };
     use steward_types::{
-        AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email,
-        ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, TaskPhase, ToolGrant,
+        AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding,
+        CanonicalUserId, Duration, Email, ModelRef, PENDING_APPROVAL_ANNOTATION, Principal,
+        RuntimeOwnership, TaskPhase, ToolGrant,
     };
     use tower::ServiceExt;
     use utoipa::OpenApi;
@@ -8651,6 +8652,126 @@ mod tests {
             StatusCode::CONFLICT,
             "a retry with changed caller-owned pins must conflict without live catalog resolution"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adopted_task_retry_recovers_a_reservation_persisted_before_runtime_binding()
+    -> Result<(), String> {
+        let ledger = ledger();
+        let workflow = task_workflow("100.00");
+        let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        let spec = AgentRuntimeSpec {
+            principal: Principal::Service {
+                name: "steward-run".to_owned(),
+                acting_user: Some(Email("alice@example.com".to_owned())),
+            },
+            owner: Email("alice@example.com".to_owned()),
+            canonical_authority: Some(CanonicalAuthorityBinding::new(
+                canonical_user_id.clone(),
+                Some(canonical_user_id),
+            )?),
+            agent_type: AgentType {
+                name: workflow.coding_agent_runtime.clone(),
+            },
+            llms: workflow.llms.clone(),
+            tools: workflow.tools.clone(),
+            budget: workflow.budget.clone(),
+            ttl: workflow.ttl.clone(),
+            runner: steward_types::RunnerRequirements::default(),
+            bindings: None,
+        };
+        let reservation = ledger
+            .reserve_task(TaskReservationRequest {
+                idempotency_key: "adopted-crash-retry",
+                submitter_service: "steward-run",
+                acting_user: Some("alice@example.com"),
+                acting_user_id: Some("usr_0123456789abcdef0123456789abcdef"),
+                owner: "alice@example.com",
+                owner_user_id: "usr_0123456789abcdef0123456789abcdef",
+                workflow: &workflow.name,
+                workflow_name: None,
+                workflow_version: None,
+                workflow_digest: None,
+                user_envelope_instance_id: None,
+                user_envelope_revision: None,
+                user_envelope_digest: None,
+                coding_agent_runtime: &workflow.coding_agent_runtime,
+                runtime_namespace: &workflow.namespace,
+                runtime_name: "runtime-a",
+                runtime_ownership: RuntimeOwnership::Adopted,
+                runtime_spec: &spec,
+                agent_command: &workflow.command,
+                execution_binding: None,
+                envelope_revision: 3,
+            })
+            .await
+            .map_err(|error| format!("seed unbound adopted reservation: {error}"))?;
+        assert!(reservation.inserted && reservation.record.runtime_uid.is_none());
+
+        let mut runtime = AgentRuntime::new("runtime-a", spec.clone());
+        runtime.metadata.namespace = Some("team-a".to_owned());
+        runtime.metadata.uid = Some("runtime-uid-a".to_owned());
+        let mut other_runtime = AgentRuntime::new("runtime-b", spec);
+        other_runtime.metadata.namespace = Some("team-a".to_owned());
+        other_runtime.metadata.uid = Some("runtime-uid-b".to_owned());
+        let runtimes = MultiRuntimeRepository {
+            runtimes: Arc::new(Mutex::new(vec![runtime, other_runtime])),
+        };
+        let app = task_router(
+            runtimes,
+            ledger.clone(),
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            TaskApiConfig::default(),
+        );
+        let request = |runtime_uid: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "adopted-crash-retry")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"workflow":"code-review","codingAgentRuntime":"agent-v1","agentRuntimeUid":"{runtime_uid}"}}"#,
+                )))
+                .map_err(|error| format!("build adopted Task retry: {error}"))
+        };
+        let wrong_runtime = app
+            .clone()
+            .oneshot(request("runtime-uid-b")?)
+            .await
+            .map_err(|error| format!("retry adopted Task with another runtime: {error}"))?;
+        assert_eq!(
+            wrong_runtime.status(),
+            StatusCode::CONFLICT,
+            "recovery must not bind a different runtime to the persisted reservation"
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?[0]
+                .runtime_uid
+                .is_none(),
+            "a rejected recovery must leave the reservation unbound"
+        );
+        let response = app
+            .oneshot(request("runtime-uid-a")?)
+            .await
+            .map_err(|error| format!("retry unbound adopted Task: {error}"))?;
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "an exact retry must recover the requested adopted runtime binding"
+        );
+        let tasks = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake task ledger lock was poisoned")?;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].runtime_uid.as_deref(), Some("runtime-uid-a"));
         Ok(())
     }
 

@@ -1370,6 +1370,15 @@ where
             .await
             .map_err(ApiError::Store)?
         {
+            let record = recover_unbound_adopted_task_retry(
+                &self.runtimes,
+                &self.ledger,
+                &identity,
+                reference.as_ref(),
+                request,
+                record,
+            )
+            .await?;
             return task_retry_response(&identity, reference.as_ref(), request, record);
         }
         if let Some(reference) = reference {
@@ -1711,12 +1720,64 @@ where
     task_response(record, deltas)
 }
 
-fn task_retry_response(
+async fn recover_unbound_adopted_task_retry<R, L>(
+    runtimes: &R,
+    ledger: &L,
     identity: &TaskIdentity,
     reference: Option<&WorkflowReference>,
     request: &TaskSubmissionRequest,
     record: TaskRecord,
-) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
+) -> Result<TaskRecord, ApiError>
+where
+    R: RuntimeRepository,
+    L: TaskSubmissionLedger,
+{
+    let Some(requested_runtime_uid) = request.agent_runtime_uid.as_deref() else {
+        return Ok(record);
+    };
+    if reference.is_some()
+        || record.runtime_ownership != RuntimeOwnership::Adopted
+        || record.runtime_uid.is_some()
+    {
+        return Ok(record);
+    }
+    validate_task_retry(identity, reference, request, &record, true)?;
+    if record.phase != TaskPhase::Submitted
+        || record.execute_requested
+        || record.finalize_requested
+        || record.finalized
+    {
+        return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
+    }
+
+    let runtime = runtimes
+        .get_by_uid(requested_runtime_uid)
+        .await
+        .map_err(ApiError::Runtime)?;
+    if runtime.namespace().as_deref() != Some(record.runtime_namespace.as_str())
+        || runtime.name_any() != record.runtime_name
+        || runtime.spec != record.runtime_spec
+        || runtime
+            .annotations()
+            .contains_key(PENDING_APPROVAL_ANNOTATION)
+    {
+        return Err(ApiError::Conflict(
+            "adopted runtime does not match the persisted task reservation".to_owned(),
+        ));
+    }
+    ledger
+        .bind_task_runtime(record.task_uid, requested_runtime_uid, TaskPhase::Submitted)
+        .await
+        .map_err(ApiError::Store)
+}
+
+fn validate_task_retry(
+    identity: &TaskIdentity,
+    reference: Option<&WorkflowReference>,
+    request: &TaskSubmissionRequest,
+    record: &TaskRecord,
+    allow_unbound_adopted_runtime: bool,
+) -> Result<(), ApiError> {
     let acting_user = identity.acting_user.as_ref().map(|email| email.0.as_str());
     let acting_user_id = identity
         .acting_user
@@ -1750,7 +1811,8 @@ fn task_retry_response(
             let runtime_binding_matches = match request.agent_runtime_uid.as_deref() {
                 Some(runtime_uid) => {
                     record.runtime_ownership == RuntimeOwnership::Adopted
-                        && record.runtime_uid.as_deref() == Some(runtime_uid)
+                        && (record.runtime_uid.as_deref() == Some(runtime_uid)
+                            || (allow_unbound_adopted_runtime && record.runtime_uid.is_none()))
                 }
                 None => record.runtime_ownership == RuntimeOwnership::Provisioned,
             };
@@ -1764,6 +1826,16 @@ fn task_retry_response(
             }
         }
     }
+    Ok(())
+}
+
+fn task_retry_response(
+    identity: &TaskIdentity,
+    reference: Option<&WorkflowReference>,
+    request: &TaskSubmissionRequest,
+    record: TaskRecord,
+) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
+    validate_task_retry(identity, reference, request, &record, false)?;
     task_response(record, Vec::new())
 }
 
