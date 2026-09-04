@@ -294,6 +294,7 @@ impl<B> GovernedConnectionsBroker<B> {
             user_envelope_revision: None,
             user_envelope_digest: None,
             coding_agent_runtime: "connections-bridge",
+            runtime_uid: None,
             runtime_namespace: &bindings.namespace,
             runtime_name: &runtime_name,
             runtime_ownership: steward_types::RuntimeOwnership::Provisioned,

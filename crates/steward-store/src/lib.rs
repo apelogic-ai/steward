@@ -2499,6 +2499,7 @@ impl PgStore {
     ) -> Result<TaskReservation, StoreError> {
         validate_task_identity_binding(request)?;
         validate_task_version_pins(request)?;
+        validate_task_runtime_binding(request)?;
         let task_uid = Uuid::new_v4();
         let inserted = sqlx::query(
             "INSERT INTO task_submissions \
@@ -2506,10 +2507,10 @@ impl PgStore {
               owner, owner_user_id, identity_binding_state, workflow, \
               workflow_name, workflow_version, workflow_digest, \
               user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
-              coding_agent_runtime, runtime_namespace, runtime_name, runtime_ownership, phase, \
+              coding_agent_runtime, runtime_uid, runtime_namespace, runtime_name, runtime_ownership, phase, \
               runtime_spec, agent_command, execution_binding, envelope_revision) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, $12, $13, $14, \
-                     $15, $16, $17, $18, 'submitted', $19, $20, $21, $22) \
+                     $15, $16, $17, $18, $19, 'submitted', $20, $21, $22, $23) \
              ON CONFLICT DO NOTHING",
         )
         .bind(task_uid)
@@ -2527,6 +2528,7 @@ impl PgStore {
         .bind(request.user_envelope_revision)
         .bind(request.user_envelope_digest)
         .bind(request.coding_agent_runtime)
+        .bind(request.runtime_uid)
         .bind(request.runtime_namespace)
         .bind(request.runtime_name)
         .bind(ownership_text(request.runtime_ownership))
@@ -2564,6 +2566,7 @@ impl PgStore {
             || record.user_envelope_revision != request.user_envelope_revision
             || record.user_envelope_digest.as_deref() != request.user_envelope_digest
             || record.coding_agent_runtime != request.coding_agent_runtime
+            || record.runtime_uid.as_deref() != request.runtime_uid
             || record.runtime_namespace != request.runtime_namespace
             || record.runtime_name != request.runtime_name
             || record.runtime_ownership != request.runtime_ownership
@@ -3069,8 +3072,13 @@ impl PgStore {
         }
         let result = sqlx::query(
             "UPDATE task_submissions \
-             SET runtime_uid = $2, phase = $3, updated_at = now() \
-             WHERE task_uid = $1 AND (runtime_uid IS NULL OR runtime_uid = $2)",
+             SET runtime_uid = $2, \
+                 phase = CASE WHEN execute_requested THEN phase ELSE $3 END, \
+                 updated_at = now() \
+             WHERE task_uid = $1 AND runtime_uid IS NULL \
+               AND NOT finalize_requested AND NOT finalized \
+               AND ((NOT execute_requested AND phase = 'submitted') \
+                    OR (execute_requested AND phase IN ('parked', 'queued')))",
         )
         .bind(task_uid)
         .bind(runtime_uid)
@@ -3078,10 +3086,14 @@ impl PgStore {
         .execute(&self.pool)
         .await
         .map_err(database_error)?;
-        if result.rows_affected() != 1 {
-            return Err(StoreError::InvalidTaskTransition);
+        if result.rows_affected() == 1 {
+            return self.task(task_uid).await?.ok_or(StoreError::TaskNotFound);
         }
-        self.task(task_uid).await?.ok_or(StoreError::TaskNotFound)
+        let current = self.task(task_uid).await?.ok_or(StoreError::TaskNotFound)?;
+        if current.runtime_uid.as_deref() == Some(runtime_uid) {
+            return Ok(current);
+        }
+        Err(StoreError::InvalidTaskTransition)
     }
 
     pub async fn task(&self, task_uid: Uuid) -> Result<Option<TaskRecord>, StoreError> {
@@ -3631,6 +3643,9 @@ pub struct TaskReservationRequest<'a> {
     pub user_envelope_revision: Option<i64>,
     pub user_envelope_digest: Option<&'a str>,
     pub coding_agent_runtime: &'a str,
+    /// Exact Kubernetes UID for an adopted runtime. Provisioned runtimes are unbound here and
+    /// receive their server-created UID later through `bind_task_runtime`.
+    pub runtime_uid: Option<&'a str>,
     pub runtime_namespace: &'a str,
     pub runtime_name: &'a str,
     pub runtime_ownership: steward_types::RuntimeOwnership,
@@ -3826,11 +3841,24 @@ fn validate_task_identity_binding(request: &TaskReservationRequest<'_>) -> Resul
     Ok(())
 }
 
+fn validate_task_runtime_binding(request: &TaskReservationRequest<'_>) -> Result<(), StoreError> {
+    match (request.runtime_ownership, request.runtime_uid) {
+        (steward_types::RuntimeOwnership::Adopted, Some(runtime_uid))
+            if !runtime_uid.is_empty() =>
+        {
+            Ok(())
+        }
+        (steward_types::RuntimeOwnership::Provisioned, None) => Ok(()),
+        _ => Err(StoreError::InvalidTaskTransition),
+    }
+}
+
 fn validate_connection_operation_request(
     request: &ConnectionOperationReservationRequest<'_>,
 ) -> Result<(), StoreError> {
     validate_task_identity_binding(&request.task)?;
     validate_task_version_pins(&request.task)?;
+    validate_task_runtime_binding(&request.task)?;
     let expected_action = request.operation_kind.as_str();
     let [tool] = request.task.runtime_spec.tools.as_slice() else {
         return Err(StoreError::InvalidConnectionOperation);

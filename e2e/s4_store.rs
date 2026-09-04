@@ -110,6 +110,7 @@ async fn reserve_governed_connection_with_bindings(
         user_envelope_revision: None,
         user_envelope_digest: None,
         coding_agent_runtime: "connections-bridge",
+        runtime_uid: None,
         runtime_namespace: &binding_snapshot.namespace,
         runtime_name: &runtime_name,
         runtime_ownership: RuntimeOwnership::Provisioned,
@@ -816,6 +817,7 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         user_envelope_revision: None,
         user_envelope_digest: None,
         coding_agent_runtime: "agent-v1",
+        runtime_uid: None,
         runtime_namespace: "team-a",
         runtime_name: &runtime_name,
         runtime_ownership: RuntimeOwnership::Provisioned,
@@ -833,6 +835,32 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
     let second = store.reserve_task(&request).await?;
     assert!(!second.inserted);
     assert_eq!(second.record.task_uid, first.record.task_uid);
+
+    let adopted_key = format!("adopted-{suffix}");
+    let adopted_runtime_uid = format!("adopted-runtime-{suffix}");
+    let adopted_request = TaskReservationRequest {
+        idempotency_key: &adopted_key,
+        runtime_uid: Some(&adopted_runtime_uid),
+        runtime_ownership: RuntimeOwnership::Adopted,
+        ..request
+    };
+    let adopted = store.reserve_task(&adopted_request).await?;
+    assert!(adopted.inserted);
+    assert_eq!(
+        adopted.record.runtime_uid.as_deref(),
+        Some(adopted_runtime_uid.as_str()),
+        "an adopted runtime UID must be persisted by the reservation insert"
+    );
+    let replacement_runtime_uid = format!("replacement-runtime-{suffix}");
+    let recreated_runtime_request = TaskReservationRequest {
+        runtime_uid: Some(&replacement_runtime_uid),
+        ..adopted_request
+    };
+    assert_eq!(
+        store.reserve_task(&recreated_runtime_request).await,
+        Err(StoreError::TaskIdempotencyConflict),
+        "a same-name replacement UID must not match the durable adopted-runtime reservation"
+    );
 
     let other = store
         .register_canonical_identity(
@@ -979,13 +1007,23 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
             archive,
         )
         .await?;
-    store
+    let queued = store
         .request_task_execution(
             first.record.task_uid,
             "steward-run",
             canonical.user_id.as_str(),
         )
         .await?;
+    assert_eq!(queued.phase, TaskPhase::Queued);
+    let repeated_binding = store
+        .bind_task_runtime(first.record.task_uid, &runtime_uid, TaskPhase::Submitted)
+        .await?;
+    assert_eq!(
+        repeated_binding.phase,
+        TaskPhase::Queued,
+        "an idempotent runtime bind must not regress concurrent execution state"
+    );
+    assert!(repeated_binding.execute_requested);
     assert!(store.claim_task_execution(first.record.task_uid).await?);
     assert!(
         !store.claim_task_execution(first.record.task_uid).await?,
@@ -3245,9 +3283,23 @@ async fn connection_artifact_trust_migration_backfills_populated_state_and_keeps
     .bind(principal.user_id.as_str())
     .execute(&mut *transaction)
     .await?;
-    sqlx::query(
-        "INSERT INTO task_submissions SELECT * FROM public.task_submissions WHERE task_uid = $1",
+    let prechange_task_columns = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = $1 AND table_name = 'task_submissions' \
+         ORDER BY ordinal_position",
     )
+    .bind(&schema)
+    .fetch_all(&mut *transaction)
+    .await?;
+    let task_columns = prechange_task_columns
+        .iter()
+        .map(|column| format!("\"{column}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sqlx::query(&format!(
+        "INSERT INTO task_submissions ({task_columns}) \
+         SELECT {task_columns} FROM public.task_submissions WHERE task_uid = $1"
+    ))
     .bind(source.record.task_uid)
     .execute(&mut *transaction)
     .await?;

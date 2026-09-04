@@ -5942,7 +5942,7 @@ mod tests {
                     internal_authority_version: None,
                     internal_authority_digest: None,
                     coding_agent_runtime: request.coding_agent_runtime.to_owned(),
-                    runtime_uid: None,
+                    runtime_uid: request.runtime_uid.map(str::to_owned),
                     runtime_namespace: request.runtime_namespace.to_owned(),
                     runtime_name: request.runtime_name.to_owned(),
                     runtime_ownership: request.runtime_ownership,
@@ -5979,8 +5979,22 @@ mod tests {
                     .iter_mut()
                     .find(|task| task.task_uid == task_uid)
                     .ok_or(StoreError::TaskNotFound)?;
+                if task.runtime_uid.as_deref() == Some(runtime_uid) {
+                    return Ok(task.clone());
+                }
+                let unchanged_unbound_state = task.runtime_uid.is_none()
+                    && !task.finalize_requested
+                    && !task.finalized
+                    && ((!task.execute_requested && task.phase == TaskPhase::Submitted)
+                        || (task.execute_requested
+                            && matches!(task.phase, TaskPhase::Parked | TaskPhase::Queued)));
+                if !unchanged_unbound_state {
+                    return Err(StoreError::InvalidTaskTransition);
+                }
                 task.runtime_uid = Some(runtime_uid.to_owned());
-                task.phase = phase;
+                if !task.execute_requested {
+                    task.phase = phase;
+                }
                 Ok(task.clone())
             })
         }
@@ -8656,7 +8670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adopted_task_retry_recovers_a_reservation_persisted_before_runtime_binding()
+    async fn adopted_task_reservation_persists_and_retries_the_exact_runtime_uid()
     -> Result<(), String> {
         let ledger = ledger();
         let workflow = task_workflow("100.00");
@@ -8697,6 +8711,7 @@ mod tests {
                 user_envelope_revision: None,
                 user_envelope_digest: None,
                 coding_agent_runtime: &workflow.coding_agent_runtime,
+                runtime_uid: Some("runtime-uid-a"),
                 runtime_namespace: &workflow.namespace,
                 runtime_name: "runtime-a",
                 runtime_ownership: RuntimeOwnership::Adopted,
@@ -8706,13 +8721,18 @@ mod tests {
                 envelope_revision: 3,
             })
             .await
-            .map_err(|error| format!("seed unbound adopted reservation: {error}"))?;
-        assert!(reservation.inserted && reservation.record.runtime_uid.is_none());
+            .map_err(|error| format!("seed adopted reservation: {error}"))?;
+        assert!(reservation.inserted);
+        assert_eq!(
+            reservation.record.runtime_uid.as_deref(),
+            Some("runtime-uid-a"),
+            "the adopted UID must be part of the durable reservation"
+        );
 
         let mut runtime = AgentRuntime::new("runtime-a", spec.clone());
         runtime.metadata.namespace = Some("team-a".to_owned());
         runtime.metadata.uid = Some("runtime-uid-a".to_owned());
-        let mut other_runtime = AgentRuntime::new("runtime-b", spec);
+        let mut other_runtime = AgentRuntime::new("runtime-a", spec);
         other_runtime.metadata.namespace = Some("team-a".to_owned());
         other_runtime.metadata.uid = Some("runtime-uid-b".to_owned());
         let runtimes = MultiRuntimeRepository {
@@ -8746,7 +8766,7 @@ mod tests {
         assert_eq!(
             wrong_runtime.status(),
             StatusCode::CONFLICT,
-            "recovery must not bind a different runtime to the persisted reservation"
+            "a same-name replacement runtime must not match the persisted UID"
         );
         assert!(
             ledger
@@ -8754,17 +8774,18 @@ mod tests {
                 .lock()
                 .map_err(|_| "fake task ledger lock was poisoned")?[0]
                 .runtime_uid
-                .is_none(),
-            "a rejected recovery must leave the reservation unbound"
+                .as_deref()
+                == Some("runtime-uid-a"),
+            "a rejected retry must preserve the original runtime UID"
         );
         let response = app
             .oneshot(request("runtime-uid-a")?)
             .await
-            .map_err(|error| format!("retry unbound adopted Task: {error}"))?;
+            .map_err(|error| format!("retry adopted Task: {error}"))?;
         assert_eq!(
             response.status(),
             StatusCode::CREATED,
-            "an exact retry must recover the requested adopted runtime binding"
+            "an exact retry must reuse the requested adopted runtime binding"
         );
         let tasks = ledger
             .tasks
@@ -8772,6 +8793,101 @@ mod tests {
             .map_err(|_| "fake task ledger lock was poisoned")?;
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].runtime_uid.as_deref(), Some("runtime-uid-a"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_runtime_binding_does_not_regress_a_queued_task() -> Result<(), String> {
+        let ledger = ledger();
+        let workflow = task_workflow("100.00");
+        let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        let spec = AgentRuntimeSpec {
+            principal: Principal::Service {
+                name: "steward-run".to_owned(),
+                acting_user: Some(Email("alice@example.com".to_owned())),
+            },
+            owner: Email("alice@example.com".to_owned()),
+            canonical_authority: Some(CanonicalAuthorityBinding::new(
+                canonical_user_id.clone(),
+                Some(canonical_user_id),
+            )?),
+            agent_type: AgentType {
+                name: workflow.coding_agent_runtime.clone(),
+            },
+            llms: workflow.llms.clone(),
+            tools: workflow.tools.clone(),
+            budget: workflow.budget.clone(),
+            ttl: workflow.ttl.clone(),
+            runner: steward_types::RunnerRequirements::default(),
+            bindings: None,
+        };
+        let reservation = ledger
+            .reserve_task(TaskReservationRequest {
+                idempotency_key: "runtime-bind-race",
+                submitter_service: "steward-run",
+                acting_user: Some("alice@example.com"),
+                acting_user_id: Some("usr_0123456789abcdef0123456789abcdef"),
+                owner: "alice@example.com",
+                owner_user_id: "usr_0123456789abcdef0123456789abcdef",
+                workflow: &workflow.name,
+                workflow_name: None,
+                workflow_version: None,
+                workflow_digest: None,
+                user_envelope_instance_id: None,
+                user_envelope_revision: None,
+                user_envelope_digest: None,
+                coding_agent_runtime: &workflow.coding_agent_runtime,
+                runtime_uid: None,
+                runtime_namespace: &workflow.namespace,
+                runtime_name: "runtime-a",
+                runtime_ownership: RuntimeOwnership::Provisioned,
+                runtime_spec: &spec,
+                agent_command: &workflow.command,
+                execution_binding: None,
+                envelope_revision: 3,
+            })
+            .await
+            .map_err(|error| format!("reserve task: {error}"))?;
+        ledger
+            .put_task_inputs(
+                reservation.record.task_uid,
+                "steward-run",
+                "usr_0123456789abcdef0123456789abcdef",
+                b"input",
+            )
+            .await
+            .map_err(|error| format!("store task inputs: {error}"))?;
+        let queued = ledger
+            .request_task_execution(
+                reservation.record.task_uid,
+                "steward-run",
+                "usr_0123456789abcdef0123456789abcdef",
+            )
+            .await
+            .map_err(|error| format!("queue task: {error}"))?;
+        assert_eq!(queued.phase, TaskPhase::Queued);
+
+        let bound = ledger
+            .bind_task_runtime(
+                reservation.record.task_uid,
+                "runtime-uid-a",
+                TaskPhase::Submitted,
+            )
+            .await
+            .map_err(|error| format!("bind runtime after execution request: {error}"))?;
+        assert_eq!(bound.phase, TaskPhase::Queued);
+        assert!(bound.execute_requested);
+
+        let repeated = ledger
+            .bind_task_runtime(bound.task_uid, "runtime-uid-a", TaskPhase::Submitted)
+            .await
+            .map_err(|error| format!("repeat runtime binding: {error}"))?;
+        assert_eq!(
+            repeated.phase,
+            TaskPhase::Queued,
+            "an idempotent binding must return current state without rewriting phase"
+        );
+        assert!(repeated.execute_requested);
         Ok(())
     }
 
