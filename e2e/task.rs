@@ -259,7 +259,12 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         .ok_or_else(|| io::Error::other("versioned Task omitted its execution binding"))?;
     assert_eq!(execution_binding.agent_ref, "codex@0.140.0");
     assert_eq!(execution_binding.executable, "/usr/bin/codex");
-    assert_eq!(execution_binding.expected_version, "codex-cli 0.140.0");
+    assert_eq!(execution_binding.adapter, "codex-v1");
+    assert_eq!(
+        execution_binding.version_probe.expected_stdout,
+        "codex-cli 0.140.0"
+    );
+    assert_eq!(execution_binding.version_probe.arguments, ["--version"]);
     assert!(
         execution_binding
             .image
@@ -268,8 +273,20 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         "the Task must persist the exact digest-addressed sandbox image"
     );
     assert_eq!(
-        execution_binding.native_profile,
-        "steward-runtime-providers@1.3.0"
+        execution_binding
+            .provider_profiles
+            .tools
+            .as_ref()
+            .map(|profile| profile.id.as_str()),
+        Some("steward-mcp-gw-v1-3-0")
+    );
+    assert_eq!(
+        execution_binding
+            .provider_profiles
+            .inference
+            .as_ref()
+            .map(|profile| profile.id.as_str()),
+        Some("steward-litellm-v1-3-0")
     );
     assert_eq!(submitted.runtime_spec.llms.len(), 1);
     assert_eq!(submitted.runtime_spec.llms[0].provider, "openai");

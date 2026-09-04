@@ -20,11 +20,10 @@ use xtask::{
 
 type TaskResult = Result<(), String>;
 
-const PROVIDER_PROFILE_BUNDLE_CATALOG: [(&str, &str); 4] = [
+const PROVIDER_PROFILE_BUNDLE_CATALOG: [(&str, &str); 3] = [
     ("1.0.0", "config/provider-profile-bundle/v1"),
     ("1.1.0", "config/provider-profile-bundle/v1.1.0"),
     ("1.2.0", "config/provider-profile-bundle/v1.2.0"),
-    ("1.3.0", "config/provider-profile-bundle/v1.3.0"),
 ];
 
 fn main() -> ExitCode {
@@ -1489,8 +1488,6 @@ mod tests {
         for profile_path in [
             "config/task/tool-provider-profile.yaml",
             "config/task/inference-provider-profile.yaml",
-            "config/provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw-v1-3-0.json",
-            "config/provider-profile-bundle/v1.3.0/profiles/steward-litellm-v1-3-0.json",
         ] {
             let profile = fs::read_to_string(root().join(profile_path)).map_err(|error| {
                 format!("Codex provider profile {profile_path} is required: {error}")
@@ -1510,6 +1507,41 @@ mod tests {
                 && task_e2e.contains("cargo xtask e2e-controller-runtime-lifecycle"),
             "the real Codex MCP-GW E2E must exercise the linux/amd64 provider path in CI"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn production_execution_binding_code_contains_no_deployment_agent_values() -> Result<(), String>
+    {
+        let production_sources = [
+            "crates/steward-types/src/lib.rs",
+            "crates/steward-apiserver/src/execution_bindings.rs",
+            "crates/steward-apiserver/src/tasks.rs",
+            "crates/steward-apiserver/src/workflows.rs",
+            "adapters/openshell/src/lib.rs",
+            "bins/steward-apiserver/src/main.rs",
+        ];
+        let forbidden = [
+            "SUPPORTED_WORKFLOW_AGENT",
+            "codex@0.117.0",
+            "codex@0.140.0",
+            "codex-cli 0.117.0",
+            "codex-cli 0.140.0",
+            "steward-runtime-providers@1.3.0",
+            "steward-mcp-gw-v1-3-0",
+            "steward-litellm-v1-3-0",
+            "@openai/codex-linux-",
+        ];
+        for path in production_sources {
+            let source = fs::read_to_string(root().join(path))
+                .map_err(|error| format!("read production source {path}: {error}"))?;
+            for value in forbidden {
+                assert!(
+                    !source.contains(value),
+                    "production source {path} embeds deployment-owned value {value}"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1607,12 +1639,9 @@ mod tests {
 
     #[test]
     fn provider_profile_inputs_select_their_exact_immutable_bundle() -> Result<(), String> {
-        for (version, expected_suffix) in [
-            ("1.0.0", "/v1"),
-            ("1.1.0", "/v1.1.0"),
-            ("1.2.0", "/v1.2.0"),
-            ("1.3.0", "/v1.3.0"),
-        ] {
+        for (version, expected_suffix) in
+            [("1.0.0", "/v1"), ("1.1.0", "/v1.1.0"), ("1.2.0", "/v1.2.0")]
+        {
             let inputs = serde_json::json!({
                 "bundle": {"id": "steward-runtime-providers", "version": version}
             });
@@ -1624,11 +1653,11 @@ mod tests {
             );
         }
         let unsupported = serde_json::json!({
-            "bundle": {"id": "steward-runtime-providers", "version": "1.4.0"}
+            "bundle": {"id": "steward-runtime-providers", "version": "1.3.0"}
         });
         let result = provider_profile_bundle_directory_for_inputs(&unsupported.to_string());
         assert!(
-            matches!(result, Err(ref error) if error.contains("unsupported") && error.contains("1.4.0")),
+            matches!(result, Err(ref error) if error.contains("unsupported") && error.contains("1.3.0")),
             "unknown bundle identities must fail closed: {result:?}"
         );
         Ok(())
@@ -2423,7 +2452,7 @@ mod tests {
             "Verify authenticated OpenShell adapter on linux/amd64",
             "cargo xtask e2e-openshell-adapter",
             "Provider profile bundle asset:",
-            "Provider profile bundle identity: steward-runtime-providers@1.3.0",
+            "Provider profile bundle identity: steward-runtime-providers@1.2.0",
             "Provider profile bundle SHA-256:",
             "Provider profile bundle signer identity:",
             "Provider profile bundle source repository:",
@@ -2473,11 +2502,9 @@ mod tests {
             "--numeric-owner",
             "--format=ustar",
             "gzip -n",
-            "provider-profile-bundle/v1.3.0/bundle.json",
-            "provider-profile-bundle/v1.3.0/profiles/steward-litellm.json",
-            "provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw.json",
-            "provider-profile-bundle/v1.3.0/profiles/steward-litellm-v1-3-0.json",
-            "provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw-v1-3-0.json",
+            "provider-profile-bundle/v1.2.0/bundle.json",
+            "provider-profile-bundle/v1.2.0/profiles/steward-litellm.json",
+            "provider-profile-bundle/v1.2.0/profiles/steward-mcp-gw.json",
             "sha256sum",
         ] {
             assert!(
@@ -2497,7 +2524,7 @@ mod tests {
             );
         }
         let bundle_readme =
-            fs::read_to_string(root().join("config/provider-profile-bundle/v1.3.0/README.md"))
+            fs::read_to_string(root().join("config/provider-profile-bundle/v1.2.0/README.md"))
                 .map_err(|error| format!("provider-profile bundle README is required: {error}"))?;
         for required in [
             "Verify a released bundle before rendering or installation",

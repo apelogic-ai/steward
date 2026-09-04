@@ -32,12 +32,10 @@ if [[ "$(<"$first_digest")" != "$actual_digest" ]]; then
 fi
 
 expected_entries=(
-  provider-profile-bundle/v1.3.0/README.md
-  provider-profile-bundle/v1.3.0/bundle.json
-  provider-profile-bundle/v1.3.0/profiles/steward-litellm-v1-3-0.json
-  provider-profile-bundle/v1.3.0/profiles/steward-litellm.json
-  provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw-v1-3-0.json
-  provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw.json
+  provider-profile-bundle/v1.2.0/README.md
+  provider-profile-bundle/v1.2.0/bundle.json
+  provider-profile-bundle/v1.2.0/profiles/steward-litellm.json
+  provider-profile-bundle/v1.2.0/profiles/steward-mcp-gw.json
 )
 actual_entries="$(tar -tzf "$first_archive")"
 expected_entries_text="$(printf '%s\n' "${expected_entries[@]}")"

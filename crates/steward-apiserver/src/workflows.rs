@@ -17,7 +17,6 @@ use crate::browser_auth::{
 };
 use crate::{ApiError, BoxFuture};
 
-pub const SUPPORTED_WORKFLOW_AGENT: &str = "codex@0.117.0";
 const BROWSER_WORKFLOW_API_VERSION: &str = "steward.workflows/v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,11 +238,7 @@ pub fn protected_admin_router<L>(repository: L, browser_auth: BrowserAuthService
 where
     L: WorkflowRepository,
 {
-    protected_admin_router_with_agents(
-        repository,
-        browser_auth,
-        vec![SUPPORTED_WORKFLOW_AGENT.to_owned()],
-    )
+    protected_admin_router_with_agents(repository, browser_auth, Vec::new())
 }
 
 pub fn protected_admin_router_with_agents<L>(
@@ -389,6 +384,12 @@ async fn publish_workflow<L>(
 where
     L: WorkflowRepository,
 {
+    if state.agents.is_empty() {
+        return ApiError::TaskRuntimeContractUnavailable(
+            "no coding agents are configured for Workflow publication".to_owned(),
+        )
+        .into_response();
+    }
     if request.validate(&state.agents).is_err() {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
@@ -447,14 +448,17 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        PublishWorkflowError, PublishWorkflowRequest, SUPPORTED_WORKFLOW_AGENT, WorkflowReference,
-        WorkflowReferenceError, WorkflowRepository, protected_admin_router_with_agents,
+        PublishWorkflowError, PublishWorkflowRequest, WorkflowReference, WorkflowReferenceError,
+        WorkflowRepository, protected_admin_router_with_agents,
     };
     use crate::BoxFuture;
     use crate::browser_auth::{
         BrowserAuthService, LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service,
     };
     use steward_store::{StoreError, WorkflowPublication, WorkflowRevisionRecord};
+
+    const TEST_AGENT: &str = "example-agent@1.0.0";
+    const TEST_AGENT_TWO: &str = "example-agent@2.0.0";
 
     #[test]
     fn malformed_or_unversioned_workflow_references_fail_closed() {
@@ -514,7 +518,7 @@ mod tests {
             let mut value = serde_json::json!({
                 "name": "repository-review",
                 "displayName": "Repository review",
-                "agent": SUPPORTED_WORKFLOW_AGENT,
+                "agent": TEST_AGENT,
                 "prompt": "Review the repository state."
             });
             value
@@ -536,13 +540,13 @@ mod tests {
             PublishWorkflowRequest {
                 name: "Repository-review".to_owned(),
                 display_name: "Repository review".to_owned(),
-                agent: SUPPORTED_WORKFLOW_AGENT.to_owned(),
+                agent: TEST_AGENT.to_owned(),
                 prompt: "Review the repository state.".to_owned(),
             },
             PublishWorkflowRequest {
                 name: "repository-review".to_owned(),
                 display_name: " ".to_owned(),
-                agent: SUPPORTED_WORKFLOW_AGENT.to_owned(),
+                agent: TEST_AGENT.to_owned(),
                 prompt: "Review the repository state.".to_owned(),
             },
             PublishWorkflowRequest {
@@ -554,12 +558,12 @@ mod tests {
             PublishWorkflowRequest {
                 name: "repository-review".to_owned(),
                 display_name: "Repository review".to_owned(),
-                agent: SUPPORTED_WORKFLOW_AGENT.to_owned(),
+                agent: TEST_AGENT.to_owned(),
                 prompt: "".to_owned(),
             },
         ] {
             assert_eq!(
-                request.validate(&BTreeSet::from([SUPPORTED_WORKFLOW_AGENT.to_owned()])),
+                request.validate(&BTreeSet::from([TEST_AGENT.to_owned()])),
                 Err(PublishWorkflowError::Invalid),
                 "invalid Workflow publication content must fail closed"
             );
@@ -569,22 +573,22 @@ mod tests {
             PublishWorkflowRequest {
                 name: "repository-review".to_owned(),
                 display_name: "Repository review".to_owned(),
-                agent: SUPPORTED_WORKFLOW_AGENT.to_owned(),
+                agent: TEST_AGENT.to_owned(),
                 prompt: "Review the repository state.".to_owned(),
             }
-            .validate(&BTreeSet::from([SUPPORTED_WORKFLOW_AGENT.to_owned()])),
+            .validate(&BTreeSet::from([TEST_AGENT.to_owned()])),
             Ok(())
         );
         assert_eq!(
             PublishWorkflowRequest {
                 name: "repository-review".to_owned(),
                 display_name: "Repository review".to_owned(),
-                agent: "codex@0.140.0".to_owned(),
+                agent: TEST_AGENT_TWO.to_owned(),
                 prompt: "Review the repository state.".to_owned(),
             }
             .validate(&BTreeSet::from([
-                SUPPORTED_WORKFLOW_AGENT.to_owned(),
-                "codex@0.140.0".to_owned(),
+                TEST_AGENT.to_owned(),
+                TEST_AGENT_TWO.to_owned(),
             ])),
             Ok(()),
             "a successor exact agent reference advertised by the deployment must be publishable"
@@ -793,10 +797,7 @@ mod tests {
         let app: Router = protected_admin_router_with_agents(
             repository.clone(),
             auth,
-            vec![
-                SUPPORTED_WORKFLOW_AGENT.to_owned(),
-                "codex@0.140.0".to_owned(),
-            ],
+            vec![TEST_AGENT.to_owned(), TEST_AGENT_TWO.to_owned()],
         );
         let listed = app
             .clone()
@@ -817,10 +818,7 @@ mod tests {
         .map_err(|error| error.to_string())?;
         assert_eq!(
             listed.pointer("/agents"),
-            Some(&serde_json::json!([
-                SUPPORTED_WORKFLOW_AGENT,
-                "codex@0.140.0"
-            ])),
+            Some(&serde_json::json!([TEST_AGENT, TEST_AGENT_TWO])),
             "the authoring UI must receive only deployment-advertised logical references"
         );
         let created_v1 = app
@@ -833,7 +831,7 @@ mod tests {
                 serde_json::json!({
                     "name": "repository-review",
                     "displayName": "Repository review",
-                    "agent": SUPPORTED_WORKFLOW_AGENT,
+                    "agent": TEST_AGENT,
                     "prompt": "Review version one."
                 }),
             )?)
@@ -850,7 +848,7 @@ mod tests {
                 &csrf,
                 serde_json::json!({
                     "displayName": "Repository review",
-                    "agent": "codex@0.140.0",
+                    "agent": TEST_AGENT_TWO,
                     "prompt": "Review version two."
                 }),
             )?)
@@ -902,6 +900,55 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         assert_eq!(forbidden_update.status(), StatusCode::METHOD_NOT_ALLOWED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_catalog_is_advertised_and_publication_is_unavailable() -> Result<(), String> {
+        let origin = "http://127.0.0.1:33108";
+        let (auth, cookie, csrf) = signed_in_admin(origin).await?;
+        let app: Router =
+            protected_admin_router_with_agents(FakeWorkflowRepository::default(), auth, Vec::new());
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/workflows")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = serde_json::from_slice::<serde_json::Value>(
+            &to_bytes(listed.into_body(), 1024 * 1024)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(listed.pointer("/agents"), Some(&serde_json::json!([])));
+
+        let rejected = app
+            .oneshot(mutation_request(
+                "/admin/api/v1/workflows",
+                origin,
+                &cookie,
+                &csrf,
+                serde_json::json!({
+                    "name": "repository-review",
+                    "displayName": "Repository review",
+                    "agent": TEST_AGENT,
+                    "prompt": "Review the repository state."
+                }),
+            )?)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            rejected.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an empty deployment catalog must reject Workflow publication as unavailable"
+        );
         Ok(())
     }
 }

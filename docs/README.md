@@ -50,6 +50,8 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | [`browser-session-contract-v1.md`](browser-session-contract-v1.md) | **Current implementation, with stated activation dependency** | Browser authentication and session boundary. |
 | [`canonical-user-identity-v1.md`](canonical-user-identity-v1.md) | **Current implementation** | Canonical person identity and ownership keys. |
 | [`github-actions-generator.md`](github-actions-generator.md) | **Current implementation, renderer scope** | Bounded GitHub Actions YAML generation. |
+| [`installation/execution-bindings.md`](installation/execution-bindings.md) | **Current implementation** | Deployment-neutral coding-agent catalog, validation, Helm installation, and lifecycle behavior. |
+| [`installation/upgrade-execution-bindings.md`](installation/upgrade-execution-bindings.md) | **Current implementation** | Upgrade from implicit coding-agent behavior to explicit deployment bindings. |
 | [`task-submission-api.md`](task-submission-api.md) | **Current pre-M1 compatibility behavior** | Implemented v0.1 Task API; subordinate to the frozen contract for M1. |
 
 ### Accepted post-M1 direction

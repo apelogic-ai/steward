@@ -69,6 +69,19 @@ image_values=(
   --set-string config.controller.openshellRuntimeClassName=openshell-runc
   --set-string config.apiserver.mcpGatewayEndpoint=https://mcp-gw.example.test/mcp
 )
+task_execution_binding_values=(
+  --set-string 'config.apiserver.executionBindings.bindings[0].agentRef=example-agent@1.2.3'
+  --set-string 'config.apiserver.executionBindings.bindings[0].displayName=Example Agent 1.2.3'
+  --set-string 'config.apiserver.executionBindings.bindings[0].adapter=codex-v1'
+  --set-string 'config.apiserver.executionBindings.bindings[0].image=registry.example.test/agents/example@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  --set-string 'config.apiserver.executionBindings.bindings[0].executable=/opt/example/bin/agent'
+  --set-string 'config.apiserver.executionBindings.bindings[0].versionProbe.arguments[0]=--version'
+  --set-string 'config.apiserver.executionBindings.bindings[0].versionProbe.expectedStdout=example-agent 1.2.3'
+  --set-string 'config.apiserver.executionBindings.bindings[0].providerProfiles.tools.id=example-tools-profile-v7'
+  --set-string 'config.apiserver.executionBindings.bindings[0].providerProfiles.tools.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+  --set-string 'config.apiserver.executionBindings.bindings[0].providerProfiles.inference.id=example-inference-profile-v7'
+  --set-string 'config.apiserver.executionBindings.bindings[0].providerProfiles.inference.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+)
 stable_bridge_values=(
   --set stableBridge.enabled=true
   --set-string stableBridge.image=ghcr.io/example-org/steward-bridge@sha256:3333333333333333333333333333333333333333333333333333333333333333
@@ -114,19 +127,48 @@ helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
   "${image_values[@]}" > "${rendered}"
-if grep -q 'STEWARD_TASK_EXECUTION_BINDINGS_JSON' "${rendered}"; then
-  echo "disabled execution binding catalog must render no workload environment" >&2
+if [[ "$(grep -c 'name: STEWARD_TASK_EXECUTION_BINDINGS_FILE' "${rendered}")" != "1" ]] ||
+  ! grep -Fq '\"apiVersion\":\"steward.execution-bindings/v1\"' "${rendered}" ||
+  ! grep -Fq '\"bindings\":[]' "${rendered}"
+then
+  echo "the empty execution binding catalog must be mounted only in the apiserver" >&2
   exit 1
 fi
 helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
   "${image_values[@]}" \
-  --set-string 'config.apiserver.taskExecutionBindingsJson=[{"agentRef":"codex@0.140.0"}]' \
+  "${task_execution_binding_values[@]}" \
   > "${task_execution_bindings_rendered}"
-if [[ "$(grep -c 'name: STEWARD_TASK_EXECUTION_BINDINGS_JSON' \
+if [[ "$(grep -c 'name: STEWARD_TASK_EXECUTION_BINDINGS_FILE' \
   "${task_execution_bindings_rendered}")" != "1" ]]; then
-  echo "configured execution binding catalog must reach only the apiserver environment" >&2
+  echo "configured execution binding catalog must reach only the apiserver file mount" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  "${image_values[@]}" \
+  "${task_execution_binding_values[@]}" \
+  --set-string 'config.apiserver.executionBindings.bindings[0].image=registry.example.test/agents/example:latest' \
+  >/dev/null 2>&1
+then
+  echo "structured execution binding values must reject mutable image tags" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  "${image_values[@]}" \
+  "${task_execution_binding_values[@]}" \
+  --set-string 'config.apiserver.executionBindings.bindings[0].credential=forbidden' \
+  >/dev/null 2>&1
+then
+  echo "structured execution binding values must reject unknown fields" >&2
+  exit 1
+fi
+if ! grep -q 'example-tools-profile-v7' "${task_execution_bindings_rendered}" ||
+  cmp -s "${rendered}" "${task_execution_bindings_rendered}"
+then
+  echo "configured execution binding content must change the immutable ConfigMap and rollout" >&2
   exit 1
 fi
 

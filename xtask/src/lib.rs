@@ -529,9 +529,6 @@ pub fn upgrade_rendered_provider_profile_bundle(
         ) | (
             ("steward-runtime-providers", "1.1.0"),
             ("steward-runtime-providers", "1.2.0")
-        ) | (
-            ("steward-runtime-providers", "1.2.0"),
-            ("steward-runtime-providers", "1.3.0")
         )
     );
     if !supported_transition {
@@ -674,10 +671,6 @@ fn validate_provider_profile_upgrade_delta(
         );
     }
 
-    if (current_version, replacement_version) == ("1.2.0", "1.3.0") {
-        return validate_provider_profile_upgrade_to_1_3(current, replacement);
-    }
-
     if current.profiles.keys().collect::<BTreeSet<_>>()
         != replacement.profiles.keys().collect::<BTreeSet<_>>()
     {
@@ -735,95 +728,6 @@ fn validate_provider_profile_upgrade_delta(
         }
     }
     Ok(())
-}
-
-fn validate_provider_profile_upgrade_to_1_3(
-    current: &RenderedProviderProfileBundle,
-    replacement: &RenderedProviderProfileBundle,
-) -> Result<(), String> {
-    let expected_current = BTreeSet::from(["steward-litellm", "steward-mcp-gw"]);
-    let expected_replacement = BTreeSet::from([
-        "steward-litellm",
-        "steward-litellm-v1-3-0",
-        "steward-mcp-gw",
-        "steward-mcp-gw-v1-3-0",
-    ]);
-    if current
-        .profiles
-        .keys()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>()
-        != expected_current
-        || replacement
-            .profiles
-            .keys()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>()
-            != expected_replacement
-    {
-        return Err(
-            "provider profile upgrade to 1.3.0 must preserve legacy profiles and add only the two versioned Task profiles"
-                .to_owned(),
-        );
-    }
-
-    for legacy_id in &expected_current {
-        if current.profiles.get(*legacy_id) != replacement.profiles.get(*legacy_id) {
-            return Err(format!(
-                "provider profile upgrade must preserve all environment bindings and the exact legacy profile {legacy_id}"
-            ));
-        }
-    }
-
-    let task_binaries = serde_json::json!([
-        "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/bin/codex",
-        "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
-        "/usr/bin/curl",
-        "/usr/local/bin/curl"
-    ]);
-    for (legacy_id, task_id) in [
-        ("steward-mcp-gw", "steward-mcp-gw-v1-3-0"),
-        ("steward-litellm", "steward-litellm-v1-3-0"),
-    ] {
-        let legacy = replacement
-            .profiles
-            .get(legacy_id)
-            .ok_or_else(|| format!("replacement legacy profile {legacy_id} is required"))?;
-        let task = replacement
-            .profiles
-            .get(task_id)
-            .ok_or_else(|| format!("replacement Task profile {task_id} is required"))?;
-        if task.get("binaries") != Some(&task_binaries) {
-            return Err(format!(
-                "provider profile upgrade for {task_id} permits only the declared Codex 0.140 binaries"
-            ));
-        }
-        if profile_without_identity_and_binaries(legacy, legacy_id)?
-            != profile_without_identity_and_binaries(task, task_id)?
-        {
-            return Err(format!(
-                "provider profile upgrade must preserve environment bindings and policy fields in {task_id}"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn profile_without_identity_and_binaries(
-    profile: &Value,
-    profile_id: &str,
-) -> Result<Value, String> {
-    let mut normalized = profile.clone();
-    let object = normalized
-        .as_object_mut()
-        .ok_or_else(|| format!("rendered provider profile {profile_id} must be an object"))?;
-    object
-        .remove("id")
-        .ok_or_else(|| format!("rendered provider profile {profile_id} requires an id"))?;
-    object
-        .remove("binaries")
-        .ok_or_else(|| format!("rendered provider profile {profile_id} requires binaries"))?;
-    Ok(normalized)
 }
 
 fn profile_without_binaries(profile: &Value, profile_id: &str) -> Result<Value, String> {
@@ -3050,90 +2954,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_profile_upgrade_to_1_3_adds_exact_task_profiles_without_rebinding()
-    -> Result<(), String> {
-        let current = render_test_provider_profile_bundle(
-            "v1.2.0",
-            "1.2.0",
-            "https://mcp.gateway.test",
-            "https://inference.gateway.test",
-            "https://mint.gateway.test",
-            "10.42.0.0/16",
-        )?;
-        let replacement = render_test_provider_profile_bundle(
-            "v1.3.0",
-            "1.3.0",
-            "https://mcp.gateway.test",
-            "https://inference.gateway.test",
-            "https://mint.gateway.test",
-            "10.42.0.0/16",
-        )?;
-
-        for legacy_id in ["steward-mcp-gw", "steward-litellm"] {
-            assert_eq!(
-                current.profiles.get(legacy_id),
-                replacement.profiles.get(legacy_id),
-                "1.3.0 must preserve the existing {legacy_id} profile byte-for-byte"
-            );
-        }
-        let task_mcp = replacement
-            .profiles
-            .get("steward-mcp-gw-v1-3-0")
-            .ok_or_else(|| "1.3.0 versioned Task MCP profile is required".to_owned())?;
-        let task_inference = replacement
-            .profiles
-            .get("steward-litellm-v1-3-0")
-            .ok_or_else(|| "1.3.0 versioned Task inference profile is required".to_owned())?;
-        for profile in [task_mcp, task_inference] {
-            let binaries = profile
-                .get("binaries")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| "versioned Task profile requires binaries".to_owned())?;
-            for required in [
-                "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/bin/codex",
-                "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
-            ] {
-                assert!(
-                    binaries
-                        .iter()
-                        .any(|value| value.as_str() == Some(required)),
-                    "versioned Task profile must authorize the exact Codex 0.140 binary {required}"
-                );
-            }
-        }
-
-        let directory = std::env::temp_dir().join(format!(
-            "steward-provider-profile-upgrade-1-3-test-{}-{}",
-            std::process::id(),
-            NEXT_RENDER_INSTALL_ID.fetch_add(1, Ordering::Relaxed),
-        ));
-        fs::create_dir(&directory).map_err(|error| format!("create fixture: {error}"))?;
-        let output = directory.join("installed");
-        let result = (|| {
-            install_rendered_provider_profile_bundle(&output, &current)?;
-            let rebound = render_test_provider_profile_bundle(
-                "v1.3.0",
-                "1.3.0",
-                "https://changed.gateway.test",
-                "https://inference.gateway.test",
-                "https://mint.gateway.test",
-                "10.42.0.0/16",
-            )?;
-            let rebound_result =
-                upgrade_rendered_provider_profile_bundle(&output, &current, &rebound);
-            if !matches!(rebound_result, Err(ref error) if error.contains("environment bindings")) {
-                return Err(format!(
-                    "1.3.0 upgrade must reject endpoint rebinding: {rebound_result:?}"
-                ));
-            }
-            upgrade_rendered_provider_profile_bundle(&output, &current, &replacement)?;
-            reconcile_rendered_provider_profile_bundle(&output, &replacement)
-        })();
-        fs::remove_dir_all(&directory).map_err(|error| format!("remove fixture: {error}"))?;
-        result
-    }
-
-    #[test]
     fn provider_profile_upgrade_requires_an_exact_supported_predecessor() -> Result<(), String> {
         let current = render_test_provider_profile_bundle(
             "v1",
@@ -3256,7 +3076,7 @@ mod tests {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .ok_or_else(|| "xtask manifest directory must have a repository parent".to_owned())?;
-        let mut inputs = serde_json::json!({
+        let inputs = serde_json::json!({
             "schema": "steward.provider-profile-inputs/v1",
             "bundle": {
                 "id": "steward-runtime-providers",
@@ -3281,30 +3101,6 @@ mod tests {
                 }
             ]
         });
-        if version == "1.3.0" {
-            let profiles = inputs
-                .get_mut("profiles")
-                .and_then(serde_json::Value::as_array_mut)
-                .ok_or_else(|| "test provider inputs require a profiles array".to_owned())?;
-            profiles.extend([
-                serde_json::json!({
-                    "id": "steward-mcp-gw-v1-3-0",
-                    "inputs": {
-                        "gateway-origin": mcp_gateway_origin,
-                        "runtime-grant-origin": runtime_grant_origin,
-                        "service-cidrs": [service_cidr]
-                    }
-                }),
-                serde_json::json!({
-                    "id": "steward-litellm-v1-3-0",
-                    "inputs": {
-                        "gateway-origin": inference_gateway_origin,
-                        "runtime-grant-origin": runtime_grant_origin,
-                        "service-cidrs": [service_cidr]
-                    }
-                }),
-            ]);
-        }
         render_provider_profile_bundle_directory(
             &repository
                 .join("config/provider-profile-bundle")

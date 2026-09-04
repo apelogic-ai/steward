@@ -9,8 +9,9 @@ worker is part of the normal `steward-controller` process.
 |---|---|
 | `STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE` | Required and non-empty. DEV uses `https://kubernetes.default.svc`. |
 | `STEWARD_TASK_WORKFLOWS_JSON` | Required JSON array matching `workflows.example.json`. Commands are server-selected; clients cannot supply them. |
-| `STEWARD_TASK_EXECUTION_BINDINGS_JSON` | Optional non-empty JSON array of deployment-owned immutable execution bindings. When configured, every newly submitted versioned Workflow must resolve an exact logical agent reference from this catalog. |
-| `STEWARD_TASK_MCP_GW_ENDPOINT` | Exact HTTP(S) streamable MCP endpoint. Required only when a versioned Codex task resolves non-empty tool authority; otherwise the task fails before reservation or execution. |
+| `STEWARD_TASK_EXECUTION_BINDINGS_FILE` | Preferred read-only file containing `steward.execution-bindings/v1`. Missing or empty catalog means no coding agents are available. |
+| `STEWARD_TASK_EXECUTION_BINDINGS_JSON` | Optional inline form of the same document for non-Helm integration environments. Configuring both forms fails startup. |
+| `STEWARD_TASK_MCP_GW_ENDPOINT` | Exact HTTP(S) streamable MCP endpoint. Required only when a versioned task resolves non-empty tool authority; otherwise the task fails before reservation or execution. |
 | `STEWARD_APISERVER_BIND` | HTTPS listener, default `0.0.0.0:8443`. Expose the existing apiserver Service port to this target port. |
 | Task API enablement | Enabled whenever the production apiserver starts. There is no bypass flag; invalid or absent Task configuration fails startup. |
 | `STEWARD_DATABASE_URL` | Existing Postgres connection reference. Keep the value in a Secret, never this repository. |
@@ -22,34 +23,19 @@ JWT still has `aud=steward-task-api`, matching the EKS external OIDC client ID; 
 parse or reinterpret that JWT. See `docs/task-submission-api.md` for the required verified
 username/groups and the external mapper boundary.
 
-For a tool-bearing versioned Codex Workflow, Steward writes the configured MCP endpoint and a
-bearer environment-variable name into the task's fresh `CODEX_HOME/config.toml`. The command sets
-that variable only to OpenShell's documented non-secret provider placeholder. OpenShell derives
-the runtime bearer at the governed egress boundary; the plan, database, and Codex configuration
-never contain a provider credential. Tool-less plans contain no MCP server entry or MCP bearer
-variable and do not require the endpoint.
+For a tool-bearing versioned Workflow using the `codex-v1` adapter, Steward writes the configured
+MCP endpoint and a bearer environment-variable name into the task's fresh adapter configuration.
+The command sets that variable only to OpenShell's documented non-secret provider placeholder.
+OpenShell derives the runtime bearer at the governed egress boundary; the plan, database, and
+agent configuration never contain a provider credential. Tool-less plans contain no MCP server
+entry or MCP bearer variable and do not require the endpoint.
 
-An execution-binding catalog entry maps only a bounded logical reference such as
-`codex@0.140.0` to server-owned deployment data: a content-bound binding identity and SHA-256
-digest, digest-pinned OCI image, absolute executable, expected version output, and exact native
-provider-profile reference. Steward resolves and persists that complete binding before Task
-reservation. Retries use the persisted binding and do not reinterpret existing work under a
-changed catalog. The browser and Task APIs expose or accept only the logical reference; they do
-not accept any image, executable, namespace, runtime class, endpoint, or credential override.
-`bindingDigest` is `sha256:<lowercase hex>` over this length-prefixed UTF-8 sequence, in order:
-schema version `steward/task-execution-binding/v1`, `agentRef`, `image`, `executable`,
-`expectedVersion`, and `nativeProfile`. Each value is prefixed by its unsigned 64-bit big-endian
-byte length. `bindingId` must equal that digest. The content-addressed identity therefore changes
-if any execution byte or compatibility pin changes, and cannot be reused with different content.
-
-`steward-runtime-providers@1.3.0` is the first executable native-profile pin. The
-OpenShell adapter maps it only to the co-installable versioned provider IDs
-`steward-mcp-gw-v1-3-0` and `steward-litellm-v1-3-0`; it never substitutes the
-unversioned profiles. Any other persisted native-profile reference fails before sandbox
-creation. Operators must install or explicitly upgrade to the immutable 1.3.0 bundle
-before admitting bindings that reference it. The bundle retains the unversioned profiles
-for legacy and governed Connections runtimes while the versioned Task profiles authorize
-the exact Codex 0.140 native binaries.
+Execution images, versions, executable paths, and OpenShell provider profiles are deployment
+configuration, not values owned by this E2E fixture or by Steward production code. The complete
+schema, Helm surface, released validator, empty-catalog behavior, lifecycle rules, and upgrade
+procedure are documented in
+[`docs/installation/execution-bindings.md`](../../docs/installation/execution-bindings.md).
+The concrete agent and profile values in this directory are local E2E fixtures only.
 
 ## Controller inputs
 

@@ -14,6 +14,10 @@ mod tasks;
 pub mod user_envelopes;
 pub mod workflows;
 
+pub use execution_bindings::{
+    EXECUTION_BINDING_CATALOG_API_VERSION, ExecutionBindingAdvertisement, ExecutionBindingCatalog,
+    ExecutionBindingValidation, MAX_EXECUTION_BINDING_CATALOG_BYTES,
+};
 pub use github_actions::{
     GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA, GITHUB_ACTIONS_RENDER_REQUEST_SCHEMA,
     GITHUB_FILE_READ_TEMPLATE, GeneratedGithubActionsWorkflow, GithubActionsEnvelopeSelection,
@@ -3041,9 +3045,38 @@ mod tests {
     };
 
     const KUBERNETES_TOKEN_REVIEW_AUDIENCE: &str = "https://kubernetes.default.svc";
+    const TEST_VERSIONED_AGENT: &str = "example-agent@1.0.0";
+
+    fn execution_binding_catalog() -> String {
+        serde_json::json!({
+            "apiVersion": "steward.execution-bindings/v1",
+            "bindings": [{
+                "agentRef": TEST_VERSIONED_AGENT,
+                "adapter": "codex-v1",
+                "image": format!("registry.example.test/agents/example@sha256:{}", "a".repeat(64)),
+                "executable": "/opt/example/bin/agent",
+                "versionProbe": {
+                    "arguments": ["--version"],
+                    "expectedStdout": "example-agent 1.0.0"
+                },
+                "providerProfiles": {
+                    "tools": {
+                        "id": "example-tools-profile-v7",
+                        "digest": format!("sha256:{}", "b".repeat(64))
+                    },
+                    "inference": {
+                        "id": "example-inference-profile-v7",
+                        "digest": format!("sha256:{}", "c".repeat(64))
+                    }
+                }
+            }]
+        })
+        .to_string()
+    }
 
     fn task_api_config() -> Result<TaskApiConfig, String> {
-        TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))
+        TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
+            .with_execution_bindings_json(Some(&execution_binding_catalog()))
     }
 
     fn browser_cookie(response: &Response, name: &str) -> Result<String, String> {
@@ -6268,7 +6301,7 @@ mod tests {
                 name: "repository-review".to_owned(),
                 version: 1,
                 display_name: "Repository review".to_owned(),
-                agent: "codex@0.117.0".to_owned(),
+                agent: TEST_VERSIONED_AGENT.to_owned(),
                 prompt: "Review the repository state that triggered this run.".to_owned(),
                 content_digest: format!("sha256:{}", "a".repeat(64)),
                 published_by: "admin@example.com".to_owned(),
@@ -8466,8 +8499,8 @@ mod tests {
             task.user_envelope_digest.as_deref(),
             Some(format!("sha256:{}", "b".repeat(64)).as_str())
         );
-        assert_eq!(task.coding_agent_runtime, "codex@0.117.0");
-        assert_eq!(task.runtime_spec.agent_type.name, "codex@0.117.0");
+        assert_eq!(task.coding_agent_runtime, TEST_VERSIONED_AGENT);
+        assert_eq!(task.runtime_spec.agent_type.name, TEST_VERSIONED_AGENT);
         assert_eq!(task.runtime_spec.llms[0].model, "gpt-5.4");
         assert_eq!(task.runtime_spec.budget.monthly_limit, "25.00");
         assert_eq!(task.runtime_spec.ttl, Duration("4h".to_owned()));
@@ -8533,7 +8566,8 @@ mod tests {
             FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([]),
-            TaskApiConfig::new(Some("https://mcp-a.example.test/mcp".to_owned()))?,
+            TaskApiConfig::new(Some("https://mcp-a.example.test/mcp".to_owned()))?
+                .with_execution_bindings_json(Some(&execution_binding_catalog()))?,
         );
         let first = first_app
             .oneshot(request("repository-review@1")?)

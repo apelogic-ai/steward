@@ -72,21 +72,13 @@ const KUBERNETES_DNS_LABEL_MAX_LENGTH: usize = 63;
 #[cfg(feature = "runtime")]
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
 #[cfg(feature = "runtime")]
-const NATIVE_PROFILE_LABEL: &str = "agents.apelogic.ai/native-profile";
+const EXECUTION_BINDING_LABEL: &str = "agents.apelogic.ai/execution-binding";
 /// Server-authored agent type for the one-shot Connections bridge operation.
 pub const CONNECTIONS_BRIDGE_AGENT_TYPE: &str = "connections-bridge";
-/// The sole immutable Workflow agent supported by this slice.
-pub const WORKFLOW_CODEX_AGENT_TYPE: &str = "codex@0.117.0";
 #[cfg(feature = "runtime")]
 const TOOL_PROVIDER: &str = "steward-mcp-gw";
 #[cfg(feature = "runtime")]
 const INFERENCE_PROVIDER: &str = "steward-litellm";
-#[cfg(feature = "runtime")]
-const TASK_NATIVE_PROFILE_V1_3_0: &str = "steward-runtime-providers@1.3.0";
-#[cfg(feature = "runtime")]
-const TASK_TOOL_PROVIDER_V1_3_0: &str = "steward-mcp-gw-v1-3-0";
-#[cfg(feature = "runtime")]
-const TASK_INFERENCE_PROVIDER_V1_3_0: &str = "steward-litellm-v1-3-0";
 #[cfg(feature = "runtime")]
 const GRPC_NOT_FOUND: i32 = 5;
 #[cfg(feature = "runtime")]
@@ -115,15 +107,6 @@ fn provider_reconciliation(attached: bool, desired: bool) -> Option<ProviderReco
     }
 }
 
-#[cfg(feature = "runtime")]
-fn managed_provider_names() -> [&'static str; 4] {
-    [
-        TOOL_PROVIDER,
-        INFERENCE_PROVIDER,
-        TASK_TOOL_PROVIDER_V1_3_0,
-        TASK_INFERENCE_PROVIDER_V1_3_0,
-    ]
-}
 #[cfg(feature = "identity")]
 const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
 #[cfg(feature = "identity")]
@@ -300,8 +283,12 @@ pub fn stable_name(kind: NameKind, identity: &[u8]) -> String {
 }
 
 #[cfg(feature = "runtime")]
-fn native_profile_label_value(native_profile: &str) -> String {
-    let digest = Sha256::digest(native_profile.as_bytes());
+fn execution_binding_label_value(binding_digest: &str) -> String {
+    let digest = binding_digest
+        .strip_prefix("sha256:")
+        .and_then(|value| (value.len() == 64).then_some(value))
+        .unwrap_or(binding_digest);
+    let digest = Sha256::digest(digest.as_bytes());
     let mut label = String::with_capacity(63);
     label.push_str("sha256-");
     for byte in digest.iter().take(28) {
@@ -319,7 +306,7 @@ struct OpenShellProjection {
     providers: Vec<String>,
     runtime_uid: String,
     image: Option<String>,
-    native_profile: Option<String>,
+    execution_binding_digest: Option<String>,
 }
 
 #[cfg(feature = "runtime")]
@@ -353,9 +340,7 @@ fn bridge_image_for_execution(
     connections_bridge_image: Option<&str>,
 ) -> Result<Option<String>, PortError> {
     if let Some(binding) = execution_binding {
-        binding
-            .validate()
-            .map_err(|reason| PortError::Rejected { reason })?;
+        validate_disposable_execution_binding(binding)?;
         if execution_class != SandboxExecutionClass::Agent || binding.agent_ref != agent_type.name {
             return Err(PortError::Rejected {
                 reason: "persisted execution binding does not match the requested agent runtime"
@@ -365,7 +350,7 @@ fn bridge_image_for_execution(
         return Ok(Some(binding.image.clone()));
     }
     match (agent_type.name.as_str(), execution_class) {
-        ("base" | WORKFLOW_CODEX_AGENT_TYPE, SandboxExecutionClass::Agent) => Ok(None),
+        ("base", SandboxExecutionClass::Agent) => Ok(None),
         (CONNECTIONS_BRIDGE_AGENT_TYPE, SandboxExecutionClass::Agent) => stable_bridge_image
             .filter(|image| is_digest_pinned_image(image))
             .map(str::to_owned)
@@ -389,10 +374,35 @@ fn bridge_image_for_execution(
 }
 
 #[cfg(feature = "runtime")]
-fn output_archive_command(agent_type: &AgentType) -> &'static str {
+fn validate_disposable_execution_binding(
+    binding: &steward_types::DisposableExecutionBinding,
+) -> Result<(), PortError> {
+    binding
+        .validate()
+        .map_err(|reason| PortError::Rejected { reason })?;
+    let mut digest = Sha256::new();
+    digest.update(steward_types::TASK_EXECUTION_BINDING_DIGEST_DOMAIN);
+    digest.update(
+        binding
+            .canonical_content()
+            .map_err(|reason| PortError::Rejected { reason })?,
+    );
+    if format!("sha256:{:x}", digest.finalize()) != binding.binding_digest {
+        return Err(PortError::Rejected {
+            reason: "persisted execution binding digest does not match its content".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "runtime")]
+fn output_archive_command(
+    agent_type: &AgentType,
+    execution_binding: Option<&steward_types::DisposableExecutionBinding>,
+) -> &'static str {
     if agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE {
         "set -eu; test -f /sandbox/steward-output/response.json; tar -cf - -C /sandbox/steward-output response.json"
-    } else if agent_type.name == WORKFLOW_CODEX_AGENT_TYPE || agent_type.name.contains('@') {
+    } else if execution_binding.is_some() {
         "set -eu; test -s /sandbox/steward-output/result.txt; test -d /sandbox/steward-output/out; tar -cf - -C /sandbox/steward-output out"
     } else {
         "set -eu; tar -cf - -C /sandbox/steward-output ."
@@ -647,36 +657,50 @@ fn project_request(
         stable_bridge_image,
         connections_bridge_image,
     )?;
-    let (tool_provider, inference_provider) = match request.execution_binding.as_ref() {
-        Some(binding) if binding.native_profile == TASK_NATIVE_PROFILE_V1_3_0 => {
-            (TASK_TOOL_PROVIDER_V1_3_0, TASK_INFERENCE_PROVIDER_V1_3_0)
-        }
-        Some(_) => {
-            return Err(PortError::Rejected {
-                reason:
-                    "persisted native provider profile is not installed by this Steward release"
-                        .to_owned(),
-            });
-        }
-        None => (TOOL_PROVIDER, INFERENCE_PROVIDER),
-    };
+    let (tool_provider, inference_provider) = request.execution_binding.as_ref().map_or(
+        (Some(TOOL_PROVIDER), Some(INFERENCE_PROVIDER)),
+        |binding| {
+            (
+                binding
+                    .provider_profiles
+                    .tools
+                    .as_ref()
+                    .map(|profile| profile.id.as_str()),
+                binding
+                    .provider_profiles
+                    .inference
+                    .as_ref()
+                    .map(|profile| profile.id.as_str()),
+            )
+        },
+    );
+    if !request.tools.is_empty() && tool_provider.is_none() {
+        return Err(PortError::Rejected {
+            reason: "persisted execution binding has no tool provider profile".to_owned(),
+        });
+    }
+    if !request.models.is_empty() && inference_provider.is_none() {
+        return Err(PortError::Rejected {
+            reason: "persisted execution binding has no inference provider profile".to_owned(),
+        });
+    }
     Ok(OpenShellProjection {
         workspace: stable_name(NameKind::Workspace, request.workspace_key.as_bytes()),
         workspace_key: request.workspace_key.clone(),
         sandbox: stable_name(NameKind::Sandbox, request.runtime.0.as_bytes()),
         providers: [
-            (!request.tools.is_empty()).then(|| tool_provider.to_owned()),
-            (!request.models.is_empty()).then(|| inference_provider.to_owned()),
+            (!request.tools.is_empty()).then(|| tool_provider.unwrap_or_default().to_owned()),
+            (!request.models.is_empty()).then(|| inference_provider.unwrap_or_default().to_owned()),
         ]
         .into_iter()
         .flatten()
         .collect(),
         runtime_uid: request.runtime.0.clone(),
         image,
-        native_profile: request
+        execution_binding_digest: request
             .execution_binding
             .as_ref()
-            .map(|binding| binding.native_profile.clone()),
+            .map(|binding| binding.binding_digest.clone()),
     })
 }
 
@@ -684,10 +708,10 @@ fn project_request(
 fn sandbox_spec(projection: &OpenShellProjection) -> SandboxSpec {
     let mut labels = HashMap::new();
     labels.insert(RUNTIME_UID_LABEL.to_owned(), projection.runtime_uid.clone());
-    if let Some(native_profile) = &projection.native_profile {
+    if let Some(binding_digest) = &projection.execution_binding_digest {
         labels.insert(
-            NATIVE_PROFILE_LABEL.to_owned(),
-            native_profile_label_value(native_profile),
+            EXECUTION_BINDING_LABEL.to_owned(),
+            execution_binding_label_value(binding_digest),
         );
     }
     SandboxSpec {
@@ -1942,15 +1966,14 @@ impl SandboxRuntime for OpenShellRuntime {
                 reason: "sandbox name resolved to a different runtime UID".to_owned(),
             });
         }
-        let expected_native_profile_label = projection
-            .native_profile
+        let expected_execution_binding_label = projection
+            .execution_binding_digest
             .as_deref()
-            .map(native_profile_label_value);
-        if expected_native_profile_label.as_ref() != snapshot.labels.get(NATIVE_PROFILE_LABEL) {
+            .map(execution_binding_label_value);
+        if expected_execution_binding_label.as_ref() != snapshot.labels.get(EXECUTION_BINDING_LABEL)
+        {
             return Err(PortError::Rejected {
-                reason:
-                    "sandbox native provider profile does not match the persisted execution binding"
-                        .to_owned(),
+                reason: "sandbox does not match the persisted execution binding".to_owned(),
             });
         }
         self.resolve_raw_sandbox_binding(
@@ -1961,15 +1984,12 @@ impl SandboxRuntime for OpenShellRuntime {
             false,
         )
         .await?;
-        for provider_name in managed_provider_names() {
+        for provider_name in &projection.providers {
             self.reconcile_provider(
                 &projection.workspace,
                 &projection.sandbox,
                 provider_name,
-                projection
-                    .providers
-                    .iter()
-                    .any(|provider| provider == provider_name),
+                true,
             )
             .await?;
         }
@@ -2061,14 +2081,14 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             self.stable_bridge_image.as_deref(),
             self.bridge_image.as_deref(),
         )?;
-        let expected_native_profile_label = request
+        let expected_execution_binding_label = request
             .execution_binding
             .as_ref()
-            .map(|binding| native_profile_label_value(&binding.native_profile));
-        if expected_native_profile_label.as_ref() != snapshot.labels.get(NATIVE_PROFILE_LABEL) {
+            .map(|binding| execution_binding_label_value(&binding.binding_digest));
+        if expected_execution_binding_label.as_ref() != snapshot.labels.get(EXECUTION_BINDING_LABEL)
+        {
             return Err(PortError::Rejected {
-                reason: "task sandbox native provider profile does not match the persisted execution binding"
-                    .to_owned(),
+                reason: "task sandbox does not match the persisted execution binding".to_owned(),
             });
         }
         self.resolve_raw_sandbox_binding(
@@ -2127,7 +2147,8 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 ),
             });
         }
-        let output_archive_command = output_archive_command(&request.agent_type);
+        let output_archive_command =
+            output_archive_command(&request.agent_type, request.execution_binding.as_ref());
         let collected = self
             .authenticated_client()
             .await?
@@ -2240,13 +2261,16 @@ mod tests {
     #[cfg(feature = "runtime")]
     use reqwest::{Client as HttpClient, Url};
     #[cfg(feature = "runtime")]
+    use sha2::{Digest, Sha256};
+    #[cfg(feature = "runtime")]
     use tokio::sync::{Mutex, mpsc as tokio_mpsc};
 
     #[cfg(feature = "runtime")]
     use steward_ports::{PortError, SandboxExecutionClass, SandboxRequest};
     #[cfg(feature = "runtime")]
     use steward_types::{
-        AgentType, DisposableExecutionBinding, ModelRef, RuntimeId, RuntimeRefs,
+        AgentType, DisposableExecutionBinding, ExecutionProviderProfile, ExecutionProviderProfiles,
+        ExecutionVersionProbe, ModelRef, RuntimeId, RuntimeRefs,
         TASK_EXECUTION_BINDING_SCHEMA_VERSION, ToolGrant,
     };
 
@@ -2263,11 +2287,22 @@ mod tests {
         staging_extract_command, staging_prepare_command, task_agent_failure_category,
         task_process_log_record, validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
     };
+    #[cfg(feature = "runtime")]
+    use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
     #[cfg(feature = "identity")]
     use super::{IdentityResolutionError, SANDBOX_ID_LABEL, binding_from_sandbox};
-    #[cfg(feature = "runtime")]
-    use super::{NATIVE_PROFILE_LABEL, RUNTIME_UID_LABEL};
     use super::{NameKind, stable_name};
+
+    #[cfg(feature = "runtime")]
+    fn seal_binding(binding: &mut DisposableExecutionBinding) -> Result<(), String> {
+        let mut digest = Sha256::new();
+        digest.update(steward_types::TASK_EXECUTION_BINDING_DIGEST_DOMAIN);
+        digest.update(binding.canonical_content()?);
+        let digest = format!("sha256:{:x}", digest.finalize());
+        binding.binding_id.clone_from(&digest);
+        binding.binding_digest = digest;
+        Ok(())
+    }
 
     #[cfg(feature = "runtime")]
     struct QueuedTaskProcessEventStream {
@@ -3338,8 +3373,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn approved_codex_workflow_uses_the_gateway_default_image_and_unknown_agents_fail_closed()
-    -> Result<(), String> {
+    fn unbound_versioned_agents_fail_closed() {
         let request = |agent_type: &str| SandboxRequest {
             runtime: RuntimeId("runtime-uid-a".to_owned()),
             workspace_key: "team-a".to_owned(),
@@ -3353,36 +3387,44 @@ mod tests {
             execution_binding: None,
         };
 
-        let projection = project_request(&request("codex@0.117.0"), None, None)
-            .map_err(|error| format!("approved Workflow agent was rejected: {error:?}"))?;
         assert!(
-            sandbox_spec(&projection).image.is_none(),
-            "the approved agent must not let Steward select an OpenShell image"
+            project_request(&request("example-agent@1.0.0"), None, None).is_err(),
+            "a versioned agent without a persisted deployment binding must fail closed"
         );
-        assert!(
-            project_request(&request("codex@latest"), None, None).is_err(),
-            "an unpinned agent reference must fail closed"
-        );
-        assert!(
-            project_request(&request("other-agent@1"), None, None).is_err(),
-            "an unpublished agent reference must fail closed"
-        );
-        Ok(())
     }
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn persisted_disposable_binding_selects_exact_image_and_native_profile() -> Result<(), String> {
-        let binding = DisposableExecutionBinding {
+    fn persisted_disposable_binding_selects_exact_image_and_provider_profiles() -> Result<(), String>
+    {
+        let mut binding = DisposableExecutionBinding {
             schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
             binding_id: format!("sha256:{}", "a".repeat(64)),
             binding_digest: format!("sha256:{}", "a".repeat(64)),
-            agent_ref: "codex@0.140.0".to_owned(),
-            image: format!("registry.example.test/codex@sha256:{}", "b".repeat(64)),
-            executable: "/opt/codex/bin/codex".to_owned(),
-            expected_version: "codex-cli 0.140.0".to_owned(),
-            native_profile: "steward-runtime-providers@1.3.0".to_owned(),
+            agent_ref: "example-agent@1.0.0".to_owned(),
+            display_name: Some("Example Agent".to_owned()),
+            adapter: "codex-v1".to_owned(),
+            image: format!(
+                "registry.example.test/agents/example@sha256:{}",
+                "b".repeat(64)
+            ),
+            executable: "/opt/example/bin/agent".to_owned(),
+            version_probe: ExecutionVersionProbe {
+                arguments: vec!["--version".to_owned()],
+                expected_stdout: "example-agent 1.0.0".to_owned(),
+            },
+            provider_profiles: ExecutionProviderProfiles {
+                tools: Some(ExecutionProviderProfile {
+                    id: "example-tools-profile-v7".to_owned(),
+                    digest: format!("sha256:{}", "c".repeat(64)),
+                }),
+                inference: Some(ExecutionProviderProfile {
+                    id: "example-inference-profile-v7".to_owned(),
+                    digest: format!("sha256:{}", "d".repeat(64)),
+                }),
+            },
         };
+        seal_binding(&mut binding)?;
         let projection = project_request(
             &SandboxRequest {
                 runtime: RuntimeId("runtime-uid-a".to_owned()),
@@ -3411,36 +3453,37 @@ mod tests {
         assert_eq!(projection.image.as_deref(), Some(binding.image.as_str()));
         assert_eq!(
             projection.providers,
-            ["steward-mcp-gw-v1-3-0", "steward-litellm-v1-3-0"],
-            "the persisted native profile must select the exact versioned OpenShell profiles used by execution"
+            ["example-tools-profile-v7", "example-inference-profile-v7"],
+            "the persisted binding must select the exact deployment-owned OpenShell profiles"
         );
-        let native_profile_label = sandbox_spec(&projection)
+        let execution_binding_label = sandbox_spec(&projection)
             .labels
-            .get(NATIVE_PROFILE_LABEL)
+            .get(EXECUTION_BINDING_LABEL)
             .cloned()
-            .ok_or_else(|| "sandbox must carry a native-profile label".to_owned())?;
+            .ok_or_else(|| "sandbox must carry an execution-binding label".to_owned())?;
         assert_ne!(
-            native_profile_label, binding.native_profile,
-            "the exact profile identity can contain characters that OpenShell forbids in label values"
+            execution_binding_label, binding.binding_digest,
+            "the exact binding digest must be encoded for OpenShell label compatibility"
         );
         assert!(
-            native_profile_label.starts_with("sha256-"),
+            execution_binding_label.starts_with("sha256-"),
             "the label must identify its deterministic digest encoding"
         );
         assert_eq!(
-            native_profile_label.len(),
+            execution_binding_label.len(),
             63,
             "the digest label must fit the Kubernetes/OpenShell label-value limit"
         );
         assert!(
-            native_profile_label
+            execution_binding_label
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
             "the digest label must use only OpenShell-compatible characters"
         );
 
-        let mut unsupported = binding.clone();
-        unsupported.native_profile = "arbitrary-profile@9.9.9".to_owned();
+        let mut incomplete = binding.clone();
+        incomplete.provider_profiles.tools = None;
+        seal_binding(&mut incomplete)?;
         assert!(
             project_request(
                 &SandboxRequest {
@@ -3448,7 +3491,7 @@ mod tests {
                     workspace_key: "team-a".to_owned(),
                     execution_class: SandboxExecutionClass::Agent,
                     agent_type: AgentType {
-                        name: unsupported.agent_ref.clone(),
+                        name: incomplete.agent_ref.clone(),
                     },
                     models: vec![ModelRef {
                         provider: "litellm".to_owned(),
@@ -3460,23 +3503,69 @@ mod tests {
                         action: "get_file_contents".to_owned(),
                     }],
                     refs: RuntimeRefs::default(),
-                    execution_binding: Some(unsupported),
+                    execution_binding: Some(incomplete),
                 },
                 None,
                 None,
             )
             .is_err(),
-            "an arbitrary well-formed native-profile reference must fail before sandbox creation"
+            "a required profile missing from the persisted binding must fail before sandbox creation"
+        );
+
+        let mut tampered = binding.clone();
+        tampered.executable = "/opt/example/bin/other-agent".to_owned();
+        assert!(
+            matches!(
+                project_request(
+                    &SandboxRequest {
+                        runtime: RuntimeId("runtime-uid-c".to_owned()),
+                        workspace_key: "team-a".to_owned(),
+                        execution_class: SandboxExecutionClass::Agent,
+                        agent_type: AgentType {
+                            name: tampered.agent_ref.clone(),
+                        },
+                        models: Vec::new(),
+                        tools: Vec::new(),
+                        refs: RuntimeRefs::default(),
+                        execution_binding: Some(tampered),
+                    },
+                    None,
+                    None,
+                ),
+                Err(PortError::Rejected { ref reason }) if reason.contains("digest")
+            ),
+            "runtime projection must recompute the content-bound digest"
         );
         Ok(())
     }
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn approved_codex_workflow_validates_the_standard_result_and_archives_declared_outputs() {
-        let command = output_archive_command(&AgentType {
-            name: "codex@0.117.0".to_owned(),
-        });
+    fn bound_workflow_validates_the_standard_result_and_archives_declared_outputs() {
+        let binding = DisposableExecutionBinding {
+            schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+            binding_id: format!("sha256:{}", "a".repeat(64)),
+            binding_digest: format!("sha256:{}", "a".repeat(64)),
+            agent_ref: "example-agent@1.0.0".to_owned(),
+            display_name: None,
+            adapter: "codex-v1".to_owned(),
+            image: format!(
+                "registry.example.test/agents/example@sha256:{}",
+                "b".repeat(64)
+            ),
+            executable: "/opt/example/bin/agent".to_owned(),
+            version_probe: ExecutionVersionProbe {
+                arguments: vec!["--version".to_owned()],
+                expected_stdout: "example-agent 1.0.0".to_owned(),
+            },
+            provider_profiles: ExecutionProviderProfiles::default(),
+        };
+        let command = output_archive_command(
+            &AgentType {
+                name: binding.agent_ref.clone(),
+            },
+            Some(&binding),
+        );
         assert!(
             command.contains("test -s /sandbox/steward-output/result.txt"),
             "the runtime must reject a missing or empty standard result"
@@ -3921,21 +4010,6 @@ mod tests {
             provider_reconciliation(false, true),
             Some(ProviderReconciliation::Attach),
             "a newly granted tool capability must attach the gateway provider"
-        );
-    }
-
-    #[cfg(feature = "runtime")]
-    #[test]
-    fn versioned_task_profiles_are_managed_during_reconciliation() {
-        let managed = super::managed_provider_names();
-
-        assert!(
-            managed.contains(&super::TASK_TOOL_PROVIDER_V1_3_0),
-            "the exact tool profile selected by the persisted native-profile pin must be reconciled"
-        );
-        assert!(
-            managed.contains(&super::TASK_INFERENCE_PROVIDER_V1_3_0),
-            "the exact inference profile selected by the persisted native-profile pin must be reconciled"
         );
     }
 

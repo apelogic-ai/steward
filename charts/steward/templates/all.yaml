@@ -1,5 +1,8 @@
 {{- $stableBridgeBundleName := printf "steward-stable-bridge-attestation-%s" (.Values.stableBridge.attestationBundle | sha256sum | trunc 12) }}
 {{- $connectionsBridgeBundleName := printf "steward-connections-bridge-attestation-%s" (.Values.connectionsBridge.attestationBundle | sha256sum | trunc 12) }}
+{{- $executionBindingsJson := toJson .Values.config.apiserver.executionBindings }}
+{{- $executionBindingsHash := $executionBindingsJson | sha256sum }}
+{{- $executionBindingsConfigMapName := printf "steward-execution-bindings-%s" ($executionBindingsHash | trunc 12) }}
 {{- if and .Values.web.enabled .Values.web.ingress.enabled (ne .Values.browserAuth.google.origin (printf "https://%s" .Values.web.host)) }}
 {{- fail "web.host must exactly match the HTTPS browserAuth.google.origin" }}
 {{- end }}
@@ -163,6 +166,13 @@ data:
 {{ .Values.connectionsBridge.attestationBundle | indent 4 }}
 {{- end }}
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: {{ $executionBindingsConfigMapName }} }
+immutable: true
+data:
+  execution-bindings.json: {{ $executionBindingsJson | quote }}
+---
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata: { name: steward-webhook-tls }
@@ -232,7 +242,10 @@ spec:
   replicas: {{ .Values.replicaCount.apiserver }}
   selector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
   template:
-    metadata: { labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
+    metadata:
+      labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver }
+      annotations:
+        checksum/execution-bindings: {{ $executionBindingsHash | quote }}
     spec:
       serviceAccountName: {{ include "steward.apiserverName" . }}
       securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
@@ -252,9 +265,7 @@ spec:
             - { name: STEWARD_JIRA_ACCOUNT_EMAIL, value: {{ .Values.config.apiserver.jiraAccountEmail | quote }} }
             - { name: STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE, value: {{ .Values.config.apiserver.kubernetesTokenReviewAudience | quote }} }
             - { name: STEWARD_TASK_WORKFLOWS_JSON, value: {{ .Values.config.apiserver.taskWorkflowsJson | quote }} }
-{{- if .Values.config.apiserver.taskExecutionBindingsJson }}
-            - { name: STEWARD_TASK_EXECUTION_BINDINGS_JSON, value: {{ .Values.config.apiserver.taskExecutionBindingsJson | quote }} }
-{{- end }}
+            - { name: STEWARD_TASK_EXECUTION_BINDINGS_FILE, value: /run/execution-bindings/execution-bindings.json }
             - { name: STEWARD_TASK_MCP_GW_ENDPOINT, value: {{ .Values.config.apiserver.mcpGatewayEndpoint | quote }} }
 {{- if .Values.taskIdentity.enabled }}
             - { name: STEWARD_IDENTITY_TASK_ISSUER, value: {{ .Values.taskIdentity.issuer | quote }} }
@@ -288,6 +299,7 @@ spec:
             - { name: STEWARD_TLS_KEY_DER, value: /run/tls/tls.key }
           volumeMounts:
             - { name: tls, mountPath: /run/tls, readOnly: true }
+            - { name: execution-bindings, mountPath: /run/execution-bindings, readOnly: true }
 {{- if .Values.taskIdentity.enabled }}
             - { name: identity-task, mountPath: /run/identity-task, readOnly: true }
 {{- end }}
@@ -298,6 +310,10 @@ spec:
 {{ toYaml .Values.resources.apiserver | nindent 12 }}
       volumes:
         - { name: tls, secret: { secretName: steward-apiserver-tls } }
+        - name: execution-bindings
+          configMap:
+            name: {{ $executionBindingsConfigMapName }}
+            items: [{ key: execution-bindings.json, path: execution-bindings.json }]
 {{- if .Values.taskIdentity.enabled }}
         - name: identity-task
           configMap:

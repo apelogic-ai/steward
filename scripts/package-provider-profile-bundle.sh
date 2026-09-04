@@ -30,7 +30,7 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ -z "$output_directory" ]
 fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-bundle_directory="${root}/config/provider-profile-bundle/v1.3.0"
+bundle_directory="${root}/config/provider-profile-bundle/v1.2.0"
 archive_name="steward-runtime-providers-${version}.tar.gz"
 archive_path="${output_directory}/${archive_name}"
 digest_path="${output_directory}/provider-profile-bundle.digest"
@@ -39,9 +39,7 @@ for required in \
   "${bundle_directory}/bundle.json" \
   "${bundle_directory}/README.md" \
   "${bundle_directory}/profiles/steward-litellm.json" \
-  "${bundle_directory}/profiles/steward-litellm-v1-3-0.json" \
-  "${bundle_directory}/profiles/steward-mcp-gw.json" \
-  "${bundle_directory}/profiles/steward-mcp-gw-v1-3-0.json"
+  "${bundle_directory}/profiles/steward-mcp-gw.json"
 do
   test -s "$required"
 done
@@ -53,12 +51,10 @@ if [[ -e "$archive_path" || -e "$digest_path" ]]; then
 fi
 
 bundle_paths=(
-  provider-profile-bundle/v1.3.0/README.md
-  provider-profile-bundle/v1.3.0/bundle.json
-  provider-profile-bundle/v1.3.0/profiles/steward-litellm-v1-3-0.json
-  provider-profile-bundle/v1.3.0/profiles/steward-litellm.json
-  provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw-v1-3-0.json
-  provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw.json
+  provider-profile-bundle/v1.2.0/README.md
+  provider-profile-bundle/v1.2.0/bundle.json
+  provider-profile-bundle/v1.2.0/profiles/steward-litellm.json
+  provider-profile-bundle/v1.2.0/profiles/steward-mcp-gw.json
 )
 
 # GNU tar metadata controls plus gzip -n make the release bundle bytes
@@ -75,12 +71,10 @@ else
 fi
 
 expected_entries="$(cat <<'ENTRIES'
-provider-profile-bundle/v1.3.0/README.md
-provider-profile-bundle/v1.3.0/bundle.json
-provider-profile-bundle/v1.3.0/profiles/steward-litellm-v1-3-0.json
-provider-profile-bundle/v1.3.0/profiles/steward-litellm.json
-provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw-v1-3-0.json
-provider-profile-bundle/v1.3.0/profiles/steward-mcp-gw.json
+provider-profile-bundle/v1.2.0/README.md
+provider-profile-bundle/v1.2.0/bundle.json
+provider-profile-bundle/v1.2.0/profiles/steward-litellm.json
+provider-profile-bundle/v1.2.0/profiles/steward-mcp-gw.json
 ENTRIES
 )"
 actual_entries="$(tar -tzf "$archive_path")"
@@ -92,13 +86,11 @@ fi
 for archived_file in \
   README.md \
   bundle.json \
-  profiles/steward-litellm-v1-3-0.json \
   profiles/steward-litellm.json \
-  profiles/steward-mcp-gw-v1-3-0.json \
   profiles/steward-mcp-gw.json
 do
   if ! cmp -s "${bundle_directory}/${archived_file}" \
-    <(tar -xOzf "$archive_path" "provider-profile-bundle/v1.3.0/${archived_file}")
+    <(tar -xOzf "$archive_path" "provider-profile-bundle/v1.2.0/${archived_file}")
   then
     echo "provider-profile bundle archive content does not match ${archived_file}" >&2
     exit 1

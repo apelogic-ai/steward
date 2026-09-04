@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub const PENDING_APPROVAL_ANNOTATION: &str = "agents.apelogic.ai/pending-approval";
 pub const TASK_EXECUTION_BINDING_ANNOTATION: &str = "agents.apelogic.ai/task-execution-binding";
 pub const TASK_EXECUTION_BINDING_SCHEMA_VERSION: &str = "steward/task-execution-binding/v1";
+pub const TASK_EXECUTION_BINDING_DIGEST_DOMAIN: &[u8] = b"steward.execution-bindings/v1\0";
 
 pub fn runtime_activated_condition(observed_generation: i64) -> Condition {
     Condition {
@@ -626,10 +627,13 @@ pub struct DisposableExecutionBinding {
     pub binding_id: String,
     pub binding_digest: String,
     pub agent_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub adapter: String,
     pub image: String,
     pub executable: String,
-    pub expected_version: String,
-    pub native_profile: String,
+    pub version_probe: ExecutionVersionProbe,
+    pub provider_profiles: ExecutionProviderProfiles,
 }
 
 impl DisposableExecutionBinding {
@@ -639,12 +643,104 @@ impl DisposableExecutionBinding {
             || !valid_sha256_digest(&self.binding_digest)
             || self.binding_id != self.binding_digest
             || !valid_versioned_binding_reference(&self.agent_ref)
+            || self
+                .display_name
+                .as_deref()
+                .is_some_and(|value| !valid_bounded_display_name(value))
+            || !valid_binding_slug(&self.adapter)
             || !valid_digest_pinned_image(&self.image)
             || !valid_absolute_executable(&self.executable)
-            || !valid_bounded_binding_scalar(&self.expected_version)
-            || !valid_versioned_binding_reference(&self.native_profile)
+            || self.version_probe.validate().is_err()
+            || self.provider_profiles.validate().is_err()
         {
             return Err("disposable execution binding is incomplete or mutable".to_owned());
+        }
+        Ok(())
+    }
+
+    pub fn canonical_content(&self) -> Result<Vec<u8>, String> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Content<'a> {
+            agent_ref: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            display_name: Option<&'a str>,
+            adapter: &'a str,
+            image: &'a str,
+            executable: &'a str,
+            version_probe: &'a ExecutionVersionProbe,
+            provider_profiles: &'a ExecutionProviderProfiles,
+        }
+
+        serde_json::to_vec(&Content {
+            agent_ref: &self.agent_ref,
+            display_name: self.display_name.as_deref(),
+            adapter: &self.adapter,
+            image: &self.image,
+            executable: &self.executable,
+            version_probe: &self.version_probe,
+            provider_profiles: &self.provider_profiles,
+        })
+        .map_err(|error| format!("execution binding cannot be canonicalized: {error}"))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionVersionProbe {
+    pub arguments: Vec<String>,
+    pub expected_stdout: String,
+}
+
+impl ExecutionVersionProbe {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.arguments.is_empty()
+            || self.arguments.len() > 8
+            || self.arguments.iter().any(|argument| {
+                argument.is_empty()
+                    || argument.len() > 128
+                    || argument.chars().any(char::is_control)
+            })
+            || !valid_bounded_binding_scalar(&self.expected_stdout)
+        {
+            return Err("execution version probe is invalid or unbounded".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionProviderProfiles {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ExecutionProviderProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<ExecutionProviderProfile>,
+}
+
+impl ExecutionProviderProfiles {
+    pub fn validate(&self) -> Result<(), String> {
+        for profile in [&self.tools, &self.inference].into_iter().flatten() {
+            profile.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionProviderProfile {
+    pub id: String,
+    pub digest: String,
+}
+
+impl ExecutionProviderProfile {
+    pub fn validate(&self) -> Result<(), String> {
+        if !valid_bounded_binding_scalar(&self.id)
+            || self.id.chars().any(char::is_whitespace)
+            || !valid_sha256_digest(&self.digest)
+        {
+            return Err("execution provider profile is incomplete or mutable".to_owned());
         }
         Ok(())
     }
@@ -791,6 +887,13 @@ fn valid_absolute_executable(value: &str) -> bool {
 fn valid_bounded_binding_scalar(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 255
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_bounded_display_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
         && value.trim() == value
         && !value.chars().any(char::is_control)
 }

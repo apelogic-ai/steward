@@ -22,11 +22,6 @@ if [[ "${STEWARD_S5_MCP_GW_IMAGE}" != "${MCP_GW_IMAGE}" ]]; then
   exit 2
 fi
 
-docker build \
-  --file "${ROOT}/e2e/Dockerfile.task" \
-  --label "steward.test/run-id=${STEWARD_RUN_ID}" \
-  --tag "${TASK_IMAGE}" \
-  "${ROOT}"
 "${ROOT}/scripts/build-steward-mint-image.sh"
 "${ROOT}/scripts/build-patched-mcp-gw.sh"
 docker run --rm \
@@ -35,6 +30,14 @@ docker run --rm \
   --workdir /workspace \
   "${MCP_GW_IMAGE}" \
   test config/s5/capture-proxy.test.ts
+
+# Build the run-scoped image last so hosts under local image-cache pressure do
+# not evict it while the larger shared dependency images are being assembled.
+docker build \
+  --file "${ROOT}/e2e/Dockerfile.task" \
+  --label "steward.test/run-id=${STEWARD_RUN_ID}" \
+  --tag "${TASK_IMAGE}" \
+  "${ROOT}"
 
 for image in "${MINT_IMAGE}" "${MCP_GW_IMAGE}" "${TASK_IMAGE}"; do
   docker image inspect "${image}" >/dev/null

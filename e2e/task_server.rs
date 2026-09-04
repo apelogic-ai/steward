@@ -183,31 +183,30 @@ fn workflow_content_digest(agent: &str, prompt: &str) -> String {
 }
 
 fn execution_binding_catalog(image: &str) -> Result<String, Box<dyn Error>> {
-    let executable = "/usr/bin/codex";
-    let expected_version = "codex-cli 0.140.0";
-    let native_profile = "steward-runtime-providers@1.3.0";
-    let mut hasher = Sha256::new();
-    for value in [
-        steward_types::TASK_EXECUTION_BINDING_SCHEMA_VERSION,
-        VERSIONED_WORKFLOW_AGENT,
-        image,
-        executable,
-        expected_version,
-        native_profile,
-    ] {
-        hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
-        hasher.update(value.as_bytes());
-    }
-    let binding_digest = format!("sha256:{:x}", hasher.finalize());
-    Ok(serde_json::to_string(&json!([{
-        "bindingId": binding_digest,
-        "bindingDigest": binding_digest,
-        "agentRef": VERSIONED_WORKFLOW_AGENT,
-        "image": image,
-        "executable": executable,
-        "expectedVersion": expected_version,
-        "nativeProfile": native_profile
-    }]))?)
+    Ok(serde_json::to_string(&json!({
+        "apiVersion": "steward.execution-bindings/v1",
+        "bindings": [{
+            "agentRef": VERSIONED_WORKFLOW_AGENT,
+            "displayName": "Codex 0.140.0",
+            "adapter": "codex-v1",
+            "image": image,
+            "executable": "/usr/bin/codex",
+            "versionProbe": {
+                "arguments": ["--version"],
+                "expectedStdout": "codex-cli 0.140.0"
+            },
+            "providerProfiles": {
+                "tools": {
+                    "id": "steward-mcp-gw-v1-3-0",
+                    "digest": format!("sha256:{}", "a".repeat(64))
+                },
+                "inference": {
+                    "id": "steward-litellm-v1-3-0",
+                    "digest": format!("sha256:{}", "b".repeat(64))
+                }
+            }
+        }]
+    }))?)
 }
 
 fn envelope_content_digest(envelope: &Envelope) -> Result<String, serde_json::Error> {

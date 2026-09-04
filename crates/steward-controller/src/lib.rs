@@ -2849,7 +2849,7 @@ mod tests {
         );
 
         let mut ordinary = governed;
-        ordinary.agent_type.name = "codex@0.117.0".to_owned();
+        ordinary.agent_type.name = "example-agent@1.0.0".to_owned();
         assert_eq!(
             sandbox_execution_class(&ordinary),
             SandboxExecutionClass::Agent

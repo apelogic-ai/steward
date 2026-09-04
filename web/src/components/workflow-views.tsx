@@ -72,9 +72,9 @@ function WorkflowDetail({ workflow }: Readonly<{ workflow: WorkflowRevision }>) 
 export function NewWorkflowView({ from }: Readonly<{ from?: WorkflowRevision }>) {
   const list = useCallback(() => listAdminWorkflows(), []);
   const state = useApiResource<WorkflowListResponse>(list);
-  return <ResourceBoundary state={state}>{({ agents }) => (
-    <WorkflowForm agents={agents} from={from} />
-  )}</ResourceBoundary>;
+  return <ResourceBoundary state={state}>{({ agents }) => agents.length === 0 ? (
+    <EmptyState title="No coding agents configured" />
+  ) : <WorkflowForm agents={agents} from={from} />}</ResourceBoundary>;
 }
 
 function WorkflowForm({ agents, from }: Readonly<{ agents: string[]; from?: WorkflowRevision }>) {
@@ -120,6 +120,7 @@ export function NewWorkflowVersionView({ name }: Readonly<{ name: string }>) {
   const state = useApiResource<WorkflowListResponse>(list);
   return <ResourceBoundary state={state}>{({ agents, workflows }) => {
     const current = workflows.find((workflow) => workflow.name === name);
+    if (agents.length === 0) return <EmptyState title="No coding agents configured" />;
     return current ? <WorkflowForm agents={agents} from={current} /> : <EmptyState title="No data" />;
   }}</ResourceBoundary>;
 }
