@@ -1,7 +1,7 @@
 //! Thin OpenShell integration seam.
 
 #[cfg(feature = "runtime")]
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 #[cfg(feature = "runtime")]
 use std::future::Future;
 #[cfg(feature = "runtime")]
@@ -323,6 +323,58 @@ fn provider_reconciliation_targets(projection: &OpenShellProjection) -> Vec<(Str
         .collect::<Vec<_>>();
     targets.sort_by_key(|(_, desired)| *desired);
     targets
+}
+
+#[cfg(feature = "runtime")]
+fn observed_managed_providers(
+    providers: &[Provider],
+    workspace: &str,
+    managed_providers: &[String],
+) -> Result<BTreeSet<String>, PortError> {
+    let managed = managed_providers
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut observed = BTreeSet::new();
+    for provider in providers {
+        let metadata_name = provider
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.name.as_str());
+        let provider_type = provider.r#type.as_str();
+        let managed_name = metadata_name
+            .filter(|name| managed.contains(name))
+            .or_else(|| managed.contains(provider_type).then_some(provider_type));
+        let Some(managed_name) = managed_name else {
+            continue;
+        };
+        validate_provider(provider, workspace, managed_name)?;
+        if !observed.insert(managed_name.to_owned()) {
+            return Err(PortError::Rejected {
+                reason: "OpenShell returned duplicate Steward provider attachments".to_owned(),
+            });
+        }
+    }
+    Ok(observed)
+}
+
+#[cfg(feature = "runtime")]
+fn provider_reconciliation_plan(
+    projection: &OpenShellProjection,
+    observed: &[Provider],
+) -> Result<Vec<(String, ProviderReconciliation)>, PortError> {
+    let observed = observed_managed_providers(
+        observed,
+        &projection.workspace,
+        &projection.managed_providers,
+    )?;
+    Ok(provider_reconciliation_targets(projection)
+        .into_iter()
+        .filter_map(|(provider, desired)| {
+            provider_reconciliation(observed.contains(&provider), desired)
+                .map(|action| (provider, action))
+        })
+        .collect())
 }
 
 #[cfg(feature = "runtime")]
@@ -1718,43 +1770,20 @@ impl OpenShellRuntime {
             .map_err(raw_port_failure)
     }
 
-    async fn provider_is_attached(
+    async fn attached_providers(
         &self,
         workspace: &str,
         sandbox: &str,
-        provider_name: &str,
-    ) -> Result<bool, PortError> {
+    ) -> Result<Vec<Provider>, PortError> {
         let mut client = self.authenticated_client().await?.raw_grpc();
-        let providers = client
+        let response = client
             .list_sandbox_providers(ListSandboxProvidersRequest {
                 sandbox_name: sandbox.to_owned(),
                 workspace: workspace.to_owned(),
             })
             .await
-            .map_err(raw_port_failure)?
-            .into_inner()
-            .providers;
-        let attached = providers
-            .iter()
-            .filter(|provider| {
-                provider
-                    .metadata
-                    .as_ref()
-                    .map(|metadata| metadata.name.as_str())
-                    == Some(provider_name)
-            })
-            .collect::<Vec<_>>();
-        let [provider] = attached.as_slice() else {
-            return if attached.is_empty() {
-                Ok(false)
-            } else {
-                Err(PortError::Rejected {
-                    reason: "OpenShell returned duplicate Steward provider attachments".to_owned(),
-                })
-            };
-        };
-        validate_provider(provider, workspace, provider_name)?;
-        Ok(true)
+            .map_err(raw_port_failure)?;
+        Ok(response.into_inner().providers)
     }
 
     async fn detach_provider(
@@ -1777,18 +1806,15 @@ impl OpenShellRuntime {
             .map_err(raw_port_failure)
     }
 
-    async fn reconcile_provider(
+    async fn apply_provider_reconciliation(
         &self,
         workspace: &str,
         sandbox: &str,
         provider_name: &str,
-        desired: bool,
+        reconciliation: ProviderReconciliation,
     ) -> Result<(), PortError> {
-        let attached = self
-            .provider_is_attached(workspace, sandbox, provider_name)
-            .await?;
-        match provider_reconciliation(attached, desired) {
-            Some(ProviderReconciliation::Attach) => {
+        match reconciliation {
+            ProviderReconciliation::Attach => {
                 let resource_version = self
                     .authenticated_client()
                     .await?
@@ -1800,7 +1826,7 @@ impl OpenShellRuntime {
                 self.attach_provider(workspace, sandbox, provider_name, resource_version)
                     .await
             }
-            Some(ProviderReconciliation::Detach) => {
+            ProviderReconciliation::Detach => {
                 let resource_version = self
                     .authenticated_client()
                     .await?
@@ -1812,7 +1838,6 @@ impl OpenShellRuntime {
                 self.detach_provider(workspace, sandbox, provider_name, resource_version)
                     .await
             }
-            None => Ok(()),
         }
     }
 }
@@ -1829,7 +1854,10 @@ fn validate_provider(
         .ok_or_else(|| PortError::Rejected {
             reason: "OpenShell provider has no identity metadata".to_owned(),
         })?;
-    if provider.r#type != provider_name || metadata.workspace != workspace {
+    if metadata.name != provider_name
+        || provider.r#type != provider_name
+        || metadata.workspace != workspace
+    {
         return Err(PortError::Rejected {
             reason: "provider name resolved to a different type or workspace".to_owned(),
         });
@@ -2021,27 +2049,37 @@ impl SandboxRuntime for OpenShellRuntime {
             false,
         )
         .await?;
-        let provider_targets = provider_reconciliation_targets(&projection);
-        for (provider_name, desired) in &provider_targets {
-            self.reconcile_provider(
+        let observed = self
+            .attached_providers(&projection.workspace, &projection.sandbox)
+            .await?;
+        let provider_plan = provider_reconciliation_plan(&projection, &observed)?;
+        for (provider_name, reconciliation) in &provider_plan {
+            self.apply_provider_reconciliation(
                 &projection.workspace,
                 &projection.sandbox,
                 provider_name,
-                *desired,
+                *reconciliation,
             )
             .await?;
         }
-        for (provider_name, desired) in &provider_targets {
-            if self
-                .provider_is_attached(&projection.workspace, &projection.sandbox, provider_name)
-                .await?
-                != *desired
-            {
-                return Err(PortError::Failed {
-                    reason: "OpenShell provider attachments did not converge to desired state"
-                        .to_owned(),
-                });
-            }
+        let reobserved = self
+            .attached_providers(&projection.workspace, &projection.sandbox)
+            .await?;
+        let actual = observed_managed_providers(
+            &reobserved,
+            &projection.workspace,
+            &projection.managed_providers,
+        )?;
+        let desired = projection
+            .providers
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if actual != desired {
+            return Err(PortError::Failed {
+                reason: "OpenShell provider attachments did not converge to desired state"
+                    .to_owned(),
+            });
         }
         let refs = runtime_refs(&projection);
         match snapshot.phase {
@@ -2300,7 +2338,7 @@ mod tests {
     use std::time::Duration;
 
     #[cfg(feature = "runtime")]
-    use openshell_sdk::raw::proto::datamodel::v1::ObjectMeta;
+    use openshell_sdk::raw::proto::datamodel::v1::{ObjectMeta, Provider};
     #[cfg(feature = "runtime")]
     use openshell_sdk::raw::proto::{
         ExecSandboxEvent, ExecSandboxExit, ExecSandboxStderr, ExecSandboxStdout,
@@ -2334,10 +2372,10 @@ mod tests {
         TaskProcessLogSink, TaskProcessStream, WorkloadExchangeTokenProvider,
         collect_task_process_stream, delete_owned_sandbox, deletion_names, load_source_credential,
         output_archive_command, project_request, provider_reconciliation,
-        provider_reconciliation_targets, sandbox_spec, staging_append_command,
-        staging_archive_chunks, staging_extract_command, staging_prepare_command,
-        task_agent_failure_category, task_process_log_record, validate_raw_sandbox_binding,
-        validate_workload_exchange_endpoint,
+        provider_reconciliation_plan, provider_reconciliation_targets, sandbox_spec,
+        staging_append_command, staging_archive_chunks, staging_extract_command,
+        staging_prepare_command, task_agent_failure_category, task_process_log_record,
+        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
     };
     #[cfg(feature = "runtime")]
     use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
@@ -2354,6 +2392,19 @@ mod tests {
         binding.binding_id.clone_from(&digest);
         binding.binding_digest = digest;
         Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    fn attached_provider(name: &str, workspace: &str) -> Provider {
+        Provider {
+            metadata: Some(ObjectMeta {
+                name: name.to_owned(),
+                workspace: workspace.to_owned(),
+                ..ObjectMeta::default()
+            }),
+            r#type: name.to_owned(),
+            ..Provider::default()
+        }
     }
 
     #[cfg(feature = "runtime")]
@@ -4163,6 +4214,105 @@ mod tests {
             ],
             "removing all authority must explicitly reconcile both Steward providers absent"
         );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn provider_plan_detaches_managed_extras_before_attach_and_preserves_unmanaged_entries()
+    -> Result<(), String> {
+        let projection = project_request(
+            &SandboxRequest {
+                runtime: RuntimeId("runtime-uid-a".to_owned()),
+                workspace_key: "team-a".to_owned(),
+                execution_class: SandboxExecutionClass::Agent,
+                agent_type: AgentType {
+                    name: "base".to_owned(),
+                },
+                models: Vec::new(),
+                tools: vec![ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "repository".to_owned(),
+                    action: "read".to_owned(),
+                }],
+                refs: RuntimeRefs::default(),
+                execution_binding: None,
+            },
+            None,
+            None,
+        )
+        .map_err(|error| format!("runtime projection failed: {error:?}"))?;
+        let observed = [
+            attached_provider(INFERENCE_PROVIDER, &projection.workspace),
+            attached_provider("customer-managed-provider", &projection.workspace),
+        ];
+
+        assert_eq!(
+            provider_reconciliation_plan(&projection, &observed)
+                .map_err(|error| format!("provider plan failed: {error:?}"))?,
+            [
+                (
+                    INFERENCE_PROVIDER.to_owned(),
+                    ProviderReconciliation::Detach,
+                ),
+                (TOOL_PROVIDER.to_owned(), ProviderReconciliation::Attach),
+            ],
+            "the complete managed set must converge subtractively before additions without touching non-Steward attachments"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn provider_plan_is_idempotent_and_rejects_duplicate_or_malformed_managed_entries()
+    -> Result<(), String> {
+        let projection = project_request(
+            &SandboxRequest {
+                runtime: RuntimeId("runtime-uid-a".to_owned()),
+                workspace_key: "team-a".to_owned(),
+                execution_class: SandboxExecutionClass::Agent,
+                agent_type: AgentType {
+                    name: "base".to_owned(),
+                },
+                models: Vec::new(),
+                tools: vec![ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "repository".to_owned(),
+                    action: "read".to_owned(),
+                }],
+                refs: RuntimeRefs::default(),
+                execution_binding: None,
+            },
+            None,
+            None,
+        )
+        .map_err(|error| format!("runtime projection failed: {error:?}"))?;
+        let desired = attached_provider(TOOL_PROVIDER, &projection.workspace);
+        assert!(
+            provider_reconciliation_plan(&projection, std::slice::from_ref(&desired))
+                .map_err(|error| format!("idempotent provider plan failed: {error:?}"))?
+                .is_empty(),
+            "an exact observed provider set must be a no-op"
+        );
+        assert!(
+            matches!(
+                provider_reconciliation_plan(&projection, &[desired.clone(), desired]),
+                Err(PortError::Rejected { ref reason }) if reason.contains("duplicate")
+            ),
+            "duplicate Steward-managed attachments must fail closed"
+        );
+        let malformed = Provider {
+            metadata: None,
+            r#type: TOOL_PROVIDER.to_owned(),
+            ..Provider::default()
+        };
+        assert!(
+            matches!(
+                provider_reconciliation_plan(&projection, &[malformed]),
+                Err(PortError::Rejected { ref reason }) if reason.contains("identity metadata")
+            ),
+            "a malformed Steward-managed attachment must fail closed"
+        );
+        Ok(())
     }
 
     #[cfg(feature = "runtime")]
