@@ -69,7 +69,7 @@ use steward_store::{
     AgentRunTimelineProvenance, ApprovalCandidate, ApproveAdmission, ApprovedAdmission,
     DecisionFiling, DecisionFilingClaim, EnvelopeRequestRecord, EnvelopeRequestStatusUpdate,
     GrantApplication, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval,
-    PendingEnvelopeRequest, PgStore, StoreError,
+    PendingEnvelopeRequest, PgStore, StoreError, TaskAdmissionLookup, TaskAdmissionRecord,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, ModelRef,
@@ -1086,6 +1086,11 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         request: ParkRejection<'a>,
     ) -> BoxFuture<'a, Result<ParkedAdmission, StoreError>>;
 
+    fn task_admission<'a>(
+        &'a self,
+        lookup: TaskAdmissionLookup<'a>,
+    ) -> BoxFuture<'a, Result<Option<TaskAdmissionRecord>, StoreError>>;
+
     fn pending_approvals(&self) -> BoxFuture<'_, Result<Vec<PendingApproval>, StoreError>>;
 
     fn pending_envelope_requests(
@@ -1281,6 +1286,13 @@ impl AdmissionLedger for PgStore {
         request: ParkRejection<'a>,
     ) -> BoxFuture<'a, Result<ParkedAdmission, StoreError>> {
         Box::pin(async move { PgStore::park_rejection(self, request).await })
+    }
+
+    fn task_admission<'a>(
+        &'a self,
+        lookup: TaskAdmissionLookup<'a>,
+    ) -> BoxFuture<'a, Result<Option<TaskAdmissionRecord>, StoreError>> {
+        Box::pin(async move { PgStore::task_admission(self, lookup).await })
     }
 
     fn pending_approvals(&self) -> BoxFuture<'_, Result<Vec<PendingApproval>, StoreError>> {
@@ -3026,12 +3038,13 @@ mod tests {
         DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
     };
     use steward_store::{
-        AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunSpend, AgentRunTimelineEvent,
-        AgentRunTimelineKind, AgentRunTimelineProvenance, ApprovalCandidate, ApproveAdmission,
-        ApprovedAdmission, DecisionFiling, DecisionFilingClaim, EnvelopeRequestRecord,
-        EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, GrantApplication, GrantReversion,
-        ParkRejection, ParkedAdmission, PendingApproval, PendingEnvelopeRequest, StoreError,
-        TaskRecord, TaskReservation, TaskReservationRequest, WorkflowRevisionRecord,
+        AdmissionApprovalState, AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunSpend,
+        AgentRunTimelineEvent, AgentRunTimelineKind, AgentRunTimelineProvenance, ApprovalCandidate,
+        ApproveAdmission, ApprovedAdmission, DecisionFiling, DecisionFilingClaim,
+        EnvelopeRequestRecord, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
+        GrantApplication, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval,
+        PendingEnvelopeRequest, StoreError, TaskAdmissionLookup, TaskAdmissionRecord, TaskRecord,
+        TaskReservation, TaskReservationRequest, WorkflowRevisionRecord,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding,
@@ -5203,6 +5216,7 @@ mod tests {
         application_revoked_during_retirement: Arc<Mutex<bool>>,
         tasks: Arc<Mutex<Vec<TaskRecord>>>,
         task_bind_failures: Arc<AtomicUsize>,
+        task_approval_state: Arc<Mutex<FakeApprovalState>>,
         workflow_revisions: Arc<Mutex<Vec<WorkflowRevisionRecord>>>,
         user_envelopes: Arc<Mutex<Vec<EnvelopeRequestRecord>>>,
         agent_runs: Arc<Mutex<Vec<AgentRunRecord>>>,
@@ -5222,6 +5236,13 @@ mod tests {
         actor: String,
         member_role: String,
         envelope_revision: i64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FakeApprovalState {
+        Pending,
+        Approved,
+        Rejected,
     }
 
     type ParkedRows = Arc<Mutex<Vec<FakeParked>>>;
@@ -5345,10 +5366,16 @@ mod tests {
                 let mut parked = self.parked.lock().map_err(|_| {
                     StoreError::Database("fake ledger lock was poisoned".to_owned())
                 })?;
+                let approval_state = *self.task_approval_state.lock().map_err(|_| {
+                    StoreError::Database("fake approval-state lock was poisoned".to_owned())
+                })?;
                 if application_committed {
                     parked.clear();
                 }
-                if parked.is_empty() || application_committed {
+                if parked.is_empty()
+                    || application_committed
+                    || approval_state != FakeApprovalState::Pending
+                {
                     parked.push(FakeParked {
                         runtime_uid: request.runtime_uid.to_owned(),
                         runtime_namespace: request.runtime_namespace.to_owned(),
@@ -5377,6 +5404,52 @@ mod tests {
                     decision_key: reference.as_ref().map(|(_, key, _)| key.clone()),
                     evidence_url: reference.map(|(_, _, url)| url),
                 })
+            })
+        }
+
+        fn task_admission<'a>(
+            &'a self,
+            lookup: TaskAdmissionLookup<'a>,
+        ) -> BoxFuture<'a, Result<Option<TaskAdmissionRecord>, StoreError>> {
+            Box::pin(async move {
+                let parked = self.parked.lock().map_err(|_| {
+                    StoreError::Database("fake ledger lock was poisoned".to_owned())
+                })?;
+                let Some(admission) = parked.iter().find(|admission| {
+                    admission.runtime_namespace == lookup.runtime_namespace
+                        && admission.runtime_name == lookup.runtime_name
+                        && admission.base_pending_approval_digest.as_deref()
+                            == Some(lookup.spec_digest)
+                        && admission.envelope_revision == lookup.envelope_revision
+                        && admission.actor == lookup.actor
+                        && admission.member_role == lookup.member_role
+                }) else {
+                    return Ok(None);
+                };
+                let state = match *self.task_approval_state.lock().map_err(|_| {
+                    StoreError::Database("fake approval-state lock was poisoned".to_owned())
+                })? {
+                    FakeApprovalState::Pending => AdmissionApprovalState::Pending,
+                    FakeApprovalState::Approved => AdmissionApprovalState::Approved,
+                    FakeApprovalState::Rejected => AdmissionApprovalState::Rejected,
+                };
+                let reference = self
+                    .decision_references
+                    .lock()
+                    .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))?
+                    .iter()
+                    .find(|(approval_id, _, _)| *approval_id == Uuid::nil())
+                    .cloned();
+                Ok(Some(TaskAdmissionRecord {
+                    decision_id: Uuid::nil(),
+                    approval_id: Uuid::nil(),
+                    runtime_uid: admission.runtime_uid.clone(),
+                    state,
+                    decision_key: reference.as_ref().map(|(_, key, _)| key.clone()),
+                    evidence_url: reference.map(|(_, _, url)| url),
+                    deltas: admission.deltas.clone(),
+                    proposed_spec: admission.proposed_spec.clone(),
+                }))
             })
         }
 
@@ -6190,6 +6263,39 @@ mod tests {
                 Ok(task.clone())
             })
         }
+
+        fn fail_unbound_task_admission<'a>(
+            &'a self,
+            task_uid: Uuid,
+            reason: &'a str,
+        ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
+            Box::pin(async move {
+                let mut tasks = self.tasks.lock().map_err(|_| {
+                    StoreError::Database("fake task ledger lock was poisoned".to_owned())
+                })?;
+                let task = tasks
+                    .iter_mut()
+                    .find(|task| task.task_uid == task_uid)
+                    .ok_or(StoreError::TaskNotFound)?;
+                let eligible = task.runtime_uid.is_none()
+                    && !task.finalized
+                    && ((!task.finalize_requested
+                        && matches!(
+                            task.phase,
+                            TaskPhase::Submitted | TaskPhase::Parked | TaskPhase::Queued
+                        ))
+                        || (task.finalize_requested
+                            && task.phase == TaskPhase::Failed
+                            && task.failure_reason.as_deref() == Some(reason)));
+                if reason.is_empty() || !eligible {
+                    return Err(StoreError::InvalidTaskTransition);
+                }
+                task.phase = TaskPhase::Failed;
+                task.finalize_requested = true;
+                task.failure_reason = Some(reason.to_owned());
+                Ok(task.clone())
+            })
+        }
     }
 
     fn runtime() -> AgentRuntime {
@@ -6263,6 +6369,7 @@ mod tests {
             application_revoked_during_retirement: Arc::new(Mutex::new(false)),
             tasks: Arc::new(Mutex::new(Vec::new())),
             task_bind_failures: Arc::new(AtomicUsize::new(0)),
+            task_approval_state: Arc::new(Mutex::new(FakeApprovalState::Pending)),
             workflow_revisions: Arc::new(Mutex::new(Vec::new())),
             user_envelopes: Arc::new(Mutex::new(Vec::new())),
             agent_runs: Arc::new(Mutex::new(Vec::new())),
@@ -8847,6 +8954,236 @@ mod tests {
                 .len(),
             1,
             "retry must reuse the deterministic pending runtime"
+        );
+        Ok(())
+    }
+
+    async fn failed_pending_task_binding_fixture()
+    -> Result<(MultiRuntimeRepository, FakeLedger, FakeDecisionChannel), String> {
+        let runtimes = MultiRuntimeRepository::default();
+        let ledger = ledger();
+        ledger.task_bind_failures.store(1, Ordering::SeqCst);
+        let decisions = FakeDecisionChannel::default();
+        let mut workflow = task_workflow("250.00");
+        workflow.name = "wide-review".to_owned();
+        let app = task_router(
+            runtimes.clone(),
+            ledger.clone(),
+            decisions.clone(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([workflow]),
+            task_api_config()?,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "terminal-approval-race")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"workflow":"wide-review","codingAgentRuntime":"agent-v1"}"#,
+                    ))
+                    .map_err(|error| format!("build terminal approval fixture: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit terminal approval fixture: {error}"))?;
+        if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+            return Err(format!(
+                "terminal approval fixture did not fail binding: {}",
+                response.status()
+            ));
+        }
+        Ok((runtimes, ledger, decisions))
+    }
+
+    fn terminal_approval_retry_request() -> Result<Request<Body>, String> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/tasks")
+            .header("authorization", "Bearer github-assertion")
+            .header("idempotency-key", "terminal-approval-race")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"workflow":"wide-review","codingAgentRuntime":"agent-v1"}"#,
+            ))
+            .map_err(|error| format!("build terminal approval retry: {error}"))
+    }
+
+    #[tokio::test]
+    async fn unbound_task_retry_recovers_its_approved_runtime() -> Result<(), String> {
+        let (runtimes, ledger, decisions) = failed_pending_task_binding_fixture().await?;
+        let proposed_spec = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "task fixture lock was poisoned")?[0]
+            .runtime_spec
+            .clone();
+        {
+            let mut rows = runtimes
+                .runtimes
+                .lock()
+                .map_err(|_| "runtime fixture lock was poisoned")?;
+            let runtime = rows
+                .first_mut()
+                .ok_or_else(|| "pending runtime fixture is missing".to_owned())?;
+            runtime.spec = proposed_spec;
+            runtime
+                .metadata
+                .annotations
+                .get_or_insert_default()
+                .remove(PENDING_APPROVAL_ANNOTATION);
+        }
+        *ledger
+            .task_approval_state
+            .lock()
+            .map_err(|_| "approval-state fixture lock was poisoned")? = FakeApprovalState::Approved;
+        let app = task_router(
+            runtimes,
+            ledger.clone(),
+            decisions.clone(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            TaskApiConfig::default(),
+        );
+
+        let response = app
+            .oneshot(terminal_approval_retry_request()?)
+            .await
+            .map_err(|error| format!("retry Task after approval: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let rows = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "task fixture lock was poisoned")?;
+        assert!(rows[0].runtime_uid.is_some());
+        assert_eq!(rows[0].phase, TaskPhase::Submitted);
+        assert_eq!(
+            ledger
+                .parked
+                .lock()
+                .map_err(|_| "parked fixture lock was poisoned")?
+                .len(),
+            1,
+            "approved retry must not open another approval"
+        );
+        assert_eq!(
+            decisions
+                .requests
+                .lock()
+                .map_err(|_| "decision fixture lock was poisoned")?
+                .len(),
+            1,
+            "approved retry must retain the original external decision"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unbound_task_retry_applies_an_approved_pending_runtime() -> Result<(), String> {
+        let (runtimes, ledger, decisions) = failed_pending_task_binding_fixture().await?;
+        *ledger
+            .task_approval_state
+            .lock()
+            .map_err(|_| "approval-state fixture lock was poisoned")? = FakeApprovalState::Approved;
+        let app = task_router(
+            runtimes.clone(),
+            ledger.clone(),
+            decisions,
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            TaskApiConfig::default(),
+        );
+
+        let response = app
+            .oneshot(terminal_approval_retry_request()?)
+            .await
+            .map_err(|error| format!("retry Task during approved runtime application: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let task = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "task fixture lock was poisoned")?[0]
+            .clone();
+        assert_eq!(task.phase, TaskPhase::Submitted);
+        let runtime = runtimes
+            .runtimes
+            .lock()
+            .map_err(|_| "runtime fixture lock was poisoned")?[0]
+            .clone();
+        assert_eq!(runtime.spec, task.runtime_spec);
+        assert!(
+            !runtime
+                .annotations()
+                .contains_key(PENDING_APPROVAL_ANNOTATION)
+        );
+        assert_eq!(
+            ledger
+                .parked
+                .lock()
+                .map_err(|_| "parked fixture lock was poisoned")?
+                .len(),
+            1,
+            "approved recovery must reuse the original approval"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unbound_task_retry_recovers_its_rejected_admission() -> Result<(), String> {
+        let (runtimes, ledger, decisions) = failed_pending_task_binding_fixture().await?;
+        *ledger
+            .task_approval_state
+            .lock()
+            .map_err(|_| "approval-state fixture lock was poisoned")? = FakeApprovalState::Rejected;
+        let app = task_router(
+            runtimes,
+            ledger.clone(),
+            decisions.clone(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            TaskApiConfig::default(),
+        );
+
+        let response = app
+            .oneshot(terminal_approval_retry_request()?)
+            .await
+            .map_err(|error| format!("retry Task after rejection: {error}"))?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read rejected Task retry: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse rejected Task retry: {error}"))?;
+        assert_eq!(body["phase"], "failed");
+        assert!(body["runtimeUid"].is_null());
+        let rows = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "task fixture lock was poisoned")?;
+        assert!(rows[0].finalize_requested);
+        assert_eq!(
+            rows[0].failure_reason.as_deref(),
+            Some("admission_rejected")
+        );
+        assert_eq!(
+            ledger
+                .parked
+                .lock()
+                .map_err(|_| "parked fixture lock was poisoned")?
+                .len(),
+            1,
+            "rejected retry must not reopen the original approval"
+        );
+        assert_eq!(
+            decisions
+                .requests
+                .lock()
+                .map_err(|_| "decision fixture lock was poisoned")?
+                .len(),
+            1,
+            "rejected retry must retain the original external decision"
         );
         Ok(())
     }

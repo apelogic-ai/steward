@@ -91,6 +91,7 @@ fn task_runtime_action(
     ownership: RuntimeOwnership,
     execution_binding: Option<&TaskExecutionBinding>,
     finalize_requested: bool,
+    runtime_is_bound: bool,
     runtime_spec: &AgentRuntimeSpec,
     runtime: Option<&AgentRuntime>,
 ) -> TaskRuntimeAction {
@@ -100,7 +101,7 @@ fn task_runtime_action(
     if finalize_requested {
         return match (task_owns_runtime, runtime) {
             (false, _) | (true, None) => TaskRuntimeAction::MarkFinalized,
-            (true, Some(runtime)) if runtime.spec == *runtime_spec => {
+            (true, Some(runtime)) if !runtime_is_bound || runtime.spec == *runtime_spec => {
                 TaskRuntimeAction::DeleteRuntime
             }
             (true, Some(_)) => TaskRuntimeAction::Wait,
@@ -577,12 +578,13 @@ async fn reconcile_task<R: SandboxTaskRuntime>(
                 .to_owned(),
         ));
     }
-    let runtime = task_runtime(client, task).await?;
+    let runtime = task_runtime(client, authority, task).await?;
     match task_runtime_action(
         task.phase,
         task.runtime_ownership,
         task.execution_binding.as_ref(),
         task.finalize_requested,
+        task.runtime_uid.is_some(),
         &task.runtime_spec,
         runtime.as_ref(),
     ) {
@@ -849,6 +851,18 @@ trait TaskRuntimeBindingStore {
         runtime_uid: &str,
         phase: TaskPhase,
     ) -> impl Future<Output = Result<TaskRecord, StoreError>> + Send;
+
+    fn service_envelope_revision(
+        &self,
+        _service: &str,
+        _revision: i64,
+    ) -> impl Future<Output = Result<Option<Envelope>, StoreError>> + Send {
+        async {
+            Err(StoreError::Database(
+                "service envelope recovery is unavailable".to_owned(),
+            ))
+        }
+    }
 }
 
 impl TaskRuntimeBindingStore for PgStore {
@@ -859,6 +873,14 @@ impl TaskRuntimeBindingStore for PgStore {
         phase: TaskPhase,
     ) -> Result<TaskRecord, StoreError> {
         PgStore::bind_task_runtime(self, task.task_uid, runtime_uid, phase).await
+    }
+
+    async fn service_envelope_revision(
+        &self,
+        service: &str,
+        revision: i64,
+    ) -> Result<Option<Envelope>, StoreError> {
+        PgStore::service_envelope_revision(self, service, revision).await
     }
 }
 
@@ -1062,6 +1084,7 @@ fn task_failure_reason(error: &PortError) -> String {
 
 async fn task_runtime(
     client: &Client,
+    authority: &impl TaskRuntimeBindingStore,
     task: &TaskRecord,
 ) -> Result<Option<AgentRuntime>, TaskControllerError> {
     if task.runtime_uid.is_none()
@@ -1077,9 +1100,39 @@ async fn task_runtime(
         return Ok(runtime.filter(|runtime| runtime.metadata.uid.as_deref() == Some(expected_uid)));
     }
     let expected = task_runtime_manifest(task)?;
-    Ok(runtime.filter(|runtime| {
-        runtime.spec == expected.spec && runtime.annotations() == expected.annotations()
-    }))
+    let Some(runtime) = runtime else {
+        return Ok(None);
+    };
+    if runtime.spec == expected.spec && runtime.annotations() == expected.annotations() {
+        return Ok(Some(runtime));
+    }
+    let envelope = authority
+        .service_envelope_revision(&task.submitter_service, task.envelope_revision)
+        .await
+        .map_err(TaskControllerError::Store)?
+        .ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "task's exact service envelope revision is unavailable".to_owned(),
+            )
+        })?;
+    let mut pending = expected;
+    pending.spec.llms.clear();
+    pending.spec.tools.clear();
+    pending.spec.budget.monthly_limit = "0".to_owned();
+    pending.spec.budget.currency = envelope.spec.budget.currency;
+    pending.spec.ttl = envelope.spec.ttl;
+    pending.metadata.annotations.get_or_insert_default().insert(
+        PENDING_APPROVAL_ANNOTATION.to_owned(),
+        spec_digest(&task.runtime_spec).map_err(|error| {
+            TaskControllerError::InvalidState(format!(
+                "task runtime spec cannot be digested: {error}"
+            ))
+        })?,
+    );
+    Ok(
+        (runtime.spec == pending.spec && runtime.annotations() == pending.annotations())
+            .then_some(runtime),
+    )
 }
 
 #[derive(Debug)]
@@ -2855,6 +2908,30 @@ mod tests {
         }
     }
 
+    struct RecoveringTaskRuntimeBindingStore;
+
+    impl TaskRuntimeBindingStore for RecoveringTaskRuntimeBindingStore {
+        async fn bind_task_runtime(
+            &self,
+            _task: &TaskRecord,
+            _runtime_uid: &str,
+            _phase: TaskPhase,
+        ) -> Result<TaskRecord, StoreError> {
+            Err(StoreError::InvalidTaskTransition)
+        }
+
+        async fn service_envelope_revision(
+            &self,
+            _service: &str,
+            revision: i64,
+        ) -> Result<Option<Envelope>, StoreError> {
+            let mut recovered = envelope("1.00");
+            recovered.revision = revision;
+            recovered.spec.ttl = Duration("24h".to_owned());
+            Ok(Some(recovered))
+        }
+    }
+
     struct AmbiguousTaskRuntimeBindingStore {
         durable_runtime_uid: Arc<Mutex<Option<String>>>,
     }
@@ -2882,6 +2959,12 @@ mod tests {
     }
 
     fn task_runtime_creation_fixture() -> Result<TaskRuntimeCreationFixture, String> {
+        task_runtime_creation_fixture_with_pending(false)
+    }
+
+    fn task_runtime_creation_fixture_with_pending(
+        pending: bool,
+    ) -> Result<TaskRuntimeCreationFixture, String> {
         let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
         let mut spec = fixture().spec;
         spec.principal = Principal::Service {
@@ -2934,6 +3017,18 @@ mod tests {
         };
         let mut created = super::task_runtime_manifest(&task)
             .map_err(|error| format!("build runtime fixture: {error}"))?;
+        if pending {
+            created.spec.llms.clear();
+            created.spec.tools.clear();
+            created.spec.budget.monthly_limit = "0".to_owned();
+            created.spec.budget.currency = "USD".to_owned();
+            created.spec.ttl = Duration("24h".to_owned());
+            created.metadata.annotations.get_or_insert_default().insert(
+                PENDING_APPROVAL_ANNOTATION.to_owned(),
+                super::spec_digest(&task.runtime_spec)
+                    .map_err(|error| format!("digest pending runtime fixture: {error}"))?,
+            );
+        }
         created.metadata.uid = Some("created-runtime-uid".to_owned());
         let created_json = serde_json::to_vec(&created)
             .map_err(|error| format!("serialize runtime fixture: {error}"))?;
@@ -3063,7 +3158,7 @@ mod tests {
         } = task_runtime_creation_fixture()?;
         task.finalize_requested = true;
 
-        let runtime = task_runtime(&client, &task)
+        let runtime = task_runtime(&client, &RecoveringTaskRuntimeBindingStore, &task)
             .await
             .map_err(|error| format!("discover unbound deterministic runtime: {error}"))?;
         assert_eq!(
@@ -3079,6 +3174,7 @@ mod tests {
                 task.runtime_ownership,
                 task.execution_binding.as_ref(),
                 task.finalize_requested,
+                false,
                 &task.runtime_spec,
                 runtime.as_ref(),
             ),
@@ -3097,11 +3193,43 @@ mod tests {
         task.runtime_spec.budget.monthly_limit = "999.00".to_owned();
 
         assert!(
-            task_runtime(&client, &task)
+            task_runtime(&client, &RecoveringTaskRuntimeBindingStore, &task)
                 .await
                 .map_err(|error| format!("inspect conflicting deterministic runtime: {error}"))?
                 .is_none(),
             "finalization must not claim a same-name runtime with different server-authored state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalization_recovers_an_unbound_pending_placeholder() -> Result<(), String> {
+        let TaskRuntimeCreationFixture {
+            mut task, client, ..
+        } = task_runtime_creation_fixture_with_pending(true)?;
+        task.finalize_requested = true;
+
+        let runtime = task_runtime(&client, &RecoveringTaskRuntimeBindingStore, &task)
+            .await
+            .map_err(|error| format!("discover unbound pending placeholder: {error}"))?;
+        assert_eq!(
+            runtime
+                .as_ref()
+                .and_then(|runtime| runtime.metadata.uid.as_deref()),
+            Some("created-runtime-uid"),
+            "finalization must recover the exact pending-placeholder runtime"
+        );
+        assert_eq!(
+            task_runtime_action(
+                task.phase,
+                task.runtime_ownership,
+                task.execution_binding.as_ref(),
+                task.finalize_requested,
+                false,
+                &task.runtime_spec,
+                runtime.as_ref(),
+            ),
+            TaskRuntimeAction::DeleteRuntime
         );
         Ok(())
     }
@@ -3366,6 +3494,7 @@ mod tests {
                 RuntimeOwnership::Provisioned,
                 None,
                 false,
+                true,
                 &runtime.spec,
                 Some(&runtime),
             ),
@@ -3382,6 +3511,7 @@ mod tests {
                 RuntimeOwnership::Provisioned,
                 None,
                 false,
+                true,
                 &runtime.spec,
                 Some(&runtime),
             ),
@@ -3398,6 +3528,7 @@ mod tests {
                 RuntimeOwnership::Provisioned,
                 None,
                 false,
+                true,
                 &runtime.spec,
                 Some(&runtime),
             ),
@@ -3410,6 +3541,7 @@ mod tests {
                 RuntimeOwnership::Provisioned,
                 None,
                 true,
+                true,
                 &runtime.spec,
                 Some(&runtime),
             ),
@@ -3420,6 +3552,7 @@ mod tests {
                 TaskPhase::Cancelled,
                 RuntimeOwnership::Adopted,
                 None,
+                true,
                 true,
                 &runtime.spec,
                 Some(&runtime),
@@ -3444,6 +3577,7 @@ mod tests {
                 TaskPhase::Cancelled,
                 RuntimeOwnership::Provisioned,
                 Some(&resident),
+                true,
                 true,
                 &runtime.spec,
                 Some(&runtime),
@@ -3481,6 +3615,7 @@ mod tests {
                 RuntimeOwnership::Provisioned,
                 None,
                 true,
+                true,
                 &other_owner_spec,
                 Some(&runtime),
             ),
@@ -3499,6 +3634,7 @@ mod tests {
                 TaskPhase::Submitted,
                 RuntimeOwnership::Provisioned,
                 None,
+                false,
                 false,
                 &runtime.spec,
                 None,

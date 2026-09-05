@@ -1648,6 +1648,76 @@ impl PgStore {
         })
     }
 
+    /// Recovers the first approval created for an exact server-authored Task admission.
+    ///
+    /// The Task may still be unbound after an ambiguous store failure, so this lookup uses the
+    /// immutable admission identity rather than a Task runtime UID. Selecting the oldest match
+    /// ensures retries recover the original approval even if an older server created a duplicate.
+    pub async fn task_admission(
+        &self,
+        lookup: TaskAdmissionLookup<'_>,
+    ) -> Result<Option<TaskAdmissionRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT admission_decisions.id AS decision_id, approvals.id AS approval_id, \
+                    admission_decisions.runtime_uid, approvals.state, approvals.decision_key, \
+                    approvals.evidence_url, admission_decisions.deltas, \
+                    admission_decisions.proposed_spec \
+             FROM admission_decisions \
+             JOIN approvals ON approvals.admission_decision_id = admission_decisions.id \
+             WHERE admission_decisions.runtime_namespace = $1 \
+               AND admission_decisions.runtime_name = $2 \
+               AND admission_decisions.spec_digest = $3 \
+               AND admission_decisions.envelope_rev = $4 \
+               AND admission_decisions.actor = $5 \
+               AND admission_decisions.member_role = $6 \
+               AND admission_decisions.base_pending_approval_digest = $3 \
+             ORDER BY admission_decisions.at, admission_decisions.id, approvals.id \
+             LIMIT 1",
+        )
+        .bind(lookup.runtime_namespace)
+        .bind(lookup.runtime_name)
+        .bind(lookup.spec_digest)
+        .bind(lookup.envelope_revision)
+        .bind(lookup.actor)
+        .bind(lookup.member_role)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        row.map(|row| {
+            let state = match row
+                .try_get::<String, _>("state")
+                .map_err(database_error)?
+                .as_str()
+            {
+                "pending" => AdmissionApprovalState::Pending,
+                "approved" => AdmissionApprovalState::Approved,
+                "rejected" => AdmissionApprovalState::Rejected,
+                value => {
+                    return Err(StoreError::Database(format!(
+                        "persisted approval has unsupported state {value}"
+                    )));
+                }
+            };
+            let Json(deltas) = row
+                .try_get::<Json<Vec<AdmissionDelta>>, _>("deltas")
+                .map_err(database_error)?;
+            let Json(proposed_spec) = row
+                .try_get::<Json<AgentRuntimeSpec>, _>("proposed_spec")
+                .map_err(database_error)?;
+            Ok(TaskAdmissionRecord {
+                decision_id: row.try_get("decision_id").map_err(database_error)?,
+                approval_id: row.try_get("approval_id").map_err(database_error)?,
+                runtime_uid: row.try_get("runtime_uid").map_err(database_error)?,
+                state,
+                decision_key: row.try_get("decision_key").map_err(database_error)?,
+                evidence_url: row.try_get("evidence_url").map_err(database_error)?,
+                deltas,
+                proposed_spec,
+            })
+        })
+        .transpose()
+    }
+
     pub async fn pending_approvals(&self) -> Result<Vec<PendingApproval>, StoreError> {
         let rows = sqlx::query(
             "SELECT \
@@ -3386,6 +3456,40 @@ impl PgStore {
         }
     }
 
+    /// Records a terminal admission rejection before an ambiguously provisioned runtime was
+    /// bound to its Task. The transition is idempotent for the same durable rejection reason.
+    pub async fn fail_unbound_task_admission(
+        &self,
+        task_uid: Uuid,
+        reason: &str,
+    ) -> Result<TaskRecord, StoreError> {
+        if reason.is_empty() {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        let result = sqlx::query(
+            "UPDATE task_submissions \
+             SET phase = 'failed', finalize_requested = true, failure_reason = $2, \
+                 updated_at = now() \
+             WHERE task_uid = $1 AND runtime_uid IS NULL AND NOT finalized \
+               AND NOT finalize_requested AND phase IN ('submitted', 'parked', 'queued')",
+        )
+        .bind(task_uid)
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        let current = self.task(task_uid).await?.ok_or(StoreError::TaskNotFound)?;
+        if result.rows_affected() == 1
+            || (current.runtime_uid.is_none()
+                && current.phase == steward_types::TaskPhase::Failed
+                && current.finalize_requested
+                && current.failure_reason.as_deref() == Some(reason))
+        {
+            return Ok(current);
+        }
+        Err(StoreError::InvalidTaskTransition)
+    }
+
     /// Commits a validated provider-control result and finalization request together. Raw bridge
     /// output is cleared in the same transaction so OAuth continuation material cannot remain in
     /// generic task storage after extraction.
@@ -4341,6 +4445,34 @@ pub struct ParkedAdmission {
     pub approval_id: Uuid,
     pub decision_key: Option<String>,
     pub evidence_url: Option<String>,
+}
+
+pub struct TaskAdmissionLookup<'a> {
+    pub runtime_namespace: &'a str,
+    pub runtime_name: &'a str,
+    pub spec_digest: &'a str,
+    pub envelope_revision: i64,
+    pub actor: &'a str,
+    pub member_role: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionApprovalState {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskAdmissionRecord {
+    pub decision_id: Uuid,
+    pub approval_id: Uuid,
+    pub runtime_uid: String,
+    pub state: AdmissionApprovalState,
+    pub decision_key: Option<String>,
+    pub evidence_url: Option<String>,
+    pub deltas: Vec<AdmissionDelta>,
+    pub proposed_spec: AgentRuntimeSpec,
 }
 
 #[derive(Clone, Debug, PartialEq)]

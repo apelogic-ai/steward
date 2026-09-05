@@ -23,8 +23,8 @@ use sha2::{Digest, Sha256};
 use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, evaluate_with_grants};
 use steward_ports::MAX_TASK_INPUT_ARCHIVE_BYTES;
 use steward_store::{
-    EnvelopeRequestRecord, ParkRejection, PgStore, StoreError, TaskRecord, TaskReservationRequest,
-    WorkflowRevisionRecord,
+    AdmissionApprovalState, EnvelopeRequestRecord, ParkRejection, PgStore, StoreError,
+    TaskAdmissionLookup, TaskRecord, TaskReservationRequest, WorkflowRevisionRecord,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, Duration,
@@ -899,6 +899,12 @@ pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
         submitter_service: &'a str,
         owner_user_id: &'a str,
     ) -> BoxFuture<'a, Result<TaskRecord, StoreError>>;
+
+    fn fail_unbound_task_admission<'a>(
+        &'a self,
+        task_uid: Uuid,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<TaskRecord, StoreError>>;
 }
 
 impl TaskSubmissionLedger for PgStore {
@@ -1003,6 +1009,14 @@ impl TaskSubmissionLedger for PgStore {
             PgStore::request_task_finalization(self, task_uid, submitter_service, owner_user_id)
                 .await
         })
+    }
+
+    fn fail_unbound_task_admission<'a>(
+        &'a self,
+        task_uid: Uuid,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
+        Box::pin(async move { PgStore::fail_unbound_task_admission(self, task_uid, reason).await })
     }
 }
 
@@ -1615,6 +1629,146 @@ where
         if matches!(decision, AdmissionDecision::Admit) {
             return task_response(record, Vec::new());
         }
+        let AdmissionDecision::Reject { ref deltas } = decision else {
+            return Err(ApiError::Admission(
+                "rejected Task admission did not carry deltas".to_owned(),
+            ));
+        };
+        let proposed_digest = spec_digest(&record.runtime_spec)?;
+        if let Some(admission) = self
+            .ledger
+            .task_admission(TaskAdmissionLookup {
+                runtime_namespace: &record.runtime_namespace,
+                runtime_name: &record.runtime_name,
+                spec_digest: &proposed_digest,
+                envelope_revision: record.envelope_revision,
+                actor: &record.submitter_service,
+                member_role: &record.submitter_service,
+            })
+            .await
+            .map_err(ApiError::Store)?
+        {
+            if admission.runtime_uid.is_empty()
+                || admission.proposed_spec != record.runtime_spec
+                || admission.deltas != *deltas
+            {
+                return Err(ApiError::Conflict(
+                    "persisted Task admission does not match the reserved Task".to_owned(),
+                ));
+            }
+            return match admission.state {
+                AdmissionApprovalState::Pending => {
+                    let expected = pending_task_runtime(&TaskRuntimePlan {
+                        namespace: &record.runtime_namespace,
+                        name: &record.runtime_name,
+                        service: &record.submitter_service,
+                        proposed_spec: &record.runtime_spec,
+                        envelope: &envelope,
+                        decision: AdmissionDecision::Reject {
+                            deltas: deltas.clone(),
+                        },
+                        execution_binding: record.execution_binding.as_ref(),
+                    })?;
+                    let runtime = self
+                        .runtimes
+                        .get_bound(
+                            &record.runtime_namespace,
+                            &record.runtime_name,
+                            &admission.runtime_uid,
+                        )
+                        .await
+                        .map_err(ApiError::Runtime)?;
+                    validate_task_runtime_desired_state(&runtime, &expected)?;
+                    match (admission.decision_key, admission.evidence_url) {
+                        (Some(_), Some(_)) => {}
+                        (None, None) => {
+                            file_decision_reference(
+                                &self.ledger,
+                                &self.decisions,
+                                admission.approval_id,
+                            )
+                            .await?;
+                        }
+                        _ => {
+                            return Err(ApiError::Conflict(
+                                "parked Task approval has an incomplete decision reference"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                    let record = self
+                        .ledger
+                        .bind_task_runtime(
+                            record.task_uid,
+                            &admission.runtime_uid,
+                            TaskPhase::Parked,
+                        )
+                        .await
+                        .map_err(ApiError::Store)?;
+                    task_response(record, admission.deltas)
+                }
+                AdmissionApprovalState::Approved => {
+                    let expected = task_runtime_manifest(&TaskRuntimePlan {
+                        namespace: &record.runtime_namespace,
+                        name: &record.runtime_name,
+                        service: &record.submitter_service,
+                        proposed_spec: &record.runtime_spec,
+                        envelope: &envelope,
+                        decision: AdmissionDecision::Admit,
+                        execution_binding: record.execution_binding.as_ref(),
+                    })?;
+                    let mut runtime = self
+                        .runtimes
+                        .get_bound(
+                            &record.runtime_namespace,
+                            &record.runtime_name,
+                            &admission.runtime_uid,
+                        )
+                        .await
+                        .map_err(ApiError::Runtime)?;
+                    if runtime.spec != expected.spec
+                        || runtime.annotations() != expected.annotations()
+                    {
+                        let pending = pending_task_runtime(&TaskRuntimePlan {
+                            namespace: &record.runtime_namespace,
+                            name: &record.runtime_name,
+                            service: &record.submitter_service,
+                            proposed_spec: &record.runtime_spec,
+                            envelope: &envelope,
+                            decision: AdmissionDecision::Reject {
+                                deltas: deltas.clone(),
+                            },
+                            execution_binding: record.execution_binding.as_ref(),
+                        })?;
+                        validate_task_runtime_desired_state(&runtime, &pending)?;
+                        runtime.spec = expected.spec;
+                        runtime.metadata.annotations = expected.metadata.annotations;
+                        self.runtimes
+                            .replace_as_authority(&runtime)
+                            .await
+                            .map_err(ApiError::Runtime)?;
+                    }
+                    let record = self
+                        .ledger
+                        .bind_task_runtime(
+                            record.task_uid,
+                            &admission.runtime_uid,
+                            TaskPhase::Submitted,
+                        )
+                        .await
+                        .map_err(ApiError::Store)?;
+                    task_response(record, Vec::new())
+                }
+                AdmissionApprovalState::Rejected => {
+                    let record = self
+                        .ledger
+                        .fail_unbound_task_admission(record.task_uid, "admission_rejected")
+                        .await
+                        .map_err(ApiError::Store)?;
+                    task_response(record, admission.deltas)
+                }
+            };
+        }
         let (runtime, phase, deltas) = create_task_runtime(
             &self.runtimes,
             &self.ledger,
@@ -1891,6 +2045,44 @@ where
     L: AdmissionLedger,
     D: DecisionChannel,
 {
+    let mut runtime = task_runtime_manifest(&plan)?;
+    let AdmissionDecision::Reject { ref deltas } = plan.decision else {
+        let created = create_or_get_matching_runtime(runtimes, plan.namespace, &runtime).await?;
+        return Ok((created, TaskPhase::Submitted, Vec::new()));
+    };
+    let proposed_digest = spec_digest(plan.proposed_spec)?;
+    runtime = pending_task_runtime_with_digest(&plan, proposed_digest.clone())?;
+    let created = create_or_get_matching_runtime(runtimes, plan.namespace, &runtime).await?;
+    let runtime_uid = created
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or(ApiError::MissingRuntimeUid)?;
+    let base_digest = spec_digest(&created.spec)?;
+    let parked = ledger
+        .park_rejection(ParkRejection {
+            runtime_uid,
+            runtime_namespace: plan.namespace,
+            runtime_name: plan.name,
+            spec_digest: &proposed_digest,
+            base_spec_digest: &base_digest,
+            base_pending_approval_digest: Some(&proposed_digest),
+            base_spec: &created.spec,
+            envelope_revision: plan.envelope.revision,
+            deltas,
+            proposed_spec: plan.proposed_spec,
+            actor: plan.service,
+            member_role: plan.service,
+        })
+        .await
+        .map_err(ApiError::Store)?;
+    if parked.decision_key.is_none() || parked.evidence_url.is_none() {
+        file_decision_reference(ledger, decisions, parked.approval_id).await?;
+    }
+    Ok((created, TaskPhase::Parked, deltas.clone()))
+}
+
+fn task_runtime_manifest(plan: &TaskRuntimePlan<'_>) -> Result<AgentRuntime, ApiError> {
     let mut runtime = AgentRuntime::new(plan.name, plan.proposed_spec.clone());
     runtime.metadata.namespace = Some(plan.namespace.to_owned());
     runtime.metadata.annotations = Some(BTreeMap::from([(
@@ -1912,48 +2104,41 @@ where
             })?,
         );
     }
-    let AdmissionDecision::Reject { deltas } = plan.decision else {
-        let created = create_or_get_matching_runtime(runtimes, plan.namespace, &runtime).await?;
-        return Ok((created, TaskPhase::Submitted, Vec::new()));
-    };
-    let proposed_digest = spec_digest(plan.proposed_spec)?;
+    Ok(runtime)
+}
+
+fn pending_task_runtime(plan: &TaskRuntimePlan<'_>) -> Result<AgentRuntime, ApiError> {
+    pending_task_runtime_with_digest(plan, spec_digest(plan.proposed_spec)?)
+}
+
+fn pending_task_runtime_with_digest(
+    plan: &TaskRuntimePlan<'_>,
+    proposed_digest: String,
+) -> Result<AgentRuntime, ApiError> {
+    let mut runtime = task_runtime_manifest(plan)?;
     runtime.spec.llms.clear();
     runtime.spec.tools.clear();
     runtime.spec.budget.monthly_limit = "0".to_owned();
     runtime.spec.budget.currency = plan.envelope.spec.budget.currency.clone();
     runtime.spec.ttl = plan.envelope.spec.ttl.clone();
-    runtime.metadata.annotations.get_or_insert_default().insert(
-        PENDING_APPROVAL_ANNOTATION.to_owned(),
-        proposed_digest.clone(),
-    );
-    let created = create_or_get_matching_runtime(runtimes, plan.namespace, &runtime).await?;
-    let runtime_uid = created
+    runtime
         .metadata
-        .uid
-        .as_deref()
-        .ok_or(ApiError::MissingRuntimeUid)?;
-    let base_digest = spec_digest(&created.spec)?;
-    let parked = ledger
-        .park_rejection(ParkRejection {
-            runtime_uid,
-            runtime_namespace: plan.namespace,
-            runtime_name: plan.name,
-            spec_digest: &proposed_digest,
-            base_spec_digest: &base_digest,
-            base_pending_approval_digest: Some(&proposed_digest),
-            base_spec: &created.spec,
-            envelope_revision: plan.envelope.revision,
-            deltas: &deltas,
-            proposed_spec: plan.proposed_spec,
-            actor: plan.service,
-            member_role: plan.service,
-        })
-        .await
-        .map_err(ApiError::Store)?;
-    if parked.decision_key.is_none() || parked.evidence_url.is_none() {
-        file_decision_reference(ledger, decisions, parked.approval_id).await?;
+        .annotations
+        .get_or_insert_default()
+        .insert(PENDING_APPROVAL_ANNOTATION.to_owned(), proposed_digest);
+    Ok(runtime)
+}
+
+fn validate_task_runtime_desired_state(
+    runtime: &AgentRuntime,
+    expected: &AgentRuntime,
+) -> Result<(), ApiError> {
+    if runtime.spec != expected.spec || runtime.annotations() != expected.annotations() {
+        return Err(ApiError::Conflict(
+            "task runtime name is bound to unrelated desired state".to_owned(),
+        ));
     }
-    Ok((created, TaskPhase::Parked, deltas))
+    Ok(())
 }
 
 async fn create_or_get_matching_runtime<R: RuntimeRepository>(
