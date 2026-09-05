@@ -1708,6 +1708,29 @@ where
                     task_response(record, admission.deltas)
                 }
                 AdmissionApprovalState::Approved => {
+                    let Some(application) = self
+                        .ledger
+                        .grant_application(&admission.runtime_uid)
+                        .await
+                        .map_err(ApiError::Store)?
+                    else {
+                        let record = self
+                            .ledger
+                            .fail_unbound_task_admission(
+                                record.task_uid,
+                                "admission_authority_inactive",
+                            )
+                            .await
+                            .map_err(ApiError::Store)?;
+                        return task_response(record, admission.deltas);
+                    };
+                    validate_active_task_grant(
+                        &application,
+                        admission.approval_id,
+                        &admission.runtime_uid,
+                        &record,
+                        &proposed_digest,
+                    )?;
                     let expected = task_runtime_manifest(&TaskRuntimePlan {
                         namespace: &record.runtime_namespace,
                         name: &record.runtime_name,
@@ -2136,6 +2159,30 @@ fn validate_task_runtime_desired_state(
     if runtime.spec != expected.spec || runtime.annotations() != expected.annotations() {
         return Err(ApiError::Conflict(
             "task runtime name is bound to unrelated desired state".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_active_task_grant(
+    application: &steward_store::GrantApplication,
+    approval_id: Uuid,
+    runtime_uid: &str,
+    task: &TaskRecord,
+    proposed_digest: &str,
+) -> Result<(), ApiError> {
+    let active = &application.application;
+    if application.approval_id != approval_id
+        || active.runtime_uid != runtime_uid
+        || active.runtime_namespace != task.runtime_namespace
+        || active.runtime_name != task.runtime_name
+        || active.actor != task.submitter_service
+        || active.member_role != task.submitter_service
+        || active.proposed_spec != task.runtime_spec
+        || active.base_pending_approval_digest.as_deref() != Some(proposed_digest)
+    {
+        return Err(ApiError::Conflict(
+            "active grant does not match the exact Task admission".to_owned(),
         ));
     }
     Ok(())

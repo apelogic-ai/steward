@@ -9011,6 +9011,40 @@ mod tests {
             .map_err(|error| format!("build terminal approval retry: {error}"))
     }
 
+    fn activate_task_approval(
+        runtimes: &MultiRuntimeRepository,
+        ledger: &FakeLedger,
+    ) -> Result<(), String> {
+        let parked = ledger
+            .parked
+            .lock()
+            .map_err(|_| "parked fixture lock was poisoned")?
+            .first()
+            .cloned()
+            .ok_or_else(|| "parked admission fixture is missing".to_owned())?;
+        let base_spec = runtimes
+            .runtimes
+            .lock()
+            .map_err(|_| "runtime fixture lock was poisoned")?
+            .first()
+            .map(|runtime| runtime.spec.clone())
+            .ok_or_else(|| "pending runtime fixture is missing".to_owned())?;
+        *ledger
+            .application
+            .lock()
+            .map_err(|_| "grant application fixture lock was poisoned")? = Some(GrantReversion {
+            runtime_uid: parked.runtime_uid,
+            runtime_namespace: parked.runtime_namespace,
+            runtime_name: parked.runtime_name,
+            actor: parked.actor,
+            member_role: parked.member_role,
+            base_spec,
+            proposed_spec: parked.proposed_spec,
+            base_pending_approval_digest: parked.base_pending_approval_digest,
+        });
+        Ok(())
+    }
+
     #[tokio::test]
     async fn unbound_task_retry_recovers_its_approved_runtime() -> Result<(), String> {
         let (runtimes, ledger, decisions) = failed_pending_task_binding_fixture().await?;
@@ -9039,6 +9073,7 @@ mod tests {
             .task_approval_state
             .lock()
             .map_err(|_| "approval-state fixture lock was poisoned")? = FakeApprovalState::Approved;
+        activate_task_approval(&runtimes, &ledger)?;
         let app = task_router(
             runtimes,
             ledger.clone(),
@@ -9087,6 +9122,7 @@ mod tests {
             .task_approval_state
             .lock()
             .map_err(|_| "approval-state fixture lock was poisoned")? = FakeApprovalState::Approved;
+        activate_task_approval(&runtimes, &ledger)?;
         let app = task_router(
             runtimes.clone(),
             ledger.clone(),
@@ -9126,6 +9162,53 @@ mod tests {
                 .len(),
             1,
             "approved recovery must reuse the original approval"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unbound_task_retry_rejects_approved_history_without_an_active_grant()
+    -> Result<(), String> {
+        let (runtimes, ledger, decisions) = failed_pending_task_binding_fixture().await?;
+        *ledger
+            .task_approval_state
+            .lock()
+            .map_err(|_| "approval-state fixture lock was poisoned")? = FakeApprovalState::Approved;
+        let app = task_router(
+            runtimes.clone(),
+            ledger.clone(),
+            decisions,
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            TaskApiConfig::default(),
+        );
+
+        let response = app
+            .oneshot(terminal_approval_retry_request()?)
+            .await
+            .map_err(|error| format!("retry Task without active approval grant: {error}"))?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let task = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "task fixture lock was poisoned")?[0]
+            .clone();
+        assert_eq!(task.phase, TaskPhase::Failed);
+        assert!(task.finalize_requested);
+        assert_eq!(
+            task.failure_reason.as_deref(),
+            Some("admission_authority_inactive")
+        );
+        let runtime = runtimes
+            .runtimes
+            .lock()
+            .map_err(|_| "runtime fixture lock was poisoned")?[0]
+            .clone();
+        assert!(
+            runtime
+                .annotations()
+                .contains_key(PENDING_APPROVAL_ANNOTATION),
+            "historical approval without an active grant must not promote the placeholder"
         );
         Ok(())
     }

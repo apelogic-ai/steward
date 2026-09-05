@@ -304,9 +304,25 @@ struct OpenShellProjection {
     workspace_key: String,
     sandbox: String,
     providers: Vec<String>,
+    managed_providers: Vec<String>,
     runtime_uid: String,
     image: Option<String>,
     execution_binding_digest: Option<String>,
+}
+
+#[cfg(feature = "runtime")]
+fn provider_reconciliation_targets(projection: &OpenShellProjection) -> Vec<(String, bool)> {
+    let mut targets = projection
+        .managed_providers
+        .iter()
+        .cloned()
+        .map(|provider| {
+            let desired = projection.providers.iter().any(|value| value == &provider);
+            (provider, desired)
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|(_, desired)| *desired);
+    targets
 }
 
 #[cfg(feature = "runtime")]
@@ -692,17 +708,30 @@ fn project_request(
             reason: "persisted execution binding has no inference provider profile".to_owned(),
         });
     }
+    let mut providers = Vec::new();
+    for provider in [
+        (!request.tools.is_empty()).then(|| tool_provider.unwrap_or_default()),
+        (!request.models.is_empty()).then(|| inference_provider.unwrap_or_default()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !providers.iter().any(|desired| desired == provider) {
+            providers.push(provider.to_owned());
+        }
+    }
+    let mut managed_providers = vec![TOOL_PROVIDER.to_owned(), INFERENCE_PROVIDER.to_owned()];
+    for provider in [tool_provider, inference_provider].into_iter().flatten() {
+        if !managed_providers.iter().any(|managed| managed == provider) {
+            managed_providers.push(provider.to_owned());
+        }
+    }
     Ok(OpenShellProjection {
         workspace: stable_name(NameKind::Workspace, request.workspace_key.as_bytes()),
         workspace_key: request.workspace_key.clone(),
         sandbox: stable_name(NameKind::Sandbox, request.runtime.0.as_bytes()),
-        providers: [
-            (!request.tools.is_empty()).then(|| tool_provider.unwrap_or_default().to_owned()),
-            (!request.models.is_empty()).then(|| inference_provider.unwrap_or_default().to_owned()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect(),
+        providers,
+        managed_providers,
         runtime_uid: request.runtime.0.clone(),
         image,
         execution_binding_digest: request
@@ -1992,14 +2021,27 @@ impl SandboxRuntime for OpenShellRuntime {
             false,
         )
         .await?;
-        for provider_name in &projection.providers {
+        let provider_targets = provider_reconciliation_targets(&projection);
+        for (provider_name, desired) in &provider_targets {
             self.reconcile_provider(
                 &projection.workspace,
                 &projection.sandbox,
                 provider_name,
-                true,
+                *desired,
             )
             .await?;
+        }
+        for (provider_name, desired) in &provider_targets {
+            if self
+                .provider_is_attached(&projection.workspace, &projection.sandbox, provider_name)
+                .await?
+                != *desired
+            {
+                return Err(PortError::Failed {
+                    reason: "OpenShell provider attachments did not converge to desired state"
+                        .to_owned(),
+                });
+            }
         }
         let refs = runtime_refs(&projection);
         match snapshot.phase {
@@ -2286,14 +2328,16 @@ mod tests {
     use super::validate_connections_bridge_archive;
     #[cfg(feature = "runtime")]
     use super::{
-        CONNECTIONS_BRIDGE_AGENT_TYPE, OpenShellConnectionConfig, OpenShellTaskLogMode,
-        ProviderReconciliation, STAGING_EXEC_STDIN_CHUNK_BYTES, SandboxDeleteClient,
-        TaskProcessEventStream, TaskProcessLogContext, TaskProcessLogSink, TaskProcessStream,
-        WorkloadExchangeTokenProvider, collect_task_process_stream, delete_owned_sandbox,
-        deletion_names, load_source_credential, output_archive_command, project_request,
-        provider_reconciliation, sandbox_spec, staging_append_command, staging_archive_chunks,
-        staging_extract_command, staging_prepare_command, task_agent_failure_category,
-        task_process_log_record, validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
+        CONNECTIONS_BRIDGE_AGENT_TYPE, INFERENCE_PROVIDER, OpenShellConnectionConfig,
+        OpenShellTaskLogMode, ProviderReconciliation, STAGING_EXEC_STDIN_CHUNK_BYTES,
+        SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream, TaskProcessLogContext,
+        TaskProcessLogSink, TaskProcessStream, WorkloadExchangeTokenProvider,
+        collect_task_process_stream, delete_owned_sandbox, deletion_names, load_source_credential,
+        output_archive_command, project_request, provider_reconciliation,
+        provider_reconciliation_targets, sandbox_spec, staging_append_command,
+        staging_archive_chunks, staging_extract_command, staging_prepare_command,
+        task_agent_failure_category, task_process_log_record, validate_raw_sandbox_binding,
+        validate_workload_exchange_endpoint,
     };
     #[cfg(feature = "runtime")]
     use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
@@ -3575,6 +3619,80 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
+    fn versioned_provider_reconciliation_converges_the_complete_managed_set() -> Result<(), String>
+    {
+        let mut binding = DisposableExecutionBinding {
+            schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+            binding_id: format!("sha256:{}", "a".repeat(64)),
+            binding_digest: format!("sha256:{}", "a".repeat(64)),
+            agent_ref: "example-agent@1.0.0".to_owned(),
+            display_name: None,
+            adapter: "codex-v1".to_owned(),
+            image: format!(
+                "registry.example.test/agents/example@sha256:{}",
+                "b".repeat(64)
+            ),
+            executable: "/opt/example/bin/agent".to_owned(),
+            version_probe: ExecutionVersionProbe {
+                arguments: vec!["--version".to_owned()],
+                expected_stdout: "example-agent 1.0.0".to_owned(),
+            },
+            provider_profiles: ExecutionProviderProfiles {
+                tools: Some(ExecutionProviderProfile {
+                    id: "example-tools-profile-v7".to_owned(),
+                    digest: format!("sha256:{}", "c".repeat(64)),
+                }),
+                inference: Some(ExecutionProviderProfile {
+                    id: "example-inference-profile-v7".to_owned(),
+                    digest: format!("sha256:{}", "d".repeat(64)),
+                }),
+            },
+        };
+        seal_binding(&mut binding)?;
+        let projection = project_request(
+            &SandboxRequest {
+                runtime: RuntimeId("runtime-uid-a".to_owned()),
+                workspace_key: "team-a".to_owned(),
+                execution_class: SandboxExecutionClass::Agent,
+                agent_type: AgentType {
+                    name: binding.agent_ref.clone(),
+                },
+                models: Vec::new(),
+                tools: vec![ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "repository".to_owned(),
+                    action: "read".to_owned(),
+                }],
+                refs: RuntimeRefs::default(),
+                execution_binding: Some(binding),
+            },
+            None,
+            None,
+        )
+        .map_err(|error| format!("runtime projection failed: {error:?}"))?;
+
+        assert_eq!(
+            provider_reconciliation_targets(&projection),
+            [
+                (TOOL_PROVIDER.to_owned(), false),
+                (INFERENCE_PROVIDER.to_owned(), false),
+                ("example-inference-profile-v7".to_owned(), false),
+                ("example-tools-profile-v7".to_owned(), true),
+            ],
+            "legacy and omitted versioned providers must detach before the one desired provider attaches"
+        );
+        assert!(
+            !projection
+                .managed_providers
+                .iter()
+                .any(|provider| provider == "customer-managed-provider"),
+            "provider convergence must not target attachments Steward does not own"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
     fn bound_workflow_validates_the_standard_result_and_archives_declared_outputs() {
         let binding = DisposableExecutionBinding {
             schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
@@ -4020,10 +4138,30 @@ mod tests {
     #[cfg(feature = "runtime")]
     #[test]
     fn removing_tool_authority_plans_provider_detach() {
+        let projection = project_request(
+            &SandboxRequest {
+                runtime: RuntimeId("runtime-uid-a".to_owned()),
+                workspace_key: "team-a".to_owned(),
+                execution_class: SandboxExecutionClass::Agent,
+                agent_type: AgentType {
+                    name: "base".to_owned(),
+                },
+                models: Vec::new(),
+                tools: Vec::new(),
+                refs: RuntimeRefs::default(),
+                execution_binding: None,
+            },
+            None,
+            None,
+        )
+        .expect("provider-removal projection must be valid");
         assert_eq!(
-            provider_reconciliation(true, false),
-            Some(ProviderReconciliation::Detach),
-            "removing all tool grants must detach the Steward gateway provider"
+            provider_reconciliation_targets(&projection),
+            [
+                (TOOL_PROVIDER.to_owned(), false),
+                (INFERENCE_PROVIDER.to_owned(), false),
+            ],
+            "removing all authority must explicitly reconcile both Steward providers absent"
         );
     }
 
