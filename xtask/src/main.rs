@@ -1457,9 +1457,9 @@ mod tests {
         );
         assert!(
             harness.contains(
-                "elif [[ \"${SLICE}\" == \"task\" ]]; then\n  profile_sources=(\n    \"${ROOT}/config/task/tool-provider-profile.yaml\"\n    \"${ROOT}/config/task/inference-provider-profile.yaml\"\n  )"
+                "elif [[ \"${SLICE}\" == \"task\" ]]; then\n  profile_sources=(\n    \"${ROOT}/config/s5/tool-provider-profile.yaml\"\n    \"${ROOT}/config/task/tool-provider-profile.yaml\"\n    \"${ROOT}/config/task/inference-provider-profile.yaml\"\n  )"
             ),
-            "the versioned Workflow E2E must install both Envelope-selected provider profiles"
+            "the versioned Workflow E2E must retain the legacy tool profile while installing both execution-binding-selected provider profiles"
         );
         assert!(
             harness.contains("label namespace \"${namespace}\"")

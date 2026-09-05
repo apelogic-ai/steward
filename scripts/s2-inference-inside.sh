@@ -365,6 +365,7 @@ if [[ "${SLICE}" == "s5" ]]; then
   )
 elif [[ "${SLICE}" == "task" ]]; then
   profile_sources=(
+    "${ROOT}/config/s5/tool-provider-profile.yaml"
     "${ROOT}/config/task/tool-provider-profile.yaml"
     "${ROOT}/config/task/inference-provider-profile.yaml"
   )
