@@ -836,7 +836,35 @@ fn connection_operation_authority_action(
 
 async fn create_task_runtime(
     client: &Client,
-    authority: &PgStore,
+    authority: &impl TaskRuntimeBindingStore,
+    task: &TaskRecord,
+) -> Result<(), TaskControllerError> {
+    create_task_runtime_inner(client, authority, task).await
+}
+
+trait TaskRuntimeBindingStore {
+    fn bind_task_runtime(
+        &self,
+        task: &TaskRecord,
+        runtime_uid: &str,
+        phase: TaskPhase,
+    ) -> impl Future<Output = Result<TaskRecord, StoreError>> + Send;
+}
+
+impl TaskRuntimeBindingStore for PgStore {
+    async fn bind_task_runtime(
+        &self,
+        task: &TaskRecord,
+        runtime_uid: &str,
+        phase: TaskPhase,
+    ) -> Result<TaskRecord, StoreError> {
+        PgStore::bind_task_runtime(self, task.task_uid, runtime_uid, phase).await
+    }
+}
+
+async fn create_task_runtime_inner(
+    client: &Client,
+    authority: &impl TaskRuntimeBindingStore,
     task: &TaskRecord,
 ) -> Result<(), TaskControllerError> {
     let runtime = task_runtime_manifest(task)?;
@@ -865,11 +893,34 @@ async fn create_task_runtime(
     let runtime_uid = created.metadata.uid.as_deref().ok_or_else(|| {
         TaskControllerError::InvalidState("created task runtime has no UID".to_owned())
     })?;
-    authority
-        .bind_task_runtime(task.task_uid, runtime_uid, task.phase)
-        .await
-        .map(|_| ())
-        .map_err(TaskControllerError::Store)
+    let binding = authority
+        .bind_task_runtime(task, runtime_uid, task.phase)
+        .await;
+    let Err(binding_error) = binding else {
+        return Ok(());
+    };
+    let deletion = api
+        .delete(
+            &created.name_any(),
+            &DeleteParams {
+                preconditions: Some(Preconditions {
+                    uid: Some(runtime_uid.to_owned()),
+                    resource_version: None,
+                }),
+                ..DeleteParams::default()
+            },
+        )
+        .await;
+    match deletion {
+        Ok(_) => Err(TaskControllerError::Store(binding_error)),
+        Err(kube::Error::Api(response)) if response.code == 404 => {
+            Err(TaskControllerError::Store(binding_error))
+        }
+        Err(cleanup_error) => Err(TaskControllerError::RuntimeBindingCleanup {
+            binding: binding_error,
+            cleanup: Box::new(cleanup_error),
+        }),
+    }
 }
 
 fn task_runtime_manifest(task: &TaskRecord) -> Result<AgentRuntime, TaskControllerError> {
@@ -1021,6 +1072,10 @@ async fn task_runtime(
 enum TaskControllerError {
     Kubernetes(kube::Error),
     Store(StoreError),
+    RuntimeBindingCleanup {
+        binding: StoreError,
+        cleanup: Box<kube::Error>,
+    },
     InvalidState(String),
 }
 
@@ -1031,6 +1086,10 @@ impl fmt::Display for TaskControllerError {
                 write!(formatter, "Kubernetes task operation failed: {error}")
             }
             Self::Store(error) => write!(formatter, "task store operation failed: {error}"),
+            Self::RuntimeBindingCleanup { binding, cleanup } => write!(
+                formatter,
+                "task runtime binding failed ({binding}) and exact-UID cleanup failed ({cleanup})"
+            ),
             Self::InvalidState(reason) => write!(formatter, "task state is invalid: {reason}"),
         }
     }
@@ -2745,7 +2804,8 @@ mod tests {
     };
     use steward_store::{
         ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase, ConnectionOperationKind,
-        ConnectionOperationRecord, ConnectionOperationState, GrantReversion,
+        ConnectionOperationRecord, ConnectionOperationState, GrantReversion, StoreError,
+        TaskRecord,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
@@ -2759,14 +2819,148 @@ mod tests {
     use super::{
         Action, AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ReconcileDecision,
         ReconcileIntent, SERVICE_PRINCIPAL_ANNOTATION, TaskRuntimeAction, TaskRuntimeBinding,
-        authority_action, authority_application_action, cleanup_runtime,
-        connection_operation_authority_action, exhausted_spend_to_preserve, inference_action,
-        provider_control_bindings_match, reconcile_once, replace_as_authority,
-        runtime_authority_action, runtime_ttl_action, sandbox_execution_class,
-        server_task_runtime_manifest, status_merge_patch, suspend_runtime,
+        TaskRuntimeBindingStore, authority_action, authority_application_action, cleanup_runtime,
+        connection_operation_authority_action, create_task_runtime_inner,
+        exhausted_spend_to_preserve, inference_action, provider_control_bindings_match,
+        reconcile_once, replace_as_authority, runtime_authority_action, runtime_ttl_action,
+        sandbox_execution_class, server_task_runtime_manifest, status_merge_patch, suspend_runtime,
         suspend_runtime_with_inference_cleanup, task_output_archive_failure, task_runtime_action,
         ttl_action,
     };
+
+    struct RejectingTaskRuntimeBindingStore;
+
+    impl TaskRuntimeBindingStore for RejectingTaskRuntimeBindingStore {
+        async fn bind_task_runtime(
+            &self,
+            _task: &TaskRecord,
+            _runtime_uid: &str,
+            _phase: TaskPhase,
+        ) -> Result<TaskRecord, StoreError> {
+            Err(StoreError::InvalidTaskTransition)
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_created_during_finalization_race_is_deleted_by_exact_uid() -> Result<(), String>
+    {
+        let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        let mut spec = fixture().spec;
+        spec.principal = Principal::Service {
+            name: "steward-run".to_owned(),
+            acting_user: Some(Email("alice@example.com".to_owned())),
+        };
+        spec.owner = Email("alice@example.com".to_owned());
+        spec.canonical_authority = Some(CanonicalAuthorityBinding::new(
+            canonical_user_id.clone(),
+            Some(canonical_user_id),
+        )?);
+        let task = TaskRecord {
+            task_uid: serde_json::from_value(serde_json::json!(
+                "00000000-0000-0000-0000-000000000000"
+            ))
+            .map_err(|error| format!("parse task UID fixture: {error}"))?,
+            idempotency_key: "runtime-finalization-race".to_owned(),
+            submitter_service: "steward-run".to_owned(),
+            acting_user: Some("alice@example.com".to_owned()),
+            acting_user_id: Some("usr_0123456789abcdef0123456789abcdef".to_owned()),
+            owner: "alice@example.com".to_owned(),
+            owner_user_id: Some("usr_0123456789abcdef0123456789abcdef".to_owned()),
+            identity_binding_state: "bound".to_owned(),
+            workflow: "code-review".to_owned(),
+            workflow_name: None,
+            workflow_version: None,
+            workflow_digest: None,
+            user_envelope_instance_id: None,
+            user_envelope_revision: None,
+            user_envelope_digest: None,
+            internal_authority_id: None,
+            internal_authority_version: None,
+            internal_authority_digest: None,
+            coding_agent_runtime: "base".to_owned(),
+            runtime_uid: None,
+            runtime_namespace: "team-a".to_owned(),
+            runtime_name: "task-race".to_owned(),
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            phase: TaskPhase::Submitted,
+            runtime_spec: spec,
+            agent_command: Vec::new(),
+            execution_binding: None,
+            input_archive: None,
+            output_archive: None,
+            execute_requested: false,
+            finalize_requested: false,
+            finalized: false,
+            failure_reason: None,
+        };
+        let mut created = super::task_runtime_manifest(&task)
+            .map_err(|error| format!("build runtime fixture: {error}"))?;
+        created.metadata.uid = Some("created-runtime-uid".to_owned());
+        let created_json = serde_json::to_vec(&created)
+            .map_err(|error| format!("serialize runtime fixture: {error}"))?;
+        let delete_body = Arc::new(Mutex::new(None));
+        let delete_body_for_service = delete_body.clone();
+        let client = Client::new(
+            service_fn(move |request: Request<KubeBody>| {
+                let created_json = created_json.clone();
+                let delete_body = delete_body_for_service.clone();
+                async move {
+                    let method = request.method().clone();
+                    let body = if method == Method::POST {
+                        created_json
+                    } else if method == Method::DELETE {
+                        let bytes = request.into_body().collect_bytes().await.map_err(|error| {
+                            std::io::Error::other(format!(
+                                "delete request body must be readable: {error}"
+                            ))
+                        })?;
+                        *delete_body.lock().map_err(|_| {
+                            std::io::Error::other("delete request lock was poisoned")
+                        })? = Some(bytes.to_vec());
+                        br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success","code":200}"#
+                            .to_vec()
+                    } else {
+                        br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Failure","reason":"NotFound","code":404}"#
+                            .to_vec()
+                    };
+                    let mut response = Response::new(Body::from(body));
+                    *response.status_mut() = if matches!(method, Method::POST | Method::DELETE) {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::NOT_FOUND
+                    };
+                    Ok::<_, std::io::Error>(response)
+                }
+            }),
+            "team-a",
+        );
+
+        let result =
+            create_task_runtime_inner(&client, &RejectingTaskRuntimeBindingStore, &task).await;
+        assert!(
+            matches!(
+                result,
+                Err(super::TaskControllerError::Store(
+                    StoreError::InvalidTaskTransition
+                ))
+            ),
+            "the no-resurrection transition failure must remain visible"
+        );
+        let body = delete_body
+            .lock()
+            .map_err(|_| "delete request lock was poisoned")?
+            .clone()
+            .ok_or_else(|| "binding loss orphaned the created AgentRuntime".to_owned())?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse delete request: {error}"))?;
+        assert_eq!(
+            body.pointer("/preconditions/uid")
+                .and_then(serde_json::Value::as_str),
+            Some("created-runtime-uid"),
+            "cleanup must not delete a same-name replacement runtime"
+        );
+        Ok(())
+    }
 
     #[test]
     fn provider_control_execution_rejects_every_binding_drift_dimension() {

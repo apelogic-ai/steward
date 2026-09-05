@@ -266,6 +266,9 @@ mod tests {
         for invalid in [
             "invalid-agent-ref.json",
             "invalid-image.json",
+            "invalid-image-registry.json",
+            "invalid-image-path.json",
+            "invalid-image-length.json",
             "invalid-display-name.json",
             "invalid-expected-stdout.json",
         ] {

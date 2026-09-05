@@ -849,33 +849,93 @@ fn valid_versioned_binding_reference(value: &str) -> bool {
 }
 
 fn valid_digest_pinned_image(value: &str) -> bool {
+    const SHA256_SUFFIX_BYTES: usize = "@sha256:".len() + 64;
+    const OCI_REPOSITORY_MAX_BYTES: usize = 255;
+    if value.len() > OCI_REPOSITORY_MAX_BYTES + SHA256_SUFFIX_BYTES {
+        return false;
+    }
     let Some((repository, digest)) = value.split_once("@sha256:") else {
         return false;
     };
+    if repository.len() > OCI_REPOSITORY_MAX_BYTES || repository.contains('@') {
+        return false;
+    }
     let mut components = repository.split('/');
     let Some(registry) = components.next() else {
         return false;
     };
-    !registry.is_empty()
-        && registry.bytes().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || matches!(byte, b'.' | b':' | b'_' | b'-')
-        })
+    valid_oci_registry(registry)
         && components.clone().next().is_some()
-        && components.all(|component| {
-            !component.is_empty()
-                && component.bytes().all(|byte| {
-                    byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || matches!(byte, b'.' | b'_' | b'-')
-                })
-        })
-        && !repository.contains('@')
+        && components.all(valid_oci_path_component)
         && digest.len() == 64
         && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_oci_registry(value: &str) -> bool {
+    let (host, port) = value
+        .split_once(':')
+        .map_or((value, None), |(host, port)| (host, Some(port)));
+    if host.contains(':')
+        || port.is_some_and(|port| {
+            port.is_empty()
+                || port.len() > 5
+                || port.starts_with('0')
+                || !port.bytes().all(|byte| byte.is_ascii_digit())
+                || port.parse::<u16>().ok().is_none_or(|port| port == 0)
+        })
+    {
+        return false;
+    }
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            !bytes.is_empty()
+                && bytes.len() <= 63
+                && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+                && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        })
+}
+
+fn valid_oci_path_component(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return false;
+    }
+    let mut index = 1;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_lowercase() || bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        match bytes[index] {
+            b'.' => index += 1,
+            b'_' => {
+                index += 1;
+                if bytes.get(index) == Some(&b'_') {
+                    index += 1;
+                }
+            }
+            b'-' => {
+                while bytes.get(index) == Some(&b'-') {
+                    index += 1;
+                }
+            }
+            _ => return false,
+        }
+        if bytes
+            .get(index)
+            .is_none_or(|byte| !byte.is_ascii_lowercase() && !byte.is_ascii_digit())
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 fn valid_absolute_executable(value: &str) -> bool {
@@ -1074,6 +1134,7 @@ mod tests {
         CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
         OrganizationIdentityPolicy, Principal, ResidentExecutionBinding, ResidentExecutionContext,
         RuntimeId, TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding, agent_runtime_crd,
+        valid_digest_pinned_image,
     };
 
     fn digest(byte: char) -> String {
@@ -1203,6 +1264,29 @@ mod tests {
         assert!(binding.matches_context(&matching));
         assert!(!TaskExecutionBinding::Resident(binding).task_owns_runtime());
         Ok(())
+    }
+
+    #[test]
+    fn digest_pinned_images_require_bounded_oci_names() {
+        let digest = "a".repeat(64);
+        assert!(valid_digest_pinned_image(&format!(
+            "registry.example.test:5000/team-a/agent@sha256:{digest}"
+        )));
+        for invalid in [
+            format!("registry::5000/agent@sha256:{digest}"),
+            format!("registry.example.test:00001/agent@sha256:{digest}"),
+            format!("registry.example.test/team-a/-agent@sha256:{digest}"),
+            format!("registry.example.test/team-a/agent..v1@sha256:{digest}"),
+            format!(
+                "registry.example.test/{}/agent@sha256:{digest}",
+                "a".repeat(240)
+            ),
+        ] {
+            assert!(
+                !valid_digest_pinned_image(&invalid),
+                "accepted malformed or unbounded OCI image reference {invalid}"
+            );
+        }
     }
 
     #[test]

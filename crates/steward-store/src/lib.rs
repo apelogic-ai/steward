@@ -4022,6 +4022,7 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
                 TaskExecutionBinding::Resident(resident) => {
                     request.runtime_ownership != steward_types::RuntimeOwnership::Adopted
                         || resident.owner_user_id.as_str() != request.owner_user_id
+                        || request.runtime_uid != Some(resident.runtime_uid.0.as_str())
                 }
             })
         || !complete(workflow_pins)
@@ -4039,6 +4040,87 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
         return Err(StoreError::InvalidTaskIdentityBinding);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod task_execution_binding_tests {
+    use steward_types::{
+        AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email, Principal,
+        ResidentExecutionBinding, RunnerRequirements, RuntimeId, RuntimeOwnership,
+        TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding,
+    };
+
+    use super::{StoreError, TaskReservationRequest, validate_task_version_pins};
+
+    #[test]
+    fn resident_reservation_uid_must_match_its_lease_binding() -> Result<(), String> {
+        let owner = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        let binding = TaskExecutionBinding::Resident(ResidentExecutionBinding {
+            schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+            binding_id: "resident-agent-instance-v1".to_owned(),
+            binding_digest: format!("sha256:{}", "a".repeat(64)),
+            owner_user_id: owner,
+            agent_instance_id: "agent-instance-01".to_owned(),
+            agent_instance_revision: 1,
+            runtime_uid: RuntimeId("runtime-uid-a".to_owned()),
+            runtime_spec_digest: format!("sha256:{}", "b".repeat(64)),
+            standing_authority_digest: format!("sha256:{}", "c".repeat(64)),
+            deployment_binding_digest: format!("sha256:{}", "d".repeat(64)),
+            freshness_generation: 1,
+        });
+        let spec = AgentRuntimeSpec {
+            principal: Principal::User {
+                acting_user: Email("alice@example.com".to_owned()),
+            },
+            owner: Email("alice@example.com".to_owned()),
+            canonical_authority: None,
+            agent_type: AgentType {
+                name: "agent@1.0.0".to_owned(),
+            },
+            llms: Vec::new(),
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: "1.00".to_owned(),
+                single_run_limit: None,
+                currency: "USD".to_owned(),
+            },
+            ttl: Duration("1h".to_owned()),
+            runner: RunnerRequirements::default(),
+            bindings: None,
+        };
+        let command = Vec::new();
+        let request = TaskReservationRequest {
+            idempotency_key: "resident-mismatch",
+            submitter_service: "steward-run",
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some("usr_0123456789abcdef0123456789abcdef"),
+            owner: "alice@example.com",
+            owner_user_id: "usr_0123456789abcdef0123456789abcdef",
+            workflow: "code-review",
+            workflow_name: None,
+            workflow_version: None,
+            workflow_digest: None,
+            user_envelope_instance_id: None,
+            user_envelope_revision: None,
+            user_envelope_digest: None,
+            coding_agent_runtime: "agent@1.0.0",
+            runtime_uid: Some("runtime-uid-b"),
+            runtime_namespace: "team-a",
+            runtime_name: "runtime-a",
+            runtime_ownership: RuntimeOwnership::Adopted,
+            runtime_spec: &spec,
+            agent_command: &command,
+            execution_binding: Some(&binding),
+            envelope_revision: 1,
+        };
+
+        assert_eq!(
+            validate_task_version_pins(&request),
+            Err(StoreError::InvalidTaskIdentityBinding),
+            "a resident Task row must not disagree with its immutable lease UID"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
