@@ -1075,6 +1075,12 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         service: &'a str,
     ) -> BoxFuture<'a, Result<Option<Envelope>, StoreError>>;
 
+    fn service_envelope_revision<'a>(
+        &'a self,
+        service: &'a str,
+        revision: i64,
+    ) -> BoxFuture<'a, Result<Option<Envelope>, StoreError>>;
+
     fn park_rejection<'a>(
         &'a self,
         request: ParkRejection<'a>,
@@ -1260,6 +1266,14 @@ impl AdmissionLedger for PgStore {
         service: &'a str,
     ) -> BoxFuture<'a, Result<Option<Envelope>, StoreError>> {
         Box::pin(async move { PgStore::latest_service_envelope(self, service).await })
+    }
+
+    fn service_envelope_revision<'a>(
+        &'a self,
+        service: &'a str,
+        revision: i64,
+    ) -> BoxFuture<'a, Result<Option<Envelope>, StoreError>> {
+        Box::pin(async move { PgStore::service_envelope_revision(self, service, revision).await })
     }
 
     fn park_rejection<'a>(
@@ -5188,6 +5202,7 @@ mod tests {
         application_committed_during_park: Arc<Mutex<Option<GrantReversion>>>,
         application_revoked_during_retirement: Arc<Mutex<bool>>,
         tasks: Arc<Mutex<Vec<TaskRecord>>>,
+        task_bind_failures: Arc<AtomicUsize>,
         workflow_revisions: Arc<Mutex<Vec<WorkflowRevisionRecord>>>,
         user_envelopes: Arc<Mutex<Vec<EnvelopeRequestRecord>>>,
         agent_runs: Arc<Mutex<Vec<AgentRunRecord>>>,
@@ -5288,6 +5303,19 @@ mod tests {
                 self.envelope
                     .lock()
                     .map(|envelope| Some(envelope.clone()))
+                    .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))
+            })
+        }
+
+        fn service_envelope_revision<'a>(
+            &'a self,
+            _service: &'a str,
+            revision: i64,
+        ) -> BoxFuture<'a, Result<Option<Envelope>, StoreError>> {
+            Box::pin(async move {
+                self.envelope
+                    .lock()
+                    .map(|envelope| (envelope.revision == revision).then(|| envelope.clone()))
                     .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))
             })
         }
@@ -5986,6 +6014,7 @@ mod tests {
                     runtime_spec: request.runtime_spec.clone(),
                     agent_command: request.agent_command.to_vec(),
                     execution_binding: request.execution_binding.cloned(),
+                    envelope_revision: request.envelope_revision,
                     input_archive: None,
                     output_archive: None,
                     execute_requested: false,
@@ -6008,6 +6037,17 @@ mod tests {
             phase: TaskPhase,
         ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
             Box::pin(async move {
+                if self
+                    .task_bind_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(StoreError::Database(
+                        "fake post-reservation binding failure".to_owned(),
+                    ));
+                }
                 let mut tasks = self.tasks.lock().map_err(|_| {
                     StoreError::Database("fake task ledger lock was poisoned".to_owned())
                 })?;
@@ -6222,6 +6262,7 @@ mod tests {
             application_committed_during_park: Arc::new(Mutex::new(None)),
             application_revoked_during_retirement: Arc::new(Mutex::new(false)),
             tasks: Arc::new(Mutex::new(Vec::new())),
+            task_bind_failures: Arc::new(AtomicUsize::new(0)),
             workflow_revisions: Arc::new(Mutex::new(Vec::new())),
             user_envelopes: Arc::new(Mutex::new(Vec::new())),
             agent_runs: Arc::new(Mutex::new(Vec::new())),
@@ -8703,6 +8744,109 @@ mod tests {
             conflicting.status(),
             StatusCode::CONFLICT,
             "a retry with changed caller-owned pins must conflict without live catalog resolution"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unbound_task_retry_resumes_pending_runtime_admission() -> Result<(), String> {
+        let runtimes = MultiRuntimeRepository::default();
+        let runtime_rows = runtimes.runtimes.clone();
+        let ledger = ledger();
+        let task_rows = ledger.tasks.clone();
+        ledger.task_bind_failures.store(1, Ordering::SeqCst);
+        let decisions = FakeDecisionChannel::default();
+        let decision_requests = decisions.requests.clone();
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "pending-runtime-retry")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"workflow":"wide-review","codingAgentRuntime":"agent-v1"}"#,
+                ))
+                .map_err(|error| format!("build pending-runtime Task retry: {error}"))
+        };
+        let mut workflow = task_workflow("250.00");
+        workflow.name = "wide-review".to_owned();
+        let first_app = task_router(
+            runtimes.clone(),
+            ledger.clone(),
+            decisions.clone(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([workflow]),
+            task_api_config()?,
+        );
+
+        let first = first_app
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("submit initial pending-runtime Task: {error}"))?;
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            runtime_rows
+                .lock()
+                .map_err(|_| "runtime fixture lock was poisoned")?
+                .len(),
+            1,
+            "the failed binding attempt must leave one deterministic pending runtime"
+        );
+        assert!(
+            task_rows
+                .lock()
+                .map_err(|_| "task fixture lock was poisoned")?[0]
+                .runtime_uid
+                .is_none(),
+            "the fixture must model a failure before the Task binding commits"
+        );
+
+        let retry_app = task_router(
+            runtimes,
+            ledger.clone(),
+            decisions,
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            TaskApiConfig::default(),
+        );
+        let retry = retry_app
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("retry unbound pending-runtime Task: {error}"))?;
+        assert_eq!(retry.status(), StatusCode::ACCEPTED);
+        let retry_body = to_bytes(retry.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read pending-runtime retry response: {error}"))?;
+        let retry: serde_json::Value = serde_json::from_slice(&retry_body)
+            .map_err(|error| format!("parse pending-runtime retry response: {error}"))?;
+        assert_eq!(retry["phase"], "parked");
+        assert_eq!(retry["deltas"][0]["dimension"], "budget");
+        assert!(
+            retry["runtimeUid"].as_str().is_some(),
+            "retry must bind the persisted Task to the pending runtime"
+        );
+        let rows = task_rows
+            .lock()
+            .map_err(|_| "task fixture lock was poisoned")?;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].runtime_uid.is_some());
+        assert_eq!(rows[0].phase, TaskPhase::Parked);
+        assert_eq!(
+            decision_requests
+                .lock()
+                .map_err(|_| "decision fixture lock was poisoned")?
+                .len(),
+            1,
+            "retry must reuse the pending admission instead of filing another decision"
+        );
+        assert_eq!(
+            runtime_rows
+                .lock()
+                .map_err(|_| "runtime fixture lock was poisoned")?
+                .len(),
+            1,
+            "retry must reuse the deterministic pending runtime"
         );
         Ok(())
     }

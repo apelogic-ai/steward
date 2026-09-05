@@ -1481,6 +1481,42 @@ impl PgStore {
             .await
     }
 
+    pub async fn service_envelope_revision(
+        &self,
+        service: &str,
+        revision: i64,
+    ) -> Result<Option<Envelope>, StoreError> {
+        self.scoped_envelope_revision(EnvelopeScopeKind::Service, service, revision)
+            .await
+    }
+
+    async fn scoped_envelope_revision(
+        &self,
+        scope_kind: EnvelopeScopeKind,
+        scope_ref: &str,
+        revision: i64,
+    ) -> Result<Option<Envelope>, StoreError> {
+        let row = sqlx::query(
+            "SELECT revision, spec \
+             FROM envelopes \
+             WHERE scope_kind = $1 AND scope_ref = $2 AND revision = $3",
+        )
+        .bind(scope_kind.as_str())
+        .bind(scope_ref)
+        .bind(revision)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        row.map(|row| {
+            let revision = row.try_get("revision").map_err(database_error)?;
+            let Json(spec) = row
+                .try_get::<Json<EnvelopeSpec>, _>("spec")
+                .map_err(database_error)?;
+            Ok(Envelope { revision, spec })
+        })
+        .transpose()
+    }
+
     pub async fn latest_scoped_envelope(
         &self,
         scope_kind: EnvelopeScopeKind,
@@ -4158,6 +4194,7 @@ pub struct TaskRecord {
     pub runtime_spec: AgentRuntimeSpec,
     pub agent_command: Vec<String>,
     pub execution_binding: Option<TaskExecutionBinding>,
+    pub envelope_revision: i64,
     pub input_archive: Option<Vec<u8>>,
     pub output_archive: Option<Vec<u8>>,
     pub execute_requested: bool,
@@ -4790,6 +4827,7 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
             .try_get::<Option<Json<TaskExecutionBinding>>, _>("execution_binding")
             .map_err(database_error)?
             .map(|binding| binding.0),
+        envelope_revision: row.try_get("envelope_revision").map_err(database_error)?,
         input_archive: row.try_get("input_archive").map_err(database_error)?,
         output_archive: row.try_get("output_archive").map_err(database_error)?,
         execute_requested: row.try_get("execute_requested").map_err(database_error)?,

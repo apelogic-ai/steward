@@ -1405,7 +1405,9 @@ where
             .await
             .map_err(ApiError::Store)?
         {
-            return task_retry_response(&identity, reference.as_ref(), request, record);
+            return self
+                .retry_existing_task(&identity, reference.as_ref(), request, record)
+                .await;
         }
         if let Some(reference) = reference {
             return submit_versioned_task(self, idempotency_key, identity, reference, request)
@@ -1586,6 +1588,60 @@ where
             .map_err(ApiError::Store)?;
         task_response(record, deltas)
     }
+
+    async fn retry_existing_task(
+        &self,
+        identity: &TaskIdentity,
+        reference: Option<&WorkflowReference>,
+        request: &TaskSubmissionRequest,
+        record: TaskRecord,
+    ) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
+        validate_task_retry(identity, reference, request, &record)?;
+        if record.runtime_uid.is_some()
+            || record.finalize_requested
+            || record.finalized
+            || record.runtime_ownership != RuntimeOwnership::Provisioned
+        {
+            return task_response(record, Vec::new());
+        }
+        let envelope = self
+            .ledger
+            .service_envelope_revision(&record.submitter_service, record.envelope_revision)
+            .await
+            .map_err(ApiError::Store)?
+            .ok_or(ApiError::MissingEnvelope)?;
+        let decision = evaluate_with_grants(&record.runtime_spec, &envelope, &[])
+            .map_err(|error| ApiError::Admission(format!("{error:?}")))?;
+        if matches!(decision, AdmissionDecision::Admit) {
+            return task_response(record, Vec::new());
+        }
+        let (runtime, phase, deltas) = create_task_runtime(
+            &self.runtimes,
+            &self.ledger,
+            &self.decisions,
+            TaskRuntimePlan {
+                namespace: &record.runtime_namespace,
+                name: &record.runtime_name,
+                service: &record.submitter_service,
+                proposed_spec: &record.runtime_spec,
+                envelope: &envelope,
+                decision,
+                execution_binding: record.execution_binding.as_ref(),
+            },
+        )
+        .await?;
+        let runtime_uid = runtime
+            .metadata
+            .uid
+            .as_deref()
+            .ok_or(ApiError::MissingRuntimeUid)?;
+        let record = self
+            .ledger
+            .bind_task_runtime(record.task_uid, runtime_uid, phase)
+            .await
+            .map_err(ApiError::Store)?;
+        task_response(record, deltas)
+    }
 }
 
 async fn submit_versioned_task<R, L, D, W>(
@@ -1699,7 +1755,9 @@ where
                 .await
                 .map_err(ApiError::Store)?
                 .ok_or(ApiError::Store(StoreError::TaskIdempotencyConflict))?;
-            return task_retry_response(&identity, Some(&reference), request, record);
+            return application
+                .retry_existing_task(&identity, Some(&reference), request, record)
+                .await;
         }
         Err(error) => return Err(ApiError::Store(error)),
     };
@@ -1791,16 +1849,6 @@ fn validate_task_retry(
         }
     }
     Ok(())
-}
-
-fn task_retry_response(
-    identity: &TaskIdentity,
-    reference: Option<&WorkflowReference>,
-    request: &TaskSubmissionRequest,
-    record: TaskRecord,
-) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
-    validate_task_retry(identity, reference, request, &record)?;
-    task_response(record, Vec::new())
 }
 
 async fn resolve_task_identity<I: TaskIdentityResolver>(

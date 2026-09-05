@@ -1064,14 +1064,22 @@ async fn task_runtime(
     client: &Client,
     task: &TaskRecord,
 ) -> Result<Option<AgentRuntime>, TaskControllerError> {
-    let Some(expected_uid) = task.runtime_uid.as_deref() else {
+    if task.runtime_uid.is_none()
+        && (!task.finalize_requested || task.runtime_ownership != RuntimeOwnership::Provisioned)
+    {
         return Ok(None);
-    };
+    }
     let runtime = Api::<AgentRuntime>::namespaced(client.clone(), &task.runtime_namespace)
         .get_opt(&task.runtime_name)
         .await
         .map_err(TaskControllerError::Kubernetes)?;
-    Ok(runtime.filter(|runtime| runtime.metadata.uid.as_deref() == Some(expected_uid)))
+    if let Some(expected_uid) = task.runtime_uid.as_deref() {
+        return Ok(runtime.filter(|runtime| runtime.metadata.uid.as_deref() == Some(expected_uid)));
+    }
+    let expected = task_runtime_manifest(task)?;
+    Ok(runtime.filter(|runtime| {
+        runtime.spec == expected.spec && runtime.annotations() == expected.annotations()
+    }))
 }
 
 #[derive(Debug)]
@@ -2830,8 +2838,8 @@ mod tests {
         exhausted_spend_to_preserve, inference_action, provider_control_bindings_match,
         reconcile_once, replace_as_authority, runtime_authority_action, runtime_ttl_action,
         sandbox_execution_class, server_task_runtime_manifest, status_merge_patch, suspend_runtime,
-        suspend_runtime_with_inference_cleanup, task_output_archive_failure, task_runtime_action,
-        ttl_action,
+        suspend_runtime_with_inference_cleanup, task_output_archive_failure, task_runtime,
+        task_runtime_action, ttl_action,
     };
 
     struct RejectingTaskRuntimeBindingStore;
@@ -2916,6 +2924,7 @@ mod tests {
             runtime_spec: spec,
             agent_command: Vec::new(),
             execution_binding: None,
+            envelope_revision: 3,
             input_archive: None,
             output_archive: None,
             execute_requested: false,
@@ -2936,7 +2945,7 @@ mod tests {
                 let delete_body = delete_body_for_service.clone();
                 async move {
                     let method = request.method().clone();
-                    let body = if method == Method::POST {
+                    let body = if matches!(method, Method::GET | Method::POST) {
                         created_json
                     } else if method == Method::DELETE {
                         let bytes = request.into_body().collect_bytes().await.map_err(|error| {
@@ -2954,11 +2963,12 @@ mod tests {
                             .to_vec()
                     };
                     let mut response = Response::new(Body::from(body));
-                    *response.status_mut() = if matches!(method, Method::POST | Method::DELETE) {
-                        StatusCode::OK
-                    } else {
-                        StatusCode::NOT_FOUND
-                    };
+                    *response.status_mut() =
+                        if matches!(method, Method::GET | Method::POST | Method::DELETE) {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::NOT_FOUND
+                        };
                     Ok::<_, std::io::Error>(response)
                 }
             }),
@@ -3042,6 +3052,56 @@ mod tests {
                 .map_err(|_| "delete request lock was poisoned")?
                 .is_none(),
             "an ambiguous store error deleted a runtime that may be durably bound"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalization_recovers_an_unbound_deterministic_runtime() -> Result<(), String> {
+        let TaskRuntimeCreationFixture {
+            mut task, client, ..
+        } = task_runtime_creation_fixture()?;
+        task.finalize_requested = true;
+
+        let runtime = task_runtime(&client, &task)
+            .await
+            .map_err(|error| format!("discover unbound deterministic runtime: {error}"))?;
+        assert_eq!(
+            runtime
+                .as_ref()
+                .and_then(|runtime| runtime.metadata.uid.as_deref()),
+            Some("created-runtime-uid"),
+            "finalization must recover the runtime created before an ambiguous bind failure"
+        );
+        assert_eq!(
+            task_runtime_action(
+                task.phase,
+                task.runtime_ownership,
+                task.execution_binding.as_ref(),
+                task.finalize_requested,
+                &task.runtime_spec,
+                runtime.as_ref(),
+            ),
+            TaskRuntimeAction::DeleteRuntime
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalization_ignores_an_unbound_same_name_runtime_with_different_state()
+    -> Result<(), String> {
+        let TaskRuntimeCreationFixture {
+            mut task, client, ..
+        } = task_runtime_creation_fixture()?;
+        task.finalize_requested = true;
+        task.runtime_spec.budget.monthly_limit = "999.00".to_owned();
+
+        assert!(
+            task_runtime(&client, &task)
+                .await
+                .map_err(|error| format!("inspect conflicting deterministic runtime: {error}"))?
+                .is_none(),
+            "finalization must not claim a same-name runtime with different server-authored state"
         );
         Ok(())
     }
