@@ -899,6 +899,12 @@ async fn create_task_runtime_inner(
     let Err(binding_error) = binding else {
         return Ok(());
     };
+    if !matches!(
+        &binding_error,
+        StoreError::InvalidTaskTransition | StoreError::TaskNotFound
+    ) {
+        return Err(TaskControllerError::Store(binding_error));
+    }
     let deletion = api
         .delete(
             &created.name_any(),
@@ -2841,9 +2847,33 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn runtime_created_during_finalization_race_is_deleted_by_exact_uid() -> Result<(), String>
-    {
+    struct AmbiguousTaskRuntimeBindingStore {
+        durable_runtime_uid: Arc<Mutex<Option<String>>>,
+    }
+
+    impl TaskRuntimeBindingStore for AmbiguousTaskRuntimeBindingStore {
+        async fn bind_task_runtime(
+            &self,
+            _task: &TaskRecord,
+            runtime_uid: &str,
+            _phase: TaskPhase,
+        ) -> Result<TaskRecord, StoreError> {
+            *self.durable_runtime_uid.lock().map_err(|_| {
+                StoreError::Database("durable binding fixture lock was poisoned".to_owned())
+            })? = Some(runtime_uid.to_owned());
+            Err(StoreError::Database(
+                "post-bind task read failed".to_owned(),
+            ))
+        }
+    }
+
+    struct TaskRuntimeCreationFixture {
+        task: TaskRecord,
+        client: Client,
+        delete_body: Arc<Mutex<Option<Vec<u8>>>>,
+    }
+
+    fn task_runtime_creation_fixture() -> Result<TaskRuntimeCreationFixture, String> {
         let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
         let mut spec = fixture().spec;
         spec.principal = Principal::Service {
@@ -2935,6 +2965,22 @@ mod tests {
             "team-a",
         );
 
+        Ok(TaskRuntimeCreationFixture {
+            task,
+            client,
+            delete_body,
+        })
+    }
+
+    #[tokio::test]
+    async fn runtime_created_during_finalization_race_is_deleted_by_exact_uid() -> Result<(), String>
+    {
+        let TaskRuntimeCreationFixture {
+            task,
+            client,
+            delete_body,
+        } = task_runtime_creation_fixture()?;
+
         let result =
             create_task_runtime_inner(&client, &RejectingTaskRuntimeBindingStore, &task).await;
         assert!(
@@ -2958,6 +3004,44 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("created-runtime-uid"),
             "cleanup must not delete a same-name replacement runtime"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ambiguous_post_bind_error_preserves_the_durably_bound_runtime() -> Result<(), String> {
+        let TaskRuntimeCreationFixture {
+            task,
+            client,
+            delete_body,
+        } = task_runtime_creation_fixture()?;
+        let durable_runtime_uid = Arc::new(Mutex::new(None));
+        let store = AmbiguousTaskRuntimeBindingStore {
+            durable_runtime_uid: durable_runtime_uid.clone(),
+        };
+
+        let result = create_task_runtime_inner(&client, &store, &task).await;
+        assert!(
+            matches!(
+                result,
+                Err(super::TaskControllerError::Store(StoreError::Database(_)))
+            ),
+            "the ambiguous store failure must remain visible"
+        );
+        assert_eq!(
+            durable_runtime_uid
+                .lock()
+                .map_err(|_| "durable binding fixture lock was poisoned")?
+                .as_deref(),
+            Some("created-runtime-uid"),
+            "the fixture must model a committed binding before the read failure"
+        );
+        assert!(
+            delete_body
+                .lock()
+                .map_err(|_| "delete request lock was poisoned")?
+                .is_none(),
+            "an ambiguous store error deleted a runtime that may be durably bound"
         );
         Ok(())
     }
