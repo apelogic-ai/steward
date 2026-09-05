@@ -5,6 +5,7 @@ pub mod browser_admin;
 pub mod browser_auth;
 mod browser_security;
 pub mod connections;
+mod execution_bindings;
 mod github_actions;
 pub mod google_oidc;
 pub mod governed_connections;
@@ -13,6 +14,10 @@ mod tasks;
 pub mod user_envelopes;
 pub mod workflows;
 
+pub use execution_bindings::{
+    EXECUTION_BINDING_CATALOG_API_VERSION, ExecutionBindingAdvertisement, ExecutionBindingCatalog,
+    ExecutionBindingValidation, MAX_EXECUTION_BINDING_CATALOG_BYTES,
+};
 pub use github_actions::{
     GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA, GITHUB_ACTIONS_RENDER_REQUEST_SCHEMA,
     GITHUB_FILE_READ_TEMPLATE, GeneratedGithubActionsWorkflow, GithubActionsEnvelopeSelection,
@@ -3015,8 +3020,9 @@ mod tests {
         TaskRecord, TaskReservation, TaskReservationRequest, WorkflowRevisionRecord,
     };
     use steward_types::{
-        AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email,
-        ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, TaskPhase, ToolGrant,
+        AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding,
+        CanonicalUserId, Duration, Email, ModelRef, PENDING_APPROVAL_ANNOTATION, Principal,
+        RuntimeOwnership, TaskPhase, ToolGrant,
     };
     use tower::ServiceExt;
     use utoipa::OpenApi;
@@ -3039,9 +3045,41 @@ mod tests {
     };
 
     const KUBERNETES_TOKEN_REVIEW_AUDIENCE: &str = "https://kubernetes.default.svc";
+    const TEST_VERSIONED_AGENT: &str = "example-agent@1.0.0";
+
+    fn execution_binding_catalog() -> String {
+        serde_json::json!({
+            "apiVersion": "steward.execution-bindings/v1",
+            "bindings": [{
+                "agentRef": TEST_VERSIONED_AGENT,
+                "adapter": "codex-v1",
+                "image": format!("registry.example.test/agents/example@sha256:{}", "a".repeat(64)),
+                "executable": "/opt/example/bin/agent",
+                "versionProbe": {
+                    "arguments": ["--version"],
+                    "expectedStdout": "example-agent 1.0.0"
+                },
+                "providerProfiles": {
+                    "tools": {
+                        "id": "example-tools-profile-v7",
+                        "digest": format!("sha256:{}", "b".repeat(64))
+                    },
+                    "inference": {
+                        "id": "example-inference-profile-v7",
+                        "digest": format!("sha256:{}", "c".repeat(64))
+                    }
+                }
+            }]
+        })
+        .to_string()
+    }
 
     fn task_api_config() -> Result<TaskApiConfig, String> {
-        TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))
+        Ok(
+            TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
+                .with_execution_bindings_json(Some(&execution_binding_catalog()))?
+                .with_execution_bindings_active(true),
+        )
     }
 
     fn browser_cookie(response: &Response, name: &str) -> Result<String, String> {
@@ -5940,13 +5978,14 @@ mod tests {
                     internal_authority_version: None,
                     internal_authority_digest: None,
                     coding_agent_runtime: request.coding_agent_runtime.to_owned(),
-                    runtime_uid: None,
+                    runtime_uid: request.runtime_uid.map(str::to_owned),
                     runtime_namespace: request.runtime_namespace.to_owned(),
                     runtime_name: request.runtime_name.to_owned(),
                     runtime_ownership: request.runtime_ownership,
                     phase: TaskPhase::Submitted,
                     runtime_spec: request.runtime_spec.clone(),
                     agent_command: request.agent_command.to_vec(),
+                    execution_binding: request.execution_binding.cloned(),
                     input_archive: None,
                     output_archive: None,
                     execute_requested: false,
@@ -5976,8 +6015,22 @@ mod tests {
                     .iter_mut()
                     .find(|task| task.task_uid == task_uid)
                     .ok_or(StoreError::TaskNotFound)?;
+                if task.runtime_uid.as_deref() == Some(runtime_uid) {
+                    return Ok(task.clone());
+                }
+                let unchanged_unbound_state = task.runtime_uid.is_none()
+                    && !task.finalize_requested
+                    && !task.finalized
+                    && ((!task.execute_requested && task.phase == TaskPhase::Submitted)
+                        || (task.execute_requested
+                            && matches!(task.phase, TaskPhase::Parked | TaskPhase::Queued)));
+                if !unchanged_unbound_state {
+                    return Err(StoreError::InvalidTaskTransition);
+                }
                 task.runtime_uid = Some(runtime_uid.to_owned());
-                task.phase = phase;
+                if !task.execute_requested {
+                    task.phase = phase;
+                }
                 Ok(task.clone())
             })
         }
@@ -6251,7 +6304,7 @@ mod tests {
                 name: "repository-review".to_owned(),
                 version: 1,
                 display_name: "Repository review".to_owned(),
-                agent: "codex@0.117.0".to_owned(),
+                agent: TEST_VERSIONED_AGENT.to_owned(),
                 prompt: "Review the repository state that triggered this run.".to_owned(),
                 content_digest: format!("sha256:{}", "a".repeat(64)),
                 published_by: "admin@example.com".to_owned(),
@@ -8449,8 +8502,8 @@ mod tests {
             task.user_envelope_digest.as_deref(),
             Some(format!("sha256:{}", "b".repeat(64)).as_str())
         );
-        assert_eq!(task.coding_agent_runtime, "codex@0.117.0");
-        assert_eq!(task.runtime_spec.agent_type.name, "codex@0.117.0");
+        assert_eq!(task.coding_agent_runtime, TEST_VERSIONED_AGENT);
+        assert_eq!(task.runtime_spec.agent_type.name, TEST_VERSIONED_AGENT);
         assert_eq!(task.runtime_spec.llms[0].model, "gpt-5.4");
         assert_eq!(task.runtime_spec.budget.monthly_limit, "25.00");
         assert_eq!(task.runtime_spec.ttl, Duration("4h".to_owned()));
@@ -8516,7 +8569,9 @@ mod tests {
             FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([]),
-            TaskApiConfig::new(Some("https://mcp-a.example.test/mcp".to_owned()))?,
+            TaskApiConfig::new(Some("https://mcp-a.example.test/mcp".to_owned()))?
+                .with_execution_bindings_json(Some(&execution_binding_catalog()))?
+                .with_execution_bindings_active(true),
         );
         let first = first_app
             .oneshot(request("repository-review@1")?)
@@ -8570,6 +8625,307 @@ mod tests {
             StatusCode::CONFLICT,
             "the persisted retry path must still reject a different caller-owned Workflow pin"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_task_retry_uses_persisted_plan_across_workflow_catalog_changes()
+    -> Result<(), String> {
+        let ledger = ledger();
+        let request = |workflow: &'static str, runtime: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "legacy-catalog-retry")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"workflow":"{workflow}","codingAgentRuntime":"{runtime}"}}"#
+                )))
+                .map_err(|error| format!("build legacy Task retry: {error}"))
+        };
+        let first_app = task_router(
+            MultiRuntimeRepository::default(),
+            ledger.clone(),
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+            task_api_config()?,
+        );
+        let first = first_app
+            .oneshot(request("code-review", "agent-v1")?)
+            .await
+            .map_err(|error| format!("submit initial legacy Task: {error}"))?;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_body = to_bytes(first.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read initial legacy Task response: {error}"))?;
+        let first_task_uid = serde_json::from_slice::<serde_json::Value>(&first_body)
+            .map_err(|error| format!("parse initial legacy Task response: {error}"))?
+            .get("taskUid")
+            .cloned();
+
+        let retry_app = task_router(
+            MultiRuntimeRepository::default(),
+            ledger,
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            TaskApiConfig::default(),
+        );
+        let retry = retry_app
+            .clone()
+            .oneshot(request("code-review", "agent-v1")?)
+            .await
+            .map_err(|error| format!("retry legacy Task after catalog change: {error}"))?;
+        assert_eq!(
+            retry.status(),
+            StatusCode::ACCEPTED,
+            "an identical retry must return the persisted Task before consulting the current catalog"
+        );
+        let retry_body = to_bytes(retry.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read legacy Task retry response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&retry_body)
+                .map_err(|error| format!("parse legacy Task retry response: {error}"))?
+                .get("taskUid")
+                .cloned(),
+            first_task_uid,
+            "the application service must return the original Task"
+        );
+
+        let conflicting = retry_app
+            .oneshot(request("different-workflow", "agent-v1")?)
+            .await
+            .map_err(|error| format!("submit conflicting legacy Task retry: {error}"))?;
+        assert_eq!(
+            conflicting.status(),
+            StatusCode::CONFLICT,
+            "a retry with changed caller-owned pins must conflict without live catalog resolution"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adopted_task_reservation_persists_and_retries_the_exact_runtime_uid()
+    -> Result<(), String> {
+        let ledger = ledger();
+        let workflow = task_workflow("100.00");
+        let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        let spec = AgentRuntimeSpec {
+            principal: Principal::Service {
+                name: "steward-run".to_owned(),
+                acting_user: Some(Email("alice@example.com".to_owned())),
+            },
+            owner: Email("alice@example.com".to_owned()),
+            canonical_authority: Some(CanonicalAuthorityBinding::new(
+                canonical_user_id.clone(),
+                Some(canonical_user_id),
+            )?),
+            agent_type: AgentType {
+                name: workflow.coding_agent_runtime.clone(),
+            },
+            llms: workflow.llms.clone(),
+            tools: workflow.tools.clone(),
+            budget: workflow.budget.clone(),
+            ttl: workflow.ttl.clone(),
+            runner: steward_types::RunnerRequirements::default(),
+            bindings: None,
+        };
+        let reservation = ledger
+            .reserve_task(TaskReservationRequest {
+                idempotency_key: "adopted-crash-retry",
+                submitter_service: "steward-run",
+                acting_user: Some("alice@example.com"),
+                acting_user_id: Some("usr_0123456789abcdef0123456789abcdef"),
+                owner: "alice@example.com",
+                owner_user_id: "usr_0123456789abcdef0123456789abcdef",
+                workflow: &workflow.name,
+                workflow_name: None,
+                workflow_version: None,
+                workflow_digest: None,
+                user_envelope_instance_id: None,
+                user_envelope_revision: None,
+                user_envelope_digest: None,
+                coding_agent_runtime: &workflow.coding_agent_runtime,
+                runtime_uid: Some("runtime-uid-a"),
+                runtime_namespace: &workflow.namespace,
+                runtime_name: "runtime-a",
+                runtime_ownership: RuntimeOwnership::Adopted,
+                runtime_spec: &spec,
+                agent_command: &workflow.command,
+                execution_binding: None,
+                envelope_revision: 3,
+            })
+            .await
+            .map_err(|error| format!("seed adopted reservation: {error}"))?;
+        assert!(reservation.inserted);
+        assert_eq!(
+            reservation.record.runtime_uid.as_deref(),
+            Some("runtime-uid-a"),
+            "the adopted UID must be part of the durable reservation"
+        );
+
+        let mut runtime = AgentRuntime::new("runtime-a", spec.clone());
+        runtime.metadata.namespace = Some("team-a".to_owned());
+        runtime.metadata.uid = Some("runtime-uid-a".to_owned());
+        let mut other_runtime = AgentRuntime::new("runtime-a", spec);
+        other_runtime.metadata.namespace = Some("team-a".to_owned());
+        other_runtime.metadata.uid = Some("runtime-uid-b".to_owned());
+        let runtimes = MultiRuntimeRepository {
+            runtimes: Arc::new(Mutex::new(vec![runtime, other_runtime])),
+        };
+        let app = task_router(
+            runtimes,
+            ledger.clone(),
+            FakeDecisionChannel::default(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            TaskApiConfig::default(),
+        );
+        let request = |runtime_uid: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "adopted-crash-retry")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"workflow":"code-review","codingAgentRuntime":"agent-v1","agentRuntimeUid":"{runtime_uid}"}}"#,
+                )))
+                .map_err(|error| format!("build adopted Task retry: {error}"))
+        };
+        let wrong_runtime = app
+            .clone()
+            .oneshot(request("runtime-uid-b")?)
+            .await
+            .map_err(|error| format!("retry adopted Task with another runtime: {error}"))?;
+        assert_eq!(
+            wrong_runtime.status(),
+            StatusCode::CONFLICT,
+            "a same-name replacement runtime must not match the persisted UID"
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?[0]
+                .runtime_uid
+                .as_deref()
+                == Some("runtime-uid-a"),
+            "a rejected retry must preserve the original runtime UID"
+        );
+        let response = app
+            .oneshot(request("runtime-uid-a")?)
+            .await
+            .map_err(|error| format!("retry adopted Task: {error}"))?;
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "an exact retry must reuse the requested adopted runtime binding"
+        );
+        let tasks = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake task ledger lock was poisoned")?;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].runtime_uid.as_deref(), Some("runtime-uid-a"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_runtime_binding_does_not_regress_a_queued_task() -> Result<(), String> {
+        let ledger = ledger();
+        let workflow = task_workflow("100.00");
+        let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        let spec = AgentRuntimeSpec {
+            principal: Principal::Service {
+                name: "steward-run".to_owned(),
+                acting_user: Some(Email("alice@example.com".to_owned())),
+            },
+            owner: Email("alice@example.com".to_owned()),
+            canonical_authority: Some(CanonicalAuthorityBinding::new(
+                canonical_user_id.clone(),
+                Some(canonical_user_id),
+            )?),
+            agent_type: AgentType {
+                name: workflow.coding_agent_runtime.clone(),
+            },
+            llms: workflow.llms.clone(),
+            tools: workflow.tools.clone(),
+            budget: workflow.budget.clone(),
+            ttl: workflow.ttl.clone(),
+            runner: steward_types::RunnerRequirements::default(),
+            bindings: None,
+        };
+        let reservation = ledger
+            .reserve_task(TaskReservationRequest {
+                idempotency_key: "runtime-bind-race",
+                submitter_service: "steward-run",
+                acting_user: Some("alice@example.com"),
+                acting_user_id: Some("usr_0123456789abcdef0123456789abcdef"),
+                owner: "alice@example.com",
+                owner_user_id: "usr_0123456789abcdef0123456789abcdef",
+                workflow: &workflow.name,
+                workflow_name: None,
+                workflow_version: None,
+                workflow_digest: None,
+                user_envelope_instance_id: None,
+                user_envelope_revision: None,
+                user_envelope_digest: None,
+                coding_agent_runtime: &workflow.coding_agent_runtime,
+                runtime_uid: None,
+                runtime_namespace: &workflow.namespace,
+                runtime_name: "runtime-a",
+                runtime_ownership: RuntimeOwnership::Provisioned,
+                runtime_spec: &spec,
+                agent_command: &workflow.command,
+                execution_binding: None,
+                envelope_revision: 3,
+            })
+            .await
+            .map_err(|error| format!("reserve task: {error}"))?;
+        ledger
+            .put_task_inputs(
+                reservation.record.task_uid,
+                "steward-run",
+                "usr_0123456789abcdef0123456789abcdef",
+                b"input",
+            )
+            .await
+            .map_err(|error| format!("store task inputs: {error}"))?;
+        let queued = ledger
+            .request_task_execution(
+                reservation.record.task_uid,
+                "steward-run",
+                "usr_0123456789abcdef0123456789abcdef",
+            )
+            .await
+            .map_err(|error| format!("queue task: {error}"))?;
+        assert_eq!(queued.phase, TaskPhase::Queued);
+
+        let bound = ledger
+            .bind_task_runtime(
+                reservation.record.task_uid,
+                "runtime-uid-a",
+                TaskPhase::Submitted,
+            )
+            .await
+            .map_err(|error| format!("bind runtime after execution request: {error}"))?;
+        assert_eq!(bound.phase, TaskPhase::Queued);
+        assert!(bound.execute_requested);
+
+        let repeated = ledger
+            .bind_task_runtime(bound.task_uid, "runtime-uid-a", TaskPhase::Submitted)
+            .await
+            .map_err(|error| format!("repeat runtime binding: {error}"))?;
+        assert_eq!(
+            repeated.phase,
+            TaskPhase::Queued,
+            "an idempotent binding must return current state without rewriting phase"
+        );
+        assert!(repeated.execute_requested);
         Ok(())
     }
 

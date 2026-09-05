@@ -294,11 +294,13 @@ impl<B> GovernedConnectionsBroker<B> {
             user_envelope_revision: None,
             user_envelope_digest: None,
             coding_agent_runtime: "connections-bridge",
+            runtime_uid: None,
             runtime_namespace: &bindings.namespace,
             runtime_name: &runtime_name,
             runtime_ownership: steward_types::RuntimeOwnership::Provisioned,
             runtime_spec: &plan.spec,
             agent_command: &plan.command,
+            execution_binding: None,
             envelope_revision: CONNECTIONS_AUTHORITY_VERSION,
         };
         self.store

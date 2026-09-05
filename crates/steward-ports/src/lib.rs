@@ -2,7 +2,10 @@
 
 use std::future::Future;
 
-use steward_types::{AgentType, Budget, ModelRef, RuntimeId, RuntimeRefs, SpendSummary, ToolGrant};
+use steward_types::{
+    AgentType, Budget, DisposableExecutionBinding, ModelRef, RuntimeId, RuntimeRefs, SpendSummary,
+    ToolGrant,
+};
 
 /// Maximum raw tar body accepted by the Task input endpoint.
 pub const MAX_TASK_INPUT_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
@@ -123,6 +126,10 @@ pub struct SandboxRequest {
     pub models: Vec<ModelRef>,
     pub tools: Vec<ToolGrant>,
     pub refs: RuntimeRefs,
+    /// Immutable deployment binding persisted with a disposable Task.
+    ///
+    /// Legacy and resident runtimes do not carry this value.
+    pub execution_binding: Option<DisposableExecutionBinding>,
 }
 
 /// Controller-owned execution bindings for a short-lived provider-control runtime.
@@ -174,6 +181,8 @@ pub struct SandboxTaskRequest {
     /// The controller reads this only from the persisted runtime spec; callers cannot choose it.
     pub agent_type: AgentType,
     pub command: Vec<String>,
+    /// The exact deployment binding persisted when the Task was reserved.
+    pub execution_binding: Option<DisposableExecutionBinding>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

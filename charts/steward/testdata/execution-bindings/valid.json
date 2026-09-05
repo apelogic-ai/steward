@@ -1,0 +1,24 @@
+{
+  "apiVersion": "steward.execution-bindings/v1",
+  "bindings": [{
+    "agentRef": "codex@1.2.3",
+    "displayName": "Codex",
+    "adapter": "codex-v1",
+    "image": "registry.example.test/agents/example\u0040sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "executable": "/opt/example/bin/agent",
+    "versionProbe": {
+      "arguments": ["--version"],
+      "expectedStdout": "codex 1.2.3"
+    },
+    "providerProfiles": {
+      "tools": {
+        "id": "example-tools-profile-v7",
+        "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "inference": {
+        "id": "example-inference-profile-v7",
+        "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      }
+    }
+  }]
+}

@@ -36,6 +36,11 @@ exactly one runnable `linux/amd64` child manifest (excluding SBOM/provenance
 attestations) and records both the release index digest and scanned platform
 digest. A missing or ambiguous runnable child fails closed.
 
+Execution bindings default to `config.apiserver.executionBindingsMode: staged`. An upgrade from a
+pre-binding release must roll out all new binaries in that mode before a second Helm operation sets
+the mode to `active`; see the repository's execution-binding upgrade note. This prevents either
+side of a mixed-version rollout from interpreting a Task under the other version's contract.
+
 ## Required secrets
 
 The chart references five existing Secrets and never creates their values:
@@ -155,6 +160,11 @@ that allowlist remain inaccessible to both service accounts.
 - `config.apiserver.taskWorkflowsJson` is the complete Task workflow catalog as
   a JSON array. Invalid JSON or a missing, empty, or whitespace-only Kubernetes
   TokenReview audience stops the apiserver.
+- `config.apiserver.executionBindings` is the structured, deployment-owned coding-agent
+  catalog. The default `bindings: []` advertises no agents and creates no fallback.
+  The chart validates it, renders it into an immutable content-addressed ConfigMap,
+  mounts it read-only in the apiserver, and rolls the apiserver when its checksum
+  changes. See [Execution bindings](../../docs/installation/execution-bindings.md).
 - `config.apiserver.jiraBaseUrl`, `jiraProjectKey`, and `jiraAccountEmail` are
   mandatory startup inputs. The base URL is the public HTTPS Jira tenant root,
   the project must already exist, and the account email must correspond to the

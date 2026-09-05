@@ -11,7 +11,7 @@ use steward_admission::{
 };
 use steward_types::{
     AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
-    OrganizationIdentity, OrganizationIdentityMigration,
+    OrganizationIdentity, OrganizationIdentityMigration, TaskExecutionBinding,
 };
 use uuid::Uuid;
 
@@ -2499,6 +2499,7 @@ impl PgStore {
     ) -> Result<TaskReservation, StoreError> {
         validate_task_identity_binding(request)?;
         validate_task_version_pins(request)?;
+        validate_task_runtime_binding(request)?;
         let task_uid = Uuid::new_v4();
         let inserted = sqlx::query(
             "INSERT INTO task_submissions \
@@ -2506,10 +2507,10 @@ impl PgStore {
               owner, owner_user_id, identity_binding_state, workflow, \
               workflow_name, workflow_version, workflow_digest, \
               user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
-              coding_agent_runtime, runtime_namespace, runtime_name, runtime_ownership, phase, \
-              runtime_spec, agent_command, envelope_revision) \
+              coding_agent_runtime, runtime_uid, runtime_namespace, runtime_name, runtime_ownership, phase, \
+              runtime_spec, agent_command, execution_binding, envelope_revision) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, $12, $13, $14, \
-                     $15, $16, $17, $18, 'submitted', $19, $20, $21) \
+                     $15, $16, $17, $18, $19, 'submitted', $20, $21, $22, $23) \
              ON CONFLICT DO NOTHING",
         )
         .bind(task_uid)
@@ -2527,11 +2528,13 @@ impl PgStore {
         .bind(request.user_envelope_revision)
         .bind(request.user_envelope_digest)
         .bind(request.coding_agent_runtime)
+        .bind(request.runtime_uid)
         .bind(request.runtime_namespace)
         .bind(request.runtime_name)
         .bind(ownership_text(request.runtime_ownership))
         .bind(Json(request.runtime_spec))
         .bind(Json(request.agent_command))
+        .bind(request.execution_binding.map(Json))
         .bind(request.envelope_revision)
         .execute(&self.pool)
         .await
@@ -2563,11 +2566,13 @@ impl PgStore {
             || record.user_envelope_revision != request.user_envelope_revision
             || record.user_envelope_digest.as_deref() != request.user_envelope_digest
             || record.coding_agent_runtime != request.coding_agent_runtime
+            || record.runtime_uid.as_deref() != request.runtime_uid
             || record.runtime_namespace != request.runtime_namespace
             || record.runtime_name != request.runtime_name
             || record.runtime_ownership != request.runtime_ownership
             || record.runtime_spec != *request.runtime_spec
             || record.agent_command != request.agent_command
+            || record.execution_binding.as_ref() != request.execution_binding
         {
             return Err(StoreError::TaskIdempotencyConflict);
         }
@@ -3067,8 +3072,13 @@ impl PgStore {
         }
         let result = sqlx::query(
             "UPDATE task_submissions \
-             SET runtime_uid = $2, phase = $3, updated_at = now() \
-             WHERE task_uid = $1 AND (runtime_uid IS NULL OR runtime_uid = $2)",
+             SET runtime_uid = $2, \
+                 phase = CASE WHEN execute_requested THEN phase ELSE $3 END, \
+                 updated_at = now() \
+             WHERE task_uid = $1 AND runtime_uid IS NULL \
+               AND NOT finalize_requested AND NOT finalized \
+               AND ((NOT execute_requested AND phase = 'submitted') \
+                    OR (execute_requested AND phase IN ('parked', 'queued')))",
         )
         .bind(task_uid)
         .bind(runtime_uid)
@@ -3076,10 +3086,14 @@ impl PgStore {
         .execute(&self.pool)
         .await
         .map_err(database_error)?;
-        if result.rows_affected() != 1 {
-            return Err(StoreError::InvalidTaskTransition);
+        if result.rows_affected() == 1 {
+            return self.task(task_uid).await?.ok_or(StoreError::TaskNotFound);
         }
-        self.task(task_uid).await?.ok_or(StoreError::TaskNotFound)
+        let current = self.task(task_uid).await?.ok_or(StoreError::TaskNotFound)?;
+        if current.runtime_uid.as_deref() == Some(runtime_uid) {
+            return Ok(current);
+        }
+        Err(StoreError::InvalidTaskTransition)
     }
 
     pub async fn task(&self, task_uid: Uuid) -> Result<Option<TaskRecord>, StoreError> {
@@ -3629,11 +3643,15 @@ pub struct TaskReservationRequest<'a> {
     pub user_envelope_revision: Option<i64>,
     pub user_envelope_digest: Option<&'a str>,
     pub coding_agent_runtime: &'a str,
+    /// Exact Kubernetes UID for an adopted runtime. Provisioned runtimes are unbound here and
+    /// receive their server-created UID later through `bind_task_runtime`.
+    pub runtime_uid: Option<&'a str>,
     pub runtime_namespace: &'a str,
     pub runtime_name: &'a str,
     pub runtime_ownership: steward_types::RuntimeOwnership,
     pub runtime_spec: &'a AgentRuntimeSpec,
     pub agent_command: &'a [String],
+    pub execution_binding: Option<&'a TaskExecutionBinding>,
     pub envelope_revision: i64,
 }
 
@@ -3823,11 +3841,24 @@ fn validate_task_identity_binding(request: &TaskReservationRequest<'_>) -> Resul
     Ok(())
 }
 
+fn validate_task_runtime_binding(request: &TaskReservationRequest<'_>) -> Result<(), StoreError> {
+    match (request.runtime_ownership, request.runtime_uid) {
+        (steward_types::RuntimeOwnership::Adopted, Some(runtime_uid))
+            if !runtime_uid.is_empty() =>
+        {
+            Ok(())
+        }
+        (steward_types::RuntimeOwnership::Provisioned, None) => Ok(()),
+        _ => Err(StoreError::InvalidTaskTransition),
+    }
+}
+
 fn validate_connection_operation_request(
     request: &ConnectionOperationReservationRequest<'_>,
 ) -> Result<(), StoreError> {
     validate_task_identity_binding(&request.task)?;
     validate_task_version_pins(&request.task)?;
+    validate_task_runtime_binding(&request.task)?;
     let expected_action = request.operation_kind.as_str();
     let [tool] = request.task.runtime_spec.tools.as_slice() else {
         return Err(StoreError::InvalidConnectionOperation);
@@ -3974,7 +4005,27 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
     let complete = |pins: [bool; 3]| {
         pins.iter().all(|present| *present) || pins.iter().all(|present| !*present)
     };
-    if !complete(workflow_pins)
+    if request
+        .execution_binding
+        .is_some_and(|binding| binding.validate().is_err())
+        || request.execution_binding.is_some_and(|binding| {
+            binding
+                .disposable()
+                .is_some_and(|disposable| disposable.agent_ref != request.coding_agent_runtime)
+        })
+        || request
+            .execution_binding
+            .is_some_and(|binding| match binding {
+                TaskExecutionBinding::Disposable(_) => {
+                    request.runtime_ownership != steward_types::RuntimeOwnership::Provisioned
+                }
+                TaskExecutionBinding::Resident(resident) => {
+                    request.runtime_ownership != steward_types::RuntimeOwnership::Adopted
+                        || resident.owner_user_id.as_str() != request.owner_user_id
+                        || request.runtime_uid != Some(resident.runtime_uid.0.as_str())
+                }
+            })
+        || !complete(workflow_pins)
         || !complete(envelope_pins)
         || workflow_pins[0] != envelope_pins[0]
         || request.workflow_version.is_some_and(|version| version <= 0)
@@ -3989,6 +4040,87 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
         return Err(StoreError::InvalidTaskIdentityBinding);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod task_execution_binding_tests {
+    use steward_types::{
+        AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email, Principal,
+        ResidentExecutionBinding, RunnerRequirements, RuntimeId, RuntimeOwnership,
+        TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding,
+    };
+
+    use super::{StoreError, TaskReservationRequest, validate_task_version_pins};
+
+    #[test]
+    fn resident_reservation_uid_must_match_its_lease_binding() -> Result<(), String> {
+        let owner = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        let binding = TaskExecutionBinding::Resident(ResidentExecutionBinding {
+            schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+            binding_id: "resident-agent-instance-v1".to_owned(),
+            binding_digest: format!("sha256:{}", "a".repeat(64)),
+            owner_user_id: owner,
+            agent_instance_id: "agent-instance-01".to_owned(),
+            agent_instance_revision: 1,
+            runtime_uid: RuntimeId("runtime-uid-a".to_owned()),
+            runtime_spec_digest: format!("sha256:{}", "b".repeat(64)),
+            standing_authority_digest: format!("sha256:{}", "c".repeat(64)),
+            deployment_binding_digest: format!("sha256:{}", "d".repeat(64)),
+            freshness_generation: 1,
+        });
+        let spec = AgentRuntimeSpec {
+            principal: Principal::User {
+                acting_user: Email("alice@example.com".to_owned()),
+            },
+            owner: Email("alice@example.com".to_owned()),
+            canonical_authority: None,
+            agent_type: AgentType {
+                name: "agent@1.0.0".to_owned(),
+            },
+            llms: Vec::new(),
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: "1.00".to_owned(),
+                single_run_limit: None,
+                currency: "USD".to_owned(),
+            },
+            ttl: Duration("1h".to_owned()),
+            runner: RunnerRequirements::default(),
+            bindings: None,
+        };
+        let command = Vec::new();
+        let request = TaskReservationRequest {
+            idempotency_key: "resident-mismatch",
+            submitter_service: "steward-run",
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some("usr_0123456789abcdef0123456789abcdef"),
+            owner: "alice@example.com",
+            owner_user_id: "usr_0123456789abcdef0123456789abcdef",
+            workflow: "code-review",
+            workflow_name: None,
+            workflow_version: None,
+            workflow_digest: None,
+            user_envelope_instance_id: None,
+            user_envelope_revision: None,
+            user_envelope_digest: None,
+            coding_agent_runtime: "agent@1.0.0",
+            runtime_uid: Some("runtime-uid-b"),
+            runtime_namespace: "team-a",
+            runtime_name: "runtime-a",
+            runtime_ownership: RuntimeOwnership::Adopted,
+            runtime_spec: &spec,
+            agent_command: &command,
+            execution_binding: Some(&binding),
+            envelope_revision: 1,
+        };
+
+        assert_eq!(
+            validate_task_version_pins(&request),
+            Err(StoreError::InvalidTaskIdentityBinding),
+            "a resident Task row must not disagree with its immutable lease UID"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -4025,6 +4157,7 @@ pub struct TaskRecord {
     pub phase: steward_types::TaskPhase,
     pub runtime_spec: AgentRuntimeSpec,
     pub agent_command: Vec<String>,
+    pub execution_binding: Option<TaskExecutionBinding>,
     pub input_archive: Option<Vec<u8>>,
     pub output_archive: Option<Vec<u8>>,
     pub execute_requested: bool,
@@ -4653,6 +4786,10 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
             .try_get::<Json<Vec<String>>, _>("agent_command")
             .map_err(database_error)?
             .0,
+        execution_binding: row
+            .try_get::<Option<Json<TaskExecutionBinding>>, _>("execution_binding")
+            .map_err(database_error)?
+            .map(|binding| binding.0),
         input_archive: row.try_get("input_archive").map_err(database_error)?,
         output_archive: row.try_get("output_archive").map_err(database_error)?,
         execute_requested: row.try_get("execute_requested").map_err(database_error)?,

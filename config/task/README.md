@@ -9,7 +9,9 @@ worker is part of the normal `steward-controller` process.
 |---|---|
 | `STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE` | Required and non-empty. DEV uses `https://kubernetes.default.svc`. |
 | `STEWARD_TASK_WORKFLOWS_JSON` | Required JSON array matching `workflows.example.json`. Commands are server-selected; clients cannot supply them. |
-| `STEWARD_TASK_MCP_GW_ENDPOINT` | Exact HTTP(S) streamable MCP endpoint. Required only when a versioned Codex task resolves non-empty tool authority; otherwise the task fails before reservation or execution. |
+| `STEWARD_TASK_EXECUTION_BINDINGS_FILE` | Preferred read-only file containing `steward.execution-bindings/v1`. Missing or empty catalog means no coding agents are available. |
+| `STEWARD_TASK_EXECUTION_BINDINGS_JSON` | Optional inline form of the same document for non-Helm integration environments. Configuring both forms fails startup. |
+| `STEWARD_TASK_MCP_GW_ENDPOINT` | Exact HTTP(S) streamable MCP endpoint. Required only when a versioned task resolves non-empty tool authority; otherwise the task fails before reservation or execution. |
 | `STEWARD_APISERVER_BIND` | HTTPS listener, default `0.0.0.0:8443`. Expose the existing apiserver Service port to this target port. |
 | Task API enablement | Enabled whenever the production apiserver starts. There is no bypass flag; invalid or absent Task configuration fails startup. |
 | `STEWARD_DATABASE_URL` | Existing Postgres connection reference. Keep the value in a Secret, never this repository. |
@@ -21,12 +23,19 @@ JWT still has `aud=steward-task-api`, matching the EKS external OIDC client ID; 
 parse or reinterpret that JWT. See `docs/task-submission-api.md` for the required verified
 username/groups and the external mapper boundary.
 
-For a tool-bearing versioned Codex Workflow, Steward writes the configured MCP endpoint and a
-bearer environment-variable name into the task's fresh `CODEX_HOME/config.toml`. The command sets
-that variable only to OpenShell's documented non-secret provider placeholder. OpenShell derives
-the runtime bearer at the governed egress boundary; the plan, database, and Codex configuration
-never contain a provider credential. Tool-less plans contain no MCP server entry or MCP bearer
-variable and do not require the endpoint.
+For a tool-bearing versioned Workflow using the `codex-v1` adapter, Steward writes the configured
+MCP endpoint and a bearer environment-variable name into the task's fresh adapter configuration.
+The command sets that variable only to OpenShell's documented non-secret provider placeholder.
+OpenShell derives the runtime bearer at the governed egress boundary; the plan, database, and
+agent configuration never contain a provider credential. Tool-less plans contain no MCP server
+entry or MCP bearer variable and do not require the endpoint.
+
+Execution images, versions, executable paths, and OpenShell provider profiles are deployment
+configuration, not values owned by this E2E fixture or by Steward production code. The complete
+schema, Helm surface, released validator, empty-catalog behavior, lifecycle rules, and upgrade
+procedure are documented in
+[`docs/installation/execution-bindings.md`](../../docs/installation/execution-bindings.md).
+The concrete agent and profile values in this directory are local E2E fixtures only.
 
 ## Controller inputs
 

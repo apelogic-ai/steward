@@ -31,6 +31,13 @@ is present only after failure. `deltas` carries the structured budget, TTL, mode
 counterexample when submission parks outside the service envelope. `finalized` is the cleanup
 completion signal and is independent of execution phase.
 
+For a versioned Workflow, its stored agent reference is an opaque identifier advertised by the
+current deployment catalog. The submitter supplies the Workflow reference, not the agent image,
+executable, provider profile, endpoint, namespace, runtime class, or credential. Steward resolves
+and persists the complete execution binding before reservation. See
+[Execution bindings](installation/execution-bindings.md) for configuration, retry, removal, and
+empty-catalog behavior.
+
 ## Tar paths and limits
 
 The tar body is a workspace snapshot, not a second naming scheme:

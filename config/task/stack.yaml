@@ -180,6 +180,10 @@ spec:
               value: STEWARD_RUN_ID
             - name: STEWARD_TASK_MCP_GW_ENDPOINT
               value: http://hop1-capture-tools.steward-system.svc.cluster.local:8085/mcp
+            - name: STEWARD_TASK_EXECUTION_BINDING_IMAGE
+              value: STEWARD_TASK_EXECUTION_BINDING_IMAGE_VALUE
+            - name: STEWARD_TASK_EXECUTION_BINDING_IMAGE_TWO
+              value: STEWARD_TASK_EXECUTION_BINDING_IMAGE_TWO_VALUE
           ports:
             - name: http
               containerPort: 8082

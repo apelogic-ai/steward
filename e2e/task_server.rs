@@ -34,7 +34,8 @@ use tokio::net::TcpListener;
 
 const SCHEDULED_OWNER_EMAIL: &str = "owner@example.com";
 const VERSIONED_WORKFLOW_NAME: &str = "repository-review";
-const VERSIONED_WORKFLOW_AGENT: &str = "codex@0.117.0";
+const VERSIONED_WORKFLOW_AGENT_ONE: &str = "codex@0.139.0";
+const VERSIONED_WORKFLOW_AGENT_TWO: &str = "codex@0.140.0";
 const VERSIONED_WORKFLOW_PROMPT: &str =
     "Review the repository state that triggered this GitHub Actions run.";
 
@@ -123,12 +124,31 @@ async fn seed_versioned_workflow_authority(
         .await?
         .is_none()
     {
-        let digest = workflow_content_digest(VERSIONED_WORKFLOW_AGENT, VERSIONED_WORKFLOW_PROMPT);
+        let digest =
+            workflow_content_digest(VERSIONED_WORKFLOW_AGENT_ONE, VERSIONED_WORKFLOW_PROMPT);
         store
             .publish_initial_workflow(WorkflowPublication {
                 name: VERSIONED_WORKFLOW_NAME,
                 display_name: "Repository review",
-                agent: VERSIONED_WORKFLOW_AGENT,
+                agent: VERSIONED_WORKFLOW_AGENT_ONE,
+                prompt: VERSIONED_WORKFLOW_PROMPT,
+                content_digest: &digest,
+                published_by: "admin@example.com",
+            })
+            .await?;
+    }
+    if store
+        .workflow_revision(VERSIONED_WORKFLOW_NAME, 2)
+        .await?
+        .is_none()
+    {
+        let digest =
+            workflow_content_digest(VERSIONED_WORKFLOW_AGENT_TWO, VERSIONED_WORKFLOW_PROMPT);
+        store
+            .publish_next_workflow(WorkflowPublication {
+                name: VERSIONED_WORKFLOW_NAME,
+                display_name: "Repository review",
+                agent: VERSIONED_WORKFLOW_AGENT_TWO,
                 prompt: VERSIONED_WORKFLOW_PROMPT,
                 content_digest: &digest,
                 published_by: "admin@example.com",
@@ -180,6 +200,40 @@ fn workflow_content_digest(agent: &str, prompt: &str) -> String {
         hasher.update(value.as_bytes());
     }
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn execution_binding_entry(agent_ref: &str, version: &str, image: &str) -> Value {
+    json!({
+        "agentRef": agent_ref,
+        "displayName": format!("Codex {version}"),
+        "adapter": "codex-v1",
+        "image": image,
+        "executable": "/usr/bin/codex",
+        "versionProbe": {
+            "arguments": ["--version"],
+            "expectedStdout": format!("codex-cli {version}")
+        },
+        "providerProfiles": {
+            "tools": {
+                "id": "steward-mcp-gw-v1-3-0",
+                "digest": format!("sha256:{}", "a".repeat(64))
+            },
+            "inference": {
+                "id": "steward-litellm-v1-3-0",
+                "digest": format!("sha256:{}", "b".repeat(64))
+            }
+        }
+    })
+}
+
+fn execution_binding_catalog(image_one: &str, image_two: &str) -> Result<String, Box<dyn Error>> {
+    Ok(serde_json::to_string(&json!({
+        "apiVersion": "steward.execution-bindings/v1",
+        "bindings": [
+            execution_binding_entry(VERSIONED_WORKFLOW_AGENT_ONE, "0.139.0", image_one),
+            execution_binding_entry(VERSIONED_WORKFLOW_AGENT_TWO, "0.140.0", image_two)
+        ]
+    }))?)
 }
 
 fn envelope_content_digest(envelope: &Envelope) -> Result<String, serde_json::Error> {
@@ -416,6 +470,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         TaskApiConfig::new(Some(env::var("STEWARD_TASK_MCP_GW_ENDPOINT").map_err(
             |_| io::Error::other("STEWARD_TASK_MCP_GW_ENDPOINT is required"),
         )?))
+        .and_then(|config| {
+            let image_one = env::var("STEWARD_TASK_EXECUTION_BINDING_IMAGE")
+                .map_err(|_| "STEWARD_TASK_EXECUTION_BINDING_IMAGE is required".to_owned())?;
+            let image_two = env::var("STEWARD_TASK_EXECUTION_BINDING_IMAGE_TWO")
+                .map_err(|_| "STEWARD_TASK_EXECUTION_BINDING_IMAGE_TWO is required".to_owned())?;
+            let catalog = execution_binding_catalog(&image_one, &image_two)
+                .map_err(|error| error.to_string())?;
+            Ok(config
+                .with_execution_bindings_json(Some(&catalog))?
+                .with_execution_bindings_active(true))
+        })
         .map_err(io::Error::other)?,
     )
     .merge(api_router(

@@ -263,6 +263,7 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
         models: Vec::new(),
         tools: Vec::new(),
         refs: RuntimeRefs::default(),
+        execution_binding: None,
     };
     let refs = wait_running(&runtime, &request).await?;
 
@@ -291,6 +292,7 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
                     "-c".to_owned(),
                     "set -eu; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; cp in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"".to_owned(),
                 ],
+                execution_binding: None,
             },
             &input_archive,
         )

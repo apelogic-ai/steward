@@ -404,6 +404,7 @@ workload_exchange_ca_certificate="${RUN_DIR}/workload-exchange-ca.crt"
 workload_exchange_private_key="${RUN_DIR}/workload-exchange.key"
 workload_exchange_certificate_request="${RUN_DIR}/workload-exchange.csr"
 workload_exchange_certificate="${RUN_DIR}/workload-exchange.crt"
+workload_exchange_extensions="${RUN_DIR}/workload-exchange-extensions.cnf"
 workload_exchange_log="${RUN_DIR}/workload-exchange.log"
 printf '%s' obviously-fake-workload-source >"${workload_source_file}"
 openssl req \
@@ -428,6 +429,12 @@ openssl req \
   -addext extendedKeyUsage=serverAuth \
   -keyout "${workload_exchange_private_key}" \
   -out "${workload_exchange_certificate_request}" >/dev/null 2>&1
+printf '%s\n' \
+  'subjectAltName=IP:127.0.0.1' \
+  'basicConstraints=critical,CA:FALSE' \
+  'keyUsage=critical,digitalSignature,keyEncipherment' \
+  'extendedKeyUsage=serverAuth' \
+  >"${workload_exchange_extensions}"
 openssl x509 \
   -req \
   -in "${workload_exchange_certificate_request}" \
@@ -436,7 +443,7 @@ openssl x509 \
   -CAcreateserial \
   -days 1 \
   -sha256 \
-  -copy_extensions copy \
+  -extfile "${workload_exchange_extensions}" \
   -out "${workload_exchange_certificate}" >/dev/null 2>&1
 chmod 600 "${workload_exchange_ca_private_key}" "${workload_exchange_private_key}"
 python3 "${ROOT}/scripts/test-workload-exchange.py" \

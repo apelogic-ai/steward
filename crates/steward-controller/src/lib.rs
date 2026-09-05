@@ -39,8 +39,10 @@ use steward_store::{
     TaskRecord,
 };
 use steward_types::{
-    AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, Duration, PENDING_APPROVAL_ANNOTATION,
-    Phase, RuntimeId, RuntimeOwnership, RuntimeRefs, TaskPhase, runtime_activated_condition,
+    AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, DisposableExecutionBinding, Duration,
+    PENDING_APPROVAL_ANNOTATION, Phase, RuntimeId, RuntimeOwnership, RuntimeRefs,
+    TASK_EXECUTION_BINDING_ANNOTATION, TaskExecutionBinding, TaskPhase,
+    runtime_activated_condition,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,25 +89,25 @@ enum TaskRuntimeAction {
 fn task_runtime_action(
     phase: TaskPhase,
     ownership: RuntimeOwnership,
+    execution_binding: Option<&TaskExecutionBinding>,
     finalize_requested: bool,
     runtime_spec: &AgentRuntimeSpec,
     runtime: Option<&AgentRuntime>,
 ) -> TaskRuntimeAction {
+    let task_owns_runtime = execution_binding
+        .map(TaskExecutionBinding::task_owns_runtime)
+        .unwrap_or(ownership == RuntimeOwnership::Provisioned);
     if finalize_requested {
-        return match (ownership, runtime) {
-            (RuntimeOwnership::Adopted, _) | (RuntimeOwnership::Provisioned, None) => {
-                TaskRuntimeAction::MarkFinalized
-            }
-            (RuntimeOwnership::Provisioned, Some(runtime)) if runtime.spec == *runtime_spec => {
+        return match (task_owns_runtime, runtime) {
+            (false, _) | (true, None) => TaskRuntimeAction::MarkFinalized,
+            (true, Some(runtime)) if runtime.spec == *runtime_spec => {
                 TaskRuntimeAction::DeleteRuntime
             }
-            (RuntimeOwnership::Provisioned, Some(_)) => TaskRuntimeAction::Wait,
+            (true, Some(_)) => TaskRuntimeAction::Wait,
         };
     }
     let Some(runtime) = runtime else {
-        return if ownership == RuntimeOwnership::Provisioned
-            && matches!(phase, TaskPhase::Submitted | TaskPhase::Queued)
-        {
+        return if task_owns_runtime && matches!(phase, TaskPhase::Submitted | TaskPhase::Queued) {
             TaskRuntimeAction::CreateRuntime
         } else {
             TaskRuntimeAction::Wait
@@ -359,6 +361,26 @@ pub async fn reconcile_once<R: SandboxRuntime>(
         .clone()
         .map(RuntimeId)
         .ok_or(ReconcileError::MissingRuntimeUid)?;
+    let execution_binding = runtime
+        .annotations()
+        .get(TASK_EXECUTION_BINDING_ANNOTATION)
+        .map(|serialized| {
+            let binding = serde_json::from_str::<DisposableExecutionBinding>(serialized).map_err(
+                |error| ReconcileError::InvalidSpec {
+                    reason: format!("invalid task execution binding annotation: {error}"),
+                },
+            )?;
+            binding
+                .validate()
+                .map_err(|reason| ReconcileError::InvalidSpec { reason })?;
+            if binding.agent_ref != runtime.spec.agent_type.name {
+                return Err(ReconcileError::InvalidSpec {
+                    reason: "task execution binding does not match runtime agent type".to_owned(),
+                });
+            }
+            Ok(binding)
+        })
+        .transpose()?;
     let request = SandboxRequest {
         runtime: runtime_id,
         workspace_key,
@@ -371,6 +393,7 @@ pub async fn reconcile_once<R: SandboxRuntime>(
             .as_ref()
             .map(|status| status.refs.clone())
             .unwrap_or_default(),
+        execution_binding,
     };
 
     let observation = match intent {
@@ -543,10 +566,22 @@ async fn reconcile_task<R: SandboxTaskRuntime>(
             return Ok(());
         }
     }
+    if task
+        .execution_binding
+        .as_ref()
+        .is_some_and(|binding| matches!(binding, TaskExecutionBinding::Resident(_)))
+        && !task.finalize_requested
+    {
+        return Err(TaskControllerError::InvalidState(
+            "resident Task dispatch is not implemented by the disposable Task controller"
+                .to_owned(),
+        ));
+    }
     let runtime = task_runtime(client, task).await?;
     match task_runtime_action(
         task.phase,
         task.runtime_ownership,
+        task.execution_binding.as_ref(),
         task.finalize_requested,
         &task.runtime_spec,
         runtime.as_ref(),
@@ -593,6 +628,11 @@ async fn reconcile_task<R: SandboxTaskRuntime>(
                         execution_class: sandbox_execution_class(&task.runtime_spec),
                         agent_type: task.runtime_spec.agent_type.clone(),
                         command: task.agent_command.clone(),
+                        execution_binding: task
+                            .execution_binding
+                            .as_ref()
+                            .and_then(TaskExecutionBinding::disposable)
+                            .cloned(),
                     },
                     input,
                 )
@@ -796,7 +836,35 @@ fn connection_operation_authority_action(
 
 async fn create_task_runtime(
     client: &Client,
-    authority: &PgStore,
+    authority: &impl TaskRuntimeBindingStore,
+    task: &TaskRecord,
+) -> Result<(), TaskControllerError> {
+    create_task_runtime_inner(client, authority, task).await
+}
+
+trait TaskRuntimeBindingStore {
+    fn bind_task_runtime(
+        &self,
+        task: &TaskRecord,
+        runtime_uid: &str,
+        phase: TaskPhase,
+    ) -> impl Future<Output = Result<TaskRecord, StoreError>> + Send;
+}
+
+impl TaskRuntimeBindingStore for PgStore {
+    async fn bind_task_runtime(
+        &self,
+        task: &TaskRecord,
+        runtime_uid: &str,
+        phase: TaskPhase,
+    ) -> Result<TaskRecord, StoreError> {
+        PgStore::bind_task_runtime(self, task.task_uid, runtime_uid, phase).await
+    }
+}
+
+async fn create_task_runtime_inner(
+    client: &Client,
+    authority: &impl TaskRuntimeBindingStore,
     task: &TaskRecord,
 ) -> Result<(), TaskControllerError> {
     let runtime = task_runtime_manifest(task)?;
@@ -825,11 +893,34 @@ async fn create_task_runtime(
     let runtime_uid = created.metadata.uid.as_deref().ok_or_else(|| {
         TaskControllerError::InvalidState("created task runtime has no UID".to_owned())
     })?;
-    authority
-        .bind_task_runtime(task.task_uid, runtime_uid, task.phase)
-        .await
-        .map(|_| ())
-        .map_err(TaskControllerError::Store)
+    let binding = authority
+        .bind_task_runtime(task, runtime_uid, task.phase)
+        .await;
+    let Err(binding_error) = binding else {
+        return Ok(());
+    };
+    let deletion = api
+        .delete(
+            &created.name_any(),
+            &DeleteParams {
+                preconditions: Some(Preconditions {
+                    uid: Some(runtime_uid.to_owned()),
+                    resource_version: None,
+                }),
+                ..DeleteParams::default()
+            },
+        )
+        .await;
+    match deletion {
+        Ok(_) => Err(TaskControllerError::Store(binding_error)),
+        Err(kube::Error::Api(response)) if response.code == 404 => {
+            Err(TaskControllerError::Store(binding_error))
+        }
+        Err(cleanup_error) => Err(TaskControllerError::RuntimeBindingCleanup {
+            binding: binding_error,
+            cleanup: Box::new(cleanup_error),
+        }),
+    }
 }
 
 fn task_runtime_manifest(task: &TaskRecord) -> Result<AgentRuntime, TaskControllerError> {
@@ -851,6 +942,7 @@ struct TaskRuntimeBinding<'a> {
     identity_binding_state: &'a str,
     runtime_namespace: &'a str,
     runtime_name: &'a str,
+    execution_binding: Option<&'a TaskExecutionBinding>,
 }
 
 impl<'a> From<&'a TaskRecord> for TaskRuntimeBinding<'a> {
@@ -865,6 +957,7 @@ impl<'a> From<&'a TaskRecord> for TaskRuntimeBinding<'a> {
             identity_binding_state: &task.identity_binding_state,
             runtime_namespace: &task.runtime_namespace,
             runtime_name: &task.runtime_name,
+            execution_binding: task.execution_binding.as_ref(),
         }
     }
 }
@@ -918,6 +1011,31 @@ fn server_task_runtime_manifest(
         SERVICE_PRINCIPAL_ANNOTATION.to_owned(),
         task.submitter_service.to_owned(),
     )]));
+    if let Some(binding) = task.execution_binding {
+        let disposable = binding.disposable().ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "resident execution bindings cannot provision task-owned runtimes".to_owned(),
+            )
+        })?;
+        disposable.validate().map_err(|reason| {
+            TaskControllerError::InvalidState(format!(
+                "task execution binding is invalid: {reason}"
+            ))
+        })?;
+        if disposable.agent_ref != task.runtime_spec.agent_type.name {
+            return Err(TaskControllerError::InvalidState(
+                "task execution binding does not match runtime agent type".to_owned(),
+            ));
+        }
+        runtime.metadata.annotations.get_or_insert_default().insert(
+            TASK_EXECUTION_BINDING_ANNOTATION.to_owned(),
+            serde_json::to_string(disposable).map_err(|error| {
+                TaskControllerError::InvalidState(format!(
+                    "task execution binding cannot be serialized: {error}"
+                ))
+            })?,
+        );
+    }
     Ok(runtime)
 }
 
@@ -954,6 +1072,10 @@ async fn task_runtime(
 enum TaskControllerError {
     Kubernetes(kube::Error),
     Store(StoreError),
+    RuntimeBindingCleanup {
+        binding: StoreError,
+        cleanup: Box<kube::Error>,
+    },
     InvalidState(String),
 }
 
@@ -964,6 +1086,10 @@ impl fmt::Display for TaskControllerError {
                 write!(formatter, "Kubernetes task operation failed: {error}")
             }
             Self::Store(error) => write!(formatter, "task store operation failed: {error}"),
+            Self::RuntimeBindingCleanup { binding, cleanup } => write!(
+                formatter,
+                "task runtime binding failed ({binding}) and exact-UID cleanup failed ({cleanup})"
+            ),
             Self::InvalidState(reason) => write!(formatter, "task state is invalid: {reason}"),
         }
     }
@@ -2249,6 +2375,13 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
     let Some(username) = request.user_info.username.as_deref() else {
         return response.deny("authenticated Kubernetes username is required");
     };
+    let execution_binding = runtime.annotations().get(TASK_EXECUTION_BINDING_ANNOTATION);
+    if request.operation == Operation::Create
+        && execution_binding.is_some()
+        && !trusted_writer_usernames.contains(username)
+    {
+        return response.deny("task execution binding may be set only by a trusted Steward writer");
+    }
     if request.operation == Operation::Create
         && runtime.spec.canonical_authority.is_some()
         && !trusted_writer_usernames.contains(username)
@@ -2260,6 +2393,13 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
         let Some(old_runtime) = request.old_object.as_ref() else {
             return response.deny("AgentRuntime UPDATE admission request has no old object");
         };
+        if old_runtime
+            .annotations()
+            .get(TASK_EXECUTION_BINDING_ANNOTATION)
+            != execution_binding
+        {
+            return response.deny("task execution binding is immutable");
+        }
         if old_runtime.spec.canonical_authority != runtime.spec.canonical_authority {
             return response.deny("canonical runtime authority is immutable");
         }
@@ -2664,26 +2804,163 @@ mod tests {
     };
     use steward_store::{
         ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase, ConnectionOperationKind,
-        ConnectionOperationRecord, ConnectionOperationState, GrantReversion,
+        ConnectionOperationRecord, ConnectionOperationState, GrantReversion, StoreError,
+        TaskRecord,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
         CanonicalAuthorityBinding, CanonicalUserId, Duration, Email, ModelRef,
-        PENDING_APPROVAL_ANNOTATION, Phase, Principal, RuntimeOwnership, RuntimeRefs, TaskPhase,
+        PENDING_APPROVAL_ANNOTATION, Phase, Principal, ResidentExecutionBinding, RuntimeId,
+        RuntimeOwnership, RuntimeRefs, TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding,
+        TaskPhase,
     };
     use tower::service_fn;
 
     use super::{
         Action, AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ReconcileDecision,
         ReconcileIntent, SERVICE_PRINCIPAL_ANNOTATION, TaskRuntimeAction, TaskRuntimeBinding,
-        authority_action, authority_application_action, cleanup_runtime,
-        connection_operation_authority_action, exhausted_spend_to_preserve, inference_action,
-        provider_control_bindings_match, reconcile_once, replace_as_authority,
-        runtime_authority_action, runtime_ttl_action, sandbox_execution_class,
-        server_task_runtime_manifest, status_merge_patch, suspend_runtime,
+        TaskRuntimeBindingStore, authority_action, authority_application_action, cleanup_runtime,
+        connection_operation_authority_action, create_task_runtime_inner,
+        exhausted_spend_to_preserve, inference_action, provider_control_bindings_match,
+        reconcile_once, replace_as_authority, runtime_authority_action, runtime_ttl_action,
+        sandbox_execution_class, server_task_runtime_manifest, status_merge_patch, suspend_runtime,
         suspend_runtime_with_inference_cleanup, task_output_archive_failure, task_runtime_action,
         ttl_action,
     };
+
+    struct RejectingTaskRuntimeBindingStore;
+
+    impl TaskRuntimeBindingStore for RejectingTaskRuntimeBindingStore {
+        async fn bind_task_runtime(
+            &self,
+            _task: &TaskRecord,
+            _runtime_uid: &str,
+            _phase: TaskPhase,
+        ) -> Result<TaskRecord, StoreError> {
+            Err(StoreError::InvalidTaskTransition)
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_created_during_finalization_race_is_deleted_by_exact_uid() -> Result<(), String>
+    {
+        let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        let mut spec = fixture().spec;
+        spec.principal = Principal::Service {
+            name: "steward-run".to_owned(),
+            acting_user: Some(Email("alice@example.com".to_owned())),
+        };
+        spec.owner = Email("alice@example.com".to_owned());
+        spec.canonical_authority = Some(CanonicalAuthorityBinding::new(
+            canonical_user_id.clone(),
+            Some(canonical_user_id),
+        )?);
+        let task = TaskRecord {
+            task_uid: serde_json::from_value(serde_json::json!(
+                "00000000-0000-0000-0000-000000000000"
+            ))
+            .map_err(|error| format!("parse task UID fixture: {error}"))?,
+            idempotency_key: "runtime-finalization-race".to_owned(),
+            submitter_service: "steward-run".to_owned(),
+            acting_user: Some("alice@example.com".to_owned()),
+            acting_user_id: Some("usr_0123456789abcdef0123456789abcdef".to_owned()),
+            owner: "alice@example.com".to_owned(),
+            owner_user_id: Some("usr_0123456789abcdef0123456789abcdef".to_owned()),
+            identity_binding_state: "bound".to_owned(),
+            workflow: "code-review".to_owned(),
+            workflow_name: None,
+            workflow_version: None,
+            workflow_digest: None,
+            user_envelope_instance_id: None,
+            user_envelope_revision: None,
+            user_envelope_digest: None,
+            internal_authority_id: None,
+            internal_authority_version: None,
+            internal_authority_digest: None,
+            coding_agent_runtime: "base".to_owned(),
+            runtime_uid: None,
+            runtime_namespace: "team-a".to_owned(),
+            runtime_name: "task-race".to_owned(),
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            phase: TaskPhase::Submitted,
+            runtime_spec: spec,
+            agent_command: Vec::new(),
+            execution_binding: None,
+            input_archive: None,
+            output_archive: None,
+            execute_requested: false,
+            finalize_requested: false,
+            finalized: false,
+            failure_reason: None,
+        };
+        let mut created = super::task_runtime_manifest(&task)
+            .map_err(|error| format!("build runtime fixture: {error}"))?;
+        created.metadata.uid = Some("created-runtime-uid".to_owned());
+        let created_json = serde_json::to_vec(&created)
+            .map_err(|error| format!("serialize runtime fixture: {error}"))?;
+        let delete_body = Arc::new(Mutex::new(None));
+        let delete_body_for_service = delete_body.clone();
+        let client = Client::new(
+            service_fn(move |request: Request<KubeBody>| {
+                let created_json = created_json.clone();
+                let delete_body = delete_body_for_service.clone();
+                async move {
+                    let method = request.method().clone();
+                    let body = if method == Method::POST {
+                        created_json
+                    } else if method == Method::DELETE {
+                        let bytes = request.into_body().collect_bytes().await.map_err(|error| {
+                            std::io::Error::other(format!(
+                                "delete request body must be readable: {error}"
+                            ))
+                        })?;
+                        *delete_body.lock().map_err(|_| {
+                            std::io::Error::other("delete request lock was poisoned")
+                        })? = Some(bytes.to_vec());
+                        br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success","code":200}"#
+                            .to_vec()
+                    } else {
+                        br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Failure","reason":"NotFound","code":404}"#
+                            .to_vec()
+                    };
+                    let mut response = Response::new(Body::from(body));
+                    *response.status_mut() = if matches!(method, Method::POST | Method::DELETE) {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::NOT_FOUND
+                    };
+                    Ok::<_, std::io::Error>(response)
+                }
+            }),
+            "team-a",
+        );
+
+        let result =
+            create_task_runtime_inner(&client, &RejectingTaskRuntimeBindingStore, &task).await;
+        assert!(
+            matches!(
+                result,
+                Err(super::TaskControllerError::Store(
+                    StoreError::InvalidTaskTransition
+                ))
+            ),
+            "the no-resurrection transition failure must remain visible"
+        );
+        let body = delete_body
+            .lock()
+            .map_err(|_| "delete request lock was poisoned")?
+            .clone()
+            .ok_or_else(|| "binding loss orphaned the created AgentRuntime".to_owned())?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse delete request: {error}"))?;
+        assert_eq!(
+            body.pointer("/preconditions/uid")
+                .and_then(serde_json::Value::as_str),
+            Some("created-runtime-uid"),
+            "cleanup must not delete a same-name replacement runtime"
+        );
+        Ok(())
+    }
 
     #[test]
     fn provider_control_execution_rejects_every_binding_drift_dimension() {
@@ -2766,7 +3043,7 @@ mod tests {
         );
 
         let mut ordinary = governed;
-        ordinary.agent_type.name = "codex@0.117.0".to_owned();
+        ordinary.agent_type.name = "example-agent@1.0.0".to_owned();
         assert_eq!(
             sandbox_execution_class(&ordinary),
             SandboxExecutionClass::Agent
@@ -2943,6 +3220,7 @@ mod tests {
             task_runtime_action(
                 TaskPhase::Queued,
                 RuntimeOwnership::Provisioned,
+                None,
                 false,
                 &runtime.spec,
                 Some(&runtime),
@@ -2958,6 +3236,7 @@ mod tests {
             task_runtime_action(
                 TaskPhase::Parked,
                 RuntimeOwnership::Provisioned,
+                None,
                 false,
                 &runtime.spec,
                 Some(&runtime),
@@ -2973,6 +3252,7 @@ mod tests {
             task_runtime_action(
                 TaskPhase::Parked,
                 RuntimeOwnership::Provisioned,
+                None,
                 false,
                 &runtime.spec,
                 Some(&runtime),
@@ -2984,6 +3264,7 @@ mod tests {
             task_runtime_action(
                 TaskPhase::Cancelled,
                 RuntimeOwnership::Provisioned,
+                None,
                 true,
                 &runtime.spec,
                 Some(&runtime),
@@ -2994,11 +3275,37 @@ mod tests {
             task_runtime_action(
                 TaskPhase::Cancelled,
                 RuntimeOwnership::Adopted,
+                None,
                 true,
                 &runtime.spec,
                 Some(&runtime),
             ),
             TaskRuntimeAction::MarkFinalized
+        );
+        let resident = TaskExecutionBinding::Resident(ResidentExecutionBinding {
+            schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+            binding_id: "resident-agent-instance-v1".to_owned(),
+            binding_digest: format!("sha256:{}", "a".repeat(64)),
+            owner_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
+            agent_instance_id: "agent-instance-01".to_owned(),
+            agent_instance_revision: 1,
+            runtime_uid: RuntimeId("runtime-uid-a".to_owned()),
+            runtime_spec_digest: format!("sha256:{}", "b".repeat(64)),
+            standing_authority_digest: format!("sha256:{}", "c".repeat(64)),
+            deployment_binding_digest: format!("sha256:{}", "d".repeat(64)),
+            freshness_generation: 1,
+        });
+        assert_eq!(
+            task_runtime_action(
+                TaskPhase::Cancelled,
+                RuntimeOwnership::Provisioned,
+                Some(&resident),
+                true,
+                &runtime.spec,
+                Some(&runtime),
+            ),
+            TaskRuntimeAction::MarkFinalized,
+            "Task completion must not delete an AgentInstance-owned resident runtime"
         );
 
         let mut other_owner_spec = runtime.spec.clone();
@@ -3028,6 +3335,7 @@ mod tests {
             task_runtime_action(
                 TaskPhase::Cancelled,
                 RuntimeOwnership::Provisioned,
+                None,
                 true,
                 &other_owner_spec,
                 Some(&runtime),
@@ -3046,6 +3354,7 @@ mod tests {
             task_runtime_action(
                 TaskPhase::Submitted,
                 RuntimeOwnership::Provisioned,
+                None,
                 false,
                 &runtime.spec,
                 None,
@@ -3080,6 +3389,7 @@ mod tests {
                 identity_binding_state: "bound",
                 runtime_namespace: "team-a",
                 runtime_name: "task-a",
+                execution_binding: None,
             },)
             .is_ok(),
             "the controller must accept the exact server-authored Task record"
@@ -3095,6 +3405,7 @@ mod tests {
                 identity_binding_state: "bound",
                 runtime_namespace: "team-a",
                 runtime_name: "task-a",
+                execution_binding: None,
             },)
             .is_err(),
             "a task record whose owner differs from the canonical runtime authority must fail before the controller creates any runtime"
@@ -4486,7 +4797,9 @@ mod webhook_tests {
     use kube::core::admission::{AdmissionRequest, AdmissionReview};
     use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
     use steward_store::StoreError;
-    use steward_types::{AgentRuntime, Budget, Duration, ModelRef};
+    use steward_types::{
+        AgentRuntime, Budget, Duration, ModelRef, TASK_EXECUTION_BINDING_ANNOTATION,
+    };
     use tower::ServiceExt;
 
     use super::{
@@ -4846,6 +5159,33 @@ mod webhook_tests {
         assert_eq!(
             response.result.message,
             "AgentRuntime principal is immutable through the validating admission path"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_caller_authored_task_execution_bindings() -> Result<(), String> {
+        let mut value = admission_review_value();
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
+        value["request"]["oldObject"]["spec"]["budget"]["monthlyLimit"] =
+            serde_json::json!("100.00");
+        value["request"]["object"]["metadata"]["annotations"][TASK_EXECUTION_BINDING_ANNOTATION] =
+            serde_json::json!("caller-selected");
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct binding injection review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read binding injection review: {error}"))?;
+
+        let response = validate_admission(&request, &fake_envelopes()).await;
+
+        assert!(
+            !response.allowed,
+            "a caller-authored deployment binding was admitted"
+        );
+        assert_eq!(
+            response.result.message,
+            "task execution binding is immutable"
         );
         Ok(())
     }

@@ -60,6 +60,8 @@ const NAME_LENGTH: usize = 19;
 const HASH_CHARACTERS: usize = NAME_LENGTH - 2;
 const LOWER_BASE36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 #[cfg(feature = "runtime")]
+const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+#[cfg(feature = "runtime")]
 const TAR_BLOCK_BYTES: usize = 512;
 #[cfg(feature = "runtime")]
 const STAGING_EXEC_STDIN_CHUNK_BYTES: usize = 512 * 1024;
@@ -69,10 +71,10 @@ const KUBERNETES_DNS_SUBDOMAIN_MAX_LENGTH: usize = 253;
 const KUBERNETES_DNS_LABEL_MAX_LENGTH: usize = 63;
 #[cfg(feature = "runtime")]
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
+#[cfg(feature = "runtime")]
+const EXECUTION_BINDING_LABEL: &str = "agents.apelogic.ai/execution-binding";
 /// Server-authored agent type for the one-shot Connections bridge operation.
 pub const CONNECTIONS_BRIDGE_AGENT_TYPE: &str = "connections-bridge";
-/// The sole immutable Workflow agent supported by this slice.
-pub const WORKFLOW_CODEX_AGENT_TYPE: &str = "codex@0.117.0";
 #[cfg(feature = "runtime")]
 const TOOL_PROVIDER: &str = "steward-mcp-gw";
 #[cfg(feature = "runtime")]
@@ -104,6 +106,7 @@ fn provider_reconciliation(attached: bool, desired: bool) -> Option<ProviderReco
         (false, false) | (true, true) => None,
     }
 }
+
 #[cfg(feature = "identity")]
 const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
 #[cfg(feature = "identity")]
@@ -280,6 +283,22 @@ pub fn stable_name(kind: NameKind, identity: &[u8]) -> String {
 }
 
 #[cfg(feature = "runtime")]
+fn execution_binding_label_value(binding_digest: &str) -> String {
+    let digest = binding_digest
+        .strip_prefix("sha256:")
+        .and_then(|value| (value.len() == 64).then_some(value))
+        .unwrap_or(binding_digest);
+    let digest = Sha256::digest(digest.as_bytes());
+    let mut label = String::with_capacity(63);
+    label.push_str("sha256-");
+    for byte in digest.iter().take(28) {
+        label.push(char::from(LOWER_HEX[usize::from(byte >> 4)]));
+        label.push(char::from(LOWER_HEX[usize::from(byte & 0x0f)]));
+    }
+    label
+}
+
+#[cfg(feature = "runtime")]
 struct OpenShellProjection {
     workspace: String,
     workspace_key: String,
@@ -287,6 +306,7 @@ struct OpenShellProjection {
     providers: Vec<String>,
     runtime_uid: String,
     image: Option<String>,
+    execution_binding_digest: Option<String>,
 }
 
 #[cfg(feature = "runtime")]
@@ -315,11 +335,22 @@ fn deletion_names(request: &SandboxRequest) -> (String, String) {
 fn bridge_image_for_execution(
     agent_type: &AgentType,
     execution_class: SandboxExecutionClass,
+    execution_binding: Option<&steward_types::DisposableExecutionBinding>,
     stable_bridge_image: Option<&str>,
     connections_bridge_image: Option<&str>,
 ) -> Result<Option<String>, PortError> {
+    if let Some(binding) = execution_binding {
+        validate_disposable_execution_binding(binding)?;
+        if execution_class != SandboxExecutionClass::Agent || binding.agent_ref != agent_type.name {
+            return Err(PortError::Rejected {
+                reason: "persisted execution binding does not match the requested agent runtime"
+                    .to_owned(),
+            });
+        }
+        return Ok(Some(binding.image.clone()));
+    }
     match (agent_type.name.as_str(), execution_class) {
-        ("base" | WORKFLOW_CODEX_AGENT_TYPE, SandboxExecutionClass::Agent) => Ok(None),
+        ("base", SandboxExecutionClass::Agent) => Ok(None),
         (CONNECTIONS_BRIDGE_AGENT_TYPE, SandboxExecutionClass::Agent) => stable_bridge_image
             .filter(|image| is_digest_pinned_image(image))
             .map(str::to_owned)
@@ -343,10 +374,43 @@ fn bridge_image_for_execution(
 }
 
 #[cfg(feature = "runtime")]
-fn output_archive_command(agent_type: &AgentType) -> &'static str {
+fn validate_disposable_execution_binding(
+    binding: &steward_types::DisposableExecutionBinding,
+) -> Result<(), PortError> {
+    binding
+        .validate()
+        .map_err(|reason| PortError::Rejected { reason })?;
+    if binding.adapter != "codex-v1" {
+        return Err(PortError::Rejected {
+            reason: format!(
+                "persisted execution binding uses unsupported adapter {}",
+                binding.adapter
+            ),
+        });
+    }
+    let mut digest = Sha256::new();
+    digest.update(steward_types::TASK_EXECUTION_BINDING_DIGEST_DOMAIN);
+    digest.update(
+        binding
+            .canonical_content()
+            .map_err(|reason| PortError::Rejected { reason })?,
+    );
+    if format!("sha256:{:x}", digest.finalize()) != binding.binding_digest {
+        return Err(PortError::Rejected {
+            reason: "persisted execution binding digest does not match its content".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "runtime")]
+fn output_archive_command(
+    agent_type: &AgentType,
+    execution_binding: Option<&steward_types::DisposableExecutionBinding>,
+) -> &'static str {
     if agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE {
         "set -eu; test -f /sandbox/steward-output/response.json; tar -cf - -C /sandbox/steward-output response.json"
-    } else if agent_type.name == WORKFLOW_CODEX_AGENT_TYPE {
+    } else if execution_binding.is_some() {
         "set -eu; test -s /sandbox/steward-output/result.txt; test -d /sandbox/steward-output/out; tar -cf - -C /sandbox/steward-output out"
     } else {
         "set -eu; tar -cf - -C /sandbox/steward-output ."
@@ -597,22 +661,54 @@ fn project_request(
     let image = bridge_image_for_execution(
         &request.agent_type,
         request.execution_class,
+        request.execution_binding.as_ref(),
         stable_bridge_image,
         connections_bridge_image,
     )?;
+    let (tool_provider, inference_provider) = request.execution_binding.as_ref().map_or(
+        (Some(TOOL_PROVIDER), Some(INFERENCE_PROVIDER)),
+        |binding| {
+            (
+                binding
+                    .provider_profiles
+                    .tools
+                    .as_ref()
+                    .map(|profile| profile.id.as_str()),
+                binding
+                    .provider_profiles
+                    .inference
+                    .as_ref()
+                    .map(|profile| profile.id.as_str()),
+            )
+        },
+    );
+    if !request.tools.is_empty() && tool_provider.is_none() {
+        return Err(PortError::Rejected {
+            reason: "persisted execution binding has no tool provider profile".to_owned(),
+        });
+    }
+    if !request.models.is_empty() && inference_provider.is_none() {
+        return Err(PortError::Rejected {
+            reason: "persisted execution binding has no inference provider profile".to_owned(),
+        });
+    }
     Ok(OpenShellProjection {
         workspace: stable_name(NameKind::Workspace, request.workspace_key.as_bytes()),
         workspace_key: request.workspace_key.clone(),
         sandbox: stable_name(NameKind::Sandbox, request.runtime.0.as_bytes()),
         providers: [
-            (!request.tools.is_empty()).then(|| TOOL_PROVIDER.to_owned()),
-            (!request.models.is_empty()).then(|| INFERENCE_PROVIDER.to_owned()),
+            (!request.tools.is_empty()).then(|| tool_provider.unwrap_or_default().to_owned()),
+            (!request.models.is_empty()).then(|| inference_provider.unwrap_or_default().to_owned()),
         ]
         .into_iter()
         .flatten()
         .collect(),
         runtime_uid: request.runtime.0.clone(),
         image,
+        execution_binding_digest: request
+            .execution_binding
+            .as_ref()
+            .map(|binding| binding.binding_digest.clone()),
     })
 }
 
@@ -620,6 +716,12 @@ fn project_request(
 fn sandbox_spec(projection: &OpenShellProjection) -> SandboxSpec {
     let mut labels = HashMap::new();
     labels.insert(RUNTIME_UID_LABEL.to_owned(), projection.runtime_uid.clone());
+    if let Some(binding_digest) = &projection.execution_binding_digest {
+        labels.insert(
+            EXECUTION_BINDING_LABEL.to_owned(),
+            execution_binding_label_value(binding_digest),
+        );
+    }
     SandboxSpec {
         name: Some(projection.sandbox.clone()),
         image: projection.image.clone(),
@@ -1872,6 +1974,16 @@ impl SandboxRuntime for OpenShellRuntime {
                 reason: "sandbox name resolved to a different runtime UID".to_owned(),
             });
         }
+        let expected_execution_binding_label = projection
+            .execution_binding_digest
+            .as_deref()
+            .map(execution_binding_label_value);
+        if expected_execution_binding_label.as_ref() != snapshot.labels.get(EXECUTION_BINDING_LABEL)
+        {
+            return Err(PortError::Rejected {
+                reason: "sandbox does not match the persisted execution binding".to_owned(),
+            });
+        }
         self.resolve_raw_sandbox_binding(
             &projection.workspace,
             &projection.sandbox,
@@ -1880,15 +1992,12 @@ impl SandboxRuntime for OpenShellRuntime {
             false,
         )
         .await?;
-        for provider_name in [TOOL_PROVIDER, INFERENCE_PROVIDER] {
+        for provider_name in &projection.providers {
             self.reconcile_provider(
                 &projection.workspace,
                 &projection.sandbox,
                 provider_name,
-                projection
-                    .providers
-                    .iter()
-                    .any(|provider| provider == provider_name),
+                true,
             )
             .await?;
         }
@@ -1976,9 +2085,20 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         let expected_image = bridge_image_for_execution(
             &request.agent_type,
             request.execution_class,
+            request.execution_binding.as_ref(),
             self.stable_bridge_image.as_deref(),
             self.bridge_image.as_deref(),
         )?;
+        let expected_execution_binding_label = request
+            .execution_binding
+            .as_ref()
+            .map(|binding| execution_binding_label_value(&binding.binding_digest));
+        if expected_execution_binding_label.as_ref() != snapshot.labels.get(EXECUTION_BINDING_LABEL)
+        {
+            return Err(PortError::Rejected {
+                reason: "task sandbox does not match the persisted execution binding".to_owned(),
+            });
+        }
         self.resolve_raw_sandbox_binding(
             workspace,
             sandbox,
@@ -2035,7 +2155,8 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 ),
             });
         }
-        let output_archive_command = output_archive_command(&request.agent_type);
+        let output_archive_command =
+            output_archive_command(&request.agent_type, request.execution_binding.as_ref());
         let collected = self
             .authenticated_client()
             .await?
@@ -2148,15 +2269,19 @@ mod tests {
     #[cfg(feature = "runtime")]
     use reqwest::{Client as HttpClient, Url};
     #[cfg(feature = "runtime")]
+    use sha2::{Digest, Sha256};
+    #[cfg(feature = "runtime")]
     use tokio::sync::{Mutex, mpsc as tokio_mpsc};
 
     #[cfg(feature = "runtime")]
     use steward_ports::{PortError, SandboxExecutionClass, SandboxRequest};
     #[cfg(feature = "runtime")]
-    use steward_types::{AgentType, RuntimeId, RuntimeRefs, ToolGrant};
+    use steward_types::{
+        AgentType, DisposableExecutionBinding, ExecutionProviderProfile, ExecutionProviderProfiles,
+        ExecutionVersionProbe, ModelRef, RuntimeId, RuntimeRefs,
+        TASK_EXECUTION_BINDING_SCHEMA_VERSION, ToolGrant,
+    };
 
-    #[cfg(feature = "runtime")]
-    use super::RUNTIME_UID_LABEL;
     #[cfg(feature = "runtime")]
     use super::validate_connections_bridge_archive;
     #[cfg(feature = "runtime")]
@@ -2170,9 +2295,22 @@ mod tests {
         staging_extract_command, staging_prepare_command, task_agent_failure_category,
         task_process_log_record, validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
     };
+    #[cfg(feature = "runtime")]
+    use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
     #[cfg(feature = "identity")]
     use super::{IdentityResolutionError, SANDBOX_ID_LABEL, binding_from_sandbox};
     use super::{NameKind, stable_name};
+
+    #[cfg(feature = "runtime")]
+    fn seal_binding(binding: &mut DisposableExecutionBinding) -> Result<(), String> {
+        let mut digest = Sha256::new();
+        digest.update(steward_types::TASK_EXECUTION_BINDING_DIGEST_DOMAIN);
+        digest.update(binding.canonical_content()?);
+        let digest = format!("sha256:{:x}", digest.finalize());
+        binding.binding_id.clone_from(&digest);
+        binding.binding_digest = digest;
+        Ok(())
+    }
 
     #[cfg(feature = "runtime")]
     struct QueuedTaskProcessEventStream {
@@ -3223,6 +3361,7 @@ mod tests {
                 models: Vec::new(),
                 tools: Vec::new(),
                 refs: RuntimeRefs::default(),
+                execution_binding: None,
             },
             None,
             None,
@@ -3242,8 +3381,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn approved_codex_workflow_uses_the_gateway_default_image_and_unknown_agents_fail_closed()
-    -> Result<(), String> {
+    fn unbound_versioned_agents_fail_closed() {
         let request = |agent_type: &str| SandboxRequest {
             runtime: RuntimeId("runtime-uid-a".to_owned()),
             workspace_key: "team-a".to_owned(),
@@ -3254,31 +3392,214 @@ mod tests {
             models: Vec::new(),
             tools: Vec::new(),
             refs: RuntimeRefs::default(),
+            execution_binding: None,
         };
 
-        let projection = project_request(&request("codex@0.117.0"), None, None)
-            .map_err(|error| format!("approved Workflow agent was rejected: {error:?}"))?;
         assert!(
-            sandbox_spec(&projection).image.is_none(),
-            "the approved agent must not let Steward select an OpenShell image"
+            project_request(&request("example-agent@1.0.0"), None, None).is_err(),
+            "a versioned agent without a persisted deployment binding must fail closed"
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn persisted_disposable_binding_selects_exact_image_and_provider_profiles() -> Result<(), String>
+    {
+        let mut binding = DisposableExecutionBinding {
+            schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+            binding_id: format!("sha256:{}", "a".repeat(64)),
+            binding_digest: format!("sha256:{}", "a".repeat(64)),
+            agent_ref: "example-agent@1.0.0".to_owned(),
+            display_name: Some("Example Agent".to_owned()),
+            adapter: "codex-v1".to_owned(),
+            image: format!(
+                "registry.example.test/agents/example@sha256:{}",
+                "b".repeat(64)
+            ),
+            executable: "/opt/example/bin/agent".to_owned(),
+            version_probe: ExecutionVersionProbe {
+                arguments: vec!["--version".to_owned()],
+                expected_stdout: "example-agent 1.0.0".to_owned(),
+            },
+            provider_profiles: ExecutionProviderProfiles {
+                tools: Some(ExecutionProviderProfile {
+                    id: "example-tools-profile-v7".to_owned(),
+                    digest: format!("sha256:{}", "c".repeat(64)),
+                }),
+                inference: Some(ExecutionProviderProfile {
+                    id: "example-inference-profile-v7".to_owned(),
+                    digest: format!("sha256:{}", "d".repeat(64)),
+                }),
+            },
+        };
+        seal_binding(&mut binding)?;
+        let projection = project_request(
+            &SandboxRequest {
+                runtime: RuntimeId("runtime-uid-a".to_owned()),
+                workspace_key: "team-a".to_owned(),
+                execution_class: SandboxExecutionClass::Agent,
+                agent_type: AgentType {
+                    name: binding.agent_ref.clone(),
+                },
+                models: vec![ModelRef {
+                    provider: "litellm".to_owned(),
+                    model: "test-model".to_owned(),
+                }],
+                tools: vec![ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "repository".to_owned(),
+                    action: "get_file_contents".to_owned(),
+                }],
+                refs: RuntimeRefs::default(),
+                execution_binding: Some(binding.clone()),
+            },
+            Some("registry.example.test/unrelated@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+            None,
+        )
+        .map_err(|error| format!("persisted binding was rejected: {error:?}"))?;
+
+        assert_eq!(projection.image.as_deref(), Some(binding.image.as_str()));
+        assert_eq!(
+            projection.providers,
+            ["example-tools-profile-v7", "example-inference-profile-v7"],
+            "the persisted binding must select the exact deployment-owned OpenShell profiles"
+        );
+        let execution_binding_label = sandbox_spec(&projection)
+            .labels
+            .get(EXECUTION_BINDING_LABEL)
+            .cloned()
+            .ok_or_else(|| "sandbox must carry an execution-binding label".to_owned())?;
+        assert_ne!(
+            execution_binding_label, binding.binding_digest,
+            "the exact binding digest must be encoded for OpenShell label compatibility"
         );
         assert!(
-            project_request(&request("codex@latest"), None, None).is_err(),
-            "an unpinned agent reference must fail closed"
+            execution_binding_label.starts_with("sha256-"),
+            "the label must identify its deterministic digest encoding"
+        );
+        assert_eq!(
+            execution_binding_label.len(),
+            63,
+            "the digest label must fit the Kubernetes/OpenShell label-value limit"
         );
         assert!(
-            project_request(&request("other-agent@1"), None, None).is_err(),
-            "an unpublished agent reference must fail closed"
+            execution_binding_label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
+            "the digest label must use only OpenShell-compatible characters"
+        );
+
+        let mut incomplete = binding.clone();
+        incomplete.provider_profiles.tools = None;
+        seal_binding(&mut incomplete)?;
+        assert!(
+            project_request(
+                &SandboxRequest {
+                    runtime: RuntimeId("runtime-uid-b".to_owned()),
+                    workspace_key: "team-a".to_owned(),
+                    execution_class: SandboxExecutionClass::Agent,
+                    agent_type: AgentType {
+                        name: incomplete.agent_ref.clone(),
+                    },
+                    models: vec![ModelRef {
+                        provider: "litellm".to_owned(),
+                        model: "test-model".to_owned(),
+                    }],
+                    tools: vec![ToolGrant {
+                        provider: "github".to_owned(),
+                        resource: "repository".to_owned(),
+                        action: "get_file_contents".to_owned(),
+                    }],
+                    refs: RuntimeRefs::default(),
+                    execution_binding: Some(incomplete),
+                },
+                None,
+                None,
+            )
+            .is_err(),
+            "a required profile missing from the persisted binding must fail before sandbox creation"
+        );
+
+        let mut tampered = binding.clone();
+        tampered.executable = "/opt/example/bin/other-agent".to_owned();
+        assert!(
+            matches!(
+                project_request(
+                    &SandboxRequest {
+                        runtime: RuntimeId("runtime-uid-c".to_owned()),
+                        workspace_key: "team-a".to_owned(),
+                        execution_class: SandboxExecutionClass::Agent,
+                        agent_type: AgentType {
+                            name: tampered.agent_ref.clone(),
+                        },
+                        models: Vec::new(),
+                        tools: Vec::new(),
+                        refs: RuntimeRefs::default(),
+                        execution_binding: Some(tampered),
+                    },
+                    None,
+                    None,
+                ),
+                Err(PortError::Rejected { ref reason }) if reason.contains("digest")
+            ),
+            "runtime projection must recompute the content-bound digest"
+        );
+
+        let mut unsupported = binding.clone();
+        unsupported.adapter = "future-v1".to_owned();
+        seal_binding(&mut unsupported)?;
+        assert!(
+            matches!(
+                project_request(
+                    &SandboxRequest {
+                        runtime: RuntimeId("runtime-uid-d".to_owned()),
+                        workspace_key: "team-a".to_owned(),
+                        execution_class: SandboxExecutionClass::Agent,
+                        agent_type: AgentType {
+                            name: unsupported.agent_ref.clone(),
+                        },
+                        models: Vec::new(),
+                        tools: Vec::new(),
+                        refs: RuntimeRefs::default(),
+                        execution_binding: Some(unsupported),
+                    },
+                    None,
+                    None,
+                ),
+                Err(PortError::Rejected { ref reason }) if reason.contains("unsupported adapter")
+            ),
+            "a rollback must not interpret a persisted newer adapter with Codex semantics"
         );
         Ok(())
     }
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn approved_codex_workflow_validates_the_standard_result_and_archives_declared_outputs() {
-        let command = output_archive_command(&AgentType {
-            name: "codex@0.117.0".to_owned(),
-        });
+    fn bound_workflow_validates_the_standard_result_and_archives_declared_outputs() {
+        let binding = DisposableExecutionBinding {
+            schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+            binding_id: format!("sha256:{}", "a".repeat(64)),
+            binding_digest: format!("sha256:{}", "a".repeat(64)),
+            agent_ref: "example-agent@1.0.0".to_owned(),
+            display_name: None,
+            adapter: "codex-v1".to_owned(),
+            image: format!(
+                "registry.example.test/agents/example@sha256:{}",
+                "b".repeat(64)
+            ),
+            executable: "/opt/example/bin/agent".to_owned(),
+            version_probe: ExecutionVersionProbe {
+                arguments: vec!["--version".to_owned()],
+                expected_stdout: "example-agent 1.0.0".to_owned(),
+            },
+            provider_profiles: ExecutionProviderProfiles::default(),
+        };
+        let command = output_archive_command(
+            &AgentType {
+                name: binding.agent_ref.clone(),
+            },
+            Some(&binding),
+        );
         assert!(
             command.contains("test -s /sandbox/steward-output/result.txt"),
             "the runtime must reject a missing or empty standard result"
@@ -3306,6 +3627,7 @@ mod tests {
             models: Vec::new(),
             tools: Vec::new(),
             refs: RuntimeRefs::default(),
+            execution_binding: None,
         };
         assert!(
             project_request(&request, None, None).is_err(),
@@ -3551,6 +3873,7 @@ mod tests {
                 sandbox: Some("sandbox-recorded".to_owned()),
                 litellm_key: Some("key-recorded".to_owned()),
             },
+            execution_binding: None,
         };
 
         assert_eq!(
@@ -3581,6 +3904,7 @@ mod tests {
                     action: "read".to_owned(),
                 }],
                 refs: RuntimeRefs::default(),
+                execution_binding: None,
             },
             None,
             None,
@@ -3612,6 +3936,7 @@ mod tests {
                 }],
                 tools: Vec::new(),
                 refs: RuntimeRefs::default(),
+                execution_binding: None,
             },
             None,
             None,

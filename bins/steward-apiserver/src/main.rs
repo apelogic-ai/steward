@@ -9,8 +9,9 @@ use axum::serve::Listener;
 use steward_adapter_github_artifact::GitHubArtifactVerifier;
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{
-    ConfiguredTaskIdentityResolver, IdentityOrKubernetesTokenAuthenticator, KubeRuntimeRepository,
-    KubernetesTokenAuthenticator, KubernetesTokenReviewAudience, StaticTaskWorkflowCatalog,
+    ConfiguredTaskIdentityResolver, ExecutionBindingCatalog,
+    IdentityOrKubernetesTokenAuthenticator, KubeRuntimeRepository, KubernetesTokenAuthenticator,
+    KubernetesTokenReviewAudience, MAX_EXECUTION_BINDING_CATALOG_BYTES, StaticTaskWorkflowCatalog,
     TaskApiConfig, agent_runs_ui, browser_admin, browser_auth, connections, google_oidc,
     governed_connections, router, stable_runtime_bridge, task_router, user_envelopes, workflows,
 };
@@ -36,8 +37,16 @@ const MAX_PENDING_TLS_HANDSHAKES: usize = 64;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider()?;
-    if env::args().nth(1).as_deref() == Some("bootstrap-rbac") {
-        return bootstrap_rbac(env::args().skip(2).collect()).await;
+    let mut arguments = env::args().skip(1);
+    match arguments.next().as_deref() {
+        Some("bootstrap-rbac") => return bootstrap_rbac(arguments.collect()).await,
+        Some("validate-execution-bindings") => {
+            return validate_execution_bindings(arguments.collect());
+        }
+        Some(command) => {
+            return Err(io::Error::other(format!("unknown command {command}")).into());
+        }
+        None => {}
     }
     let client = kube::Client::try_default().await?;
     let store = PgStore::connect(&required("STEWARD_DATABASE_URL")?).await?;
@@ -82,10 +91,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
             return Err(io::Error::other("STEWARD_TASK_MCP_GW_ENDPOINT must be Unicode").into());
         }
     };
-    let task_api_config =
-        TaskApiConfig::new(task_mcp_gateway_endpoint).map_err(io::Error::other)?;
+    let task_execution_bindings_json = configured_execution_bindings_json()?;
+    let task_execution_bindings_active = execution_bindings_active().map_err(io::Error::other)?;
+    let task_api_config = TaskApiConfig::new(task_mcp_gateway_endpoint)
+        .and_then(|config| {
+            config.with_execution_bindings_json(task_execution_bindings_json.as_deref())
+        })
+        .map(|config| config.with_execution_bindings_active(task_execution_bindings_active))
+        .map_err(io::Error::other)?;
+    let workflow_agents = task_api_config.execution_binding_advertisements();
     let runtimes = KubeRuntimeRepository::new(client);
-    let browser = browser_application_router(store.clone(), runtimes.clone(), decisions.clone())?;
+    let browser = browser_application_router(
+        store.clone(),
+        runtimes.clone(),
+        decisions.clone(),
+        workflow_agents,
+    )?;
     let app = router(
         runtimes.clone(),
         store.clone(),
@@ -112,6 +133,89 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn configured_execution_bindings_json() -> Result<Option<String>, io::Error> {
+    let inline = match env::var("STEWARD_TASK_EXECUTION_BINDINGS_JSON") {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::other(
+                "STEWARD_TASK_EXECUTION_BINDINGS_JSON must be Unicode",
+            ));
+        }
+    };
+    let file = match env::var("STEWARD_TASK_EXECUTION_BINDINGS_FILE") {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::other(
+                "STEWARD_TASK_EXECUTION_BINDINGS_FILE must be Unicode",
+            ));
+        }
+    };
+    match (inline, file) {
+        (Some(_), Some(_)) => Err(io::Error::other(
+            "configure exactly one of STEWARD_TASK_EXECUTION_BINDINGS_JSON or STEWARD_TASK_EXECUTION_BINDINGS_FILE",
+        )),
+        (Some(value), None) => Ok(Some(value)),
+        (None, Some(path)) if path.is_empty() => Err(io::Error::other(
+            "STEWARD_TASK_EXECUTION_BINDINGS_FILE must be a non-empty path",
+        )),
+        (None, Some(path)) => read_execution_binding_catalog(&path).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+fn execution_bindings_active() -> Result<bool, String> {
+    match env::var("STEWARD_TASK_EXECUTION_BINDINGS_MODE") {
+        Ok(value) => parse_execution_bindings_mode(&value),
+        Err(env::VarError::NotPresent) => Ok(false),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("STEWARD_TASK_EXECUTION_BINDINGS_MODE must be Unicode".to_owned())
+        }
+    }
+}
+
+fn parse_execution_bindings_mode(value: &str) -> Result<bool, String> {
+    match value {
+        "active" => Ok(true),
+        "staged" => Ok(false),
+        _ => Err("STEWARD_TASK_EXECUTION_BINDINGS_MODE must be staged or active".to_owned()),
+    }
+}
+
+fn validate_execution_bindings(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let [flag, path] = arguments.as_slice() else {
+        return Err(io::Error::other(
+            "usage: steward-apiserver validate-execution-bindings --file <path>",
+        )
+        .into());
+    };
+    if flag != "--file" || path.is_empty() {
+        return Err(io::Error::other(
+            "usage: steward-apiserver validate-execution-bindings --file <path>",
+        )
+        .into());
+    }
+    let document = read_execution_binding_catalog(path)?;
+    let catalog = ExecutionBindingCatalog::from_json(&document).map_err(io::Error::other)?;
+    println!("{}", catalog.validation_report_json()?);
+    Ok(())
+}
+
+fn read_execution_binding_catalog(path: &str) -> Result<String, io::Error> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        io::Error::other(format!("read execution binding catalog {path}: {error}"))
+    })?;
+    if metadata.len() > MAX_EXECUTION_BINDING_CATALOG_BYTES as u64 {
+        return Err(io::Error::other(
+            "execution binding catalog exceeds 1048576 bytes",
+        ));
+    }
+    fs::read_to_string(path).map_err(|error| {
+        io::Error::other(format!("read execution binding catalog {path}: {error}"))
+    })
 }
 
 fn configured_task_identity_resolver(
@@ -167,6 +271,7 @@ fn browser_application_router(
     store: PgStore,
     runtimes: KubeRuntimeRepository,
     decisions: JiraAdapter,
+    workflow_agents: Vec<steward_apiserver::ExecutionBindingAdvertisement>,
 ) -> Result<Option<axum::Router>, Box<dyn Error>> {
     let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
         return Ok(None);
@@ -204,9 +309,10 @@ fn browser_application_router(
             decisions,
             auth.clone(),
         ))
-        .merge(workflows::protected_admin_router(
+        .merge(workflows::protected_admin_router_with_agents(
             store.clone(),
             auth.clone(),
+            workflow_agents,
         ));
     let app = match connections {
         Some(broker) => app.merge(connections::protected_router(broker, auth.clone())),
@@ -529,8 +635,29 @@ mod tests {
     use super::{
         KubernetesTokenReviewAudience, TlsListener, bootstrap_rbac_arguments, decode_tls_material,
         install_rustls_crypto_provider, kubernetes_token_review_audience,
-        stable_bridge_configuration_from_values,
+        parse_execution_bindings_mode, stable_bridge_configuration_from_values,
+        validate_execution_bindings,
     };
+
+    #[test]
+    fn released_validator_accepts_the_documented_catalog_example() -> Result<(), String> {
+        let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/installation/execution-bindings.example.json");
+        validate_execution_bindings(vec![
+            "--file".to_owned(),
+            example.to_string_lossy().into_owned(),
+        ])
+        .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn execution_binding_rollout_mode_is_exact_and_staged_by_default() {
+        assert_eq!(parse_execution_bindings_mode("staged"), Ok(false));
+        assert_eq!(parse_execution_bindings_mode("active"), Ok(true));
+        for invalid in ["", "enabled", "Active", " active"] {
+            assert!(parse_execution_bindings_mode(invalid).is_err());
+        }
+    }
 
     #[test]
     fn governed_connections_configuration_rejects_unpinned_or_partial_bindings()

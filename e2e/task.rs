@@ -93,7 +93,9 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     install_rustls_crypto_provider()?;
     let base_url = required("STEWARD_TASK_URL")?;
     let runtime_api = Api::<AgentRuntime>::all(kube::Client::try_default().await?);
-    let store = PgStore::connect(&required("STEWARD_TEST_DATABASE_URL")?).await?;
+    let database_url = required("STEWARD_TEST_DATABASE_URL")?;
+    let store = PgStore::connect(&database_url).await?;
+    let rollout_pool = sqlx::PgPool::connect(&database_url).await?;
     let run_dir = PathBuf::from(required("STEWARD_RUN_DIR")?).join("task-client");
     fs::create_dir_all(run_dir.join("input/in"))?;
     fs::write(
@@ -251,7 +253,43 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
             .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71),
         "the admitted Task must pin the provisioned User Envelope digest"
     );
-    assert_eq!(submitted.runtime_spec.agent_type.name, "codex@0.117.0");
+    assert_eq!(submitted.runtime_spec.agent_type.name, "codex@0.139.0");
+    let execution_binding = submitted
+        .execution_binding
+        .as_ref()
+        .and_then(steward_types::TaskExecutionBinding::disposable)
+        .ok_or_else(|| io::Error::other("versioned Task omitted its execution binding"))?;
+    assert_eq!(execution_binding.agent_ref, "codex@0.139.0");
+    assert_eq!(execution_binding.executable, "/usr/bin/codex");
+    assert_eq!(execution_binding.adapter, "codex-v1");
+    assert_eq!(
+        execution_binding.version_probe.expected_stdout,
+        "codex-cli 0.139.0"
+    );
+    assert_eq!(execution_binding.version_probe.arguments, ["--version"]);
+    assert!(
+        execution_binding
+            .image
+            .starts_with("docker.io/steward/workflow-sandbox-0-139-0@sha256:")
+            && execution_binding.image.contains("@sha256:"),
+        "the Task must persist the exact digest-addressed sandbox image"
+    );
+    assert_eq!(
+        execution_binding
+            .provider_profiles
+            .tools
+            .as_ref()
+            .map(|profile| profile.id.as_str()),
+        Some("steward-mcp-gw-v1-3-0")
+    );
+    assert_eq!(
+        execution_binding
+            .provider_profiles
+            .inference
+            .as_ref()
+            .map(|profile| profile.id.as_str()),
+        Some("steward-litellm-v1-3-0")
+    );
     assert_eq!(submitted.runtime_spec.llms.len(), 1);
     assert_eq!(submitted.runtime_spec.llms[0].provider, "openai");
     assert_eq!(submitted.runtime_spec.llms[0].model, "priced-model");
@@ -293,7 +331,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         submitted
             .agent_command
             .iter()
-            .any(|argument| argument.contains("codex-cli 0.117.0")),
+            .any(|argument| argument.contains("codex-cli 0.139.0")),
         "the persisted server-owned command must require the exact Workflow agent version"
     );
     assert!(
@@ -309,6 +347,41 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     let versioned_bound =
         wait_for_runtime_binding(&base_url, &versioned_task_uid, "github-assertion", &run_dir)?;
     let versioned_runtime_uid = json_string(&versioned_bound, "runtimeUid")?;
+    assert_controller_runtime_tool_ready(
+        &runtime_api,
+        &versioned_runtime_uid,
+        "steward-mcp-gw-v1-3-0",
+        Some("steward-mcp-gw"),
+    )
+    .await?;
+
+    let old_writer_uid = sqlx::types::Uuid::new_v4();
+    let old_writer = sqlx::query(
+        "INSERT INTO task_submissions \
+         SELECT (jsonb_populate_record( \
+             NULL::task_submissions, \
+             to_jsonb(source) || jsonb_build_object( \
+                 'task_uid', $2::uuid, \
+                 'idempotency_key', $3::text, \
+                 'execution_binding', NULL))).* \
+         FROM task_submissions AS source WHERE task_uid = $1",
+    )
+    .bind(versioned_task_uid.parse::<sqlx::types::Uuid>()?)
+    .bind(old_writer_uid)
+    .bind("mixed-version-old-writer-escape")
+    .execute(&rollout_pool)
+    .await;
+    assert!(
+        old_writer
+            .as_ref()
+            .err()
+            .and_then(sqlx::Error::as_database_error)
+            .and_then(|error| error.constraint())
+            .is_some_and(|constraint| {
+                constraint == "task_submissions_new_versioned_binding_required"
+            }),
+        "the rollout fence must reject a versioned Task written without a binding: {old_writer:?}"
+    );
     put_archive(
         &base_url,
         &versioned_task_uid,
@@ -344,7 +417,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     )?;
     assert_eq!(
         fs::read_to_string(versioned_output_dir.join("out/result.txt"))?,
-        "Repository review completed by codex@0.117.0.\n",
+        "Repository review completed by the configured Codex runtime.\n",
         "real Codex must receive github:repository:get_file_contents through MCP-GW before producing its declared output"
     );
     let run = store
@@ -379,6 +452,79 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
             .await?
             .is_none(),
         "finalizing the versioned Workflow Task must delete its exact provisioned runtime"
+    );
+
+    let second_submission = submit_response(
+        &base_url,
+        "github-assertion",
+        "repository-review-v2-123",
+        r#"{"workflow":"repository-review@2"}"#,
+        &run_dir,
+    )?;
+    assert_eq!(second_submission.http_status, 202);
+    let second_task_uid = json_string(&second_submission.body, "taskUid")?;
+    let second_task = store
+        .task(second_task_uid.parse()?)
+        .await?
+        .ok_or_else(|| io::Error::other("second versioned Task was not persisted"))?;
+    let second_binding = second_task
+        .execution_binding
+        .as_ref()
+        .and_then(steward_types::TaskExecutionBinding::disposable)
+        .ok_or_else(|| io::Error::other("second versioned Task omitted its binding"))?;
+    assert_eq!(second_task.workflow_version, Some(2));
+    assert_eq!(second_binding.agent_ref, "codex@0.140.0");
+    assert_eq!(
+        second_binding.version_probe.expected_stdout,
+        "codex-cli 0.140.0"
+    );
+    assert!(
+        second_binding
+            .image
+            .starts_with("docker.io/steward/workflow-sandbox-0-140-0@sha256:")
+    );
+    assert_ne!(execution_binding.image, second_binding.image);
+    assert_ne!(
+        execution_binding.binding_digest,
+        second_binding.binding_digest
+    );
+    let second_bound =
+        wait_for_runtime_binding(&base_url, &second_task_uid, "github-assertion", &run_dir)?;
+    let second_runtime_uid = json_string(&second_bound, "runtimeUid")?;
+    assert_controller_runtime_tool_ready(
+        &runtime_api,
+        &second_runtime_uid,
+        "steward-mcp-gw-v1-3-0",
+        Some("steward-mcp-gw"),
+    )
+    .await?;
+    put_archive(
+        &base_url,
+        &second_task_uid,
+        "github-assertion",
+        &input_tar,
+        &run_dir,
+    )?;
+    execute(&base_url, &second_task_uid, "github-assertion", &run_dir)?;
+    wait_for(
+        &base_url,
+        &second_task_uid,
+        "github-assertion",
+        |status| status["phase"] == "succeeded",
+        &run_dir,
+    )?;
+    delete_task(&base_url, &second_task_uid, "github-assertion", &run_dir)?;
+    wait_for(
+        &base_url,
+        &second_task_uid,
+        "github-assertion",
+        |status| status["finalized"] == true,
+        &run_dir,
+    )?;
+    assert!(
+        runtime_by_uid(&runtime_api, &second_runtime_uid)
+            .await?
+            .is_none()
     );
 
     let stale = submit(
@@ -440,7 +586,13 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     let diagnostic_bound =
         wait_for_runtime_binding(&base_url, diagnostic_task_uid, "github-assertion", &run_dir)?;
     let diagnostic_runtime_uid = json_string(&diagnostic_bound, "runtimeUid")?;
-    assert_controller_runtime_tool_ready(&runtime_api, diagnostic_runtime_uid).await?;
+    assert_controller_runtime_tool_ready(
+        &runtime_api,
+        diagnostic_runtime_uid,
+        "steward-mcp-gw",
+        None,
+    )
+    .await?;
     delete_task(&base_url, diagnostic_task_uid, "github-assertion", &run_dir)?;
     wait_for(
         &base_url,
@@ -787,6 +939,8 @@ async fn wait_for_running_runtime(
 async fn assert_controller_runtime_tool_ready(
     runtimes: &Api<AgentRuntime>,
     runtime_uid: &str,
+    expected_provider: &str,
+    forbidden_provider: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let runtime = wait_for_running_runtime(runtimes, runtime_uid).await?;
     assert!(
@@ -819,10 +973,23 @@ async fn assert_controller_runtime_tool_ready(
         ))
         .into());
     }
+    let provider_output = String::from_utf8(providers.stdout)?;
+    let provider_ids = provider_output
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
     assert!(
-        String::from_utf8_lossy(&providers.stdout).contains("steward-mcp-gw"),
-        "controller-created runtime must attach the governed tool provider before execution"
+        provider_ids.contains(&expected_provider),
+        "versioned sandbox must attach the exact selected tool profile: {provider_output}"
     );
+    if let Some(forbidden_provider) = forbidden_provider {
+        assert!(
+            !provider_ids.contains(&forbidden_provider),
+            "versioned sandbox must not attach the imported legacy tool profile: {provider_output}"
+        );
+    }
 
     let deadline = Instant::now() + Duration::from_secs(60);
     let terminal_response = loop {

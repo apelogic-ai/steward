@@ -18,6 +18,7 @@ instance-bound grants.
 | Implemented v0.1.x Task lifecycle and identity contract | [Task submission API](docs/task-submission-api.md) |
 | Canonical browser / Task person identity | [Canonical user identity](docs/canonical-user-identity-v1.md) |
 | Deploy the Task API and worker | [Task deployment](config/task/README.md) |
+| Configure coding-agent versions | [Execution bindings](docs/installation/execution-bindings.md) |
 | The rules for changing this repository | [Agent rules](AGENTS.md) |
 | Run the complete local gate | `cargo xtask ci` |
 
@@ -70,6 +71,8 @@ docs/
   task-submission-api.md      lifecycle REST, tar paths, limits, identity boundary
   canonical-user-identity-v1.md
                               immutable user ID, Google OIDC mapping, reconnect contract
+  installation/execution-bindings.md
+                              deployment-neutral agent catalog and validation
   m1-delivery-plan.md         historical M1 delivery dependency index
   solution-overview.md       historical long-running-agent exploration
   data-plane-spec.md         historical multi-step data-plane exploration
