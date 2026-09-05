@@ -24,28 +24,33 @@ The top-level object and every nested object reject unknown fields.
 | `apiVersion` | yes | Exact value `steward.execution-bindings/v1`. |
 | `bindings` | yes | Zero to 128 entries; duplicate `agentRef` or derived identities fail startup. |
 | `agentRef` | yes | Opaque exact deployment value, 3–255 bytes, one `@`, lowercase bounded name, version beginning with a digit; `latest` is invalid. |
-| `displayName` | no | Presentation only, 1–200 bytes, trimmed, no control characters. It is never an ownership key. |
+| `displayName` | no | Presentation only, 1–200 characters, trimmed, no control characters. The Workflow UI shows it beside the exact reference; it is excluded from execution identity and is never an ownership key. |
 | `adapter` | yes | Product-supported adapter. This release accepts only `codex-v1`. |
 | `image` | yes | Lowercase OCI repository plus exact `@sha256:` and 64 lowercase hexadecimal digits. Tags are rejected. |
 | `executable` | yes | Absolute normalized path, 2–1024 bytes; no empty, `.` or `..` components. |
-| `versionProbe.arguments` | yes | One to eight process arguments, each 1–128 bytes with no control characters. No shell parsing occurs. |
-| `versionProbe.expectedStdout` | yes | Exact trimmed stdout, 1–255 bytes with no control characters. Any difference fails execution before the agent runs. |
+| `versionProbe.arguments` | yes | One to eight process arguments, each 1–128 characters with no control characters. No shell parsing occurs. |
+| `versionProbe.expectedStdout` | yes | Exact trimmed stdout, 1–255 characters with no control characters. Any difference fails execution before the agent runs. |
 | `providerProfiles.tools` | conditional | Required for Tasks with approved tools. |
 | `providerProfiles.inference` | conditional | Required for Tasks with approved models. |
-| `providerProfiles.*.id` | conditional | Exact OpenShell provider-profile ID, 1–255 bytes, no whitespace or control characters. |
+| `providerProfiles.*.id` | conditional | Exact OpenShell provider-profile ID, 1–255 characters, no whitespace or control characters. |
 | `providerProfiles.*.digest` | conditional | Exact `sha256:` plus 64 lowercase hexadecimal digits. |
 
-The catalog is limited to 1 MiB. Steward serializes each validated entry in schema field order,
-prefixes the schema domain, and derives a SHA-256 `bindingId`/`bindingDigest`. Operators do not
-provide those values. Use the released validator to calculate and print them:
+The catalog is limited to 1 MiB. Steward serializes each validated execution entry in schema field
+order, excludes presentation-only `displayName`, prefixes the schema domain, and derives a SHA-256
+`bindingId`/`bindingDigest`. Operators do not provide those values. Use the exact released
+apiserver image digest from the release handoff to calculate and print them offline:
 
 ```sh
-steward-apiserver-bin validate-execution-bindings \
-  --file /path/to/execution-bindings.json
+catalog="$PWD/execution-bindings.json"
+docker run --rm --network none --read-only --user 65532:65532 \
+  --mount "type=bind,src=${catalog},dst=/catalog.json,readonly" \
+  ghcr.io/apelogic-ai/steward@sha256:<approved-apiserver-manifest-digest> \
+  validate-execution-bindings --file /catalog.json
 ```
 
-The command uses the production parser, contacts no external service, needs no credential, prints
-only public `agentRef` and derived digest metadata, and returns nonzero for an invalid document.
+Do not substitute a tag. The command invokes the released `/usr/local/bin/steward` entrypoint, uses
+the production parser with networking disabled, needs no credential, prints only public `agentRef`
+and derived digest metadata, and returns nonzero for an invalid document.
 
 ## Agent image and adapter contract
 
@@ -90,6 +95,7 @@ Configure the catalog structurally at `config.apiserver.executionBindings`:
 ```yaml
 config:
   apiserver:
+    executionBindingsMode: active
     executionBindings:
       apiVersion: steward.execution-bindings/v1
       bindings:
@@ -112,12 +118,15 @@ config:
 
 The chart validates the structure, writes it to an immutable content-addressed ConfigMap, mounts it
 read-only in the apiserver, sets `STEWARD_TASK_EXECUTION_BINDINGS_FILE`, and changes the pod-template
-checksum when content changes. The catalog is deliberately a ConfigMap, not a Secret.
+checksum when content changes. The catalog is deliberately a ConfigMap, not a Secret. A first
+upgrade from a release without persisted bindings must keep `executionBindingsMode: staged`; follow
+[the enforced two-stage upgrade](upgrade-execution-bindings.md) before setting it to `active`.
 
-For non-Helm installations, mount the same JSON document and set
-`STEWARD_TASK_EXECUTION_BINDINGS_FILE`. Inline `STEWARD_TASK_EXECUTION_BINDINGS_JSON` remains for
-bounded integration environments; setting both is a startup error. Neither mechanism changes the
-schema.
+For non-Helm installations, mount the same JSON document, set
+`STEWARD_TASK_EXECUTION_BINDINGS_FILE`, and set
+`STEWARD_TASK_EXECUTION_BINDINGS_MODE=active` only after completing the same staged rollout. Inline
+`STEWARD_TASK_EXECUTION_BINDINGS_JSON` remains for bounded integration environments; setting both is
+a startup error. An absent mode is fail-closed `staged`. Neither mechanism changes the schema.
 
 ## Lifecycle, changes, and rollback
 

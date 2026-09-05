@@ -70,6 +70,7 @@ image_values=(
   --set-string config.apiserver.mcpGatewayEndpoint=https://mcp-gw.example.test/mcp
 )
 task_execution_binding_values=(
+  --set-string config.apiserver.executionBindingsMode=active
   --set-string 'config.apiserver.executionBindings.bindings[0].agentRef=example-agent@1.2.3'
   --set-string 'config.apiserver.executionBindings.bindings[0].displayName=Example Agent 1.2.3'
   --set-string 'config.apiserver.executionBindings.bindings[0].adapter=codex-v1'
@@ -128,12 +129,36 @@ helm template steward "${root}/charts/steward" \
   --include-crds \
   "${image_values[@]}" > "${rendered}"
 if [[ "$(grep -c 'name: STEWARD_TASK_EXECUTION_BINDINGS_FILE' "${rendered}")" != "1" ]] ||
+  ! grep -Fq 'name: STEWARD_TASK_EXECUTION_BINDINGS_MODE, value: "staged"' "${rendered}" ||
   ! grep -Fq '\"apiVersion\":\"steward.execution-bindings/v1\"' "${rendered}" ||
   ! grep -Fq '\"bindings\":[]' "${rendered}"
 then
   echo "the empty execution binding catalog must be mounted only in the apiserver" >&2
   exit 1
 fi
+catalog_fixture_directory="${root}/charts/steward/testdata/execution-bindings"
+if ! helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  "${image_values[@]}" \
+  --set-string config.apiserver.executionBindingsMode=active \
+  --set-json "config.apiserver.executionBindings=$(<"${catalog_fixture_directory}/valid.json")" \
+  >/dev/null
+then
+  echo "Helm rejected the runtime-valid execution binding parity fixture" >&2
+  exit 1
+fi
+for invalid_catalog in "${catalog_fixture_directory}"/invalid-*.json; do
+  if helm template steward "${root}/charts/steward" \
+    --namespace steward \
+    "${image_values[@]}" \
+    --set-string config.apiserver.executionBindingsMode=active \
+    --set-json "config.apiserver.executionBindings=$(<"${invalid_catalog}")" \
+    >/dev/null 2>&1
+  then
+    echo "Helm accepted runtime-invalid execution binding parity fixture ${invalid_catalog}" >&2
+    exit 1
+  fi
+done
 helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \

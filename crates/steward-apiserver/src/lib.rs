@@ -3075,8 +3075,11 @@ mod tests {
     }
 
     fn task_api_config() -> Result<TaskApiConfig, String> {
-        TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
-            .with_execution_bindings_json(Some(&execution_binding_catalog()))
+        Ok(
+            TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
+                .with_execution_bindings_json(Some(&execution_binding_catalog()))?
+                .with_execution_bindings_active(true),
+        )
     }
 
     fn browser_cookie(response: &Response, name: &str) -> Result<String, String> {
@@ -8567,7 +8570,8 @@ mod tests {
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([]),
             TaskApiConfig::new(Some("https://mcp-a.example.test/mcp".to_owned()))?
-                .with_execution_bindings_json(Some(&execution_binding_catalog()))?,
+                .with_execution_bindings_json(Some(&execution_binding_catalog()))?
+                .with_execution_bindings_active(true),
         );
         let first = first_app
             .oneshot(request("repository-review@1")?)

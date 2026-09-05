@@ -342,6 +342,11 @@ export type EnvelopeTemplatesResponse = {
     templates: Array<AvailableEnvelopeTemplate>;
 };
 
+export type ExecutionBindingAdvertisement = {
+    agentRef: string;
+    displayName?: string | null;
+};
+
 export type GeneratedGithubActionsWorkflow = {
     contentType: string;
     schemaVersion: string;
@@ -543,7 +548,7 @@ export type WorkflowListResponse = {
     /**
      * Exact logical agent references from the deployment-owned execution catalog.
      */
-    agents: Array<string>;
+    agents: Array<ExecutionBindingAdvertisement>;
     apiVersion: string;
     workflows: Array<WorkflowRevisionView>;
 };

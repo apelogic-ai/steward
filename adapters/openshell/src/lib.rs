@@ -380,6 +380,14 @@ fn validate_disposable_execution_binding(
     binding
         .validate()
         .map_err(|reason| PortError::Rejected { reason })?;
+    if binding.adapter != "codex-v1" {
+        return Err(PortError::Rejected {
+            reason: format!(
+                "persisted execution binding uses unsupported adapter {}",
+                binding.adapter
+            ),
+        });
+    }
     let mut digest = Sha256::new();
     digest.update(steward_types::TASK_EXECUTION_BINDING_DIGEST_DOMAIN);
     digest.update(
@@ -3535,6 +3543,32 @@ mod tests {
                 Err(PortError::Rejected { ref reason }) if reason.contains("digest")
             ),
             "runtime projection must recompute the content-bound digest"
+        );
+
+        let mut unsupported = binding.clone();
+        unsupported.adapter = "future-v1".to_owned();
+        seal_binding(&mut unsupported)?;
+        assert!(
+            matches!(
+                project_request(
+                    &SandboxRequest {
+                        runtime: RuntimeId("runtime-uid-d".to_owned()),
+                        workspace_key: "team-a".to_owned(),
+                        execution_class: SandboxExecutionClass::Agent,
+                        agent_type: AgentType {
+                            name: unsupported.agent_ref.clone(),
+                        },
+                        models: Vec::new(),
+                        tools: Vec::new(),
+                        refs: RuntimeRefs::default(),
+                        execution_binding: Some(unsupported),
+                    },
+                    None,
+                    None,
+                ),
+                Err(PortError::Rejected { ref reason }) if reason.contains("unsupported adapter")
+            ),
+            "a rollback must not interpret a persisted newer adapter with Codex semantics"
         );
         Ok(())
     }

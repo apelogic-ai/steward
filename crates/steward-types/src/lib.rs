@@ -663,8 +663,6 @@ impl DisposableExecutionBinding {
         #[serde(rename_all = "camelCase")]
         struct Content<'a> {
             agent_ref: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            display_name: Option<&'a str>,
             adapter: &'a str,
             image: &'a str,
             executable: &'a str,
@@ -674,7 +672,6 @@ impl DisposableExecutionBinding {
 
         serde_json::to_vec(&Content {
             agent_ref: &self.agent_ref,
-            display_name: self.display_name.as_deref(),
             adapter: &self.adapter,
             image: &self.image,
             executable: &self.executable,
@@ -698,7 +695,7 @@ impl ExecutionVersionProbe {
             || self.arguments.len() > 8
             || self.arguments.iter().any(|argument| {
                 argument.is_empty()
-                    || argument.len() > 128
+                    || argument.chars().count() > 128
                     || argument.chars().any(char::is_control)
             })
             || !valid_bounded_binding_scalar(&self.expected_stdout)
@@ -834,6 +831,7 @@ fn valid_versioned_binding_reference(value: &str) -> bool {
     };
     !name.is_empty()
         && !version.is_empty()
+        && name.as_bytes()[0].is_ascii_alphanumeric()
         && version.as_bytes()[0].is_ascii_digit()
         && version != "latest"
         && value.len() <= 255
@@ -854,17 +852,26 @@ fn valid_digest_pinned_image(value: &str) -> bool {
     let Some((repository, digest)) = value.split_once("@sha256:") else {
         return false;
     };
-    !repository.is_empty()
-        && repository.contains('/')
-        && !repository.contains('@')
-        && !repository
-            .rsplit_once('/')
-            .is_some_and(|(_, image)| image.contains(':'))
-        && repository.bytes().all(|byte| {
+    let mut components = repository.split('/');
+    let Some(registry) = components.next() else {
+        return false;
+    };
+    !registry.is_empty()
+        && registry.bytes().all(|byte| {
             byte.is_ascii_lowercase()
                 || byte.is_ascii_digit()
-                || matches!(byte, b'.' | b'/' | b':' | b'_' | b'-')
+                || matches!(byte, b'.' | b':' | b'_' | b'-')
         })
+        && components.clone().next().is_some()
+        && components.all(|component| {
+            !component.is_empty()
+                && component.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'.' | b'_' | b'-')
+                })
+        })
+        && !repository.contains('@')
         && digest.len() == 64
         && digest
             .bytes()
@@ -886,14 +893,14 @@ fn valid_absolute_executable(value: &str) -> bool {
 
 fn valid_bounded_binding_scalar(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 255
+        && value.chars().count() <= 255
         && value.trim() == value
         && !value.chars().any(char::is_control)
 }
 
 fn valid_bounded_display_name(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 200
+        && value.chars().count() <= 200
         && value.trim() == value
         && !value.chars().any(char::is_control)
 }

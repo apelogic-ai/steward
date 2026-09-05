@@ -92,12 +92,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let task_execution_bindings_json = configured_execution_bindings_json()?;
+    let task_execution_bindings_active = execution_bindings_active().map_err(io::Error::other)?;
     let task_api_config = TaskApiConfig::new(task_mcp_gateway_endpoint)
         .and_then(|config| {
             config.with_execution_bindings_json(task_execution_bindings_json.as_deref())
         })
+        .map(|config| config.with_execution_bindings_active(task_execution_bindings_active))
         .map_err(io::Error::other)?;
-    let workflow_agents = task_api_config.execution_binding_refs();
+    let workflow_agents = task_api_config.execution_binding_advertisements();
     let runtimes = KubeRuntimeRepository::new(client);
     let browser = browser_application_router(
         store.clone(),
@@ -162,6 +164,24 @@ fn configured_execution_bindings_json() -> Result<Option<String>, io::Error> {
         )),
         (None, Some(path)) => read_execution_binding_catalog(&path).map(Some),
         (None, None) => Ok(None),
+    }
+}
+
+fn execution_bindings_active() -> Result<bool, String> {
+    match env::var("STEWARD_TASK_EXECUTION_BINDINGS_MODE") {
+        Ok(value) => parse_execution_bindings_mode(&value),
+        Err(env::VarError::NotPresent) => Ok(false),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("STEWARD_TASK_EXECUTION_BINDINGS_MODE must be Unicode".to_owned())
+        }
+    }
+}
+
+fn parse_execution_bindings_mode(value: &str) -> Result<bool, String> {
+    match value {
+        "active" => Ok(true),
+        "staged" => Ok(false),
+        _ => Err("STEWARD_TASK_EXECUTION_BINDINGS_MODE must be staged or active".to_owned()),
     }
 }
 
@@ -251,7 +271,7 @@ fn browser_application_router(
     store: PgStore,
     runtimes: KubeRuntimeRepository,
     decisions: JiraAdapter,
-    workflow_agents: Vec<String>,
+    workflow_agents: Vec<steward_apiserver::ExecutionBindingAdvertisement>,
 ) -> Result<Option<axum::Router>, Box<dyn Error>> {
     let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
         return Ok(None);
@@ -615,7 +635,8 @@ mod tests {
     use super::{
         KubernetesTokenReviewAudience, TlsListener, bootstrap_rbac_arguments, decode_tls_material,
         install_rustls_crypto_provider, kubernetes_token_review_audience,
-        stable_bridge_configuration_from_values, validate_execution_bindings,
+        parse_execution_bindings_mode, stable_bridge_configuration_from_values,
+        validate_execution_bindings,
     };
 
     #[test]
@@ -627,6 +648,15 @@ mod tests {
             example.to_string_lossy().into_owned(),
         ])
         .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn execution_binding_rollout_mode_is_exact_and_staged_by_default() {
+        assert_eq!(parse_execution_bindings_mode("staged"), Ok(false));
+        assert_eq!(parse_execution_bindings_mode("active"), Ok(true));
+        for invalid in ["", "enabled", "Active", " active"] {
+            assert!(parse_execution_bindings_mode(invalid).is_err());
+        }
     }
 
     #[test]

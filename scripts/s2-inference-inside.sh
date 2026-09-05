@@ -67,9 +67,13 @@ if [[ "${SLICE}" == "s5" && -z "${STEWARD_POC_API_IMAGE:-}" ]]; then
   echo "STEWARD_POC_API_IMAGE is required from the ephemeral S5 harness" >&2
   exit 2
 fi
-if [[ "${SLICE}" == "task" && -z "${STEWARD_TASK_IMAGE:-}" ]]; then
-  echo "STEWARD_TASK_IMAGE is required from the ephemeral Task harness" >&2
-  exit 2
+if [[ "${SLICE}" == "task" ]]; then
+  for variable in STEWARD_TASK_IMAGE STEWARD_OPENSHELL_SANDBOX_IMAGE_TWO; do
+    if [[ -z "${!variable:-}" ]]; then
+      echo "${variable} is required from the ephemeral Task harness" >&2
+      exit 2
+    fi
+  done
 fi
 for command in awk cargo curl docker jq kind kubectl openssl sed tar; do
   if ! command -v "${command}" >/dev/null 2>&1; then
@@ -183,6 +187,7 @@ workload_exchange_ca_cert="${STEWARD_RUN_DIR}/s2-workload-exchange-ca.crt"
 workload_exchange_key="${STEWARD_RUN_DIR}/s2-workload-exchange.key"
 workload_exchange_csr="${STEWARD_RUN_DIR}/s2-workload-exchange.csr"
 workload_exchange_cert="${STEWARD_RUN_DIR}/s2-workload-exchange.crt"
+workload_exchange_extensions="${STEWARD_RUN_DIR}/s2-workload-exchange-extensions.cnf"
 openssl rand 32 >"${signing_key}"
 openssl rand -hex 24 | tr -d '\n' >"${introspection_client}"
 openssl rand -hex 32 | tr -d '\n' >"${master_key}"
@@ -209,6 +214,12 @@ openssl req -new -newkey rsa:2048 -nodes \
   -addext "extendedKeyUsage=serverAuth" \
   -keyout "${workload_exchange_key}" \
   -out "${workload_exchange_csr}" >/dev/null 2>&1
+printf '%s\n' \
+  'subjectAltName=DNS:workload-exchange.steward-system.svc.cluster.local' \
+  'basicConstraints=critical,CA:FALSE' \
+  'keyUsage=critical,digitalSignature,keyEncipherment' \
+  'extendedKeyUsage=serverAuth' \
+  >"${workload_exchange_extensions}"
 openssl x509 -req \
   -in "${workload_exchange_csr}" \
   -CA "${workload_exchange_ca_cert}" \
@@ -216,7 +227,7 @@ openssl x509 -req \
   -CAcreateserial \
   -days 1 \
   -sha256 \
-  -copy_extensions copy \
+  -extfile "${workload_exchange_extensions}" \
   -out "${workload_exchange_cert}" >/dev/null 2>&1
 chmod 600 \
   "${signing_key}" \
@@ -303,26 +314,32 @@ if [[ "${SLICE}" == "s5" ]]; then
   "${KUBECTL[@]}" apply -f "${rendered_poc_stack}"
 fi
 if [[ "${SLICE}" == "task" ]]; then
-  if [[ -z "${STEWARD_OPENSHELL_SANDBOX_IMAGE:-}" ]]; then
-    echo "STEWARD_OPENSHELL_SANDBOX_IMAGE is required for the bound Task sandbox" >&2
-    exit 2
-  fi
-  sandbox_containerd_name="docker.io/${STEWARD_OPENSHELL_SANDBOX_IMAGE}"
-  sandbox_digest="$(
-    docker exec "${cluster_name}-control-plane" ctr -n k8s.io images list |
-      awk -v image="${sandbox_containerd_name}" '$1 == image { print $3 }'
-  )"
-  if [[ ! "${sandbox_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-    echo "loaded Task sandbox image has no exact containerd manifest digest" >&2
-    exit 1
-  fi
-  sandbox_digest_image="docker.io/${STEWARD_OPENSHELL_SANDBOX_IMAGE%:*}@${sandbox_digest}"
-  docker exec "${cluster_name}-control-plane" \
-    ctr -n k8s.io images tag "${sandbox_containerd_name}" "${sandbox_digest_image}"
+  kind load docker-image "${STEWARD_OPENSHELL_SANDBOX_IMAGE_TWO}" --name "${cluster_name}"
+  sandbox_digest_image() {
+    local tagged_image="$1"
+    local containerd_name="docker.io/${tagged_image}"
+    local digest=""
+    digest="$(
+      docker exec "${cluster_name}-control-plane" ctr -n k8s.io images list |
+        awk -v image="${containerd_name}" '$1 == image { print $3 }'
+    )"
+    if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+      echo "loaded Task sandbox image ${tagged_image} has no exact containerd manifest digest" >&2
+      return 1
+    fi
+    local digest_image="docker.io/${tagged_image%:*}@${digest}"
+    docker exec "${cluster_name}-control-plane" \
+      ctr -n k8s.io images tag "${containerd_name}" "${digest_image}" >/dev/null
+    printf '%s' "${digest_image}"
+  }
+  sandbox_digest_image_one="$(sandbox_digest_image "${STEWARD_OPENSHELL_SANDBOX_IMAGE}")"
+  sandbox_digest_image_two="$(sandbox_digest_image "${STEWARD_OPENSHELL_SANDBOX_IMAGE_TWO}")"
+  sandbox_digest_image="${sandbox_digest_image_one}"
   rendered_task_stack="${STEWARD_RUN_DIR}/task-stack.yaml"
   sed \
     -e "s#STEWARD_TASK_IMAGE#${STEWARD_TASK_IMAGE}#g" \
     -e "s#STEWARD_TASK_EXECUTION_BINDING_IMAGE_VALUE#${sandbox_digest_image}#g" \
+    -e "s#STEWARD_TASK_EXECUTION_BINDING_IMAGE_TWO_VALUE#${sandbox_digest_image_two}#g" \
     -e "s#STEWARD_RUN_ID#${STEWARD_RUN_ID}#g" \
     "${ROOT}/config/task/stack.yaml" >"${rendered_task_stack}"
   "${KUBECTL[@]}" apply -f "${rendered_task_stack}"

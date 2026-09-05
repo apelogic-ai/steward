@@ -77,7 +77,7 @@ export function NewWorkflowView({ from }: Readonly<{ from?: WorkflowRevision }>)
   ) : <WorkflowForm agents={agents} from={from} />}</ResourceBoundary>;
 }
 
-function WorkflowForm({ agents, from }: Readonly<{ agents: string[]; from?: WorkflowRevision }>) {
+function WorkflowForm({ agents, from }: Readonly<{ agents: WorkflowListResponse["agents"]; from?: WorkflowRevision }>) {
   const router = useRouter();
   const session = useSession();
   const [submission, setSubmission] = useState<"idle" | "submitting" | MutationFailureState>("idle");
@@ -106,7 +106,7 @@ function WorkflowForm({ agents, from }: Readonly<{ agents: string[]; from?: Work
       <form className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm" onSubmit={submit}>
         <label className="grid gap-2 text-sm font-semibold">Name<input className="min-h-11 rounded-md border px-3 font-normal" defaultValue={from?.name ?? ""} disabled={Boolean(from)} name="name" pattern="[a-z](?:[a-z0-9]|-)*[a-z0-9]" required /></label>
         <label className="grid gap-2 text-sm font-semibold">Display name<input className="min-h-11 rounded-md border px-3 font-normal" defaultValue={from?.displayName ?? ""} name="displayName" required /></label>
-        <label className="grid gap-2 text-sm font-semibold">Agent<select className="min-h-11 rounded-md border bg-panel px-3 font-normal" defaultValue={from?.agent ?? agents[0]} name="agent" required>{agents.map((agent) => <option key={agent} value={agent}>{agent}</option>)}</select></label>
+        <label className="grid gap-2 text-sm font-semibold">Agent<select className="min-h-11 rounded-md border bg-panel px-3 font-normal" defaultValue={from?.agent ?? agents[0].agentRef} name="agent" required>{agents.map((agent) => <option key={agent.agentRef} value={agent.agentRef}>{agent.displayName ?? agent.agentRef} · {agent.agentRef}</option>)}</select></label>
         <label className="grid gap-2 text-sm font-semibold">Prompt<textarea className="min-h-52 rounded-md border p-3 font-normal" defaultValue={from?.prompt ?? ""} name="prompt" required /></label>
         {submission !== "idle" && submission !== "submitting" ? <p className="text-sm text-red-800" role="alert">{{ conflict: "This Workflow name or version was published concurrently.", rejected: "The Workflow content was rejected.", forbidden: "The authorization boundary rejected publication.", unavailable: "The Workflow service is unavailable.", error: "The Workflow could not be published." }[submission]}</p> : null}
         <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Publishing…" : from ? "Publish new version" : "Publish workflow"}</button>

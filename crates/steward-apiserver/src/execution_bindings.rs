@@ -60,7 +60,7 @@ struct CatalogDocument {
     bindings: Vec<CatalogEntry>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionBindingAdvertisement {
     pub agent_ref: String,
@@ -253,6 +253,31 @@ mod tests {
     }
 
     #[test]
+    fn runtime_parser_matches_the_helm_catalog_parity_fixtures() -> Result<(), String> {
+        let fixture = |name: &str| {
+            std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../charts/steward/testdata/execution-bindings")
+                    .join(name),
+            )
+            .map_err(|error| format!("read catalog parity fixture {name}: {error}"))
+        };
+        ExecutionBindingCatalog::from_json(&fixture("valid.json")?)?;
+        for invalid in [
+            "invalid-agent-ref.json",
+            "invalid-image.json",
+            "invalid-display-name.json",
+            "invalid-expected-stdout.json",
+        ] {
+            assert!(
+                ExecutionBindingCatalog::from_json(&fixture(invalid)?).is_err(),
+                "runtime parser accepted Helm-invalid parity fixture {invalid}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rejects_mutable_incomplete_duplicate_or_unknown_catalog_entries() -> Result<(), String> {
         let valid = entry("agent@1.0.0", 'a');
         let mut cases = Vec::new();
@@ -260,6 +285,25 @@ mod tests {
         let mut mutable_image = valid.clone();
         mutable_image["image"] = json!("registry.example.test/agents/example:latest");
         cases.push(vec![mutable_image]);
+
+        let mut malformed_image_path = valid.clone();
+        malformed_image_path["image"] = json!(format!(
+            "registry.example.test//example@sha256:{}",
+            "a".repeat(64)
+        ));
+        cases.push(vec![malformed_image_path]);
+
+        let mut malformed_agent = valid.clone();
+        malformed_agent["agentRef"] = json!("-agent@1.0.0");
+        cases.push(vec![malformed_agent]);
+
+        let mut padded_display_name = valid.clone();
+        padded_display_name["displayName"] = json!(" Example Agent");
+        cases.push(vec![padded_display_name]);
+
+        let mut padded_expected_stdout = valid.clone();
+        padded_expected_stdout["versionProbe"]["expectedStdout"] = json!("example-agent 1.0.0 ");
+        cases.push(vec![padded_expected_stdout]);
 
         let mut relative_executable = valid.clone();
         relative_executable["executable"] = json!("bin/agent");
@@ -335,6 +379,19 @@ mod tests {
                 .clone();
             assert_ne!(baseline, changed_digest, "{pointer} was not content-bound");
         }
+
+        let mut presentation_change = original;
+        presentation_change["displayName"] = json!("Renamed Example Agent");
+        let presentation_digest =
+            ExecutionBindingCatalog::from_json(&catalog_json(vec![presentation_change])?)?
+                .resolve("agent@1.0.0")
+                .ok_or_else(|| "presentation-only binding did not resolve".to_owned())?
+                .binding_digest
+                .clone();
+        assert_eq!(
+            baseline, presentation_digest,
+            "presentation-only displayName must not change execution identity"
+        );
         Ok(())
     }
 }

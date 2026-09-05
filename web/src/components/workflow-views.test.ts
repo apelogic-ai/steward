@@ -8,4 +8,9 @@ describe("Workflow agent catalog", () => {
     expect(source).toContain('agents.length === 0');
     expect(source).toContain('title="No coding agents configured"');
   });
+
+  test("uses deployment presentation metadata without changing submitted identity", () => {
+    expect(source).toContain("agent.displayName ?? agent.agentRef");
+    expect(source).toContain('value={agent.agentRef}');
+  });
 });

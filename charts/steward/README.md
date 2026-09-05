@@ -36,6 +36,11 @@ exactly one runnable `linux/amd64` child manifest (excluding SBOM/provenance
 attestations) and records both the release index digest and scanned platform
 digest. A missing or ambiguous runnable child fails closed.
 
+Execution bindings default to `config.apiserver.executionBindingsMode: staged`. An upgrade from a
+pre-binding release must roll out all new binaries in that mode before a second Helm operation sets
+the mode to `active`; see the repository's execution-binding upgrade note. This prevents either
+side of a mixed-version rollout from interpreting a Task under the other version's contract.
+
 ## Required secrets
 
 The chart references five existing Secrets and never creates their values:

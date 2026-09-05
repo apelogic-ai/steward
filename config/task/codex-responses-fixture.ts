@@ -1,7 +1,7 @@
 type JsonObject = Record<string, unknown>;
 
 const encoder = new TextEncoder();
-const declaredOutput = "Repository review completed by codex@0.140.0.";
+const declaredOutput = "Repository review completed by the configured Codex runtime.";
 const governedContents = "governed fixture file contents";
 
 function responseEnvelope(id: string, output: JsonObject[], status: string): JsonObject {

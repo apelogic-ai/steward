@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use steward_store::PgStore;
 use steward_store::{StoreError, WorkflowPublication, WorkflowRevisionRecord};
 
+use crate::ExecutionBindingAdvertisement;
 use crate::browser_auth::{
     BrowserAdminAuthority, BrowserAuthService, BrowserMutationProof, protect_browser_admin_routes,
 };
@@ -149,7 +150,7 @@ pub struct WorkflowRevisionResponse {
 pub struct WorkflowListResponse {
     pub api_version: &'static str,
     /// Exact logical agent references from the deployment-owned execution catalog.
-    pub agents: Vec<String>,
+    pub agents: Vec<ExecutionBindingAdvertisement>,
     pub workflows: Vec<WorkflowRevisionView>,
 }
 
@@ -208,10 +209,11 @@ impl WorkflowRepository for PgStore {
 #[derive(Clone)]
 pub(crate) struct WorkflowApiState<L> {
     repository: L,
-    agents: BTreeSet<String>,
+    allowed_agents: BTreeSet<String>,
+    agents: Vec<ExecutionBindingAdvertisement>,
 }
 
-fn inner_admin_router<L>(repository: L, agents: Vec<String>) -> Router
+fn inner_admin_router<L>(repository: L, agents: Vec<ExecutionBindingAdvertisement>) -> Router
 where
     L: WorkflowRepository,
 {
@@ -230,7 +232,8 @@ where
         )
         .with_state(WorkflowApiState {
             repository,
-            agents: agents.into_iter().collect(),
+            allowed_agents: agents.iter().map(|agent| agent.agent_ref.clone()).collect(),
+            agents,
         })
 }
 
@@ -244,7 +247,7 @@ where
 pub fn protected_admin_router_with_agents<L>(
     repository: L,
     browser_auth: BrowserAuthService,
-    agents: Vec<String>,
+    agents: Vec<ExecutionBindingAdvertisement>,
 ) -> Router
 where
     L: WorkflowRepository,
@@ -274,7 +277,7 @@ where
     match state.repository.list_latest_workflows().await {
         Ok(workflows) => Json(WorkflowListResponse {
             api_version: BROWSER_WORKFLOW_API_VERSION,
-            agents: state.agents.iter().cloned().collect(),
+            agents: state.agents.clone(),
             workflows: workflows.into_iter().map(Into::into).collect(),
         })
         .into_response(),
@@ -384,13 +387,13 @@ async fn publish_workflow<L>(
 where
     L: WorkflowRepository,
 {
-    if state.agents.is_empty() {
+    if state.allowed_agents.is_empty() {
         return ApiError::TaskRuntimeContractUnavailable(
             "no coding agents are configured for Workflow publication".to_owned(),
         )
         .into_response();
     }
-    if request.validate(&state.agents).is_err() {
+    if request.validate(&state.allowed_agents).is_err() {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
     let digest = workflow_content_digest(&request.agent, &request.prompt);
@@ -452,6 +455,7 @@ mod tests {
         WorkflowRepository, protected_admin_router_with_agents,
     };
     use crate::BoxFuture;
+    use crate::ExecutionBindingAdvertisement;
     use crate::browser_auth::{
         BrowserAuthService, LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service,
     };
@@ -459,6 +463,13 @@ mod tests {
 
     const TEST_AGENT: &str = "example-agent@1.0.0";
     const TEST_AGENT_TWO: &str = "example-agent@2.0.0";
+
+    fn advertised_agent(agent_ref: &str, display_name: &str) -> ExecutionBindingAdvertisement {
+        ExecutionBindingAdvertisement {
+            agent_ref: agent_ref.to_owned(),
+            display_name: Some(display_name.to_owned()),
+        }
+    }
 
     #[test]
     fn malformed_or_unversioned_workflow_references_fail_closed() {
@@ -797,7 +808,10 @@ mod tests {
         let app: Router = protected_admin_router_with_agents(
             repository.clone(),
             auth,
-            vec![TEST_AGENT.to_owned(), TEST_AGENT_TWO.to_owned()],
+            vec![
+                advertised_agent(TEST_AGENT, "Example Agent 1"),
+                advertised_agent(TEST_AGENT_TWO, "Example Agent 2"),
+            ],
         );
         let listed = app
             .clone()
@@ -818,8 +832,11 @@ mod tests {
         .map_err(|error| error.to_string())?;
         assert_eq!(
             listed.pointer("/agents"),
-            Some(&serde_json::json!([TEST_AGENT, TEST_AGENT_TWO])),
-            "the authoring UI must receive only deployment-advertised logical references"
+            Some(&serde_json::json!([
+                {"agentRef": TEST_AGENT, "displayName": "Example Agent 1"},
+                {"agentRef": TEST_AGENT_TWO, "displayName": "Example Agent 2"}
+            ])),
+            "the authoring UI must receive deployment presentation metadata with exact logical references"
         );
         let created_v1 = app
             .clone()

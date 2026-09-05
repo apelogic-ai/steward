@@ -74,6 +74,8 @@ config:
     jiraAccountEmail: alice@example.com
     kubernetesTokenReviewAudience: https://kubernetes.default.svc
     taskWorkflowsJson: "[]"
+    # Keep staged for the first binary rollout; activate only after every controller is upgraded.
+    executionBindingsMode: staged
     # Deployment-owned catalog. An empty list advertises no coding agents and creates no fallback.
     executionBindings:
       apiVersion: steward.execution-bindings/v1

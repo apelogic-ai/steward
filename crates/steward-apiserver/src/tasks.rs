@@ -83,6 +83,7 @@ struct VersionedTaskPlan {
 pub struct TaskApiConfig {
     mcp_gateway_endpoint: Option<String>,
     execution_bindings: ExecutionBindingCatalog,
+    execution_bindings_active: bool,
 }
 
 impl TaskApiConfig {
@@ -95,6 +96,7 @@ impl TaskApiConfig {
         Ok(Self {
             mcp_gateway_endpoint,
             execution_bindings: ExecutionBindingCatalog::default(),
+            execution_bindings_active: false,
         })
     }
 
@@ -105,14 +107,27 @@ impl TaskApiConfig {
         Ok(self)
     }
 
+    pub const fn with_execution_bindings_active(mut self, active: bool) -> Self {
+        self.execution_bindings_active = active;
+        self
+    }
+
     pub fn execution_binding_refs(&self) -> Vec<String> {
-        self.execution_bindings.agent_refs()
+        if self.execution_bindings_active {
+            self.execution_bindings.agent_refs()
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn execution_binding_advertisements(
         &self,
     ) -> Vec<crate::execution_bindings::ExecutionBindingAdvertisement> {
-        self.execution_bindings.advertisements()
+        if self.execution_bindings_active {
+            self.execution_bindings.advertisements()
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -169,8 +184,9 @@ fn resolve_versioned_task_plan(
         ));
     };
     let execution_binding = config
-        .execution_bindings
-        .resolve(&workflow.agent)
+        .execution_bindings_active
+        .then(|| config.execution_bindings.resolve(&workflow.agent))
+        .flatten()
         .cloned()
         .ok_or_else(|| {
             ApiError::TaskRuntimeContractUnavailable(format!(
@@ -2017,8 +2033,9 @@ mod workflow_request_tests {
 
     fn task_config(endpoint: Option<&str>) -> Result<TaskApiConfig, String> {
         let workflow = workflow();
-        TaskApiConfig::new(endpoint.map(str::to_owned))?
-            .with_execution_bindings_json(Some(&execution_catalog(&workflow.agent, 'a')?))
+        Ok(TaskApiConfig::new(endpoint.map(str::to_owned))?
+            .with_execution_bindings_json(Some(&execution_catalog(&workflow.agent, 'a')?))?
+            .with_execution_bindings_active(true))
     }
 
     #[test]
@@ -2027,6 +2044,29 @@ mod workflow_request_tests {
             versioned_workflow_reference("repository-review@1", Some("base")).is_err(),
             "versioned Workflow requests must not let the caller select the coding runtime"
         );
+    }
+
+    #[test]
+    fn staged_execution_catalog_is_validated_but_not_advertised_or_selected() -> Result<(), String>
+    {
+        let workflow = workflow();
+        let config = TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
+            .with_execution_bindings_json(Some(&execution_catalog(&workflow.agent, 'a')?))?;
+        assert!(config.execution_binding_refs().is_empty());
+        assert!(config.execution_binding_advertisements().is_empty());
+        assert!(
+            resolve_versioned_task_plan(
+                &identity("usr_0123456789abcdef0123456789abcdef")?,
+                workflow,
+                vec![provisioned_envelope(
+                    "usr_0123456789abcdef0123456789abcdef",
+                )?],
+                &config,
+            )
+            .is_err(),
+            "the first rollout stage must not let a new apiserver feed bindings to an old controller"
+        );
+        Ok(())
     }
 
     #[test]
@@ -2282,7 +2322,8 @@ mod workflow_request_tests {
         selected_workflow.agent = "example-agent@2.0.0".to_owned();
         let catalog = execution_catalog(&selected_workflow.agent, 'b')?;
         let config = TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
-            .with_execution_bindings_json(Some(&catalog))?;
+            .with_execution_bindings_json(Some(&catalog))?
+            .with_execution_bindings_active(true);
         let plan = resolve_versioned_task_plan(
             &identity("usr_0123456789abcdef0123456789abcdef")?,
             selected_workflow,
@@ -2400,7 +2441,8 @@ mod workflow_request_tests {
                 .ok_or_else(|| "fixture provider profiles are missing".to_owned())?
                 .remove(profile);
             let config = TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
-                .with_execution_bindings_json(Some(&catalog.to_string()))?;
+                .with_execution_bindings_json(Some(&catalog.to_string()))?
+                .with_execution_bindings_active(true);
             let result = resolve_versioned_task_plan(
                 &identity("usr_0123456789abcdef0123456789abcdef")?,
                 workflow(),

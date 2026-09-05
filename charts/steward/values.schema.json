@@ -235,6 +235,7 @@
             "jiraAccountEmail",
             "kubernetesTokenReviewAudience",
             "taskWorkflowsJson",
+            "executionBindingsMode",
             "executionBindings",
             "mcpGatewayEndpoint"
           ],
@@ -248,6 +249,7 @@
               "pattern": "\\S"
             },
             "taskWorkflowsJson": {"type": "string", "pattern": "^\\s*\\[", "minLength": 2},
+            "executionBindingsMode": {"type": "string", "enum": ["staged", "active"]},
             "executionBindings": {
               "type": "object",
               "additionalProperties": false,
@@ -279,7 +281,7 @@
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 200,
-                        "pattern": "^[^\\x00-\\x1F\\x7F]+$"
+                        "pattern": "^[^\\s\\x00-\\x1F\\x7F](?:[^\\x00-\\x1F\\x7F]*[^\\s\\x00-\\x1F\\x7F])?$"
                       },
                       "adapter": {"const": "codex-v1"},
                       "image": {
@@ -312,7 +314,7 @@
                             "type": "string",
                             "minLength": 1,
                             "maxLength": 255,
-                            "pattern": "^[^\\x00-\\x1F\\x7F]+$"
+                            "pattern": "^[^\\s\\x00-\\x1F\\x7F](?:[^\\x00-\\x1F\\x7F]*[^\\s\\x00-\\x1F\\x7F])?$"
                           }
                         }
                       },
