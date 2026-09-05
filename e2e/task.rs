@@ -681,6 +681,8 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
             .contains("example-org/fixture-repository"),
         "the Task output must contain the governed tool result"
     );
+    revoke_grants(&base_url, runtime_uid, &run_dir)?;
+    wait_for_pending_runtime_authority_removal(&runtime_api, runtime_uid).await?;
     delete_task(&base_url, task_uid, "github-assertion", &run_dir)?;
     wait_for(
         &base_url,
@@ -1134,6 +1136,34 @@ fn put_archive(
     Ok(())
 }
 
+async fn wait_for_pending_runtime_authority_removal(
+    runtimes: &Api<AgentRuntime>,
+    runtime_uid: &str,
+) -> Result<(), Box<dyn Error>> {
+    for _attempt in 0..240 {
+        if let Some(runtime) = runtime_by_uid(runtimes, runtime_uid).await?
+            && runtime.metadata.annotations.as_ref().is_some_and(|annotations| {
+                annotations.contains_key(steward_types::PENDING_APPROVAL_ANNOTATION)
+            })
+            && runtime.spec.llms.is_empty()
+            && runtime.spec.tools.is_empty()
+            && runtime.status.as_ref().is_some_and(|status| {
+                status.phase == Phase::Pending
+                    && status.refs.workspace.is_none()
+                    && status.refs.sandbox.is_none()
+                    && status.refs.litellm_key.is_none()
+            })
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(io::Error::other(format!(
+        "revoked Task runtime {runtime_uid} retained provisioned authority"
+    ))
+    .into())
+}
+
 fn execute(
     base_url: &str,
     task_uid: &str,
@@ -1224,6 +1254,37 @@ fn approve(
     )?;
     if status != 200 {
         return Err(io::Error::other(format!("Task approval returned {status}")).into());
+    }
+    Ok(())
+}
+
+fn revoke_grants(
+    base_url: &str,
+    runtime_uid: &str,
+    run_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let response = run_dir.join(format!("revocation-{runtime_uid}.json"));
+    let status = curl_status(
+        Command::new("curl")
+            .args(["-sS", "-o"])
+            .arg(response)
+            .args([
+                "-w",
+                "%{http_code}",
+                "-X",
+                "POST",
+                "-H",
+                "Authorization: Bearer admin-assertion",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                r#"{"reason":"task e2e authority ended"}"#,
+                &format!("{base_url}/admin/runtimes/{runtime_uid}/grants/revoke"),
+            ]),
+        "revoke Task grants",
+    )?;
+    if status != 204 {
+        return Err(io::Error::other(format!("Task grant revocation returned {status}")).into());
     }
     Ok(())
 }

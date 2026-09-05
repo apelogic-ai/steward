@@ -101,7 +101,10 @@ fn task_runtime_action(
     if finalize_requested {
         return match (task_owns_runtime, runtime) {
             (false, _) | (true, None) => TaskRuntimeAction::MarkFinalized,
-            (true, Some(runtime)) if !runtime_is_bound || runtime.spec == *runtime_spec => {
+            (true, Some(runtime))
+                if !runtime_is_bound
+                    || task_runtime_matches_cleanup_authority(runtime_spec, runtime) =>
+            {
                 TaskRuntimeAction::DeleteRuntime
             }
             (true, Some(_)) => TaskRuntimeAction::Wait,
@@ -133,6 +136,16 @@ fn task_runtime_action(
         }
         _ => TaskRuntimeAction::Wait,
     }
+}
+
+fn task_runtime_matches_cleanup_authority(
+    task_spec: &AgentRuntimeSpec,
+    runtime: &AgentRuntime,
+) -> bool {
+    runtime.spec == *task_spec
+        || spec_digest(task_spec).is_ok_and(|digest| {
+            runtime.annotations().get(PENDING_APPROVAL_ANNOTATION) == Some(&digest)
+        })
 }
 
 fn ttl_action(
@@ -348,9 +361,15 @@ pub async fn reconcile_once<R: SandboxRuntime>(
     intent: ReconcileIntent,
     sandbox_runtime: &R,
 ) -> Result<ReconcileDecision, ReconcileError> {
-    if intent == ReconcileIntent::Ensure && is_pending_approval(runtime) {
-        return Ok(ReconcileDecision::Status(pending_approval_status(runtime)?));
-    }
+    let intent = if intent == ReconcileIntent::Ensure && is_pending_approval(runtime) {
+        if runtime_has_provisioned_authority(runtime) {
+            ReconcileIntent::Delete
+        } else {
+            return Ok(ReconcileDecision::Status(pending_approval_status(runtime)?));
+        }
+    } else {
+        intent
+    };
     let workspace_key = runtime
         .metadata
         .namespace
@@ -362,26 +381,30 @@ pub async fn reconcile_once<R: SandboxRuntime>(
         .clone()
         .map(RuntimeId)
         .ok_or(ReconcileError::MissingRuntimeUid)?;
-    let execution_binding = runtime
-        .annotations()
-        .get(TASK_EXECUTION_BINDING_ANNOTATION)
-        .map(|serialized| {
-            let binding = serde_json::from_str::<DisposableExecutionBinding>(serialized).map_err(
-                |error| ReconcileError::InvalidSpec {
-                    reason: format!("invalid task execution binding annotation: {error}"),
-                },
-            )?;
-            binding
-                .validate()
-                .map_err(|reason| ReconcileError::InvalidSpec { reason })?;
-            if binding.agent_ref != runtime.spec.agent_type.name {
-                return Err(ReconcileError::InvalidSpec {
-                    reason: "task execution binding does not match runtime agent type".to_owned(),
-                });
-            }
-            Ok(binding)
-        })
-        .transpose()?;
+    let execution_binding = if intent == ReconcileIntent::Ensure {
+        runtime
+            .annotations()
+            .get(TASK_EXECUTION_BINDING_ANNOTATION)
+            .map(|serialized| {
+                let binding = serde_json::from_str::<DisposableExecutionBinding>(serialized)
+                    .map_err(|error| ReconcileError::InvalidSpec {
+                        reason: format!("invalid task execution binding annotation: {error}"),
+                    })?;
+                binding
+                    .validate()
+                    .map_err(|reason| ReconcileError::InvalidSpec { reason })?;
+                if binding.agent_ref != runtime.spec.agent_type.name {
+                    return Err(ReconcileError::InvalidSpec {
+                        reason: "task execution binding does not match runtime agent type"
+                            .to_owned(),
+                    });
+                }
+                Ok(binding)
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let request = SandboxRequest {
         runtime: runtime_id,
         workspace_key,
@@ -442,6 +465,14 @@ fn is_pending_approval(runtime: &AgentRuntime) -> bool {
         .annotations()
         .get(PENDING_APPROVAL_ANNOTATION)
         .is_some_and(|digest| !digest.is_empty())
+}
+
+fn runtime_has_provisioned_authority(runtime: &AgentRuntime) -> bool {
+    runtime.status.as_ref().is_some_and(|status| {
+        status.refs.workspace.is_some()
+            || status.refs.sandbox.is_some()
+            || status.refs.litellm_key.is_some()
+    })
 }
 
 fn pending_approval_status(runtime: &AgentRuntime) -> Result<AgentRuntimeStatus, ReconcileError> {
@@ -1482,6 +1513,25 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         }
                     };
                 if is_pending_approval(&runtime) {
+                    let cleanup = cleanup_runtime(
+                        &runtime,
+                        context.client.clone(),
+                        &context.inference,
+                        &context.sandbox_runtime,
+                    )
+                    .await?;
+                    if let ReconcileDecision::Status(status) = cleanup {
+                        if runtime.status.as_ref() != Some(&status) {
+                            api.patch_status(
+                                &runtime.name_any(),
+                                &PatchParams::default(),
+                                &Patch::Merge(&status_merge_patch(&status)),
+                            )
+                            .await
+                            .map_err(ControllerError::Kubernetes)?;
+                        }
+                        return Ok(Action::requeue(StdDuration::from_secs(2)));
+                    }
                     if let Some(authority) = &context.authority {
                         let runtime_uid =
                             runtime
@@ -3230,6 +3280,34 @@ mod tests {
                 runtime.as_ref(),
             ),
             TaskRuntimeAction::DeleteRuntime
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalization_deletes_the_exact_bound_runtime_after_revocation_restores_its_placeholder()
+    -> Result<(), String> {
+        let TaskRuntimeCreationFixture {
+            mut task, client, ..
+        } = task_runtime_creation_fixture_with_pending(true)?;
+        task.runtime_uid = Some("created-runtime-uid".to_owned());
+        task.finalize_requested = true;
+
+        let runtime = task_runtime(&client, &RecoveringTaskRuntimeBindingStore, &task)
+            .await
+            .map_err(|error| format!("discover bound pending placeholder: {error}"))?;
+        assert_eq!(
+            task_runtime_action(
+                task.phase,
+                task.runtime_ownership,
+                task.execution_binding.as_ref(),
+                task.finalize_requested,
+                true,
+                &task.runtime_spec,
+                runtime.as_ref(),
+            ),
+            TaskRuntimeAction::DeleteRuntime,
+            "the exact bound UID must remain cleanable after its active grant is revoked"
         );
         Ok(())
     }
@@ -5036,6 +5114,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_uid_cleanup_does_not_depend_on_a_valid_execution_binding_annotation()
+    -> Result<(), String> {
+        let mut runtime = fixture();
+        runtime.metadata.annotations.get_or_insert_default().insert(
+            steward_types::TASK_EXECUTION_BINDING_ANNOTATION.to_owned(),
+            "{".to_owned(),
+        );
+        let refs = RuntimeRefs {
+            workspace: Some("workspace-team-a".to_owned()),
+            sandbox: Some("sandbox-runtime-uid-a".to_owned()),
+            litellm_key: None,
+        };
+        runtime.status = Some(AgentRuntimeStatus {
+            phase: Phase::Running,
+            observed_generation: 3,
+            spec_digest: "previously-active-digest".to_owned(),
+            refs: refs.clone(),
+            conditions: Vec::new(),
+            spend: None,
+        });
+        let sandbox_runtime = FakeSandboxRuntime {
+            state: Mutex::new(FakeState {
+                created: 1,
+                deleted: 0,
+                refs: Some(refs),
+            }),
+        };
+
+        let decision = reconcile_once(&runtime, ReconcileIntent::Delete, &sandbox_runtime)
+            .await
+            .map_err(|error| format!("exact UID cleanup was blocked: {error:?}"))?;
+        assert_eq!(decision, ReconcileDecision::Deleted);
+        assert_eq!(
+            sandbox_runtime
+                .state
+                .lock()
+                .map_err(|_| "fake runtime state lock was poisoned")?
+                .deleted,
+            1,
+            "desired-state corruption must not preserve an exact UID's external authority"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn pending_initial_approval_does_not_provision_a_sandbox() -> Result<(), String> {
         let mut runtime = fixture();
         runtime.metadata.annotations.get_or_insert_default().insert(
@@ -5063,6 +5186,56 @@ mod tests {
                 .created,
             0,
             "a pending create must not allocate an OpenShell sandbox"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restored_pending_placeholder_removes_previously_provisioned_sandbox_authority()
+    -> Result<(), String> {
+        let mut runtime = fixture();
+        runtime.metadata.annotations.get_or_insert_default().insert(
+            PENDING_APPROVAL_ANNOTATION.to_owned(),
+            "request-digest".to_owned(),
+        );
+        let refs = RuntimeRefs {
+            workspace: Some("workspace-team-a".to_owned()),
+            sandbox: Some("sandbox-runtime-uid-a".to_owned()),
+            litellm_key: None,
+        };
+        runtime.status = Some(AgentRuntimeStatus {
+            phase: Phase::Running,
+            observed_generation: 3,
+            spec_digest: "previously-active-digest".to_owned(),
+            refs: refs.clone(),
+            conditions: Vec::new(),
+            spend: None,
+        });
+        let sandbox_runtime = FakeSandboxRuntime {
+            state: Mutex::new(FakeState {
+                created: 1,
+                deleted: 0,
+                refs: Some(refs),
+            }),
+        };
+
+        let decision = reconcile_once(&runtime, ReconcileIntent::Ensure, &sandbox_runtime)
+            .await
+            .map_err(|error| format!("restored pending reconcile failed: {error:?}"))?;
+
+        assert_eq!(
+            decision,
+            ReconcileDecision::Deleted,
+            "revoked authority must remove an already-provisioned sandbox before the placeholder returns to Pending"
+        );
+        assert_eq!(
+            sandbox_runtime
+                .state
+                .lock()
+                .map_err(|_| "fake runtime state lock was poisoned")?
+                .deleted,
+            1,
+            "the pending fast path must not retain the sandbox that held the revoked provider"
         );
         Ok(())
     }
