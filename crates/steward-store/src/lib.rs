@@ -7,7 +7,7 @@ use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec,
-    envelope_is_within,
+    envelope_is_within, evaluate,
 };
 use steward_types::{
     AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
@@ -1550,15 +1550,20 @@ impl PgStore {
     ) -> Result<ParkedAdmission, StoreError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(format!(
-                "{}:{}:{}:{}:{}:{}:{}",
-                request.runtime_uid,
-                request.spec_digest,
-                request.envelope_revision,
-                request.base_spec_digest,
-                request.base_pending_approval_digest.unwrap_or_default(),
-                request.actor,
-                request.member_role,
+            .bind(request.task_uid.map_or_else(
+                || {
+                    format!(
+                        "{}:{}:{}:{}:{}:{}:{}",
+                        request.runtime_uid,
+                        request.spec_digest,
+                        request.envelope_revision,
+                        request.base_spec_digest,
+                        request.base_pending_approval_digest.unwrap_or_default(),
+                        request.actor,
+                        request.member_role,
+                    )
+                },
+                |task_uid| format!("task-admission:{task_uid}"),
             ))
             .execute(&mut *transaction)
             .await
@@ -1568,17 +1573,27 @@ impl PgStore {
                 admission_decisions.id AS decision_id, \
                 approvals.id AS approval_id, \
                 approvals.decision_key, \
-                approvals.evidence_url \
+                approvals.evidence_url, \
+                admission_decisions.runtime_uid, admission_decisions.runtime_namespace, \
+                admission_decisions.runtime_name, admission_decisions.spec_digest, \
+                admission_decisions.envelope_rev, admission_decisions.base_spec_digest, \
+                admission_decisions.base_pending_approval_digest, \
+                admission_decisions.base_spec, admission_decisions.deltas, \
+                admission_decisions.proposed_spec, admission_decisions.actor, \
+                admission_decisions.member_role \
              FROM admission_decisions \
              JOIN approvals ON approvals.admission_decision_id = admission_decisions.id \
-             WHERE admission_decisions.runtime_uid = $1 \
-               AND admission_decisions.spec_digest = $2 \
-               AND admission_decisions.envelope_rev = $3 \
-               AND admission_decisions.base_spec_digest = $4 \
-               AND admission_decisions.actor = $5 \
-               AND admission_decisions.member_role = $6 \
-               AND admission_decisions.base_pending_approval_digest IS NOT DISTINCT FROM $7 \
-               AND approvals.state = 'pending' \
+             WHERE (($8::uuid IS NOT NULL AND admission_decisions.task_uid = $8) \
+                    OR ($8::uuid IS NULL \
+                        AND admission_decisions.runtime_uid = $1 \
+                        AND admission_decisions.spec_digest = $2 \
+                        AND admission_decisions.envelope_rev = $3 \
+                        AND admission_decisions.base_spec_digest = $4 \
+                        AND admission_decisions.actor = $5 \
+                        AND admission_decisions.member_role = $6 \
+                        AND admission_decisions.base_pending_approval_digest \
+                            IS NOT DISTINCT FROM $7)) \
+               AND ($8::uuid IS NOT NULL OR approvals.state = 'pending') \
              ORDER BY admission_decisions.at DESC \
              LIMIT 1",
         )
@@ -1589,10 +1604,60 @@ impl PgStore {
         .bind(request.actor)
         .bind(request.member_role)
         .bind(request.base_pending_approval_digest)
+        .bind(request.task_uid)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
         if let Some(row) = existing {
+            let Json(base_spec) = row
+                .try_get::<Json<AgentRuntimeSpec>, _>("base_spec")
+                .map_err(database_error)?;
+            let Json(deltas) = row
+                .try_get::<Json<Vec<AdmissionDelta>>, _>("deltas")
+                .map_err(database_error)?;
+            let Json(proposed_spec) = row
+                .try_get::<Json<AgentRuntimeSpec>, _>("proposed_spec")
+                .map_err(database_error)?;
+            if row
+                .try_get::<String, _>("runtime_uid")
+                .map_err(database_error)?
+                != request.runtime_uid
+                || row
+                    .try_get::<String, _>("runtime_namespace")
+                    .map_err(database_error)?
+                    != request.runtime_namespace
+                || row
+                    .try_get::<String, _>("runtime_name")
+                    .map_err(database_error)?
+                    != request.runtime_name
+                || row
+                    .try_get::<String, _>("spec_digest")
+                    .map_err(database_error)?
+                    != request.spec_digest
+                || row
+                    .try_get::<i64, _>("envelope_rev")
+                    .map_err(database_error)?
+                    != request.envelope_revision
+                || row
+                    .try_get::<String, _>("base_spec_digest")
+                    .map_err(database_error)?
+                    != request.base_spec_digest
+                || row
+                    .try_get::<Option<String>, _>("base_pending_approval_digest")
+                    .map_err(database_error)?
+                    .as_deref()
+                    != request.base_pending_approval_digest
+                || base_spec != *request.base_spec
+                || deltas != request.deltas
+                || proposed_spec != *request.proposed_spec
+                || row.try_get::<String, _>("actor").map_err(database_error)? != request.actor
+                || row
+                    .try_get::<String, _>("member_role")
+                    .map_err(database_error)?
+                    != request.member_role
+            {
+                return Err(StoreError::TaskIdempotencyConflict);
+            }
             let parked = ParkedAdmission {
                 decision_id: row.try_get("decision_id").map_err(database_error)?,
                 approval_id: row.try_get("approval_id").map_err(database_error)?,
@@ -1609,8 +1674,8 @@ impl PgStore {
             "INSERT INTO admission_decisions \
              (id, runtime_uid, spec_digest, envelope_rev, verdict, deltas, proposed_spec, actor, \
               member_role, base_spec_digest, base_spec, runtime_namespace, runtime_name, \
-              base_pending_approval_digest) \
-             VALUES ($1, $2, $3, $4, 'reject', $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+              base_pending_approval_digest, task_uid) \
+             VALUES ($1, $2, $3, $4, 'reject', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(decision_id)
         .bind(request.runtime_uid)
@@ -1625,6 +1690,7 @@ impl PgStore {
         .bind(request.runtime_namespace)
         .bind(request.runtime_name)
         .bind(request.base_pending_approval_digest)
+        .bind(request.task_uid)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -1655,67 +1721,242 @@ impl PgStore {
     /// ensures retries recover the original approval even if an older server created a duplicate.
     pub async fn task_admission(
         &self,
-        lookup: TaskAdmissionLookup<'_>,
+        lookup: TaskAdmissionLookup,
     ) -> Result<Option<TaskAdmissionRecord>, StoreError> {
-        let row = sqlx::query(
+        let mut rows = sqlx::query(
             "SELECT admission_decisions.id AS decision_id, approvals.id AS approval_id, \
                     admission_decisions.runtime_uid, approvals.state, approvals.decision_key, \
                     approvals.evidence_url, admission_decisions.deltas, \
                     admission_decisions.proposed_spec \
              FROM admission_decisions \
              JOIN approvals ON approvals.admission_decision_id = admission_decisions.id \
-             WHERE admission_decisions.runtime_namespace = $1 \
-               AND admission_decisions.runtime_name = $2 \
-               AND admission_decisions.spec_digest = $3 \
-               AND admission_decisions.envelope_rev = $4 \
-               AND admission_decisions.actor = $5 \
-               AND admission_decisions.member_role = $6 \
-               AND admission_decisions.base_pending_approval_digest = $3 \
+             WHERE admission_decisions.task_uid = $1 \
              ORDER BY admission_decisions.at, admission_decisions.id, approvals.id \
              LIMIT 1",
         )
-        .bind(lookup.runtime_namespace)
-        .bind(lookup.runtime_name)
-        .bind(lookup.spec_digest)
-        .bind(lookup.envelope_revision)
-        .bind(lookup.actor)
-        .bind(lookup.member_role)
-        .fetch_optional(&self.pool)
+        .bind(lookup.task_uid)
+        .fetch_all(&self.pool)
         .await
         .map_err(database_error)?;
-        row.map(|row| {
-            let state = match row
-                .try_get::<String, _>("state")
-                .map_err(database_error)?
-                .as_str()
-            {
-                "pending" => AdmissionApprovalState::Pending,
-                "approved" => AdmissionApprovalState::Approved,
-                "rejected" => AdmissionApprovalState::Rejected,
-                value => {
-                    return Err(StoreError::Database(format!(
-                        "persisted approval has unsupported state {value}"
-                    )));
-                }
-            };
-            let Json(deltas) = row
-                .try_get::<Json<Vec<AdmissionDelta>>, _>("deltas")
-                .map_err(database_error)?;
-            let Json(proposed_spec) = row
-                .try_get::<Json<AgentRuntimeSpec>, _>("proposed_spec")
-                .map_err(database_error)?;
-            Ok(TaskAdmissionRecord {
-                decision_id: row.try_get("decision_id").map_err(database_error)?,
-                approval_id: row.try_get("approval_id").map_err(database_error)?,
-                runtime_uid: row.try_get("runtime_uid").map_err(database_error)?,
-                state,
-                decision_key: row.try_get("decision_key").map_err(database_error)?,
-                evidence_url: row.try_get("evidence_url").map_err(database_error)?,
-                deltas,
-                proposed_spec,
-            })
+        if rows.len() > 1 {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        rows.pop().map(task_admission_record).transpose()
+    }
+
+    /// Returns a grant only when it is the exact, currently effective authority for this Task.
+    /// Historical approval state alone never authorizes restoration or execution.
+    pub async fn task_grant_application(
+        &self,
+        task_uid: Uuid,
+        runtime_uid: &str,
+    ) -> Result<Option<GrantApplication>, StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let (_, authority) = self
+            .effective_task_authority(&mut transaction, task_uid, Some(runtime_uid))
+            .await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(match authority {
+            EffectiveTaskAuthority::Active(application) => Some(*application),
+            EffectiveTaskAuthority::Baseline
+            | EffectiveTaskAuthority::Pending
+            | EffectiveTaskAuthority::Inactive => None,
         })
-        .transpose()
+    }
+
+    async fn effective_task_authority(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Postgres>,
+        task_uid: Uuid,
+        expected_runtime_uid: Option<&str>,
+    ) -> Result<(TaskRecord, EffectiveTaskAuthority), StoreError> {
+        let task = sqlx::query("SELECT * FROM task_submissions WHERE task_uid = $1 FOR UPDATE")
+            .bind(task_uid)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(database_error)?
+            .map(task_record)
+            .transpose()?
+            .ok_or(StoreError::TaskNotFound)?;
+        lock_envelope_scope(
+            transaction,
+            EnvelopeScopeKind::Service,
+            &task.submitter_service,
+        )
+        .await?;
+        let latest_envelope = sqlx::query(
+            "SELECT revision, spec FROM envelopes \
+             WHERE scope_kind = 'service' AND scope_ref = $1 \
+             ORDER BY revision DESC LIMIT 1",
+        )
+        .bind(&task.submitter_service)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+        let latest_envelope = latest_envelope
+            .map(|row| {
+                let revision = row.try_get("revision").map_err(database_error)?;
+                let Json(spec) = row
+                    .try_get::<Json<EnvelopeSpec>, _>("spec")
+                    .map_err(database_error)?;
+                Ok::<_, StoreError>(Envelope { revision, spec })
+            })
+            .transpose()?;
+        let internal_authority_pinned = task.internal_authority_id.is_some()
+            && task.internal_authority_version.is_some()
+            && task.internal_authority_digest.is_some();
+        let current_envelope = latest_envelope
+            .as_ref()
+            .is_some_and(|envelope| envelope.revision == task.envelope_revision);
+        let current_baseline_authority = internal_authority_pinned
+            || latest_envelope.as_ref().is_some_and(|envelope| {
+                envelope.revision == task.envelope_revision
+                    && matches!(
+                        evaluate(&task.runtime_spec, envelope),
+                        Ok(AdmissionDecision::Admit)
+                    )
+            });
+
+        let mut rows = sqlx::query(
+            "SELECT admission_decisions.id AS decision_id, approvals.id AS approval_id, \
+                    admission_decisions.runtime_uid, approvals.runtime_uid AS approval_runtime_uid, \
+                    approvals.state, approvals.decision_key, approvals.evidence_url, \
+                    admission_decisions.deltas, admission_decisions.proposed_spec, \
+                    admission_decisions.base_spec, admission_decisions.spec_digest, \
+                    admission_decisions.base_pending_approval_digest, \
+                    admission_decisions.runtime_namespace, admission_decisions.runtime_name, \
+                    admission_decisions.envelope_rev, admission_decisions.actor, \
+                    admission_decisions.member_role \
+             FROM admission_decisions \
+             JOIN approvals ON approvals.admission_decision_id = admission_decisions.id \
+             WHERE admission_decisions.task_uid = $1 \
+             ORDER BY approvals.id \
+             LIMIT 2",
+        )
+        .bind(task_uid)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+        if rows.is_empty() {
+            let authority = if current_baseline_authority {
+                EffectiveTaskAuthority::Baseline
+            } else {
+                EffectiveTaskAuthority::Inactive
+            };
+            return Ok((task, authority));
+        }
+        if rows.len() != 1 {
+            return Ok((task, EffectiveTaskAuthority::Inactive));
+        }
+        let row = rows
+            .pop()
+            .ok_or_else(|| StoreError::Database("Task admission row disappeared".to_owned()))?;
+        let approval_runtime_uid = row
+            .try_get::<String, _>("approval_runtime_uid")
+            .map_err(database_error)?;
+        let runtime_namespace = row
+            .try_get::<String, _>("runtime_namespace")
+            .map_err(database_error)?;
+        let runtime_name = row
+            .try_get::<String, _>("runtime_name")
+            .map_err(database_error)?;
+        let envelope_revision = row
+            .try_get::<i64, _>("envelope_rev")
+            .map_err(database_error)?;
+        let actor = row.try_get::<String, _>("actor").map_err(database_error)?;
+        let member_role = row
+            .try_get::<String, _>("member_role")
+            .map_err(database_error)?;
+        let spec_digest = row
+            .try_get::<String, _>("spec_digest")
+            .map_err(database_error)?;
+        let base_pending_approval_digest = row
+            .try_get::<Option<String>, _>("base_pending_approval_digest")
+            .map_err(database_error)?;
+        let Json(base_spec) = row
+            .try_get::<Json<AgentRuntimeSpec>, _>("base_spec")
+            .map_err(database_error)?;
+        let admission = task_admission_record(row)?;
+        let exact_runtime = expected_runtime_uid
+            .map(|runtime_uid| runtime_uid == admission.runtime_uid)
+            .unwrap_or(true)
+            && task
+                .runtime_uid
+                .as_deref()
+                .map(|runtime_uid| runtime_uid == admission.runtime_uid)
+                .unwrap_or(true)
+            && approval_runtime_uid == admission.runtime_uid;
+        let exact_admission = current_envelope
+            && exact_runtime
+            && task.runtime_ownership == steward_types::RuntimeOwnership::Provisioned
+            && runtime_namespace == task.runtime_namespace
+            && runtime_name == task.runtime_name
+            && envelope_revision == task.envelope_revision
+            && actor == task.submitter_service
+            && member_role == task.submitter_service
+            && admission.proposed_spec == task.runtime_spec
+            && !admission.deltas.is_empty()
+            && base_pending_approval_digest.as_deref() == Some(spec_digest.as_str());
+        if !exact_admission {
+            return Ok((task, EffectiveTaskAuthority::Inactive));
+        }
+        if admission.state == AdmissionApprovalState::Pending {
+            return Ok((task, EffectiveTaskAuthority::Pending));
+        }
+        if admission.state != AdmissionApprovalState::Approved {
+            return Ok((task, EffectiveTaskAuthority::Inactive));
+        }
+
+        let grants =
+            sqlx::query("SELECT id FROM grants WHERE approval_id = $1 ORDER BY id FOR UPDATE")
+                .bind(admission.approval_id)
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(database_error)?;
+        if grants.len() != admission.deltas.len() {
+            return Ok((task, EffectiveTaskAuthority::Inactive));
+        }
+        let grant_status = sqlx::query(
+            "SELECT count(grants.id)::bigint AS grant_count, \
+                    COALESCE(bool_and( \
+                        grants.runtime_uid = $2 \
+                        AND grants.envelope_revision = $3 \
+                        AND grants.expires_at > clock_timestamp() \
+                        AND grant_revocations.grant_id IS NULL \
+                    ), false) AS grants_active \
+             FROM grants \
+             LEFT JOIN grant_revocations ON grant_revocations.grant_id = grants.id \
+             WHERE grants.approval_id = $1",
+        )
+        .bind(admission.approval_id)
+        .bind(&admission.runtime_uid)
+        .bind(envelope_revision)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+        let grant_count = grant_status
+            .try_get::<i64, _>("grant_count")
+            .map_err(database_error)?;
+        let grants_active = grant_status
+            .try_get::<bool, _>("grants_active")
+            .map_err(database_error)?;
+        if !grants_active || grant_count != admission.deltas.len() as i64 {
+            return Ok((task, EffectiveTaskAuthority::Inactive));
+        }
+        let application = GrantApplication {
+            approval_id: admission.approval_id,
+            application: GrantReversion {
+                runtime_uid: admission.runtime_uid.clone(),
+                runtime_namespace,
+                runtime_name,
+                actor,
+                member_role,
+                base_spec,
+                proposed_spec: admission.proposed_spec.clone(),
+                base_pending_approval_digest,
+            },
+        };
+        Ok((task, EffectiveTaskAuthority::Active(Box::new(application))))
     }
 
     pub async fn pending_approvals(&self) -> Result<Vec<PendingApproval>, StoreError> {
@@ -3176,7 +3417,31 @@ impl PgStore {
         if runtime_uid.is_empty() {
             return Err(StoreError::InvalidTaskTransition);
         }
-        let result = sqlx::query(
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let (current, authority) = self
+            .effective_task_authority(&mut transaction, task_uid, Some(runtime_uid))
+            .await?;
+        let authority_allows_binding = match phase {
+            steward_types::TaskPhase::Parked => {
+                matches!(authority, EffectiveTaskAuthority::Pending)
+            }
+            steward_types::TaskPhase::Submitted | steward_types::TaskPhase::Queued => matches!(
+                authority,
+                EffectiveTaskAuthority::Baseline | EffectiveTaskAuthority::Active(_)
+            ),
+            steward_types::TaskPhase::Running
+            | steward_types::TaskPhase::Succeeded
+            | steward_types::TaskPhase::Failed
+            | steward_types::TaskPhase::Cancelled => false,
+        };
+        if !authority_allows_binding {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        if current.runtime_uid.as_deref() == Some(runtime_uid) {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(current);
+        }
+        let row = sqlx::query(
             "UPDATE task_submissions \
              SET runtime_uid = $2, \
                  phase = CASE WHEN execute_requested THEN phase ELSE $3 END, \
@@ -3184,22 +3449,21 @@ impl PgStore {
              WHERE task_uid = $1 AND runtime_uid IS NULL \
                AND NOT finalize_requested AND NOT finalized \
                AND ((NOT execute_requested AND phase = 'submitted') \
-                    OR (execute_requested AND phase IN ('parked', 'queued')))",
+                    OR (execute_requested AND phase IN ('parked', 'queued'))) \
+             RETURNING *",
         )
         .bind(task_uid)
         .bind(runtime_uid)
         .bind(task_phase_text(phase))
-        .execute(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
-        if result.rows_affected() == 1 {
-            return self.task(task_uid).await?.ok_or(StoreError::TaskNotFound);
-        }
-        let current = self.task(task_uid).await?.ok_or(StoreError::TaskNotFound)?;
-        if current.runtime_uid.as_deref() == Some(runtime_uid) {
-            return Ok(current);
-        }
-        Err(StoreError::InvalidTaskTransition)
+        let Some(row) = row else {
+            return Err(StoreError::InvalidTaskTransition);
+        };
+        let record = task_record(row)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(record)
     }
 
     pub async fn task(&self, task_uid: Uuid) -> Result<Option<TaskRecord>, StoreError> {
@@ -3396,16 +3660,59 @@ impl PgStore {
     }
 
     pub async fn claim_task_execution(&self, task_uid: Uuid) -> Result<bool, StoreError> {
-        sqlx::query(
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let task = sqlx::query("SELECT * FROM task_submissions WHERE task_uid = $1 FOR UPDATE")
+            .bind(task_uid)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?
+            .map(task_record)
+            .transpose()?
+            .ok_or(StoreError::TaskNotFound)?;
+        if task.phase != steward_types::TaskPhase::Queued
+            || !task.execute_requested
+            || task.finalize_requested
+        {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(false);
+        }
+        let runtime_uid = task
+            .runtime_uid
+            .as_deref()
+            .ok_or(StoreError::InvalidTaskTransition)?;
+        let (_, authority) = self
+            .effective_task_authority(&mut transaction, task_uid, Some(runtime_uid))
+            .await?;
+        if !matches!(
+            authority,
+            EffectiveTaskAuthority::Baseline | EffectiveTaskAuthority::Active(_)
+        ) {
+            sqlx::query(
+                "UPDATE task_submissions \
+                 SET phase = 'failed', finalize_requested = true, \
+                     failure_reason = 'admission_authority_inactive', updated_at = now() \
+                 WHERE task_uid = $1 AND phase = 'queued' AND execute_requested \
+                   AND NOT finalize_requested",
+            )
+            .bind(task_uid)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(false);
+        }
+        let claimed = sqlx::query(
             "UPDATE task_submissions SET phase = 'running', updated_at = now() \
              WHERE task_uid = $1 AND phase = 'queued' AND execute_requested \
                AND NOT finalize_requested",
         )
         .bind(task_uid)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(database_error)
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(claimed)
     }
 
     pub async fn complete_task_execution(
@@ -4425,6 +4732,7 @@ pub struct ActiveTaskRuntime {
 }
 
 pub struct ParkRejection<'a> {
+    pub task_uid: Option<Uuid>,
     pub runtime_uid: &'a str,
     pub runtime_namespace: &'a str,
     pub runtime_name: &'a str,
@@ -4447,13 +4755,8 @@ pub struct ParkedAdmission {
     pub evidence_url: Option<String>,
 }
 
-pub struct TaskAdmissionLookup<'a> {
-    pub runtime_namespace: &'a str,
-    pub runtime_name: &'a str,
-    pub spec_digest: &'a str,
-    pub envelope_revision: i64,
-    pub actor: &'a str,
-    pub member_role: &'a str,
+pub struct TaskAdmissionLookup {
+    pub task_uid: Uuid,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4473,6 +4776,13 @@ pub struct TaskAdmissionRecord {
     pub evidence_url: Option<String>,
     pub deltas: Vec<AdmissionDelta>,
     pub proposed_spec: AgentRuntimeSpec,
+}
+
+enum EffectiveTaskAuthority {
+    Baseline,
+    Pending,
+    Active(Box<GrantApplication>),
+    Inactive,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -4900,6 +5210,39 @@ fn connection_operation_record(
         output_archive: row.try_get("output_archive").map_err(database_error)?,
         finalize_requested: row.try_get("finalize_requested").map_err(database_error)?,
         finalized: row.try_get("finalized").map_err(database_error)?,
+    })
+}
+
+fn task_admission_record(row: sqlx::postgres::PgRow) -> Result<TaskAdmissionRecord, StoreError> {
+    let state = match row
+        .try_get::<String, _>("state")
+        .map_err(database_error)?
+        .as_str()
+    {
+        "pending" => AdmissionApprovalState::Pending,
+        "approved" => AdmissionApprovalState::Approved,
+        "rejected" => AdmissionApprovalState::Rejected,
+        value => {
+            return Err(StoreError::Database(format!(
+                "persisted approval has unsupported state {value}"
+            )));
+        }
+    };
+    let Json(deltas) = row
+        .try_get::<Json<Vec<AdmissionDelta>>, _>("deltas")
+        .map_err(database_error)?;
+    let Json(proposed_spec) = row
+        .try_get::<Json<AgentRuntimeSpec>, _>("proposed_spec")
+        .map_err(database_error)?;
+    Ok(TaskAdmissionRecord {
+        decision_id: row.try_get("decision_id").map_err(database_error)?,
+        approval_id: row.try_get("approval_id").map_err(database_error)?,
+        runtime_uid: row.try_get("runtime_uid").map_err(database_error)?,
+        state,
+        decision_key: row.try_get("decision_key").map_err(database_error)?,
+        evidence_url: row.try_get("evidence_url").map_err(database_error)?,
+        deltas,
+        proposed_spec,
     })
 }
 

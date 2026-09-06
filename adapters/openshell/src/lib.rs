@@ -4188,7 +4188,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn removing_tool_authority_plans_provider_detach() {
+    fn removing_tool_authority_plans_provider_detach() -> Result<(), String> {
         let projection = project_request(
             &SandboxRequest {
                 runtime: RuntimeId("runtime-uid-a".to_owned()),
@@ -4205,7 +4205,7 @@ mod tests {
             None,
             None,
         )
-        .expect("provider-removal projection must be valid");
+        .map_err(|error| format!("provider-removal projection failed: {error:?}"))?;
         assert_eq!(
             provider_reconciliation_targets(&projection),
             [
@@ -4214,6 +4214,7 @@ mod tests {
             ],
             "removing all authority must explicitly reconcile both Steward providers absent"
         );
+        Ok(())
     }
 
     #[cfg(feature = "runtime")]

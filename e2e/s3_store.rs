@@ -306,6 +306,7 @@ async fn s3_postgres_keeps_envelopes_immutable_and_parks_exact_rejections()
     base_spec.budget.monthly_limit = "100.00".to_owned();
     let parked = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: &runtime_uid,
             runtime_namespace: "team-a",
             runtime_name: "runtime-a",
@@ -336,6 +337,7 @@ async fn s3_postgres_keeps_envelopes_immutable_and_parks_exact_rejections()
     let other_runtime_uid = format!("runtime-other-{suffix}");
     let other = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: &other_runtime_uid,
             runtime_namespace: "team-a",
             runtime_name: "runtime-b",

@@ -1142,9 +1142,13 @@ async fn wait_for_pending_runtime_authority_removal(
 ) -> Result<(), Box<dyn Error>> {
     for _attempt in 0..240 {
         if let Some(runtime) = runtime_by_uid(runtimes, runtime_uid).await?
-            && runtime.metadata.annotations.as_ref().is_some_and(|annotations| {
-                annotations.contains_key(steward_types::PENDING_APPROVAL_ANNOTATION)
-            })
+            && runtime
+                .metadata
+                .annotations
+                .as_ref()
+                .is_some_and(|annotations| {
+                    annotations.contains_key(steward_types::PENDING_APPROVAL_ANNOTATION)
+                })
             && runtime.spec.llms.is_empty()
             && runtime.spec.tools.is_empty()
             && runtime.status.as_ref().is_some_and(|status| {
@@ -1258,11 +1262,7 @@ fn approve(
     Ok(())
 }
 
-fn revoke_grants(
-    base_url: &str,
-    runtime_uid: &str,
-    run_dir: &Path,
-) -> Result<(), Box<dyn Error>> {
+fn revoke_grants(base_url: &str, runtime_uid: &str, run_dir: &Path) -> Result<(), Box<dyn Error>> {
     let response = run_dir.join(format!("revocation-{runtime_uid}.json"));
     let status = curl_status(
         Command::new("curl")

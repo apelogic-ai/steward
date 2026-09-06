@@ -1580,6 +1580,7 @@ where
             &self.ledger,
             &self.decisions,
             TaskRuntimePlan {
+                task_uid: reservation.record.task_uid,
                 namespace: &workflow.namespace,
                 name: &runtime_name,
                 service: &identity.service,
@@ -1638,12 +1639,7 @@ where
         if let Some(admission) = self
             .ledger
             .task_admission(TaskAdmissionLookup {
-                runtime_namespace: &record.runtime_namespace,
-                runtime_name: &record.runtime_name,
-                spec_digest: &proposed_digest,
-                envelope_revision: record.envelope_revision,
-                actor: &record.submitter_service,
-                member_role: &record.submitter_service,
+                task_uid: record.task_uid,
             })
             .await
             .map_err(ApiError::Store)?
@@ -1659,6 +1655,7 @@ where
             return match admission.state {
                 AdmissionApprovalState::Pending => {
                     let expected = pending_task_runtime(&TaskRuntimePlan {
+                        task_uid: record.task_uid,
                         namespace: &record.runtime_namespace,
                         name: &record.runtime_name,
                         service: &record.submitter_service,
@@ -1710,7 +1707,7 @@ where
                 AdmissionApprovalState::Approved => {
                     let Some(application) = self
                         .ledger
-                        .grant_application(&admission.runtime_uid)
+                        .task_grant_application(record.task_uid, &admission.runtime_uid)
                         .await
                         .map_err(ApiError::Store)?
                     else {
@@ -1732,6 +1729,7 @@ where
                         &proposed_digest,
                     )?;
                     let expected = task_runtime_manifest(&TaskRuntimePlan {
+                        task_uid: record.task_uid,
                         namespace: &record.runtime_namespace,
                         name: &record.runtime_name,
                         service: &record.submitter_service,
@@ -1753,6 +1751,7 @@ where
                         || runtime.annotations() != expected.annotations()
                     {
                         let pending = pending_task_runtime(&TaskRuntimePlan {
+                            task_uid: record.task_uid,
                             namespace: &record.runtime_namespace,
                             name: &record.runtime_name,
                             service: &record.submitter_service,
@@ -1797,6 +1796,7 @@ where
             &self.ledger,
             &self.decisions,
             TaskRuntimePlan {
+                task_uid: record.task_uid,
                 namespace: &record.runtime_namespace,
                 name: &record.runtime_name,
                 service: &record.submitter_service,
@@ -1949,6 +1949,7 @@ where
         &application.ledger,
         &application.decisions,
         TaskRuntimePlan {
+            task_uid: reservation.record.task_uid,
             namespace: VERSIONED_WORKFLOW_NAMESPACE,
             name: &runtime_name,
             service: &identity.service,
@@ -2048,6 +2049,7 @@ async fn resolve_task_identity<I: TaskIdentityResolver>(
 }
 
 struct TaskRuntimePlan<'a> {
+    task_uid: Uuid,
     namespace: &'a str,
     name: &'a str,
     service: &'a str,
@@ -2084,6 +2086,7 @@ where
     let base_digest = spec_digest(&created.spec)?;
     let parked = ledger
         .park_rejection(ParkRejection {
+            task_uid: Some(plan.task_uid),
             runtime_uid,
             runtime_namespace: plan.namespace,
             runtime_name: plan.name,

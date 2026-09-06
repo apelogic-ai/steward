@@ -1088,7 +1088,7 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
 
     fn task_admission<'a>(
         &'a self,
-        lookup: TaskAdmissionLookup<'a>,
+        lookup: TaskAdmissionLookup,
     ) -> BoxFuture<'a, Result<Option<TaskAdmissionRecord>, StoreError>>;
 
     fn pending_approvals(&self) -> BoxFuture<'_, Result<Vec<PendingApproval>, StoreError>>;
@@ -1188,6 +1188,12 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
 
     fn grant_application<'a>(
         &'a self,
+        runtime_uid: &'a str,
+    ) -> BoxFuture<'a, Result<Option<GrantApplication>, StoreError>>;
+
+    fn task_grant_application<'a>(
+        &'a self,
+        task_uid: Uuid,
         runtime_uid: &'a str,
     ) -> BoxFuture<'a, Result<Option<GrantApplication>, StoreError>>;
 }
@@ -1290,7 +1296,7 @@ impl AdmissionLedger for PgStore {
 
     fn task_admission<'a>(
         &'a self,
-        lookup: TaskAdmissionLookup<'a>,
+        lookup: TaskAdmissionLookup,
     ) -> BoxFuture<'a, Result<Option<TaskAdmissionRecord>, StoreError>> {
         Box::pin(async move { PgStore::task_admission(self, lookup).await })
     }
@@ -1457,6 +1463,14 @@ impl AdmissionLedger for PgStore {
         runtime_uid: &'a str,
     ) -> BoxFuture<'a, Result<Option<GrantApplication>, StoreError>> {
         Box::pin(async move { PgStore::grant_application(self, runtime_uid).await })
+    }
+
+    fn task_grant_application<'a>(
+        &'a self,
+        task_uid: Uuid,
+        runtime_uid: &'a str,
+    ) -> BoxFuture<'a, Result<Option<GrantApplication>, StoreError>> {
+        Box::pin(async move { PgStore::task_grant_application(self, task_uid, runtime_uid).await })
     }
 }
 
@@ -2231,6 +2245,7 @@ where
             let spec_digest = spec_digest(&proposed.spec)?;
             let parked = ledger
                 .park_rejection(ParkRejection {
+                    task_uid: None,
                     runtime_uid,
                     runtime_namespace: namespace,
                     runtime_name: name,
@@ -2393,6 +2408,7 @@ where
             let base_spec_digest = spec_digest(&created.spec)?;
             let parked = ledger
                 .park_rejection(ParkRejection {
+                    task_uid: None,
                     runtime_uid,
                     runtime_namespace: namespace,
                     runtime_name: &request.name,
@@ -5226,6 +5242,7 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeParked {
+        task_uid: Option<Uuid>,
         runtime_uid: String,
         runtime_namespace: String,
         runtime_name: String,
@@ -5377,6 +5394,7 @@ mod tests {
                     || approval_state != FakeApprovalState::Pending
                 {
                     parked.push(FakeParked {
+                        task_uid: request.task_uid,
                         runtime_uid: request.runtime_uid.to_owned(),
                         runtime_namespace: request.runtime_namespace.to_owned(),
                         runtime_name: request.runtime_name.to_owned(),
@@ -5409,21 +5427,16 @@ mod tests {
 
         fn task_admission<'a>(
             &'a self,
-            lookup: TaskAdmissionLookup<'a>,
+            lookup: TaskAdmissionLookup,
         ) -> BoxFuture<'a, Result<Option<TaskAdmissionRecord>, StoreError>> {
             Box::pin(async move {
                 let parked = self.parked.lock().map_err(|_| {
                     StoreError::Database("fake ledger lock was poisoned".to_owned())
                 })?;
-                let Some(admission) = parked.iter().find(|admission| {
-                    admission.runtime_namespace == lookup.runtime_namespace
-                        && admission.runtime_name == lookup.runtime_name
-                        && admission.base_pending_approval_digest.as_deref()
-                            == Some(lookup.spec_digest)
-                        && admission.envelope_revision == lookup.envelope_revision
-                        && admission.actor == lookup.actor
-                        && admission.member_role == lookup.member_role
-                }) else {
+                let Some(admission) = parked
+                    .iter()
+                    .find(|admission| admission.task_uid == Some(lookup.task_uid))
+                else {
                     return Ok(None);
                 };
                 let state = match *self.task_approval_state.lock().map_err(|_| {
@@ -5853,6 +5866,39 @@ mod tests {
             _runtime_uid: &'a str,
         ) -> BoxFuture<'a, Result<Option<GrantApplication>, StoreError>> {
             Box::pin(async move {
+                self.application
+                    .lock()
+                    .map(|application| {
+                        application.clone().map(|application| GrantApplication {
+                            approval_id: Uuid::nil(),
+                            application,
+                        })
+                    })
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake approved-application lock was poisoned".to_owned(),
+                        )
+                    })
+            })
+        }
+
+        fn task_grant_application<'a>(
+            &'a self,
+            task_uid: Uuid,
+            runtime_uid: &'a str,
+        ) -> BoxFuture<'a, Result<Option<GrantApplication>, StoreError>> {
+            Box::pin(async move {
+                let correlated = self
+                    .parked
+                    .lock()
+                    .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))?
+                    .iter()
+                    .any(|admission| {
+                        admission.task_uid == Some(task_uid) && admission.runtime_uid == runtime_uid
+                    });
+                if !correlated {
+                    return Ok(None);
+                }
                 self.application
                     .lock()
                     .map(|application| {

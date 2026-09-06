@@ -769,10 +769,17 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         )
         .await?;
     let mut spec = proposed_spec();
+    spec.principal = Principal::Service {
+        name: "steward-run".to_owned(),
+        acting_user: Some(Email("alice@example.com".to_owned())),
+    };
     spec.canonical_authority = Some(CanonicalAuthorityBinding::new(
         canonical.user_id.clone(),
         Some(canonical.user_id.clone()),
     )?);
+    store
+        .insert_service_envelope("steward-run", &envelope("250.00", 1), "admin@example.com")
+        .await?;
     let command = vec!["agent-v1".to_owned()];
     let legacy = sqlx::query(
         "INSERT INTO task_submissions \
@@ -981,6 +988,30 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
     assert!(
         direct_mismatch.is_err(),
         "the database must reject delegated acting_user_id != owner_user_id"
+    );
+
+    let escaped_runtime_name = format!("task-historical-escape-{suffix}");
+    let escaped_runtime_uid = format!("runtime-historical-escape-{suffix}");
+    let escaped_idempotency_key = format!("historical-escape-{suffix}");
+    let mut escaped_spec = spec.clone();
+    escaped_spec.budget.monthly_limit = "260.00".to_owned();
+    let escaped_request = TaskReservationRequest {
+        idempotency_key: &escaped_idempotency_key,
+        runtime_name: &escaped_runtime_name,
+        runtime_spec: &escaped_spec,
+        ..request
+    };
+    let escaped = store.reserve_task(&escaped_request).await?;
+    assert_eq!(
+        store
+            .bind_task_runtime(
+                escaped.record.task_uid,
+                &escaped_runtime_uid,
+                TaskPhase::Submitted,
+            )
+            .await,
+        Err(StoreError::InvalidTaskTransition),
+        "a historical over-envelope Task without an exact correlated admission must fail closed"
     );
 
     store
@@ -1239,6 +1270,7 @@ async fn s4_service_envelopes_and_grants_are_isolated_from_equal_role_names()
     }];
     let parked = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: &runtime_uid,
             runtime_namespace: "team-a",
             runtime_name: &runtime_uid,
@@ -1428,6 +1460,7 @@ async fn s4_repeated_parking_reuses_one_approval_and_one_channel_marker()
     let base_spec = base_spec();
     let deltas = budget_deltas();
     let request = || ParkRejection {
+        task_uid: None,
         runtime_uid: "runtime-retry-a",
         runtime_namespace: "team-a",
         runtime_name: "runtime-retry-a",
@@ -1461,6 +1494,61 @@ async fn s4_repeated_parking_reuses_one_approval_and_one_channel_marker()
 }
 
 #[tokio::test]
+async fn s4_task_admission_correlation_is_nullable_unique_and_immutable()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the S4 Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+
+    let nullable = sqlx::query_scalar::<_, String>(
+        "SELECT is_nullable FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'admission_decisions' \
+           AND column_name = 'task_uid'",
+    )
+    .fetch_optional(store.pool())
+    .await?;
+    assert_eq!(
+        nullable.as_deref(),
+        Some("YES"),
+        "Task admission correlation must be optional for non-Task and historical decisions"
+    );
+
+    let index_definition = sqlx::query_scalar::<_, String>(
+        "SELECT indexdef FROM pg_indexes \
+         WHERE schemaname = 'public' AND tablename = 'admission_decisions' \
+           AND indexname = 'admission_decisions_task_uid_unique'",
+    )
+    .fetch_optional(store.pool())
+    .await?;
+    let index_definition = index_definition
+        .ok_or_else(|| io::Error::other("Task admission unique partial index is missing"))?;
+    assert!(index_definition.contains("UNIQUE INDEX"));
+    assert!(index_definition.contains("WHERE (task_uid IS NOT NULL)"));
+
+    let append_only_trigger = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM pg_trigger \
+             WHERE tgrelid = 'admission_decisions'::regclass \
+               AND tgname = 'admission_decisions_are_append_only' \
+               AND NOT tgisinternal \
+         )",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert!(
+        append_only_trigger,
+        "the correlation must inherit append-only admission-decision immutability"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn s4_active_grants_expire_and_can_be_revoked_without_erasing_history()
 -> Result<(), Box<dyn Error>> {
     let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
@@ -1484,6 +1572,7 @@ async fn s4_active_grants_expire_and_can_be_revoked_without_erasing_history()
         .await?;
     let parked = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: "runtime-revocation-a",
             runtime_namespace: "team-a",
             runtime_name: "runtime-revocation-a",
@@ -1612,6 +1701,7 @@ async fn s4_application_requires_every_granted_dimension_to_remain_active()
         .await?;
     let parked = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: &runtime_uid,
             runtime_namespace: "team-a",
             runtime_name: "runtime-multigrant",
@@ -1732,6 +1822,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
     );
     let parked = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: "runtime-evidence-a",
             runtime_namespace: "team-a",
             runtime_name: "runtime-evidence-a",
@@ -1879,6 +1970,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
     );
     let next_escalation = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: "runtime-evidence-a",
             runtime_namespace: "team-a",
             runtime_name: "runtime-evidence-a",
@@ -1967,6 +2059,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
     );
     let recoverable_escalation = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: "runtime-evidence-a",
             runtime_namespace: "team-a",
             runtime_name: "runtime-evidence-a",
@@ -2044,6 +2137,7 @@ async fn s4_approval_rejects_evidence_not_bound_to_the_parked_issue() -> Result<
     );
     let current_escalation = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: "runtime-evidence-a",
             runtime_namespace: "team-a",
             runtime_name: "runtime-evidence-a",
@@ -2136,6 +2230,7 @@ async fn s4_retirement_checks_expiry_after_waiting_for_authority_locks()
         .await?;
     let winner = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: &runtime_uid,
             runtime_namespace: "team-a",
             runtime_name: "runtime-expiry",
@@ -2172,6 +2267,7 @@ async fn s4_retirement_checks_expiry_after_waiting_for_authority_locks()
         .await?;
     let loser = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: &runtime_uid,
             runtime_namespace: "team-a",
             runtime_name: "runtime-expiry",
@@ -2243,6 +2339,7 @@ async fn s4_decision_filing_claim_serializes_concurrent_retries() -> Result<(), 
     let deltas = budget_deltas();
     let parked = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: &runtime_uid,
             runtime_namespace: "team-a",
             runtime_name: "runtime-filing",
@@ -2319,6 +2416,7 @@ async fn s4_pending_create_provenance_survives_every_authority_transition()
 
     let parked = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: &runtime_uid,
             runtime_namespace: "team-a",
             runtime_name: "runtime-provenance",
@@ -2419,6 +2517,7 @@ async fn s4_pending_create_provenance_survives_every_authority_transition()
 
     let edit = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: &edit_runtime_uid,
             runtime_namespace: "team-a",
             runtime_name: "runtime-edit-provenance",
@@ -2446,6 +2545,7 @@ async fn s4_pending_create_provenance_survives_every_authority_transition()
 
     let empty_marker = store
         .park_rejection(ParkRejection {
+            task_uid: None,
             runtime_uid: &invalid_runtime_uid,
             runtime_namespace: "team-a",
             runtime_name: "runtime-invalid-provenance",
