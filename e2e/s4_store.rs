@@ -843,6 +843,18 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
     assert!(!second.inserted);
     assert_eq!(second.record.task_uid, first.record.task_uid);
 
+    store
+        .insert_service_envelope("steward-run", &envelope("250.00", 2), "admin@example.com")
+        .await?;
+    let rebound_after_envelope_revision = store
+        .bind_task_runtime(first.record.task_uid, &runtime_uid, TaskPhase::Submitted)
+        .await?;
+    assert_eq!(
+        rebound_after_envelope_revision.runtime_uid.as_deref(),
+        Some(runtime_uid.as_str()),
+        "a baseline Task admitted by the latest envelope must bind durably after a revision bump"
+    );
+
     let adopted_key = format!("adopted-{suffix}");
     let adopted_runtime_uid = format!("adopted-runtime-{suffix}");
     let adopted_request = TaskReservationRequest {

@@ -1810,11 +1810,10 @@ impl PgStore {
             .is_some_and(|envelope| envelope.revision == task.envelope_revision);
         let current_baseline_authority = internal_authority_pinned
             || latest_envelope.as_ref().is_some_and(|envelope| {
-                envelope.revision == task.envelope_revision
-                    && matches!(
-                        evaluate(&task.runtime_spec, envelope),
-                        Ok(AdmissionDecision::Admit)
-                    )
+                matches!(
+                    evaluate(&task.runtime_spec, envelope),
+                    Ok(AdmissionDecision::Admit)
+                )
             });
 
         let mut rows = sqlx::query(
