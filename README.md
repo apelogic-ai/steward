@@ -68,6 +68,8 @@ docs/
   v2/README.md                 accepted post-M1 semantics; not a wire contract
   v2/deferred-implementation-contracts.md
                                the sole current post-M1 deferred-contract register
+  task-runtime-orchestration.md
+                              accepted durable Task runtime state-machine architecture
   task-submission-api.md      lifecycle REST, tar paths, limits, identity boundary
   canonical-user-identity-v1.md
                               immutable user ID, Google OIDC mapping, reconnect contract

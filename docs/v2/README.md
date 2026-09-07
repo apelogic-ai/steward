@@ -194,6 +194,11 @@ transitions before acknowledging side effects, make retries idempotent, retain i
 bindings, recover after apiserver or controller restarts, support explicit cancellation
 and deadlines, preserve journal order, and recover exact-runtime finalization.
 
+The accepted [durable Task runtime orchestration architecture](../task-runtime-orchestration.md)
+defines the single-owner state machine, inert-first provisioning, exact-UID observation,
+authority activation, no-replay execution, cleanup, and fault-injection requirements
+that implement this durability boundary.
+
 An external durable engine is reconsidered only if a separately accepted TaskGraph or
 orchestration requirement justifies it.
 
