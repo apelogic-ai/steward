@@ -1439,6 +1439,44 @@ mod tests {
     }
 
     #[test]
+    fn durable_task_orchestration_migration_declares_the_recovery_boundary() -> Result<(), String> {
+        let migration_path = root().join("migrations/0028_durable_task_runtime_orchestration.sql");
+        let migration = fs::read_to_string(&migration_path).map_err(|error| {
+            format!(
+                "the durable Task orchestration migration must exist at {}: {error}",
+                migration_path.display()
+            )
+        })?;
+
+        for required in [
+            "CREATE TABLE task_runtime_operations",
+            "CREATE TABLE task_execution_attempts",
+            "CREATE TABLE external_effect_outbox",
+            "CREATE TABLE task_orchestration_journal",
+            "generation bigint",
+            "runtime_create_pending",
+            "runtime_observed",
+            "approval_pending",
+            "activation_pending",
+            "cleanup_pending",
+            "outcome_unknown",
+            "cancel_requested",
+            "runtime_absent_observed_at",
+            "projections_absent_observed_at",
+            "runtime_create_authorized_at",
+            "task_commands_are_monotonic",
+            "external_effect_outbox_transition_is_monotonic",
+        ] {
+            assert!(
+                migration.contains(required),
+                "the durable Task orchestration migration is missing {required}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn versioned_workflow_e2e_creates_a_run_owned_runtime_namespace() -> Result<(), String> {
         let harness = fs::read_to_string(root().join("scripts/s2-inference-inside.sh"))
             .map_err(|error| format!("in-cluster task E2E harness is required: {error}"))?;
@@ -1539,6 +1577,28 @@ mod tests {
                 assert!(
                     !source.contains(value),
                     "production source {path} embeds deployment-owned value {value}"
+                );
+            }
+        }
+
+        let core_task_sources = [
+            "crates/steward-apiserver/src/execution_bindings.rs",
+            "crates/steward-apiserver/src/tasks.rs",
+        ];
+        let adapter_owned_values = [
+            "codex",
+            "CODEX_HOME",
+            "litellm-litellm",
+            "STEWARD_MCP_GW_BEARER_TOKEN",
+            "openshell-token-grant-placeholder",
+        ];
+        for path in core_task_sources {
+            let source = fs::read_to_string(root().join(path))
+                .map_err(|error| format!("read core Task source {path}: {error}"))?;
+            for value in adapter_owned_values {
+                assert!(
+                    !source.contains(value),
+                    "core Task source {path} embeds adapter-owned value {value}"
                 );
             }
         }
@@ -2842,7 +2902,18 @@ mod tests {
         assert!(!apiserver.contains(".Values.secrets.mint"));
         assert!(!apiserver.contains(".Values.secrets.litellm"));
         assert!(!controller.contains(".Values.secrets.mint"));
-        assert!(!controller.contains(".Values.secrets.jira"));
+        assert!(
+            controller.contains("STEWARD_JIRA_TOKEN")
+                && controller.contains("STEWARD_JIRA_BASE_URL")
+                && controller.contains("STEWARD_JIRA_PROJECT_KEY")
+                && controller.contains("STEWARD_JIRA_ACCOUNT_EMAIL")
+                && controller.contains(".Values.secrets.jira"),
+            "the Task approval outbox dispatcher must receive only the Jira decision-channel configuration"
+        );
+        assert!(
+            apiserver.contains("STEWARD_TASK_INFERENCE_ENDPOINT"),
+            "the Codex execution adapter must receive its deployment-owned inference endpoint"
+        );
         assert!(!mint.contains(".Values.secrets.database"));
         assert!(!mint.contains(".Values.secrets.jira"));
         assert!(!mint.contains(".Values.secrets.litellm"));

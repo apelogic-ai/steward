@@ -44,7 +44,8 @@ use steward_ports::PortError;
 #[cfg(feature = "runtime")]
 use steward_ports::{
     ProviderControlExecutionBindings, SandboxExecutionClass, SandboxObservation, SandboxRequest,
-    SandboxRuntime, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
+    SandboxRuntime, SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest,
+    SandboxTaskRuntime, TaskAttemptId,
 };
 #[cfg(feature = "runtime")]
 use steward_types::{AgentType, RuntimeRefs};
@@ -485,7 +486,7 @@ fn output_archive_command(
     }
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(all(feature = "runtime", test))]
 fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
     let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
     if stderr.contains("steward-connections-bridge:")
@@ -2118,11 +2119,12 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         provider_control_execution_bindings(self)
     }
 
-    async fn run_task(
+    async fn start_task(
         &self,
+        attempt_id: &TaskAttemptId,
         request: &SandboxTaskRequest,
         input_archive: &[u8],
-    ) -> Result<SandboxTaskOutput, PortError> {
+    ) -> Result<SandboxTaskObservation, PortError> {
         let workspace = request
             .refs
             .workspace
@@ -2187,6 +2189,33 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             true,
         )
         .await?;
+        let attempt_directory = task_attempt_directory(attempt_id)?;
+        let claim = self
+            .authenticated_client()
+            .await?
+            .workspace(workspace)
+            .exec(
+                sandbox,
+                &[
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    task_attempt_claim_command(&attempt_directory),
+                ],
+                ExecOptions {
+                    timeout: Some(StdDuration::from_secs(120)),
+                    ..ExecOptions::default()
+                },
+            )
+            .await
+            .map_err(port_failure)?;
+        if claim.exit_code == 17 {
+            return self.observe_task(attempt_id, request).await;
+        }
+        if claim.exit_code != 0 {
+            return Err(PortError::Failed {
+                reason: "Task attempt marker could not be reserved".to_owned(),
+            });
+        }
         self.stage_input_archive(workspace, sandbox, input_archive)
             .await?;
         let sandbox_id = self
@@ -2213,10 +2242,17 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             })?;
             environment.insert("STEWARD_MCP_GW_ORIGIN".to_owned(), origin.to_owned());
         }
+        let output_archive_command =
+            output_archive_command(&request.agent_type, request.execution_binding.as_ref());
+        let wrapped_command = task_attempt_execution_command(
+            &attempt_directory,
+            &request.command,
+            output_archive_command,
+        );
         let executed = self
             .exec_task_process(
                 &sandbox_id,
-                &request.command,
+                &["/bin/sh".to_owned(), "-c".to_owned(), wrapped_command],
                 environment,
                 request.execution_class,
                 TaskProcessLogContext {
@@ -2225,19 +2261,54 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                     sandbox,
                 },
             )
-            .await?;
-        if executed.exit_code != 0 {
-            let category = task_agent_failure_category(&executed.stderr);
-            return Err(PortError::Failed {
-                reason: format!(
-                    "task agent exited with code {} (diagnostic-category={category})",
-                    executed.exit_code
-                ),
+            .await;
+        let Err(execution_error) = executed else {
+            return self.observe_task(attempt_id, request).await;
+        };
+        match self.observe_task(attempt_id, request).await {
+            Ok(SandboxTaskObservation::Absent) => Err(execution_error),
+            Ok(observation) => Ok(observation),
+            Err(_) => Err(execution_error),
+        }
+    }
+
+    async fn observe_task(
+        &self,
+        attempt_id: &TaskAttemptId,
+        request: &SandboxTaskRequest,
+    ) -> Result<SandboxTaskObservation, PortError> {
+        let workspace = request
+            .refs
+            .workspace
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PortError::Rejected {
+                reason: "task runtime has no sandbox workspace reference".to_owned(),
+            })?;
+        let sandbox = request
+            .refs
+            .sandbox
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PortError::Rejected {
+                reason: "task runtime has no sandbox name reference".to_owned(),
+            })?;
+        let snapshot = self
+            .authenticated_client()
+            .await?
+            .workspace(workspace)
+            .get_sandbox(sandbox)
+            .await
+            .map_err(port_failure)?;
+        if snapshot.labels.get(RUNTIME_UID_LABEL).map(String::as_str)
+            != Some(request.runtime.0.as_str())
+        {
+            return Err(PortError::Rejected {
+                reason: "task sandbox is bound to a different runtime UID".to_owned(),
             });
         }
-        let output_archive_command =
-            output_archive_command(&request.agent_type, request.execution_binding.as_ref());
-        let collected = self
+        let attempt_directory = task_attempt_directory(attempt_id)?;
+        let observed = self
             .authenticated_client()
             .await?
             .workspace(workspace)
@@ -2246,7 +2317,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 &[
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    output_archive_command.to_owned(),
+                    task_attempt_observation_command(&attempt_directory),
                 ],
                 ExecOptions {
                     timeout: Some(StdDuration::from_secs(120)),
@@ -2255,23 +2326,148 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             )
             .await
             .map_err(port_failure)?;
-        if collected.exit_code != 0 {
+        if observed.exit_code == 44 {
+            return Ok(SandboxTaskObservation::Absent);
+        }
+        if observed.exit_code != 0 {
             return Err(PortError::Failed {
-                reason: "task output archive could not be collected".to_owned(),
+                reason: "Task attempt marker could not be observed".to_owned(),
             });
         }
-        if is_connections_bridge {
-            validate_connections_bridge_archive(&collected.stdout, "response.json")?;
+        let (state, payload) = split_task_attempt_observation(&observed.stdout)?;
+        let correlation = attempt_id.0.clone();
+        match state {
+            "claimed" => Ok(SandboxTaskObservation::Accepted {
+                adapter_observation_id: correlation,
+            }),
+            "running" => Ok(SandboxTaskObservation::Running {
+                adapter_observation_id: correlation,
+            }),
+            "succeeded" => {
+                if request.agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE {
+                    validate_connections_bridge_archive(payload, "response.json")?;
+                }
+                Ok(SandboxTaskObservation::Succeeded {
+                    adapter_observation_id: correlation,
+                    output: SandboxTaskOutput {
+                        archive: payload.to_vec(),
+                    },
+                })
+            }
+            "failed" => Ok(SandboxTaskObservation::Failed {
+                adapter_observation_id: correlation,
+                reason: "task agent failed; inspect the bounded controller diagnostic".to_owned(),
+            }),
+            _ => Ok(SandboxTaskObservation::OutcomeUnknown {
+                reason: "Task attempt marker has an unknown state".to_owned(),
+            }),
         }
-        Ok(SandboxTaskOutput {
-            archive: collected.stdout,
-        })
+    }
+
+    async fn cancel_task(
+        &self,
+        attempt_id: &TaskAttemptId,
+        request: &SandboxTaskRequest,
+    ) -> Result<SandboxTaskObservation, PortError> {
+        match self.observe_task(attempt_id, request).await? {
+            terminal @ (SandboxTaskObservation::Absent
+            | SandboxTaskObservation::Succeeded { .. }
+            | SandboxTaskObservation::Failed { .. }
+            | SandboxTaskObservation::OutcomeUnknown { .. }) => Ok(terminal),
+            SandboxTaskObservation::Accepted { .. } | SandboxTaskObservation::Running { .. } => {
+                Ok(SandboxTaskObservation::OutcomeUnknown {
+                    reason: "OpenShell does not expose a proven attempt-scoped cancellation acknowledgement"
+                        .to_owned(),
+                })
+            }
+        }
     }
 }
 
 #[cfg(feature = "runtime")]
 fn staging_archive_chunks(input_archive: &[u8]) -> std::slice::Chunks<'_, u8> {
     input_archive.chunks(STAGING_EXEC_STDIN_CHUNK_BYTES)
+}
+
+#[cfg(feature = "runtime")]
+fn task_attempt_directory(attempt_id: &TaskAttemptId) -> Result<String, PortError> {
+    let value = attempt_id.0.as_str();
+    let canonical_shape = value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        });
+    if !canonical_shape {
+        return Err(PortError::Rejected {
+            reason: "invalid Task attempt identity".to_owned(),
+        });
+    }
+    Ok(format!("/sandbox/.steward-attempts/{value}"))
+}
+
+#[cfg(feature = "runtime")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(feature = "runtime")]
+fn task_attempt_claim_command(directory: &str) -> String {
+    let directory = shell_quote(directory);
+    format!(
+        "set -eu; mkdir -p /sandbox/.steward-attempts; \
+         if mkdir {directory} 2>/dev/null; then printf claimed > {directory}/state; \
+         else exit 17; fi"
+    )
+}
+
+#[cfg(feature = "runtime")]
+fn task_attempt_execution_command(
+    directory: &str,
+    command: &[String],
+    output_archive_command: &str,
+) -> String {
+    let directory = shell_quote(directory);
+    let command = command
+        .iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "set +e; printf running > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; \
+         {command}; status=$?; \
+         if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
+           printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi; \
+         ({output_archive_command}) > {directory}/output.tar; status=$?; \
+         if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
+           printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi; \
+         printf succeeded > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state"
+    )
+}
+
+#[cfg(feature = "runtime")]
+fn task_attempt_observation_command(directory: &str) -> String {
+    let directory = shell_quote(directory);
+    format!(
+        "set -eu; test -d {directory} || exit 44; state=$(cat {directory}/state); \
+         printf '%s\\n' \"$state\"; \
+         if [ \"$state\" = succeeded ]; then cat {directory}/output.tar; fi"
+    )
+}
+
+#[cfg(feature = "runtime")]
+fn split_task_attempt_observation(bytes: &[u8]) -> Result<(&str, &[u8]), PortError> {
+    let Some(separator) = bytes.iter().position(|byte| *byte == b'\n') else {
+        return Err(PortError::Failed {
+            reason: "Task attempt observation is malformed".to_owned(),
+        });
+    };
+    let state = std::str::from_utf8(&bytes[..separator]).map_err(|_| PortError::Failed {
+        reason: "Task attempt state is not UTF-8".to_owned(),
+    })?;
+    Ok((state, &bytes[separator + 1..]))
 }
 
 #[cfg(feature = "runtime")]
@@ -2354,7 +2550,7 @@ mod tests {
     use tokio::sync::{Mutex, mpsc as tokio_mpsc};
 
     #[cfg(feature = "runtime")]
-    use steward_ports::{PortError, SandboxExecutionClass, SandboxRequest};
+    use steward_ports::{PortError, SandboxExecutionClass, SandboxRequest, TaskAttemptId};
     #[cfg(feature = "runtime")]
     use steward_types::{
         AgentType, DisposableExecutionBinding, ExecutionProviderProfile, ExecutionProviderProfiles,
@@ -2374,8 +2570,8 @@ mod tests {
         output_archive_command, project_request, provider_reconciliation,
         provider_reconciliation_plan, provider_reconciliation_targets, sandbox_spec,
         staging_append_command, staging_archive_chunks, staging_extract_command,
-        staging_prepare_command, task_agent_failure_category, task_process_log_record,
-        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
+        staging_prepare_command, task_agent_failure_category, task_attempt_directory,
+        task_process_log_record, validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
     };
     #[cfg(feature = "runtime")]
     use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
@@ -2771,20 +2967,20 @@ mod tests {
             .split("impl SandboxTaskRuntime for OpenShellRuntime")
             .nth(1)
             .ok_or_else(|| "SandboxTaskRuntime implementation was not found".to_owned())?;
-        let run_task = implementation
-            .split("async fn run_task")
+        let start_task = implementation
+            .split("async fn start_task")
             .nth(1)
             .and_then(|value| value.split("async fn").next())
-            .ok_or_else(|| "run_task implementation was not found".to_owned())?;
-        let staging = run_task
+            .ok_or_else(|| "start_task implementation was not found".to_owned())?;
+        let staging = start_task
             .find(".stage_input_archive(")
             .ok_or_else(|| "task input staging call was not found".to_owned())?;
-        let resolution = run_task
+        let resolution = start_task
             .rfind(".resolve_raw_sandbox_binding(")
             .ok_or_else(|| {
                 "task sandbox ID is not re-resolved and verified after staging".to_owned()
             })?;
-        let execution = run_task
+        let execution = start_task
             .find(".exec_task_process(")
             .ok_or_else(|| "task process execution call was not found".to_owned())?;
 
@@ -2793,12 +2989,12 @@ mod tests {
             "the exact sandbox ID must be resolved after name-based staging and before raw execution"
         );
         assert!(
-            run_task[staging..resolution].contains("let sandbox_id =")
-                && run_task[execution..].contains("&sandbox_id,"),
+            start_task[staging..resolution].contains("let sandbox_id =")
+                && start_task[execution..].contains("&sandbox_id,"),
             "raw execution must use the post-staging verified sandbox ID"
         );
         assert!(
-            !run_task[execution..].contains("&snapshot.id,"),
+            !start_task[execution..].contains("&snapshot.id,"),
             "raw execution must not reuse the pre-staging sandbox ID"
         );
         Ok(())
@@ -2972,6 +3168,27 @@ mod tests {
                 .contains("tar -xf /sandbox/steward-input.tar -C /sandbox/steward-input")
         );
         assert!(staging_extract_command().contains("rm -f /sandbox/steward-input.tar"));
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn task_attempt_identity_cannot_escape_its_sandbox_directory() {
+        assert_eq!(
+            task_attempt_directory(&TaskAttemptId(
+                "01234567-89ab-cdef-0123-456789abcdef".to_owned()
+            ))
+            .as_deref(),
+            Ok("/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef")
+        );
+        for malicious in ["../other", "attempt;replay", "", "01234567-89ab-cdef"] {
+            assert!(
+                matches!(
+                    task_attempt_directory(&TaskAttemptId(malicious.to_owned())),
+                    Err(PortError::Rejected { .. })
+                ),
+                "attempt identity {malicious:?} must not reach an adapter command"
+            );
+        }
     }
 
     #[cfg(feature = "runtime")]

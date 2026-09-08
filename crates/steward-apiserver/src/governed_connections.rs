@@ -279,7 +279,23 @@ impl<B> GovernedConnectionsBroker<B> {
             namespace: plan.bindings.namespace.clone(),
             runtime_class: plan.bindings.runtime_class.clone(),
         };
+        let service_envelope = steward_connections_v1::envelope();
+        let admission = evaluate(&plan.spec, &service_envelope)
+            .map_err(|_| ConnectionBrokerError::Unavailable)?;
+        let task_uid = Uuid::new_v4();
+        let orchestration = super::tasks::task_orchestration_reservation(
+            task_uid,
+            operation_id,
+            &bindings.namespace,
+            &runtime_name,
+            &plan.spec,
+            &service_envelope,
+            None,
+        )
+        .map_err(|_| ConnectionBrokerError::Unavailable)?;
         let task = TaskReservationRequest {
+            task_uid,
+            operation_id,
             idempotency_key: &operation_key,
             submitter_service: CONNECTIONS_SERVICE,
             acting_user: Some(email.as_str()),
@@ -302,6 +318,12 @@ impl<B> GovernedConnectionsBroker<B> {
             agent_command: &plan.command,
             execution_binding: None,
             envelope_revision: CONNECTIONS_AUTHORITY_VERSION,
+            service_envelope: &service_envelope,
+            service_envelope_digest: &orchestration.service_envelope_digest,
+            candidate_digest: &orchestration.candidate_digest,
+            admission_decision: &admission,
+            inert_manifest_digest: &orchestration.inert_manifest_digest,
+            active_manifest_digest: &orchestration.active_manifest_digest,
         };
         self.store
             .reserve_connection_operation(&ConnectionOperationReservationRequest {

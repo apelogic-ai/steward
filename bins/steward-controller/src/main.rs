@@ -9,6 +9,7 @@ use std::time::Duration;
 use axum::serve::Listener;
 use kube::Client;
 use steward_adapter_github_artifact::GitHubArtifactVerifier;
+use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_adapter_litellm::{LiteLlmAdapter, LiteLlmConfig};
 use steward_adapter_openshell::{
     OpenShellConnectionConfig, OpenShellRuntime, OpenShellTaskLogMode,
@@ -62,6 +63,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .map_err(|error| {
         io::Error::other(format!("inference plane configuration failed: {error:?}"))
     })?;
+    let decisions = JiraAdapter::new(
+        JiraConfig {
+            base_url: required("STEWARD_JIRA_BASE_URL")?,
+            project_key: required("STEWARD_JIRA_PROJECT_KEY")?,
+            account_email: required("STEWARD_JIRA_ACCOUNT_EMAIL")?,
+        },
+        required("STEWARD_JIRA_TOKEN")?,
+    )
+    .map_err(|error| {
+        io::Error::other(format!("decision channel configuration failed: {error:?}"))
+    })?;
     let listener = tls_listener(
         &env::var("STEWARD_WEBHOOK_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_owned()),
         &required("STEWARD_TLS_CERT_DER")?,
@@ -77,10 +89,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             required("STEWARD_APISERVER_USERNAME")?,
         ),
     );
+    let approval_dispatcher =
+        steward_controller::run_task_approval_dispatcher(store.clone(), decisions);
     let controller =
         steward_controller::run_controller_with_planes(client, sandbox_runtime, inference, store);
     tokio::select! {
         result = webhook => result?,
+        () = approval_dispatcher => return Err(io::Error::other("task approval dispatcher exited").into()),
         () = controller => return Err(io::Error::other("controller exited").into()),
     }
     Ok(())

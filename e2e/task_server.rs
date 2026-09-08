@@ -14,6 +14,7 @@ use kube::ResourceExt;
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use steward_adapter_codex::CodexTaskExecutionAdapter;
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_admission::{Envelope, EnvelopeSpec};
 use steward_apiserver::{
@@ -462,24 +463,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .map_err(|error| io::Error::other(format!("failed to configure Jira adapter: {error:?}")))?;
     let runtimes = KubeRuntimeRepository::new(client);
     let app: Router = task_router(
-        runtimes.clone(),
         store.clone(),
-        decisions.clone(),
         task_identities,
         workflows,
         TaskApiConfig::new(Some(env::var("STEWARD_TASK_MCP_GW_ENDPOINT").map_err(
             |_| io::Error::other("STEWARD_TASK_MCP_GW_ENDPOINT is required"),
         )?))
         .and_then(|config| {
+            let adapter = CodexTaskExecutionAdapter::new(
+                "http://litellm-litellm.litellm.svc.cluster.local:4000/v1".to_owned(),
+            )
+            .map_err(|error| format!("configure Codex execution adapter: {error:?}"))?;
             let image_one = env::var("STEWARD_TASK_EXECUTION_BINDING_IMAGE")
                 .map_err(|_| "STEWARD_TASK_EXECUTION_BINDING_IMAGE is required".to_owned())?;
             let image_two = env::var("STEWARD_TASK_EXECUTION_BINDING_IMAGE_TWO")
                 .map_err(|_| "STEWARD_TASK_EXECUTION_BINDING_IMAGE_TWO is required".to_owned())?;
             let catalog = execution_binding_catalog(&image_one, &image_two)
                 .map_err(|error| error.to_string())?;
-            Ok(config
+            config
+                .with_execution_adapter(Arc::new(adapter))?
                 .with_execution_bindings_json(Some(&catalog))?
-                .with_execution_bindings_active(true))
+                .with_execution_bindings_active(true)
         })
         .map_err(io::Error::other)?,
     )

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::serve::Listener;
+use steward_adapter_codex::CodexTaskExecutionAdapter;
 use steward_adapter_github_artifact::GitHubArtifactVerifier;
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{
@@ -93,11 +94,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let task_execution_bindings_json = configured_execution_bindings_json()?;
     let task_execution_bindings_active = execution_bindings_active().map_err(io::Error::other)?;
+    let task_execution_adapter = CodexTaskExecutionAdapter::new(required(
+        "STEWARD_TASK_INFERENCE_ENDPOINT",
+    )?)
+    .map_err(|error| {
+        io::Error::other(format!(
+            "Codex execution adapter configuration failed: {error:?}"
+        ))
+    })?;
     let task_api_config = TaskApiConfig::new(task_mcp_gateway_endpoint)
+        .and_then(|config| config.with_execution_adapter(Arc::new(task_execution_adapter)))
         .and_then(|config| {
             config.with_execution_bindings_json(task_execution_bindings_json.as_deref())
         })
-        .map(|config| config.with_execution_bindings_active(task_execution_bindings_active))
+        .and_then(|config| config.with_execution_bindings_active(task_execution_bindings_active))
         .map_err(io::Error::other)?;
     let workflow_agents = task_api_config.execution_binding_advertisements();
     let runtimes = KubeRuntimeRepository::new(client);
@@ -114,9 +124,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         decisions.clone(),
     )
     .merge(task_router(
-        runtimes.clone(),
         store.clone(),
-        decisions,
         task_identities,
         task_workflows,
         task_api_config,

@@ -49,6 +49,10 @@ name = "task"
 path = "task.rs"
 
 [[test]]
+name = "task_orchestration"
+path = "task_orchestration.rs"
+
+[[test]]
 name = "openshell_adapter_v0098"
 path = "openshell_adapter_v0098.rs"
 
@@ -79,6 +83,7 @@ serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
 steward-admission = { path = "../crates/steward-admission", version = "=0.0.0" }
+steward-adapter-codex = { path = "../adapters/codex", version = "=0.0.0" } # Exercises the production Task command renderer in the full-stack fixture.
 steward-adapter-jira = { path = "../adapters/jira", version = "=0.0.0" } # Exercises the real Jira decision-channel adapter in the S4 full-stack test.
 steward-adapter-openshell = { path = "../adapters/openshell", version = "=0.0.0", features = ["runtime"] }
 steward-apiserver = { path = "../crates/steward-apiserver", version = "=0.0.0" }

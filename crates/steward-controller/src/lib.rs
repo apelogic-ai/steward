@@ -29,20 +29,24 @@ use steward_admission::{
     duration_seconds, evaluate, evaluate_with_grants,
 };
 use steward_ports::{
-    InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
-    InferenceRequest, MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProvisionedInference, SandboxExecutionClass,
-    SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
+    DecisionChannel, DecisionRequest, InferenceCapabilities, InferenceCredential,
+    InferenceObservation, InferencePlane, InferenceRequest, MAX_TASK_OUTPUT_ARCHIVE_BYTES,
+    ProvisionedInference, SandboxExecutionClass, SandboxTaskObservation, SandboxTaskRequest,
+    SandboxTaskRuntime, TaskAttemptId,
 };
 pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
 use steward_store::{
-    ConnectionOperationKind, ConnectionOperationRecord, GrantReversion, PgStore, StoreError,
-    TaskRecord,
+    ApprovalDeliveryTransition, ConnectionOperationKind, ConnectionOperationRecord, GrantReversion,
+    PgStore, StoreError, TaskActivationObservation, TaskCleanupCause, TaskCleanupObservation,
+    TaskExecutionAttemptState, TaskExecutionObservation, TaskExecutionTransition,
+    TaskOrchestrationState, TaskOrchestrationWorkItem, TaskRecord, TaskRuntimeOwnership,
 };
+#[cfg(test)]
+use steward_types::RuntimeOwnership;
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, DisposableExecutionBinding, Duration,
-    PENDING_APPROVAL_ANNOTATION, Phase, RuntimeId, RuntimeOwnership, RuntimeRefs,
-    TASK_EXECUTION_BINDING_ANNOTATION, TaskExecutionBinding, TaskPhase,
-    runtime_activated_condition,
+    PENDING_APPROVAL_ANNOTATION, Phase, RuntimeId, RuntimeRefs, TASK_EXECUTION_BINDING_ANNOTATION,
+    TaskExecutionBinding, TaskPhase, runtime_activated_condition,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +81,7 @@ enum TtlAction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum TaskRuntimeAction {
     Wait,
     CreateRuntime,
@@ -86,6 +91,7 @@ enum TaskRuntimeAction {
     MarkFinalized,
 }
 
+#[cfg(test)]
 fn task_runtime_action(
     phase: TaskPhase,
     ownership: RuntimeOwnership,
@@ -138,6 +144,7 @@ fn task_runtime_action(
     }
 }
 
+#[cfg(test)]
 fn task_runtime_matches_cleanup_authority(
     task_spec: &AgentRuntimeSpec,
     runtime: &AgentRuntime,
@@ -562,11 +569,16 @@ async fn run_task_controller<R: SandboxTaskRuntime>(
     authority: PgStore,
 ) {
     loop {
-        match authority.task_work_items().await {
-            Ok(tasks) => {
-                for task in tasks {
-                    if let Err(error) =
-                        reconcile_task(&client, &sandbox_runtime, &authority, &task).await
+        match authority.task_orchestration_work_items().await {
+            Ok(work) => {
+                for item in work {
+                    if let Err(error) = reconcile_task_orchestration_work_item(
+                        &client,
+                        &sandbox_runtime,
+                        &authority,
+                        &item,
+                    )
+                    .await
                     {
                         eprintln!("task reconcile error: {error}");
                     }
@@ -578,155 +590,1168 @@ async fn run_task_controller<R: SandboxTaskRuntime>(
     }
 }
 
-async fn reconcile_task<R: SandboxTaskRuntime>(
+/// Reconciles one immutable Task operation by at most one durable lifecycle step.
+///
+/// This bounded entry point is shared by the production loop and fault-injection tests. Safety
+/// does not depend on one caller: immutable external identities and store generations arbitrate
+/// concurrent invocations.
+pub async fn reconcile_task_orchestration_work_item<R: SandboxTaskRuntime>(
     client: &Client,
     sandbox_runtime: &R,
     authority: &PgStore,
-    task: &TaskRecord,
+    work: &TaskOrchestrationWorkItem,
 ) -> Result<(), TaskControllerError> {
-    if let Some(operation) = authority
+    reconcile_task_operation(client, sandbox_runtime, authority, work).await
+}
+
+const TASK_UID_ANNOTATION: &str = "agents.apelogic.ai/task-uid";
+const TASK_OPERATION_ANNOTATION: &str = "agents.apelogic.ai/orchestration-id";
+const TASK_MANIFEST_DIGEST_ANNOTATION: &str = "agents.apelogic.ai/manifest-digest";
+const TASK_RUNTIME_MODE_ANNOTATION: &str = "agents.apelogic.ai/runtime-mode";
+const TASK_ORCHESTRATOR_ACTOR: &str = "task-orchestrator";
+
+#[derive(Debug)]
+pub enum ApprovalDispatcherError {
+    Store(StoreError),
+    InvalidApproval(String),
+    Delivery(steward_ports::PortError),
+}
+
+impl fmt::Display for ApprovalDispatcherError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => write!(formatter, "approval outbox store failed: {error}"),
+            Self::InvalidApproval(reason) => {
+                write!(formatter, "approval outbox is invalid: {reason}")
+            }
+            Self::Delivery(error) => write!(formatter, "approval delivery failed: {error:?}"),
+        }
+    }
+}
+
+impl Error for ApprovalDispatcherError {}
+
+pub async fn dispatch_one_task_approval<D: DecisionChannel>(
+    authority: &PgStore,
+    decisions: &D,
+    worker: &str,
+) -> Result<bool, ApprovalDispatcherError> {
+    let Some(work) = authority
+        .claim_approval_delivery(worker, 30)
+        .await
+        .map_err(ApprovalDispatcherError::Store)?
+    else {
+        return Ok(false);
+    };
+    let counterexample = AdmissionDecision::Reject {
+        deltas: work.deltas.clone(),
+    }
+    .counterexample()
+    .ok_or_else(|| {
+        ApprovalDispatcherError::InvalidApproval(
+            "runtime-bound approval has no rejection counterexample".to_owned(),
+        )
+    })?;
+    let request = DecisionRequest {
+        request_id: work.approval_id.to_string(),
+        runtime_uid: work.runtime_uid.clone(),
+        actor: work.actor.clone(),
+        member_role: work.member_role.clone(),
+        counterexample,
+    };
+    let reference = match decisions.request(&request).await {
+        Ok(reference) => reference,
+        Err(error) => {
+            authority
+                .retry_approval_delivery(
+                    work.effect_id,
+                    work.generation,
+                    worker,
+                    "decision_channel_unavailable",
+                )
+                .await
+                .map_err(ApprovalDispatcherError::Store)?;
+            return Err(ApprovalDispatcherError::Delivery(error));
+        }
+    };
+    match authority
+        .complete_approval_delivery(
+            work.effect_id,
+            work.generation,
+            worker,
+            &reference.key,
+            &reference.evidence_url,
+        )
+        .await
+        .map_err(ApprovalDispatcherError::Store)?
+    {
+        ApprovalDeliveryTransition::Applied
+        | ApprovalDeliveryTransition::AlreadyApplied
+        | ApprovalDeliveryTransition::Superseded => Ok(true),
+    }
+}
+
+/// Delivers durable Task approval outbox rows through the configured decision channel.
+///
+/// A successful delivery is immediately followed by another claim so a backlog drains without a
+/// fixed per-item delay. Empty queues and failures back off; the durable lease and idempotency
+/// marker make concurrent controller replicas safe.
+pub async fn run_task_approval_dispatcher<D: DecisionChannel>(authority: PgStore, decisions: D) {
+    const WORKER: &str = "task-approval-dispatcher";
+    loop {
+        let should_back_off = match dispatch_one_task_approval(&authority, &decisions, WORKER).await
+        {
+            Ok(delivered) => !delivered,
+            Err(error) => {
+                eprintln!("task approval delivery failed: {error}");
+                true
+            }
+        };
+        if should_back_off {
+            tokio::time::sleep(StdDuration::from_secs(1)).await;
+        }
+    }
+}
+
+async fn reconcile_task_operation<R: SandboxTaskRuntime>(
+    client: &Client,
+    sandbox_runtime: &R,
+    authority: &PgStore,
+    work: &TaskOrchestrationWorkItem,
+) -> Result<(), TaskControllerError> {
+    let task = &work.task;
+    let operation = &work.operation;
+    if operation.state == TaskOrchestrationState::Finalized {
+        return Ok(());
+    }
+    if (task.cancel_requested
+        || task.finalize_requested
+        || operation.state == TaskOrchestrationState::CleanupPending)
+        && let Some(attempt) = authority
+            .task_execution_attempt(task.task_uid)
+            .await
+            .map_err(TaskControllerError::Store)?
+        && !matches!(
+            attempt.state,
+            TaskExecutionAttemptState::Succeeded
+                | TaskExecutionAttemptState::Failed
+                | TaskExecutionAttemptState::OutcomeUnknown
+        )
+        && attempt.start_invoked_at.is_some()
+    {
+        reconcile_task_cancellation(client, sandbox_runtime, authority, task, attempt).await?;
+        return Ok(());
+    }
+    if (task.cancel_requested || task.finalize_requested)
+        && operation.state != TaskOrchestrationState::CleanupPending
+    {
+        let cause = if task.cancel_requested {
+            TaskCleanupCause::Cancelled
+        } else {
+            TaskCleanupCause::FinalizationRequested
+        };
+        authority
+            .enter_task_cleanup(
+                task.task_uid,
+                operation.generation,
+                cause,
+                TASK_ORCHESTRATOR_ACTOR,
+            )
+            .await
+            .map_err(TaskControllerError::Store)?;
+        return Ok(());
+    }
+    match operation.state {
+        TaskOrchestrationState::IntentRecorded => {
+            if operation.runtime_ownership != TaskRuntimeOwnership::Provisioned {
+                return reconcile_shared_runtime_observation(client, authority, work).await;
+            }
+            authority
+                .authorize_task_runtime_creation(
+                    task.task_uid,
+                    operation.generation,
+                    TASK_ORCHESTRATOR_ACTOR,
+                )
+                .await
+                .map(|_| ())
+                .map_err(TaskControllerError::Store)
+        }
+        TaskOrchestrationState::RuntimeCreatePending => {
+            reconcile_runtime_creation(client, authority, work).await
+        }
+        TaskOrchestrationState::RuntimeObserved => {
+            let (envelope, envelope_digest) = task_authority_snapshot(authority, task).await?;
+            authority
+                .decide_task_runtime_authority(
+                    task.task_uid,
+                    operation.generation,
+                    &envelope,
+                    &envelope_digest,
+                    TASK_ORCHESTRATOR_ACTOR,
+                )
+                .await
+                .map(|_| ())
+                .map_err(TaskControllerError::Store)
+        }
+        TaskOrchestrationState::ApprovalPending => authority
+            .authorize_task_activation_from_approval(
+                task.task_uid,
+                operation.generation,
+                TASK_ORCHESTRATOR_ACTOR,
+            )
+            .await
+            .map(|_| ())
+            .map_err(TaskControllerError::Store),
+        TaskOrchestrationState::ActivationPending => {
+            let (envelope, envelope_digest) = task_authority_snapshot(authority, task).await?;
+            match authority
+                .decide_task_runtime_authority(
+                    task.task_uid,
+                    operation.generation,
+                    &envelope,
+                    &envelope_digest,
+                    TASK_ORCHESTRATOR_ACTOR,
+                )
+                .await
+                .map_err(TaskControllerError::Store)?
+            {
+                steward_store::TaskOperationTransition::AlreadyApplied(current)
+                    if current.activation_effect_authorized_at.is_some() =>
+                {
+                    reconcile_runtime_activation(client, authority, work).await
+                }
+                steward_store::TaskOperationTransition::Applied(_)
+                | steward_store::TaskOperationTransition::AlreadyApplied(_)
+                | steward_store::TaskOperationTransition::Superseded(_)
+                | steward_store::TaskOperationTransition::AuthorityInactive { .. }
+                | steward_store::TaskOperationTransition::InvariantViolation { .. } => Ok(()),
+            }
+        }
+        TaskOrchestrationState::Active => {
+            if task.execute_requested
+                && matches!(task.phase, TaskPhase::Queued | TaskPhase::Running)
+            {
+                reconcile_task_execution(client, sandbox_runtime, authority, work).await
+            } else {
+                Ok(())
+            }
+        }
+        TaskOrchestrationState::CleanupPending => {
+            reconcile_runtime_cleanup(client, authority, work).await
+        }
+        TaskOrchestrationState::Finalized => Ok(()),
+    }
+}
+
+async fn task_authority_snapshot(
+    authority: &PgStore,
+    task: &TaskRecord,
+) -> Result<(Envelope, String), TaskControllerError> {
+    if task.internal_authority_id.as_deref() == Some(steward_connections_v1::SERVICE)
+        && task.internal_authority_version == Some(steward_connections_v1::AUTHORITY_VERSION)
+        && task.internal_authority_digest.as_deref()
+            == Some(steward_connections_v1::AUTHORITY_DIGEST)
+    {
+        return Ok((
+            steward_connections_v1::envelope(),
+            task.service_envelope_digest.clone().ok_or_else(|| {
+                TaskControllerError::InvalidState(
+                    "internal Task has no authority-envelope digest".to_owned(),
+                )
+            })?,
+        ));
+    }
+    let envelope = authority
+        .latest_service_envelope(&task.submitter_service)
+        .await
+        .map_err(TaskControllerError::Store)?
+        .ok_or_else(|| {
+            TaskControllerError::InvalidState("Task service has no current Envelope".to_owned())
+        })?;
+    let digest = bytes_digest(&serde_json::to_vec(&envelope).map_err(|error| {
+        TaskControllerError::InvalidState(format!(
+            "current Task Envelope cannot be digested: {error}"
+        ))
+    })?);
+    Ok((envelope, digest))
+}
+
+async fn reconcile_task_execution<R: SandboxTaskRuntime>(
+    client: &Client,
+    sandbox_runtime: &R,
+    authority: &PgStore,
+    work: &TaskOrchestrationWorkItem,
+) -> Result<(), TaskControllerError> {
+    let task = &work.task;
+    if let Some(connection) = authority
         .connection_operation_for_task(task.task_uid)
         .await
         .map_err(TaskControllerError::Store)?
     {
         let current = sandbox_runtime.provider_control_bindings();
-        if !connection_operation_bindings_match(&operation, task, current.as_ref()) {
+        if !connection_operation_bindings_match(&connection, task, current.as_ref()) {
             authority
-                .fail_connection_operation(operation.operation_id, "binding_mismatch")
+                .fail_connection_operation(connection.operation_id, "binding_mismatch")
+                .await
+                .map_err(TaskControllerError::Store)?;
+            authority
+                .enter_task_cleanup(
+                    task.task_uid,
+                    work.operation.generation,
+                    TaskCleanupCause::Failed("execution_binding_mismatch"),
+                    TASK_ORCHESTRATOR_ACTOR,
+                )
                 .await
                 .map_err(TaskControllerError::Store)?;
             return Ok(());
         }
     }
-    if task
-        .execution_binding
-        .as_ref()
-        .is_some_and(|binding| matches!(binding, TaskExecutionBinding::Resident(_)))
-        && !task.finalize_requested
-    {
+    if matches!(
+        task.execution_binding,
+        Some(TaskExecutionBinding::Resident(_))
+    ) {
         return Err(TaskControllerError::InvalidState(
-            "resident Task dispatch is not implemented by the disposable Task controller"
-                .to_owned(),
+            "resident Task dispatch protocol is not implemented".to_owned(),
         ));
     }
-    let runtime = task_runtime(client, authority, task).await?;
-    match task_runtime_action(
-        task.phase,
-        task.runtime_ownership,
-        task.execution_binding.as_ref(),
-        task.finalize_requested,
-        task.runtime_uid.is_some(),
-        &task.runtime_spec,
-        runtime.as_ref(),
+    let runtime_uid = work.operation.runtime_uid.as_deref().ok_or_else(|| {
+        TaskControllerError::InvalidState("active Task has no exact runtime UID".to_owned())
+    })?;
+    let api = Api::<AgentRuntime>::namespaced(client.clone(), &work.operation.runtime_namespace);
+    let runtime = api
+        .get_opt(&work.operation.runtime_name)
+        .await
+        .map_err(TaskControllerError::Kubernetes)?
+        .filter(|runtime| {
+            runtime.metadata.uid.as_deref() == Some(runtime_uid)
+                && (work.operation.runtime_ownership != TaskRuntimeOwnership::Provisioned
+                    || runtime_identity_matches(runtime, work))
+        })
+        .ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "active Task runtime exact identity disappeared".to_owned(),
+            )
+        })?;
+    let refs = runtime
+        .status
+        .as_ref()
+        .filter(|status| status.phase == Phase::Running)
+        .map(|status| status.refs.clone())
+        .ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "active Task runtime has no ready observed references".to_owned(),
+            )
+        })?;
+    let input = task.input_archive.as_deref().ok_or_else(|| {
+        TaskControllerError::InvalidState("queued Task has no input archive".to_owned())
+    })?;
+    let request = sandbox_task_request(task, runtime_uid.to_owned(), refs);
+    let command_digest =
+        bytes_digest(&serde_json::to_vec(&task.agent_command).map_err(|error| {
+            TaskControllerError::InvalidState(format!("Task command cannot be digested: {error}"))
+        })?);
+    let input_digest = bytes_digest(input);
+    let attempt = match authority
+        .claim_task_execution_attempt(
+            task.task_uid,
+            &command_digest,
+            &input_digest,
+            TASK_ORCHESTRATOR_ACTOR,
+        )
+        .await
+        .map_err(TaskControllerError::Store)?
+    {
+        TaskExecutionTransition::Created(_) => return Ok(()),
+        TaskExecutionTransition::AlreadyApplied(attempt) => attempt,
+        TaskExecutionTransition::Applied(_)
+        | TaskExecutionTransition::Superseded(_)
+        | TaskExecutionTransition::AuthorityInactive { .. }
+        | TaskExecutionTransition::InvariantViolation { .. } => return Ok(()),
+    };
+    if matches!(
+        attempt.state,
+        TaskExecutionAttemptState::Succeeded
+            | TaskExecutionAttemptState::Failed
+            | TaskExecutionAttemptState::OutcomeUnknown
     ) {
-        TaskRuntimeAction::Wait => Ok(()),
-        TaskRuntimeAction::CreateRuntime => create_task_runtime(client, authority, task).await,
-        TaskRuntimeAction::Release => authority
-            .release_parked_task(task.task_uid)
+        return Ok(());
+    }
+    let attempt_id = TaskAttemptId(attempt.attempt_id.to_string());
+    if attempt.state == TaskExecutionAttemptState::StartPending
+        && attempt.start_invoked_at.is_none()
+    {
+        authority
+            .authorize_task_execution_start(
+                attempt.attempt_id,
+                attempt.generation,
+                TASK_ORCHESTRATOR_ACTOR,
+            )
+            .await
+            .map_err(TaskControllerError::Store)?;
+        return Ok(());
+    }
+    if attempt.state != TaskExecutionAttemptState::StartPending {
+        return observe_execution_attempt(sandbox_runtime, authority, &request, attempt).await;
+    }
+    let observation = sandbox_runtime
+        .start_task(&attempt_id, &request, input)
+        .await
+        .unwrap_or_else(|error| SandboxTaskObservation::OutcomeUnknown {
+            reason: task_failure_reason(&error),
+        });
+    persist_execution_observation(authority, &attempt, attempt.generation, observation).await
+}
+
+async fn reconcile_shared_runtime_observation(
+    client: &Client,
+    authority: &PgStore,
+    work: &TaskOrchestrationWorkItem,
+) -> Result<(), TaskControllerError> {
+    let expected_uid = work
+        .operation
+        .expected_runtime_uid
+        .as_deref()
+        .ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "shared Task runtime binding has no server-resolved UID".to_owned(),
+            )
+        })?;
+    let api = Api::<AgentRuntime>::namespaced(client.clone(), &work.operation.runtime_namespace);
+    let Some(runtime) = api
+        .get_opt(&work.operation.runtime_name)
+        .await
+        .map_err(TaskControllerError::Kubernetes)?
+    else {
+        authority
+            .enter_task_cleanup(
+                work.task.task_uid,
+                work.operation.generation,
+                TaskCleanupCause::Failed("shared_runtime_absent"),
+                TASK_ORCHESTRATOR_ACTOR,
+            )
+            .await
+            .map_err(TaskControllerError::Store)?;
+        return Ok(());
+    };
+    let runtime_uid_matches = runtime.metadata.uid.as_deref() == Some(expected_uid);
+    let owner_matches = runtime.spec.owner == work.task.runtime_spec.owner
+        && runtime.spec.canonical_authority == work.task.runtime_spec.canonical_authority;
+    let binding_matches = match (
+        work.operation.runtime_ownership,
+        work.task.execution_binding.as_ref(),
+    ) {
+        (TaskRuntimeOwnership::Resident, Some(TaskExecutionBinding::Resident(binding))) => {
+            runtime.status.as_ref().is_some_and(|status| {
+                status.phase == Phase::Running
+                    && status.observed_generation == runtime.metadata.generation.unwrap_or_default()
+                    && status.spec_digest == binding.runtime_spec_digest
+            })
+        }
+        (TaskRuntimeOwnership::Adopted, None) => {
+            let expected_spec_digest = spec_digest(&work.task.runtime_spec).map_err(|error| {
+                TaskControllerError::InvalidState(format!(
+                    "adopted Task runtime spec cannot be digested: {error}"
+                ))
+            })?;
+            runtime.spec == work.task.runtime_spec
+                && runtime.status.as_ref().is_some_and(|status| {
+                    status.phase == Phase::Running
+                        && status.observed_generation
+                            == runtime.metadata.generation.unwrap_or_default()
+                        && status.spec_digest == expected_spec_digest
+                })
+        }
+        _ => false,
+    };
+    if !runtime_uid_matches || !owner_matches || !binding_matches {
+        authority
+            .enter_task_cleanup(
+                work.task.task_uid,
+                work.operation.generation,
+                TaskCleanupCause::Failed("shared_runtime_binding_mismatch"),
+                TASK_ORCHESTRATOR_ACTOR,
+            )
+            .await
+            .map_err(TaskControllerError::Store)?;
+        return Ok(());
+    }
+    let resource_version = runtime
+        .metadata
+        .resource_version
+        .as_deref()
+        .ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "observed shared Task runtime has no resource version".to_owned(),
+            )
+        })?;
+    authority
+        .record_task_runtime_observed(
+            work.task.task_uid,
+            work.operation.generation,
+            expected_uid,
+            resource_version,
+            TASK_ORCHESTRATOR_ACTOR,
+        )
+        .await
+        .map(|_| ())
+        .map_err(TaskControllerError::Store)
+}
+
+async fn reconcile_task_cancellation<R: SandboxTaskRuntime>(
+    client: &Client,
+    sandbox_runtime: &R,
+    authority: &PgStore,
+    task: &TaskRecord,
+    attempt: steward_store::TaskExecutionAttemptRecord,
+) -> Result<(), TaskControllerError> {
+    let attempt = if attempt.state == TaskExecutionAttemptState::CancelPending {
+        attempt
+    } else {
+        match authority
+            .authorize_task_execution_cancel(
+                attempt.attempt_id,
+                attempt.generation,
+                TASK_ORCHESTRATOR_ACTOR,
+            )
+            .await
+            .map_err(TaskControllerError::Store)?
+        {
+            TaskExecutionTransition::Applied(attempt)
+            | TaskExecutionTransition::AlreadyApplied(attempt) => attempt,
+            TaskExecutionTransition::Superseded(_)
+            | TaskExecutionTransition::Created(_)
+            | TaskExecutionTransition::AuthorityInactive { .. }
+            | TaskExecutionTransition::InvariantViolation { .. } => return Ok(()),
+        }
+    };
+    let runtime = Api::<AgentRuntime>::namespaced(client.clone(), &task.runtime_namespace)
+        .get_opt(&task.runtime_name)
+        .await
+        .map_err(TaskControllerError::Kubernetes)?;
+    let Some(runtime) = runtime
+        .filter(|runtime| runtime.metadata.uid.as_deref() == Some(attempt.runtime_uid.as_str()))
+    else {
+        let observation = if authority
+            .task_execution_start_observation_expired(attempt.attempt_id)
+            .await
+            .map_err(TaskControllerError::Store)?
+        {
+            SandboxTaskObservation::OutcomeUnknown {
+                reason: "runtime disappeared before cancellation was observed".to_owned(),
+            }
+        } else {
+            return Ok(());
+        };
+        return persist_execution_observation(authority, &attempt, attempt.generation, observation)
+            .await;
+    };
+    let refs = runtime
+        .status
+        .as_ref()
+        .map(|status| status.refs.clone())
+        .ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "cancellable Task runtime has no observed references".to_owned(),
+            )
+        })?;
+    let request = sandbox_task_request(task, attempt.runtime_uid.clone(), refs);
+    let observation = sandbox_runtime
+        .cancel_task(&TaskAttemptId(attempt.attempt_id.to_string()), &request)
+        .await
+        .unwrap_or_else(|error| SandboxTaskObservation::OutcomeUnknown {
+            reason: task_failure_reason(&error),
+        });
+    match observation {
+        SandboxTaskObservation::Absent
+        | SandboxTaskObservation::Accepted { .. }
+        | SandboxTaskObservation::Running { .. } => Ok(()),
+        observation => {
+            persist_execution_observation(authority, &attempt, attempt.generation, observation)
+                .await
+        }
+    }
+}
+
+async fn reconcile_runtime_creation(
+    client: &Client,
+    authority: &PgStore,
+    work: &TaskOrchestrationWorkItem,
+) -> Result<(), TaskControllerError> {
+    let envelope = authority
+        .service_envelope_revision(&work.task.submitter_service, work.task.envelope_revision)
+        .await
+        .map_err(TaskControllerError::Store)?
+        .ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "Task's immutable Envelope revision is unavailable".to_owned(),
+            )
+        })?;
+    let expected = orchestrated_task_runtime_manifest(work, Some(&envelope), false)?;
+    let api = Api::<AgentRuntime>::namespaced(client.clone(), &work.operation.runtime_namespace);
+    match api.create(&PostParams::default(), &expected).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(response)) if response.code == 409 => {}
+        Err(_) => {
+            // The create result is ambiguous. Observation below, not compensation,
+            // determines what happened.
+        }
+    }
+    let Some(observed) = api
+        .get_opt(&work.operation.runtime_name)
+        .await
+        .map_err(TaskControllerError::Kubernetes)?
+    else {
+        return Ok(());
+    };
+    if !runtime_matches_orchestration(&observed, &expected, work, "inert") {
+        authority
+            .enter_task_cleanup(
+                work.task.task_uid,
+                work.operation.generation,
+                TaskCleanupCause::Failed("runtime_identity_collision"),
+                TASK_ORCHESTRATOR_ACTOR,
+            )
+            .await
+            .map_err(TaskControllerError::Store)?;
+        return Ok(());
+    }
+    let uid = observed.metadata.uid.as_deref().ok_or_else(|| {
+        TaskControllerError::InvalidState("observed Task runtime has no UID".to_owned())
+    })?;
+    let resource_version = observed
+        .metadata
+        .resource_version
+        .as_deref()
+        .ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "observed Task runtime has no resource version".to_owned(),
+            )
+        })?;
+    authority
+        .record_task_runtime_observed(
+            work.task.task_uid,
+            work.operation.generation,
+            uid,
+            resource_version,
+            TASK_ORCHESTRATOR_ACTOR,
+        )
+        .await
+        .map(|_| ())
+        .map_err(TaskControllerError::Store)
+}
+
+async fn reconcile_runtime_activation(
+    client: &Client,
+    authority: &PgStore,
+    work: &TaskOrchestrationWorkItem,
+) -> Result<(), TaskControllerError> {
+    let expected_uid = work.operation.runtime_uid.as_deref().ok_or_else(|| {
+        TaskControllerError::InvalidState("activation has no exact runtime UID".to_owned())
+    })?;
+    let api = Api::<AgentRuntime>::namespaced(client.clone(), &work.operation.runtime_namespace);
+    let Some(mut observed) = api
+        .get_opt(&work.operation.runtime_name)
+        .await
+        .map_err(TaskControllerError::Kubernetes)?
+    else {
+        authority
+            .enter_task_cleanup(
+                work.task.task_uid,
+                work.operation.generation,
+                TaskCleanupCause::Failed("observed_runtime_disappeared"),
+                TASK_ORCHESTRATOR_ACTOR,
+            )
+            .await
+            .map_err(TaskControllerError::Store)?;
+        return Ok(());
+    };
+    if observed.metadata.uid.as_deref() != Some(expected_uid)
+        || !runtime_identity_matches(&observed, work)
+    {
+        authority
+            .enter_task_cleanup(
+                work.task.task_uid,
+                work.operation.generation,
+                TaskCleanupCause::Failed("observed_runtime_identity_changed"),
+                TASK_ORCHESTRATOR_ACTOR,
+            )
+            .await
+            .map_err(TaskControllerError::Store)?;
+        return Ok(());
+    }
+    let desired = orchestrated_task_runtime_manifest(work, None, true)?;
+    if observed.spec != desired.spec || !runtime_mode_matches(&observed, &desired, "active") {
+        let resource_version = observed.metadata.resource_version.clone().ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "Task runtime activation has no resource version".to_owned(),
+            )
+        })?;
+        let mut replacement = desired;
+        replacement.metadata.resource_version = Some(resource_version);
+        match api
+            .replace(
+                &work.operation.runtime_name,
+                &PostParams::default(),
+                &replacement,
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(response)) if response.code == 409 => {}
+            Err(_) => return Ok(()),
+        }
+        observed = match api.get(&work.operation.runtime_name).await {
+            Ok(runtime) => runtime,
+            Err(kube::Error::Api(response)) if response.code == 404 => return Ok(()),
+            Err(error) => return Err(TaskControllerError::Kubernetes(error)),
+        };
+    }
+    let expected = orchestrated_task_runtime_manifest(work, None, true)?;
+    let expected_spec_digest = spec_digest(&expected.spec).map_err(|error| {
+        TaskControllerError::InvalidState(format!(
+            "active Task runtime spec cannot be digested: {error}"
+        ))
+    })?;
+    let ready = runtime_matches_orchestration(&observed, &expected, work, "active")
+        && observed.status.as_ref().is_some_and(|status| {
+            status.phase == Phase::Running
+                && status.observed_generation == observed.metadata.generation.unwrap_or_default()
+                && status.spec_digest == expected_spec_digest
+        });
+    let resource_version = observed
+        .metadata
+        .resource_version
+        .as_deref()
+        .ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "active Task runtime has no resource version".to_owned(),
+            )
+        })?;
+    authority
+        .record_task_activation_observed(
+            work.task.task_uid,
+            work.operation.generation,
+            &TaskActivationObservation {
+                runtime_uid: expected_uid,
+                resource_version,
+                active_manifest_digest: &work.operation.active_manifest_digest,
+                provider_set_ready: ready,
+            },
+            TASK_ORCHESTRATOR_ACTOR,
+        )
+        .await
+        .map(|_| ())
+        .map_err(TaskControllerError::Store)
+}
+
+async fn reconcile_runtime_cleanup(
+    client: &Client,
+    authority: &PgStore,
+    work: &TaskOrchestrationWorkItem,
+) -> Result<(), TaskControllerError> {
+    let api = Api::<AgentRuntime>::namespaced(client.clone(), &work.operation.runtime_namespace);
+    let observed = api
+        .get_opt(&work.operation.runtime_name)
+        .await
+        .map_err(TaskControllerError::Kubernetes)?;
+    if let Some(expected_uid) = work.operation.runtime_uid.as_deref() {
+        if work.operation.runtime_ownership == TaskRuntimeOwnership::Provisioned
+            && let Some(runtime) = observed.as_ref()
+            && runtime.metadata.uid.as_deref() == Some(expected_uid)
+        {
+            api.delete(
+                &work.operation.runtime_name,
+                &DeleteParams {
+                    preconditions: Some(Preconditions {
+                        uid: Some(expected_uid.to_owned()),
+                        resource_version: None,
+                    }),
+                    ..DeleteParams::default()
+                },
+            )
             .await
             .map(|_| ())
-            .map_err(TaskControllerError::Store),
-        TaskRuntimeAction::Execute => {
-            if !authority
-                .claim_task_execution(task.task_uid)
-                .await
-                .map_err(TaskControllerError::Store)?
-            {
-                return Ok(());
-            }
-            let runtime = runtime.ok_or_else(|| {
-                TaskControllerError::InvalidState("claimed task runtime disappeared".to_owned())
-            })?;
-            let refs = runtime
-                .status
-                .as_ref()
-                .map(|status| status.refs.clone())
-                .ok_or_else(|| {
-                    TaskControllerError::InvalidState(
-                        "claimed task runtime has no observed references".to_owned(),
-                    )
-                })?;
-            let input = task.input_archive.as_deref().ok_or_else(|| {
-                TaskControllerError::InvalidState("queued task has no input archive".to_owned())
-            })?;
-            let result = sandbox_runtime
-                .run_task(
-                    &SandboxTaskRequest {
-                        runtime: RuntimeId(task.runtime_uid.clone().ok_or_else(|| {
-                            TaskControllerError::InvalidState(
-                                "task has no bound runtime UID".to_owned(),
-                            )
-                        })?),
-                        refs,
-                        execution_class: sandbox_execution_class(&task.runtime_spec),
-                        agent_type: task.runtime_spec.agent_type.clone(),
-                        command: task.agent_command.clone(),
-                        execution_binding: task
-                            .execution_binding
-                            .as_ref()
-                            .and_then(TaskExecutionBinding::disposable)
-                            .cloned(),
-                    },
-                    input,
-                )
-                .await;
-            match result {
-                Ok(SandboxTaskOutput { archive }) => {
-                    if let Some(reason) = task_output_archive_failure(archive.len()) {
-                        authority
-                            .fail_task_execution(task.task_uid, reason)
-                            .await
-                            .map_err(TaskControllerError::Store)
-                    } else {
-                        authority
-                            .complete_task_execution(task.task_uid, &archive)
-                            .await
-                            .map_err(TaskControllerError::Store)
-                    }
-                }
-                Err(error) => {
-                    let reason = task_failure_reason(&error);
-                    eprintln!(
-                        "task execution failed: task_uid={} runtime_uid={} reason={reason}",
-                        task.task_uid,
-                        task.runtime_uid.as_deref().unwrap_or("unbound")
-                    );
-                    authority
-                        .fail_task_execution(task.task_uid, &reason)
-                        .await
-                        .map_err(TaskControllerError::Store)
-                }
-            }
+            .or_else(|error| match error {
+                kube::Error::Api(response) if response.code == 404 => Ok(()),
+                error => Err(error),
+            })
+            .map_err(TaskControllerError::Kubernetes)?;
+            return Ok(());
         }
-        TaskRuntimeAction::DeleteRuntime => {
-            let runtime = runtime.ok_or_else(|| {
-                TaskControllerError::InvalidState("task runtime disappeared".to_owned())
-            })?;
-            let namespace = runtime.namespace().ok_or_else(|| {
-                TaskControllerError::InvalidState("task runtime has no namespace".to_owned())
-            })?;
-            let uid = runtime.metadata.uid.clone().ok_or_else(|| {
-                TaskControllerError::InvalidState("task runtime has no UID".to_owned())
-            })?;
-            Api::<AgentRuntime>::namespaced(client.clone(), &namespace)
-                .delete(
-                    &runtime.name_any(),
-                    &DeleteParams {
-                        preconditions: Some(Preconditions {
-                            uid: Some(uid),
-                            resource_version: None,
-                        }),
-                        ..DeleteParams::default()
-                    },
-                )
-                .await
-                .map(|_| ())
-                .map_err(TaskControllerError::Kubernetes)
-        }
-        TaskRuntimeAction::MarkFinalized => authority
-            .mark_task_finalized(task.task_uid)
+        return authority
+            .record_task_cleanup_complete(
+                work.task.task_uid,
+                work.operation.generation,
+                TaskCleanupObservation {
+                    exact_runtime_absent: work.operation.runtime_ownership
+                        == TaskRuntimeOwnership::Provisioned,
+                    owned_projections_absent: true,
+                },
+                TASK_ORCHESTRATOR_ACTOR,
+            )
             .await
-            .map_err(TaskControllerError::Store),
+            .map(|_| ())
+            .map_err(TaskControllerError::Store);
+    }
+    if work.operation.runtime_create_authorized_at.is_none() {
+        return authority
+            .record_task_cleanup_complete(
+                work.task.task_uid,
+                work.operation.generation,
+                TaskCleanupObservation {
+                    exact_runtime_absent: false,
+                    owned_projections_absent: false,
+                },
+                TASK_ORCHESTRATOR_ACTOR,
+            )
+            .await
+            .map(|_| ())
+            .map_err(TaskControllerError::Store);
+    }
+    let envelope = authority
+        .service_envelope_revision(&work.task.submitter_service, work.task.envelope_revision)
+        .await
+        .map_err(TaskControllerError::Store)?
+        .ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "Task's immutable Envelope revision is unavailable during cleanup".to_owned(),
+            )
+        })?;
+    let expected = orchestrated_task_runtime_manifest(work, Some(&envelope), false)?;
+    if let Some(runtime) = observed.as_ref() {
+        if runtime_matches_orchestration(runtime, &expected, work, "inert") {
+            let uid = runtime.metadata.uid.as_deref().ok_or_else(|| {
+                TaskControllerError::InvalidState("ambiguous Task runtime has no UID".to_owned())
+            })?;
+            let resource_version =
+                runtime
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .ok_or_else(|| {
+                        TaskControllerError::InvalidState(
+                            "ambiguous Task runtime has no resource version".to_owned(),
+                        )
+                    })?;
+            authority
+                .record_task_cleanup_runtime_observed(
+                    work.task.task_uid,
+                    work.operation.generation,
+                    uid,
+                    resource_version,
+                    TASK_ORCHESTRATOR_ACTOR,
+                )
+                .await
+                .map_err(TaskControllerError::Store)?;
+        }
+        return Ok(());
+    }
+    match api.create(&PostParams::default(), &expected).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(response)) if response.code == 409 => {}
+        Err(_) => return Ok(()),
+    }
+    let Some(runtime) = api
+        .get_opt(&work.operation.runtime_name)
+        .await
+        .map_err(TaskControllerError::Kubernetes)?
+    else {
+        return Ok(());
+    };
+    if !runtime_matches_orchestration(&runtime, &expected, work, "inert") {
+        return Ok(());
+    }
+    let uid = runtime.metadata.uid.as_deref().ok_or_else(|| {
+        TaskControllerError::InvalidState("ambiguous Task runtime has no UID".to_owned())
+    })?;
+    let resource_version = runtime
+        .metadata
+        .resource_version
+        .as_deref()
+        .ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "ambiguous Task runtime has no resource version".to_owned(),
+            )
+        })?;
+    authority
+        .record_task_cleanup_runtime_observed(
+            work.task.task_uid,
+            work.operation.generation,
+            uid,
+            resource_version,
+            TASK_ORCHESTRATOR_ACTOR,
+        )
+        .await
+        .map(|_| ())
+        .map_err(TaskControllerError::Store)
+}
+
+fn orchestrated_task_runtime_manifest(
+    work: &TaskOrchestrationWorkItem,
+    envelope: Option<&Envelope>,
+    active: bool,
+) -> Result<AgentRuntime, TaskControllerError> {
+    let mut runtime = server_task_runtime_manifest(TaskRuntimeBinding::from(&work.task))?;
+    let mode = if active { "active" } else { "inert" };
+    let digest = if active {
+        &work.operation.active_manifest_digest
+    } else {
+        let envelope = envelope.ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "inert Task runtime construction requires its Envelope".to_owned(),
+            )
+        })?;
+        runtime.spec.llms.clear();
+        runtime.spec.tools.clear();
+        runtime.spec.budget.monthly_limit = "0".to_owned();
+        runtime.spec.budget.single_run_limit = Some("0".to_owned());
+        runtime.spec.budget.currency = envelope.spec.budget.currency.clone();
+        &work.operation.inert_manifest_digest
+    };
+    let canonical_digest = bytes_digest(
+        &serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": "steward-task-runtime-manifest/v1",
+            "taskUid": work.task.task_uid,
+            "operationId": work.operation.operation_id,
+            "runtimeNamespace": work.operation.runtime_namespace,
+            "runtimeName": work.operation.runtime_name,
+            "mode": mode,
+            "spec": &runtime.spec,
+            "executionBinding": &work.task.execution_binding,
+        }))
+        .map_err(|error| {
+            TaskControllerError::InvalidState(format!(
+                "Task runtime manifest cannot be canonicalized: {error}"
+            ))
+        })?,
+    );
+    if &canonical_digest != digest {
+        return Err(TaskControllerError::InvalidState(
+            "persisted Task runtime manifest digest does not match immutable intent".to_owned(),
+        ));
+    }
+    let annotations = runtime.metadata.annotations.get_or_insert_default();
+    annotations.insert(
+        TASK_UID_ANNOTATION.to_owned(),
+        work.task.task_uid.to_string(),
+    );
+    annotations.insert(
+        TASK_OPERATION_ANNOTATION.to_owned(),
+        work.operation.operation_id.to_string(),
+    );
+    annotations.insert(TASK_MANIFEST_DIGEST_ANNOTATION.to_owned(), digest.clone());
+    annotations.insert(TASK_RUNTIME_MODE_ANNOTATION.to_owned(), mode.to_owned());
+    if active {
+        annotations.remove(PENDING_APPROVAL_ANNOTATION);
+    } else {
+        annotations.insert(
+            PENDING_APPROVAL_ANNOTATION.to_owned(),
+            work.task.candidate_digest.clone().ok_or_else(|| {
+                TaskControllerError::InvalidState(
+                    "Task has no immutable candidate digest".to_owned(),
+                )
+            })?,
+        );
+    }
+    Ok(runtime)
+}
+
+fn runtime_identity_matches(runtime: &AgentRuntime, work: &TaskOrchestrationWorkItem) -> bool {
+    let annotations = runtime.annotations();
+    annotations.get(TASK_UID_ANNOTATION) == Some(&work.task.task_uid.to_string())
+        && annotations.get(TASK_OPERATION_ANNOTATION)
+            == Some(&work.operation.operation_id.to_string())
+}
+
+fn runtime_mode_matches(runtime: &AgentRuntime, expected: &AgentRuntime, mode: &str) -> bool {
+    let annotations = runtime.annotations();
+    let expected_annotations = expected.annotations();
+    [
+        SERVICE_PRINCIPAL_ANNOTATION,
+        TASK_EXECUTION_BINDING_ANNOTATION,
+        TASK_UID_ANNOTATION,
+        TASK_OPERATION_ANNOTATION,
+        TASK_MANIFEST_DIGEST_ANNOTATION,
+        TASK_RUNTIME_MODE_ANNOTATION,
+        PENDING_APPROVAL_ANNOTATION,
+    ]
+    .into_iter()
+    .all(|key| annotations.get(key) == expected_annotations.get(key))
+        && annotations
+            .get(TASK_RUNTIME_MODE_ANNOTATION)
+            .is_some_and(|value| value == mode)
+}
+
+fn runtime_matches_orchestration(
+    runtime: &AgentRuntime,
+    expected: &AgentRuntime,
+    work: &TaskOrchestrationWorkItem,
+    mode: &str,
+) -> bool {
+    runtime.spec == expected.spec
+        && runtime_identity_matches(runtime, work)
+        && runtime_mode_matches(runtime, expected, mode)
+}
+
+async fn observe_execution_attempt<R: SandboxTaskRuntime>(
+    sandbox_runtime: &R,
+    authority: &PgStore,
+    request: &SandboxTaskRequest,
+    attempt: steward_store::TaskExecutionAttemptRecord,
+) -> Result<(), TaskControllerError> {
+    let attempt_id = TaskAttemptId(attempt.attempt_id.to_string());
+    let observation = sandbox_runtime
+        .observe_task(&attempt_id, request)
+        .await
+        .unwrap_or_else(|error| SandboxTaskObservation::OutcomeUnknown {
+            reason: task_failure_reason(&error),
+        });
+    let observation = match observation {
+        SandboxTaskObservation::Absent
+            if attempt.start_invoked_at.is_some()
+                && authority
+                    .task_execution_start_observation_expired(attempt.attempt_id)
+                    .await
+                    .map_err(TaskControllerError::Store)? =>
+        {
+            SandboxTaskObservation::OutcomeUnknown {
+                reason: "authorized execution start has no durable adapter observation".to_owned(),
+            }
+        }
+        SandboxTaskObservation::Absent => return Ok(()),
+        observation => observation,
+    };
+    persist_execution_observation(authority, &attempt, attempt.generation, observation).await
+}
+
+async fn persist_execution_observation(
+    authority: &PgStore,
+    attempt: &steward_store::TaskExecutionAttemptRecord,
+    generation: i64,
+    observation: SandboxTaskObservation,
+) -> Result<(), TaskControllerError> {
+    let transition = match observation {
+        SandboxTaskObservation::Absent => return Ok(()),
+        SandboxTaskObservation::Accepted {
+            adapter_observation_id,
+        } => {
+            authority
+                .record_task_execution_observation(
+                    attempt.attempt_id,
+                    generation,
+                    TaskExecutionObservation::Accepted {
+                        adapter_observation_id: &adapter_observation_id,
+                    },
+                    "task-orchestrator",
+                )
+                .await
+        }
+        SandboxTaskObservation::Running {
+            adapter_observation_id,
+        } => {
+            authority
+                .record_task_execution_observation(
+                    attempt.attempt_id,
+                    generation,
+                    TaskExecutionObservation::Running {
+                        adapter_observation_id: &adapter_observation_id,
+                    },
+                    "task-orchestrator",
+                )
+                .await
+        }
+        SandboxTaskObservation::Succeeded {
+            adapter_observation_id,
+            output,
+        } => {
+            if let Some(reason) = task_output_archive_failure(output.archive.len()) {
+                authority
+                    .record_task_execution_observation(
+                        attempt.attempt_id,
+                        generation,
+                        TaskExecutionObservation::Failed {
+                            adapter_observation_id: &adapter_observation_id,
+                            reason,
+                        },
+                        "task-orchestrator",
+                    )
+                    .await
+            } else {
+                let result_digest = bytes_digest(&output.archive);
+                let result_reference = format!("adapter:{adapter_observation_id}");
+                authority
+                    .record_task_execution_observation(
+                        attempt.attempt_id,
+                        generation,
+                        TaskExecutionObservation::Succeeded {
+                            adapter_observation_id: &adapter_observation_id,
+                            result_digest: &result_digest,
+                            result_reference: &result_reference,
+                            output_archive: &output.archive,
+                        },
+                        "task-orchestrator",
+                    )
+                    .await
+            }
+        }
+        SandboxTaskObservation::Failed {
+            adapter_observation_id,
+            reason,
+        } => {
+            authority
+                .record_task_execution_observation(
+                    attempt.attempt_id,
+                    generation,
+                    TaskExecutionObservation::Failed {
+                        adapter_observation_id: &adapter_observation_id,
+                        reason: &reason,
+                    },
+                    "task-orchestrator",
+                )
+                .await
+        }
+        SandboxTaskObservation::OutcomeUnknown { reason } => {
+            authority
+                .record_task_execution_observation(
+                    attempt.attempt_id,
+                    generation,
+                    TaskExecutionObservation::OutcomeUnknown { reason: &reason },
+                    "task-orchestrator",
+                )
+                .await
+        }
+    }
+    .map_err(TaskControllerError::Store)?;
+    match transition {
+        TaskExecutionTransition::Created(_)
+        | TaskExecutionTransition::Applied(_)
+        | TaskExecutionTransition::AlreadyApplied(_)
+        | TaskExecutionTransition::Superseded(_)
+        | TaskExecutionTransition::AuthorityInactive { .. }
+        | TaskExecutionTransition::InvariantViolation { .. } => Ok(()),
+    }
+}
+
+fn bytes_digest(value: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(value))
+}
+
+fn sandbox_task_request(
+    task: &TaskRecord,
+    runtime_uid: String,
+    refs: RuntimeRefs,
+) -> SandboxTaskRequest {
+    SandboxTaskRequest {
+        runtime: RuntimeId(runtime_uid),
+        refs,
+        execution_class: sandbox_execution_class(&task.runtime_spec),
+        agent_type: task.runtime_spec.agent_type.clone(),
+        command: task.agent_command.clone(),
+        execution_binding: task
+            .execution_binding
+            .as_ref()
+            .and_then(TaskExecutionBinding::disposable)
+            .cloned(),
     }
 }
 
@@ -867,14 +1892,7 @@ fn connection_operation_authority_action(
     Ok(AuthorityAction::Continue)
 }
 
-async fn create_task_runtime(
-    client: &Client,
-    authority: &impl TaskRuntimeBindingStore,
-    task: &TaskRecord,
-) -> Result<(), TaskControllerError> {
-    create_task_runtime_inner(client, authority, task).await
-}
-
+#[cfg(test)]
 trait TaskRuntimeBindingStore {
     fn bind_task_runtime(
         &self,
@@ -896,25 +1914,7 @@ trait TaskRuntimeBindingStore {
     }
 }
 
-impl TaskRuntimeBindingStore for PgStore {
-    async fn bind_task_runtime(
-        &self,
-        task: &TaskRecord,
-        runtime_uid: &str,
-        phase: TaskPhase,
-    ) -> Result<TaskRecord, StoreError> {
-        PgStore::bind_task_runtime(self, task.task_uid, runtime_uid, phase).await
-    }
-
-    async fn service_envelope_revision(
-        &self,
-        service: &str,
-        revision: i64,
-    ) -> Result<Option<Envelope>, StoreError> {
-        PgStore::service_envelope_revision(self, service, revision).await
-    }
-}
-
+#[cfg(test)]
 async fn create_task_runtime_inner(
     client: &Client,
     authority: &impl TaskRuntimeBindingStore,
@@ -982,6 +1982,7 @@ async fn create_task_runtime_inner(
     }
 }
 
+#[cfg(test)]
 fn task_runtime_manifest(task: &TaskRecord) -> Result<AgentRuntime, TaskControllerError> {
     if task.runtime_ownership != RuntimeOwnership::Provisioned || task.runtime_uid.is_some() {
         return Err(TaskControllerError::InvalidState(
@@ -1113,6 +2114,7 @@ fn task_failure_reason(error: &PortError) -> String {
     }
 }
 
+#[cfg(test)]
 async fn task_runtime(
     client: &Client,
     authority: &impl TaskRuntimeBindingStore,
@@ -1167,9 +2169,10 @@ async fn task_runtime(
 }
 
 #[derive(Debug)]
-enum TaskControllerError {
+pub enum TaskControllerError {
     Kubernetes(kube::Error),
     Store(StoreError),
+    #[cfg(test)]
     RuntimeBindingCleanup {
         binding: StoreError,
         cleanup: Box<kube::Error>,
@@ -1184,6 +2187,7 @@ impl fmt::Display for TaskControllerError {
                 write!(formatter, "Kubernetes task operation failed: {error}")
             }
             Self::Store(error) => write!(formatter, "task store operation failed: {error}"),
+            #[cfg(test)]
             Self::RuntimeBindingCleanup { binding, cleanup } => write!(
                 formatter,
                 "task runtime binding failed ({binding}) and exact-UID cleanup failed ({cleanup})"
@@ -3058,9 +4062,19 @@ mod tests {
             agent_command: Vec::new(),
             execution_binding: None,
             envelope_revision: 3,
+            orchestration_version: 2,
+            orchestration_operation_id: Some(
+                serde_json::from_value(serde_json::json!("00000000-0000-0000-0000-000000000001"))
+                    .map_err(|error| format!("parse orchestration UID fixture: {error}"))?,
+            ),
+            candidate_digest: Some(format!("sha256:{}", "a".repeat(64))),
+            service_envelope_digest: Some(format!("sha256:{}", "b".repeat(64))),
+            original_admission_decision: Some("admit".to_owned()),
+            original_admission_deltas: Some(Vec::new()),
             input_archive: None,
             output_archive: None,
             execute_requested: false,
+            cancel_requested: false,
             finalize_requested: false,
             finalized: false,
             failure_reason: None,

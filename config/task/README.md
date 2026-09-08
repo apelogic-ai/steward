@@ -11,6 +11,7 @@ worker is part of the normal `steward-controller` process.
 | `STEWARD_TASK_WORKFLOWS_JSON` | Required JSON array matching `workflows.example.json`. Commands are server-selected; clients cannot supply them. |
 | `STEWARD_TASK_EXECUTION_BINDINGS_FILE` | Preferred read-only file containing `steward.execution-bindings/v1`. Missing or empty catalog means no coding agents are available. |
 | `STEWARD_TASK_EXECUTION_BINDINGS_JSON` | Optional inline form of the same document for non-Helm integration environments. Configuring both forms fails startup. |
+| `STEWARD_TASK_INFERENCE_ENDPOINT` | Exact OpenAI-compatible Responses API endpoint rendered by the configured Codex adapter. Production routes this through the governed inference provider. |
 | `STEWARD_TASK_MCP_GW_ENDPOINT` | Exact HTTP(S) streamable MCP endpoint. Required only when a versioned task resolves non-empty tool authority; otherwise the task fails before reservation or execution. |
 | `STEWARD_APISERVER_BIND` | HTTPS listener, default `0.0.0.0:8443`. Expose the existing apiserver Service port to this target port. |
 | Task API enablement | Enabled whenever the production apiserver starts. There is no bypass flag; invalid or absent Task configuration fails startup. |
@@ -41,9 +42,12 @@ The concrete agent and profile values in this directory are local E2E fixtures o
 
 Task execution is enabled in the normal controller composition root when
 `STEWARD_DATABASE_URL`, `STEWARD_OPENSHELL_ENDPOINT`, and the existing inference-plane inputs
-are present. `STEWARD_S0_BOOTSTRAP=1` is the bootstrap-only mode and does not run the durable
-Task worker; do not use it for a Task deployment. No second Task controller flag or service
-port exists.
+are present. The same process drains the Task approval outbox through the Jira
+`DecisionChannel`, so it also requires `STEWARD_JIRA_BASE_URL`,
+`STEWARD_JIRA_PROJECT_KEY`, `STEWARD_JIRA_ACCOUNT_EMAIL`, and the
+`STEWARD_JIRA_TOKEN` secret reference. `STEWARD_S0_BOOTSTRAP=1` is the bootstrap-only mode and
+does not run the durable Task worker or approval dispatcher; do not use it for a Task deployment.
+No second Task controller flag or service port exists.
 
 ## Migration 0011
 

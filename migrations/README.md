@@ -18,6 +18,16 @@ Migration 0015 appends an immutable, separately-recorded approved Envelope
 snapshot to user-request lifecycle events. Older events intentionally have no
 snapshot rather than inferring one from the original request.
 
+Migration 0028 drains legacy in-flight Task rows and introduces the durable
+Task-runtime orchestration boundary described in
+[`docs/task-runtime-orchestration.md`](../docs/task-runtime-orchestration.md).
+It atomically records immutable Task intent and an operation generation, exact
+runtime UID observations, one observable execution attempt, recoverable
+external-effect outbox state, append-only transition history, and absence
+evidence required before finalization. New v2 writers are fenced from the old
+nullable-UID lifecycle by database constraints and monotonic transition
+triggers.
+
 `cargo xtask migrate-check` rejects edits or renames of migrations already
 present on the comparison base. The S3 and S4 store integration tests apply the
 full set to empty ephemeral Postgres databases.

@@ -1,11 +1,11 @@
 # Durable Task runtime orchestration
 
-Status: accepted implementation architecture; implementation pending
+Status: accepted and implemented on the v2 common-core branch
 
 This document defines the target internal architecture for applying one immutable
 Steward `Task` across Postgres, Kubernetes, approval, runtime-provider, and execution
 boundaries. It is an implementation decision, not a public wire contract and not a
-claim about current repository behavior.
+claim about the public wire contract.
 
 The frozen [`steward.m1/v1` contract](contracts/m1/v1/README.md) remains authoritative
 for M1 request, response, phase, evidence, and finalization behavior. The
@@ -39,6 +39,32 @@ state machine.
 
 This replaces recovery based on nullable fields, reusable names, reconstructed object
 shape, or submission retries.
+
+## Implementation map
+
+The architecture is implemented by these internal boundaries:
+
+- append-only migration `0028_durable_task_runtime_orchestration.sql` creates the
+  operation, execution-attempt, external-effect outbox, and orchestration-journal
+  records and fences old lifecycle writers;
+- `steward-store` owns locked, generation-checked transitions and revalidates current
+  authority in the activation and execution-start transactions;
+- `steward-apiserver` records immutable Task intent and monotonic commands only;
+- the Task reconciler in `steward-controller` owns inert creation, exact UID
+  observation, admission materialization, activation, execution, and cleanup;
+- the controller's approval dispatcher drains durable outbox records through the
+  `DecisionChannel` port using the approval UUID as the stable delivery identity;
+- `SandboxTaskRuntime` exposes attempt-scoped start, observation, and cancellation;
+  the OpenShell adapter persists attempt markers and fails closed on an ambiguous
+  outcome instead of replaying it; and
+- `TaskExecutionAdapter` keeps agent-specific command generation out of core. The
+  Codex implementation lives in `adapters/codex`, while deployment-selected images,
+  executables, versions, profiles, and network endpoints remain configuration.
+
+The focused Postgres and fake-Kubernetes fault suite covers concurrent reconcilers,
+ambiguous create and execution results, UID replacement, authority revision and
+revocation races, state monotonicity, and exact-UID cleanup. The pinned full-stack lane
+remains the conformance proof for the real external components.
 
 ## Scope
 
@@ -277,8 +303,8 @@ adapter contract, digest-pinned image, executable and version probe, and require
 provider-profile IDs and digests. The complete validated binding is stored in immutable
 Task intent and covered by the active manifest digest.
 
-Core orchestration switches only on a supported versioned adapter contract. Command and
-agent configuration rendering belong to that adapter. Core Task code must not contain a
+Core orchestration resolves a registered versioned adapter contract. Command and agent
+configuration rendering belong to that adapter. Core Task code must not contain a
 Codex command, `CODEX_HOME`, a LiteLLM cluster URL, npm package path, provider-profile
 name, or fallback agent/version. Supporting a new deployment instance is catalog data;
 supporting a new execution protocol is an explicit new adapter contract.

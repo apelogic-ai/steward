@@ -9,8 +9,8 @@ use steward_adapter_openshell::{
     OpenShellConnectionConfig, OpenShellRuntime, OpenShellTaskLogMode,
 };
 use steward_ports::{
-    SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskRequest,
-    SandboxTaskRuntime,
+    SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
+    SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
 };
 use steward_types::{AgentType, RuntimeId, RuntimeRefs};
 use tokio::time::sleep;
@@ -280,8 +280,10 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
 
     let run_dir = PathBuf::from(required("STEWARD_RUN_DIR")?);
     let (input_archive, expected_payload) = make_input_archive(&run_dir)?;
+    let attempt_id = TaskAttemptId("00000000-0000-4000-8000-000000000001".to_owned());
     let task_result = runtime
-        .run_task(
+        .start_task(
+            &attempt_id,
             &SandboxTaskRequest {
                 runtime: request.runtime.clone(),
                 refs,
@@ -298,7 +300,14 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
         )
         .await
         .map_err(|error| format!("adapter task round trip failed: {error:?}"))
-        .and_then(|output| output_payload(&run_dir, &output.archive));
+        .and_then(|observation| match observation {
+            SandboxTaskObservation::Succeeded { output, .. } => {
+                output_payload(&run_dir, &output.archive)
+            }
+            other => Err(format!(
+                "adapter task round trip did not produce a terminal success: {other:?}"
+            )),
+        });
 
     let cleanup_result = delete_sandbox(&runtime, &request).await;
     let actual_payload = task_result?;

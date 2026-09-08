@@ -6,20 +6,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::types::Uuid;
 use steward_admission::internal_authorities::steward_connections_v1;
-use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
+use steward_admission::{
+    AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec, evaluate,
+};
 use steward_apiserver::governed_connections::{
     CONNECTIONS_AUTHORITY_DIGEST, CONNECTIONS_AUTHORITY_VERSION, CONNECTIONS_SERVICE,
     ConnectionExecutionBindings, ConnectionOperationKind as PlannedConnectionOperationKind,
     plan_connection_operation,
 };
 use steward_store::{
-    AgentRunQuery, AgentRunTimelineKind, AgentRunTimelineProvenance, ApproveAdmission,
-    BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
-    ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase, ConnectionOperationKind,
-    ConnectionOperationReservation, ConnectionOperationReservationRequest,
+    AgentRunQuery, AgentRunTimelineKind, AgentRunTimelineProvenance, ApprovalDeliveryTransition,
+    ApproveAdmission, BrowserRbacAssignment, BrowserRbacAssignmentAction,
+    BrowserRbacAssignmentChange, ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase,
+    ConnectionOperationKind, ConnectionOperationReservation, ConnectionOperationReservationRequest,
     ConnectionOperationRetention, ConnectionOperationState, ParkRejection, PgStore, StoreError,
-    TaskReservationRequest,
+    TaskActivationObservation, TaskCleanupObservation, TaskExecutionAttemptState,
+    TaskExecutionObservation, TaskExecutionTransition, TaskOperationTransition,
+    TaskOrchestrationState, TaskReservationRequest,
 };
 use steward_types::{
     AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding, CanonicalUserId, Duration,
@@ -47,6 +52,1343 @@ fn connection_operation_retention() -> ConnectionOperationRetention {
         result_ttl_seconds: 30,
         oauth_lifetime_seconds: 630,
     }
+}
+
+#[tokio::test]
+async fn durable_task_operation_is_atomic_generation_checked_and_uid_immutable()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Task Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let service = format!("task-orchestrator-{suffix}");
+    let identity = store
+        .register_canonical_identity(
+            &google_identity(
+                format!("task-orchestrator-subject-{suffix}"),
+                format!("alice-{suffix}@example.com"),
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let authority = envelope("250.00", 1);
+    store
+        .insert_service_envelope(&service, &authority, "admin@example.com")
+        .await?;
+    let mut spec = proposed_spec();
+    spec.principal = Principal::Service {
+        name: service.clone(),
+        acting_user: Some(Email("alice@example.com".to_owned())),
+    };
+    spec.owner = Email("alice@example.com".to_owned());
+    spec.canonical_authority = Some(CanonicalAuthorityBinding::new(
+        identity.user_id.clone(),
+        Some(identity.user_id.clone()),
+    )?);
+    let decision = evaluate(&spec, &authority)
+        .map_err(|error| io::Error::other(format!("evaluate Task fixture: {error:?}")))?;
+    assert_eq!(decision, AdmissionDecision::Admit);
+    let command = vec!["agent-v1".to_owned()];
+    let idempotency_key = format!("orchestration-{suffix}");
+    let task_uid = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let runtime_name = format!("task-{}", operation_id.simple());
+    let candidate_digest = format!("sha256:{}", "1".repeat(64));
+    let envelope_digest = format!("sha256:{}", "2".repeat(64));
+    let inert_digest = format!("sha256:{}", "3".repeat(64));
+    let reservation = store
+        .reserve_task(&TaskReservationRequest {
+            task_uid,
+            operation_id,
+            idempotency_key: &idempotency_key,
+            submitter_service: &service,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: identity.user_id.as_str(),
+            workflow: "code-review",
+            workflow_name: None,
+            workflow_version: None,
+            workflow_digest: None,
+            user_envelope_instance_id: None,
+            user_envelope_revision: None,
+            user_envelope_digest: None,
+            coding_agent_runtime: "agent-v1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &command,
+            execution_binding: None,
+            envelope_revision: authority.revision,
+            service_envelope: &authority,
+            service_envelope_digest: &envelope_digest,
+            candidate_digest: &candidate_digest,
+            admission_decision: &decision,
+            inert_manifest_digest: &inert_digest,
+            active_manifest_digest: &candidate_digest,
+        })
+        .await?;
+    assert!(reservation.inserted);
+    assert_eq!(
+        reservation.operation.state,
+        TaskOrchestrationState::IntentRecorded
+    );
+    assert_eq!(reservation.operation.generation, 1);
+    assert_eq!(
+        reservation.record.orchestration_operation_id,
+        Some(reservation.operation.operation_id),
+        "Task intent and runtime operation must commit as one identity"
+    );
+    store
+        .put_task_inputs(
+            reservation.record.task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"fixture-input",
+        )
+        .await?;
+    let execution_requested = store
+        .request_task_execution(
+            reservation.record.task_uid,
+            &service,
+            identity.user_id.as_str(),
+        )
+        .await?;
+    assert_eq!(
+        execution_requested.phase,
+        TaskPhase::Submitted,
+        "an execution command cannot project queued before exact runtime activation"
+    );
+
+    let mut invalid_owned_observation = store.pool().begin().await?;
+    let skipped_create_authorization = sqlx::query(
+        "UPDATE task_runtime_operations \
+         SET state = 'runtime_observed', generation = generation + 1, \
+             runtime_uid = 'runtime-uid-without-create-intent', \
+             runtime_resource_version = 'resource-version-a', observed_at = now() \
+         WHERE task_uid = $1",
+    )
+    .bind(task_uid)
+    .execute(&mut *invalid_owned_observation)
+    .await;
+    invalid_owned_observation.rollback().await?;
+    assert!(
+        skipped_create_authorization.is_err(),
+        "a provisioned runtime UID cannot be observed before inert creation is authorized"
+    );
+
+    let first_store = store.clone();
+    let second_store = store.clone();
+    let task_uid = reservation.record.task_uid;
+    let (first, second) = tokio::join!(
+        first_store.authorize_task_runtime_creation(task_uid, 1, "controller-a"),
+        second_store.authorize_task_runtime_creation(task_uid, 1, "controller-b")
+    );
+    let transitions = [first?, second?];
+    assert_eq!(
+        transitions
+            .iter()
+            .filter(|transition| matches!(transition, TaskOperationTransition::Applied(_)))
+            .count(),
+        1,
+        "exactly one reconciler may authorize the external create effect"
+    );
+    assert!(transitions.iter().all(|transition| match transition {
+        TaskOperationTransition::Applied(current)
+        | TaskOperationTransition::Superseded(current) => {
+            current.state == TaskOrchestrationState::RuntimeCreatePending && current.generation == 2
+        }
+        TaskOperationTransition::AlreadyApplied(_)
+        | TaskOperationTransition::AuthorityInactive { .. }
+        | TaskOperationTransition::InvariantViolation { .. } => false,
+    }));
+
+    let mut invalid_observation = store.pool().begin().await?;
+    let missing_resource_version = sqlx::query(
+        "UPDATE task_runtime_operations \
+         SET state = 'runtime_observed', generation = generation + 1, \
+             runtime_uid = 'runtime-uid-without-version', observed_at = now() \
+         WHERE task_uid = $1",
+    )
+    .bind(task_uid)
+    .execute(&mut *invalid_observation)
+    .await;
+    invalid_observation.rollback().await?;
+    assert!(
+        missing_resource_version.is_err(),
+        "a UID observation without its exact Kubernetes resource version must be rejected"
+    );
+
+    let observed = store
+        .record_task_runtime_observed(
+            task_uid,
+            2,
+            "runtime-uid-a",
+            "resource-version-a",
+            "controller-a",
+        )
+        .await?;
+    let TaskOperationTransition::Applied(observed) = observed else {
+        return Err(io::Error::other("the first exact UID observation must apply").into());
+    };
+    assert_eq!(observed.state, TaskOrchestrationState::RuntimeObserved);
+    assert_eq!(observed.runtime_uid.as_deref(), Some("runtime-uid-a"));
+    assert_eq!(observed.generation, 3);
+    assert_eq!(
+        store
+            .task(task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .runtime_uid
+            .as_deref(),
+        Some("runtime-uid-a"),
+        "the public Task projection must expose the operation's exact observed UID"
+    );
+
+    let stale = store
+        .record_task_runtime_observed(
+            task_uid,
+            2,
+            "runtime-uid-b",
+            "resource-version-b",
+            "controller-b",
+        )
+        .await?;
+    assert!(matches!(
+        stale,
+        TaskOperationTransition::Superseded(current)
+            if current.runtime_uid.as_deref() == Some("runtime-uid-a")
+                && current.generation == 3
+    ));
+    let overwrite = sqlx::query(
+        "UPDATE task_runtime_operations \
+         SET runtime_uid = 'runtime-uid-b', generation = generation + 1 \
+         WHERE task_uid = $1",
+    )
+    .bind(task_uid)
+    .execute(store.pool())
+    .await;
+    assert!(
+        overwrite.is_err(),
+        "the database must reject replacement of an observed runtime UID"
+    );
+    let backwards = sqlx::query(
+        "UPDATE task_runtime_operations \
+         SET state = 'runtime_create_pending', generation = generation + 1 \
+         WHERE task_uid = $1",
+    )
+    .bind(task_uid)
+    .execute(store.pool())
+    .await;
+    assert!(
+        backwards.is_err(),
+        "the database must reject a backward orchestration transition"
+    );
+
+    let mut invalid_activation = store.pool().begin().await?;
+    let incomplete_authority = sqlx::query(
+        "UPDATE task_runtime_operations \
+         SET state = 'activation_pending', generation = generation + 1, \
+             activation_authority_kind = 'baseline' \
+         WHERE task_uid = $1",
+    )
+    .bind(task_uid)
+    .execute(&mut *invalid_activation)
+    .await;
+    invalid_activation.rollback().await?;
+    assert!(
+        incomplete_authority.is_err(),
+        "activation intent without the exact Envelope revision and digest must be rejected"
+    );
+
+    let authority_selected = store
+        .decide_task_runtime_authority(task_uid, 3, &authority, &envelope_digest, "controller-a")
+        .await?;
+    assert!(matches!(
+        authority_selected,
+        TaskOperationTransition::Applied(current)
+            if current.state == TaskOrchestrationState::ActivationPending
+                && current.generation == 4
+                && current.activation_authority_kind.as_deref() == Some("baseline")
+                && current.activation_envelope_revision == Some(authority.revision)
+                && current.activation_envelope_digest.as_deref() == Some(envelope_digest.as_str())
+    ));
+    let refreshed_authority = envelope("250.00", 2);
+    let refreshed_envelope_digest = format!("sha256:{}", "7".repeat(64));
+    store
+        .insert_service_envelope(&service, &refreshed_authority, "admin@example.com")
+        .await?;
+    let activation_authorized = store
+        .decide_task_runtime_authority(
+            task_uid,
+            4,
+            &refreshed_authority,
+            &refreshed_envelope_digest,
+            "controller-a",
+        )
+        .await?;
+    assert!(
+        matches!(
+            activation_authorized,
+            TaskOperationTransition::Applied(current)
+                if current.state == TaskOrchestrationState::ActivationPending
+                    && current.generation == 5
+                    && current.activation_effect_authorized_at.is_some()
+                    && current.activation_envelope_revision == Some(refreshed_authority.revision)
+                    && current.activation_envelope_digest.as_deref()
+                        == Some(refreshed_envelope_digest.as_str())
+        ),
+        "the external activation intent must revalidate and pin the latest still-admitting Envelope"
+    );
+    let active = store
+        .record_task_activation_observed(
+            task_uid,
+            5,
+            &TaskActivationObservation {
+                runtime_uid: "runtime-uid-a",
+                resource_version: "resource-version-active",
+                active_manifest_digest: &candidate_digest,
+                provider_set_ready: true,
+            },
+            "controller-a",
+        )
+        .await?;
+    assert!(matches!(
+        active,
+        TaskOperationTransition::Applied(current)
+            if current.state == TaskOrchestrationState::Active
+                && current.generation == 6
+                && current.runtime_uid.as_deref() == Some("runtime-uid-a")
+    ));
+
+    assert_eq!(
+        store
+            .task(task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .phase,
+        TaskPhase::Queued,
+        "the durable execution command becomes queued only after activation"
+    );
+    let phase_backwards =
+        sqlx::query("UPDATE task_submissions SET phase = 'submitted' WHERE task_uid = $1")
+            .bind(task_uid)
+            .execute(store.pool())
+            .await;
+    assert!(
+        phase_backwards.is_err(),
+        "the database must reject a backward public Task phase transition"
+    );
+    let command_digest = format!("sha256:{}", "5".repeat(64));
+    let input_digest = format!("sha256:{}", "6".repeat(64));
+    let first_store = store.clone();
+    let second_store = store.clone();
+    let (first, second) = tokio::join!(
+        first_store.claim_task_execution_attempt(
+            task_uid,
+            &command_digest,
+            &input_digest,
+            "controller-a",
+        ),
+        second_store.claim_task_execution_attempt(
+            task_uid,
+            &command_digest,
+            &input_digest,
+            "controller-b",
+        )
+    );
+    let attempts = [first?, second?];
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|transition| matches!(transition, TaskExecutionTransition::Created(_)))
+            .count(),
+        1,
+        "two reconcilers must reserve one immutable execution attempt"
+    );
+    let attempt = attempts
+        .iter()
+        .find_map(|transition| match transition {
+            TaskExecutionTransition::Created(attempt)
+            | TaskExecutionTransition::AlreadyApplied(attempt) => Some(attempt.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| io::Error::other("the execution attempt must remain observable"))?;
+    assert_eq!(attempt.state, TaskExecutionAttemptState::StartPending);
+    let mut invalid_running = store.pool().begin().await?;
+    let unobserved_running = sqlx::query(
+        "UPDATE task_execution_attempts \
+         SET state = 'running', generation = generation + 1 \
+         WHERE attempt_id = $1",
+    )
+    .bind(attempt.attempt_id)
+    .execute(&mut *invalid_running)
+    .await;
+    invalid_running.rollback().await?;
+    assert!(
+        unobserved_running.is_err(),
+        "a running execution attempt must carry start invocation and acknowledgement evidence"
+    );
+    let first_store = store.clone();
+    let second_store = store.clone();
+    let (first, second) = tokio::join!(
+        first_store.authorize_task_execution_start(attempt.attempt_id, 1, "controller-a"),
+        second_store.authorize_task_execution_start(attempt.attempt_id, 1, "controller-b")
+    );
+    let starts = [first?, second?];
+    assert_eq!(
+        starts
+            .iter()
+            .filter(|transition| matches!(transition, TaskExecutionTransition::Applied(_)))
+            .count(),
+        1,
+        "exactly one reconciler may cross the external execution-start boundary"
+    );
+    let attempt = starts
+        .iter()
+        .find_map(|transition| match transition {
+            TaskExecutionTransition::Applied(attempt)
+            | TaskExecutionTransition::Superseded(attempt) => Some(attempt.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| io::Error::other("the authorized execution start must be observable"))?;
+    assert!(attempt.start_invoked_at.is_some());
+    assert!(attempt.start_observation_deadline_at.is_some());
+    assert_eq!(attempt.generation, 2);
+    let erase_start_intent = sqlx::query(
+        "UPDATE task_execution_attempts \
+         SET start_invoked_at = NULL, generation = generation + 1 \
+         WHERE attempt_id = $1",
+    )
+    .bind(attempt.attempt_id)
+    .execute(store.pool())
+    .await;
+    assert!(
+        erase_start_intent.is_err(),
+        "durable external-start intent must not be erasable before a replay"
+    );
+    let outcome_unknown = store
+        .record_task_execution_observation(
+            attempt.attempt_id,
+            2,
+            TaskExecutionObservation::OutcomeUnknown {
+                reason: "ambiguous_adapter_start",
+            },
+            "controller-a",
+        )
+        .await?;
+    assert!(matches!(
+        outcome_unknown,
+        TaskExecutionTransition::Applied(current)
+            if current.state == TaskExecutionAttemptState::OutcomeUnknown
+                && current.generation == 3
+    ));
+    let cleanup = store
+        .task_runtime_operation(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(cleanup.state, TaskOrchestrationState::CleanupPending);
+    assert_eq!(cleanup.generation, 7);
+    let terminal_task = store
+        .task(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(terminal_task.phase, TaskPhase::Failed);
+    assert!(terminal_task.finalize_requested);
+    assert_eq!(
+        terminal_task.failure_reason.as_deref(),
+        Some("execution_outcome_unknown")
+    );
+    assert!(matches!(
+        store
+            .claim_task_execution_attempt(
+                task_uid,
+                &command_digest,
+                &input_digest,
+                "controller-b",
+            )
+            .await?,
+        TaskExecutionTransition::InvariantViolation { attempt: Some(current), .. }
+            if current.attempt_id == attempt.attempt_id
+                && current.state == TaskExecutionAttemptState::OutcomeUnknown
+    ));
+
+    let incomplete = store
+        .record_task_cleanup_complete(
+            task_uid,
+            7,
+            TaskCleanupObservation {
+                exact_runtime_absent: true,
+                owned_projections_absent: false,
+            },
+            "controller-a",
+        )
+        .await?;
+    assert!(matches!(
+        incomplete,
+        TaskOperationTransition::InvariantViolation { current, .. }
+            if current.state == TaskOrchestrationState::CleanupPending
+    ));
+    let finalized = store
+        .record_task_cleanup_complete(
+            task_uid,
+            7,
+            TaskCleanupObservation {
+                exact_runtime_absent: true,
+                owned_projections_absent: true,
+            },
+            "controller-a",
+        )
+        .await?;
+    assert!(matches!(
+        finalized,
+        TaskOperationTransition::Applied(current)
+            if current.state == TaskOrchestrationState::Finalized
+                && current.runtime_absent_observed_at.is_some()
+                && current.projections_absent_observed_at.is_some()
+    ));
+    assert!(
+        store
+            .task(task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .finalized
+    );
+
+    let command_after_finalization =
+        sqlx::query("UPDATE task_submissions SET cancel_requested = true WHERE task_uid = $1")
+            .bind(task_uid)
+            .execute(store.pool())
+            .await;
+    assert!(
+        command_after_finalization.is_err(),
+        "a finalized Task must reject every later command"
+    );
+
+    let stale_task_uid = Uuid::new_v4();
+    let stale_operation_id = Uuid::new_v4();
+    let stale_runtime_name = format!("task-{}", stale_operation_id.simple());
+    let stale_idempotency_key = format!("orchestration-stale-authority-{suffix}");
+    let stale_reservation = store
+        .reserve_task(&TaskReservationRequest {
+            task_uid: stale_task_uid,
+            operation_id: stale_operation_id,
+            idempotency_key: &stale_idempotency_key,
+            submitter_service: &service,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: identity.user_id.as_str(),
+            workflow: "code-review",
+            workflow_name: None,
+            workflow_version: None,
+            workflow_digest: None,
+            user_envelope_instance_id: None,
+            user_envelope_revision: None,
+            user_envelope_digest: None,
+            coding_agent_runtime: "agent-v1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &stale_runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &command,
+            execution_binding: None,
+            envelope_revision: refreshed_authority.revision,
+            service_envelope: &refreshed_authority,
+            service_envelope_digest: &refreshed_envelope_digest,
+            candidate_digest: &candidate_digest,
+            admission_decision: &AdmissionDecision::Admit,
+            inert_manifest_digest: &inert_digest,
+            active_manifest_digest: &candidate_digest,
+        })
+        .await?;
+    assert!(matches!(
+        store
+            .authorize_task_runtime_creation(stale_reservation.record.task_uid, 1, "controller-a")
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    assert!(matches!(
+        store
+            .record_task_runtime_observed(
+                stale_reservation.record.task_uid,
+                2,
+                "runtime-uid-stale-authority",
+                "resource-version-stale-authority",
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    assert!(matches!(
+        store
+            .decide_task_runtime_authority(
+                stale_reservation.record.task_uid,
+                3,
+                &refreshed_authority,
+                &refreshed_envelope_digest,
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    let restrictive_authority = envelope("200.00", 3);
+    store
+        .insert_service_envelope(&service, &restrictive_authority, "admin@example.com")
+        .await?;
+    let restrictive_envelope_digest = format!("sha256:{}", "8".repeat(64));
+    assert!(
+        matches!(
+            store
+                .decide_task_runtime_authority(
+                    stale_reservation.record.task_uid,
+                    4,
+                    &restrictive_authority,
+                    &restrictive_envelope_digest,
+                    "controller-a",
+                )
+                .await?,
+            TaskOperationTransition::AuthorityInactive { current, .. }
+                if current.state == TaskOrchestrationState::CleanupPending
+                    && current.generation == 5
+        ),
+        "authority loss must atomically prevent the activation effect and enter cleanup"
+    );
+    let excessive_decision = evaluate(&spec, &restrictive_authority)
+        .map_err(|error| io::Error::other(format!("evaluate excessive Task: {error:?}")))?;
+    assert!(matches!(
+        excessive_decision,
+        AdmissionDecision::Reject { .. }
+    ));
+    let excessive_envelope_digest = format!("sha256:{}", "4".repeat(64));
+    let excessive_idempotency_key = format!("orchestration-excessive-{suffix}");
+    let excessive_task_uid = Uuid::new_v4();
+    let excessive_operation_id = Uuid::new_v4();
+    let excessive_runtime_name = format!("task-{}", excessive_operation_id.simple());
+    let excessive = store
+        .reserve_task(&TaskReservationRequest {
+            task_uid: excessive_task_uid,
+            operation_id: excessive_operation_id,
+            idempotency_key: &excessive_idempotency_key,
+            submitter_service: &service,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: identity.user_id.as_str(),
+            workflow: "code-review",
+            workflow_name: None,
+            workflow_version: None,
+            workflow_digest: None,
+            user_envelope_instance_id: None,
+            user_envelope_revision: None,
+            user_envelope_digest: None,
+            coding_agent_runtime: "agent-v1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &excessive_runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &command,
+            execution_binding: None,
+            envelope_revision: restrictive_authority.revision,
+            service_envelope: &restrictive_authority,
+            service_envelope_digest: &excessive_envelope_digest,
+            candidate_digest: &candidate_digest,
+            admission_decision: &excessive_decision,
+            inert_manifest_digest: &inert_digest,
+            active_manifest_digest: &candidate_digest,
+        })
+        .await?;
+    let excessive_uid = excessive.record.task_uid;
+    assert!(matches!(
+        store
+            .authorize_task_runtime_creation(excessive_uid, 1, "controller-a")
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    assert!(matches!(
+        store
+            .record_task_runtime_observed(
+                excessive_uid,
+                2,
+                "runtime-uid-excessive",
+                "resource-version-excessive",
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    let first_store = store.clone();
+    let second_store = store.clone();
+    let (first, second) = tokio::join!(
+        first_store.decide_task_runtime_authority(
+            excessive_uid,
+            3,
+            &restrictive_authority,
+            &excessive_envelope_digest,
+            "controller-a",
+        ),
+        second_store.decide_task_runtime_authority(
+            excessive_uid,
+            3,
+            &restrictive_authority,
+            &excessive_envelope_digest,
+            "controller-b",
+        )
+    );
+    let decisions = [first?, second?];
+    assert_eq!(
+        decisions
+            .iter()
+            .filter(|transition| matches!(transition, TaskOperationTransition::Applied(_)))
+            .count(),
+        1,
+        "two reconcilers must materialize one runtime-bound approval"
+    );
+    assert!(decisions.iter().all(|transition| match transition {
+        TaskOperationTransition::Applied(current)
+        | TaskOperationTransition::Superseded(current) => {
+            current.state == TaskOrchestrationState::ApprovalPending
+                && current.generation == 4
+                && current.approval_id.is_some()
+        }
+        TaskOperationTransition::AlreadyApplied(_)
+        | TaskOperationTransition::AuthorityInactive { .. }
+        | TaskOperationTransition::InvariantViolation { .. } => false,
+    }));
+    let approval_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM admission_decisions WHERE task_uid = $1")
+            .bind(excessive_uid)
+            .fetch_one(store.pool())
+            .await?;
+    let outbox_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM external_effect_outbox WHERE task_uid = $1")
+            .bind(excessive_uid)
+            .fetch_one(store.pool())
+            .await?;
+    assert_eq!(approval_count, 1);
+    assert_eq!(outbox_count, 1);
+    let approval_id = store
+        .task_runtime_operation(excessive_uid)
+        .await?
+        .and_then(|operation| operation.approval_id)
+        .ok_or_else(|| io::Error::other("approval identity must be durable"))?;
+    sqlx::query(
+        "UPDATE external_effect_outbox \
+         SET created_at = '-infinity'::timestamptz, generation = generation + 1 \
+         WHERE approval_id = $1",
+    )
+    .bind(approval_id)
+    .execute(store.pool())
+    .await?;
+    let first_store = store.clone();
+    let second_store = store.clone();
+    let (first_delivery, second_delivery) = tokio::join!(
+        first_store.claim_approval_delivery("dispatcher-a", 30),
+        second_store.claim_approval_delivery("dispatcher-b", 30),
+    );
+    let deliveries = [first_delivery?, second_delivery?];
+    assert_eq!(
+        deliveries
+            .iter()
+            .filter(|delivery| {
+                delivery
+                    .as_ref()
+                    .is_some_and(|delivery| delivery.approval_id == approval_id)
+            })
+            .count(),
+        1,
+        "two dispatchers must claim one durable approval-delivery identity"
+    );
+    let delivery = deliveries
+        .into_iter()
+        .flatten()
+        .find(|delivery| delivery.approval_id == approval_id)
+        .ok_or_else(|| io::Error::other("approval delivery was not claimable"))?;
+    assert_eq!(delivery.approval_id, approval_id);
+    assert_eq!(delivery.runtime_uid, "runtime-uid-excessive");
+    assert_eq!(delivery.idempotency_key, format!("approval:{approval_id}"));
+    let dispatcher = if store
+        .complete_approval_delivery(
+            delivery.effect_id,
+            delivery.generation,
+            "dispatcher-a",
+            "PROJ-123",
+            "https://jira.example.com/browse/PROJ-123",
+        )
+        .await?
+        == ApprovalDeliveryTransition::Applied
+    {
+        "dispatcher-a"
+    } else {
+        "dispatcher-b"
+    };
+    if dispatcher == "dispatcher-b" {
+        assert_eq!(
+            store
+                .complete_approval_delivery(
+                    delivery.effect_id,
+                    delivery.generation,
+                    dispatcher,
+                    "PROJ-123",
+                    "https://jira.example.com/browse/PROJ-123",
+                )
+                .await?,
+            ApprovalDeliveryTransition::Applied
+        );
+    }
+    assert_eq!(
+        store
+            .complete_approval_delivery(
+                delivery.effect_id,
+                delivery.generation,
+                dispatcher,
+                "PROJ-123",
+                "https://jira.example.com/browse/PROJ-123",
+            )
+            .await?,
+        ApprovalDeliveryTransition::AlreadyApplied,
+        "a lost database response must be recovered without another external approval"
+    );
+    store
+        .approve_admission(ApproveAdmission {
+            approval_id,
+            decided_by: "admin@example.com",
+            rationale: "bounded exact-runtime exception",
+            evidence_url: "https://jira.example.com/browse/PROJ-123",
+            expires_at: "2999-01-01T00:00:00Z",
+        })
+        .await?;
+    let grant_authority = store
+        .authorize_task_activation_from_approval(excessive_uid, 4, "controller-a")
+        .await?;
+    assert!(matches!(
+        grant_authority,
+        TaskOperationTransition::Applied(current)
+            if current.state == TaskOrchestrationState::ActivationPending
+                && current.generation == 5
+                && current.activation_authority_kind.as_deref() == Some("grant")
+                && current.approval_id == Some(approval_id)
+    ));
+    assert!(matches!(
+        store
+            .decide_task_runtime_authority(
+                excessive_uid,
+                5,
+                &restrictive_authority,
+                &excessive_envelope_digest,
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(current)
+            if current.state == TaskOrchestrationState::ActivationPending
+                && current.generation == 6
+                && current.activation_effect_authorized_at.is_some()
+    ));
+    assert_eq!(
+        store
+            .revoke_runtime_grants(
+                "runtime-uid-excessive",
+                "admin@example.com",
+                "approval withdrawn before activation",
+            )
+            .await?,
+        1
+    );
+    assert!(
+        matches!(
+            store
+                .decide_task_runtime_authority(
+                    excessive_uid,
+                    6,
+                    &restrictive_authority,
+                    &excessive_envelope_digest,
+                    "controller-b",
+                )
+                .await?,
+            TaskOperationTransition::AuthorityInactive { current, .. }
+                if current.state == TaskOrchestrationState::CleanupPending
+                    && current.generation == 7
+        ),
+        "a revoked exact grant must prevent activation even after an earlier worker was authorized"
+    );
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CleanupEntryState {
+    IntentRecorded,
+    RuntimeCreatePending,
+    RuntimeObserved,
+    ApprovalPending,
+    ActivationPending,
+    Active,
+}
+
+#[tokio::test]
+async fn finalization_is_monotonic_from_every_task_orchestration_state()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Task Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let service = format!("cleanup-matrix-{suffix}");
+    let identity = store
+        .register_canonical_identity(
+            &google_identity(
+                format!("cleanup-matrix-subject-{suffix}"),
+                format!("alice-{suffix}@example.com"),
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let authority = envelope("250.00", 1);
+    store
+        .insert_service_envelope(&service, &authority, "admin@example.com")
+        .await?;
+    let mut admitted_spec = proposed_spec();
+    admitted_spec.principal = Principal::Service {
+        name: service.clone(),
+        acting_user: Some(Email("alice@example.com".to_owned())),
+    };
+    admitted_spec.owner = Email("alice@example.com".to_owned());
+    admitted_spec.canonical_authority = Some(CanonicalAuthorityBinding::new(
+        identity.user_id.clone(),
+        Some(identity.user_id.clone()),
+    )?);
+
+    for entry_state in [
+        CleanupEntryState::IntentRecorded,
+        CleanupEntryState::RuntimeCreatePending,
+        CleanupEntryState::RuntimeObserved,
+        CleanupEntryState::ApprovalPending,
+        CleanupEntryState::ActivationPending,
+        CleanupEntryState::Active,
+    ] {
+        let task_uid = reserve_task_at_cleanup_entry_state(
+            &store,
+            &service,
+            &identity.user_id,
+            &authority,
+            &admitted_spec,
+            entry_state,
+            &suffix,
+        )
+        .await?;
+        let before = store
+            .task_runtime_operation(task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?;
+        assert_eq!(before.state.as_str(), cleanup_entry_state_name(entry_state));
+        store
+            .request_task_finalization(task_uid, &service, identity.user_id.as_str())
+            .await?;
+        let cleanup = store
+            .enter_task_cleanup(
+                task_uid,
+                before.generation,
+                steward_store::TaskCleanupCause::FinalizationRequested,
+                "controller-a",
+            )
+            .await?;
+        let TaskOperationTransition::Applied(cleanup) = cleanup else {
+            return Err(io::Error::other(format!(
+                "finalization did not enter cleanup from {entry_state:?}"
+            ))
+            .into());
+        };
+        assert_eq!(cleanup.state, TaskOrchestrationState::CleanupPending);
+        assert!(matches!(
+            store
+                .enter_task_cleanup(
+                    task_uid,
+                    cleanup.generation,
+                    steward_store::TaskCleanupCause::FinalizationRequested,
+                    "controller-b",
+                )
+                .await?,
+            TaskOperationTransition::AlreadyApplied(current)
+                if current.generation == cleanup.generation
+        ));
+        let cleanup =
+            if cleanup.runtime_create_authorized_at.is_some() && cleanup.runtime_uid.is_none() {
+                assert!(
+                    matches!(
+                        store
+                            .record_task_cleanup_complete(
+                                task_uid,
+                                cleanup.generation,
+                                TaskCleanupObservation {
+                                    exact_runtime_absent: true,
+                                    owned_projections_absent: true,
+                                },
+                                "controller-a",
+                            )
+                            .await?,
+                        TaskOperationTransition::InvariantViolation { current, .. }
+                            if current.state == TaskOrchestrationState::CleanupPending
+                    ),
+                    "one absence read cannot finalize a Task after runtime creation was authorized"
+                );
+                let observed = store
+                    .record_task_cleanup_runtime_observed(
+                        task_uid,
+                        cleanup.generation,
+                        &format!("cleanup-runtime-{task_uid}"),
+                        "cleanup-resource-version",
+                        "controller-a",
+                    )
+                    .await?;
+                let TaskOperationTransition::Applied(observed) = observed else {
+                    return Err(io::Error::other(
+                        "cleanup did not persist the exact runtime created to resolve ambiguity",
+                    )
+                    .into());
+                };
+                observed
+            } else {
+                cleanup
+            };
+        let runtime_effect_possible = cleanup.runtime_uid.is_some();
+        let finalized = store
+            .record_task_cleanup_complete(
+                task_uid,
+                cleanup.generation,
+                TaskCleanupObservation {
+                    exact_runtime_absent: runtime_effect_possible,
+                    owned_projections_absent: runtime_effect_possible,
+                },
+                "controller-a",
+            )
+            .await?;
+        assert!(matches!(
+            finalized,
+            TaskOperationTransition::Applied(current)
+                if current.state == TaskOrchestrationState::Finalized
+        ));
+        assert!(
+            store
+                .task(task_uid)
+                .await?
+                .ok_or(StoreError::TaskNotFound)?
+                .finalized
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn execution_claim_and_start_revalidate_latest_baseline_authority()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Task Postgres test")
+    })?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_nanos()
+        .to_string();
+    let service = format!("start-authority-race-{suffix}");
+    let identity = store
+        .register_canonical_identity(
+            &google_identity(
+                format!("start-authority-subject-{suffix}"),
+                format!("alice-{suffix}@example.com"),
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let authority = envelope("250.00", 1);
+    store
+        .insert_service_envelope(&service, &authority, "admin@example.com")
+        .await?;
+    let mut spec = proposed_spec();
+    spec.principal = Principal::Service {
+        name: service.clone(),
+        acting_user: Some(Email("alice@example.com".to_owned())),
+    };
+    spec.owner = Email("alice@example.com".to_owned());
+    spec.canonical_authority = Some(CanonicalAuthorityBinding::new(
+        identity.user_id.clone(),
+        Some(identity.user_id.clone()),
+    )?);
+    let admitted_task_uid = reserve_task_at_cleanup_entry_state(
+        &store,
+        &service,
+        &identity.user_id,
+        &authority,
+        &spec,
+        CleanupEntryState::Active,
+        &format!("{suffix}-still-admitted"),
+    )
+    .await?;
+    let revoked_task_uid = reserve_task_at_cleanup_entry_state(
+        &store,
+        &service,
+        &identity.user_id,
+        &authority,
+        &spec,
+        CleanupEntryState::Active,
+        &format!("{suffix}-revoked"),
+    )
+    .await?;
+    store
+        .put_task_inputs(
+            admitted_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"still-admitted-input",
+        )
+        .await?;
+    store
+        .request_task_execution(admitted_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    let still_admitted = envelope("300.00", 2);
+    store
+        .insert_service_envelope(&service, &still_admitted, "admin@example.com")
+        .await?;
+    let admitted_attempt = match store
+        .claim_task_execution_attempt(
+            admitted_task_uid,
+            &format!("sha256:{}", "5".repeat(64)),
+            &format!("sha256:{}", "6".repeat(64)),
+            "controller-a",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Created(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "execution attempt was not reserved: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    assert!(
+        matches!(
+            store
+                .authorize_task_execution_start(
+                    admitted_attempt.attempt_id,
+                    admitted_attempt.generation,
+                    "controller-a",
+                )
+                .await?,
+            TaskExecutionTransition::Applied(current)
+                if current.attempt_id == admitted_attempt.attempt_id
+                    && current.start_invoked_at.is_some()
+        ),
+        "a newer Envelope that still admits the immutable candidate must permit execution"
+    );
+
+    store
+        .put_task_inputs(
+            revoked_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"authority-race-input",
+        )
+        .await?;
+    store
+        .request_task_execution(revoked_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    let revoked_attempt = match store
+        .claim_task_execution_attempt(
+            revoked_task_uid,
+            &format!("sha256:{}", "7".repeat(64)),
+            &format!("sha256:{}", "8".repeat(64)),
+            "controller-a",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Created(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "execution attempt was not reserved under the latest authority: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    let restrictive = envelope("100.00", 3);
+    store
+        .insert_service_envelope(&service, &restrictive, "admin@example.com")
+        .await?;
+    assert!(
+        matches!(
+            store
+                .authorize_task_execution_start(
+                    revoked_attempt.attempt_id,
+                    revoked_attempt.generation,
+                    "controller-b",
+                )
+                .await?,
+            TaskExecutionTransition::AuthorityInactive { attempt: Some(current), .. }
+                if current.attempt_id == revoked_attempt.attempt_id
+                    && current.start_invoked_at.is_none()
+        ),
+        "authority lost after attempt claim must prevent the external start crossing"
+    );
+    assert_eq!(
+        store
+            .task_runtime_operation(revoked_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .state,
+        TaskOrchestrationState::CleanupPending
+    );
+    assert_eq!(
+        store
+            .task(revoked_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .phase,
+        TaskPhase::Failed
+    );
+    Ok(())
+}
+
+fn cleanup_entry_state_name(state: CleanupEntryState) -> &'static str {
+    match state {
+        CleanupEntryState::IntentRecorded => "intent_recorded",
+        CleanupEntryState::RuntimeCreatePending => "runtime_create_pending",
+        CleanupEntryState::RuntimeObserved => "runtime_observed",
+        CleanupEntryState::ApprovalPending => "approval_pending",
+        CleanupEntryState::ActivationPending => "activation_pending",
+        CleanupEntryState::Active => "active",
+    }
+}
+
+async fn reserve_task_at_cleanup_entry_state(
+    store: &PgStore,
+    service: &str,
+    owner_user_id: &CanonicalUserId,
+    authority: &Envelope,
+    admitted_spec: &AgentRuntimeSpec,
+    entry_state: CleanupEntryState,
+    suffix: &str,
+) -> Result<Uuid, Box<dyn Error>> {
+    let mut spec = admitted_spec.clone();
+    if matches!(entry_state, CleanupEntryState::ApprovalPending) {
+        spec.budget.monthly_limit = "300.00".to_owned();
+    }
+    let decision = evaluate(&spec, authority)
+        .map_err(|error| io::Error::other(format!("evaluate cleanup fixture: {error:?}")))?;
+    let task_uid = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let runtime_name = format!("task-{}", operation_id.simple());
+    let idempotency_key = format!("cleanup-{entry_state:?}-{suffix}");
+    let command = ["agent-v1".to_owned()];
+    let candidate_digest = format!("sha256:{}", "1".repeat(64));
+    let envelope_digest = format!("sha256:{}", "2".repeat(64));
+    let inert_digest = format!("sha256:{}", "3".repeat(64));
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid,
+            operation_id,
+            idempotency_key: &idempotency_key,
+            submitter_service: service,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(owner_user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: owner_user_id.as_str(),
+            workflow: "cleanup-matrix",
+            workflow_name: None,
+            workflow_version: None,
+            workflow_digest: None,
+            user_envelope_instance_id: None,
+            user_envelope_revision: None,
+            user_envelope_digest: None,
+            coding_agent_runtime: "agent-v1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &command,
+            execution_binding: None,
+            envelope_revision: authority.revision,
+            service_envelope: authority,
+            service_envelope_digest: &envelope_digest,
+            candidate_digest: &candidate_digest,
+            admission_decision: &decision,
+            inert_manifest_digest: &inert_digest,
+            active_manifest_digest: &candidate_digest,
+        })
+        .await?;
+    if matches!(entry_state, CleanupEntryState::IntentRecorded) {
+        return Ok(task_uid);
+    }
+    store
+        .authorize_task_runtime_creation(task_uid, 1, "controller-a")
+        .await?;
+    if matches!(entry_state, CleanupEntryState::RuntimeCreatePending) {
+        return Ok(task_uid);
+    }
+    let runtime_uid = format!("runtime-{operation_id}");
+    store
+        .record_task_runtime_observed(
+            task_uid,
+            2,
+            &runtime_uid,
+            "resource-version-a",
+            "controller-a",
+        )
+        .await?;
+    if matches!(entry_state, CleanupEntryState::RuntimeObserved) {
+        return Ok(task_uid);
+    }
+    store
+        .decide_task_runtime_authority(task_uid, 3, authority, &envelope_digest, "controller-a")
+        .await?;
+    if matches!(entry_state, CleanupEntryState::ApprovalPending) {
+        return Ok(task_uid);
+    }
+    if matches!(entry_state, CleanupEntryState::ActivationPending) {
+        return Ok(task_uid);
+    }
+    store
+        .decide_task_runtime_authority(task_uid, 4, authority, &envelope_digest, "controller-a")
+        .await?;
+    store
+        .record_task_activation_observed(
+            task_uid,
+            5,
+            &TaskActivationObservation {
+                runtime_uid: &runtime_uid,
+                resource_version: "resource-version-active",
+                active_manifest_digest: &candidate_digest,
+                provider_set_ready: true,
+            },
+            "controller-a",
+        )
+        .await?;
+    Ok(task_uid)
 }
 
 async fn reserve_governed_connection(
@@ -95,7 +1437,15 @@ async fn reserve_governed_connection_with_bindings(
         namespace: plan.bindings.namespace.clone(),
         runtime_class: plan.bindings.runtime_class.clone(),
     };
+    let service_envelope = steward_connections_v1::envelope();
+    let admission = AdmissionDecision::Admit;
+    let candidate_digest = format!("sha256:{}", "a".repeat(64));
+    let envelope_digest = format!("sha256:{}", "b".repeat(64));
+    let inert_manifest_digest = format!("sha256:{}", "c".repeat(64));
+    let task_uid = Uuid::new_v4();
     let task = TaskReservationRequest {
+        task_uid,
+        operation_id,
         idempotency_key: idempotency_identity,
         submitter_service: CONNECTIONS_SERVICE,
         acting_user: Some(email.as_str()),
@@ -118,6 +1468,12 @@ async fn reserve_governed_connection_with_bindings(
         agent_command: &plan.command,
         execution_binding: None,
         envelope_revision: CONNECTIONS_AUTHORITY_VERSION,
+        service_envelope: &service_envelope,
+        service_envelope_digest: &envelope_digest,
+        candidate_digest: &candidate_digest,
+        admission_decision: &admission,
+        inert_manifest_digest: &inert_manifest_digest,
+        active_manifest_digest: &candidate_digest,
     };
     store
         .reserve_connection_operation(&ConnectionOperationReservationRequest {
@@ -757,7 +2113,6 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         .as_nanos()
         .to_string();
     let idempotency_key = format!("job-{suffix}");
-    let runtime_name = format!("task-{suffix}");
     let runtime_uid = format!("runtime-{suffix}");
     let canonical = store
         .register_canonical_identity(
@@ -777,9 +2132,14 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         canonical.user_id.clone(),
         Some(canonical.user_id.clone()),
     )?);
+    let service_envelope = envelope("250.00", 1);
     store
-        .insert_service_envelope("steward-run", &envelope("250.00", 1), "admin@example.com")
+        .insert_service_envelope("steward-run", &service_envelope, "admin@example.com")
         .await?;
+    let admission = AdmissionDecision::Admit;
+    let candidate_digest = format!("sha256:{}", "d".repeat(64));
+    let service_envelope_digest = format!("sha256:{}", "e".repeat(64));
+    let inert_manifest_digest = format!("sha256:{}", "f".repeat(64));
     let command = vec!["agent-v1".to_owned()];
     let legacy = sqlx::query(
         "INSERT INTO task_submissions \
@@ -794,22 +2154,18 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
     .bind(format!("legacy-{suffix}"))
     .bind(format!("legacy-{suffix}"))
     .fetch_one(store.pool())
-    .await?;
-    assert_eq!(
-        legacy.try_get::<String, _>("identity_binding_state")?,
-        "legacy_reconnect_required"
-    );
-    assert_eq!(legacy.try_get::<Option<String>, _>("acting_user_id")?, None);
-    assert_eq!(legacy.try_get::<Option<String>, _>("owner_user_id")?, None);
-    assert_eq!(
-        legacy
-            .try_get::<serde_json::Value, _>("runtime_spec")?
-            .get("canonicalAuthority"),
-        None,
-        "legacy rows must remain explicitly unbound instead of adopting an email-derived ID"
+    .await;
+    assert!(
+        legacy.is_err(),
+        "the staged rollout fence must reject a legacy writer after durable orchestration is installed"
     );
 
+    let task_uid = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let runtime_name = format!("task-{}", operation_id.simple());
     let request = TaskReservationRequest {
+        task_uid,
+        operation_id,
         idempotency_key: &idempotency_key,
         submitter_service: "steward-run",
         acting_user: Some("alice@example.com"),
@@ -832,6 +2188,12 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         agent_command: &command,
         execution_binding: None,
         envelope_revision: 1,
+        service_envelope: &service_envelope,
+        service_envelope_digest: &service_envelope_digest,
+        candidate_digest: &candidate_digest,
+        admission_decision: &admission,
+        inert_manifest_digest: &inert_manifest_digest,
+        active_manifest_digest: &candidate_digest,
     };
     let first = store.reserve_task(&request).await?;
     assert!(first.inserted);
@@ -846,29 +2208,91 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
     store
         .insert_service_envelope("steward-run", &envelope("250.00", 2), "admin@example.com")
         .await?;
-    let rebound_after_envelope_revision = store
-        .bind_task_runtime(first.record.task_uid, &runtime_uid, TaskPhase::Submitted)
-        .await?;
-    assert_eq!(
-        rebound_after_envelope_revision.runtime_uid.as_deref(),
-        Some(runtime_uid.as_str()),
-        "a baseline Task admitted by the latest envelope must bind durably after a revision bump"
-    );
+    assert!(matches!(
+        store
+            .authorize_task_runtime_creation(first.record.task_uid, 1, "controller-a")
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    assert!(matches!(
+        store
+            .record_task_runtime_observed(
+                first.record.task_uid,
+                2,
+                &runtime_uid,
+                "resource-version-a",
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    let latest_envelope = envelope("250.00", 2);
+    assert!(matches!(
+        store
+            .decide_task_runtime_authority(
+                first.record.task_uid,
+                3,
+                &latest_envelope,
+                &service_envelope_digest,
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    assert!(matches!(
+        store
+            .decide_task_runtime_authority(
+                first.record.task_uid,
+                4,
+                &latest_envelope,
+                &service_envelope_digest,
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    assert!(matches!(
+        store
+            .record_task_activation_observed(
+                first.record.task_uid,
+                5,
+                &TaskActivationObservation {
+                    runtime_uid: &runtime_uid,
+                    resource_version: "resource-version-active",
+                    active_manifest_digest: &candidate_digest,
+                    provider_set_ready: true,
+                },
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
 
     let adopted_key = format!("adopted-{suffix}");
     let adopted_runtime_uid = format!("adopted-runtime-{suffix}");
+    let adopted_task_uid = Uuid::new_v4();
+    let adopted_operation_id = Uuid::new_v4();
     let adopted_request = TaskReservationRequest {
+        task_uid: adopted_task_uid,
+        operation_id: adopted_operation_id,
         idempotency_key: &adopted_key,
+        envelope_revision: latest_envelope.revision,
+        service_envelope: &latest_envelope,
         runtime_uid: Some(&adopted_runtime_uid),
         runtime_ownership: RuntimeOwnership::Adopted,
         ..request
     };
     let adopted = store.reserve_task(&adopted_request).await?;
     assert!(adopted.inserted);
+    assert!(adopted.record.runtime_uid.is_none());
     assert_eq!(
-        adopted.record.runtime_uid.as_deref(),
+        adopted.operation.expected_runtime_uid.as_deref(),
         Some(adopted_runtime_uid.as_str()),
-        "an adopted runtime UID must be persisted by the reservation insert"
+        "a shared runtime remains unbound until independently observed"
+    );
+    assert_eq!(
+        adopted.operation.state,
+        TaskOrchestrationState::IntentRecorded
     );
     let replacement_runtime_uid = format!("replacement-runtime-{suffix}");
     let recreated_runtime_request = TaskReservationRequest {
@@ -895,8 +2319,14 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         other.user_id.clone(),
         Some(other.user_id.clone()),
     )?);
-    let other_runtime_name = format!("task-other-{suffix}");
+    let other_task_uid = Uuid::new_v4();
+    let other_operation_id = Uuid::new_v4();
+    let other_runtime_name = format!("task-{}", other_operation_id.simple());
     let other_request = TaskReservationRequest {
+        task_uid: other_task_uid,
+        operation_id: other_operation_id,
+        envelope_revision: latest_envelope.revision,
+        service_envelope: &latest_envelope,
         acting_user_id: Some(other.user_id.as_str()),
         owner_user_id: other.user_id.as_str(),
         runtime_name: &other_runtime_name,
@@ -911,15 +2341,19 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
     assert!(!other_retry.inserted);
     assert_eq!(other_retry.record.task_uid, other_task.record.task_uid);
 
-    let injected_runtime_name = format!("task-injected-{suffix}");
+    let injected_operation_id = Uuid::new_v4();
+    let injected_runtime_name = format!("task-{}", injected_operation_id.simple());
     let injected_same_owner = TaskReservationRequest {
+        task_uid: Uuid::new_v4(),
+        operation_id: injected_operation_id,
         runtime_name: &injected_runtime_name,
         ..request
     };
+    let injected_retry = store.reserve_task(&injected_same_owner).await?;
+    assert!(!injected_retry.inserted);
     assert_eq!(
-        store.reserve_task(&injected_same_owner).await,
-        Err(StoreError::TaskIdempotencyConflict),
-        "a retry cannot adopt an injected or legacy runtime name outside its durable reservation"
+        injected_retry.record.runtime_name,
+        first.record.runtime_name
     );
     assert!(
         store
@@ -941,10 +2375,14 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
     );
 
     let legacy_key = format!("legacy-{suffix}");
-    let rebound_runtime_name = format!("task-reconnected-{suffix}");
+    let reconnect_operation_id = Uuid::new_v4();
+    let rebound_runtime_name = format!("task-{}", reconnect_operation_id.simple());
     let legacy_reconnect = TaskReservationRequest {
+        task_uid: Uuid::new_v4(),
+        operation_id: reconnect_operation_id,
         idempotency_key: &legacy_key,
-        submitter_service: "legacy-service",
+        envelope_revision: latest_envelope.revision,
+        service_envelope: &latest_envelope,
         runtime_name: &rebound_runtime_name,
         ..request
     };
@@ -958,6 +2396,8 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
 
     let mismatched_columns_key = format!("mismatched-columns-{suffix}");
     let mismatched_columns = TaskReservationRequest {
+        task_uid: Uuid::new_v4(),
+        operation_id: request.operation_id,
         idempotency_key: &mismatched_columns_key,
         acting_user_id: Some(other.user_id.as_str()),
         ..request
@@ -970,6 +2410,8 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
 
     let mismatched_runtime_key = format!("mismatched-runtime-{suffix}");
     let mismatched_runtime_authority = TaskReservationRequest {
+        task_uid: Uuid::new_v4(),
+        operation_id: request.operation_id,
         idempotency_key: &mismatched_runtime_key,
         owner_user_id: other.user_id.as_str(),
         acting_user_id: Some(other.user_id.as_str()),
@@ -1002,33 +2444,25 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         "the database must reject delegated acting_user_id != owner_user_id"
     );
 
-    let escaped_runtime_name = format!("task-historical-escape-{suffix}");
-    let escaped_runtime_uid = format!("runtime-historical-escape-{suffix}");
+    let escaped_operation_id = Uuid::new_v4();
+    let escaped_runtime_name = format!("task-{}", escaped_operation_id.simple());
     let escaped_idempotency_key = format!("historical-escape-{suffix}");
     let mut escaped_spec = spec.clone();
     escaped_spec.budget.monthly_limit = "260.00".to_owned();
     let escaped_request = TaskReservationRequest {
+        task_uid: Uuid::new_v4(),
+        operation_id: escaped_operation_id,
         idempotency_key: &escaped_idempotency_key,
         runtime_name: &escaped_runtime_name,
         runtime_spec: &escaped_spec,
         ..request
     };
-    let escaped = store.reserve_task(&escaped_request).await?;
     assert_eq!(
-        store
-            .bind_task_runtime(
-                escaped.record.task_uid,
-                &escaped_runtime_uid,
-                TaskPhase::Submitted,
-            )
-            .await,
-        Err(StoreError::InvalidTaskTransition),
-        "a historical over-envelope Task without an exact correlated admission must fail closed"
+        store.reserve_task(&escaped_request).await,
+        Err(StoreError::StaleEnvelope),
+        "the reservation transaction must reject a candidate whose claimed decision is stale"
     );
 
-    store
-        .bind_task_runtime(first.record.task_uid, &runtime_uid, TaskPhase::Submitted)
-        .await?;
     store
         .record_spend_observation(
             &runtime_uid,
@@ -1058,23 +2492,56 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         )
         .await?;
     assert_eq!(queued.phase, TaskPhase::Queued);
-    let repeated_binding = store
-        .bind_task_runtime(first.record.task_uid, &runtime_uid, TaskPhase::Submitted)
-        .await?;
-    assert_eq!(
-        repeated_binding.phase,
-        TaskPhase::Queued,
-        "an idempotent runtime bind must not regress concurrent execution state"
-    );
-    assert!(repeated_binding.execute_requested);
-    assert!(store.claim_task_execution(first.record.task_uid).await?);
-    assert!(
-        !store.claim_task_execution(first.record.task_uid).await?,
-        "a task execution must have only one durable winner"
-    );
-    store
-        .complete_task_execution(first.record.task_uid, b"neutral-output-tar")
-        .await?;
+    let command_digest = format!("sha256:{}", "8".repeat(64));
+    let input_digest = format!("sha256:{}", "9".repeat(64));
+    let attempt = match store
+        .claim_task_execution_attempt(
+            first.record.task_uid,
+            &command_digest,
+            &input_digest,
+            "controller-a",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Created(attempt) => attempt,
+        other => {
+            return Err(io::Error::other(format!("unexpected attempt claim: {other:?}")).into());
+        }
+    };
+    assert!(matches!(
+        store
+            .claim_task_execution_attempt(
+                first.record.task_uid,
+                &command_digest,
+                &input_digest,
+                "controller-b",
+            )
+            .await?,
+        TaskExecutionTransition::AlreadyApplied(current)
+            if current.attempt_id == attempt.attempt_id
+    ));
+    assert!(matches!(
+        store
+            .authorize_task_execution_start(attempt.attempt_id, 1, "controller-a")
+            .await?,
+        TaskExecutionTransition::Applied(_)
+    ));
+    assert!(matches!(
+        store
+            .record_task_execution_observation(
+                attempt.attempt_id,
+                2,
+                TaskExecutionObservation::Succeeded {
+                    adapter_observation_id: "adapter-attempt-a",
+                    result_digest: &format!("sha256:{}", "a".repeat(64)),
+                    result_reference: "adapter:attempt-a",
+                    output_archive: b"neutral-output-tar",
+                },
+                "controller-a",
+            )
+            .await?,
+        TaskExecutionTransition::Applied(_)
+    ));
     let completed = store
         .task(first.record.task_uid)
         .await?
@@ -1091,7 +2558,31 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
             canonical.user_id.as_str(),
         )
         .await?;
-    store.mark_task_finalized(first.record.task_uid).await?;
+    assert!(matches!(
+        store
+            .enter_task_cleanup(
+                first.record.task_uid,
+                6,
+                steward_store::TaskCleanupCause::FinalizationRequested,
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    assert!(matches!(
+        store
+            .record_task_cleanup_complete(
+                first.record.task_uid,
+                7,
+                TaskCleanupObservation {
+                    exact_runtime_absent: true,
+                    owned_projections_absent: true,
+                },
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
     assert!(
         store
             .task(first.record.task_uid)
@@ -2690,13 +4181,76 @@ async fn governed_connection_operations_are_serialized_restart_safe_and_hidden_f
         "internal task authority pins must be either all absent or all present"
     );
     let bridge_runtime_uid = format!("bridge-runtime-{suffix}");
-    store
-        .bind_task_runtime(
-            status.record.task_uid,
-            &bridge_runtime_uid,
-            TaskPhase::Submitted,
-        )
-        .await?;
+    assert!(matches!(
+        store
+            .authorize_task_runtime_creation(status.record.task_uid, 1, "controller-a")
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    assert!(matches!(
+        store
+            .record_task_runtime_observed(
+                status.record.task_uid,
+                2,
+                &bridge_runtime_uid,
+                "resource-version-bridge",
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    let task = store
+        .task(status.record.task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    let operation = store
+        .task_runtime_operation(status.record.task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert!(matches!(
+        store
+            .decide_task_runtime_authority(
+                status.record.task_uid,
+                3,
+                &steward_connections_v1::envelope(),
+                task.service_envelope_digest
+                    .as_deref()
+                    .ok_or(StoreError::InvalidTaskTransition)?,
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    assert!(matches!(
+        store
+            .decide_task_runtime_authority(
+                status.record.task_uid,
+                4,
+                &steward_connections_v1::envelope(),
+                task.service_envelope_digest
+                    .as_deref()
+                    .ok_or(StoreError::InvalidTaskTransition)?,
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    assert!(matches!(
+        store
+            .record_task_activation_observed(
+                status.record.task_uid,
+                5,
+                &TaskActivationObservation {
+                    runtime_uid: &bridge_runtime_uid,
+                    resource_version: "resource-version-bridge-active",
+                    active_manifest_digest: &operation.active_manifest_digest,
+                    provider_set_ready: true,
+                },
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
     let by_runtime = store
         .connection_operation_for_runtime(&bridge_runtime_uid)
         .await?

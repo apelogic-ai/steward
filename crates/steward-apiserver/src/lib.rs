@@ -3052,6 +3052,7 @@ mod tests {
     };
     use steward_ports::{
         DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
+        TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest,
     };
     use steward_store::{
         AdmissionApprovalState, AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunSpend,
@@ -3059,8 +3060,9 @@ mod tests {
         ApproveAdmission, ApprovedAdmission, DecisionFiling, DecisionFilingClaim,
         EnvelopeRequestRecord, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
         GrantApplication, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval,
-        PendingEnvelopeRequest, StoreError, TaskAdmissionLookup, TaskAdmissionRecord, TaskRecord,
-        TaskReservation, TaskReservationRequest, WorkflowRevisionRecord,
+        PendingEnvelopeRequest, StoreError, TaskAdmissionLookup, TaskAdmissionRecord,
+        TaskOrchestrationState, TaskRecord, TaskReservation, TaskReservationRequest,
+        TaskRuntimeOperationRecord, TaskRuntimeOwnership, WorkflowRevisionRecord,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding,
@@ -3090,12 +3092,33 @@ mod tests {
     const KUBERNETES_TOKEN_REVIEW_AUDIENCE: &str = "https://kubernetes.default.svc";
     const TEST_VERSIONED_AGENT: &str = "example-agent@1.0.0";
 
+    struct ExampleExecutionAdapter;
+
+    impl TaskExecutionAdapter for ExampleExecutionAdapter {
+        fn contract(&self) -> &'static str {
+            "example-v1"
+        }
+
+        fn render(
+            &self,
+            request: TaskExecutionPlanRequest<'_>,
+        ) -> Result<TaskExecutionPlan, PortError> {
+            Ok(TaskExecutionPlan {
+                command: vec![
+                    "example-runner".to_owned(),
+                    request.workflow_prompt.to_owned(),
+                    format!("{}/{}", request.model.provider, request.model.model),
+                ],
+            })
+        }
+    }
+
     fn execution_binding_catalog() -> String {
         serde_json::json!({
             "apiVersion": "steward.execution-bindings/v1",
             "bindings": [{
                 "agentRef": TEST_VERSIONED_AGENT,
-                "adapter": "codex-v1",
+                "adapter": "example-v1",
                 "image": format!("registry.example.test/agents/example@sha256:{}", "a".repeat(64)),
                 "executable": "/opt/example/bin/agent",
                 "versionProbe": {
@@ -3118,11 +3141,10 @@ mod tests {
     }
 
     fn task_api_config() -> Result<TaskApiConfig, String> {
-        Ok(
-            TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
-                .with_execution_bindings_json(Some(&execution_binding_catalog()))?
-                .with_execution_bindings_active(true),
-        )
+        TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
+            .with_execution_adapter(Arc::new(ExampleExecutionAdapter))?
+            .with_execution_bindings_json(Some(&execution_binding_catalog()))?
+            .with_execution_bindings_active(true)
     }
 
     fn browser_cookie(response: &Response, name: &str) -> Result<String, String> {
@@ -5231,7 +5253,6 @@ mod tests {
         application_committed_during_park: Arc<Mutex<Option<GrantReversion>>>,
         application_revoked_during_retirement: Arc<Mutex<bool>>,
         tasks: Arc<Mutex<Vec<TaskRecord>>>,
-        task_bind_failures: Arc<AtomicUsize>,
         task_approval_state: Arc<Mutex<FakeApprovalState>>,
         workflow_revisions: Arc<Mutex<Vec<WorkflowRevisionRecord>>>,
         user_envelopes: Arc<Mutex<Vec<EnvelopeRequestRecord>>>,
@@ -5265,6 +5286,48 @@ mod tests {
     type ParkedRows = Arc<Mutex<Vec<FakeParked>>>;
     type DecisionReferences = Arc<Mutex<Vec<(Uuid, String, String)>>>;
     type AgentRunEvents = Arc<Mutex<Vec<(Uuid, Vec<AgentRunTimelineEvent>)>>>;
+
+    fn fake_task_operation(
+        request: &TaskReservationRequest<'_>,
+        task_uid: Uuid,
+        operation_id: Uuid,
+    ) -> TaskRuntimeOperationRecord {
+        let runtime_ownership = match request.runtime_ownership {
+            RuntimeOwnership::Provisioned => TaskRuntimeOwnership::Provisioned,
+            RuntimeOwnership::Adopted => TaskRuntimeOwnership::Adopted,
+        };
+        TaskRuntimeOperationRecord {
+            task_uid,
+            operation_id,
+            state: TaskOrchestrationState::IntentRecorded,
+            generation: 1,
+            runtime_ownership,
+            runtime_namespace: request.runtime_namespace.to_owned(),
+            runtime_name: request.runtime_name.to_owned(),
+            inert_manifest_digest: request.inert_manifest_digest.to_owned(),
+            active_manifest_digest: request.active_manifest_digest.to_owned(),
+            expected_runtime_uid: request.runtime_uid.map(str::to_owned),
+            runtime_uid: None,
+            runtime_resource_version: None,
+            activation_authority_kind: None,
+            activation_envelope_revision: None,
+            activation_envelope_digest: None,
+            approval_id: None,
+            retry_at: None,
+            last_error_code: None,
+            lease_owner: None,
+            lease_expires_at: None,
+            requested_at: "now".to_owned(),
+            runtime_create_authorized_at: None,
+            observed_at: None,
+            activation_effect_authorized_at: None,
+            activated_at: None,
+            cleanup_requested_at: None,
+            runtime_absent_observed_at: None,
+            projections_absent_observed_at: None,
+            finalized_at: None,
+        }
+    }
 
     impl AdmissionLedger for FakeLedger {
         fn insert_envelope<'a>(
@@ -6103,10 +6166,18 @@ mod tests {
                     return Ok(TaskReservation {
                         inserted: false,
                         record: existing.clone(),
+                        operation: fake_task_operation(
+                            &request,
+                            existing.task_uid,
+                            existing
+                                .orchestration_operation_id
+                                .ok_or(StoreError::InvalidTaskTransition)?,
+                        ),
                     });
                 }
+                let operation_id = request.operation_id;
                 let record = TaskRecord {
-                    task_uid: Uuid::new_v4(),
+                    task_uid: request.task_uid,
                     idempotency_key: request.idempotency_key.to_owned(),
                     submitter_service: request.submitter_service.to_owned(),
                     acting_user: request.acting_user.map(str::to_owned),
@@ -6125,18 +6196,34 @@ mod tests {
                     internal_authority_version: None,
                     internal_authority_digest: None,
                     coding_agent_runtime: request.coding_agent_runtime.to_owned(),
-                    runtime_uid: request.runtime_uid.map(str::to_owned),
+                    runtime_uid: None,
                     runtime_namespace: request.runtime_namespace.to_owned(),
                     runtime_name: request.runtime_name.to_owned(),
                     runtime_ownership: request.runtime_ownership,
-                    phase: TaskPhase::Submitted,
+                    phase: match request.admission_decision {
+                        AdmissionDecision::Admit => TaskPhase::Submitted,
+                        AdmissionDecision::Reject { .. } => TaskPhase::Parked,
+                    },
                     runtime_spec: request.runtime_spec.clone(),
                     agent_command: request.agent_command.to_vec(),
                     execution_binding: request.execution_binding.cloned(),
                     envelope_revision: request.envelope_revision,
+                    orchestration_version: 2,
+                    orchestration_operation_id: Some(operation_id),
+                    candidate_digest: Some(request.candidate_digest.to_owned()),
+                    service_envelope_digest: Some(request.service_envelope_digest.to_owned()),
+                    original_admission_decision: Some(match request.admission_decision {
+                        AdmissionDecision::Admit => "admit".to_owned(),
+                        AdmissionDecision::Reject { .. } => "reject".to_owned(),
+                    }),
+                    original_admission_deltas: Some(match request.admission_decision {
+                        AdmissionDecision::Admit => Vec::new(),
+                        AdmissionDecision::Reject { deltas } => deltas.clone(),
+                    }),
                     input_archive: None,
                     output_archive: None,
                     execute_requested: false,
+                    cancel_requested: false,
                     finalize_requested: false,
                     finalized: false,
                     failure_reason: None,
@@ -6144,53 +6231,9 @@ mod tests {
                 tasks.push(record.clone());
                 Ok(TaskReservation {
                     inserted: true,
+                    operation: fake_task_operation(&request, record.task_uid, operation_id),
                     record,
                 })
-            })
-        }
-
-        fn bind_task_runtime<'a>(
-            &'a self,
-            task_uid: Uuid,
-            runtime_uid: &'a str,
-            phase: TaskPhase,
-        ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
-            Box::pin(async move {
-                if self
-                    .task_bind_failures
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                        remaining.checked_sub(1)
-                    })
-                    .is_ok()
-                {
-                    return Err(StoreError::Database(
-                        "fake post-reservation binding failure".to_owned(),
-                    ));
-                }
-                let mut tasks = self.tasks.lock().map_err(|_| {
-                    StoreError::Database("fake task ledger lock was poisoned".to_owned())
-                })?;
-                let task = tasks
-                    .iter_mut()
-                    .find(|task| task.task_uid == task_uid)
-                    .ok_or(StoreError::TaskNotFound)?;
-                if task.runtime_uid.as_deref() == Some(runtime_uid) {
-                    return Ok(task.clone());
-                }
-                let unchanged_unbound_state = task.runtime_uid.is_none()
-                    && !task.finalize_requested
-                    && !task.finalized
-                    && ((!task.execute_requested && task.phase == TaskPhase::Submitted)
-                        || (task.execute_requested
-                            && matches!(task.phase, TaskPhase::Parked | TaskPhase::Queued)));
-                if !unchanged_unbound_state {
-                    return Err(StoreError::InvalidTaskTransition);
-                }
-                task.runtime_uid = Some(runtime_uid.to_owned());
-                if !task.execute_requested {
-                    task.phase = phase;
-                }
-                Ok(task.clone())
             })
         }
 
@@ -6249,9 +6292,6 @@ mod tests {
                     return Err(StoreError::InvalidTaskTransition);
                 }
                 task.execute_requested = true;
-                if task.phase == TaskPhase::Submitted {
-                    task.phase = TaskPhase::Queued;
-                }
                 Ok(task.clone())
             })
         }
@@ -6300,45 +6340,16 @@ mod tests {
                     })
                     .ok_or(StoreError::TaskNotFound)?;
                 task.finalize_requested = true;
+                task.cancel_requested = !matches!(
+                    task.phase,
+                    TaskPhase::Succeeded | TaskPhase::Failed | TaskPhase::Cancelled
+                );
                 if matches!(
                     task.phase,
                     TaskPhase::Submitted | TaskPhase::Parked | TaskPhase::Queued
                 ) {
                     task.phase = TaskPhase::Cancelled;
                 }
-                Ok(task.clone())
-            })
-        }
-
-        fn fail_unbound_task_admission<'a>(
-            &'a self,
-            task_uid: Uuid,
-            reason: &'a str,
-        ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
-            Box::pin(async move {
-                let mut tasks = self.tasks.lock().map_err(|_| {
-                    StoreError::Database("fake task ledger lock was poisoned".to_owned())
-                })?;
-                let task = tasks
-                    .iter_mut()
-                    .find(|task| task.task_uid == task_uid)
-                    .ok_or(StoreError::TaskNotFound)?;
-                let eligible = task.runtime_uid.is_none()
-                    && !task.finalized
-                    && ((!task.finalize_requested
-                        && matches!(
-                            task.phase,
-                            TaskPhase::Submitted | TaskPhase::Parked | TaskPhase::Queued
-                        ))
-                        || (task.finalize_requested
-                            && task.phase == TaskPhase::Failed
-                            && task.failure_reason.as_deref() == Some(reason)));
-                if reason.is_empty() || !eligible {
-                    return Err(StoreError::InvalidTaskTransition);
-                }
-                task.phase = TaskPhase::Failed;
-                task.finalize_requested = true;
-                task.failure_reason = Some(reason.to_owned());
                 Ok(task.clone())
             })
         }
@@ -6414,7 +6425,6 @@ mod tests {
             application_committed_during_park: Arc::new(Mutex::new(None)),
             application_revoked_during_retirement: Arc::new(Mutex::new(false)),
             tasks: Arc::new(Mutex::new(Vec::new())),
-            task_bind_failures: Arc::new(AtomicUsize::new(0)),
             task_approval_state: Arc::new(Mutex::new(FakeApprovalState::Pending)),
             workflow_revisions: Arc::new(Mutex::new(Vec::new())),
             user_envelopes: Arc::new(Mutex::new(Vec::new())),
@@ -8611,13 +8621,10 @@ mod tests {
     #[tokio::test]
     async fn versioned_task_route_resolves_exact_workflow_and_pins_user_envelope()
     -> Result<(), String> {
-        let runtimes = MultiRuntimeRepository::default();
         let ledger = versioned_task_ledger()?;
         let task_rows = ledger.tasks.clone();
         let app = task_router(
-            runtimes,
             ledger,
-            FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
             task_api_config()?,
@@ -8706,11 +8713,11 @@ mod tests {
             [steward_types::RunnerPlatform::Linux]
         );
         assert_eq!(
-            task.agent_command.get(4).map(String::as_str),
+            task.agent_command.get(1).map(String::as_str),
             Some("Review the repository state that triggered this run.")
         );
         assert_eq!(
-            task.agent_command.get(5).map(String::as_str),
+            task.agent_command.get(2).map(String::as_str),
             Some("openai/gpt-5.4")
         );
         Ok(())
@@ -8758,14 +8765,13 @@ mod tests {
                 .map_err(|error| format!("build versioned Workflow retry: {error}"))
         };
         let first_app = task_router(
-            MultiRuntimeRepository::default(),
             ledger.clone(),
-            FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([]),
             TaskApiConfig::new(Some("https://mcp-a.example.test/mcp".to_owned()))?
+                .with_execution_adapter(Arc::new(ExampleExecutionAdapter))?
                 .with_execution_bindings_json(Some(&execution_binding_catalog()))?
-                .with_execution_bindings_active(true),
+                .with_execution_bindings_active(true)?,
         );
         let first = first_app
             .oneshot(request("repository-review@1")?)
@@ -8781,9 +8787,7 @@ mod tests {
             .cloned();
 
         let retry_app = task_router(
-            MultiRuntimeRepository::default(),
             ledger.clone(),
-            FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([]),
             TaskApiConfig::default(),
@@ -8839,9 +8843,7 @@ mod tests {
                 .map_err(|error| format!("build legacy Task retry: {error}"))
         };
         let first_app = task_router(
-            MultiRuntimeRepository::default(),
             ledger.clone(),
-            FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
             task_api_config()?,
@@ -8860,9 +8862,7 @@ mod tests {
             .cloned();
 
         let retry_app = task_router(
-            MultiRuntimeRepository::default(),
             ledger,
-            FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([]),
             TaskApiConfig::default(),
@@ -8902,12 +8902,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unbound_task_retry_resumes_pending_runtime_admission() -> Result<(), String> {
+    async fn task_retry_only_reads_pending_orchestration_intent() -> Result<(), String> {
         let runtimes = MultiRuntimeRepository::default();
         let runtime_rows = runtimes.runtimes.clone();
         let ledger = ledger();
         let task_rows = ledger.tasks.clone();
-        ledger.task_bind_failures.store(1, Ordering::SeqCst);
         let decisions = FakeDecisionChannel::default();
         let decision_requests = decisions.requests.clone();
         let request = || {
@@ -8925,9 +8924,7 @@ mod tests {
         let mut workflow = task_workflow("250.00");
         workflow.name = "wide-review".to_owned();
         let first_app = task_router(
-            runtimes.clone(),
             ledger.clone(),
-            decisions.clone(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([workflow]),
             task_api_config()?,
@@ -8937,14 +8934,14 @@ mod tests {
             .oneshot(request()?)
             .await
             .map_err(|error| format!("submit initial pending-runtime Task: {error}"))?;
-        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
         assert_eq!(
             runtime_rows
                 .lock()
                 .map_err(|_| "runtime fixture lock was poisoned")?
                 .len(),
-            1,
-            "the failed binding attempt must leave one deterministic pending runtime"
+            0,
+            "submission must not create a pending runtime in the API process"
         );
         assert!(
             task_rows
@@ -8956,9 +8953,7 @@ mod tests {
         );
 
         let retry_app = task_router(
-            runtimes,
             ledger.clone(),
-            decisions,
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([]),
             TaskApiConfig::default(),
@@ -8976,46 +8971,43 @@ mod tests {
         assert_eq!(retry["phase"], "parked");
         assert_eq!(retry["deltas"][0]["dimension"], "budget");
         assert!(
-            retry["runtimeUid"].as_str().is_some(),
-            "retry must bind the persisted Task to the pending runtime"
+            retry["runtimeUid"].is_null(),
+            "retry must not bind or otherwise advance orchestration"
         );
         let rows = task_rows
             .lock()
             .map_err(|_| "task fixture lock was poisoned")?;
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].runtime_uid.is_some());
+        assert!(rows[0].runtime_uid.is_none());
         assert_eq!(rows[0].phase, TaskPhase::Parked);
         assert_eq!(
             decision_requests
                 .lock()
                 .map_err(|_| "decision fixture lock was poisoned")?
                 .len(),
-            1,
-            "retry must reuse the pending admission instead of filing another decision"
+            0,
+            "neither submission nor retry may file an external decision"
         );
         assert_eq!(
             runtime_rows
                 .lock()
                 .map_err(|_| "runtime fixture lock was poisoned")?
                 .len(),
-            1,
-            "retry must reuse the deterministic pending runtime"
+            0,
+            "retry must remain a read of durable intent"
         );
         Ok(())
     }
 
-    async fn failed_pending_task_binding_fixture()
+    async fn recorded_pending_task_fixture()
     -> Result<(MultiRuntimeRepository, FakeLedger, FakeDecisionChannel), String> {
         let runtimes = MultiRuntimeRepository::default();
         let ledger = ledger();
-        ledger.task_bind_failures.store(1, Ordering::SeqCst);
         let decisions = FakeDecisionChannel::default();
         let mut workflow = task_workflow("250.00");
         workflow.name = "wide-review".to_owned();
         let app = task_router(
-            runtimes.clone(),
             ledger.clone(),
-            decisions.clone(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([workflow]),
             task_api_config()?,
@@ -9035,9 +9027,9 @@ mod tests {
             )
             .await
             .map_err(|error| format!("submit terminal approval fixture: {error}"))?;
-        if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+        if response.status() != StatusCode::ACCEPTED {
             return Err(format!(
-                "terminal approval fixture did not fail binding: {}",
+                "pending Task fixture was not durably accepted: {}",
                 response.status()
             ));
         }
@@ -9057,73 +9049,15 @@ mod tests {
             .map_err(|error| format!("build terminal approval retry: {error}"))
     }
 
-    fn activate_task_approval(
-        runtimes: &MultiRuntimeRepository,
-        ledger: &FakeLedger,
-    ) -> Result<(), String> {
-        let parked = ledger
-            .parked
-            .lock()
-            .map_err(|_| "parked fixture lock was poisoned")?
-            .first()
-            .cloned()
-            .ok_or_else(|| "parked admission fixture is missing".to_owned())?;
-        let base_spec = runtimes
-            .runtimes
-            .lock()
-            .map_err(|_| "runtime fixture lock was poisoned")?
-            .first()
-            .map(|runtime| runtime.spec.clone())
-            .ok_or_else(|| "pending runtime fixture is missing".to_owned())?;
-        *ledger
-            .application
-            .lock()
-            .map_err(|_| "grant application fixture lock was poisoned")? = Some(GrantReversion {
-            runtime_uid: parked.runtime_uid,
-            runtime_namespace: parked.runtime_namespace,
-            runtime_name: parked.runtime_name,
-            actor: parked.actor,
-            member_role: parked.member_role,
-            base_spec,
-            proposed_spec: parked.proposed_spec,
-            base_pending_approval_digest: parked.base_pending_approval_digest,
-        });
-        Ok(())
-    }
-
     #[tokio::test]
-    async fn unbound_task_retry_recovers_its_approved_runtime() -> Result<(), String> {
-        let (runtimes, ledger, decisions) = failed_pending_task_binding_fixture().await?;
-        let proposed_spec = ledger
-            .tasks
-            .lock()
-            .map_err(|_| "task fixture lock was poisoned")?[0]
-            .runtime_spec
-            .clone();
-        {
-            let mut rows = runtimes
-                .runtimes
-                .lock()
-                .map_err(|_| "runtime fixture lock was poisoned")?;
-            let runtime = rows
-                .first_mut()
-                .ok_or_else(|| "pending runtime fixture is missing".to_owned())?;
-            runtime.spec = proposed_spec;
-            runtime
-                .metadata
-                .annotations
-                .get_or_insert_default()
-                .remove(PENDING_APPROVAL_ANNOTATION);
-        }
+    async fn task_retry_does_not_apply_an_approved_runtime() -> Result<(), String> {
+        let (runtimes, ledger, decisions) = recorded_pending_task_fixture().await?;
         *ledger
             .task_approval_state
             .lock()
             .map_err(|_| "approval-state fixture lock was poisoned")? = FakeApprovalState::Approved;
-        activate_task_approval(&runtimes, &ledger)?;
         let app = task_router(
-            runtimes,
             ledger.clone(),
-            decisions.clone(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([]),
             TaskApiConfig::default(),
@@ -9133,21 +9067,21 @@ mod tests {
             .oneshot(terminal_approval_retry_request()?)
             .await
             .map_err(|error| format!("retry Task after approval: {error}"))?;
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         let rows = ledger
             .tasks
             .lock()
             .map_err(|_| "task fixture lock was poisoned")?;
-        assert!(rows[0].runtime_uid.is_some());
-        assert_eq!(rows[0].phase, TaskPhase::Submitted);
+        assert!(rows[0].runtime_uid.is_none());
+        assert_eq!(rows[0].phase, TaskPhase::Parked);
         assert_eq!(
             ledger
                 .parked
                 .lock()
                 .map_err(|_| "parked fixture lock was poisoned")?
                 .len(),
-            1,
-            "approved retry must not open another approval"
+            0,
+            "the API retry must not materialize approval state"
         );
         assert_eq!(
             decisions
@@ -9155,24 +9089,29 @@ mod tests {
                 .lock()
                 .map_err(|_| "decision fixture lock was poisoned")?
                 .len(),
-            1,
-            "approved retry must retain the original external decision"
+            0,
+            "the API retry must not file an external decision"
+        );
+        assert!(
+            runtimes
+                .runtimes
+                .lock()
+                .map_err(|_| "runtime fixture lock was poisoned")?
+                .is_empty(),
+            "the API retry must not create or activate a runtime"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn unbound_task_retry_applies_an_approved_pending_runtime() -> Result<(), String> {
-        let (runtimes, ledger, decisions) = failed_pending_task_binding_fixture().await?;
+    async fn task_retry_does_not_resume_approved_runtime_application() -> Result<(), String> {
+        let (runtimes, ledger, _decisions) = recorded_pending_task_fixture().await?;
         *ledger
             .task_approval_state
             .lock()
             .map_err(|_| "approval-state fixture lock was poisoned")? = FakeApprovalState::Approved;
-        activate_task_approval(&runtimes, &ledger)?;
         let app = task_router(
-            runtimes.clone(),
             ledger.clone(),
-            decisions,
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([]),
             TaskApiConfig::default(),
@@ -9182,23 +9121,20 @@ mod tests {
             .oneshot(terminal_approval_retry_request()?)
             .await
             .map_err(|error| format!("retry Task during approved runtime application: {error}"))?;
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         let task = ledger
             .tasks
             .lock()
             .map_err(|_| "task fixture lock was poisoned")?[0]
             .clone();
-        assert_eq!(task.phase, TaskPhase::Submitted);
-        let runtime = runtimes
-            .runtimes
-            .lock()
-            .map_err(|_| "runtime fixture lock was poisoned")?[0]
-            .clone();
-        assert_eq!(runtime.spec, task.runtime_spec);
+        assert_eq!(task.phase, TaskPhase::Parked);
+        assert!(task.runtime_uid.is_none());
         assert!(
-            !runtime
-                .annotations()
-                .contains_key(PENDING_APPROVAL_ANNOTATION)
+            runtimes
+                .runtimes
+                .lock()
+                .map_err(|_| "runtime fixture lock was poisoned")?
+                .is_empty()
         );
         assert_eq!(
             ledger
@@ -9206,24 +9142,22 @@ mod tests {
                 .lock()
                 .map_err(|_| "parked fixture lock was poisoned")?
                 .len(),
-            1,
-            "approved recovery must reuse the original approval"
+            0,
+            "approval materialization belongs to the orchestrator"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn unbound_task_retry_rejects_approved_history_without_an_active_grant()
+    async fn task_retry_does_not_interpret_approved_history_without_an_active_grant()
     -> Result<(), String> {
-        let (runtimes, ledger, decisions) = failed_pending_task_binding_fixture().await?;
+        let (runtimes, ledger, _decisions) = recorded_pending_task_fixture().await?;
         *ledger
             .task_approval_state
             .lock()
             .map_err(|_| "approval-state fixture lock was poisoned")? = FakeApprovalState::Approved;
         let app = task_router(
-            runtimes.clone(),
             ledger.clone(),
-            decisions,
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([]),
             TaskApiConfig::default(),
@@ -9239,37 +9173,28 @@ mod tests {
             .lock()
             .map_err(|_| "task fixture lock was poisoned")?[0]
             .clone();
-        assert_eq!(task.phase, TaskPhase::Failed);
-        assert!(task.finalize_requested);
-        assert_eq!(
-            task.failure_reason.as_deref(),
-            Some("admission_authority_inactive")
-        );
-        let runtime = runtimes
-            .runtimes
-            .lock()
-            .map_err(|_| "runtime fixture lock was poisoned")?[0]
-            .clone();
+        assert_eq!(task.phase, TaskPhase::Parked);
+        assert!(!task.finalize_requested);
+        assert!(task.failure_reason.is_none());
         assert!(
-            runtime
-                .annotations()
-                .contains_key(PENDING_APPROVAL_ANNOTATION),
-            "historical approval without an active grant must not promote the placeholder"
+            runtimes
+                .runtimes
+                .lock()
+                .map_err(|_| "runtime fixture lock was poisoned")?
+                .is_empty()
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn unbound_task_retry_recovers_its_rejected_admission() -> Result<(), String> {
-        let (runtimes, ledger, decisions) = failed_pending_task_binding_fixture().await?;
+    async fn task_retry_does_not_interpret_rejected_admission() -> Result<(), String> {
+        let (runtimes, ledger, decisions) = recorded_pending_task_fixture().await?;
         *ledger
             .task_approval_state
             .lock()
             .map_err(|_| "approval-state fixture lock was poisoned")? = FakeApprovalState::Rejected;
         let app = task_router(
-            runtimes,
             ledger.clone(),
-            decisions.clone(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([]),
             TaskApiConfig::default(),
@@ -9285,25 +9210,22 @@ mod tests {
             .map_err(|error| format!("read rejected Task retry: {error}"))?;
         let body: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|error| format!("parse rejected Task retry: {error}"))?;
-        assert_eq!(body["phase"], "failed");
+        assert_eq!(body["phase"], "parked");
         assert!(body["runtimeUid"].is_null());
         let rows = ledger
             .tasks
             .lock()
             .map_err(|_| "task fixture lock was poisoned")?;
-        assert!(rows[0].finalize_requested);
-        assert_eq!(
-            rows[0].failure_reason.as_deref(),
-            Some("admission_rejected")
-        );
+        assert!(!rows[0].finalize_requested);
+        assert!(rows[0].failure_reason.is_none());
         assert_eq!(
             ledger
                 .parked
                 .lock()
                 .map_err(|_| "parked fixture lock was poisoned")?
                 .len(),
-            1,
-            "rejected retry must not reopen the original approval"
+            0,
+            "the API retry must not materialize or reopen approval state"
         );
         assert_eq!(
             decisions
@@ -9311,14 +9233,21 @@ mod tests {
                 .lock()
                 .map_err(|_| "decision fixture lock was poisoned")?
                 .len(),
-            1,
-            "rejected retry must retain the original external decision"
+            0,
+            "the API retry must not contact the decision channel"
+        );
+        assert!(
+            runtimes
+                .runtimes
+                .lock()
+                .map_err(|_| "runtime fixture lock was poisoned")?
+                .is_empty()
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn adopted_task_reservation_persists_and_retries_the_exact_runtime_uid()
+    async fn public_task_retry_cannot_select_even_a_persisted_shared_runtime_uid()
     -> Result<(), String> {
         let ledger = ledger();
         let workflow = task_workflow("100.00");
@@ -9343,8 +9272,18 @@ mod tests {
             runner: steward_types::RunnerRequirements::default(),
             bindings: None,
         };
+        let service_envelope = ledger
+            .envelope
+            .lock()
+            .map_err(|_| "service envelope fixture lock was poisoned")?
+            .clone();
+        let admission = AdmissionDecision::Admit;
+        let intent_digest = format!("sha256:{}", "a".repeat(64));
+        let manifest_digest = format!("sha256:{}", "b".repeat(64));
         let reservation = ledger
             .reserve_task(TaskReservationRequest {
+                task_uid: Uuid::new_v4(),
+                operation_id: Uuid::new_v4(),
                 idempotency_key: "adopted-crash-retry",
                 submitter_service: "steward-run",
                 acting_user: Some("alice@example.com"),
@@ -9367,29 +9306,25 @@ mod tests {
                 agent_command: &workflow.command,
                 execution_binding: None,
                 envelope_revision: 3,
+                service_envelope: &service_envelope,
+                service_envelope_digest: &intent_digest,
+                candidate_digest: &intent_digest,
+                admission_decision: &admission,
+                inert_manifest_digest: &manifest_digest,
+                active_manifest_digest: &manifest_digest,
             })
             .await
             .map_err(|error| format!("seed adopted reservation: {error}"))?;
         assert!(reservation.inserted);
+        assert!(reservation.record.runtime_uid.is_none());
         assert_eq!(
-            reservation.record.runtime_uid.as_deref(),
+            reservation.operation.expected_runtime_uid.as_deref(),
             Some("runtime-uid-a"),
-            "the adopted UID must be part of the durable reservation"
+            "the server-resolved UID is immutable intent, not a public bound-UID projection"
         );
 
-        let mut runtime = AgentRuntime::new("runtime-a", spec.clone());
-        runtime.metadata.namespace = Some("team-a".to_owned());
-        runtime.metadata.uid = Some("runtime-uid-a".to_owned());
-        let mut other_runtime = AgentRuntime::new("runtime-a", spec);
-        other_runtime.metadata.namespace = Some("team-a".to_owned());
-        other_runtime.metadata.uid = Some("runtime-uid-b".to_owned());
-        let runtimes = MultiRuntimeRepository {
-            runtimes: Arc::new(Mutex::new(vec![runtime, other_runtime])),
-        };
         let app = task_router(
-            runtimes,
             ledger.clone(),
-            FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([]),
             TaskApiConfig::default(),
@@ -9422,30 +9357,24 @@ mod tests {
                 .lock()
                 .map_err(|_| "fake task ledger lock was poisoned")?[0]
                 .runtime_uid
-                .as_deref()
-                == Some("runtime-uid-a"),
-            "a rejected retry must preserve the original runtime UID"
+                .is_none()
         );
         let response = app
             .oneshot(request("runtime-uid-a")?)
             .await
             .map_err(|error| format!("retry adopted Task: {error}"))?;
-        assert_eq!(
-            response.status(),
-            StatusCode::CREATED,
-            "an exact retry must reuse the requested adopted runtime binding"
-        );
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         let tasks = ledger
             .tasks
             .lock()
             .map_err(|_| "fake task ledger lock was poisoned")?;
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].runtime_uid.as_deref(), Some("runtime-uid-a"));
+        assert!(tasks[0].runtime_uid.is_none());
         Ok(())
     }
 
     #[tokio::test]
-    async fn repeated_runtime_binding_does_not_regress_a_queued_task() -> Result<(), String> {
+    async fn repeated_execution_command_does_not_advance_unactivated_task() -> Result<(), String> {
         let ledger = ledger();
         let workflow = task_workflow("100.00");
         let canonical_user_id = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
@@ -9469,8 +9398,18 @@ mod tests {
             runner: steward_types::RunnerRequirements::default(),
             bindings: None,
         };
+        let service_envelope = ledger
+            .envelope
+            .lock()
+            .map_err(|_| "service envelope fixture lock was poisoned")?
+            .clone();
+        let admission = AdmissionDecision::Admit;
+        let intent_digest = format!("sha256:{}", "c".repeat(64));
+        let manifest_digest = format!("sha256:{}", "d".repeat(64));
         let reservation = ledger
             .reserve_task(TaskReservationRequest {
+                task_uid: Uuid::new_v4(),
+                operation_id: Uuid::new_v4(),
                 idempotency_key: "runtime-bind-race",
                 submitter_service: "steward-run",
                 acting_user: Some("alice@example.com"),
@@ -9493,6 +9432,12 @@ mod tests {
                 agent_command: &workflow.command,
                 execution_binding: None,
                 envelope_revision: 3,
+                service_envelope: &service_envelope,
+                service_envelope_digest: &intent_digest,
+                candidate_digest: &intent_digest,
+                admission_decision: &admission,
+                inert_manifest_digest: &manifest_digest,
+                active_manifest_digest: &manifest_digest,
             })
             .await
             .map_err(|error| format!("reserve task: {error}"))?;
@@ -9505,7 +9450,7 @@ mod tests {
             )
             .await
             .map_err(|error| format!("store task inputs: {error}"))?;
-        let queued = ledger
+        let requested = ledger
             .request_task_execution(
                 reservation.record.task_uid,
                 "steward-run",
@@ -9513,36 +9458,31 @@ mod tests {
             )
             .await
             .map_err(|error| format!("queue task: {error}"))?;
-        assert_eq!(queued.phase, TaskPhase::Queued);
-
-        let bound = ledger
-            .bind_task_runtime(
-                reservation.record.task_uid,
-                "runtime-uid-a",
-                TaskPhase::Submitted,
-            )
-            .await
-            .map_err(|error| format!("bind runtime after execution request: {error}"))?;
-        assert_eq!(bound.phase, TaskPhase::Queued);
-        assert!(bound.execute_requested);
+        assert_eq!(requested.phase, TaskPhase::Submitted);
+        assert!(requested.execute_requested);
+        assert!(requested.runtime_uid.is_none());
 
         let repeated = ledger
-            .bind_task_runtime(bound.task_uid, "runtime-uid-a", TaskPhase::Submitted)
+            .request_task_execution(
+                reservation.record.task_uid,
+                "steward-run",
+                "usr_0123456789abcdef0123456789abcdef",
+            )
             .await
-            .map_err(|error| format!("repeat runtime binding: {error}"))?;
+            .map_err(|error| format!("repeat execution command: {error}"))?;
         assert_eq!(
             repeated.phase,
-            TaskPhase::Queued,
-            "an idempotent binding must return current state without rewriting phase"
+            TaskPhase::Submitted,
+            "an idempotent API command must not project queued before activation"
         );
         assert!(repeated.execute_requested);
+        assert!(repeated.runtime_uid.is_none());
         Ok(())
     }
 
     #[tokio::test]
     async fn versioned_task_route_applies_service_envelope_as_a_narrowing_ceiling()
     -> Result<(), String> {
-        let runtimes = MultiRuntimeRepository::default();
         let ledger = versioned_task_ledger()?;
         ledger
             .envelope
@@ -9553,9 +9493,7 @@ mod tests {
             .monthly_limit = "10.00".to_owned();
         let task_rows = ledger.tasks.clone();
         let app = task_router(
-            runtimes,
             ledger,
-            FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
             task_api_config()?,
@@ -9610,9 +9548,7 @@ mod tests {
             decisions.clone(),
         )
         .merge(task_router(
-            runtimes,
             ledger,
-            decisions,
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([TaskWorkflow {
                 name: "wide-review".to_owned(),
@@ -9669,17 +9605,24 @@ mod tests {
             response.pointer("/phase"),
             Some(&serde_json::json!("parked"))
         );
-        let parked = runtime_state
+        let unchanged = runtime_state
             .lock()
             .map_err(|_| "fake runtime lock was poisoned")?;
         assert!(
-            parked
+            !unchanged
                 .annotations()
                 .contains_key(PENDING_APPROVAL_ANNOTATION),
-            "the parked task runtime must carry the controller-enforced pending marker"
+            "the Task API must not mutate any runtime while recording parked intent"
         );
-        assert!(parked.spec.llms.is_empty() && parked.spec.tools.is_empty());
-        assert_eq!(parked.spec.budget.monthly_limit, "0");
+        assert_eq!(
+            decisions
+                .requests
+                .lock()
+                .map_err(|_| "decision fixture lock was poisoned")?
+                .len(),
+            0,
+            "the Task API must not file approval side effects"
+        );
         Ok(())
     }
 
@@ -9697,9 +9640,7 @@ mod tests {
             FakeDecisionChannel::default(),
         )
         .merge(task_router(
-            runtimes,
             ledger,
-            FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
             task_api_config()?,
@@ -9770,9 +9711,7 @@ mod tests {
             decisions.clone(),
         )
         .merge(task_router(
-            runtimes,
             ledger,
-            decisions,
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
             task_api_config()?,
@@ -9953,7 +9892,11 @@ mod tests {
             .map_err(|error| format!("failed to read task status: {error}"))?;
         let status = serde_json::from_slice::<serde_json::Value>(&body)
             .map_err(|error| format!("task status was not JSON: {error}"))?;
-        assert_eq!(status.pointer("/phase"), Some(&serde_json::json!("queued")));
+        assert_eq!(
+            status.pointer("/phase"),
+            Some(&serde_json::json!("submitted")),
+            "the execute endpoint records a command; only the orchestrator may project queued"
+        );
 
         let cancelled = app
             .clone()
@@ -10025,9 +9968,7 @@ mod tests {
             FakeDecisionChannel::default(),
         )
         .merge(task_router(
-            runtimes,
             ledger,
-            FakeDecisionChannel::default(),
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
             task_api_config()?,
@@ -10166,9 +10107,7 @@ mod tests {
             decisions.clone(),
         )
         .merge(task_router(
-            runtimes,
             ledger,
-            decisions,
             FakeTaskIdentityResolver,
             StaticTaskWorkflowCatalog::new([workflow]),
             task_api_config()?,

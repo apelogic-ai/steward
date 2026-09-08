@@ -237,6 +237,7 @@
             "taskWorkflowsJson",
             "executionBindingsMode",
             "executionBindings",
+            "inferenceEndpoint",
             "mcpGatewayEndpoint"
           ],
           "properties": {
@@ -250,6 +251,7 @@
             },
             "taskWorkflowsJson": {"type": "string", "pattern": "^\\s*\\[", "minLength": 2},
             "executionBindingsMode": {"type": "string", "enum": ["staged", "active"]},
+            "inferenceEndpoint": {"type": "string", "pattern": "^https?://", "minLength": 10},
             "executionBindings": {
               "type": "object",
               "additionalProperties": false,

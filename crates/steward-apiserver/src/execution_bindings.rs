@@ -11,7 +11,6 @@ use steward_types::{
 
 const BINDING_SCHEMA: &str = TASK_EXECUTION_BINDING_SCHEMA_VERSION;
 pub const EXECUTION_BINDING_CATALOG_API_VERSION: &str = "steward.execution-bindings/v1";
-pub const CODEX_V1_ADAPTER: &str = "codex-v1";
 pub const MAX_EXECUTION_BINDING_CATALOG_BYTES: usize = 1024 * 1024;
 const MAX_EXECUTION_BINDINGS: usize = 128;
 
@@ -89,12 +88,6 @@ impl ExecutionBindingCatalog {
         let mut by_agent = BTreeMap::new();
         let mut by_identity = BTreeMap::<String, String>::new();
         for entry in document.bindings {
-            if entry.adapter != CODEX_V1_ADAPTER {
-                return Err(format!(
-                    "execution binding {} uses unsupported adapter {}",
-                    entry.agent_ref, entry.adapter
-                ));
-            }
             let binding = entry.into_binding()?;
             let binding_digest = binding.binding_digest.clone();
             if by_identity
@@ -117,6 +110,10 @@ impl ExecutionBindingCatalog {
 
     pub fn resolve(&self, agent_ref: &str) -> Option<&DisposableExecutionBinding> {
         self.by_agent.get(agent_ref)
+    }
+
+    pub(crate) fn bindings(&self) -> impl Iterator<Item = &DisposableExecutionBinding> {
+        self.by_agent.values()
     }
 
     pub fn agent_refs(&self) -> Vec<String> {
@@ -178,7 +175,7 @@ mod tests {
         json!({
             "agentRef": agent_ref,
             "displayName": format!("Agent {agent_ref}"),
-            "adapter": "codex-v1",
+            "adapter": "example-v1",
             "image": format!(
                 "registry.example.test/agents/example@sha256:{}",
                 image_byte.to_string().repeat(64)
@@ -232,7 +229,7 @@ mod tests {
         assert_ne!(one.binding_digest, two.binding_digest);
         assert_eq!(one.binding_id, one.binding_digest);
         let one = serde_json::to_value(one).map_err(|error| error.to_string())?;
-        assert_eq!(one.pointer("/adapter"), Some(&json!("codex-v1")));
+        assert_eq!(one.pointer("/adapter"), Some(&json!("example-v1")));
         assert_eq!(
             one.pointer("/versionProbe/arguments"),
             Some(&json!(["--version"]))
@@ -317,9 +314,9 @@ mod tests {
             json!(format!("sha256:{}", "A".repeat(64)));
         cases.push(vec![malformed_digest]);
 
-        let mut unknown_adapter = valid.clone();
-        unknown_adapter["adapter"] = json!("unknown-v1");
-        cases.push(vec![unknown_adapter]);
+        let mut empty_adapter = valid.clone();
+        empty_adapter["adapter"] = json!("");
+        cases.push(vec![empty_adapter]);
 
         let mut invalid_probe = valid.clone();
         invalid_probe["versionProbe"]["arguments"] = json!([]);
