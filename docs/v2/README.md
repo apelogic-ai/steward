@@ -12,6 +12,28 @@ See the [documentation index](../README.md) for authority order and the
 [deferred-contract register](deferred-implementation-contracts.md) for decisions that
 still require separate design and acceptance.
 
+## Post-PR #78 delivery follow-ups
+
+The initial customer DevInt/DevOps demonstration may use one pre-created,
+pre-approved `agentic-ops` artifact in local-main. It does not require AgentSession,
+DEV readiness, automated publication, release tags, over-envelope demonstrations,
+multiple workflows, or stable-lane evidence.
+
+The deferred delivery work is split by ownership and may proceed in parallel after PR
+#78:
+
+- [Automate customer-authored artifact publication and release provenance](agentic-ops-publication-lifecycle-ticket.md)
+  owns deterministic package release metadata and create-only Steward catalog
+  publication.
+- [Expand customer-authored GHA Task conformance](customer-authored-task-conformance-ticket.md)
+  owns authority-negative behavior, multiple-workflow isolation, and retained
+  local-stable acceptance.
+
+The conformance lane may begin with manually pre-published fixtures. Its final
+automated-publication scenario consumes the immutable publication handoff from the
+publication lane. Heavy local-main and local-stable test lanes remain sequential even
+when implementation work proceeds in parallel.
+
 ## Canonical terminology
 
 | Term | Accepted meaning |
