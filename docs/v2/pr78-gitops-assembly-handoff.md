@@ -1,6 +1,10 @@
 # PR #78: GitOps assembly handoff
 
-Status: candidate preparation; not a release or deployment approval.
+Status: blocked candidate, not a completed handoff or deployment approval.
+The final Task run `task-20260909065936-32809` passed the approved revocation
+cleanup and earlier executions, but legacy adoption returned HTTP 409. Legacy
+execute-and-detach therefore remains unverified. See the completion checklist;
+do not treat passing production CI/governed E2E as a full Task-suite pass.
 
 Source: [PR #78](https://github.com/apelogic-ai/steward/pull/78),
 `feat/v2-common-core-sprint`. Lifecycle checkpoint: `5b46b58`.
