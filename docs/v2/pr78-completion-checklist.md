@@ -41,10 +41,15 @@ explicitly recorded as follow-up rather than represented as fixed.
 - Fresh Postgres controller fault-path suite: `task_orchestration` passed on
   `b482b2f`, including a temporary observation failure that leaves the accepted
   attempt and Task unchanged (2026-09-09 UTC).
-- Workspace tests, formatting, warning-as-error Clippy, and static quality checks
-  passed in `cargo xtask ci`. The pinned G-1 lane then failed during Kind API-server
-  startup, before the egress assertion. Run
-  `steward-g1-20260909013755-23420` was removed by the harness; full CI is not green.
+- `cargo xtask ci` passed on the `b482b2f` production/test tree (only handoff
+  documentation differs at `dde4889`): workspace tests, formatting,
+  warning-as-error Clippy, static quality, and all four pinned guarantees.
+  G-1 passed in run `g1-20260909022337-73843`, G-2 passed against pinned MCP-GW,
+  and G-4/G-5 passed against pinned LiteLLM. Run-owned infrastructure and
+  credential directories were removed. An earlier G-1 attempt failed during
+  Kind API-server startup, before its assertion; this did not recur in the
+  completed CI run. A sandbox advisory-cache permission error was resolved by
+  permitting the unchanged gate to access Cargo's cache.
 - E2E all-target warning-as-error Clippy passed with the real OpenShell
   cancellation/orphan-process regression added.
 - `cargo xtask e2e-openshell-adapter` passed against OpenShell 0.0.98 in run
