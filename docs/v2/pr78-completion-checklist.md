@@ -36,6 +36,18 @@ explicitly recorded as follow-up rather than represented as fixed.
 
 ## Candidate evidence
 
+- Governed-connections rerun `pr78-gov-202609090611` on `a0fb771` passed
+  native arm64 preflight, pinned OpenShell 0.0.98 setup and internal runtime
+  creation/activation. It then failed in 51.29 seconds: the connection finalizer
+  clears transient Task output, but migration 0028 rejects that change as
+  non-monotonic. A focused fresh-Postgres regression reproduces the failure
+  after recording a successful execution through the real store transitions.
+  Correction is pending approval for narrowly scoped internal-output retirement:
+  execution outcome, identity and result digest must remain immutable, while
+  consumed OAuth-bearing payloads must not be retained indefinitely. No
+  constraint or test gate has been relaxed. The run's exact Kind node, image
+  aliases, probe and credential directory are absent; `dev doctor` reports no
+  Steward run artifacts. Full governed E2E remains red, not demo-ready.
 - Governed-connections run `governed-connections-20260909054712-89781`
   failed on `a2982d9` after the stack became ready: internal Tasks repeatedly
   reported an unavailable immutable Envelope and the connection request failed.
