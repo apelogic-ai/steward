@@ -26,22 +26,27 @@ derivation explicitly, including source and resulting content digests.
 
 ## Start and integration gates
 
-- Repository creation, artifact authoring, workflow preparation, and local-main
-  diagnosis can start immediately while #78 is tested.
+- Repository creation, artifact authoring, workflow preparation, and isolated
+  development checks can start immediately while #78 is tested.
+- GitOps owns the retained local-main cluster. Development workers must not use it
+  for testing, diagnosis, recovery, or deployment. Hand deployment and readiness
+  requirements to GitOps; do not restart or reset the cluster from this workstream.
 - Record the exact local Steward, Identity, steward-run workflow/action, OpenShell,
   MCP-GW, LiteLLM, and native binding revisions before integration.
 - Prefer the existing compatible execution path when sufficient. Adoption of #78
   requires a fixed candidate with relevant gates passing, including legacy transport
   and lifecycle regression tests; a candidate demo does not establish release readiness.
 - User updates about #78 trigger a compatibility assessment, not an automatic rollout.
-- Preserve existing worktrees and retained local state. Follow repository runbooks and
-  the local testbed skill using explicit local-main kubeconfig/context and ownership.
+- Preserve existing worktrees and retained local state. Development integration tests
+  use isolated, run-owned environments under the local testbed skill. Only the agreed
+  demo handoff uses GitOps-managed local-main, with explicit ownership and context.
 
 ## Deliverables
 
-1. Recover or provision local-main through the approved local lifecycle workflow.
-   Verify control plane/networking, identity, model/tool gateways, native ARM64 sandbox,
-   Steward API/controller/UI, and the existing deterministic/model smoke ladder.
+1. Deliver the exact component pins and readiness checklist to GitOps. GitOps prepares
+   local-main through its lifecycle workflow and confirms control plane/networking,
+   identity, model/tool gateways, native ARM64 sandbox, and Steward API/controller/UI.
+   Run development smoke and integration checks in isolated environments first.
 2. Create the repository and one useful package with neutral demonstration inputs,
    a reproducible validator, a documented customer authoring boundary, and exact pins.
    Prepare changes through PR review; merge and protection changes remain human actions.
@@ -55,7 +60,8 @@ derivation explicitly, including source and resulting content digests.
    supported interfaces. Keep model credentials in approved local secret storage.
 6. Pre-publish the approved artifact through the actual supported Steward interface.
    Read it back and verify agent/prompt/version/digest against the repository source.
-7. Dispatch the normal pinned steward-run workflow from agentic-ops. It must upload
+7. After GitOps confirms demo readiness and agrees the rehearsal window, dispatch the
+   normal pinned steward-run workflow from agentic-ops. It must upload
    the intended input, execute a real governed model/tool task, return structured
    summary.md, expose Task correlation, and finalize correctly on success or failure.
 8. Complete two successive rehearsals against unchanged pins, with useful output,
@@ -79,14 +85,18 @@ derivation explicitly, including source and resulting content digests.
 ## Parallel ownership and coordination
 
 - P0 artifact owner: agentic-ops initial package, validator, caller, authoring README.
-- P0 integration coordinator: local-main state, Identity deployment, runner setup,
-  publication, credentials, GHA dispatch, readiness, rehearsal evidence, cleanup.
+- P0 integration coordinator: repository/runner preparation, exact Identity change
+  handoff, publication mapping, isolated development checks, and demo coordination.
+- GitOps team: local-main state, deployment, recovery, readiness, and the agreed demo
+  execution window. Agree publication, credentials, dispatch, evidence, and cleanup
+  ownership before rehearsal; development workers do not operate this cluster.
 - Ticket A: publication/release tooling in isolated paths and branches; agree on the P0
   package interface before editing shared artifacts. No automatic demo-stack upgrades.
 - Ticket B: additional fixtures/harnesses and contract matrix on isolated branches;
   request a test slot before heavy builds, deployments or GHA runs.
 
-Keep one writer for each shared file and one coordinator for shared environment changes.
+Keep one writer for each shared file and one coordinator for isolated test scheduling.
+Shared local-main environment changes remain with GitOps, not the development workers.
 Status questions do not interrupt workers. Report progress and blockers periodically;
 pause only dependent work when a real prerequisite is absent and continue independent
 work. Request human merge or required approval only with concrete reviewable changes.
