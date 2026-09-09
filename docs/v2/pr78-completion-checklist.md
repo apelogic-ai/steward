@@ -36,6 +36,16 @@ explicitly recorded as follow-up rather than represented as fixed.
 
 ## Candidate evidence
 
+- Candidate `1bb5933` passed the complete `cargo xtask ci` quality stage
+  (workspace tests, warning-as-error Clippy and all static checks). Full CI then
+  failed G-1 in run `g1-20260909034940-38329`: the pinned OpenShell 0.0.90
+  sandbox's HTTP/2 stream broke before readiness, and the egress probe did not
+  execute. Host Kubernetes API observations also timed out during this run;
+  the node reported no OOM kills. The exact cluster and credential directory
+  were removed. G-1 finding: runtime readiness/transport evidence is incomplete,
+  not evidence that unlisted egress succeeded. Hold the existing pin and
+  assertion unchanged; a successful candidate run remains required. Later
+  pinned guarantees did not execute in this failed CI invocation.
 - Legacy caller compatibility correction after `b1977a3`: reproduced both the
   initial adopted-null-UID response rejection and historical retry HTTP 200
   rejection using the exact pinned `steward-run` client source at
