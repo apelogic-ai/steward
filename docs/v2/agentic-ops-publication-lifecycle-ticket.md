@@ -1,6 +1,6 @@
 # Ticket: Automate customer-authored artifact publication and release provenance
 
-Status: post-PR #78 follow-up; ready after the single-artifact local demo baseline is recorded
+Status: follow-up implementation may start before PR #78 release; not a P0 demo prerequisite
 
 ## Problem
 
@@ -30,11 +30,21 @@ admission, or runtime activation the same operation.
 
 ## Dependencies
 
-- PR #78 is merged and its common Task runtime orchestration guarantees remain green.
+- Package tooling and publication design may start immediately against frozen contracts.
+  PR #78 merge or release is not a blanket start prerequisite.
 - The frozen [`steward.m1/v1` contract](../contracts/m1/v1/README.md) remains the
   publication and artifact authority.
-- The single-artifact `agentic-ops` local demo establishes the initial package layout,
-  exact GHA caller, and manually published compatibility fixture.
+- Coordinate package layout with the owner of the [P0 demo](agentic-ops-local-demo-ticket.md).
+  Reuse its artifact where compatible; the completed demo is not a start prerequisite.
+- Before live publication, implement and verify publisher authorization, private-source
+  retrieval, repository/catalog bindings, create-only persistence, and witness APIs.
+  Frozen JSON schemas alone do not provide these server capabilities.
+- Final GHA acceptance additionally needs a compatible M1 resolver, Identity claims,
+  input-receipt path, and steward-run transport. Record exact component revisions and
+  contract versions. The existing v0.4 name@version transport is separate compatibility
+  coverage and cannot prove qualified M1 catalog resolution.
+- Integration using #78 behavior requires a fixed candidate revision and passing
+  applicable regression/E2E gates. Released-stack acceptance waits for compatible releases.
 
 No AgentSession, AgentInstance, TaskGraph, DEV deployment, or stable-lane change is a
 dependency.
@@ -56,8 +66,9 @@ dependency.
 
 ### Publication automation
 
-- Use an explicitly authorized publisher identity; do not reuse a browser session,
-  acting-user credential, provider token, runtime workload identity, or GHA task token.
+- Define and verify the publisher authentication and authorization handoff before
+  automating writes. Task execution authority does not itself grant publication rights;
+  never automate by copying browser sessions or provider credentials.
 - Submit the canonical `catalogPublicationRequest` with an idempotency key derived from
   immutable publication inputs.
 - Treat the returned `catalogPublicationWitness` as the publication result and retain
@@ -79,7 +90,8 @@ dependency.
 ## Required negative tests
 
 - a mutable branch or tag is supplied where an exact commit is required;
-- a tag is moved after release metadata is created;
+- a moved tag attempts to change recorded source identity (the exact original commit
+  remains valid if its verified bytes are still available);
 - a path escapes the configured package root;
 - source bytes or a dependency differ from the submitted digest;
 - the repository ID, commit, coordinate, content digest, or closure digest changes
@@ -115,8 +127,13 @@ Every failed case creates no publication witness and changes no Task or runtime 
 
 ## Parallel delivery boundary
 
-This ticket can run in parallel with
-[`customer-authored-task-conformance-ticket.md`](customer-authored-task-conformance-ticket.md).
-The conformance ticket may use manually pre-published fixtures until this ticket freezes
-the publication metadata and witness handoff. Its final automated-publication scenario
-depends on that handoff, not on this ticket's internal implementation.
+This ticket can run in parallel with the P0 demo and
+[conformance ticket](customer-authored-task-conformance-ticket.md). P0 has priority.
+Agree on package layout, manifest/lock versions, digest rules, publication authorization,
+catalog/source bindings, request/response versions, and transport pins before integration.
+Assign one owner to shared catalog/resolver/store code and one owner to agentic-ops
+package paths. Use separate branches; coordinate edits rather than rewriting shared work.
+The P0 coordinator alone schedules local-main deployments, credential changes, GHA
+dispatches, and heavy tests. This ticket must not upgrade the demo stack independently.
+Manual fixtures may unblock B only when they exercise the same contract; copying a
+legacy prompt is not a substitute for M1 publication/resolution coverage.

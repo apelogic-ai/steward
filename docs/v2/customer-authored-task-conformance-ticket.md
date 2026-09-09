@@ -1,6 +1,6 @@
 # Ticket: Expand customer-authored GHA Task conformance
 
-Status: post-PR #78 follow-up; may start with manually pre-published fixtures
+Status: preparation and isolated implementation may start before PR #78 release; P0 has priority
 
 ## Problem
 
@@ -22,11 +22,22 @@ Envelopes, credentials, provider connections, runtimes, or deployment policy.
 
 ## Dependencies
 
-- PR #78 is merged and its common Task runtime orchestration guarantees remain green.
-- The single-artifact local-main demo is recorded as the happy-path baseline.
+- Fixtures, test design, and isolated harness implementation can start before #78 merge
+  or release. Tests of #78 behavior require an exact candidate revision and its applicable
+  regression/E2E gates; do not imply a fully tested release from candidate results.
+- The [P0 demo](agentic-ops-local-demo-ticket.md) owns the initial repository, caller,
+  publication mapping, local-main readiness, and rehearsals. Reuse its baseline when
+  available; do not wait for it to begin independent preparation.
 - The exact GHA caller uses a pinned `steward-run` reusable workflow and is registered
   by stable repository ID plus exact workflow identity.
-- Manually pre-published fixtures are allowed during parallel development.
+- Maintain separate legacy v0.4 and M1 test matrices. Legacy name@version publication
+  accepts agent/prompt and derives runtime requirements from the User Envelope. It does
+  not prove package-requirement enforcement, qualified catalog resolution, or M1 evidence.
+- M1 cases require implemented catalog publication/resolution, Identity catalog/source
+  claims, envelopeRef and input-receipt handling, and compatible steward-run transport.
+  Record each providing implementation and exact revision before running those cases.
+- Manually pre-published fixtures are allowed only within their actual contract. Missing
+  M1 capabilities are unmet dependencies, not passing or silently skipped coverage.
 - Final automated-publication coverage consumes the immutable output of
   [`agentic-ops-publication-lifecycle-ticket.md`](agentic-ops-publication-lifecycle-ticket.md).
 
@@ -51,9 +62,10 @@ AgentSession, AgentInstance, TaskGraph, and DEV readiness are explicitly unneces
 
 - Prove an in-envelope TaskDefinition is admitted and executed without an approval
   record widening its authority.
-- Prove an over-envelope TaskDefinition is parked unchanged with a deterministic delta;
-  no runtime, provider attachment, credential projection, inference authorization, or
-  external-network authority exists while it waits.
+- Prove an over-envelope TaskDefinition is parked unchanged with a deterministic delta.
+  An inert AgentRuntime may exist to bind approval to its exact UID, as required by #78.
+  No task execution, model/tool provider attachment, credential projection, inference
+  authorization, or external-network authority is activated while it waits.
 - Prove approval is instance-bound, time-bounded, and revalidated against the current
   grant, Envelope revision, artifact closure, and deployment binding before activation.
 - Prove rejection, expiry, revocation, or a changed Envelope leaves no reusable approval
@@ -62,16 +74,23 @@ AgentSession, AgentInstance, TaskGraph, and DEV readiness are explicitly unneces
 
 ### Multiple-workflow isolation
 
-- Prove that one coordinate cannot resolve another TaskDefinition's prompt, dependency,
-  requirements, approval, Task state, evidence, or runtime.
+- Prove a coordinate resolves exactly its authorized locked closure. Explicitly locked
+  and authorized shared dependencies are allowed; undeclared substitutions fail.
+  Approval, Task state, evidence, and runtime identity cannot cross Task ownership.
 - Prove same-name artifacts in unauthorized catalogs are not searched or selected.
 - Prove queued and running Tasks retain their admitted coordinate and closure when a new
   artifact version is published.
-- Prove a workflow input cannot choose an Envelope, principal, credential, connection,
-  runtime UID, image, native policy, namespace, endpoint, or runner label.
+- Prove portable artifacts cannot choose identity, credentials, connections, runtime UID,
+  image, native policy, namespace, endpoint, or runner label. Operator transport config
+  owns runner/endpoint settings. M1 envelopeRef is a protected transport field that
+  Steward checks against the authenticated principal's issued Envelopes; reject foreign
+  or caller-injected overrides without forbidding the legitimate field.
 
 ### Stable-lane acceptance
 
+- Execution waits for compatible released component pins and explicit human approval
+  for any required stable promotion. Preparation can proceed before release. Existing
+  stable pins lacking M1 support cannot satisfy M1 acceptance.
 - Repeat the final positive, isolation, and authority-negative scenarios against the
   retained local-stable lane using its pinned released artifacts and its own provisioned
   Envelope and connection state.
@@ -84,8 +103,9 @@ AgentSession, AgentInstance, TaskGraph, and DEV readiness are explicitly unneces
 ## Required negative tests
 
 - unregistered repository, workflow, ref, event, or reusable-workflow identity;
-- unqualified, missing, unknown, or unauthorized TaskDefinition coordinate;
-- workflow A attempting to use workflow B's dependency or approval;
+- missing, unknown, or unauthorized coordinate; unqualified coordinates rejected for
+  M1 while the explicitly supported legacy shape remains accepted in its own lane;
+- undeclared/unauthorized dependency substitution or reuse of another Task's approval;
 - over-envelope submission creating any effectful runtime state before approval;
 - expired or revoked approval reused after a retry or controller restart;
 - Envelope or deployment-binding revision changed before runtime activation;
@@ -97,15 +117,18 @@ AgentSession, AgentInstance, TaskGraph, and DEV readiness are explicitly unneces
 
 1. Two customer-authored TaskDefinitions execute independently through the pinned GHA
    path in local-main.
-2. The over-envelope negative path parks without side effects, and approve, reject,
+2. The over-envelope negative path remains inert without execution authority, and approve, reject,
    expiry, revocation, and stale-authority cases have deterministic outcomes.
-3. Cross-workflow and cross-catalog substitution attempts fail before execution.
+3. Unauthorized cross-workflow/catalog substitutions fail before execution; authorized
+   locked shared dependencies remain usable.
 4. The required positive and negative matrix passes in local-stable against pinned
    released artifacts.
-5. Every agentic run performs a real model call and at least one authorized MCP tool
-   call, while logs and artifacts contain no credential material.
-6. After every run there is no AgentRuntime, Sandbox, UID-scoped runtime Secret, model
-   key projection, or retained local OAuth state owned by that run.
+5. Every successful positive agentic scenario performs real model inference and an
+   authorized MCP call. Rejected and parked scenarios prove absence of unauthorized
+   execution and calls. Logs and artifacts contain no credential material.
+6. After finalization, no disposable Task-owned runtime, Sandbox, UID-scoped Secret,
+   or Task credential projection remains. Final suite teardown revokes run-created OAuth
+   state and model projections; pre-existing user connections are not Task-owned.
 7. The relevant repository gates and affected integration/E2E targets are green with no
    warnings.
 
@@ -120,8 +143,12 @@ AgentSession, AgentInstance, TaskGraph, and DEV readiness are explicitly unneces
 
 ## Parallel delivery boundary
 
-Identity/GitOps/`steward-run` caller registration, multiple-workflow fixtures, and
-authority-state tests can proceed with manually pre-published artifacts while the
-publication-lifecycle ticket is implemented. The shared integration point is the frozen
-qualified coordinate plus publication witness. Stable-lane execution starts only after
-the local-main matrix is green and never runs concurrently with it.
+Use separate branches and assign ownership before editing shared fixtures, catalog,
+resolver/store code, Identity configuration, or caller workflows. P0 owns the demo
+package and caller; A owns publication tooling and the catalog integration handoff;
+B owns additional test scenarios and harnesses. Reuse agreed transport and manifest
+versions, digest rules, source/catalog bindings, and publisher authorization.
+Only the coordinator may schedule shared local-main deployment/configuration changes,
+credentials, dispatches, or heavy tests. Stable execution follows a green main matrix
+and compatible release/promotion; heavy lanes never overlap. A legacy manual fixture
+cannot stand in for an M1 publication witness or catalog-scoped admission.
