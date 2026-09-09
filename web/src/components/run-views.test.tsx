@@ -7,7 +7,7 @@ import { RunCards } from "./run-views";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
-    codingAgentRuntime: "codex@0.117.0",
+    codingAgentRuntime: "codex@0.140.0",
     createdAt: "2026-08-25T20:00:00Z",
     finalizationRequested: false,
     finalized: true,

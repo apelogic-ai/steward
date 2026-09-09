@@ -131,7 +131,7 @@ async fn workflow_revisions_are_immutable_and_task_pins_are_atomic() -> Result<(
         .publish_initial_workflow(WorkflowPublication {
             name: &workflow_name,
             display_name: "Repository review",
-            agent: "codex@0.117.0",
+            agent: "codex@0.140.0",
             prompt: "Review the repository state that triggered this GitHub Actions run.",
             content_digest: &first_digest,
             published_by: "admin@example.com",
@@ -141,7 +141,7 @@ async fn workflow_revisions_are_immutable_and_task_pins_are_atomic() -> Result<(
         .publish_next_workflow(WorkflowPublication {
             name: &workflow_name,
             display_name: "Repository review",
-            agent: "codex@0.117.0",
+            agent: "codex@0.140.0",
             prompt: "Review the repository state and summarize actionable findings.",
             content_digest: &second_digest,
             published_by: "admin@example.com",
@@ -180,7 +180,7 @@ async fn workflow_revisions_are_immutable_and_task_pins_are_atomic() -> Result<(
           coding_agent_runtime, runtime_namespace, runtime_name, runtime_ownership, phase, \
           runtime_spec, agent_command) \
          VALUES (gen_random_uuid(), $1, 'steward-run', \
-                 'alice@example.com', $2, $3, 'codex@0.117.0', 'steward-test', 'task-a', \
+                 'alice@example.com', $2, $3, 'codex@0.140.0', 'steward-test', 'task-a', \
                  'provisioned', 'submitted', '{}'::jsonb, '[]'::jsonb)",
     )
     .bind(format!("partial-{suffix}"))
@@ -200,7 +200,7 @@ async fn workflow_revisions_are_immutable_and_task_pins_are_atomic() -> Result<(
           user_envelope_revision, user_envelope_digest, coding_agent_runtime, \
           runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, agent_command) \
          VALUES (gen_random_uuid(), $1, 'steward-run', \
-                 'alice@example.com', $2, $3, 1, $4, 'env_test', 7, $5, 'codex@0.117.0', \
+                 'alice@example.com', $2, $3, 1, $4, 'env_test', 7, $5, 'codex@0.140.0', \
                  'steward-test', 'task-b', 'provisioned', 'submitted', '{}'::jsonb, '[]'::jsonb)",
     )
     .bind(format!("complete-{suffix}"))
