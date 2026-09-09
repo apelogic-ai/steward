@@ -73,6 +73,11 @@ bound. The authoritative observed UID remains the reconciler-written
 - Legacy v0.2 compatibility requests may contain `agentRuntimeUid` and may return
   `runtimeOwnership: adopted`.
 - A newly reserved adopted Task returns 202 while the reconciler observes the exact UID.
+- Every legacy adopted response projects the immutable server-validated target
+  `runtimeUid`, as required by the pinned caller. This is a reference, not proof
+  of durable binding or runtime readiness; persisted observed UIDs remain null
+  until controller observation. Exact legacy submission retries retain 201/202,
+  including finalized historical Tasks. M1 exact retries retain 200.
 - M1 requests never contain or select a runtime UID.
 - No name-only adoption, fallback lookup, replacement-UID recovery, or implicit adoption is
   permitted.

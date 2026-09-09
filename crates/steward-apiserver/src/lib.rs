@@ -483,7 +483,7 @@ pub async fn budget_increase_contract() {}
     responses(
         (status = 200, description = "An exact versioned-Workflow retry returns the existing Task under the frozen M1 contract; the request performs no runtime lifecycle effect", body = TaskStatusResponse, content_type = "application/json"),
         (status = 201, description = "An exact legacy retry returns an existing Task whose runtime binding has already been observed by the controller; the request performs no runtime lifecycle effect", body = TaskStatusResponse, content_type = "application/json"),
-        (status = 202, description = "A new Task is accepted for controller-owned runtime creation, exact legacy adopted-runtime observation, or a governed approval hold; runtimeUid is null until the controller observes and binds the exact runtime UID", body = TaskStatusResponse, content_type = "application/json"),
+        (status = 202, description = "A new Task is accepted for controller-owned runtime creation, exact legacy adopted-runtime observation, or a governed approval hold. Legacy adoption projects the immutable server-validated target runtimeUid for caller compatibility, not binding or readiness evidence; otherwise runtimeUid is null until controller binding", body = TaskStatusResponse, content_type = "application/json"),
         (status = 400, description = "Submission JSON is malformed", body = String, content_type = "text/plain"),
         (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
         (status = 404, description = "Selected workflow does not exist", body = TaskErrorResponse, content_type = "application/json"),
@@ -9494,6 +9494,7 @@ mod tests {
         );
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -9517,12 +9518,75 @@ mod tests {
             .map_err(|error| format!("decode adopted Task response: {error}"))?;
         assert_eq!(
             response.pointer("/runtimeUid"),
-            Some(&serde_json::Value::Null)
+            Some(&serde_json::json!("runtime-uid-a")),
+            "the pinned legacy client requires the resolved adopted target UID even before controller binding"
         );
         assert_eq!(
             response.pointer("/runtimeOwnership"),
             Some(&serde_json::json!("adopted"))
         );
+        let task_uid = response["taskUid"]
+            .as_str()
+            .ok_or("adopted response has no Task UID")?;
+        let upload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/tasks/{task_uid}/inputs"))
+                    .header("authorization", "Bearer github-assertion")
+                    .header("content-type", "application/x-tar")
+                    .body(Body::from("opaque archive fixture"))
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+        for (method, path, body, expected_status) in [
+            (
+                "POST",
+                "/v1/tasks".to_owned(),
+                r#"{"workflow":"code-review","codingAgentRuntime":"agent-v1","agentRuntimeUid":"runtime-uid-a"}"#,
+                StatusCode::ACCEPTED,
+            ),
+            ("GET", format!("/v1/tasks/{task_uid}"), "", StatusCode::OK),
+            (
+                "POST",
+                format!("/v1/tasks/{task_uid}/execute"),
+                "",
+                StatusCode::ACCEPTED,
+            ),
+            (
+                "DELETE",
+                format!("/v1/tasks/{task_uid}"),
+                "",
+                StatusCode::ACCEPTED,
+            ),
+            ("GET", format!("/v1/tasks/{task_uid}"), "", StatusCode::OK),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(&path)
+                        .header("authorization", "Bearer github-assertion")
+                        .header("idempotency-key", "adopted-initial-submission")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .map_err(|error| error.to_string())?,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(response.status(), expected_status, "{method} {path}");
+            let bytes = to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .map_err(|error| error.to_string())?;
+            let response: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            assert_eq!(response["runtimeUid"], "runtime-uid-a", "{method} {path}");
+            assert_eq!(response["runtimeOwnership"], "adopted");
+        }
         let tasks = ledger
             .tasks
             .lock()
@@ -9720,7 +9784,7 @@ mod tests {
         assert_eq!(
             reservation.operation.expected_runtime_uid.as_deref(),
             Some("runtime-uid-a"),
-            "the server-resolved UID is immutable intent, not a public bound-UID projection"
+            "the server-resolved UID is immutable intent; its legacy wire projection is not durable binding evidence"
         );
 
         let app = task_router(
@@ -9819,7 +9883,11 @@ mod tests {
             .oneshot(request("runtime-uid-a")?)
             .await
             .map_err(|error| format!("retry historical adopted Task: {error}"))?;
-        assert_eq!(historical.status(), StatusCode::OK);
+        assert_eq!(
+            historical.status(),
+            StatusCode::CREATED,
+            "the pinned legacy caller accepts only 201 or 202 on an exact submission retry"
+        );
         let wrong_historical = app
             .clone()
             .oneshot(request("runtime-uid-b")?)

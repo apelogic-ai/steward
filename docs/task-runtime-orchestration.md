@@ -206,6 +206,14 @@ the current observed data-plane incarnation. No one field substitutes for anothe
 `runtimeUid` remains a nullable diagnostic projection in public M1 evidence. Internally,
 once observed, it is the immutable identity for all later authority and cleanup.
 
+The frozen legacy adopted-Task response instead projects the server-validated
+immutable target UID from the operation's intent before controller observation.
+Its pinned caller requires that reference even in the initial accepted response.
+This wire compatibility projection is not binding or readiness evidence: both
+durable `runtime_uid` columns remain null until the controller observes the exact
+UID. Legacy submission retries retain HTTP 201/202, including finalized history;
+versioned M1 exact retries retain HTTP 200.
+
 Public phase projection remains monotonic and contract-owned:
 
 - a baseline Task is `submitted` while orchestration prepares its runtime;

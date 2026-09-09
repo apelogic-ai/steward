@@ -36,6 +36,19 @@ explicitly recorded as follow-up rather than represented as fixed.
 
 ## Candidate evidence
 
+- Legacy caller compatibility correction after `b1977a3`: reproduced both the
+  initial adopted-null-UID response rejection and historical retry HTTP 200
+  rejection using the exact pinned `steward-run` client source at
+  `19230cc59a6b1246224912961e35c7044b0808d3` with mocked HTTP responses.
+  Corrected response fixtures pass that parser. All 183 API-server unit tests
+  pass, including legacy response projection across submission, retry, GET,
+  upload, execute and DELETE while durable binding remains absent, and historical
+  retry status. These are focused compatibility checks, not a full caller E2E;
+  full CI evidence below predates this correction and must be rerun.
+  The Task E2E target passes warning-as-error Clippy; its adoption check now
+  observes the real Postgres binding separately from the legacy wire reference.
+  The browser client was regenerated from OpenAPI, including its previously
+  missing M1 HTTP 200 response variant.
 - Fresh Postgres: all 28 `s4_store` tests passed, including pre-start fencing,
   concurrent runtime ownership, late retirement, and historical migration.
 - Fresh Postgres controller fault-path suite: `task_orchestration` passed on
@@ -62,6 +75,11 @@ explicitly recorded as follow-up rather than represented as fixed.
   remains open rather than being represented as a production fix.
 - `scripts/validate-release-artifacts.sh` passed chart/schema/parity and release
   helper checks. Its separate `--build-images` lane has not been verified here.
+- `cargo xtask e2e-task` run `task-20260909023901-89647` failed during
+  OpenShell's pre-install certificate-generation job timeout. No Task lifecycle
+  assertion ran. Both sandbox versions had passed the native arm64 startup and
+  executable-version preflight. The run-owned cluster, tagged images, and
+  credential directory were removed; full Task runtime evidence remains pending.
 - Web `bun run check` passed: lint, type-checking, and all 23 tests.
 
 Delivery checklist:

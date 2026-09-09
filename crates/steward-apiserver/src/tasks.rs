@@ -25,7 +25,8 @@ use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, evaluate_wi
 use steward_ports::{MAX_TASK_INPUT_ARCHIVE_BYTES, TaskExecutionAdapter, TaskExecutionPlanRequest};
 use steward_store::{
     EnvelopeRequestRecord, PgStore, StoreError, TaskOrchestrationMode, TaskRecord,
-    TaskReservationRequest, TaskRuntimeOperationRecord, WorkflowRevisionRecord,
+    TaskReservationRequest, TaskRuntimeOperationRecord, TaskRuntimeOwnership,
+    WorkflowRevisionRecord,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, Duration,
@@ -1232,7 +1233,7 @@ where
         )
         .await
     {
-        Ok(record) => match status_response(record, Vec::new()) {
+        Ok(record) => match status_response(&state.application.ledger, record, Vec::new()).await {
             Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
             Err(error) => error.into_response(),
         },
@@ -1264,7 +1265,7 @@ where
         )
         .await
     {
-        Ok(record) => match status_response(record, Vec::new()) {
+        Ok(record) => match status_response(&state.application.ledger, record, Vec::new()).await {
             Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
             Err(error) => error.into_response(),
         },
@@ -1300,7 +1301,7 @@ where
         Ok(None) => return ApiError::Store(StoreError::TaskNotFound).into_response(),
         Err(error) => return ApiError::Store(error).into_response(),
     };
-    match status_response(record, Vec::new()) {
+    match status_response(&state.application.ledger, record, Vec::new()).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => error.into_response(),
     }
@@ -1650,7 +1651,7 @@ where
     ) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
         let record = match reservation {
             Ok(reservation) if reservation.inserted => {
-                return task_response(reservation.record, deltas);
+                return task_response(&self.ledger, reservation.record, deltas).await;
             }
             Ok(reservation) => reservation.record,
             Err(StoreError::TaskIdempotencyConflict) => self
@@ -1698,9 +1699,12 @@ where
         )?;
         let deltas = record.original_admission_deltas.clone().unwrap_or_default();
         if reference.is_some() {
-            Ok((StatusCode::OK, status_response(record, deltas)?))
+            Ok((
+                StatusCode::OK,
+                status_response(&self.ledger, record, deltas).await?,
+            ))
         } else {
-            task_response(record, deltas)
+            task_response(&self.ledger, record, deltas).await
         }
     }
 }
@@ -1964,18 +1968,19 @@ fn serialized_digest<T: Serialize>(value: &T) -> Result<String, ApiError> {
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
-fn task_response(
+async fn task_response<L: TaskSubmissionLedger>(
+    ledger: &L,
     record: TaskRecord,
     deltas: Vec<AdmissionDelta>,
 ) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
     let status = if record.runtime_uid.is_none() || record.phase == TaskPhase::Parked {
         StatusCode::ACCEPTED
-    } else if record.finalized {
+    } else if record.finalized && record.workflow_name.is_some() {
         StatusCode::OK
     } else {
         StatusCode::CREATED
     };
-    Ok((status, status_response(record, deltas)?))
+    Ok((status, status_response(ledger, record, deltas).await?))
 }
 
 fn admission_deltas(decision: &AdmissionDecision) -> Vec<AdmissionDelta> {
@@ -1985,13 +1990,40 @@ fn admission_deltas(decision: &AdmissionDecision) -> Vec<AdmissionDelta> {
     }
 }
 
-fn status_response(
+async fn status_response<L: TaskSubmissionLedger>(
+    ledger: &L,
     record: TaskRecord,
     deltas: Vec<AdmissionDelta>,
 ) -> Result<TaskStatusResponse, ApiError> {
+    // The frozen legacy caller requires an adopted target UID in every response.
+    // This is a read-only projection of server-validated immutable intent, not
+    // evidence of controller binding. M1 and durable runtime_uid stay unchanged.
+    let runtime_uid = if record.runtime_uid.is_none()
+        && record.runtime_ownership == RuntimeOwnership::Adopted
+        && record.workflow_name.is_none()
+    {
+        let operation = ledger
+            .task_runtime_operation(record.task_uid)
+            .await
+            .map_err(ApiError::Store)?
+            .filter(|operation| {
+                operation.task_uid == record.task_uid
+                    && Some(operation.operation_id) == record.orchestration_operation_id
+                    && operation.runtime_ownership == TaskRuntimeOwnership::Adopted
+            })
+            .ok_or(ApiError::Store(StoreError::InvalidTaskTransition))?;
+        Some(
+            operation
+                .expected_runtime_uid
+                .filter(|uid| !uid.is_empty())
+                .ok_or(ApiError::Store(StoreError::InvalidTaskTransition))?,
+        )
+    } else {
+        record.runtime_uid
+    };
     Ok(TaskStatusResponse {
         task_uid: record.task_uid,
-        runtime_uid: record.runtime_uid,
+        runtime_uid,
         phase: record.phase,
         runtime_ownership: record.runtime_ownership,
         finalized: record.finalized,
