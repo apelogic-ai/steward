@@ -56,6 +56,7 @@ impl Drop for ServerGuard {
 struct AmbiguousTaskRuntime {
     starts: Arc<AtomicUsize>,
     terminal_observed: Arc<AtomicBool>,
+    fail_next_observation: Arc<AtomicBool>,
 }
 
 impl SandboxTaskRuntime for AmbiguousTaskRuntime {
@@ -76,6 +77,11 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
         attempt_id: &TaskAttemptId,
         _request: &SandboxTaskRequest,
     ) -> Result<SandboxTaskObservation, PortError> {
+        if self.fail_next_observation.swap(false, Ordering::SeqCst) {
+            return Err(PortError::Failed {
+                reason: "temporary observation transport failure".to_owned(),
+            });
+        }
         if self.terminal_observed.load(Ordering::SeqCst) {
             Ok(SandboxTaskObservation::Failed {
                 adapter_observation_id: attempt_id.0.clone(),
@@ -663,6 +669,38 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     .bind(adopted_attempt.generation)
     .execute(store.pool())
     .await?;
+    let accepted_attempt = store
+        .task_execution_attempt(adopted_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    store
+        .record_task_execution_observation(
+            accepted_attempt.attempt_id,
+            accepted_attempt.generation,
+            steward_store::TaskExecutionObservation::Accepted {
+                adapter_observation_id: &accepted_attempt.attempt_id.to_string(),
+            },
+            "controller-a",
+        )
+        .await?;
+    let before_transport_error = store.task(adopted_task_uid).await?;
+    let attempt_before_transport_error = store.task_execution_attempt(adopted_task_uid).await?;
+    task_runtime
+        .fail_next_observation
+        .store(true, Ordering::SeqCst);
+    assert!(
+        reconcile_current(&client, &task_runtime, &store, adopted_task_uid)
+            .await
+            .is_err(),
+        "a transient observation failure must remain retryable"
+    );
+    assert!(!task_runtime.fail_next_observation.load(Ordering::SeqCst));
+    assert_eq!(store.task(adopted_task_uid).await?, before_transport_error);
+    assert_eq!(
+        store.task_execution_attempt(adopted_task_uid).await?,
+        attempt_before_transport_error,
+        "a transport error must not manufacture outcome_unknown or retire the lease"
+    );
     store
         .request_task_finalization(adopted_task_uid, &service, identity.user_id.as_str())
         .await?;
