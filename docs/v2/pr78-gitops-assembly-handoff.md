@@ -71,7 +71,9 @@ kubeconfigs, or local test artifacts belong in GitOps source.
    historical retries remain available.
 3. Verify all legacy writers/controllers are gone. Install and validate the
    deployment-owned catalog and its matching native profiles. The separate
-   execution-binding rollout mode must also be configured deliberately.
+   execution-binding rollout mode, `config.apiserver.executionBindingsMode`,
+   must also be configured deliberately; it defaults to `staged` and is separate
+   from the Task orchestration switch.
 4. In a separate deployment change, set `config.taskOrchestrationMode=active`.
    Do not start new submissions while legacy Task controllers can still observe
    the new rows.

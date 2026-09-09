@@ -38,15 +38,25 @@ explicitly recorded as follow-up rather than represented as fixed.
 
 - Fresh Postgres: all 28 `s4_store` tests passed, including pre-start fencing,
   concurrent runtime ownership, late retirement, and historical migration.
-- Fresh Postgres controller fault-path suite: `task_orchestration` passed again
-  after the approval-port changes (2026-09-09 UTC).
+- Fresh Postgres controller fault-path suite: `task_orchestration` passed on
+  `b482b2f`, including a temporary observation failure that leaves the accepted
+  attempt and Task unchanged (2026-09-09 UTC).
 - Workspace tests, formatting, warning-as-error Clippy, and static quality checks
   passed in `cargo xtask ci`. The pinned G-1 lane then failed during Kind API-server
   startup, before the egress assertion. Run
   `steward-g1-20260909013755-23420` was removed by the harness; full CI is not green.
 - E2E all-target warning-as-error Clippy passed with the real OpenShell
-  cancellation/orphan-process regression added. That regression's runtime result
-  remains pending; compilation is not runtime evidence.
+  cancellation/orphan-process regression added.
+- `cargo xtask e2e-openshell-adapter` passed against OpenShell 0.0.98 in run
+  `pr78-adapter-marker-20260909-0220`: authenticated copy, uncertain cancellation
+  followed by success, and orphaned-wrapper detection without duplicate start.
+  This used `b482b2f` plus a temporary error-only diagnostic, since removed.
+  The harness removed the run-owned cluster and credential directory. Earlier
+  attempts failed at initial transport connection and orphan-marker observation;
+  neither reproduced in the passing run, so intermittent-failure diagnosis
+  remains open rather than being represented as a production fix.
+- `scripts/validate-release-artifacts.sh` passed chart/schema/parity and release
+  helper checks. Its separate `--build-images` lane has not been verified here.
 - Web `bun run check` passed: lint, type-checking, and all 23 tests.
 
 Delivery checklist:
