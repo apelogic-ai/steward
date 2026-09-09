@@ -36,6 +36,18 @@ explicitly recorded as follow-up rather than represented as fixed.
 
 ## Candidate evidence
 
+- Governed-connections run `governed-connections-20260909054712-89781`
+  failed on `a2982d9` after the stack became ready: internal Tasks repeatedly
+  reported an unavailable immutable Envelope and the connection request failed.
+  Run-owned resources were removed. A fresh-Postgres regression reproduced the
+  missing internal-catalog resolution in provisioning; driving the actual API
+  broker additionally exposed manifest hashes built with a Task UID different
+  from the identity persisted by the connection store. The correction resolves
+  and verifies the exact internal authority for creation, activation and
+  unbound cleanup, and hashes the persisted operation/Task identity. Both
+  `task_orchestration` tests pass against fresh Postgres, including tampered-pin
+  rejection and exact-UID cleanup before/after observation. Full governed E2E
+  and full CI on this correction remain pending.
 - Full `cargo xtask ci` passed on `66a6e60` (production/tests `1bb5933`):
   workspace tests, warning-as-error Clippy, static checks and pinned G-1/G-2/G-4/G-5.
   G-1 run `g1-20260909054055-86143` passed in 210.63 seconds after preloading

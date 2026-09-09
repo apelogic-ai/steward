@@ -15,12 +15,21 @@ use kube::{Client, ResourceExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, types::Uuid};
+use steward_admission::internal_authorities::steward_connections_v1;
 use steward_admission::{AdmissionDecision, Envelope, EnvelopeSpec};
+use steward_apiserver::connections::{
+    ConnectionSession, ConnectionSubject, ProviderConnectionBroker,
+};
+use steward_apiserver::governed_connections::{
+    ConnectionExecutionBindings, GovernedConnectionsBroker, GovernedConnectionsConfig,
+};
 use steward_controller::reconcile_task_orchestration_work_item;
 use steward_ports::{
     PortError, SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
 };
-use steward_store::{PgStore, StoreError, TaskOrchestrationState, TaskReservationRequest};
+use steward_store::{
+    PgStore, StoreError, TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest,
+};
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
     CanonicalAuthorityBinding, Duration, Email, ModelRef, OrganizationId,
@@ -101,6 +110,205 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
             reason: "attempt-scoped cancellation is unprovable".to_owned(),
         })
     }
+}
+
+#[tokio::test]
+async fn internal_authority_provisions_and_recovers_cleanup_without_a_service_envelope()
+-> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    assert!(
+        store
+            .latest_service_envelope(steward_connections_v1::SERVICE)
+            .await?
+            .is_none()
+    );
+
+    for finalize_before_observation in [false, true] {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let email = Email(format!("alice-{suffix}@example.com"));
+        let identity = store
+            .register_canonical_identity(
+                &OrganizationIdentityPolicy::new(
+                    "https://accounts.google.com",
+                    "example.com",
+                    OrganizationId::parse("org_example")?,
+                )?
+                .validate(
+                    "https://accounts.google.com",
+                    &suffix,
+                    "example.com",
+                    email.as_str(),
+                    true,
+                )?,
+                "test-bootstrap",
+            )
+            .await?;
+        let config = GovernedConnectionsConfig::new(
+            ConnectionExecutionBindings {
+                artifact_trust_mode: "github-attestation".to_owned(),
+                bridge_image_digest: format!(
+                    "ghcr.io/example-org/bridge@sha256:{}",
+                    "a".repeat(64)
+                ),
+                mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
+                mcp_gw_version: "0.3.2".to_owned(),
+                namespace: "steward-test".to_owned(),
+                runtime_class: "kata-qemu".to_owned(),
+            },
+            "https://steward.example.test",
+        )
+        .map_err(|error| io::Error::other(format!("internal Task config: {error:?}")))?;
+        let broker =
+            GovernedConnectionsBroker::new(store.clone(), config, TaskOrchestrationMode::Active);
+        let session = ConnectionSession {
+            subject: ConnectionSubject {
+                canonical_user_id: identity.user_id.clone(),
+                display_email: email.as_str().to_owned(),
+            },
+            binding: (),
+        };
+        // Drive the actual broker through reservation, then drop its HTTP wait:
+        // the controller must recover entirely from the committed intent.
+        let reserved = tokio::select! {
+            result = broker.status(&session) => {
+                return Err(io::Error::other(format!("broker returned before reconciliation: {result:?}")).into());
+            }
+            result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(work) = store.task_orchestration_work_items().await?
+                        .into_iter()
+                        .find(|work| work.task.owner_user_id.as_deref() == Some(identity.user_id.as_str()))
+                    {
+                        return Ok::<_, StoreError>(work);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }) => result??,
+        };
+        let task_uid = reserved.task.task_uid;
+        assert_eq!(task_uid, reserved.operation.operation_id);
+        assert_eq!(
+            reserved.operation.inert_manifest_digest,
+            manifest_digest(
+                task_uid,
+                reserved.operation.operation_id,
+                &reserved.operation.runtime_name,
+                &inert_spec(
+                    &reserved.task.runtime_spec,
+                    &steward_connections_v1::envelope()
+                ),
+                "inert",
+            )?,
+            "the broker must hash the identity actually persisted by the connection store"
+        );
+        let kubernetes = AmbiguousKubernetes::default();
+        let (client, _server) = kubernetes_client(kubernetes.clone()).await?;
+        let runtime = AmbiguousTaskRuntime::default();
+        reconcile_current(&client, &runtime, &store, task_uid).await?;
+        assert_eq!(
+            operation(&store, task_uid).await?.state,
+            TaskOrchestrationState::RuntimeCreatePending
+        );
+        if finalize_before_observation {
+            store
+                .request_task_finalization(
+                    task_uid,
+                    steward_connections_v1::SERVICE,
+                    identity.user_id.as_str(),
+                )
+                .await?;
+            reconcile_current(&client, &runtime, &store, task_uid).await?;
+            assert_eq!(
+                operation(&store, task_uid).await?.state,
+                TaskOrchestrationState::CleanupPending
+            );
+        }
+
+        // Corrupted internal authority must never fall back to another authority
+        // or produce even an inert external object, including during recovery.
+        for field in 0..8 {
+            let mut work = current_work(&store, task_uid).await?;
+            match field {
+                0 => work.task.internal_authority_id = Some("unknown-authority".to_owned()),
+                1 => work.task.internal_authority_version = Some(999),
+                2 => {
+                    work.task.internal_authority_digest = Some(format!("sha256:{}", "0".repeat(64)))
+                }
+                3 => work.task.service_envelope_digest = Some(format!("sha256:{}", "0".repeat(64))),
+                4 => work.task.envelope_revision = 999,
+                5 => work.task.submitter_service = "other-service".to_owned(),
+                6 => work.task.internal_authority_version = None,
+                _ => {
+                    work.task.internal_authority_id = None;
+                    work.task.internal_authority_version = None;
+                    work.task.internal_authority_digest = None;
+                }
+            }
+            assert!(
+                reconcile_task_orchestration_work_item(&client, &runtime, &store, &work)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(kubernetes.create_calls.load(Ordering::SeqCst), 0);
+        }
+        reconcile_current(&client, &runtime, &store, task_uid).await?;
+        let observed = operation(&store, task_uid).await?;
+        assert_eq!(observed.runtime_uid.as_deref(), Some("runtime-uid-a"));
+        let created = kubernetes
+            .created
+            .lock()
+            .map_err(|_| io::Error::other("fixture poisoned"))?
+            .clone();
+        assert_eq!(created.len(), 1);
+        assert!(created[0].spec.llms.is_empty() && created[0].spec.tools.is_empty());
+        if !finalize_before_observation {
+            assert_eq!(observed.state, TaskOrchestrationState::RuntimeObserved);
+            reconcile_current(&client, &runtime, &store, task_uid).await?;
+            assert_eq!(
+                operation(&store, task_uid).await?.state,
+                TaskOrchestrationState::ActivationPending
+            );
+            store
+                .request_task_finalization(
+                    task_uid,
+                    steward_connections_v1::SERVICE,
+                    identity.user_id.as_str(),
+                )
+                .await?;
+        }
+        for _ in 0..4 {
+            if operation(&store, task_uid).await?.state == TaskOrchestrationState::Finalized {
+                break;
+            }
+            reconcile_current(&client, &runtime, &store, task_uid).await?;
+        }
+        assert_eq!(
+            operation(&store, task_uid).await?.state,
+            TaskOrchestrationState::Finalized
+        );
+        assert!(
+            kubernetes
+                .runtime
+                .lock()
+                .map_err(|_| io::Error::other("fixture poisoned"))?
+                .is_none()
+        );
+        assert_eq!(
+            *kubernetes
+                .delete_preconditions
+                .lock()
+                .map_err(|_| io::Error::other("fixture poisoned"))?,
+            vec!["runtime-uid-a".to_owned()]
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]

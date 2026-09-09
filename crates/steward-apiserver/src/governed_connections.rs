@@ -291,7 +291,9 @@ impl<B> GovernedConnectionsBroker<B> {
         let service_envelope = steward_connections_v1::envelope();
         let admission = evaluate(&plan.spec, &service_envelope)
             .map_err(|_| ConnectionBrokerError::Unavailable)?;
-        let task_uid = Uuid::new_v4();
+        // Connection reservations use one identity for the operation and its Task.
+        // Manifest digests must describe the identity the store actually persists.
+        let task_uid = operation_id;
         let orchestration = super::tasks::task_orchestration_reservation(
             task_uid,
             operation_id,

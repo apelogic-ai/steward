@@ -963,19 +963,8 @@ async fn task_authority_snapshot(
     authority: &PgStore,
     task: &TaskRecord,
 ) -> Result<(Envelope, String), TaskControllerError> {
-    if task.internal_authority_id.as_deref() == Some(steward_connections_v1::SERVICE)
-        && task.internal_authority_version == Some(steward_connections_v1::AUTHORITY_VERSION)
-        && task.internal_authority_digest.as_deref()
-            == Some(steward_connections_v1::AUTHORITY_DIGEST)
-    {
-        return Ok((
-            steward_connections_v1::envelope(),
-            task.service_envelope_digest.clone().ok_or_else(|| {
-                TaskControllerError::InvalidState(
-                    "internal Task has no authority-envelope digest".to_owned(),
-                )
-            })?,
-        ));
+    if let Some(snapshot) = internal_task_authority_snapshot(task)? {
+        return Ok(snapshot);
     }
     let envelope = authority
         .latest_service_envelope(&task.submitter_service)
@@ -990,6 +979,55 @@ async fn task_authority_snapshot(
         ))
     })?);
     Ok((envelope, digest))
+}
+
+fn internal_task_authority_snapshot(
+    task: &TaskRecord,
+) -> Result<Option<(Envelope, String)>, TaskControllerError> {
+    if task.internal_authority_id.is_none()
+        && task.internal_authority_version.is_none()
+        && task.internal_authority_digest.is_none()
+        && task.submitter_service != steward_connections_v1::SERVICE
+    {
+        return Ok(None);
+    }
+    let envelope = steward_connections_v1::envelope();
+    let digest = bytes_digest(&serde_json::to_vec(&envelope).map_err(|error| {
+        TaskControllerError::InvalidState(format!(
+            "internal Task Envelope cannot be digested: {error}"
+        ))
+    })?);
+    if task.submitter_service != steward_connections_v1::SERVICE
+        || task.internal_authority_id.as_deref() != Some(steward_connections_v1::SERVICE)
+        || task.internal_authority_version != Some(steward_connections_v1::AUTHORITY_VERSION)
+        || task.internal_authority_digest.as_deref()
+            != Some(steward_connections_v1::AUTHORITY_DIGEST)
+        || task.envelope_revision != envelope.revision
+        || task.service_envelope_digest.as_deref() != Some(digest.as_str())
+    {
+        return Err(TaskControllerError::InvalidState(
+            "Task's immutable internal authority does not match the installed catalog".to_owned(),
+        ));
+    }
+    Ok(Some((envelope, digest)))
+}
+
+async fn task_immutable_envelope(
+    authority: &PgStore,
+    task: &TaskRecord,
+) -> Result<Envelope, TaskControllerError> {
+    if let Some((envelope, _)) = internal_task_authority_snapshot(task)? {
+        return Ok(envelope);
+    }
+    authority
+        .service_envelope_revision(&task.submitter_service, task.envelope_revision)
+        .await
+        .map_err(TaskControllerError::Store)?
+        .ok_or_else(|| {
+            TaskControllerError::InvalidState(
+                "Task's immutable Envelope revision is unavailable".to_owned(),
+            )
+        })
 }
 
 async fn reconcile_task_execution<R: SandboxTaskRuntime>(
@@ -1344,15 +1382,7 @@ async fn reconcile_runtime_creation(
     authority: &PgStore,
     work: &TaskOrchestrationWorkItem,
 ) -> Result<(), TaskControllerError> {
-    let envelope = authority
-        .service_envelope_revision(&work.task.submitter_service, work.task.envelope_revision)
-        .await
-        .map_err(TaskControllerError::Store)?
-        .ok_or_else(|| {
-            TaskControllerError::InvalidState(
-                "Task's immutable Envelope revision is unavailable".to_owned(),
-            )
-        })?;
+    let envelope = task_immutable_envelope(authority, &work.task).await?;
     let expected = orchestrated_task_runtime_manifest(work, Some(&envelope), false)?;
     let api = Api::<AgentRuntime>::namespaced(client.clone(), &work.operation.runtime_namespace);
     match api.create(&PostParams::default(), &expected).await {
@@ -1630,15 +1660,7 @@ async fn reconcile_runtime_cleanup(
             .map(|_| ())
             .map_err(TaskControllerError::Store);
     }
-    let envelope = authority
-        .service_envelope_revision(&work.task.submitter_service, work.task.envelope_revision)
-        .await
-        .map_err(TaskControllerError::Store)?
-        .ok_or_else(|| {
-            TaskControllerError::InvalidState(
-                "Task's immutable Envelope revision is unavailable during cleanup".to_owned(),
-            )
-        })?;
+    let envelope = task_immutable_envelope(authority, &work.task).await?;
     let expected = orchestrated_task_runtime_manifest(work, Some(&envelope), false)?;
     if let Some(runtime) = observed.as_ref() {
         if runtime_matches_orchestration(runtime, &expected, work, "inert") {
