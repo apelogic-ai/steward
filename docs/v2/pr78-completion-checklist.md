@@ -7,10 +7,11 @@ Architecture: [Task-runtime orchestration](../task-runtime-orchestration.md), pa
 the completion transition matrix. Compatibility correction:
 [legacy adopted runtimes](legacy-adopted-runtime-orchestration-correction-ticket.md).
 
-Delivery priority (maintainer direction, 2026-09-08): deliver a P1-free candidate
-first. Standalone P2 follow-up must not delay it. Retain already implemented fixes
-that support P1 safety; do not expand approval-delivery or compatibility work beyond
-what is necessary to validate the candidate. Existing mandatory gates remain required.
+Delivery cutoff (maintainer direction, 2026-09-08): fix demonstrated V2 demo
+blockers; document other review findings in PR #78 rather than expanding this
+slice. Retain already implemented safety fixes. Existing mandatory gates remain
+required. Prepare the [GitOps assembly handoff](pr78-gitops-assembly-handoff.md)
+with the exact pushed source revision and honest validation status.
 
 `Unresolved` includes implementation awaiting required evidence. A green focused test is
 not a substitute for the real-stack exit criterion. P2 residual concerns must be
@@ -46,6 +47,7 @@ explicitly recorded as follow-up rather than represented as fixed.
 - E2E all-target warning-as-error Clippy passed with the real OpenShell
   cancellation/orphan-process regression added. That regression's runtime result
   remains pending; compilation is not runtime evidence.
+- Web `bun run check` passed: lint, type-checking, and all 23 tests.
 
 Delivery checklist:
 
@@ -54,6 +56,6 @@ Delivery checklist:
 - [ ] `cargo xtask ci` and all affected required integration/E2E lanes, serially.
 - [ ] Pinned OpenShell process-liveness, cancellation uncertainty, and quarantine evidence.
 - [ ] Run-owned infrastructure and credentials cleaned up; exact tested revision recorded.
-- [ ] Protocol review has no unresolved P1 finding; residual P2 follow-up is explicit.
+- [ ] Demo-focused review has no unresolved demo blocker; other findings are explicit PR follow-up.
 - [ ] Reviewable commits, accurate PR description, announced push to PR #78 branch.
 - [ ] Human merge remains outside agent authority.
