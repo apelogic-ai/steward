@@ -18,6 +18,7 @@ use steward_apiserver::{
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
+    TaskOrchestrationMode,
 };
 use steward_types::{CanonicalUserId, OrganizationId};
 use tokio::net::{TcpListener, TcpStream};
@@ -50,6 +51,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => {}
     }
     let client = kube::Client::try_default().await?;
+    let task_orchestration_mode = task_orchestration_mode()?;
     let store = PgStore::connect(&required("STEWARD_DATABASE_URL")?).await?;
     store.migrate().await?;
     tokio::spawn(
@@ -116,6 +118,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         runtimes.clone(),
         decisions.clone(),
         workflow_agents,
+        task_orchestration_mode,
     )?;
     let app = router(
         runtimes.clone(),
@@ -127,7 +130,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         store.clone(),
         task_identities,
         task_workflows,
-        task_api_config,
+        task_api_config
+            .with_task_orchestration_mode(task_orchestration_mode)
+            .with_legacy_runtime_resolver(runtimes.clone()),
     ));
     let app = match browser {
         Some(browser) => app.merge(browser),
@@ -280,6 +285,7 @@ fn browser_application_router(
     runtimes: KubeRuntimeRepository,
     decisions: JiraAdapter,
     workflow_agents: Vec<steward_apiserver::ExecutionBindingAdvertisement>,
+    task_orchestration_mode: TaskOrchestrationMode,
 ) -> Result<Option<axum::Router>, Box<dyn Error>> {
     let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
         return Ok(None);
@@ -304,7 +310,8 @@ fn browser_application_router(
         Arc::new(browser_auth::PgBrowserIdentityResolver::new(store.clone())),
     )
     .map_err(io::Error::other)?;
-    let connections = governed_connections_configuration(&origin, store.clone())?;
+    let connections =
+        governed_connections_configuration(&origin, store.clone(), task_orchestration_mode)?;
     let app = browser_auth::browser_auth_router(auth.clone())
         .merge(user_envelopes::protected_router(
             user_envelopes::PgEnvelopeRequestBroker::new(store.clone()),
@@ -341,6 +348,7 @@ type GovernedConnectionsBroker =
 fn governed_connections_configuration(
     browser_origin: &str,
     store: PgStore,
+    task_orchestration_mode: TaskOrchestrationMode,
 ) -> Result<Option<GovernedConnectionsBroker>, io::Error> {
     let artifact_trust_mode = env::var("STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE").ok();
     let values = [
@@ -379,8 +387,16 @@ fn governed_connections_configuration(
     )
     .map_err(|_| io::Error::other("governed Connections configuration is invalid"))?;
     Ok(Some(governed_connections::GovernedConnectionsBroker::new(
-        store, config,
+        store,
+        config,
+        task_orchestration_mode,
     )))
+}
+
+fn task_orchestration_mode() -> Result<TaskOrchestrationMode, io::Error> {
+    let value = required("STEWARD_TASK_ORCHESTRATION_MODE")?;
+    TaskOrchestrationMode::parse(&value)
+        .map_err(|_| io::Error::other("STEWARD_TASK_ORCHESTRATION_MODE must be staged or active"))
 }
 
 fn stable_bridge_configuration()

@@ -48,15 +48,20 @@ The architecture is implemented by these internal boundaries:
   operation, execution-attempt, external-effect outbox, and orchestration-journal
   records and fences old lifecycle writers;
 - `steward-store` owns locked, generation-checked transitions and revalidates current
-  authority in the activation and execution-start transactions;
+  authority during activation, while active, and in execution-start transactions;
 - `steward-apiserver` records immutable Task intent and monotonic commands only;
+- one shared staged/active deployment value rejects new Task intent and keeps the new
+  Task owner and approval dispatcher stopped until every legacy writer has drained;
 - the Task reconciler in `steward-controller` owns inert creation, exact UID
   observation, admission materialization, activation, execution, and cleanup;
 - the controller's approval dispatcher drains durable outbox records through the
   `DecisionChannel` port using the approval UUID as the stable delivery identity;
 - `SandboxTaskRuntime` exposes attempt-scoped start, observation, and cancellation;
-  the OpenShell adapter persists attempt markers and fails closed on an ambiguous
-  outcome instead of replaying it; and
+  the OpenShell adapter persists process-identity-bearing attempt markers, proves
+  running-process liveness, and fails closed on an ambiguous outcome instead of
+  replaying it;
+- cleanup atomically retires pending approval delivery, pending approvals, and active
+  grants before it records Task-owned projections absent; and
 - `TaskExecutionAdapter` keeps agent-specific command generation out of core. The
   Codex implementation lives in `adapters/codex`, while deployment-selected images,
   executables, versions, profiles, and network endpoints remain configuration.
@@ -71,8 +76,9 @@ remains the conformance proof for the real external components.
 This design covers:
 
 - disposable Task-owned `AgentRuntime` creation and teardown;
-- the exact-identity and cleanup boundary for adopted or resident runtimes, while their
-  dispatch wire protocol remains deferred;
+- the frozen legacy adapter's exact-UID adopted-runtime path and the exact-identity and
+  cleanup boundary for resident runtimes, while the resident dispatch wire protocol
+  remains deferred;
 - baseline admission and approval-backed admission;
 - exact runtime-UID-bound grants;
 - immutable execution bindings;
@@ -352,6 +358,15 @@ deployment/instance binding supplies a server-resolved runtime identity, and the
 orchestrator independently observes the exact UID and matching owner before recording
 `runtime_observed`. A public M1 caller never supplies or selects this UID.
 
+The frozen legacy v0.2 adapter is the narrow compatibility exception. Its request may
+carry `agentRuntimeUid`; the API resolves that exact reference read-only to immutable
+namespace, name, spec, owner, and expected UID inputs, then records intent with no bound
+UID. The reference is not evidence of observation and authorizes no runtime write. The
+reconciler independently observes that exact UID before activation, and activation of
+an adopted runtime records readiness without applying a Task-owned manifest. The M1
+contract remains server-owned, and the legacy exception expires at the already-frozen
+v0.3 removal boundary.
+
 The Task may proceed only if the resident runtime's immutable binding, current standing
 authority ceiling, canonical owner, and operational readiness all match. Task-specific
 approval, if supported by the eventual resident dispatch contract, still binds to that
@@ -440,10 +455,25 @@ whose stable idempotency identity is the approval UUID. Delivery records may mov
 `pending` to `claimed` to `delivered`, with retry metadata. They never create another
 approval.
 
-The dispatcher supplies the stable approval identity to adapters that support
-idempotency. An adapter without native idempotency must recover by querying a
-Steward-authored correlation marker before creating anything. If neither behavior is
-possible, the adapter cannot be used for authoritative approval delivery.
+Before the first request, the dispatcher persists an immutable `delivery_invoked_at`
+under the Task lock and the current claim generation. Cancellation winning that lock
+prevents invocation. After invocation, every successor calls only
+`DecisionChannel::observe_request` with the same approval UUID; a reclaimed scheduling
+lease never authorizes another create. Transport failure and an empty search result
+are ambiguous, not evidence that an earlier request cannot arrive.
+
+Jira observation searches the Steward-authored correlation marker without creating an
+issue. Its non-atomic search-then-create API is not itself an idempotency guarantee.
+A late issue can be recorded by a later generation, after which cleanup retires the
+Task-owned approval authority. Until that reference is observed, invoked delivery
+remains explicitly unresolved and blocks finalization, including when the Task asks
+for cancellation. No worker may silently clear the invocation fence to regain progress.
+
+If a worker dies after recording invocation but before issuing the call, or the channel
+can never recover a reference, automatic recovery cannot distinguish that from a late
+external create. This is a quarantined external effect requiring operator investigation
+of the original request, not permission to replay or claim projection absence. Adapters
+without read-only request observation fail closed and cannot provide unattended recovery.
 
 An HTTP submission retry does not file or re-file an approval. It returns the same Task
 and current projected state while the reconciler/outbox completes independently.
@@ -512,13 +542,38 @@ manifest generation differs, or authority revalidation fails.
 
 The public Task remains the single execution atom. Internally, Steward records one
 non-public execution attempt so crash recovery does not turn an ambiguous call into a
-second execution.
+second execution. An exact runtime UID may have only one **unretired** execution attempt
+across all Tasks. This database-enforced execution lease prevents concurrent Tasks that
+adopt the same runtime from sharing mutable staging and output paths. Task outcome and
+execution retirement are separate facts: a terminal `outcome_unknown` does not permit
+runtime reuse, even after Task finalization or controller restart.
+
+### Completion transition matrix
+
+| Situation | Locked transition and required evidence | Progress or quarantine condition |
+|---|---|---|
+| Claim exists, start never authorized | Record `not_started` with no start timestamp or adapter acknowledgement; fence the attempt generation atomically with cleanup | Release only on the durable proof that start was never authorized |
+| Start authorized, result unresolved | Retain the exact attempt/runtime lease while observing or cancelling; never authorize a second start | Retry transient observation errors; a deadline may establish an unknown outcome, not execution absence |
+| Terminal result observed | Preserve the Task result; separately record exact-attempt execution retirement evidence | Reuse only after retirement, not merely because a Task phase is terminal |
+| `outcome_unknown` recorded | Preserve immutable outcome and runtime quarantine independently of Task finalization | A late exact-attempt terminal observation may retire execution without rewriting Task history |
+| Shared runtime temporarily unready | Validate identity and current authority independently from readiness | Wait for readiness; fail only on identity drift or inactive authority |
+| Cleanup requested before/after start | The same transaction fences an unstarted attempt or requests cancellation of an authorized one | No finalized Task may leave a live ordinary execution claim; unknown execution remains explicitly quarantined |
+| Historical finalized Task retried | Version-1 retries compare with the historical stored UID; version-2 retries require their immutable operation identity | Return the existing result without manufacturing an operation or rewriting finalized history |
+| Concurrent identical reservation | Lookup, conflict, and `inserted: false` share retry validation and response semantics | Exactly one new reservation; the M1 losing retry returns 200 |
+
+Quarantine is not a cancellation acknowledgement. A missing CR, missing status references,
+missing marker, stale heartbeat, elapsed deadline, or same-name replacement does not prove
+that the original sandbox process stopped. Where the adapter cannot recover exact-attempt
+terminal evidence, the supported recovery is to retire the original execution environment
+through its owner and use a newly resolved runtime UID. Steward must not clear the old UID's
+quarantine merely to make that runtime reusable. This procedure does not authorize Steward
+to delete an adopted runtime or an operator to relabel the replacement with the old UID.
 
 The attempt record contains:
 
 - a server-authored attempt UUID unique per Task;
 - exact Task UID, runtime UID, active manifest digest, command digest, and input digest;
-- `start_pending`, `running`, `succeeded`, `failed`, `cancel_pending`, or
+- `start_pending`, `not_started`, `running`, `succeeded`, `failed`, `cancel_pending`, or
   `outcome_unknown` state;
 - adapter observation identity and bounded retry metadata; and
 - result digest/reference when available, never credentials.
@@ -530,14 +585,15 @@ Execution proceeds as follows:
 2. Invoke the adapter with the attempt UUID as an idempotency key.
 3. Observe the same attempt by UUID. A response alone is not durable proof.
 4. Commit `running` only from adapter acknowledgement for that UUID.
-5. Commit terminal result and Task phase together, then enter cleanup when requested by
-   the active contract.
+5. Commit a terminal failure, Task phase, finalization command, and `cleanup_pending`
+   together. A successful result commits the terminal Task phase and remains available
+   for the caller's explicit finalization command.
 
 The runtime adapter contract must provide idempotent start and observation by attempt
 UUID, including durable result retrieval after controller restart. If the underlying
 runtime cannot provide this, Steward must not retry an ambiguous start. It records
-`outcome_unknown`, disables authority, and cleans up. A deliberate rerun is a new Task
-UID under the public contract.
+`outcome_unknown`, disables Task-owned authority, and cleans up while retaining the runtime
+quarantine. A deliberate rerun is a new Task UID and cannot reuse an unretired runtime UID.
 
 The vendor-neutral execution port therefore needs separate operations equivalent to:
 
@@ -658,8 +714,9 @@ public Run resource.
 
 Use an outbox for approval filing and any other external notification that cannot be
 derived solely by reconciling Kubernetes desired state. The business transaction and
-outbox insert commit together. Delivery is at least once by stable effect UUID;
-external creation must be idempotent by that UUID.
+outbox insert commit together. Observation retries use a stable effect UUID. External
+creation is invoked at most once unless the port has a proven native idempotency
+guarantee; a lease expiry or failed lookup never supplies that guarantee.
 
 ### Journal
 

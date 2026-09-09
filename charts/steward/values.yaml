@@ -68,6 +68,9 @@ tls:
     name: cluster-issuer
     kind: ClusterIssuer
 config:
+  # First deploy the new binaries with staged ownership. Switch to active only after every
+  # legacy controller replica is gone; the same value gates Task intent writers and owner loops.
+  taskOrchestrationMode: staged
   apiserver:
     jiraBaseUrl: https://jira.example.com
     jiraProjectKey: PROJ

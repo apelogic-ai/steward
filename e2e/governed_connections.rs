@@ -187,8 +187,14 @@ impl Harness {
         let runtime = self.runtime.clone();
         let store = self.store.clone();
         self.controller = Some(tokio::spawn(async move {
-            steward_controller::run_controller_with_planes(client, runtime, NoInference, store)
-                .await;
+            steward_controller::run_controller_with_planes(
+                client,
+                runtime,
+                NoInference,
+                store,
+                steward_store::TaskOrchestrationMode::Active,
+            )
+            .await;
         }));
     }
 
@@ -239,7 +245,11 @@ impl Harness {
             "https://steward.example.test",
         )
         .map_err(|error| io::Error::other(format!("build governed broker: {error:?}")))?;
-        Ok(GovernedConnectionsBroker::new(self.store.clone(), config))
+        Ok(GovernedConnectionsBroker::new(
+            self.store.clone(),
+            config,
+            steward_store::TaskOrchestrationMode::Active,
+        ))
     }
 
     fn broker(&self) -> Result<GovernedConnectionsBroker<()>, Box<dyn Error>> {

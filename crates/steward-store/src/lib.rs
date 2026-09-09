@@ -15,6 +15,26 @@ use steward_types::{
 };
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskOrchestrationMode {
+    Staged,
+    Active,
+}
+
+impl TaskOrchestrationMode {
+    pub fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "staged" => Ok(Self::Staged),
+            "active" => Ok(Self::Active),
+            _ => Err(StoreError::InvalidTaskTransition),
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        self == Self::Active
+    }
+}
+
 #[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
@@ -2334,7 +2354,8 @@ impl PgStore {
                 admission_decisions.member_role, \
                 admission_decisions.envelope_rev, \
                 admission_decisions.runtime_namespace, \
-                admission_decisions.runtime_name \
+                admission_decisions.runtime_name, \
+                admission_decisions.orchestration_operation_id \
              FROM approvals \
              JOIN admission_decisions \
                ON admission_decisions.id = approvals.admission_decision_id \
@@ -2372,6 +2393,9 @@ impl PgStore {
             envelope_revision: row.try_get("envelope_rev").map_err(database_error)?,
             runtime_namespace: row.try_get("runtime_namespace").map_err(database_error)?,
             runtime_name: row.try_get("runtime_name").map_err(database_error)?,
+            orchestration_operation_id: row
+                .try_get("orchestration_operation_id")
+                .map_err(database_error)?,
         })
     }
 
@@ -3097,6 +3121,19 @@ impl PgStore {
         Ok(work)
     }
 
+    pub async fn task_execution_holds_runtime_lease(
+        &self,
+        attempt_id: Uuid,
+    ) -> Result<bool, StoreError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM task_runtime_execution_leases WHERE attempt_id = $1)",
+        )
+        .bind(attempt_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
     pub async fn claim_approval_delivery(
         &self,
         worker: &str,
@@ -3138,6 +3175,7 @@ impl PgStore {
         let row = sqlx::query(
             "SELECT effects.id, effects.task_uid, effects.operation_id, effects.approval_id, \
                     effects.generation, effects.idempotency_key, approvals.runtime_uid, \
+                    effects.delivery_invoked_at IS NOT NULL AS delivery_invoked, \
                     decisions.actor, decisions.member_role, decisions.deltas \
              FROM external_effect_outbox effects \
              JOIN approvals ON approvals.id = effects.approval_id \
@@ -3158,6 +3196,7 @@ impl PgStore {
             operation_id: row.try_get("operation_id").map_err(database_error)?,
             approval_id: row.try_get("approval_id").map_err(database_error)?,
             generation: row.try_get("generation").map_err(database_error)?,
+            delivery_invoked: row.try_get("delivery_invoked").map_err(database_error)?,
             idempotency_key: row.try_get("idempotency_key").map_err(database_error)?,
             runtime_uid: row.try_get("runtime_uid").map_err(database_error)?,
             actor: row.try_get("actor").map_err(database_error)?,
@@ -3169,6 +3208,35 @@ impl PgStore {
         };
         transaction.commit().await.map_err(database_error)?;
         Ok(Some(work))
+    }
+
+    pub async fn authorize_approval_delivery_invocation(
+        &self,
+        work: &ApprovalDeliveryWorkItem,
+        worker: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let task = task_in_transaction_for_update(&mut transaction, work.task_uid).await?;
+        if task.finalized || task.finalize_requested || task.cancel_requested {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(None);
+        }
+        let generation = sqlx::query_scalar(
+            "UPDATE external_effect_outbox SET delivery_invoked_at = now(), \
+                 generation = generation + 1, updated_at = now() \
+             WHERE id = $1 AND task_uid = $2 AND generation = $3 \
+               AND state = 'claimed' AND claimed_by = $4 AND claimed_until > now() \
+               AND delivery_invoked_at IS NULL RETURNING generation",
+        )
+        .bind(work.effect_id)
+        .bind(work.task_uid)
+        .bind(work.generation)
+        .bind(worker)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(generation)
     }
 
     pub async fn complete_approval_delivery(
@@ -3787,6 +3855,9 @@ impl PgStore {
         if current.state == TaskOrchestrationState::Finalized
             || current.state == TaskOrchestrationState::CleanupPending
         {
+            if current.state == TaskOrchestrationState::CleanupPending {
+                fence_task_execution_for_cleanup(&mut transaction, task_uid).await?;
+            }
             transaction.commit().await.map_err(database_error)?;
             return Ok(TaskOperationTransition::AlreadyApplied(current));
         }
@@ -3794,6 +3865,7 @@ impl PgStore {
             transaction.commit().await.map_err(database_error)?;
             return Ok(TaskOperationTransition::Superseded(current));
         }
+        fence_task_execution_for_cleanup(&mut transaction, task_uid).await?;
         let updated = sqlx::query(
             "UPDATE task_runtime_operations \
              SET state = 'cleanup_pending', generation = generation + 1, \
@@ -3980,6 +4052,88 @@ impl PgStore {
         Ok(TaskOperationTransition::Applied(current))
     }
 
+    pub async fn revalidate_active_task_authority(
+        &self,
+        task_uid: Uuid,
+        expected_generation: i64,
+        actor: &str,
+    ) -> Result<TaskOperationTransition, StoreError> {
+        if expected_generation <= 0 || actor.is_empty() {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let _task = task_in_transaction_for_update(&mut transaction, task_uid).await?;
+        let current =
+            task_runtime_operation_in_transaction_for_update(&mut transaction, task_uid).await?;
+        if current.generation != expected_generation
+            || current.state != TaskOrchestrationState::Active
+        {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(TaskOperationTransition::Superseded(current));
+        }
+        let (task, authority) = self
+            .effective_task_authority(&mut transaction, task_uid, current.runtime_uid.as_deref())
+            .await?;
+        if operation_authority_is_current(&authority, &current)
+            && !task.finalize_requested
+            && !task.cancel_requested
+        {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(TaskOperationTransition::AlreadyApplied(current));
+        }
+        fence_task_execution_for_cleanup(&mut transaction, task_uid).await?;
+        let updated = sqlx::query(
+            "UPDATE task_runtime_operations \
+             SET state = 'cleanup_pending', generation = generation + 1, \
+                 cleanup_requested_at = now(), last_error_code = 'authority_inactive', \
+                 retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = now() \
+             WHERE task_uid = $1 AND generation = $2 AND state = 'active'",
+        )
+        .bind(task_uid)
+        .bind(expected_generation)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .rows_affected();
+        if updated != 1 {
+            let current = task_runtime_operation_in_transaction(&mut transaction, task_uid).await?;
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(TaskOperationTransition::Superseded(current));
+        }
+        sqlx::query(
+            "UPDATE task_submissions \
+             SET phase = CASE \
+                     WHEN phase IN ('succeeded', 'failed', 'cancelled') THEN phase \
+                     WHEN cancel_requested OR finalize_requested THEN 'cancelled' \
+                     ELSE 'failed' END, \
+                 finalize_requested = true, \
+                 failure_reason = CASE \
+                     WHEN phase IN ('succeeded', 'failed', 'cancelled') \
+                         OR cancel_requested OR finalize_requested THEN failure_reason \
+                     ELSE COALESCE(failure_reason, 'admission_authority_inactive') END, \
+                 updated_at = now() WHERE task_uid = $1 AND NOT finalized",
+        )
+        .bind(task_uid)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        append_task_orchestration_journal(
+            &mut transaction,
+            task_uid,
+            expected_generation + 1,
+            TaskOrchestrationState::CleanupPending,
+            "active_authority_inactive",
+            actor,
+        )
+        .await?;
+        let current = task_runtime_operation_in_transaction(&mut transaction, task_uid).await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(TaskOperationTransition::AuthorityInactive {
+            current,
+            reason: "admission_authority_inactive",
+        })
+    }
+
     pub async fn authorize_task_activation_from_approval(
         &self,
         task_uid: Uuid,
@@ -4128,13 +4282,34 @@ impl PgStore {
             transaction.commit().await.map_err(database_error)?;
             return Ok(TaskOperationTransition::Superseded(current));
         }
+        fence_task_execution_for_cleanup(&mut transaction, task_uid).await?;
+        if let Some(attempt) =
+            task_execution_attempt_for_task_in_transaction(&mut transaction, task_uid, true).await?
+            && !attempt.state.is_terminal()
+        {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(TaskOperationTransition::InvariantViolation {
+                current,
+                reason: "execution_cleanup_pending",
+            });
+        }
+        if !retire_task_authority_for_cleanup(
+            &mut transaction,
+            task_uid,
+            current.operation_id,
+            actor,
+        )
+        .await?
+        {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(TaskOperationTransition::InvariantViolation {
+                current,
+                reason: "approval_authority_cleanup_pending",
+            });
+        }
         let cleanup_is_complete = match (current.runtime_uid.as_ref(), current.runtime_ownership) {
-            (Some(_), TaskRuntimeOwnership::Provisioned) => {
-                observation.exact_runtime_absent && observation.owned_projections_absent
-            }
-            (Some(_), TaskRuntimeOwnership::Adopted | TaskRuntimeOwnership::Resident) => {
-                observation.owned_projections_absent
-            }
+            (Some(_), TaskRuntimeOwnership::Provisioned) => observation.exact_runtime_absent,
+            (Some(_), TaskRuntimeOwnership::Adopted | TaskRuntimeOwnership::Resident) => true,
             (None, _) => current.runtime_create_authorized_at.is_none(),
         };
         if !cleanup_is_complete {
@@ -4156,7 +4331,7 @@ impl PgStore {
         .bind(task_uid)
         .bind(expected_generation)
         .bind(observation.exact_runtime_absent)
-        .bind(observation.owned_projections_absent)
+        .bind(true)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?
@@ -4299,25 +4474,7 @@ impl PgStore {
             .await?;
         let authority_is_current = operation_authority_is_current(&authority, &operation);
         if !authority_is_current {
-            if let Some(existing) = existing.as_ref()
-                && matches!(
-                    existing.state,
-                    TaskExecutionAttemptState::StartPending | TaskExecutionAttemptState::Running
-                )
-            {
-                sqlx::query(
-                    "UPDATE task_execution_attempts \
-                     SET state = 'cancel_pending', generation = generation + 1, \
-                         updated_at = now() \
-                     WHERE attempt_id = $1 AND generation = $2 AND state = $3",
-                )
-                .bind(existing.attempt_id)
-                .bind(existing.generation)
-                .bind(existing.state.as_str())
-                .execute(&mut *transaction)
-                .await
-                .map_err(database_error)?;
-            }
+            fence_task_execution_for_cleanup(&mut transaction, task_uid).await?;
             sqlx::query(
                 "UPDATE task_runtime_operations \
                  SET state = 'cleanup_pending', generation = generation + 1, \
@@ -4349,6 +4506,9 @@ impl PgStore {
                 actor,
             )
             .await?;
+            let existing =
+                task_execution_attempt_for_task_in_transaction(&mut transaction, task_uid, false)
+                    .await?;
             transaction.commit().await.map_err(database_error)?;
             return Ok(TaskExecutionTransition::AuthorityInactive {
                 attempt: existing,
@@ -4372,6 +4532,30 @@ impl PgStore {
             });
         }
         let attempt_id = Uuid::new_v4();
+        let inserted = sqlx::query(
+            "INSERT INTO task_runtime_execution_leases (runtime_uid, attempt_id) \
+             VALUES ($1, $2) ON CONFLICT (runtime_uid) DO NOTHING",
+        )
+        .bind(runtime_uid)
+        .bind(attempt_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .rows_affected();
+        if inserted == 0 {
+            let lease_holder = sqlx::query(TASK_EXECUTION_ATTEMPT_SELECT_ACTIVE_BY_RUNTIME)
+                .bind(runtime_uid)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(database_error)?
+                .map(task_execution_attempt_record)
+                .transpose()?;
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(TaskExecutionTransition::InvariantViolation {
+                attempt: lease_holder,
+                reason: "runtime_execution_lease_held",
+            });
+        }
         sqlx::query(
             "INSERT INTO task_execution_attempts \
              (attempt_id, task_uid, operation_id, runtime_uid, active_manifest_digest, \
@@ -4423,7 +4607,10 @@ impl PgStore {
         let current = task_execution_attempt_in_transaction(&mut transaction, attempt_id, true)
             .await?
             .ok_or(StoreError::TaskNotFound)?;
-        if current.generation != expected_generation || current.start_invoked_at.is_some() {
+        if current.generation != expected_generation
+            || current.start_invoked_at.is_some()
+            || current.state != TaskExecutionAttemptState::StartPending
+        {
             transaction.commit().await.map_err(database_error)?;
             return Ok(TaskExecutionTransition::Superseded(current));
         }
@@ -4451,6 +4638,7 @@ impl PgStore {
             .await?;
         let authority_is_current = operation_authority_is_current(&authority, &operation);
         if !authority_is_current {
+            fence_task_execution_for_cleanup(&mut transaction, initial.task_uid).await?;
             sqlx::query(
                 "UPDATE task_runtime_operations \
                  SET state = 'cleanup_pending', generation = generation + 1, \
@@ -4482,6 +4670,10 @@ impl PgStore {
                 actor,
             )
             .await?;
+            let current =
+                task_execution_attempt_in_transaction(&mut transaction, attempt_id, false)
+                    .await?
+                    .ok_or(StoreError::TaskNotFound)?;
             transaction.commit().await.map_err(database_error)?;
             return Ok(TaskExecutionTransition::AuthorityInactive {
                 attempt: Some(current),
@@ -4539,20 +4731,17 @@ impl PgStore {
         let current = task_execution_attempt_in_transaction(&mut transaction, attempt_id, true)
             .await?
             .ok_or(StoreError::TaskNotFound)?;
+        if current.state.is_terminal() {
+            if current.state == TaskExecutionAttemptState::OutcomeUnknown {
+                record_terminal_execution_retirement(&mut transaction, &current, observation)
+                    .await?;
+            }
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(TaskExecutionTransition::AlreadyApplied(current));
+        }
         if current.generation != expected_generation {
             transaction.commit().await.map_err(database_error)?;
-            return Ok(
-                if matches!(
-                    current.state,
-                    TaskExecutionAttemptState::Succeeded
-                        | TaskExecutionAttemptState::Failed
-                        | TaskExecutionAttemptState::OutcomeUnknown
-                ) {
-                    TaskExecutionTransition::AlreadyApplied(current)
-                } else {
-                    TaskExecutionTransition::Superseded(current)
-                },
-            );
+            return Ok(TaskExecutionTransition::Superseded(current));
         }
         let next_generation = expected_generation + 1;
         match observation {
@@ -4592,6 +4781,15 @@ impl PgStore {
                 result_reference,
                 output_archive,
             } => {
+                sqlx::query(
+                    "UPDATE task_submissions SET phase = 'running', updated_at = now() \
+                     WHERE task_uid = $1 AND phase = 'queued' AND NOT finalize_requested \
+                       AND NOT cancel_requested",
+                )
+                .bind(current.task_uid)
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
                 sqlx::query(
                     "UPDATE task_execution_attempts \
                      SET state = 'succeeded', generation = generation + 1, \
@@ -4641,10 +4839,34 @@ impl PgStore {
                 .execute(&mut *transaction)
                 .await
                 .map_err(database_error)?;
+                if operation.state != TaskOrchestrationState::CleanupPending {
+                    sqlx::query(
+                        "UPDATE task_runtime_operations \
+                         SET state = 'cleanup_pending', generation = generation + 1, \
+                             cleanup_requested_at = now(), \
+                             last_error_code = 'execution_failed', retry_at = NULL, \
+                             lease_owner = NULL, lease_expires_at = NULL, updated_at = now() \
+                         WHERE task_uid = $1 AND generation = $2 AND state <> 'finalized'",
+                    )
+                    .bind(current.task_uid)
+                    .bind(operation.generation)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(database_error)?;
+                    append_task_orchestration_journal(
+                        &mut transaction,
+                        current.task_uid,
+                        operation.generation + 1,
+                        TaskOrchestrationState::CleanupPending,
+                        "execution_failed_cleanup_requested",
+                        actor,
+                    )
+                    .await?;
+                }
                 sqlx::query(
                     "UPDATE task_submissions \
                      SET phase = 'failed', failure_reason = COALESCE(failure_reason, $2), \
-                         updated_at = now() \
+                         finalize_requested = true, updated_at = now() \
                      WHERE task_uid = $1 AND phase IN ('queued', 'running')",
                 )
                 .bind(current.task_uid)
@@ -4694,8 +4916,13 @@ impl PgStore {
                 }
                 sqlx::query(
                     "UPDATE task_submissions \
-                     SET phase = 'failed', finalize_requested = true, \
-                         failure_reason = COALESCE(failure_reason, 'execution_outcome_unknown'), \
+                     SET phase = CASE \
+                             WHEN phase IN ('succeeded', 'failed', 'cancelled') THEN phase \
+                             ELSE 'failed' END, \
+                         finalize_requested = true, \
+                         failure_reason = CASE \
+                             WHEN phase IN ('succeeded', 'failed', 'cancelled') THEN failure_reason \
+                             ELSE COALESCE(failure_reason, 'execution_outcome_unknown') END, \
                          updated_at = now() WHERE task_uid = $1 AND NOT finalized",
                 )
                 .bind(current.task_uid)
@@ -4711,6 +4938,7 @@ impl PgStore {
             transaction.commit().await.map_err(database_error)?;
             return Ok(TaskExecutionTransition::Superseded(updated));
         }
+        record_terminal_execution_retirement(&mut transaction, &updated, observation).await?;
         transaction.commit().await.map_err(database_error)?;
         Ok(TaskExecutionTransition::Applied(updated))
     }
@@ -5420,6 +5648,22 @@ impl PgStore {
         submitter_service: &str,
         owner_user_id: &str,
     ) -> Result<TaskRecord, StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let current = task_in_transaction_for_update(&mut transaction, task_uid).await?;
+        if current.submitter_service != submitter_service
+            || current.owner_user_id.as_deref() != Some(owner_user_id)
+            || current.identity_binding_state != "bound"
+        {
+            return Err(StoreError::TaskNotFound);
+        }
+        if current.finalized {
+            transaction.commit().await.map_err(database_error)?;
+            return self.task(task_uid).await?.ok_or(StoreError::TaskNotFound);
+        }
+        if current.orchestration_version == 2 {
+            task_runtime_operation_in_transaction_for_update(&mut transaction, task_uid).await?;
+            fence_task_execution_for_cleanup(&mut transaction, task_uid).await?;
+        }
         let result = sqlx::query(
             "UPDATE task_submissions \
              SET finalize_requested = true, \
@@ -5436,12 +5680,13 @@ impl PgStore {
         .bind(task_uid)
         .bind(submitter_service)
         .bind(owner_user_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
         if result.rows_affected() != 1 {
             return Err(StoreError::TaskNotFound);
         }
+        transaction.commit().await.map_err(database_error)?;
         self.task(task_uid).await?.ok_or(StoreError::TaskNotFound)
     }
 
@@ -6456,6 +6701,7 @@ pub struct ApprovalDeliveryWorkItem {
     pub operation_id: Uuid,
     pub approval_id: Uuid,
     pub generation: i64,
+    pub delivery_invoked: bool,
     pub idempotency_key: String,
     pub runtime_uid: String,
     pub actor: String,
@@ -6528,12 +6774,12 @@ pub struct TaskActivationObservation<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskCleanupObservation {
     pub exact_runtime_absent: bool,
-    pub owned_projections_absent: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskExecutionAttemptState {
     StartPending,
+    NotStarted,
     Running,
     Succeeded,
     Failed,
@@ -6542,9 +6788,17 @@ pub enum TaskExecutionAttemptState {
 }
 
 impl TaskExecutionAttemptState {
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::NotStarted | Self::Succeeded | Self::Failed | Self::OutcomeUnknown
+        )
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::StartPending => "start_pending",
+            Self::NotStarted => "not_started",
             Self::Running => "running",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
@@ -6996,6 +7250,7 @@ pub struct ApprovalCandidate {
     pub envelope_revision: i64,
     pub runtime_namespace: String,
     pub runtime_name: String,
+    pub orchestration_operation_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -7532,6 +7787,15 @@ const TASK_EXECUTION_ATTEMPT_SELECT_BY_TASK: &str = "SELECT attempt_id, task_uid
             started_at::text AS started_at, finished_at::text AS finished_at \
      FROM task_execution_attempts WHERE task_uid = $1";
 
+const TASK_EXECUTION_ATTEMPT_SELECT_ACTIVE_BY_RUNTIME: &str = "SELECT attempt_id, task_uid, operation_id, runtime_uid, active_manifest_digest, \
+            command_digest, input_digest, state, generation, adapter_observation_id, \
+            result_digest, result_reference, retry_at::text AS retry_at, last_error_code, \
+            start_invoked_at::text AS start_invoked_at, \
+            start_observation_deadline_at::text AS start_observation_deadline_at, \
+            started_at::text AS started_at, finished_at::text AS finished_at \
+     FROM task_execution_attempts WHERE attempt_id = ( \
+         SELECT attempt_id FROM task_runtime_execution_leases WHERE runtime_uid = $1)";
+
 const TASK_RUNTIME_OPERATION_SELECT_BY_TASK: &str = "SELECT task_uid, operation_id, state, generation, runtime_ownership, \
             runtime_namespace, runtime_name, inert_manifest_digest, active_manifest_digest, \
             expected_runtime_uid, \
@@ -7563,8 +7827,93 @@ const TASK_RUNTIME_OPERATION_SELECT_DUE: &str = "SELECT task_uid, operation_id, 
             projections_absent_observed_at::text AS projections_absent_observed_at, \
             finalized_at::text AS finalized_at \
      FROM task_runtime_operations \
-     WHERE state <> 'finalized' AND (retry_at IS NULL OR retry_at <= now()) \
+     WHERE (state <> 'finalized' AND (retry_at IS NULL OR retry_at <= now())) \
+        OR (runtime_ownership IN ('adopted', 'resident') AND EXISTS ( \
+            SELECT 1 FROM task_execution_attempts attempts \
+            JOIN task_runtime_execution_leases leases ON leases.attempt_id = attempts.attempt_id \
+            WHERE attempts.task_uid = task_runtime_operations.task_uid AND attempts.state = 'outcome_unknown')) \
      ORDER BY COALESCE(retry_at, requested_at), task_uid";
+
+/// The caller holds the Task row lock (and operation lock when changing it).
+/// Start authorization takes the same lock, so either it wins and cancellation
+/// retains ownership, or this transition wins and no stale worker may start.
+async fn fence_task_execution_for_cleanup(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    task_uid: Uuid,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE task_execution_attempts \
+         SET state = CASE WHEN start_invoked_at IS NULL THEN 'not_started' ELSE 'cancel_pending' END, \
+             finished_at = CASE WHEN start_invoked_at IS NULL THEN now() ELSE finished_at END, \
+             last_error_code = CASE WHEN start_invoked_at IS NULL THEN 'start_fenced_by_cleanup' ELSE last_error_code END, \
+             generation = generation + 1, updated_at = now() \
+         WHERE task_uid = $1 AND state IN ('start_pending', 'running')",
+    )
+    .bind(task_uid)
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    sqlx::query(
+        "INSERT INTO task_execution_retirements (attempt_id, runtime_uid, evidence_kind) \
+         SELECT attempt_id, runtime_uid, 'never_authorized' FROM task_execution_attempts \
+         WHERE task_uid = $1 AND state = 'not_started' ON CONFLICT (attempt_id) DO NOTHING",
+    )
+    .bind(task_uid)
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    sqlx::query(
+        "DELETE FROM task_runtime_execution_leases leases USING task_execution_retirements retired \
+         JOIN task_execution_attempts attempts ON attempts.attempt_id = retired.attempt_id \
+         WHERE attempts.task_uid = $1 AND leases.attempt_id = retired.attempt_id \
+             AND leases.runtime_uid = retired.runtime_uid",
+    )
+    .bind(task_uid)
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    Ok(())
+}
+
+/// Late terminal evidence retires ownership without revising the Task or attempt
+/// outcome. Absence, deadlines and outcome_unknown never enter this path.
+async fn record_terminal_execution_retirement(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    attempt: &TaskExecutionAttemptRecord,
+    observation: TaskExecutionObservation<'_>,
+) -> Result<(), StoreError> {
+    let adapter_observation_id = match observation {
+        TaskExecutionObservation::Succeeded {
+            adapter_observation_id,
+            ..
+        }
+        | TaskExecutionObservation::Failed {
+            adapter_observation_id,
+            ..
+        } => adapter_observation_id,
+        _ => return Ok(()),
+    };
+    sqlx::query(
+        "INSERT INTO task_execution_retirements \
+         (attempt_id, runtime_uid, evidence_kind, adapter_observation_id) \
+         VALUES ($1, $2, 'adapter_terminal', $3) ON CONFLICT (attempt_id) DO NOTHING",
+    )
+    .bind(attempt.attempt_id)
+    .bind(&attempt.runtime_uid)
+    .bind(adapter_observation_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    sqlx::query(
+        "DELETE FROM task_runtime_execution_leases WHERE attempt_id = $1 AND runtime_uid = $2",
+    )
+    .bind(attempt.attempt_id)
+    .bind(&attempt.runtime_uid)
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    Ok(())
+}
 
 async fn task_execution_attempt_in_transaction(
     transaction: &mut sqlx::Transaction<'_, Postgres>,
@@ -7613,6 +7962,7 @@ fn task_execution_attempt_record(
         .as_str()
     {
         "start_pending" => TaskExecutionAttemptState::StartPending,
+        "not_started" => TaskExecutionAttemptState::NotStarted,
         "running" => TaskExecutionAttemptState::Running,
         "succeeded" => TaskExecutionAttemptState::Succeeded,
         "failed" => TaskExecutionAttemptState::Failed,
@@ -7719,6 +8069,108 @@ async fn append_task_orchestration_journal(
     } else {
         Err(StoreError::InvalidTaskTransition)
     }
+}
+
+async fn retire_task_authority_for_cleanup(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    task_uid: Uuid,
+    operation_id: Uuid,
+    actor: &str,
+) -> Result<bool, StoreError> {
+    let delivery_states = sqlx::query(
+        "SELECT state, delivery_invoked_at IS NOT NULL AS delivery_invoked FROM external_effect_outbox \
+         WHERE task_uid = $1 AND operation_id = $2 FOR UPDATE",
+    )
+    .bind(task_uid)
+    .bind(operation_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    if delivery_states.iter().any(|row| {
+        row.try_get::<String, _>("state").is_ok_and(|state| {
+            state == "claimed"
+                || (state != "delivered"
+                    && row.try_get::<bool, _>("delivery_invoked").unwrap_or(true))
+        })
+    }) {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE external_effect_outbox \
+         SET state = 'failed', generation = generation + 1, retry_at = NULL, \
+             last_error_code = 'task_cleanup', claimed_by = NULL, claimed_until = NULL, \
+             updated_at = now() \
+         WHERE task_uid = $1 AND operation_id = $2 AND state = 'pending'",
+    )
+    .bind(task_uid)
+    .bind(operation_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    sqlx::query(
+        "UPDATE approvals approvals \
+         SET state = 'rejected', decided_by = $3, decided_at = now(), \
+             rationale = 'Task cleanup retired pending approval authority' \
+         FROM admission_decisions decisions \
+         WHERE approvals.admission_decision_id = decisions.id \
+           AND decisions.task_uid = $1 AND decisions.orchestration_operation_id = $2 \
+           AND approvals.state = 'pending'",
+    )
+    .bind(task_uid)
+    .bind(operation_id)
+    .bind(actor)
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    sqlx::query(
+        "INSERT INTO grant_revocations (grant_id, revoked_by, reason) \
+         SELECT grants.id, $3, 'Task cleanup retired runtime authority' \
+         FROM grants \
+         JOIN approvals ON approvals.id = grants.approval_id \
+         JOIN admission_decisions decisions \
+           ON decisions.id = approvals.admission_decision_id \
+         LEFT JOIN grant_revocations ON grant_revocations.grant_id = grants.id \
+         WHERE decisions.task_uid = $1 AND decisions.orchestration_operation_id = $2 \
+           AND grant_revocations.grant_id IS NULL \
+         ON CONFLICT (grant_id) DO NOTHING",
+    )
+    .bind(task_uid)
+    .bind(operation_id)
+    .bind(actor)
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    let authority_remains = sqlx::query_scalar::<_, bool>(
+        "SELECT \
+           EXISTS( \
+             SELECT 1 FROM approvals \
+             JOIN admission_decisions decisions \
+               ON decisions.id = approvals.admission_decision_id \
+             WHERE decisions.task_uid = $1 \
+               AND decisions.orchestration_operation_id = $2 \
+               AND approvals.state = 'pending' \
+           ) OR EXISTS( \
+             SELECT 1 FROM external_effect_outbox \
+             WHERE task_uid = $1 AND operation_id = $2 \
+               AND state IN ('pending', 'claimed') \
+           ) OR EXISTS( \
+             SELECT 1 FROM grants \
+             JOIN approvals ON approvals.id = grants.approval_id \
+             JOIN admission_decisions decisions \
+               ON decisions.id = approvals.admission_decision_id \
+             LEFT JOIN grant_revocations ON grant_revocations.grant_id = grants.id \
+             WHERE decisions.task_uid = $1 \
+               AND decisions.orchestration_operation_id = $2 \
+               AND grants.expires_at > now() \
+               AND grant_revocations.grant_id IS NULL \
+           )",
+    )
+    .bind(task_uid)
+    .bind(operation_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    Ok(!authority_remains)
 }
 
 fn task_runtime_operation_record(

@@ -51,8 +51,11 @@ impl JiraAdapter {
 }
 
 impl DecisionChannel for JiraAdapter {
-    async fn request(&self, request: &DecisionRequest) -> Result<DecisionReference, PortError> {
-        let marker = approval_marker(&request.request_id);
+    async fn observe_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<DecisionReference>, PortError> {
+        let marker = approval_marker(request_id);
         let jql = format!(
             "project = {} AND labels = \"{}\"",
             self.config.project_key, marker
@@ -81,16 +84,19 @@ impl DecisionChannel for JiraAdapter {
             .await
             .map_err(|error| request_error("decode Jira search response", error))?;
         match search.issues.as_slice() {
-            [] => {}
-            [issue] => return self.reference(&issue.key),
-            _ => {
-                return Err(PortError::Rejected {
-                    reason: "multiple Jira issues carry the same Steward approval marker"
-                        .to_owned(),
-                });
-            }
+            [] => Ok(None),
+            [issue] => self.reference(&issue.key).map(Some),
+            _ => Err(PortError::Rejected {
+                reason: "multiple Jira issues carry the same Steward approval marker".to_owned(),
+            }),
         }
+    }
 
+    async fn request(&self, request: &DecisionRequest) -> Result<DecisionReference, PortError> {
+        if let Some(reference) = self.observe_request(&request.request_id).await? {
+            return Ok(reference);
+        }
+        let marker = approval_marker(&request.request_id);
         let description = format!(
             "Steward approval request {}\nRuntime UID: {}\nActor: {}\nMember role: {}\n{}",
             request.request_id,
@@ -358,6 +364,31 @@ mod tests {
                 .map_err(|_| "mock Jira request lock was poisoned".to_owned())
                 .map(|requests| requests.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn observing_an_unindexed_request_never_creates_an_issue() -> Result<(), String> {
+        let jira = MockJira::start(vec![r#"{"issues":[]}"#])?;
+        let adapter = JiraAdapter::new(
+            JiraConfig {
+                base_url: jira.base_url.clone(),
+                project_key: "PROJ".to_owned(),
+                account_email: "alice@example.com".to_owned(),
+            },
+            "test-token".to_owned(),
+        )
+        .map_err(|error| format!("construct Jira: {error:?}"))?;
+        assert_eq!(
+            adapter
+                .observe_request("approval-a")
+                .await
+                .map_err(|error| format!("observe Jira: {error:?}"))?,
+            None
+        );
+        let requests = jira.finish()?;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /rest/api/3/search/jql?"));
+        Ok(())
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ worker is part of the normal `steward-controller` process.
 
 | Input | Supported production value |
 |---|---|
+| `STEWARD_TASK_ORCHESTRATION_MODE` | Required in both the apiserver and controller. `staged` rejects new public and internal Task submissions and leaves the new Task lifecycle owner and approval dispatcher stopped; `active` enables them. Roll every replica with `staged` before a separate deployment changes the shared value to `active`. |
 | `STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE` | Required and non-empty. DEV uses `https://kubernetes.default.svc`. |
 | `STEWARD_TASK_WORKFLOWS_JSON` | Required JSON array matching `workflows.example.json`. Commands are server-selected; clients cannot supply them. |
 | `STEWARD_TASK_EXECUTION_BINDINGS_FILE` | Preferred read-only file containing `steward.execution-bindings/v1`. Missing or empty catalog means no coding agents are available. |
@@ -48,6 +49,12 @@ are present. The same process drains the Task approval outbox through the Jira
 `STEWARD_JIRA_TOKEN` secret reference. `STEWARD_S0_BOOTSTRAP=1` is the bootstrap-only mode and
 does not run the durable Task worker or approval dispatcher; do not use it for a Task deployment.
 No second Task controller flag or service port exists.
+
+The chart's `config.taskOrchestrationMode` supplies the same required mode to both binaries and
+defaults to `staged`. A migration rollout first deploys all new binaries with that default, verifies
+that no legacy Task writer remains, and only then performs a separate Helm change to `active`.
+Existing Task reads and exact idempotent retries remain available while staged, but no new Task
+intent or approval delivery may begin.
 
 ## Migration 0011
 

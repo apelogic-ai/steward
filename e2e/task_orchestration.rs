@@ -38,6 +38,7 @@ struct AmbiguousKubernetes {
     runtime: Arc<Mutex<Option<AgentRuntime>>>,
     created: Arc<Mutex<Vec<AgentRuntime>>>,
     create_calls: Arc<AtomicUsize>,
+    replace_calls: Arc<AtomicUsize>,
     fail_first_create_response: Arc<AtomicBool>,
     delete_preconditions: Arc<Mutex<Vec<String>>>,
     replace_name_after_delete: Arc<AtomicBool>,
@@ -54,6 +55,7 @@ impl Drop for ServerGuard {
 #[derive(Clone, Default)]
 struct AmbiguousTaskRuntime {
     starts: Arc<AtomicUsize>,
+    terminal_observed: Arc<AtomicBool>,
 }
 
 impl SandboxTaskRuntime for AmbiguousTaskRuntime {
@@ -71,10 +73,17 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
 
     async fn observe_task(
         &self,
-        _attempt_id: &TaskAttemptId,
+        attempt_id: &TaskAttemptId,
         _request: &SandboxTaskRequest,
     ) -> Result<SandboxTaskObservation, PortError> {
-        Ok(SandboxTaskObservation::Absent)
+        if self.terminal_observed.load(Ordering::SeqCst) {
+            Ok(SandboxTaskObservation::Failed {
+                adapter_observation_id: attempt_id.0.clone(),
+                reason: "late durable process exit".to_owned(),
+            })
+        } else {
+            Ok(SandboxTaskObservation::Absent)
+        }
     }
 
     async fn cancel_task(
@@ -253,28 +262,29 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     assert_eq!(observed.state, TaskOrchestrationState::RuntimeObserved);
     assert_eq!(observed.runtime_uid.as_deref(), Some("runtime-uid-a"));
     assert!(kubernetes.create_calls.load(Ordering::SeqCst) >= 1);
-    let created = kubernetes
-        .created
-        .lock()
-        .map_err(|_| io::Error::other("created runtime fixture was poisoned"))?;
-    assert_eq!(
-        created.len(),
-        1,
-        "ambiguous creates must converge on one CR"
-    );
-    assert!(created[0].spec.llms.is_empty() && created[0].spec.tools.is_empty());
-    assert_eq!(created[0].spec.budget.monthly_limit, "0");
-    assert_eq!(
-        created[0].spec.budget.single_run_limit.as_deref(),
-        Some("0")
-    );
-    assert_eq!(
-        created[0]
-            .annotations()
-            .get("agents.apelogic.ai/orchestration-id"),
-        Some(&operation_id.to_string())
-    );
-    drop(created);
+    {
+        let created = kubernetes
+            .created
+            .lock()
+            .map_err(|_| io::Error::other("created runtime fixture was poisoned"))?;
+        assert_eq!(
+            created.len(),
+            1,
+            "ambiguous creates must converge on one CR"
+        );
+        assert!(created[0].spec.llms.is_empty() && created[0].spec.tools.is_empty());
+        assert_eq!(created[0].spec.budget.monthly_limit, "0");
+        assert_eq!(
+            created[0].spec.budget.single_run_limit.as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            created[0]
+                .annotations()
+                .get("agents.apelogic.ai/orchestration-id"),
+            Some(&operation_id.to_string())
+        );
+    }
 
     reconcile_current(&client, &task_runtime, &store, task_uid).await?;
     assert_eq!(
@@ -583,19 +593,91 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         })
         .await?;
     assert!(adopted.inserted);
+    let ready_status = {
+        kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+            .as_mut()
+            .ok_or_else(|| io::Error::other("shared runtime missing"))?
+            .status
+            .take()
+    };
+    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
+    assert_eq!(
+        operation(&store, adopted_task_uid).await?.state,
+        TaskOrchestrationState::IntentRecorded,
+        "readiness lag is not an immutable identity conflict"
+    );
+    kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .as_mut()
+        .ok_or_else(|| io::Error::other("shared runtime missing"))?
+        .status = ready_status.clone();
     reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
     assert_eq!(
         operation(&store, adopted_task_uid).await?.state,
         TaskOrchestrationState::RuntimeObserved,
         "an exact adopted runtime must be observed without claiming ownership"
     );
-    store
-        .request_task_finalization(adopted_task_uid, &service, identity.user_id.as_str())
-        .await?;
+    let replace_count_before_adopted_activation = kubernetes.replace_calls.load(Ordering::SeqCst);
+    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
+    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
     reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
     assert_eq!(
         operation(&store, adopted_task_uid).await?.state,
-        TaskOrchestrationState::CleanupPending
+        TaskOrchestrationState::Active,
+        "an exact ready adopted runtime must become active by observation"
+    );
+    assert_eq!(
+        kubernetes.replace_calls.load(Ordering::SeqCst),
+        replace_count_before_adopted_activation,
+        "adopted activation must not replace or otherwise mutate the shared runtime"
+    );
+    store
+        .put_task_inputs(
+            adopted_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"adopted cancellation input",
+        )
+        .await?;
+    store
+        .request_task_execution(adopted_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
+    let adopted_attempt = store
+        .task_execution_attempt(adopted_task_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("adopted execution attempt was not reserved"))?;
+    sqlx::query(
+        "UPDATE task_execution_attempts \
+         SET start_invoked_at = now() - interval '3 minutes', \
+             start_observation_deadline_at = now() - interval '1 minute', \
+             generation = generation + 1, updated_at = now() \
+         WHERE attempt_id = $1 AND generation = $2 AND state = 'start_pending'",
+    )
+    .bind(adopted_attempt.attempt_id)
+    .bind(adopted_attempt.generation)
+    .execute(store.pool())
+    .await?;
+    store
+        .request_task_finalization(adopted_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .as_mut()
+        .ok_or_else(|| io::Error::other("shared runtime fixture is absent"))?
+        .status = None;
+    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
+    assert_eq!(
+        operation(&store, adopted_task_uid).await?.state,
+        TaskOrchestrationState::CleanupPending,
+        "expired cancellation must enter cleanup when runtime references disappeared"
     );
     reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
     assert!(
@@ -623,6 +705,53 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             .and_then(|runtime| runtime.metadata.uid.as_deref()),
         Some(adopted_runtime_uid),
         "shared infrastructure must remain after Task finalization"
+    );
+    let before_retirement = store
+        .task(adopted_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    let unknown_attempt = store
+        .task_execution_attempt(adopted_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert!(
+        store
+            .task_orchestration_work_items()
+            .await?
+            .iter()
+            .any(|work| work.task.task_uid == adopted_task_uid),
+        "finalized shared-runtime quarantine must remain observable after restart"
+    );
+    kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .as_mut()
+        .ok_or_else(|| io::Error::other("shared runtime missing"))?
+        .status = ready_status;
+    task_runtime.terminal_observed.store(true, Ordering::SeqCst);
+    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
+    assert_eq!(
+        store
+            .task(adopted_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?,
+        before_retirement
+    );
+    assert_eq!(
+        store
+            .task_execution_attempt(adopted_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?,
+        unknown_attempt
+    );
+    assert!(
+        !store
+            .task_orchestration_work_items()
+            .await?
+            .iter()
+            .any(|work| work.task.task_uid == adopted_task_uid),
+        "proven retirement removes finalized work without rewriting history"
     );
     assert_eq!(reservation.record.task_uid, task_uid);
     Ok(())
@@ -748,6 +877,7 @@ async fn kubernetes_request(
             Err(_) => status_response(StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
         },
         Method::PUT if path.starts_with(RUNTIME_PATH_PREFIX) => {
+            state.replace_calls.fetch_add(1, Ordering::SeqCst);
             let bytes = match to_bytes(request.into_body(), 1024 * 1024).await {
                 Ok(bytes) => bytes,
                 Err(_) => return Ok(status_response(StatusCode::BAD_REQUEST, "BadRequest")),

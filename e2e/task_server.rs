@@ -444,7 +444,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         run_id: env::var("STEWARD_TEST_RUN_ID")
             .map_err(|_| io::Error::other("STEWARD_TEST_RUN_ID is required"))?,
     };
-    let jira_listener = TcpListener::bind("127.0.0.1:8083").await?;
+    let jira_listener = TcpListener::bind("0.0.0.0:8083").await?;
     let jira_state = JiraState::default();
     let jira_server_state = jira_state.clone();
     let jira_task = tokio::spawn(async move {
@@ -484,6 +484,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .with_execution_adapter(Arc::new(adapter))?
                 .with_execution_bindings_json(Some(&catalog))?
                 .with_execution_bindings_active(true)
+                .map(|config| {
+                    config
+                        .with_task_orchestration_mode(steward_store::TaskOrchestrationMode::Active)
+                        .with_legacy_runtime_resolver(runtimes.clone())
+                })
         })
         .map_err(io::Error::other)?,
     )

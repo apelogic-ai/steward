@@ -224,8 +224,9 @@
     "config": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["apiserver", "controller", "mint"],
+      "required": ["taskOrchestrationMode", "apiserver", "controller", "mint"],
       "properties": {
+        "taskOrchestrationMode": {"type": "string", "enum": ["staged", "active"]},
         "apiserver": {
           "type": "object",
           "additionalProperties": false,

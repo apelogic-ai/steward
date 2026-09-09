@@ -416,6 +416,19 @@ pub trait DecisionChannel: Send + Sync + 'static {
         request: &DecisionRequest,
     ) -> impl Future<Output = Result<DecisionReference, PortError>> + Send;
 
+    /// Read-only recovery of an already invoked request. Absence is not permission
+    /// to create again: a previous request may still be in flight or unindexed.
+    fn observe_request(
+        &self,
+        _request_id: &str,
+    ) -> impl Future<Output = Result<Option<DecisionReference>, PortError>> + Send {
+        async {
+            Err(PortError::Rejected {
+                reason: "decision channel does not support request observation".to_owned(),
+            })
+        }
+    }
+
     fn record_resolution(
         &self,
         resolution: &DecisionResolution,

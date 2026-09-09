@@ -7,7 +7,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use kube::api::{Api, ListParams};
-use steward_store::{AgentRunQuery, AgentRunTimelineKind, PgStore};
+use steward_store::{AgentRunQuery, AgentRunTimelineKind, PendingApproval, PgStore};
 use steward_types::{AgentRuntime, Phase, Principal, RunnerPlatform, TaskPhase};
 
 const HTTP_STATUS_MARKER: &str = "__STEWARD_HTTP_STATUS:";
@@ -345,11 +345,11 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     );
 
     let versioned_bound =
-        wait_for_runtime_binding(&base_url, &versioned_task_uid, "github-assertion", &run_dir)?;
+        wait_for_runtime_binding(&base_url, versioned_task_uid, "github-assertion", &run_dir)?;
     let versioned_runtime_uid = json_string(&versioned_bound, "runtimeUid")?;
     assert_controller_runtime_tool_ready(
         &runtime_api,
-        &versioned_runtime_uid,
+        versioned_runtime_uid,
         "steward-mcp-gw-v1-3-0",
         Some("steward-mcp-gw"),
     )
@@ -384,15 +384,15 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     );
     put_archive(
         &base_url,
-        &versioned_task_uid,
+        versioned_task_uid,
         "github-assertion",
         &input_tar,
         &run_dir,
     )?;
-    execute(&base_url, &versioned_task_uid, "github-assertion", &run_dir)?;
+    execute(&base_url, versioned_task_uid, "github-assertion", &run_dir)?;
     wait_for(
         &base_url,
-        &versioned_task_uid,
+        versioned_task_uid,
         "github-assertion",
         |status| status["phase"] == "succeeded",
         &run_dir,
@@ -400,7 +400,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     let versioned_output_tar = run_dir.join("repository-review-output.tar");
     get_output(
         &base_url,
-        &versioned_task_uid,
+        versioned_task_uid,
         "github-assertion",
         &versioned_output_tar,
         &run_dir,
@@ -439,16 +439,16 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     assert_eq!(run.workflow_name.as_deref(), Some("repository-review"));
     assert_eq!(run.workflow_version, Some(1));
     assert_eq!(run.user_envelope_revision, Some(3));
-    delete_task(&base_url, &versioned_task_uid, "github-assertion", &run_dir)?;
+    delete_task(&base_url, versioned_task_uid, "github-assertion", &run_dir)?;
     wait_for(
         &base_url,
-        &versioned_task_uid,
+        versioned_task_uid,
         "github-assertion",
         |status| status["finalized"] == true,
         &run_dir,
     )?;
     assert!(
-        runtime_by_uid(&runtime_api, &versioned_runtime_uid)
+        runtime_by_uid(&runtime_api, versioned_runtime_uid)
             .await?
             .is_none(),
         "finalizing the versioned Workflow Task must delete its exact provisioned runtime"
@@ -489,40 +489,40 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         second_binding.binding_digest
     );
     let second_bound =
-        wait_for_runtime_binding(&base_url, &second_task_uid, "github-assertion", &run_dir)?;
+        wait_for_runtime_binding(&base_url, second_task_uid, "github-assertion", &run_dir)?;
     let second_runtime_uid = json_string(&second_bound, "runtimeUid")?;
     assert_controller_runtime_tool_ready(
         &runtime_api,
-        &second_runtime_uid,
+        second_runtime_uid,
         "steward-mcp-gw-v1-3-0",
         Some("steward-mcp-gw"),
     )
     .await?;
     put_archive(
         &base_url,
-        &second_task_uid,
+        second_task_uid,
         "github-assertion",
         &input_tar,
         &run_dir,
     )?;
-    execute(&base_url, &second_task_uid, "github-assertion", &run_dir)?;
+    execute(&base_url, second_task_uid, "github-assertion", &run_dir)?;
     wait_for(
         &base_url,
-        &second_task_uid,
+        second_task_uid,
         "github-assertion",
         |status| status["phase"] == "succeeded",
         &run_dir,
     )?;
-    delete_task(&base_url, &second_task_uid, "github-assertion", &run_dir)?;
+    delete_task(&base_url, second_task_uid, "github-assertion", &run_dir)?;
     wait_for(
         &base_url,
-        &second_task_uid,
+        second_task_uid,
         "github-assertion",
         |status| status["finalized"] == true,
         &run_dir,
     )?;
     assert!(
-        runtime_by_uid(&runtime_api, &second_runtime_uid)
+        runtime_by_uid(&runtime_api, second_runtime_uid)
             .await?
             .is_none()
     );
@@ -552,21 +552,17 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         &run_dir,
     )?;
     execute(&base_url, stale_task_uid, "github-assertion", &run_dir)?;
-    assert_phase_stays(
+    let stale_finalized = wait_for(
         &base_url,
         stale_task_uid,
         "github-assertion",
-        "queued",
+        |status| status["phase"] == "failed" && status["finalized"] == true,
         &run_dir,
     )?;
-    delete_task(&base_url, stale_task_uid, "github-assertion", &run_dir)?;
-    wait_for(
-        &base_url,
-        stale_task_uid,
-        "github-assertion",
-        |status| status["finalized"] == true,
-        &run_dir,
-    )?;
+    assert_eq!(
+        stale_finalized["failureReason"], "observed_runtime_identity_changed",
+        "a same-name replacement must terminalize the Task against its original exact UID"
+    );
     assert!(
         runtime_by_uid(&runtime_api, &replacement_runtime_uid)
             .await?
@@ -612,7 +608,18 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     )?;
     assert_eq!(parked["phase"], "parked");
     let task_uid = json_string(&parked, "taskUid")?;
-    let runtime_uid = json_string(&parked, "runtimeUid")?;
+    assert!(
+        parked["runtimeUid"].is_null(),
+        "an excessive Task must be durably parked before its inert runtime UID exists"
+    );
+    let parked_bound = wait_for(
+        &base_url,
+        task_uid,
+        "github-assertion",
+        |status| status["phase"] == "parked" && status["runtimeUid"].is_string(),
+        &run_dir,
+    )?;
+    let runtime_uid = json_string(&parked_bound, "runtimeUid")?;
     let retried = submit(
         &base_url,
         "github-assertion",
@@ -621,7 +628,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         &run_dir,
     )?;
     assert_eq!(retried["taskUid"], parked["taskUid"]);
-    assert_eq!(retried["runtimeUid"], parked["runtimeUid"]);
+    assert_eq!(retried["runtimeUid"], parked_bound["runtimeUid"]);
     put_archive(
         &base_url,
         task_uid,
@@ -632,12 +639,7 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     execute(&base_url, task_uid, "github-assertion", &run_dir)?;
     execute(&base_url, task_uid, "github-assertion", &run_dir)?;
 
-    let pending = store
-        .pending_approvals()
-        .await?
-        .into_iter()
-        .find(|approval| approval.runtime_uid == runtime_uid)
-        .ok_or_else(|| io::Error::other("parked Task approval was not persisted"))?;
+    let pending = wait_for_pending_approval(&store, runtime_uid).await?;
     let evidence_url = pending
         .evidence_url
         .as_deref()
@@ -814,7 +816,24 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         &run_dir,
     )?;
     assert_eq!(adopted["runtimeOwnership"], "adopted");
+    assert!(
+        adopted["runtimeUid"].is_null(),
+        "legacy adoption must return intent before the controller observes the exact UID"
+    );
     let adopted_task_uid = json_string(&adopted, "taskUid")?;
+    let adopted_bound =
+        wait_for_runtime_binding(&base_url, adopted_task_uid, "github-assertion", &run_dir)?;
+    assert_eq!(adopted_bound["runtimeUid"], standing_runtime_uid);
+    let adopted_retry = submit_response(
+        &base_url,
+        "github-assertion",
+        "adopted-runtime-123",
+        &adopted_body,
+        &run_dir,
+    )?;
+    assert_eq!(adopted_retry.http_status, 201);
+    assert_eq!(adopted_retry.body["taskUid"], adopted_task_uid);
+    assert_eq!(adopted_retry.body["runtimeUid"], standing_runtime_uid);
     put_archive(
         &base_url,
         adopted_task_uid,
@@ -1178,7 +1197,7 @@ fn execute(
     let status = curl_status(
         Command::new("curl")
             .args(["-sS", "-o"])
-            .arg(response)
+            .arg(&response)
             .args([
                 "-w",
                 "%{http_code}",
@@ -1206,7 +1225,7 @@ fn delete_task(
     let status = curl_status(
         Command::new("curl")
             .args(["-sS", "-o"])
-            .arg(response)
+            .arg(&response)
             .args([
                 "-w",
                 "%{http_code}",
@@ -1240,7 +1259,7 @@ fn approve(
     let status = curl_status(
         Command::new("curl")
             .args(["-sS", "-o"])
-            .arg(response)
+            .arg(&response)
             .args([
                 "-w",
                 "%{http_code}",
@@ -1257,7 +1276,11 @@ fn approve(
         "approve parked Task",
     )?;
     if status != 200 {
-        return Err(io::Error::other(format!("Task approval returned {status}")).into());
+        return Err(io::Error::other(format!(
+            "Task approval returned {status}: {}",
+            fs::read_to_string(response)?
+        ))
+        .into());
     }
     Ok(())
 }
@@ -1372,24 +1395,6 @@ fn replace_runtime_for_stale_uid_test(
     json_string(&serde_json::from_slice(&fs::read(response)?)?, "runtimeUid").map(str::to_owned)
 }
 
-fn assert_phase_stays(
-    base_url: &str,
-    task_uid: &str,
-    assertion: &str,
-    expected_phase: &str,
-    run_dir: &Path,
-) -> Result<(), Box<dyn Error>> {
-    for _ in 0..4 {
-        let status = task_status(base_url, task_uid, assertion, run_dir)?;
-        assert_eq!(
-            status["phase"], expected_phase,
-            "a Task bound to a stale runtime UID must fail closed instead of executing on a replacement"
-        );
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    Ok(())
-}
-
 fn wait_for_runtime_binding(
     base_url: &str,
     task_uid: &str,
@@ -1403,6 +1408,27 @@ fn wait_for_runtime_binding(
         |status| status["phase"] == "submitted" && status["runtimeUid"].is_string(),
         run_dir,
     )
+}
+
+async fn wait_for_pending_approval(
+    store: &PgStore,
+    runtime_uid: &str,
+) -> Result<PendingApproval, Box<dyn Error>> {
+    for _attempt in 0..240 {
+        if let Some(approval) = store
+            .pending_approvals()
+            .await?
+            .into_iter()
+            .find(|approval| approval.runtime_uid == runtime_uid && approval.evidence_url.is_some())
+        {
+            return Ok(approval);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(io::Error::other(format!(
+        "parked Task approval for runtime {runtime_uid} was not persisted and filed"
+    ))
+    .into())
 }
 
 fn wait_for(

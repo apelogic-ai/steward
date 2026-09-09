@@ -14,7 +14,7 @@ use steward_store::{
     ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase,
     ConnectionOperationKind as StoredOperationKind, ConnectionOperationRecord,
     ConnectionOperationReservationRequest, ConnectionOperationRetention, ConnectionOperationState,
-    PgStore, StoreError, TaskReservationRequest,
+    PgStore, StoreError, TaskOrchestrationMode, TaskReservationRequest,
 };
 use steward_types::{
     AgentRuntimeSpec, AgentType, CanonicalAuthorityBinding, CanonicalUserId, Email, Principal,
@@ -232,14 +232,20 @@ pub struct GovernedConnectionsBroker<B> {
     store: PgStore,
     config: GovernedConnectionsConfig,
     binding: PhantomData<fn() -> B>,
+    orchestration_mode: TaskOrchestrationMode,
 }
 
 impl<B> GovernedConnectionsBroker<B> {
-    pub fn new(store: PgStore, config: GovernedConnectionsConfig) -> Self {
+    pub fn new(
+        store: PgStore,
+        config: GovernedConnectionsConfig,
+        orchestration_mode: TaskOrchestrationMode,
+    ) -> Self {
         Self {
             store,
             config,
             binding: PhantomData,
+            orchestration_mode,
         }
     }
 
@@ -250,6 +256,9 @@ impl<B> GovernedConnectionsBroker<B> {
         operation: ConnectionOperationKind,
         allow_status_cache: bool,
     ) -> Result<ConnectionOperationRecord, ConnectionBrokerError> {
+        if !self.orchestration_mode.is_active() {
+            return Err(ConnectionBrokerError::Unavailable);
+        }
         let email = Email::parse(display_email.to_owned())
             .map_err(|_| ConnectionBrokerError::Unavailable)?;
         let plan = plan_connection_operation(

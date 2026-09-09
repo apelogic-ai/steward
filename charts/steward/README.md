@@ -41,6 +41,13 @@ pre-binding release must roll out all new binaries in that mode before a second 
 the mode to `active`; see the repository's execution-binding upgrade note. This prevents either
 side of a mixed-version rollout from interpreting a Task under the other version's contract.
 
+Durable Task orchestration separately defaults to `config.taskOrchestrationMode: staged`. In this
+mode the apiserver rejects new public and internal Task submissions, and the controller does not run
+the Task lifecycle owner or approval dispatcher. Roll every apiserver and controller replica with
+`staged`, verify that no legacy writer remains, and then use a separate Helm operation to set the
+shared value to `active`. Existing Task reads and exact idempotent retries remain available during
+the staged deployment.
+
 ## Required secrets
 
 The chart references five existing Secrets and never creates their values:

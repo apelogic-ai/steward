@@ -2358,6 +2358,10 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 adapter_observation_id: correlation,
                 reason: "task agent failed; inspect the bounded controller diagnostic".to_owned(),
             }),
+            "outcome_unknown" => Ok(SandboxTaskObservation::OutcomeUnknown {
+                reason: "Task attempt process is no longer live without a terminal marker"
+                    .to_owned(),
+            }),
             _ => Ok(SandboxTaskObservation::OutcomeUnknown {
                 reason: "Task attempt marker has an unknown state".to_owned(),
             }),
@@ -2436,7 +2440,18 @@ fn task_attempt_execution_command(
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "set +e; printf running > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; \
+        "set +e; pid=$$; pid_start=$(awk '{{print $22}}' /proc/$$/stat) || exit 70; \
+         printf '%s' \"$pid\" > {directory}/pid; \
+         printf '%s' \"$pid_start\" > {directory}/pid-start; \
+         date +%s > {directory}/heartbeat.tmp; \
+         mv {directory}/heartbeat.tmp {directory}/heartbeat; \
+         (while current_start=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null) \
+             && kill -0 \"$pid\" 2>/dev/null && [ \"$current_start\" = \"$pid_start\" ]; do \
+           date +%s > {directory}/heartbeat.tmp; \
+           mv {directory}/heartbeat.tmp {directory}/heartbeat; sleep 5; done) & \
+         heartbeat_pid=$!; \
+         trap 'kill \"$heartbeat_pid\" 2>/dev/null || true; wait \"$heartbeat_pid\" 2>/dev/null || true' EXIT; \
+         printf running > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; \
          {command}; status=$?; \
          if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
            printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi; \
@@ -2452,6 +2467,17 @@ fn task_attempt_observation_command(directory: &str) -> String {
     let directory = shell_quote(directory);
     format!(
         "set -eu; test -d {directory} || exit 44; state=$(cat {directory}/state); \
+         if [ \"$state\" = running ]; then \
+           heartbeat=$(cat {directory}/heartbeat 2>/dev/null || true); now=$(date +%s); \
+           case \"$heartbeat:$now\" in *[!0-9:]*|:|*:) live=false ;; \
+             *) age=$((now - heartbeat)); \
+                if [ \"$age\" -ge 0 ] && [ \"$age\" -le 30 ]; \
+                then live=true; else live=false; fi ;; \
+           esac; \
+           if [ \"$live\" != true ]; then state=outcome_unknown; \
+             printf outcome_unknown > {directory}/state.tmp; \
+             mv {directory}/state.tmp {directory}/state; fi; \
+         fi; \
          printf '%s\\n' \"$state\"; \
          if [ \"$state\" = succeeded ]; then cat {directory}/output.tar; fi"
     )
@@ -2571,7 +2597,8 @@ mod tests {
         provider_reconciliation_plan, provider_reconciliation_targets, sandbox_spec,
         staging_append_command, staging_archive_chunks, staging_extract_command,
         staging_prepare_command, task_agent_failure_category, task_attempt_directory,
-        task_process_log_record, validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
+        task_attempt_execution_command, task_attempt_observation_command, task_process_log_record,
+        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
     };
     #[cfg(feature = "runtime")]
     use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
@@ -3189,6 +3216,24 @@ mod tests {
                 "attempt identity {malicious:?} must not reach an adapter command"
             );
         }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn task_attempt_marker_uses_a_cross_exec_liveness_lease() {
+        let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
+        let execution =
+            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true");
+        assert!(execution.contains("pid=$$"));
+        assert!(execution.contains("/proc/$$/stat"));
+        assert!(execution.contains("heartbeat"));
+
+        let observation = task_attempt_observation_command(directory);
+        assert!(observation.contains("heartbeat"));
+        assert!(observation.contains("now - heartbeat"));
+        assert!(!observation.contains("/proc/$pid/stat"));
+        assert!(!observation.contains("kill -0 \"$pid\""));
+        assert!(observation.contains("state=outcome_unknown"));
     }
 
     #[cfg(feature = "runtime")]

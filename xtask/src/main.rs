@@ -1434,7 +1434,16 @@ mod tests {
                 .contains("s#STEWARD_TASK_EXECUTION_BINDING_IMAGE#${sandbox_digest_image}#g"),
             "the S2 harness must not replace the execution-binding environment variable name"
         );
-
+        let task_server_rollout = s2_harness
+            .find("rollout status deployment/steward-task-server")
+            .ok_or_else(|| "the Task server rollout gate is missing".to_owned())?;
+        let provider_seed = s2_harness
+            .find("wait --for=condition=complete job/seed-mcp-gw")
+            .ok_or_else(|| "the provider fixture seed gate is missing".to_owned())?;
+        assert!(
+            task_server_rollout < provider_seed,
+            "the Task server must register its canonical fixture identity before provider seeding waits for that identity"
+        );
         Ok(())
     }
 
@@ -1473,6 +1482,86 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn task_orchestration_rollout_is_staged_before_the_new_owner_starts() -> Result<(), String> {
+        let chart = fs::read_to_string(root().join("charts/steward/templates/all.yaml"))
+            .map_err(|error| format!("Steward chart is required: {error}"))?;
+        let controller = fs::read_to_string(root().join("bins/steward-controller/src/main.rs"))
+            .map_err(|error| format!("controller binary is required: {error}"))?;
+        let apiserver = fs::read_to_string(root().join("bins/steward-apiserver/src/main.rs"))
+            .map_err(|error| format!("apiserver binary is required: {error}"))?;
+
+        assert!(
+            chart.matches("STEWARD_TASK_ORCHESTRATION_MODE").count() >= 2
+                && controller.contains("task_orchestration_mode")
+                && apiserver.contains("task_orchestration_mode"),
+            "the initial rollout must put both Task writers behind one explicit staged mode"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_task_operations_revalidate_authority_before_runtime_observation() -> Result<(), String>
+    {
+        let controller = fs::read_to_string(root().join("crates/steward-controller/src/lib.rs"))
+            .map_err(|error| format!("controller source is required: {error}"))?;
+        assert!(
+            controller.contains("revalidate_active_task_authority"),
+            "an active Task must revalidate authority even when execution has not been requested"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retryable_attempt_observation_errors_are_not_terminalized() -> Result<(), String> {
+        let controller = fs::read_to_string(root().join("crates/steward-controller/src/lib.rs"))
+            .map_err(|error| format!("controller source is required: {error}"))?;
+        assert!(
+            controller.contains(".map_err(TaskControllerError::Sandbox)?"),
+            "a retryable sandbox observation failure must preserve the current attempt state"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_attempt_markers_prove_running_process_liveness() -> Result<(), String> {
+        let adapter = fs::read_to_string(root().join("adapters/openshell/src/lib.rs"))
+            .map_err(|error| format!("OpenShell adapter source is required: {error}"))?;
+        assert!(
+            adapter.contains("pid-start")
+                && adapter.contains("kill -0")
+                && adapter.contains("heartbeat")
+                && adapter.contains("now - heartbeat"),
+            "claimed/running attempt markers must carry a cross-exec heartbeat lease and expire without liveness proof"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn absent_cancelled_attempts_expire_into_a_terminal_observation() -> Result<(), String> {
+        let controller = fs::read_to_string(root().join("crates/steward-controller/src/lib.rs"))
+            .map_err(|error| format!("controller source is required: {error}"))?;
+        assert!(
+            controller.contains("terminalize_expired_attempt_observation"),
+            "cancellation must resolve an absent post-start attempt after its observation deadline"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_retires_task_approval_authority_before_finalization() -> Result<(), String> {
+        let store = fs::read_to_string(root().join("crates/steward-store/src/lib.rs"))
+            .map_err(|error| format!("store source is required: {error}"))?;
+        let controller = fs::read_to_string(root().join("crates/steward-controller/src/lib.rs"))
+            .map_err(|error| format!("controller source is required: {error}"))?;
+        assert!(
+            store.contains("retire_task_authority_for_cleanup")
+                && !controller.contains("owned_projections_absent: true"),
+            "cleanup must revoke grants and retire pending approval delivery before recording projection absence"
+        );
         Ok(())
     }
 

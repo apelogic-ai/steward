@@ -15,7 +15,7 @@ use steward_adapter_openshell::{
     OpenShellConnectionConfig, OpenShellRuntime, OpenShellTaskLogMode,
     validate_connections_bridge_gateway_origin,
 };
-use steward_store::PgStore;
+use steward_store::{PgStore, TaskOrchestrationMode};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{sleep, timeout};
@@ -54,6 +54,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let database_url = required("STEWARD_DATABASE_URL")?;
+    let task_orchestration_mode = task_orchestration_mode()?;
     let store = PgStore::connect(&database_url).await?;
     store.migrate().await?;
     let inference = LiteLlmAdapter::new(LiteLlmConfig {
@@ -62,17 +63,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     })
     .map_err(|error| {
         io::Error::other(format!("inference plane configuration failed: {error:?}"))
-    })?;
-    let decisions = JiraAdapter::new(
-        JiraConfig {
-            base_url: required("STEWARD_JIRA_BASE_URL")?,
-            project_key: required("STEWARD_JIRA_PROJECT_KEY")?,
-            account_email: required("STEWARD_JIRA_ACCOUNT_EMAIL")?,
-        },
-        required("STEWARD_JIRA_TOKEN")?,
-    )
-    .map_err(|error| {
-        io::Error::other(format!("decision channel configuration failed: {error:?}"))
     })?;
     let listener = tls_listener(
         &env::var("STEWARD_WEBHOOK_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_owned()),
@@ -89,16 +79,52 @@ async fn main() -> Result<(), Box<dyn Error>> {
             required("STEWARD_APISERVER_USERNAME")?,
         ),
     );
-    let approval_dispatcher =
-        steward_controller::run_task_approval_dispatcher(store.clone(), decisions);
-    let controller =
-        steward_controller::run_controller_with_planes(client, sandbox_runtime, inference, store);
-    tokio::select! {
-        result = webhook => result?,
-        () = approval_dispatcher => return Err(io::Error::other("task approval dispatcher exited").into()),
-        () = controller => return Err(io::Error::other("controller exited").into()),
+    if task_orchestration_mode.is_active() {
+        let decisions = JiraAdapter::new(
+            JiraConfig {
+                base_url: required("STEWARD_JIRA_BASE_URL")?,
+                project_key: required("STEWARD_JIRA_PROJECT_KEY")?,
+                account_email: required("STEWARD_JIRA_ACCOUNT_EMAIL")?,
+            },
+            required("STEWARD_JIRA_TOKEN")?,
+        )
+        .map_err(|error| {
+            io::Error::other(format!("decision channel configuration failed: {error:?}"))
+        })?;
+        let approval_dispatcher =
+            steward_controller::run_task_approval_dispatcher(store.clone(), decisions);
+        let controller = steward_controller::run_controller_with_planes(
+            client,
+            sandbox_runtime,
+            inference,
+            store,
+            task_orchestration_mode,
+        );
+        tokio::select! {
+            result = webhook => result?,
+            () = approval_dispatcher => return Err(io::Error::other("task approval dispatcher exited").into()),
+            () = controller => return Err(io::Error::other("controller exited").into()),
+        }
+    } else {
+        let controller = steward_controller::run_controller_with_planes(
+            client,
+            sandbox_runtime,
+            inference,
+            store,
+            task_orchestration_mode,
+        );
+        tokio::select! {
+            result = webhook => result?,
+            () = controller => return Err(io::Error::other("controller exited").into()),
+        }
     }
     Ok(())
+}
+
+fn task_orchestration_mode() -> Result<TaskOrchestrationMode, io::Error> {
+    let value = required("STEWARD_TASK_ORCHESTRATION_MODE")?;
+    TaskOrchestrationMode::parse(&value)
+        .map_err(|_| io::Error::other("STEWARD_TASK_ORCHESTRATION_MODE must be staged or active"))
 }
 
 fn install_rustls_crypto_provider() -> Result<(), io::Error> {

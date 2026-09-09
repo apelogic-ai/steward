@@ -177,6 +177,7 @@ fi
 signing_key="${STEWARD_RUN_DIR}/s2-signing-key"
 introspection_client="${STEWARD_RUN_DIR}/s2-introspection-client"
 master_key="${STEWARD_RUN_DIR}/s2-litellm-master-key"
+jira_token="${STEWARD_RUN_DIR}/s2-jira-token"
 encryption_key="${STEWARD_RUN_DIR}/s5-mcp-encryption-key"
 tls_key="${STEWARD_RUN_DIR}/s2-tls-key.pem"
 tls_cert="${STEWARD_RUN_DIR}/s2-tls-cert.pem"
@@ -191,6 +192,7 @@ workload_exchange_extensions="${STEWARD_RUN_DIR}/s2-workload-exchange-extensions
 openssl rand 32 >"${signing_key}"
 openssl rand -hex 24 | tr -d '\n' >"${introspection_client}"
 openssl rand -hex 32 | tr -d '\n' >"${master_key}"
+openssl rand -hex 24 | tr -d '\n' >"${jira_token}"
 if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   openssl rand -base64 32 | tr -d '\n' >"${encryption_key}"
 fi
@@ -233,6 +235,7 @@ chmod 600 \
   "${signing_key}" \
   "${introspection_client}" \
   "${master_key}" \
+  "${jira_token}" \
   "${tls_key}" \
   "${tls_key_der}" \
   "${workload_exchange_ca_key}" \
@@ -254,6 +257,7 @@ done
   --from-file="signing-key=${signing_key}" \
   --from-file="introspection-client=${introspection_client}" \
   --from-file="litellm-master-key=${master_key}" \
+  --from-file="jira-token=${jira_token}" \
   --from-file="tls-cert.der=${tls_cert_der}" \
   --from-file="tls-key.der=${tls_key_der}" \
   --from-file="openshell-ca.crt=${STEWARD_OPENSHELL_CA_CERTIFICATE_FILE}" \
@@ -289,8 +293,14 @@ if [[ "${SLICE}" == "task" ]]; then
     --from-file="codex-responses-fixture.ts=${ROOT}/config/task/codex-responses-fixture.ts" \
     --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
 fi
+task_orchestration_mode="staged"
+if [[ "${SLICE}" == "task" ]]; then
+  task_orchestration_mode="active"
+fi
 rendered_stack="${STEWARD_RUN_DIR}/s2-stack.yaml"
-sed "s#STEWARD_S2_CONTROLLER_IMAGE#${STEWARD_S2_CONTROLLER_IMAGE}#g" \
+sed \
+  -e "s#STEWARD_S2_CONTROLLER_IMAGE#${STEWARD_S2_CONTROLLER_IMAGE}#g" \
+  -e "s#STEWARD_TASK_ORCHESTRATION_MODE_VALUE#${task_orchestration_mode}#g" \
   "${ROOT}/config/s2/stack.yaml" >"${rendered_stack}"
 "${KUBECTL[@]}" apply -f "${rendered_stack}"
 if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
@@ -348,6 +358,10 @@ fi
 "${KUBECTL[@]}" -n steward-system rollout status deployment/litellm --timeout=300s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-mint --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-controller --timeout=300s
+if [[ "${SLICE}" == "task" ]]; then
+  # The provider seed resolves the canonical Task fixture identity registered at startup.
+  "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-task-server --timeout=180s
+fi
 if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-mint-tools --timeout=180s
   "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-opa --timeout=180s
@@ -361,7 +375,6 @@ if [[ "${SLICE}" == "s5" ]]; then
 fi
 if [[ "${SLICE}" == "task" ]]; then
   "${KUBECTL[@]}" -n litellm rollout status deployment/codex-responses --timeout=180s
-  "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-task-server --timeout=180s
 fi
 
 service_subnet="$(
