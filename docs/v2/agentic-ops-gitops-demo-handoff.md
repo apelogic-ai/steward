@@ -15,9 +15,9 @@ operate or test the GitOps-managed local-main cluster.
 | Reusable steward-run workflow | a86a227f0f731a8a96628d4628f03b4482ad612b |
 | Nested steward-run action | 0707623836cd4cdf063938e1e049c694397bc31c |
 | Legacy published coordinate | agentic-release-integration-review@1 |
-| Agent binding | codex@0.117.0 |
-| Expected content digest | sha256:9b7e9bf82754b159b3cb1bff72a898a8eb1f0308c1792e283032fbebd4098aaa |
-| Package byte digest | sha256:467705ecb9ebbd9a25504bf87a1fb8f0931bdc7664d378ebd470935d9260a63b |
+| Agent binding | codex@0.140.0 |
+| Expected content digest | sha256:e06139e2a0b34796574a58b545da8a286952601b015b9f212fc632b256dd53a1 |
+| Package byte digest | sha256:c9bb37266f87af8993144637736380d6add3f2e3413e2d11f6b64aa9e0b704ae |
 | Dedicated runner label | steward-agentic-ops-main |
 
 The repository's immutable OIDC subject setting is enabled. Its non-secret runner,

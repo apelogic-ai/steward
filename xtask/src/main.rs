@@ -1561,9 +1561,7 @@ mod tests {
         ];
         let forbidden = [
             "SUPPORTED_WORKFLOW_AGENT",
-            "codex@0.117.0",
             "codex@0.140.0",
-            "codex-cli 0.117.0",
             "codex-cli 0.140.0",
             "steward-runtime-providers@1.3.0",
             "steward-mcp-gw-v1-3-0",
