@@ -683,16 +683,64 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
             .contains("example-org/fixture-repository"),
         "the Task output must contain the governed tool result"
     );
+    let successful_output = fs::read(&output_tar)?;
     revoke_grants(&base_url, runtime_uid, &run_dir)?;
-    wait_for_pending_runtime_authority_removal(&runtime_api, runtime_uid).await?;
-    delete_task(&base_url, task_uid, "github-assertion", &run_dir)?;
-    wait_for(
+    wait_for_task_runtime_absence(&runtime_api, runtime_uid).await?;
+    let finalized = wait_for(
         &base_url,
         task_uid,
         "github-assertion",
         |status| status["finalized"] == true,
         &run_dir,
     )?;
+    assert_eq!(finalized["phase"], "succeeded");
+    assert_eq!(finalized["runtimeUid"], runtime_uid);
+    let authority_retired = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM grants WHERE approval_id = $2::text::uuid) \
+         AND NOT EXISTS ( \
+           SELECT 1 FROM grants LEFT JOIN grant_revocations \
+             ON grant_revocations.grant_id = grants.id \
+           WHERE grants.runtime_uid = $3 AND grant_revocations.grant_id IS NULL \
+         ) AND NOT EXISTS ( \
+           SELECT 1 FROM approvals JOIN admission_decisions decisions \
+             ON decisions.id = approvals.admission_decision_id \
+           WHERE decisions.task_uid = $1::text::uuid AND approvals.state = 'pending' \
+         ) AND NOT EXISTS ( \
+           SELECT 1 FROM external_effect_outbox \
+           WHERE task_uid = $1::text::uuid AND state IN ('pending', 'claimed') \
+         )",
+    )
+    .bind(task_uid)
+    .bind(&approval_id)
+    .bind(runtime_uid)
+    .fetch_one(store.pool())
+    .await?;
+    assert!(authority_retired, "finalized Task retained approval authority");
+    get_output(
+        &base_url,
+        task_uid,
+        "github-assertion",
+        &output_tar,
+        &run_dir,
+    )?;
+    assert_eq!(fs::read(&output_tar)?, successful_output);
+    delete_task(&base_url, task_uid, "github-assertion", &run_dir)?;
+    let retried_finalization = wait_for(
+        &base_url,
+        task_uid,
+        "github-assertion",
+        |status| status["finalized"] == true,
+        &run_dir,
+    )?;
+    assert_eq!(retried_finalization["phase"], "succeeded");
+    get_output(
+        &base_url,
+        task_uid,
+        "github-assertion",
+        &output_tar,
+        &run_dir,
+    )?;
+    assert_eq!(fs::read(&output_tar)?, successful_output);
 
     for (assertion, key) in [
         ("github-assertion", "github-stub-123"),
@@ -1158,34 +1206,18 @@ fn put_archive(
     Ok(())
 }
 
-async fn wait_for_pending_runtime_authority_removal(
+async fn wait_for_task_runtime_absence(
     runtimes: &Api<AgentRuntime>,
     runtime_uid: &str,
 ) -> Result<(), Box<dyn Error>> {
     for _attempt in 0..240 {
-        if let Some(runtime) = runtime_by_uid(runtimes, runtime_uid).await?
-            && runtime
-                .metadata
-                .annotations
-                .as_ref()
-                .is_some_and(|annotations| {
-                    annotations.contains_key(steward_types::PENDING_APPROVAL_ANNOTATION)
-                })
-            && runtime.spec.llms.is_empty()
-            && runtime.spec.tools.is_empty()
-            && runtime.status.as_ref().is_some_and(|status| {
-                status.phase == Phase::Pending
-                    && status.refs.workspace.is_none()
-                    && status.refs.sandbox.is_none()
-                    && status.refs.litellm_key.is_none()
-            })
-        {
+        if runtime_by_uid(runtimes, runtime_uid).await?.is_none() {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     Err(io::Error::other(format!(
-        "revoked Task runtime {runtime_uid} retained provisioned authority"
+        "revoked Task-owned runtime {runtime_uid} was not deleted"
     ))
     .into())
 }
