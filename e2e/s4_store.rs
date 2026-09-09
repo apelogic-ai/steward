@@ -5,7 +5,7 @@ use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::Row;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::types::Uuid;
 use steward_admission::internal_authorities::steward_connections_v1;
 use steward_admission::{
@@ -54,18 +54,40 @@ fn connection_operation_retention() -> ConnectionOperationRetention {
     }
 }
 
+async fn isolated_approval_queue_store(database_url: &str) -> Result<PgStore, Box<dyn Error>> {
+    // Queue consumers intentionally select globally, not by this test's Task.
+    // Give each queue fixture its own schema so unrelated tests cannot consume
+    // its work. The shell harness owns and unconditionally deletes the ephemeral
+    // Postgres instance (and these schemas), including when a test fails.
+    let schema = format!("approval_queue_{}", Uuid::new_v4().simple());
+    let bootstrap = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await?;
+    let created = sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+        .execute(&bootstrap)
+        .await;
+    bootstrap.close().await;
+    created?;
+    let options = database_url
+        .parse::<PgConnectOptions>()?
+        .options([("search_path", schema.as_str())]);
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    Ok(store)
+}
+
 #[tokio::test]
 async fn durable_task_operation_is_atomic_generation_checked_and_uid_immutable()
 -> Result<(), Box<dyn Error>> {
     let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
         io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Task Postgres test")
     })?;
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&database_url)
-        .await?;
-    let store = PgStore::new(pool);
-    store.migrate().await?;
+    let store = isolated_approval_queue_store(&database_url).await?;
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_nanos()
@@ -944,12 +966,7 @@ async fn finalization_is_monotonic_from_every_task_orchestration_state()
     let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
         io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Task Postgres test")
     })?;
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&database_url)
-        .await?;
-    let store = PgStore::new(pool);
-    store.migrate().await?;
+    let store = isolated_approval_queue_store(&database_url).await?;
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_nanos()
@@ -1471,12 +1488,7 @@ async fn orchestration_upgrade_preserves_finalized_adopted_identity_without_an_o
 async fn expired_delivery_lease_never_replays_an_inflight_approval_create()
 -> Result<(), Box<dyn Error>> {
     let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&database_url)
-        .await?;
-    let store = PgStore::new(pool);
-    store.migrate().await?;
+    let store = isolated_approval_queue_store(&database_url).await?;
     let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let service = format!("delivery-race-{suffix}");
     let identity = store

@@ -51,6 +51,19 @@ explicitly recorded as follow-up rather than represented as fixed.
   missing M1 HTTP 200 response variant.
 - Fresh Postgres: all 28 `s4_store` tests passed, including pre-start fencing,
   concurrent runtime ownership, late retirement, and historical migration.
+- S4 Kubernetes run `s4-20260909030512-6162` built and deployed its server,
+  Postgres and webhook, but its database test step lost connections: 15 passed,
+  13 failed with unexpected EOF. The grant E2E did not run. The server image
+  captured `b1977a3`; host tests used `5feebcc`. Run-owned resources were removed;
+  one exited Kind node survived the harness and was removed by exact-cluster
+  cleanup. The transport failure is not claimed resolved.
+- A default-concurrency rerun against fresh direct Postgres exposed a separate
+  approval-queue fixture collision (27 passed, cleanup matrix `ApprovalNotFound`).
+  Three global queue consumers now use distinct test schemas, preserving each
+  test's concurrent dispatchers and assertions. All 28 passed in three fresh
+  default-concurrency runs (10.46s, 6.10s, 7.23s), and warning-as-error Clippy
+  passed. Each Postgres instance was removed. No production queue selection,
+  test thread count, or gate changed.
 - Fresh Postgres controller fault-path suite: `task_orchestration` passed on
   `b482b2f`, including a temporary observation failure that leaves the accepted
   attempt and Task unchanged (2026-09-09 UTC).
