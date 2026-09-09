@@ -36,6 +36,17 @@ explicitly recorded as follow-up rather than represented as fixed.
 
 ## Candidate evidence
 
+- Task run `task-20260909044835-57089` on `84374e6` (production/test tree
+  `1bb5933`) again failed during OpenShell 0.0.90 certificate-job setup with
+  `DeadlineExceeded`, before any Task assertion. Bounded observations captured
+  the gateway image pulling successfully in 75 seconds and the certificate
+  container reporting `Completed`; they do not establish why the Job missed
+  its deadline. Kubernetes API reads intermittently timed out, with no node
+  OOM kill recorded. Exact cluster, tagged images, probe containers and the
+  credential directory were confirmed removed. Both native arm64 sandbox
+  startup/version probes passed for Codex 0.139.0 and 0.140.0. The native Task
+  controller/server image prebuild also passed; neither prebuild nor probes
+  substitute for the still-pending full Task E2E.
 - Candidate `1bb5933` passed the complete `cargo xtask ci` quality stage
   (workspace tests, warning-as-error Clippy and all static checks). Full CI then
   failed G-1 in run `g1-20260909034940-38329`: the pinned OpenShell 0.0.90
