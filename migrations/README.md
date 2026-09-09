@@ -48,3 +48,11 @@ retirement evidence or deleting immutable history.
 Migration 0032 records approval delivery invocation separately from its scheduling
 lease. Lease successors observe the original request instead of creating again;
 cleanup cannot retire an invoked delivery before its external reference is known.
+
+Migration 0033 distinguishes transient internal connection output from immutable
+execution evidence. After the matching connection result becomes terminal, its
+successful Task's response archive can be cleared in the same transaction that
+requests cleanup. The database records an immutable retirement timestamp and
+rejects replacement or restoration. Ordinary Task output, finalized history,
+runtime/attempt identity and result digests remain immutable. This is a narrowly
+approved retention correction, not permission to rewrite an execution result.

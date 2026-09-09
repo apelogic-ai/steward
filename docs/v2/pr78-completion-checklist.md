@@ -36,6 +36,16 @@ explicitly recorded as follow-up rather than represented as fixed.
 
 ## Candidate evidence
 
+- Maintainer approved the scoped internal connection-output retirement correction.
+  New migration 0033 permits a consumed successful internal response to be
+  cleared only with matching terminal connection and exact execution evidence,
+  while requesting cleanup. A database-owned immutable retirement timestamp
+  prevents restoration. No applied migration was edited; ordinary output and
+  all outcome/identity/digest/finalized-history protections remain. All 29
+  `s4_store` tests pass against fresh Postgres, including successful and rejected
+  responses, populated 0032-to-0033 upgrade/restart, premature deletion,
+  transaction rollback, ordinary-output protection and retirement/history
+  tampering. Full governed E2E and full candidate CI still need to pass.
 - Governed-connections rerun `pr78-gov-202609090611` on `a0fb771` passed
   native arm64 preflight, pinned OpenShell 0.0.98 setup and internal runtime
   creation/activation. It then failed in 51.29 seconds: the connection finalizer

@@ -726,6 +726,24 @@ outbox insert commit together. Observation retries use a stable effect UUID. Ext
 creation is invoked at most once unless the port has a proven native idempotency
 guarantee; a lease expiry or failed lookup never supplies that guarantee.
 
+### Internal connection response retention
+
+Internal connection Tasks return transient provider-control responses; an OAuth
+start response can contain a sensitive continuation URL. Consuming or rejecting
+that response must not turn the raw archive into permanently retained history.
+Once the exact matching connection operation has a terminal result, the same
+transaction may clear the successful Task's archive and request cleanup. The
+database requires preserved successful execution evidence for the same Task,
+operation and runtime UID, and records immutable `internal_output_retired_at`
+evidence. Premature deletion, replacement, and restoration after retirement are
+rejected. The separately retained connection URL still follows its existing
+completion/expiry rules.
+
+This exception does not apply to ordinary Task output and does not permit changes
+to Task outcome, finalized history, attempt/runtime identity, result digest or
+result reference. Payload retirement and execution-history immutability are
+separate guarantees.
+
 ### Journal
 
 Append an orchestration event for every successful state transition, including

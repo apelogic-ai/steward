@@ -5743,6 +5743,7 @@ impl PgStore {
     /// Commits a validated provider-control result and finalization request together. Raw bridge
     /// output is cleared in the same transaction so OAuth continuation material cannot remain in
     /// generic task storage after extraction.
+    /// Internal output retirement preserves the Task's execution result identity.
     pub async fn complete_connection_operation(
         &self,
         operation_id: Uuid,

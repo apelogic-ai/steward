@@ -3667,6 +3667,14 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
         completed.output_archive.as_deref(),
         Some(b"neutral-output-tar".as_slice())
     );
+    assert!(
+        sqlx::query("UPDATE task_submissions SET output_archive = NULL, finalize_requested = true WHERE task_uid = $1")
+            .bind(first.record.task_uid)
+            .execute(store.pool())
+            .await
+            .is_err(),
+        "ordinary Task output remains immutable even when cleanup is requested"
+    );
     let execution_history = store
         .agent_run_timeline(first.record.task_uid)
         .await?
@@ -5202,6 +5210,260 @@ async fn s4_pending_create_provenance_survives_every_authority_transition()
         empty_marker.is_err(),
         "the migration must reject empty pending-marker provenance"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn consumed_connection_output_retires_without_rewriting_execution_history()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let bootstrap = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    // Each case has its own schema. The run-owned Postgres instance is removed
+    // unconditionally by the harness, including schemas from failed cases.
+    for (upgrade, reject_result) in [(false, false), (false, true), (true, false), (true, true)] {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let schema = format!("connection_output_{suffix}");
+        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+            .execute(&bootstrap)
+            .await?;
+        let options = database_url
+            .parse::<PgConnectOptions>()?
+            .options([("search_path", schema.as_str())]);
+        let mut pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect_with(options.clone())
+            .await?;
+        let mut store = PgStore::new(pool.clone());
+        if upgrade {
+            let mut historical = sqlx::migrate!("../migrations");
+            historical
+                .migrations
+                .to_mut()
+                .retain(|migration| migration.version <= 32);
+            historical.run(&pool).await?;
+        } else {
+            store.migrate().await?;
+        }
+        let email = Email::parse(format!("alice-{suffix}@example.com"))?;
+        let principal = store
+            .register_canonical_identity(
+                &google_identity(&suffix, email.as_str())?,
+                "identity-admin",
+            )
+            .await?;
+        let reservation = reserve_governed_connection(
+            &store,
+            &principal.user_id,
+            &email,
+            ConnectionOperationKind::Status,
+            false,
+            &suffix,
+        )
+        .await?;
+        let task_uid = reservation.record.task_uid;
+        let runtime_uid = format!("runtime-{suffix}");
+        store
+            .authorize_task_runtime_creation(task_uid, 1, "controller-a")
+            .await?;
+        store
+            .record_task_runtime_observed(task_uid, 2, &runtime_uid, "1", "controller-a")
+            .await?;
+        let task = store
+            .task(task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?;
+        for generation in [3, 4] {
+            store
+                .decide_task_runtime_authority(
+                    task_uid,
+                    generation,
+                    &steward_connections_v1::envelope(),
+                    task.service_envelope_digest
+                        .as_deref()
+                        .ok_or(StoreError::InvalidTaskTransition)?,
+                    "controller-a",
+                )
+                .await?;
+        }
+        let operation = store
+            .task_runtime_operation(task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?;
+        store
+            .record_task_activation_observed(
+                task_uid,
+                5,
+                &TaskActivationObservation {
+                    runtime_uid: &runtime_uid,
+                    resource_version: "2",
+                    active_manifest_digest: &operation.active_manifest_digest,
+                    provider_set_ready: true,
+                },
+                "controller-a",
+            )
+            .await?;
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let attempt = match store
+            .claim_task_execution_attempt(task_uid, &digest, &digest, "controller-a")
+            .await?
+        {
+            TaskExecutionTransition::Created(attempt) => attempt,
+            other => {
+                return Err(
+                    io::Error::other(format!("unexpected execution claim: {other:?}")).into(),
+                );
+            }
+        };
+        store
+            .authorize_task_execution_start(attempt.attempt_id, 1, "controller-a")
+            .await?;
+        store
+            .record_task_execution_observation(
+                attempt.attempt_id,
+                2,
+                TaskExecutionObservation::Succeeded {
+                    adapter_observation_id: "adapter-result",
+                    result_digest: &digest,
+                    result_reference: "adapter:result",
+                    output_archive: b"neutral transient connection output",
+                },
+                "controller-a",
+            )
+            .await?;
+        if upgrade {
+            // Reproduce the pre-migration failure with a populated successful
+            // Task, then run the normal checksum-checked migration path.
+            assert!(matches!(
+                store
+                    .complete_connection_operation(
+                        task_uid,
+                        &serde_json::json!({"connected": false}),
+                        None,
+                        None,
+                        connection_operation_retention(),
+                    )
+                    .await,
+                Err(StoreError::Database(_))
+            ));
+            let before = store
+                .task(task_uid)
+                .await?
+                .ok_or(StoreError::TaskNotFound)?;
+            let history_before = store.task_execution_attempt(task_uid).await?;
+            store.migrate().await?;
+            // The staged rollout replaces the old processes. Reconnect after
+            // DDL rather than reusing pre-upgrade SELECT * statement caches.
+            pool.close().await;
+            pool = PgPoolOptions::new()
+                .max_connections(8)
+                .connect_with(options)
+                .await?;
+            store = PgStore::new(pool.clone());
+            assert_eq!(store.task(task_uid).await?, Some(before));
+            assert_eq!(
+                store.task_execution_attempt(task_uid).await?,
+                history_before
+            );
+        }
+        // Before the connection result is consumed, even an internal Task's
+        // output cannot be silently erased or replaced.
+        for replacement in [None, Some(b"different output".as_slice())] {
+            assert!(
+                sqlx::query("UPDATE task_submissions SET output_archive = $2 WHERE task_uid = $1")
+                    .bind(task_uid)
+                    .bind(replacement)
+                    .execute(&pool)
+                    .await
+                    .is_err()
+            );
+        }
+        // A terminal connection result alone is insufficient: retiring its
+        // output must request Task cleanup in the same transaction.
+        let mut premature = pool.begin().await?;
+        sqlx::query("UPDATE connection_operations SET operation_state = 'failed', failure_category = 'test_rejection', finalization_state = 'requested', cleanup_state = 'tearing_down' WHERE task_uid = $1")
+            .bind(task_uid).execute(&mut *premature).await?;
+        assert!(
+            sqlx::query("UPDATE task_submissions SET output_archive = NULL WHERE task_uid = $1")
+                .bind(task_uid)
+                .execute(&mut *premature)
+                .await
+                .is_err()
+        );
+        premature.rollback().await?;
+        if reject_result {
+            store
+                .fail_connection_operation(task_uid, "invalid_bridge_result")
+                .await?;
+        } else {
+            store
+                .complete_connection_operation(
+                    task_uid,
+                    &serde_json::json!({"connected": false}),
+                    None,
+                    None,
+                    connection_operation_retention(),
+                )
+                .await?;
+        }
+        let retired = store
+            .task(task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?;
+        assert_eq!(retired.phase, TaskPhase::Succeeded);
+        assert!(retired.finalize_requested);
+        assert!(
+            retired.output_archive.is_none(),
+            "transient connection output must not be retained after consumption"
+        );
+        let history = store
+            .task_execution_attempt(task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?;
+        assert_eq!(history.attempt_id, attempt.attempt_id);
+        assert_eq!(history.runtime_uid, runtime_uid);
+        assert_eq!(history.state, TaskExecutionAttemptState::Succeeded);
+        assert_eq!(history.result_digest.as_deref(), Some(digest.as_str()));
+        let retired_at: Option<String> = sqlx::query_scalar(
+            "SELECT internal_output_retired_at::text FROM task_submissions WHERE task_uid = $1",
+        )
+        .bind(task_uid)
+        .fetch_one(&pool)
+        .await?;
+        assert!(retired_at.is_some());
+        assert!(
+            sqlx::query(
+                "UPDATE task_submissions SET internal_output_retired_at = NULL WHERE task_uid = $1"
+            )
+            .bind(task_uid)
+            .execute(&pool)
+            .await
+            .is_err(),
+            "payload retirement evidence is immutable"
+        );
+        assert!(
+            sqlx::query("UPDATE task_submissions SET output_archive = $2 WHERE task_uid = $1")
+                .bind(task_uid)
+                .bind(b"restored output".as_slice())
+                .execute(&pool)
+                .await
+                .is_err(),
+            "retirement must not reopen the initial output write"
+        );
+        assert!(
+            sqlx::query(
+                "UPDATE task_execution_attempts SET result_digest = $2 WHERE attempt_id = $1"
+            )
+            .bind(attempt.attempt_id)
+            .bind(format!("sha256:{}", "b".repeat(64)))
+            .execute(&pool)
+            .await
+            .is_err(),
+            "retiring a payload does not permit rewriting its immutable result identity"
+        );
+    }
     Ok(())
 }
 
