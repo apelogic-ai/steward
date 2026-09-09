@@ -36,6 +36,21 @@ explicitly recorded as follow-up rather than represented as fixed.
 
 ## Candidate evidence
 
+- Full `cargo xtask ci` passed on `6b460cc`: formatting, workspace Clippy with
+  warnings as errors, workspace tests, all static checks and pinned guarantees.
+  G-1 passed in run `g1-20260909064820-28435` (175.68s), G-2 in 3.19s,
+  G-4 in 26.26s and G-5 in 22.04s. The unchanged gateway image was preloaded;
+  pins, deadlines and assertions were not changed. Exact run resources and
+  credential directories were removed.
+- Full governed-connections E2E passed on `6b460cc`, run
+  `pr78-gov-202609090637`, in 225.96 seconds against pinned OpenShell 0.0.98.
+  This covers status, OAuth start, disconnect, shared-runtime behavior and exact
+  cleanup. A read-only check additionally confirmed that the successful OAuth
+  start Task was finalized with its output absent, retirement timestamp present
+  and result digest preserved. The exact cluster, image aliases, native probe
+  and credential directory were removed; `dev doctor` reported no Steward run
+  artifacts. The connection-output blocker below is resolved. The separate
+  Task E2E cleanup-expectation correction still awaits approval.
 - Maintainer approved the scoped internal connection-output retirement correction.
   New migration 0033 permits a consumed successful internal response to be
   cleared only with matching terminal connection and exact execution evidence,
@@ -45,7 +60,7 @@ explicitly recorded as follow-up rather than represented as fixed.
   `s4_store` tests pass against fresh Postgres, including successful and rejected
   responses, populated 0032-to-0033 upgrade/restart, premature deletion,
   transaction rollback, ordinary-output protection and retirement/history
-  tampering. Full governed E2E and full candidate CI still need to pass.
+  tampering. Full governed E2E and candidate CI subsequently passed as recorded above.
 - Governed-connections rerun `pr78-gov-202609090611` on `a0fb771` passed
   native arm64 preflight, pinned OpenShell 0.0.98 setup and internal runtime
   creation/activation. It then failed in 51.29 seconds: the connection finalizer

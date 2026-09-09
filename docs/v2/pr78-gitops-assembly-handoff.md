@@ -61,9 +61,12 @@ kubeconfigs, or local test artifacts belong in GitOps source.
 ## Required rollout order
 
 1. Drain and finalize legacy Tasks before migration 0028. It intentionally refuses
-   to reinterpret unfinished legacy work. Review migrations 0029–0032 as well:
+   to reinterpret unfinished legacy work. Review migrations 0029–0033 as well:
    retirement migration 0031 fails closed on overlapping unresolved executions
    for one runtime UID.
+   Migration 0033 retires consumed internal connection payloads while preserving
+   immutable execution evidence. Replace old process connections during the
+   staged rollout; populated upgrade/restart is covered by the store tests.
 2. Deploy all new API-server and controller replicas with
    `config.taskOrchestrationMode=staged`. Both binaries require the corresponding
    `STEWARD_TASK_ORCHESTRATION_MODE` value. New public/internal Task submissions,
