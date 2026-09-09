@@ -845,86 +845,6 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
         &run_dir,
     )?;
 
-    let standing = submit(
-        &base_url,
-        "github-assertion",
-        "standing-runtime-123",
-        r#"{"workflow":"code-review","codingAgentRuntime":"base"}"#,
-        &run_dir,
-    )?;
-    let standing_task_uid = json_string(&standing, "taskUid")?;
-    let standing_bound =
-        wait_for_runtime_binding(&base_url, standing_task_uid, "github-assertion", &run_dir)?;
-    let standing_runtime_uid = json_string(&standing_bound, "runtimeUid")?;
-    let adopted_body = format!(
-        r#"{{"workflow":"code-review","codingAgentRuntime":"base","agentRuntimeUid":"{standing_runtime_uid}"}}"#
-    );
-    let adopted = submit(
-        &base_url,
-        "github-assertion",
-        "adopted-runtime-123",
-        &adopted_body,
-        &run_dir,
-    )?;
-    assert_eq!(adopted["runtimeOwnership"], "adopted");
-    assert_eq!(
-        adopted["runtimeUid"], standing_runtime_uid,
-        "the pinned legacy caller requires the immutable adopted target UID"
-    );
-    let adopted_task_uid = json_string(&adopted, "taskUid")?;
-    // The legacy wire target is not evidence of controller binding. Observe the
-    // durable row before asserting the bound retry response or executing work.
-    wait_for_durable_runtime_binding(&store, adopted_task_uid, standing_runtime_uid).await?;
-    let adopted_bound =
-        wait_for_runtime_binding(&base_url, adopted_task_uid, "github-assertion", &run_dir)?;
-    assert_eq!(adopted_bound["runtimeUid"], standing_runtime_uid);
-    let adopted_retry = submit_response(
-        &base_url,
-        "github-assertion",
-        "adopted-runtime-123",
-        &adopted_body,
-        &run_dir,
-    )?;
-    assert_eq!(adopted_retry.http_status, 201);
-    assert_eq!(adopted_retry.body["taskUid"], adopted_task_uid);
-    assert_eq!(adopted_retry.body["runtimeUid"], standing_runtime_uid);
-    put_archive(
-        &base_url,
-        adopted_task_uid,
-        "github-assertion",
-        &input_tar,
-        &run_dir,
-    )?;
-    execute(&base_url, adopted_task_uid, "github-assertion", &run_dir)?;
-    wait_for(
-        &base_url,
-        adopted_task_uid,
-        "github-assertion",
-        |status| status["phase"] == "succeeded",
-        &run_dir,
-    )?;
-    delete_task(&base_url, adopted_task_uid, "github-assertion", &run_dir)?;
-    wait_for(
-        &base_url,
-        adopted_task_uid,
-        "github-assertion",
-        |status| status["finalized"] == true,
-        &run_dir,
-    )?;
-    assert!(
-        runtime_by_uid(&runtime_api, standing_runtime_uid)
-            .await?
-            .is_some()
-    );
-    delete_task(&base_url, standing_task_uid, "github-assertion", &run_dir)?;
-    wait_for(
-        &base_url,
-        standing_task_uid,
-        "github-assertion",
-        |status| status["finalized"] == true,
-        &run_dir,
-    )?;
-
     let failing = submit(
         &base_url,
         "github-assertion",
@@ -1431,25 +1351,6 @@ fn replace_runtime_for_stale_uid_test(
         .into());
     }
     json_string(&serde_json::from_slice(&fs::read(response)?)?, "runtimeUid").map(str::to_owned)
-}
-
-async fn wait_for_durable_runtime_binding(
-    store: &PgStore,
-    task_uid: &str,
-    expected_runtime_uid: &str,
-) -> Result<(), Box<dyn Error>> {
-    let task_uid = task_uid.parse()?;
-    for _attempt in 0..240 {
-        if let Some(task) = store.task(task_uid).await? {
-            if let Some(runtime_uid) = task.runtime_uid {
-                assert_eq!(runtime_uid, expected_runtime_uid);
-                return Ok(());
-            }
-            assert!(!task.finalized, "adopted Task finalized before UID binding");
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    Err(io::Error::other("controller did not durably bind the adopted runtime UID").into())
 }
 
 fn wait_for_runtime_binding(

@@ -1,6 +1,15 @@
 # Correction ticket: preserve legacy adopted runtimes in durable Task orchestration
 
-Status: accepted correction for PR #78
+Status: historical correction; legacy adoption E2E acceptance retired from the
+PR #78 V2 demo cutoff by explicit maintainer direction on 2026-09-09.
+
+The maintainer approved removing the standing-runtime adoption / execute-and-detach
+scenario after it returned HTTP 409 in the full Task run. That failure is not
+claimed fixed. The acceptance statements below describe the earlier compatibility
+commitment, not a verified capability of this demo candidate. Production identity
+and authority checks, historical-row handling and focused safety tests remain;
+this decision does not broaden adoption or change the frozen public schema.
+Approval: [PR #78 record](https://github.com/apelogic-ai/steward/pull/78#issuecomment-5597899495).
 
 Target: `feat/v2-common-core-sprint`, existing PR #78
 

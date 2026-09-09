@@ -1,10 +1,10 @@
 # PR #78: GitOps assembly handoff
 
-Status: blocked candidate, not a completed handoff or deployment approval.
-The final Task run `task-20260909065936-32809` passed the approved revocation
-cleanup and earlier executions, but legacy adoption returned HTTP 409. Legacy
-execute-and-detach therefore remains unverified. See the completion checklist;
-do not treat passing production CI/governed E2E as a full Task-suite pass.
+Status: V2-only candidate awaiting final verification; not deployment approval.
+The maintainer explicitly retired legacy adoption / execute-and-detach from this
+demo's acceptance scope after run `task-20260909065936-32809` returned HTTP 409.
+That compatibility defect is not claimed fixed. Remaining V2 Task scenarios stay
+enabled; see the completion checklist for the final run result.
 
 Source: [PR #78](https://github.com/apelogic-ai/steward/pull/78),
 `feat/v2-common-core-sprint`. Lifecycle checkpoint: `5b46b58`.
@@ -22,8 +22,9 @@ tests. Candidate evidence and remaining gates are in the
 This PR supplies the common Task core: immutable deployment-owned execution
 bindings, disposable Task provisioning, exact-UID legacy adoption, durable
 admission/approval/runtime orchestration, execution ownership, and cleanup.
-Public M1 callers cannot choose runtime UIDs. Legacy adopted execution detaches
-without deleting the shared runtime.
+Public M1 callers cannot choose runtime UIDs. Do not assemble this demo around
+legacy runtime adoption: execute-and-detach is no longer an E2E-verified handoff
+claim. Existing shared-runtime identity and cleanup protections remain in code.
 
 It does **not** implement resident Task dispatch, AgentInstance/AgentSession APIs,
 or the later common event/UI and GitHub Actions publication lanes. A demo requiring
@@ -87,7 +88,7 @@ kubeconfigs, or local test artifacts belong in GitOps source.
 5. Run the selected demo path through normal authentication and admission. Verify
    exact runtime binding, model/tool access where used, output, Task finalization,
    credential retirement, and absence of Task-owned runtime resources. Legacy
-   adoption must preserve its shared runtime.
+   runtime adoption is outside this demo's accepted scope.
 
 An `outcome_unknown` Task does not free a shared runtime for reuse. Quarantine
 survives Task finalization and restart; only exact retirement evidence releases

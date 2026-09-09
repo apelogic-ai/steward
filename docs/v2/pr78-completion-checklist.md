@@ -31,11 +31,19 @@ failures; later passing runs supersede their then-current blocked status.
 | Shared runtime readiness lag versus identity drift | Readiness and stale-UID controls passed before the later adoption failure | Full Task suite remains red |
 | Historical adopted retry (P1) and finalized DELETE retry (P2) | Retry and real-Postgres historical-upgrade regressions green | No new operation or history mutation |
 | Concurrent M1 reservation retry status (P2) | Existing focused retry regression green; no further standalone expansion in P1 slice | Lookup, conflict, and noninserted reservation all return identical 200 retry semantics |
-| Legacy execute-and-detach; M1 server-owned identity | BLOCKED: legacy adoption returns 409 in the full Task run | Resolve or obtain an explicit scoped compatibility decision; no green handoff is claimed |
+| Legacy execute-and-detach | E2E acceptance retired by explicit maintainer direction, 2026-09-09 | Known HTTP 409 is not fixed; do not claim legacy adoption verified for this demo |
+| M1 server-owned identity | Retained in V2 Task tests | Caller-selected runtime identity remains rejected |
 | Immutable profile identity and provider detach | Profile/provider regressions and full CI green; both versioned Task executions passed | Full Task run later failed at adoption; packaged 1.2.0/0.140 compatibility remains an assembly prerequisite |
 
 ## Candidate evidence
 
+- Maintainer explicitly directed removal of the legacy runtime adoption scenario:
+  [approval in PR #78](https://github.com/apelogic-ai/steward/pull/78#issuecomment-5597899495).
+  Only its standing-runtime fixture, adoption/execute/detach assertions and sole-use
+  binding helper are retired. All V2 cases, including final failure cleanup, remain
+  enabled. No production behavior, mandatory gate or conformance-register claim
+  changes. The earlier 409 remains a known unverified compatibility path, not a
+  fixed defect. A full V2-only Task run and final gate remain pending.
 - Final Task run `task-20260909065936-32809` failed after 373.70 seconds at
   legacy adoption: HTTP 409, `adopted runtime does not match the resolved workflow
   and principal`. The copy, both versioned executions, stale-UID/readiness
