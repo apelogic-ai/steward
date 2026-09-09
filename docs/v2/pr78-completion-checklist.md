@@ -36,6 +36,14 @@ explicitly recorded as follow-up rather than represented as fixed.
 
 ## Candidate evidence
 
+- Full `cargo xtask e2e-s4` passed on `f7c51d3` (production/tests `1bb5933`)
+  in run `s4-20260909051236-71957`: all 28 real-Postgres tests passed at normal
+  concurrency in 17.43 seconds, followed by the live instance-bound grant E2E
+  in 27.27 seconds. This includes historical migration, pre-start fencing,
+  quarantine/retirement and approval/finalization regressions. The native server
+  release build passed; exact cluster, image tag and credential directory were
+  confirmed removed. The earlier S4 connection failure did not recur in this
+  completed candidate run.
 - Task run `task-20260909044835-57089` on `84374e6` (production/test tree
   `1bb5933`) again failed during OpenShell 0.0.90 certificate-job setup with
   `DeadlineExceeded`, before any Task assertion. Bounded observations captured
@@ -47,6 +55,11 @@ explicitly recorded as follow-up rather than represented as fixed.
   startup/version probes passed for Codex 0.139.0 and 0.140.0. The native Task
   controller/server image prebuild also passed; neither prebuild nor probes
   substitute for the still-pending full Task E2E.
+  Read-only inspection of the matching chart digest confirmed that its
+  certificate Job has a 120-second active deadline and uses `IfNotPresent`
+  image pulls. The observed 75-second pull consumed much of that deadline;
+  preloading the same pinned image is the next setup diagnostic, without
+  changing the deadline, chart, or assertions.
 - Candidate `1bb5933` passed the complete `cargo xtask ci` quality stage
   (workspace tests, warning-as-error Clippy and all static checks). Full CI then
   failed G-1 in run `g1-20260909034940-38329`: the pinned OpenShell 0.0.90
