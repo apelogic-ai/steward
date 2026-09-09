@@ -26,24 +26,40 @@ failures; later passing runs supersede their then-current blocked status.
 | Retry transient attempt observations | Controller fault-path regression green | Temporary observation error preserves durable rows; recovery observes the same attempt |
 | Orphaned claimed/running marker liveness | Pinned OpenShell 0.0.98 adapter E2E green | Orphaned wrapper becomes uncertain; duplicate start prevented |
 | Cancellation with absent marker/runtime/references | Database/controller fault-path regressions green | Deadlines do not manufacture execution-retirement evidence |
-| Cleanup of pending approval/outbox and active grants | Real-Postgres matrix and full Task run's cleanup assertions passed | Full Task run subsequently failed at legacy adoption; not a whole-suite pass |
+| Cleanup of pending approval/outbox and active grants | Real-Postgres matrix and V2-only full Task E2E green | Exact UID absent, success/output retained, no pending authority or delivery |
 | Approval delivery lease expiry and duplicate external effects (P2) | Existing focused race regression green; no further standalone expansion in P1 slice | Two delivery workers with slow/ambiguous external request |
-| Shared runtime readiness lag versus identity drift | Readiness and stale-UID controls passed before the later adoption failure | Full Task suite remains red |
+| Shared runtime readiness lag versus identity drift | V2-only full Task E2E green | Readiness and stale-UID controls retained |
 | Historical adopted retry (P1) and finalized DELETE retry (P2) | Retry and real-Postgres historical-upgrade regressions green | No new operation or history mutation |
 | Concurrent M1 reservation retry status (P2) | Existing focused retry regression green; no further standalone expansion in P1 slice | Lookup, conflict, and noninserted reservation all return identical 200 retry semantics |
 | Legacy execute-and-detach | E2E acceptance retired by explicit maintainer direction, 2026-09-09 | Known HTTP 409 is not fixed; do not claim legacy adoption verified for this demo |
 | M1 server-owned identity | Retained in V2 Task tests | Caller-selected runtime identity remains rejected |
-| Immutable profile identity and provider detach | Profile/provider regressions and full CI green; both versioned Task executions passed | Full Task run later failed at adoption; packaged 1.2.0/0.140 compatibility remains an assembly prerequisite |
+| Immutable profile identity and provider detach | Profile/provider regressions and full V2 Task E2E green | Both versioned executions passed; packaged 1.2.0/0.140 compatibility remains an assembly prerequisite |
 
 ## Candidate evidence
 
+- Final `cargo xtask ci` passed on `61b9af9`: formatting, warning-as-error
+  Clippy, workspace tests, static checks and pinned G-1/G-2/G-4/G-5. G-1 run
+  `g1-20260909074430-8217` used the unchanged preloaded gateway; G-2 passed
+  in 5.15s, G-4 in 26.25s and G-5 in 18.08s. All four guarantees executed one
+  negative test each with none skipped. Exact G-1 node and credential directory
+  are absent; `dev doctor` passed. The subsequent handoff commit changes only
+  documentation. No further review/fix expansion is included in this cutoff.
+- Full V2-only `cargo xtask e2e-task` passed on `61b9af9`, run
+  `task-20260909072600-79082`, in 256.01 seconds with zero failures. This includes
+  copy, both pinned agent versions, UID/readiness controls, approval execution
+  and revocation cleanup, caller/scheduled executions and final failure cleanup.
+  Native arm64 startup/version probes passed for Codex 0.139 and 0.140. The
+  unchanged OpenShell 0.0.90 gateway was preloaded; no deadline or remaining
+  assertion changed. Run-owned cluster, probes, image aliases and credential
+  directory are absent; `dev doctor` passed. Final CI on this revision also passed.
 - Maintainer explicitly directed removal of the legacy runtime adoption scenario:
   [approval in PR #78](https://github.com/apelogic-ai/steward/pull/78#issuecomment-5597899495).
   Only its standing-runtime fixture, adoption/execute/detach assertions and sole-use
   binding helper are retired. All V2 cases, including final failure cleanup, remain
   enabled. No production behavior, mandatory gate or conformance-register claim
   changes. The earlier 409 remains a known unverified compatibility path, not a
-  fixed defect. A full V2-only Task run and final gate remain pending.
+  fixed defect. The full V2-only Task run and final candidate CI passed as recorded
+  above. Legacy runtime compatibility is excluded, not repaired or verified.
 - Final Task run `task-20260909065936-32809` failed after 373.70 seconds at
   legacy adoption: HTTP 409, `adopted runtime does not match the resolved workflow
   and principal`. The copy, both versioned executions, stale-UID/readiness

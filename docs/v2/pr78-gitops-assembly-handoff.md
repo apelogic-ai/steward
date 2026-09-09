@@ -1,16 +1,23 @@
 # PR #78: GitOps assembly handoff
 
-Status: V2-only candidate awaiting final verification; not deployment approval.
+Status: V2-only source candidate verified for assembly. Not deployment approval.
 The maintainer explicitly retired legacy adoption / execute-and-detach from this
 demo's acceptance scope after run `task-20260909065936-32809` returned HTTP 409.
-That compatibility defect is not claimed fixed. Remaining V2 Task scenarios stay
-enabled; see the completion checklist for the final run result.
+That compatibility defect is not claimed fixed. The remaining full V2 Task E2E
+passed in run `task-20260909072600-79082` (256.01s), and full `cargo xtask ci`
+passed on `61b9af9`, including all pinned guarantees. See the completion checklist
+for earlier real-Postgres, governed-connections and adapter evidence.
 
 Source: [PR #78](https://github.com/apelogic-ai/steward/pull/78),
-`feat/v2-common-core-sprint`. Lifecycle checkpoint: `5b46b58`.
+`feat/v2-common-core-sprint`. Tested code/test checkpoint: `61b9af9`.
 Use the final pushed commit recorded in the PR for assembly, not a moving branch
 name or a mixture of component revisions. No component-image digests or signed
 release artifacts have been produced by this handoff yet.
+
+The persistent `.worktrees/v2-core` lane remains for this PR; it is not a retained
+test environment. All run-owned clusters, probes and credential directories from
+the final Task/CI runs were removed. Other worktrees and foreign workloads were
+left untouched.
 
 ## Cutoff and supplied behavior
 
@@ -20,7 +27,7 @@ tests. Candidate evidence and remaining gates are in the
 [completion checklist](pr78-completion-checklist.md).
 
 This PR supplies the common Task core: immutable deployment-owned execution
-bindings, disposable Task provisioning, exact-UID legacy adoption, durable
+bindings, disposable Task provisioning, durable
 admission/approval/runtime orchestration, execution ownership, and cleanup.
 Public M1 callers cannot choose runtime UIDs. Do not assemble this demo around
 legacy runtime adoption: execute-and-detach is no longer an E2E-verified handoff
