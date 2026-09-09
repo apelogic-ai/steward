@@ -20,8 +20,11 @@ DEV readiness, automated publication, release tags, over-envelope demonstrations
 multiple workflows, or stable-lane evidence.
 
 The [P0 local-main demo ticket](agentic-ops-local-demo-ticket.md) owns repository creation,
-the pre-approved artifact, caller/Identity/runner setup, publication verification, local
-readiness, and two rehearsals. It can start before PR #78 is released.
+the pre-approved artifact, caller/Identity/runner preparation, publication verification,
+and two agreed rehearsals. It can start before PR #78 is released. GitOps owns local-main
+deployment and readiness; development testing uses isolated, run-owned environments.
+The [GitOps demo handoff](agentic-ops-gitops-demo-handoff.md) records prepared pins,
+operator requirements, and the evidence still needed from a real run.
 
 Follow-up implementation may proceed in parallel with P0, which has priority:
 
@@ -36,7 +39,8 @@ Conformance fixtures must match the contract under test: legacy manual publicati
 not evidence of M1 catalog semantics. Shared package, transport, authorization and
 publication interfaces need explicit ownership. Candidate integration needs applicable
 tests; stable acceptance needs compatible releases and approved promotion. The P0
-coordinator schedules shared environment changes and heavy tests sequentially.
+coordinator schedules isolated heavy tests sequentially. GitOps controls local-main
+changes and the agreed demo rehearsal window; development workers do not operate it.
 
 ## Canonical terminology
 
