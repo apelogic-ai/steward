@@ -36,6 +36,24 @@ explicitly recorded as follow-up rather than represented as fixed.
 
 ## Candidate evidence
 
+- Full `cargo xtask ci` passed on `66a6e60` (production/tests `1bb5933`):
+  workspace tests, warning-as-error Clippy, static checks and pinned G-1/G-2/G-4/G-5.
+  G-1 run `g1-20260909054055-86143` passed in 210.63 seconds after preloading
+  the unchanged gateway image; its pin, chart, deadline and assertion were not
+  changed. G-2 passed in 3.49 seconds, G-4 in 28.51 seconds and G-5 in 27.36
+  seconds. Cleanup inventory and `cargo xtask dev doctor` found no run-owned
+  containers or Steward credential directories left behind.
+- Task run `task-20260909052225-76709` on `66a6e60` passed certificate setup
+  after the identical gateway image was preloaded. Its lifecycle test then
+  failed after 410.17 seconds while requiring a revoked Task-owned runtime to
+  remain present in `Pending`. Read-only Postgres evidence showed the approval
+  Task succeeded and finalized, and its exact runtime was absent; the remaining
+  pending runtime was the intentionally preserved same-name replacement from
+  the stale-UID control. The architecture instead requires authority-loss
+  cleanup and exact-UID deletion. Replacement of that intermediate-state
+  expectation with final-cleanup assertions awaits maintainer approval.
+  The later legacy adoption cases did not execute. Exact cluster, image tags,
+  probe containers and credential directory were confirmed removed.
 - Full `cargo xtask e2e-s4` passed on `f7c51d3` (production/tests `1bb5933`)
   in run `s4-20260909051236-71957`: all 28 real-Postgres tests passed at normal
   concurrency in 17.43 seconds, followed by the live instance-bound grant E2E
