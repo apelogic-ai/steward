@@ -76,6 +76,10 @@ path = "s4_server.rs"
 name = "task-server"
 path = "task_server.rs"
 
+[[bin]]
+name = "governed-connections-webhook"
+path = "governed_connections_webhook.rs"
+
 [dependencies]
 axum = "0.8"
 kube = { version = "4.2.0", default-features = false, features = ["client", "ring", "rustls-tls"] }

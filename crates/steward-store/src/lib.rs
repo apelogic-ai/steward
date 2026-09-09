@@ -5465,6 +5465,108 @@ impl PgStore {
         .transpose()
     }
 
+    /// Internal validating-webhook lookup for a connection runtime transition. Namespace and
+    /// name come from the admission object and must resolve to exactly one live, server-authored
+    /// operation. The returned orchestration projection lets admission distinguish the inert
+    /// CREATE from the later active UPDATE without trusting Kubernetes object annotations.
+    pub async fn connection_runtime_admission(
+        &self,
+        runtime_namespace: &str,
+        runtime_name: &str,
+    ) -> Result<Option<ConnectionRuntimeAdmissionRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT operations.*, \
+                    to_char(operations.flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
+                    to_char(operations.response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
+                    tasks.phase AS task_phase, runtime_operation.runtime_uid, \
+                    tasks.output_archive, tasks.finalize_requested, tasks.finalized, \
+                    tasks.candidate_digest, runtime_operation.state AS orchestration_state, \
+                    runtime_operation.runtime_ownership AS orchestration_runtime_ownership, \
+                    runtime_operation.inert_manifest_digest, \
+                    runtime_operation.active_manifest_digest, \
+                    runtime_operation.runtime_create_authorized_at IS NOT NULL \
+                        AS runtime_create_authorized, \
+                    runtime_operation.activation_effect_authorized_at IS NOT NULL \
+                        AS activation_effect_authorized \
+             FROM connection_operations operations \
+             JOIN task_submissions tasks ON tasks.task_uid = operations.task_uid \
+             JOIN task_runtime_operations runtime_operation \
+               ON runtime_operation.task_uid = tasks.task_uid \
+             WHERE runtime_operation.runtime_namespace = $1 \
+               AND runtime_operation.runtime_name = $2 \
+               AND runtime_operation.state IN ('runtime_create_pending', 'activation_pending') \
+               AND runtime_operation.runtime_ownership = 'provisioned' \
+               AND operations.operation_state = 'queued' \
+               AND operations.finalization_state = 'not_requested' \
+               AND tasks.phase = 'queued' \
+               AND NOT tasks.cancel_requested \
+               AND NOT tasks.finalize_requested \
+               AND NOT tasks.finalized \
+               AND operations.response_deadline_at > now() \
+             ORDER BY operations.created_at DESC LIMIT 2",
+        )
+        .bind(runtime_namespace)
+        .bind(runtime_name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if rows.len() > 1 {
+            return Err(StoreError::InvalidConnectionOperation);
+        }
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let candidate_digest = row
+            .try_get::<Option<String>, _>("candidate_digest")
+            .map_err(database_error)?
+            .ok_or(StoreError::InvalidConnectionOperation)?;
+        let orchestration_state = match row
+            .try_get::<String, _>("orchestration_state")
+            .map_err(database_error)?
+            .as_str()
+        {
+            "runtime_create_pending" => TaskOrchestrationState::RuntimeCreatePending,
+            "activation_pending" => TaskOrchestrationState::ActivationPending,
+            _ => return Err(StoreError::InvalidConnectionOperation),
+        };
+        let orchestration_runtime_ownership = match row
+            .try_get::<String, _>("orchestration_runtime_ownership")
+            .map_err(database_error)?
+            .as_str()
+        {
+            "provisioned" => TaskRuntimeOwnership::Provisioned,
+            _ => return Err(StoreError::InvalidConnectionOperation),
+        };
+        let inert_manifest_digest = row
+            .try_get("inert_manifest_digest")
+            .map_err(database_error)?;
+        let active_manifest_digest = row
+            .try_get("active_manifest_digest")
+            .map_err(database_error)?;
+        let runtime_create_authorized = row
+            .try_get("runtime_create_authorized")
+            .map_err(database_error)?;
+        let activation_effect_authorized = row
+            .try_get("activation_effect_authorized")
+            .map_err(database_error)?;
+        let connection = connection_operation_record(row)?;
+        if connection.operation_id != connection.task_uid
+            || runtime_name != format!("conn-{}", connection.operation_id.simple())
+        {
+            return Err(StoreError::InvalidConnectionOperation);
+        }
+        Ok(Some(ConnectionRuntimeAdmissionRecord {
+            connection,
+            orchestration_state,
+            orchestration_runtime_ownership,
+            candidate_digest,
+            inert_manifest_digest,
+            active_manifest_digest,
+            runtime_create_authorized,
+            activation_effect_authorized,
+        }))
+    }
+
     /// Internal runtime-controller lookup. The runtime UID comes from Kubernetes and is matched
     /// through the dedicated task projection; caller-visible task/run queries remain unable to
     /// discover connection operations.
@@ -7142,6 +7244,18 @@ pub struct ConnectionOperationRecord {
 pub struct ConnectionOperationReservation {
     pub inserted: bool,
     pub record: ConnectionOperationRecord,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConnectionRuntimeAdmissionRecord {
+    pub connection: ConnectionOperationRecord,
+    pub orchestration_state: TaskOrchestrationState,
+    pub orchestration_runtime_ownership: TaskRuntimeOwnership,
+    pub candidate_digest: String,
+    pub inert_manifest_digest: String,
+    pub active_manifest_digest: String,
+    pub runtime_create_authorized: bool,
+    pub activation_effect_authorized: bool,
 }
 
 /// The sole durable candidate a stable bridge may inspect before it validates the live object.

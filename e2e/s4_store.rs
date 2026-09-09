@@ -3139,7 +3139,6 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
             .await?,
         TaskOperationTransition::Applied(_)
     ));
-
     let adopted_key = format!("adopted-{suffix}");
     let adopted_runtime_uid = format!("adopted-runtime-{suffix}");
     let adopted_task_uid = Uuid::new_v4();
@@ -5577,13 +5576,69 @@ async fn governed_connection_operations_are_serialized_restart_safe_and_hidden_f
         partial_authority.is_err(),
         "internal task authority pins must be either all absent or all present"
     );
-    let bridge_runtime_uid = format!("bridge-runtime-{suffix}");
+    let bridge_runtime_name = format!("conn-{}", status.record.operation_id.simple());
+    assert!(
+        store
+            .connection_runtime_admission(&status.record.bindings.namespace, &bridge_runtime_name,)
+            .await?
+            .is_none(),
+        "recorded intent must not authorize a Kubernetes CREATE before the durable effect fence"
+    );
+    assert!(
+        store
+            .connection_runtime_admission(
+                &status.record.bindings.namespace,
+                &format!("unrelated-{suffix}"),
+            )
+            .await?
+            .is_none(),
+        "an unrelated runtime name must not resolve internal connection authority"
+    );
     assert!(matches!(
         store
             .authorize_task_runtime_creation(status.record.task_uid, 1, "controller-a")
             .await?,
         TaskOperationTransition::Applied(_)
     ));
+    let admission = store
+        .connection_runtime_admission(&status.record.bindings.namespace, &bridge_runtime_name)
+        .await?
+        .ok_or_else(|| {
+            io::Error::other(
+                "authorized server-authored runtime name did not resolve its admission state",
+            )
+        })?;
+    assert_eq!(
+        admission.connection.operation_id,
+        status.record.operation_id
+    );
+    assert_eq!(
+        admission.orchestration_state,
+        TaskOrchestrationState::RuntimeCreatePending
+    );
+    assert!(admission.runtime_create_authorized);
+    sqlx::query(
+        "UPDATE connection_operations SET response_deadline_at = now() - interval '1 second' \
+         WHERE operation_id = $1",
+    )
+    .bind(status.record.operation_id)
+    .execute(&pool)
+    .await?;
+    assert!(
+        store
+            .connection_runtime_admission(&status.record.bindings.namespace, &bridge_runtime_name,)
+            .await?
+            .is_none(),
+        "an elapsed response deadline must revoke prospective CREATE authority"
+    );
+    sqlx::query(
+        "UPDATE connection_operations SET response_deadline_at = now() + interval '40 seconds' \
+         WHERE operation_id = $1",
+    )
+    .bind(status.record.operation_id)
+    .execute(&pool)
+    .await?;
+    let bridge_runtime_uid = format!("bridge-runtime-{suffix}");
     assert!(matches!(
         store
             .record_task_runtime_observed(
@@ -5596,6 +5651,13 @@ async fn governed_connection_operations_are_serialized_restart_safe_and_hidden_f
             .await?,
         TaskOperationTransition::Applied(_)
     ));
+    assert!(
+        store
+            .connection_runtime_admission(&status.record.bindings.namespace, &bridge_runtime_name,)
+            .await?
+            .is_none(),
+        "an observed runtime must not replay its initial CREATE authority"
+    );
     let task = store
         .task(status.record.task_uid)
         .await?
@@ -5632,6 +5694,21 @@ async fn governed_connection_operations_are_serialized_restart_safe_and_hidden_f
             .await?,
         TaskOperationTransition::Applied(_)
     ));
+    let activation_admission = store
+        .connection_runtime_admission(&status.record.bindings.namespace, &bridge_runtime_name)
+        .await?
+        .ok_or_else(|| {
+            io::Error::other("authorized connection activation did not resolve its admission state")
+        })?;
+    assert_eq!(
+        activation_admission.orchestration_state,
+        TaskOrchestrationState::ActivationPending
+    );
+    assert!(activation_admission.activation_effect_authorized);
+    assert_eq!(
+        activation_admission.connection.runtime_uid.as_deref(),
+        Some(bridge_runtime_uid.as_str())
+    );
     assert!(matches!(
         store
             .record_task_activation_observed(
@@ -5648,6 +5725,13 @@ async fn governed_connection_operations_are_serialized_restart_safe_and_hidden_f
             .await?,
         TaskOperationTransition::Applied(_)
     ));
+    assert!(
+        store
+            .connection_runtime_admission(&status.record.bindings.namespace, &bridge_runtime_name,)
+            .await?
+            .is_none(),
+        "an active runtime must not replay its activation admission authority"
+    );
     let by_runtime = store
         .connection_operation_for_runtime(&bridge_runtime_uid)
         .await?

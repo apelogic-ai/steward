@@ -1,6 +1,6 @@
 //! Kubernetes reconciliation for `AgentRuntime` resources.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -36,11 +36,11 @@ use steward_ports::{
 };
 pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
 use steward_store::{
-    ApprovalDeliveryTransition, ConnectionOperationKind, ConnectionOperationRecord, GrantReversion,
-    PgStore, StoreError, TaskActivationObservation, TaskCleanupCause, TaskCleanupObservation,
-    TaskExecutionAttemptState, TaskExecutionObservation, TaskExecutionTransition,
-    TaskOrchestrationMode, TaskOrchestrationState, TaskOrchestrationWorkItem, TaskRecord,
-    TaskRuntimeOwnership,
+    ApprovalDeliveryTransition, ConnectionOperationKind, ConnectionOperationRecord,
+    ConnectionRuntimeAdmissionRecord, GrantReversion, PgStore, StoreError,
+    TaskActivationObservation, TaskCleanupCause, TaskCleanupObservation, TaskExecutionAttemptState,
+    TaskExecutionObservation, TaskExecutionTransition, TaskOrchestrationMode,
+    TaskOrchestrationState, TaskOrchestrationWorkItem, TaskRecord, TaskRuntimeOwnership,
 };
 #[cfg(test)]
 use steward_types::RuntimeOwnership;
@@ -2075,6 +2075,21 @@ fn connection_operation_authority_action(
         .uid
         .as_deref()
         .ok_or(ReconcileError::MissingRuntimeUid)?;
+    let runtime_matches = connection_operation_runtime_matches(runtime, operation)?;
+    let current_matches = current
+        .is_some_and(|bindings| provider_control_bindings_match(&operation.bindings, bindings));
+
+    if !runtime_matches || operation.runtime_uid.as_deref() != Some(runtime_uid) || !current_matches
+    {
+        return Ok(AuthorityAction::Suspend);
+    }
+    Ok(AuthorityAction::Continue)
+}
+
+fn connection_operation_runtime_matches(
+    runtime: &AgentRuntime,
+    operation: &ConnectionOperationRecord,
+) -> Result<bool, ReconcileError> {
     let namespace = runtime
         .metadata
         .namespace
@@ -2120,41 +2135,211 @@ fn connection_operation_authority_action(
         evaluate(&runtime.spec, &authority).map_err(|error| ReconcileError::InvalidSpec {
             reason: format!("{error:?}"),
         })? == AdmissionDecision::Admit;
-    let current_matches = current
-        .is_some_and(|bindings| provider_control_bindings_match(&operation.bindings, bindings));
 
-    if operation.operation_id != operation.task_uid
-        || operation.provider != "github"
-        || operation.authority_id != steward_connections_v1::AUTHORITY_ID
-        || operation.authority_version != steward_connections_v1::AUTHORITY_VERSION
-        || operation.authority_digest != steward_connections_v1::AUTHORITY_DIGEST
-        || operation.runtime_uid.as_deref() != Some(runtime_uid)
-        || operation.runtime_spec_snapshot != runtime.spec
-        || operation
+    Ok(operation.operation_id == operation.task_uid
+        && operation.provider == "github"
+        && operation.authority_id == steward_connections_v1::AUTHORITY_ID
+        && operation.authority_version == steward_connections_v1::AUTHORITY_VERSION
+        && operation.authority_digest == steward_connections_v1::AUTHORITY_DIGEST
+        && operation.runtime_spec_snapshot == runtime.spec
+        && operation
             .command_snapshot
             .iter()
             .map(String::as_str)
-            .ne(expected_command)
-        || namespace != operation.bindings.namespace
-        || runtime.spec.agent_type.name != steward_connections_v1::AGENT_TYPE
-        || !runtime.spec.llms.is_empty()
-        || runtime.spec.tools.as_slice() != [expected_grant]
-        || runtime.spec.bindings.is_some()
-        || !fixed_limits_match
-        || !identity_matches
-        || !principal_matches
-        || runtime
+            .eq(expected_command)
+        && namespace == operation.bindings.namespace
+        && runtime.spec.agent_type.name == steward_connections_v1::AGENT_TYPE
+        && runtime.spec.llms.is_empty()
+        && runtime.spec.tools.as_slice() == [expected_grant]
+        && runtime.spec.bindings.is_none()
+        && fixed_limits_match
+        && identity_matches
+        && principal_matches
+        && runtime
             .annotations()
             .get(SERVICE_PRINCIPAL_ANNOTATION)
             .map(String::as_str)
-            != Some(steward_connections_v1::SERVICE)
-        || runtime.annotations().contains_key(MEMBER_ROLE_ANNOTATION)
-        || !current_matches
-        || !admitted
-    {
-        return Ok(AuthorityAction::Suspend);
+            == Some(steward_connections_v1::SERVICE)
+        && !runtime.annotations().contains_key(MEMBER_ROLE_ANNOTATION)
+        && !runtime
+            .annotations()
+            .contains_key(PENDING_APPROVAL_ANNOTATION)
+        && admitted)
+}
+
+fn is_connection_operation_candidate(runtime: &AgentRuntime) -> bool {
+    runtime.spec.agent_type.name == steward_connections_v1::AGENT_TYPE
+        || matches!(
+            &runtime.spec.principal,
+            steward_types::Principal::Service { name, .. }
+                if name == steward_connections_v1::SERVICE
+        )
+        || runtime
+            .annotations()
+            .get(SERVICE_PRINCIPAL_ANNOTATION)
+            .is_some_and(|name| name == steward_connections_v1::SERVICE)
+}
+
+fn expected_connection_admission_runtime(
+    admission: &ConnectionRuntimeAdmissionRecord,
+    active: bool,
+) -> AgentRuntime {
+    let connection = &admission.connection;
+    let mut spec = connection.runtime_spec_snapshot.clone();
+    if !active {
+        let authority = steward_connections_v1::envelope();
+        spec.llms.clear();
+        spec.tools.clear();
+        spec.budget.monthly_limit = "0".to_owned();
+        spec.budget.single_run_limit = Some("0".to_owned());
+        spec.budget.currency = authority.spec.budget.currency;
     }
-    Ok(AuthorityAction::Continue)
+    let mode = if active { "active" } else { "inert" };
+    let manifest_digest = if active {
+        &admission.active_manifest_digest
+    } else {
+        &admission.inert_manifest_digest
+    };
+    let mut annotations = BTreeMap::from([
+        (
+            SERVICE_PRINCIPAL_ANNOTATION.to_owned(),
+            steward_connections_v1::SERVICE.to_owned(),
+        ),
+        (
+            TASK_UID_ANNOTATION.to_owned(),
+            connection.task_uid.to_string(),
+        ),
+        (
+            TASK_OPERATION_ANNOTATION.to_owned(),
+            connection.operation_id.to_string(),
+        ),
+        (
+            TASK_MANIFEST_DIGEST_ANNOTATION.to_owned(),
+            manifest_digest.clone(),
+        ),
+        (TASK_RUNTIME_MODE_ANNOTATION.to_owned(), mode.to_owned()),
+    ]);
+    if !active {
+        annotations.insert(
+            PENDING_APPROVAL_ANNOTATION.to_owned(),
+            admission.candidate_digest.clone(),
+        );
+    }
+    let runtime_name = format!("conn-{}", connection.operation_id.simple());
+    let mut runtime = AgentRuntime::new(&runtime_name, spec);
+    runtime.metadata.namespace = Some(connection.bindings.namespace.clone());
+    runtime.metadata.annotations = Some(annotations);
+    runtime
+}
+
+fn connection_admission_runtime_matches(
+    runtime: &AgentRuntime,
+    expected: &AgentRuntime,
+    mode: &str,
+) -> bool {
+    runtime.metadata.namespace == expected.metadata.namespace
+        && runtime.metadata.name == expected.metadata.name
+        && runtime.spec == expected.spec
+        && runtime_mode_matches(runtime, expected, mode)
+}
+
+async fn validate_connection_operation_admission<R: WebhookEnvelopeReader>(
+    request: &AdmissionRequest<AgentRuntime>,
+    operations: &R,
+    controller_username: Option<&str>,
+) -> Option<AdmissionResponse> {
+    let candidate = request.object.as_ref().or(request.old_object.as_ref())?;
+    if !is_connection_operation_candidate(candidate) {
+        return None;
+    }
+    let response = AdmissionResponse::from(request);
+    let Some(expected_controller) = controller_username else {
+        return Some(response.deny("internal connection authority is not configured"));
+    };
+    if request.user_info.username.as_deref() != Some(expected_controller) {
+        return Some(
+            response.deny("internal connection AgentRuntime requires the configured controller"),
+        );
+    }
+    let Some(runtime) = request.object.as_ref() else {
+        return Some(response.deny("internal connection AgentRuntime admission has no object"));
+    };
+    let Some(namespace) = runtime.metadata.namespace.as_deref() else {
+        return Some(response.deny("internal connection AgentRuntime has no namespace"));
+    };
+    let Some(name) = runtime.metadata.name.as_deref() else {
+        return Some(response.deny("internal connection AgentRuntime has no name"));
+    };
+    let admission = match operations
+        .connection_runtime_admission(namespace, name)
+        .await
+    {
+        Ok(Some(admission)) => admission,
+        Ok(None) => {
+            return Some(response.deny(
+                "internal connection AgentRuntime has no exact persisted admission transition",
+            ));
+        }
+        Err(error) => {
+            return Some(response.deny(format!(
+                "internal connection operation lookup failed closed: {error}"
+            )));
+        }
+    };
+    let connection = &admission.connection;
+    let expected_active = expected_connection_admission_runtime(&admission, true);
+    let authority_matches = match connection_operation_runtime_matches(&expected_active, connection)
+    {
+        Ok(matches) => matches,
+        Err(error) => {
+            return Some(response.deny(format!(
+                "internal connection authority validation failed closed: {error:?}"
+            )));
+        }
+    };
+    if connection.provider != "github"
+        || connection.operation_state != steward_store::ConnectionOperationState::Queued
+        || connection.task_phase != TaskPhase::Queued
+        || connection.finalize_requested
+        || connection.finalized
+        || connection.finalization_state != "not_requested"
+        || admission.orchestration_runtime_ownership != TaskRuntimeOwnership::Provisioned
+        || !authority_matches
+    {
+        return Some(response.deny(
+            "internal connection AgentRuntime does not match its persisted queued operation",
+        ));
+    }
+    let expected_inert = expected_connection_admission_runtime(&admission, false);
+    match request.operation {
+        Operation::Create
+            if admission.orchestration_state == TaskOrchestrationState::RuntimeCreatePending
+                && admission.runtime_create_authorized
+                && connection.runtime_uid.is_none()
+                && connection_admission_runtime_matches(runtime, &expected_inert, "inert") =>
+        {
+            Some(response)
+        }
+        Operation::Update
+            if admission.orchestration_state == TaskOrchestrationState::ActivationPending
+                && admission.runtime_create_authorized
+                && admission.activation_effect_authorized
+                && request.old_object.as_ref().is_some_and(|old| {
+                    connection.runtime_uid.as_deref() == old.metadata.uid.as_deref()
+                        && connection_admission_runtime_matches(old, &expected_inert, "inert")
+                })
+                && connection.runtime_uid.as_deref() == runtime.metadata.uid.as_deref()
+                && connection_admission_runtime_matches(runtime, &expected_active, "active") =>
+        {
+            Some(response)
+        }
+        Operation::Create | Operation::Update => Some(response.deny(
+            "internal connection AgentRuntime does not match its authorized orchestration transition",
+        )),
+        _ => Some(response.deny(
+            "internal connection AgentRuntime supports controller-authored CREATE and activation UPDATE only",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -3673,6 +3858,12 @@ pub trait WebhookEnvelopeReader: Clone + Send + Sync + 'static {
         scope_ref: &'a str,
         envelope_revision: i64,
     ) -> WebhookFuture<'a, Result<Vec<AdmissionDelta>, StoreError>>;
+
+    fn connection_runtime_admission<'a>(
+        &'a self,
+        runtime_namespace: &'a str,
+        runtime_name: &'a str,
+    ) -> WebhookFuture<'a, Result<Option<ConnectionRuntimeAdmissionRecord>, StoreError>>;
 }
 
 pub trait WebhookModelCatalog: Clone + Send + Sync + 'static {
@@ -3720,6 +3911,16 @@ impl WebhookEnvelopeReader for PgStore {
                 envelope_revision,
             )
             .await
+        })
+    }
+
+    fn connection_runtime_admission<'a>(
+        &'a self,
+        runtime_namespace: &'a str,
+        runtime_name: &'a str,
+    ) -> WebhookFuture<'a, Result<Option<ConnectionRuntimeAdmissionRecord>, StoreError>> {
+        Box::pin(async move {
+            PgStore::connection_runtime_admission(self, runtime_namespace, runtime_name).await
         })
     }
 }
@@ -4156,6 +4357,14 @@ async fn webhook_handler<R: WebhookEnvelopeReader, C: WebhookModelCatalog>(
                 .is_some_and(|username| is_controller_finalizer_update(&request, username))
             {
                 AdmissionResponse::from(&request)
+            } else if let Some(response) = validate_connection_operation_admission(
+                &request,
+                &state.envelopes,
+                state.controller_username.as_deref(),
+            )
+            .await
+            {
+                response
             } else {
                 validate_admission_with_catalog_for_writers(
                     &request,
@@ -6530,21 +6739,28 @@ mod webhook_tests {
     use axum::http::{Request, StatusCode};
     use kube::core::admission::{AdmissionRequest, AdmissionReview};
     use steward_admission::{AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec};
-    use steward_store::StoreError;
+    use steward_store::{
+        ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase, ConnectionOperationKind,
+        ConnectionOperationRecord, ConnectionOperationState, ConnectionRuntimeAdmissionRecord,
+        StoreError, TaskOrchestrationState, TaskRuntimeOwnership,
+    };
     use steward_types::{
-        AgentRuntime, Budget, Duration, ModelRef, TASK_EXECUTION_BINDING_ANNOTATION,
+        AgentRuntime, Budget, Duration, ModelRef, TASK_EXECUTION_BINDING_ANNOTATION, TaskPhase,
     };
     use tower::ServiceExt;
 
     use super::{
         FINALIZER, WebhookEnvelopeReader, WebhookFuture, WebhookModelCatalog, validate_admission,
         validate_admission_with_catalog, webhook_router,
+        webhook_router_for_controller_with_catalog,
     };
 
     #[derive(Clone)]
     struct FakeEnvelopes {
         envelope: Envelope,
+        return_envelope: bool,
         grants: BTreeMap<String, Vec<AdmissionDelta>>,
+        connection_operations: BTreeMap<(String, String), ConnectionRuntimeAdmissionRecord>,
     }
 
     impl WebhookEnvelopeReader for FakeEnvelopes {
@@ -6553,7 +6769,7 @@ mod webhook_tests {
             _scope_kind: EnvelopeScopeKind,
             _scope_ref: &'a str,
         ) -> WebhookFuture<'a, Result<Option<Envelope>, StoreError>> {
-            Box::pin(async move { Ok(Some(self.envelope.clone())) })
+            Box::pin(async move { Ok(self.return_envelope.then(|| self.envelope.clone())) })
         }
 
         fn grants_for_runtime<'a>(
@@ -6564,6 +6780,20 @@ mod webhook_tests {
             _envelope_revision: i64,
         ) -> WebhookFuture<'a, Result<Vec<AdmissionDelta>, StoreError>> {
             Box::pin(async move { Ok(self.grants.get(runtime_uid).cloned().unwrap_or_default()) })
+        }
+
+        fn connection_runtime_admission<'a>(
+            &'a self,
+            runtime_namespace: &'a str,
+            runtime_name: &'a str,
+        ) -> WebhookFuture<'a, Result<Option<ConnectionRuntimeAdmissionRecord>, StoreError>>
+        {
+            Box::pin(async move {
+                Ok(self
+                    .connection_operations
+                    .get(&(runtime_namespace.to_owned(), runtime_name.to_owned()))
+                    .cloned())
+            })
         }
     }
 
@@ -6685,8 +6915,430 @@ mod webhook_tests {
                     runner: steward_types::RunnerRequirements::default(),
                 },
             },
+            return_envelope: true,
             grants: BTreeMap::new(),
+            connection_operations: BTreeMap::new(),
         }
+    }
+
+    const CONNECTION_CANDIDATE_DIGEST: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const CONNECTION_INERT_DIGEST: &str =
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    const CONNECTION_ACTIVE_DIGEST: &str =
+        "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn governed_connection_active_runtime_value() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "agents.apelogic.ai/v1alpha1",
+            "kind": "AgentRuntime",
+            "metadata": {
+                "name": "conn-00000000000000000000000000000001",
+                "namespace": "steward-connections",
+                "annotations": {
+                    "agents.apelogic.ai/service-principal": "steward-connections",
+                    "agents.apelogic.ai/task-uid": "00000000-0000-0000-0000-000000000001",
+                    "agents.apelogic.ai/orchestration-id": "00000000-0000-0000-0000-000000000001",
+                    "agents.apelogic.ai/manifest-digest": CONNECTION_ACTIVE_DIGEST,
+                    "agents.apelogic.ai/runtime-mode": "active"
+                }
+            },
+            "spec": {
+                "principal": {
+                    "kind": "service",
+                    "name": "steward-connections",
+                    "actingUser": "alice@example.com"
+                },
+                "owner": "alice@example.com",
+                "canonicalAuthority": {
+                    "schemaVersion": "steward/canonical-authority-binding/v1",
+                    "ownerUserId": "usr_0123456789abcdef0123456789abcdef",
+                    "actingUserId": "usr_0123456789abcdef0123456789abcdef"
+                },
+                "agentType": {"name": "connections-bridge"},
+                "llms": [],
+                "tools": [{
+                    "provider": "github",
+                    "resource": "provider-control",
+                    "action": "status"
+                }],
+                "budget": {
+                    "monthlyLimit": "0.00",
+                    "singleRunLimit": "0.00",
+                    "currency": "USD"
+                },
+                "ttl": "2m",
+                "runner": {
+                    "platforms": ["linux"],
+                    "memory": "128Mi",
+                    "compute": "100m",
+                    "storage": "64Mi"
+                }
+            }
+        })
+    }
+
+    fn governed_connection_create_value() -> serde_json::Value {
+        let mut value = admission_review_value();
+        value["request"]["operation"] = serde_json::json!("CREATE");
+        value["request"]["oldObject"] = serde_json::Value::Null;
+        value["request"]["name"] = serde_json::json!("conn-00000000000000000000000000000001");
+        value["request"]["namespace"] = serde_json::json!("steward-connections");
+        value["request"]["userInfo"] = serde_json::json!({
+            "username": "system:serviceaccount:steward-system:steward-controller"
+        });
+        let mut runtime = governed_connection_active_runtime_value();
+        runtime["metadata"]["annotations"]["agents.apelogic.ai/manifest-digest"] =
+            serde_json::json!(CONNECTION_INERT_DIGEST);
+        runtime["metadata"]["annotations"]["agents.apelogic.ai/runtime-mode"] =
+            serde_json::json!("inert");
+        runtime["metadata"]["annotations"]["agents.apelogic.ai/pending-approval"] =
+            serde_json::json!(CONNECTION_CANDIDATE_DIGEST);
+        runtime["spec"]["tools"] = serde_json::json!([]);
+        runtime["spec"]["budget"]["monthlyLimit"] = serde_json::json!("0");
+        runtime["spec"]["budget"]["singleRunLimit"] = serde_json::json!("0");
+        value["request"]["object"] = runtime;
+        value
+    }
+
+    fn persisted_connection_operation() -> Result<ConnectionOperationRecord, String> {
+        let runtime =
+            serde_json::from_value::<AgentRuntime>(governed_connection_active_runtime_value())
+                .map_err(|error| format!("failed to construct connection runtime: {error}"))?;
+        let operation_id =
+            serde_json::from_value(serde_json::json!("00000000-0000-0000-0000-000000000001"))
+                .map_err(|error| format!("failed to construct operation ID: {error}"))?;
+        Ok(ConnectionOperationRecord {
+            operation_id,
+            task_uid: operation_id,
+            canonical_user_id: "usr_0123456789abcdef0123456789abcdef".to_owned(),
+            provider: "github".to_owned(),
+            operation_kind: ConnectionOperationKind::Status,
+            authority_id: steward_admission::internal_authorities::steward_connections_v1::AUTHORITY_ID.to_owned(),
+            authority_version: steward_admission::internal_authorities::steward_connections_v1::AUTHORITY_VERSION,
+            authority_digest: steward_admission::internal_authorities::steward_connections_v1::AUTHORITY_DIGEST.to_owned(),
+            runtime_spec_snapshot: runtime.spec,
+            command_snapshot: vec![
+                "/usr/local/bin/steward-connections-bridge".to_owned(),
+                "--operation".to_owned(),
+                "github.status".to_owned(),
+                "--input".to_owned(),
+                "request.json".to_owned(),
+            ],
+            bindings: ConnectionExecutionBindingSnapshot {
+                artifact_trust_mode: "operator-pinned".to_owned(),
+                bridge_image_digest: "registry.example.test/steward-connections-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
+                mcp_gw_version: "0.3.2".to_owned(),
+                namespace: "steward-connections".to_owned(),
+                runtime_class: "kata-qemu".to_owned(),
+            },
+            idempotency_identity: operation_id.to_string(),
+            uncached_status: false,
+            operation_state: ConnectionOperationState::Queued,
+            oauth_phase: ConnectionOAuthPhase::None,
+            authorization_url: None,
+            authorization_url_digest: None,
+            flow_expires_at: None,
+            cached_status: None,
+            result: None,
+            failure_category: None,
+            finalization_state: "not_requested".to_owned(),
+            cleanup_state: "pending".to_owned(),
+            cleanup_finding: None,
+            response_deadline_at: "2026-09-03T00:00:40Z".to_owned(),
+            task_phase: TaskPhase::Queued,
+            runtime_uid: None,
+            output_archive: None,
+            finalize_requested: false,
+            finalized: false,
+        })
+    }
+
+    fn with_persisted_connection_operation(
+        envelopes: FakeEnvelopes,
+    ) -> Result<FakeEnvelopes, String> {
+        let operation = persisted_connection_operation()?;
+        Ok(with_connection_operation(envelopes, operation))
+    }
+
+    fn with_connection_operation(
+        envelopes: FakeEnvelopes,
+        operation: ConnectionOperationRecord,
+    ) -> FakeEnvelopes {
+        with_connection_admission(
+            envelopes,
+            ConnectionRuntimeAdmissionRecord {
+                connection: operation,
+                orchestration_state: TaskOrchestrationState::RuntimeCreatePending,
+                orchestration_runtime_ownership: TaskRuntimeOwnership::Provisioned,
+                candidate_digest: CONNECTION_CANDIDATE_DIGEST.to_owned(),
+                inert_manifest_digest: CONNECTION_INERT_DIGEST.to_owned(),
+                active_manifest_digest: CONNECTION_ACTIVE_DIGEST.to_owned(),
+                runtime_create_authorized: true,
+                activation_effect_authorized: false,
+            },
+        )
+    }
+
+    fn with_connection_admission(
+        mut envelopes: FakeEnvelopes,
+        admission: ConnectionRuntimeAdmissionRecord,
+    ) -> FakeEnvelopes {
+        envelopes.connection_operations.insert(
+            (
+                "steward-connections".to_owned(),
+                "conn-00000000000000000000000000000001".to_owned(),
+            ),
+            admission,
+        );
+        envelopes
+    }
+
+    async fn call_controller_webhook(
+        value: serde_json::Value,
+        envelopes: FakeEnvelopes,
+    ) -> Result<serde_json::Value, String> {
+        let app = webhook_router_for_controller_with_catalog(
+            envelopes,
+            UsdOnlyCatalog,
+            "system:serviceaccount:steward-system:steward-controller".to_owned(),
+            "system:serviceaccount:steward-system:steward-poc-api".to_owned(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/validate-agent-runtime")
+                    .header("content-type", "application/json")
+                    .body(Body::from(value.to_string()))
+                    .map_err(|error| format!("failed to build webhook request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("webhook route failed: {error}"))?;
+        if response.status() != StatusCode::OK {
+            return Err(format!(
+                "webhook returned unexpected HTTP status {}",
+                response.status()
+            ));
+        }
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("failed to read webhook response: {error}"))?;
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .map_err(|error| format!("webhook response was not JSON: {error}"))
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_an_unpersisted_connection_operation() -> Result<(), String> {
+        let mut envelopes = fake_envelopes();
+        envelopes.return_envelope = false;
+        let review = call_controller_webhook(governed_connection_create_value(), envelopes).await?;
+        assert_eq!(
+            review.pointer("/response/allowed"),
+            Some(&serde_json::json!(false)),
+            "an internal authority must not be usable without exact persisted operation state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_a_connection_operation_from_another_trusted_writer()
+    -> Result<(), String> {
+        let mut value = governed_connection_create_value();
+        value["request"]["userInfo"]["username"] =
+            serde_json::json!("system:serviceaccount:steward-system:steward-poc-api");
+        let mut envelopes = fake_envelopes();
+        envelopes.return_envelope = false;
+        let envelopes = with_persisted_connection_operation(envelopes)?;
+        let review = call_controller_webhook(value, envelopes).await?;
+        assert_eq!(
+            review.pointer("/response/allowed"),
+            Some(&serde_json::json!(false)),
+            "the apiserver is trusted for ordinary desired state but must not mint internal connection runtimes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_tampered_connection_specs_and_candidate_markers() -> Result<(), String>
+    {
+        let mut ordinary_tool = governed_connection_create_value();
+        ordinary_tool["request"]["object"]["spec"]["tools"] = serde_json::json!([{
+            "provider": "github",
+            "resource": "repository",
+            "action": "get_file_contents"
+        }]);
+        let mut wrong_annotation = governed_connection_create_value();
+        wrong_annotation["request"]["object"]["metadata"]["annotations"]["agents.apelogic.ai/service-principal"] =
+            serde_json::json!("other-service");
+        let mut wrong_principal = governed_connection_create_value();
+        wrong_principal["request"]["object"]["spec"]["principal"]["name"] =
+            serde_json::json!("other-service");
+
+        for (case, value) in [
+            ("ordinary MCP tool", ordinary_tool),
+            ("changed service annotation", wrong_annotation),
+            ("changed service principal", wrong_principal),
+        ] {
+            let mut envelopes = fake_envelopes();
+            envelopes.return_envelope = false;
+            let envelopes = with_persisted_connection_operation(envelopes)?;
+            let review = call_controller_webhook(value, envelopes).await?;
+            assert_eq!(
+                review.pointer("/response/allowed"),
+                Some(&serde_json::json!(false)),
+                "internal connection authority must reject {case}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_replayed_terminal_and_finalized_connection_operations()
+    -> Result<(), String> {
+        let mut replayed = persisted_connection_operation()?;
+        replayed.runtime_uid = Some("runtime-uid-a".to_owned());
+
+        let mut terminal = persisted_connection_operation()?;
+        terminal.operation_state = ConnectionOperationState::Succeeded;
+        terminal.task_phase = TaskPhase::Succeeded;
+
+        let mut finalized = persisted_connection_operation()?;
+        finalized.finalize_requested = true;
+        finalized.finalized = true;
+        finalized.finalization_state = "finalized".to_owned();
+
+        for (case, operation) in [
+            ("replayed", replayed),
+            ("terminal", terminal),
+            ("finalized", finalized),
+        ] {
+            let mut envelopes = fake_envelopes();
+            envelopes.return_envelope = false;
+            let review = call_controller_webhook(
+                governed_connection_create_value(),
+                with_connection_operation(envelopes, operation),
+            )
+            .await?;
+            assert_eq!(
+                review.pointer("/response/allowed"),
+                Some(&serde_json::json!(false)),
+                "a {case} operation must not authorize another AgentRuntime CREATE"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_changed_connection_authority_and_command_snapshots()
+    -> Result<(), String> {
+        let mut changed_authority = persisted_connection_operation()?;
+        changed_authority.authority_version = 2;
+        let mut changed_command = persisted_connection_operation()?;
+        changed_command.command_snapshot[2] = "github.disconnect".to_owned();
+
+        for (case, operation) in [
+            ("authority pins", changed_authority),
+            ("command snapshot", changed_command),
+        ] {
+            let mut envelopes = fake_envelopes();
+            envelopes.return_envelope = false;
+            let review = call_controller_webhook(
+                governed_connection_create_value(),
+                with_connection_operation(envelopes, operation),
+            )
+            .await?;
+            assert_eq!(
+                review.pointer("/response/allowed"),
+                Some(&serde_json::json!(false)),
+                "changed connection {case} must fail closed"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_admits_an_exact_persisted_connection_operation_without_a_service_envelope()
+    -> Result<(), String> {
+        let mut envelopes = fake_envelopes();
+        envelopes.return_envelope = false;
+        let envelopes = with_persisted_connection_operation(envelopes)?;
+        let review = call_controller_webhook(governed_connection_create_value(), envelopes).await?;
+        assert_eq!(
+            review.pointer("/response/allowed"),
+            Some(&serde_json::json!(true)),
+            "the exact server-authored connection operation must use its immutable internal authority: {review}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_admits_only_the_exact_authorized_connection_activation_update()
+    -> Result<(), String> {
+        let mut value = governed_connection_create_value();
+        value["request"]["operation"] = serde_json::json!("UPDATE");
+        let mut old_runtime = value["request"]["object"].clone();
+        old_runtime["metadata"]["uid"] = serde_json::json!("runtime-uid-a");
+        let mut active_runtime = governed_connection_active_runtime_value();
+        active_runtime["metadata"]["uid"] = serde_json::json!("runtime-uid-a");
+        value["request"]["oldObject"] = old_runtime;
+        value["request"]["object"] = active_runtime;
+
+        let mut operation = persisted_connection_operation()?;
+        operation.runtime_uid = Some("runtime-uid-a".to_owned());
+        let admission = ConnectionRuntimeAdmissionRecord {
+            connection: operation,
+            orchestration_state: TaskOrchestrationState::ActivationPending,
+            orchestration_runtime_ownership: TaskRuntimeOwnership::Provisioned,
+            candidate_digest: CONNECTION_CANDIDATE_DIGEST.to_owned(),
+            inert_manifest_digest: CONNECTION_INERT_DIGEST.to_owned(),
+            active_manifest_digest: CONNECTION_ACTIVE_DIGEST.to_owned(),
+            runtime_create_authorized: true,
+            activation_effect_authorized: true,
+        };
+        let mut envelopes = fake_envelopes();
+        envelopes.return_envelope = false;
+        let review = call_controller_webhook(
+            value.clone(),
+            with_connection_admission(envelopes.clone(), admission.clone()),
+        )
+        .await?;
+        assert_eq!(
+            review.pointer("/response/allowed"),
+            Some(&serde_json::json!(true)),
+            "the exact authorized inert-to-active transition must bypass the absent service Envelope: {review}"
+        );
+
+        let mut unauthorized = admission;
+        unauthorized.activation_effect_authorized = false;
+        let review =
+            call_controller_webhook(value, with_connection_admission(envelopes, unauthorized))
+                .await?;
+        assert_eq!(
+            review.pointer("/response/allowed"),
+            Some(&serde_json::json!(false)),
+            "activation must fail before its durable external-effect authorization"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_uses_persisted_unbound_state_when_create_has_an_api_server_uid()
+    -> Result<(), String> {
+        let mut value = governed_connection_create_value();
+        value["request"]["object"]["metadata"]["uid"] =
+            serde_json::json!("api-server-assigned-runtime-uid");
+        let mut envelopes = fake_envelopes();
+        envelopes.return_envelope = false;
+        let envelopes = with_persisted_connection_operation(envelopes)?;
+        let review = call_controller_webhook(value, envelopes).await?;
+        assert_eq!(
+            review.pointer("/response/allowed"),
+            Some(&serde_json::json!(true)),
+            "Kubernetes object metadata must not replace the persisted unbound task as the prospective CREATE authority boundary: {review}"
+        );
+        Ok(())
     }
 
     #[tokio::test]

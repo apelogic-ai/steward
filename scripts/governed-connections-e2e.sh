@@ -18,6 +18,7 @@ docker info >/dev/null
 MCP_GW_LOCAL_IMAGE="steward/mcp-gw-github-wrapper:${RUN_ID}"
 MINT_IMAGE="steward/mint:${RUN_ID}"
 BRIDGE_IMAGE="steward/connections-bridge:${RUN_ID}"
+WEBHOOK_IMAGE="steward/connections-webhook:${RUN_ID}"
 SANDBOX_IMAGE="steward/workflow-sandbox:${RUN_ID}"
 
 cleanup() {
@@ -26,6 +27,7 @@ cleanup() {
   docker image rm "${MCP_GW_LOCAL_IMAGE}" >/dev/null 2>&1 || true
   docker image rm "${MINT_IMAGE}" >/dev/null 2>&1 || true
   docker image rm "${BRIDGE_IMAGE}" >/dev/null 2>&1 || true
+  docker image rm "${WEBHOOK_IMAGE}" >/dev/null 2>&1 || true
   docker image rm "${SANDBOX_IMAGE}" >/dev/null 2>&1 || true
   exit "${status}"
 }
@@ -60,6 +62,11 @@ docker build \
   "${ROOT}"
 docker build \
   --label "steward.test/run-id=${RUN_ID}" \
+  --file "${ROOT}/e2e/Dockerfile.governed-connections-webhook" \
+  --tag "${WEBHOOK_IMAGE}" \
+  "${ROOT}"
+docker build \
+  --label "steward.test/run-id=${RUN_ID}" \
   --file "${ROOT}/e2e/Dockerfile.workflow-sandbox" \
   --tag "${SANDBOX_IMAGE}" \
   "${ROOT}"
@@ -69,6 +76,7 @@ STEWARD_OPEN_SHELL_RELEASE=v0.0.98 \
 STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE="${MCP_GW_LOCAL_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_MINT_IMAGE="${MINT_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE="${BRIDGE_IMAGE}" \
+STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE="${WEBHOOK_IMAGE}" \
 STEWARD_OPENSHELL_SANDBOX_IMAGE="${SANDBOX_IMAGE}" \
 bash "${ROOT}/scripts/s0-0-openshell-spike.sh" \
   bash "${ROOT}/scripts/governed-connections-inside.sh"
