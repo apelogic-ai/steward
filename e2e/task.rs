@@ -715,7 +715,10 @@ async fn e2e_controller_owned_task_runtime_lifecycle() -> Result<(), Box<dyn Err
     .bind(runtime_uid)
     .fetch_one(store.pool())
     .await?;
-    assert!(authority_retired, "finalized Task retained approval authority");
+    assert!(
+        authority_retired,
+        "finalized Task retained approval authority"
+    );
     get_output(
         &base_url,
         task_uid,
