@@ -116,7 +116,8 @@ AgentSession, AgentInstance, TaskGraph, and DEV readiness are explicitly unneces
 ## Exit criteria
 
 1. Two customer-authored TaskDefinitions execute independently through the pinned GHA
-   path in local-main.
+   path in an isolated, run-owned integration environment. Development testing does
+   not use the GitOps-managed local-main demo cluster.
 2. The over-envelope negative path remains inert without execution authority, and approve, reject,
    expiry, revocation, and stale-authority cases have deterministic outcomes.
 3. Unauthorized cross-workflow/catalog substitutions fail before execution; authorized
@@ -148,7 +149,9 @@ resolver/store code, Identity configuration, or caller workflows. P0 owns the de
 package and caller; A owns publication tooling and the catalog integration handoff;
 B owns additional test scenarios and harnesses. Reuse agreed transport and manifest
 versions, digest rules, source/catalog bindings, and publisher authorization.
-Only the coordinator may schedule shared local-main deployment/configuration changes,
-credentials, dispatches, or heavy tests. Stable execution follows a green main matrix
-and compatible release/promotion; heavy lanes never overlap. A legacy manual fixture
+The coordinator schedules isolated development tests; GitOps owns local-main changes
+and readiness. No development test, recovery, or deployment uses local-main. The P0
+demo rehearsal is a separately agreed GitOps handoff after isolated checks pass.
+Stable execution follows a green isolated matrix and compatible release/promotion;
+heavy lanes never overlap. A legacy manual fixture
 cannot stand in for an M1 publication witness or catalog-scoped admission.

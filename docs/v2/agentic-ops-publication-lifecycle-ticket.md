@@ -133,7 +133,9 @@ Agree on package layout, manifest/lock versions, digest rules, publication autho
 catalog/source bindings, request/response versions, and transport pins before integration.
 Assign one owner to shared catalog/resolver/store code and one owner to agentic-ops
 package paths. Use separate branches; coordinate edits rather than rewriting shared work.
-The P0 coordinator alone schedules local-main deployments, credential changes, GHA
-dispatches, and heavy tests. This ticket must not upgrade the demo stack independently.
+The P0 coordinator schedules isolated development tests and hands demo requirements
+to GitOps. GitOps owns local-main deployment, readiness, and the agreed rehearsal
+window; development workers must not use it for testing or recovery. This ticket
+must not upgrade or operate the demo stack independently.
 Manual fixtures may unblock B only when they exercise the same contract; copying a
 legacy prompt is not a substitute for M1 publication/resolution coverage.
