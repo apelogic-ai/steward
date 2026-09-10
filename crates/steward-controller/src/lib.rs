@@ -2261,6 +2261,9 @@ async fn validate_connection_operation_admission<R: WebhookEnvelopeReader>(
             response.deny("internal connection AgentRuntime requires the configured controller"),
         );
     }
+    if request.operation == Operation::Delete {
+        return Some(response);
+    }
     let Some(runtime) = request.object.as_ref() else {
         return Some(response.deny("internal connection AgentRuntime admission has no object"));
     };
@@ -7269,6 +7272,34 @@ mod webhook_tests {
             review.pointer("/response/allowed"),
             Some(&serde_json::json!(true)),
             "the exact server-authored connection operation must use its immutable internal authority: {review}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_admits_controller_cleanup_delete_for_a_connection_runtime()
+    -> Result<(), String> {
+        let mut value = governed_connection_create_value();
+        value["request"]["operation"] = serde_json::json!("DELETE");
+        value["request"]["oldObject"] = value["request"]["object"].clone();
+        value["request"]["object"] = serde_json::Value::Null;
+
+        let mut envelopes = fake_envelopes();
+        envelopes.return_envelope = false;
+        let review = call_controller_webhook(value.clone(), envelopes.clone()).await?;
+        assert_eq!(
+            review.pointer("/response/allowed"),
+            Some(&serde_json::json!(true)),
+            "the configured controller must be able to delete its terminal connection runtime during cleanup: {review}"
+        );
+
+        value["request"]["userInfo"]["username"] =
+            serde_json::json!("system:serviceaccount:steward-system:other-writer");
+        let review = call_controller_webhook(value, envelopes).await?;
+        assert_eq!(
+            review.pointer("/response/allowed"),
+            Some(&serde_json::json!(false)),
+            "a different writer must not acquire deletion authority over a connection runtime: {review}"
         );
         Ok(())
     }
