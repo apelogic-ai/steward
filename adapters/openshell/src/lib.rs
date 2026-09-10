@@ -486,7 +486,7 @@ fn output_archive_command(
     }
 }
 
-#[cfg(all(feature = "runtime", test))]
+#[cfg(feature = "runtime")]
 fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
     let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
     if stderr.contains("steward-connections-bridge:")
@@ -579,6 +579,23 @@ fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
         "network"
     } else {
         "agent"
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn attach_task_agent_failure_category(
+    observation: SandboxTaskObservation,
+    stderr: &[u8],
+) -> SandboxTaskObservation {
+    match observation {
+        SandboxTaskObservation::Failed {
+            adapter_observation_id,
+            ..
+        } => SandboxTaskObservation::Failed {
+            adapter_observation_id,
+            reason: task_agent_failure_category(stderr).to_owned(),
+        },
+        observation => observation,
     }
 }
 
@@ -2262,8 +2279,16 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 },
             )
             .await;
-        let Err(execution_error) = executed else {
-            return self.observe_task(attempt_id, request).await;
+        let execution_error = match executed {
+            Ok(executed) => {
+                return self
+                    .observe_task(attempt_id, request)
+                    .await
+                    .map(|observation| {
+                        attach_task_agent_failure_category(observation, &executed.stderr)
+                    });
+            }
+            Err(execution_error) => execution_error,
         };
         match self.observe_task(attempt_id, request).await {
             Ok(SandboxTaskObservation::Absent) => Err(execution_error),
@@ -2576,7 +2601,10 @@ mod tests {
     use tokio::sync::{Mutex, mpsc as tokio_mpsc};
 
     #[cfg(feature = "runtime")]
-    use steward_ports::{PortError, SandboxExecutionClass, SandboxRequest, TaskAttemptId};
+    use steward_ports::{
+        PortError, SandboxExecutionClass, SandboxRequest, SandboxTaskObservation,
+        SandboxTaskOutput, TaskAttemptId,
+    };
     #[cfg(feature = "runtime")]
     use steward_types::{
         AgentType, DisposableExecutionBinding, ExecutionProviderProfile, ExecutionProviderProfiles,
@@ -2592,10 +2620,10 @@ mod tests {
         OpenShellTaskLogMode, ProviderReconciliation, STAGING_EXEC_STDIN_CHUNK_BYTES,
         SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream, TaskProcessLogContext,
         TaskProcessLogSink, TaskProcessStream, WorkloadExchangeTokenProvider,
-        collect_task_process_stream, delete_owned_sandbox, deletion_names, load_source_credential,
-        output_archive_command, project_request, provider_reconciliation,
-        provider_reconciliation_plan, provider_reconciliation_targets, sandbox_spec,
-        staging_append_command, staging_archive_chunks, staging_extract_command,
+        attach_task_agent_failure_category, collect_task_process_stream, delete_owned_sandbox,
+        deletion_names, load_source_credential, output_archive_command, project_request,
+        provider_reconciliation, provider_reconciliation_plan, provider_reconciliation_targets,
+        sandbox_spec, staging_append_command, staging_archive_chunks, staging_extract_command,
         staging_prepare_command, task_agent_failure_category, task_attempt_directory,
         task_attempt_execution_command, task_attempt_observation_command, task_process_log_record,
         validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
@@ -4446,6 +4474,44 @@ mod tests {
             "authentication"
         );
         assert_eq!(task_agent_failure_category(b"opaque failure"), "agent");
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn failed_task_observation_uses_the_safe_stderr_category() {
+        assert_eq!(
+            attach_task_agent_failure_category(
+                SandboxTaskObservation::Failed {
+                    adapter_observation_id: "attempt-a".to_owned(),
+                    reason: "raw failure".to_owned(),
+                },
+                b"steward-connections-bridge: bridge MCP-GW rejected runtime authorization",
+            ),
+            SandboxTaskObservation::Failed {
+                adapter_observation_id: "attempt-a".to_owned(),
+                reason: "bridge-runtime-authorization".to_owned(),
+            },
+            "provider-control stderr must be reduced to an allowlisted category before persistence"
+        );
+
+        assert_eq!(
+            attach_task_agent_failure_category(
+                SandboxTaskObservation::Succeeded {
+                    adapter_observation_id: "attempt-b".to_owned(),
+                    output: SandboxTaskOutput {
+                        archive: vec![1, 2, 3],
+                    },
+                },
+                b"opaque stderr",
+            ),
+            SandboxTaskObservation::Succeeded {
+                adapter_observation_id: "attempt-b".to_owned(),
+                output: SandboxTaskOutput {
+                    archive: vec![1, 2, 3],
+                },
+            },
+            "successful observations must remain unchanged"
+        );
     }
 
     #[cfg(feature = "runtime")]

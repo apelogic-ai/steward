@@ -5965,8 +5965,9 @@ impl PgStore {
         sqlx::query(
             "UPDATE task_submissions \
              SET phase = CASE WHEN phase IN ('succeeded', 'failed') THEN phase ELSE 'failed' END, \
-                 output_archive = NULL, finalize_requested = true, failure_reason = $2, \
-                 updated_at = now() WHERE task_uid = $1",
+                 output_archive = NULL, finalize_requested = true, \
+                 failure_reason = COALESCE(failure_reason, $2), updated_at = now() \
+             WHERE task_uid = $1 AND NOT finalized",
         )
         .bind(task_uid)
         .bind(category)
