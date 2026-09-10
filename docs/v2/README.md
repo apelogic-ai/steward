@@ -12,6 +12,40 @@ See the [documentation index](../README.md) for authority order and the
 [deferred-contract register](deferred-implementation-contracts.md) for decisions that
 still require separate design and acceptance.
 
+## Direct-package GHA demonstration
+
+The accepted [direct Git package architecture](direct-package-task-invocation.md) lets
+an authorized GHA caller invoke an exact package from an admitted Git repository
+without mandatory catalog publication. Git remains the package system of record;
+Steward resolves the exact package itself and executes it under an active,
+administrator-approved Envelope through the common Task application service.
+
+The [P0 demo ticket](agentic-ops-local-demo-ticket.md) coordinates one pre-reviewed
+release-summary package in `apelogic-ai/agentic-ops`, invoked cross-repository from
+`apelogic-ai/gitops`. The demo uses real GitHub MCP calls, returns a Markdown report,
+and replays an explicitly enabled successful-run stdout/stderr transcript to GHA. It
+does not require AgentSession, DEV readiness, live approval ceremonies, catalog
+publication, release tags, multiple workflows, or stable-lane breadth.
+
+Implementation ownership is split into independently reviewable tickets:
+
+- [DP-C01: direct-package contracts](direct-package-contract-ticket.md);
+- [DP-I01: verified source provenance](identity-source-provenance-ticket.md);
+- [DP-G01: Git source port and GitHub adapter](github-source-adapter-ticket.md);
+- [DP-S01: Steward direct Task path](direct-package-task-path-ticket.md);
+- [DP-R01: runner transport and transcript](steward-run-direct-package-transport-ticket.md);
+- [DP-A01: neutral release-summary package](agentic-ops-release-summary-package-ticket.md);
+- [DP-O01: GitOps/UI activation](agentic-ops-gitops-demo-handoff.md); and
+- [DP-P00: P0 demo coordination](agentic-ops-local-demo-ticket.md).
+
+The [optional publication ticket](agentic-ops-publication-lifecycle-ticket.md) and
+[broader conformance ticket](customer-authored-task-conformance-ticket.md) are
+post-P0. The [durable diagnostics ticket](task-execution-observability-ticket.md)
+generalizes P0's successful-run transcript to failed, cancelled, and rejected Tasks.
+DP-I01, DP-G01, DP-R01, and DP-A01 may proceed in parallel after DP-C01. Heavy test
+lanes remain serialized. GitOps controls local-main; development workers do not operate
+it.
+
 ## Canonical terminology
 
 | Term | Accepted meaning |
