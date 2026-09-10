@@ -14,7 +14,7 @@ contracts remain authoritative; this record does not relax their exit criteria.
 |---|---|---|---|
 | DP-P00 | `apelogic-ai/steward` | in progress | Coordinates the complete demo evidence. |
 | DP-C01 | `apelogic-ai/steward` | in progress | Contract/schema lane; blocks serialization freeze in downstream lanes. |
-| DP-I01 | `github-oidc-exchange` | in progress | Seam inventory and red tests may proceed; synchronize exact fields to DP-C01. |
+| DP-I01 | `github-oidc-exchange` | in progress | Verified provenance belongs in signed exchange-JWT claims consumed by Steward's direct Identity resolver; synchronize exact fields to DP-C01. |
 | DP-G01 | `apelogic-ai/steward` | queued | Starts after DP-C01 publishes the contract commit and an agent slot is free. |
 | DP-S01 | `apelogic-ai/steward` | blocked | Test preparation follows DP-C01; implementation depends on DP-G01. |
 | DP-R01 | `apelogic-ai/steward-run` | in progress | Seam inventory and red tests may proceed; synchronize request names to DP-C01. |

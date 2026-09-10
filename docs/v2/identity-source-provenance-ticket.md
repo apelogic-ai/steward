@@ -6,9 +6,9 @@ Status: blocked only on DP-C01 contract freeze
 
 ## Goal
 
-Extend the existing GitHub OIDC exchange and Kubernetes TokenReview path so Steward
-can bind a direct-package request to the actual repository, workflow, run, and commit
-verified by Identity.
+Extend the existing GitHub OIDC exchange JWT and Steward
+`IdentityTaskIdentityResolver` so Steward can bind a direct-package request to the
+actual repository, workflow, run, and commit verified by Identity.
 
 ## Scope
 
@@ -17,13 +17,17 @@ verified by Identity.
 - carry stable repository and owner IDs, repository name, exact SHA, run and
   run-attempt IDs, event, ref, actor, and caller/reusable-workflow refs and SHAs through
   the exchanged identity;
-- expose the ratified values to Steward through the existing TokenReview boundary;
+- expose the ratified values as signed structured exchange-JWT claims verified by the
+  existing Identity resolver;
 - retain the existing canonical user and group mapping; and
 - define bounded failure categories suitable for the caller without echoing tokens or
   raw assertions.
 
 This is additive provenance on the existing Identity-to-Principal path. It does not
-create another identity system or let Git metadata own Steward runtime authority.
+create another identity system, encode source provenance into Kubernetes groups, send
+the exchanged GitHub JWT through Kubernetes TokenReview, or let Git metadata own
+Steward runtime authority. Kubernetes TokenReview remains the alternate
+service-account authentication path.
 
 ## Negative tests
 
@@ -36,7 +40,8 @@ create another identity system or let Git metadata own Steward runtime authority
 
 ## Exit criteria
 
-- positive exchange and TokenReview tests expose every DP-C01 provenance field;
+- positive exchange and direct Identity-resolver tests expose every DP-C01 provenance
+  field;
 - mutation and replay tests fail before Steward source resolution;
 - existing user identity behavior remains compatible; and
 - Steward can verify `invocation-path` against the ratified trigger repository and

@@ -58,7 +58,8 @@ After all reviewed releases and exact source commits exist, GitOps:
 ## Required configuration
 
 - Identity accepts only the pinned reusable workflow and preserves verified source
-  provenance through TokenReview.
+  provenance in its signed exchange JWT; Steward verifies it with the existing direct
+  Identity resolver rather than Kubernetes TokenReview.
 - Steward trusts only configured Identity issuers and source repository bindings.
 - The GitHub source adapter can mint short-lived installation tokens with metadata
   and contents read access only.

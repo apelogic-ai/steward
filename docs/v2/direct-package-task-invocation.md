@@ -96,13 +96,18 @@ package closure digest.
 ## Verified source capture
 
 `steward-run` exchanges GitHub's OIDC token through the existing Identity path. The
-exchange and TokenReview result must preserve the verified source provenance required
-for this contract, including stable repository and owner IDs, exact triggered SHA,
-run and run-attempt IDs, event and ref, actor, and caller and reusable-workflow refs
-and SHAs.
+signed exchange JWT must preserve the verified source provenance required for this
+contract, including stable repository and owner IDs, exact triggered SHA, run and
+run-attempt IDs, event and ref, actor, and caller and reusable-workflow refs and SHAs.
+Steward's existing `IdentityTaskIdentityResolver` verifies that JWT directly. It must
+not route the exchanged GitHub identity through Kubernetes TokenReview or encode
+provenance into group strings; Kubernetes TokenReview remains the alternate
+service-account credential path.
 
-`steward-run` submits `invocation-path` and the ratified trigger metadata. It does not
-upload the invocation manifest or attest to package bytes.
+`steward-run` submits `invocation-path`. Verified trigger metadata reaches Steward only
+as signed claims in the exchanged Identity credential; the Task request does not
+duplicate caller-asserted provenance. The runner does not upload the invocation
+manifest or attest to package bytes.
 
 Steward resolves source through a provider-neutral Git source port. The first adapter
 uses a read-only GitHub App installed only on admitted repositories. Steward mints
