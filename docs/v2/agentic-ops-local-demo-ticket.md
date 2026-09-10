@@ -1,6 +1,7 @@
 # P0: Customer-owned agentic-ops Task executes through GHA on local-main
 
-Status: ready to start; highest priority; no blanket dependency on PR #78 release
+Status: repository and trust-policy preparation complete; live compatibility-path
+publication and rehearsal remain unverified
 
 ## Outcome
 
@@ -11,9 +12,11 @@ the disposable runtime. Approval ceremonies happen during preparation.
 
 ## Scope and implementation truth
 
-Create apelogic-ai/agentic-ops with one review task, portable source, validation, an
-authoring guide, and a pinned steward-run caller. Record the repository commit and
-content-to-publication mapping. Use a reviewed private repository by default.
+The private `apelogic-ai/agentic-ops` repository now contains one review task, portable
+source, validation, an authoring guide, and a pinned `steward-run` caller. Current
+`main` is `73306cefb4fe12995fcbda29f8e35f1da5bec129`; the selected compatibility package
+uses `agentic-release-integration-review@2` and `codex@0.140.0`. Record the exact source
+again at rehearsal time because a later commit requires deliberate revalidation.
 
 The initial supported compatibility path publishes agent/prompt as name@version.
 It derives execution requirements from the approved User Envelope. Manifest validation
@@ -26,17 +29,18 @@ derivation explicitly, including source and resulting content digests.
 
 ## Start and integration gates
 
-- Repository creation, artifact authoring, workflow preparation, and isolated
-  development checks can start immediately while #78 is tested.
+- PR #78 merged as `c87bece81f2324d83c1177a10be56ae8ceb7111a` and supplies the
+  common Task application and orchestration core. GitOps still selects and verifies a
+  compatible released assembly; merge alone is not deployment readiness.
 - GitOps owns the retained local-main cluster. Development workers must not use it
   for testing, diagnosis, recovery, or deployment. Hand deployment and readiness
   requirements to GitOps; do not restart or reset the cluster from this workstream.
 - Record the exact local Steward, Identity, steward-run workflow/action, OpenShell,
   MCP-GW, LiteLLM, and native binding revisions before integration.
-- Prefer the existing compatible execution path when sufficient. Adoption of #78
-  requires a fixed candidate with relevant gates passing, including legacy transport
-  and lifecycle regression tests; a candidate demo does not establish release readiness.
-- User updates about #78 trigger a compatibility assessment, not an automatic rollout.
+- The prepared demo remains on the existing compatibility path until the proposed
+  [direct-package architecture](direct-package-task-invocation.md) is approved,
+  implemented, and passes its own E2E. Do not change the attended demo contract merely
+  because the architecture proposal exists.
 - Preserve existing worktrees and retained local state. Development integration tests
   use isolated, run-owned environments under the local testbed skill. Only the agreed
   demo handoff uses GitOps-managed local-main, with explicit ownership and context.
@@ -58,8 +62,10 @@ derivation explicitly, including source and resulting content digests.
    variables outside portable artifacts. Verify the effective Identity mapping.
 5. Provision the intended canonical user's Envelope and provider connection through
    supported interfaces. Keep model credentials in approved local secret storage.
-6. Pre-publish the approved artifact through the actual supported Steward interface.
-   Read it back and verify agent/prompt/version/digest against the repository source.
+6. For the compatibility demo, pre-publish the approved artifact through the supported
+   Steward interface and verify agent/prompt/version/digest against repository source.
+   If direct-package invocation becomes an explicit demo requirement later, replace this
+   step only after the new contract and full path pass isolated E2E.
 7. After GitOps confirms demo readiness and agrees the rehearsal window, dispatch the
    normal pinned steward-run workflow from agentic-ops. It must upload
    the intended input, execute a real governed model/tool task, return structured
@@ -72,7 +78,8 @@ derivation explicitly, including source and resulting content digests.
 ## Exit criteria
 
 - The new repository is accessible with the approved artifact and executable caller.
-- Publication mapping is verified; declared but unenforced future fields are explicit.
+- Compatibility publication mapping is verified; declared but unenforced future fields
+  are explicit. This is not direct-package or frozen-M1 catalog evidence.
 - Two real agentic runs succeed through the normal GHA path on recorded component pins.
 - Each finalized Task leaves no disposable Task-owned AgentRuntime, Sandbox, runtime
   Secret, or model/tool authority projection. Failed runs receive bounded finalization.
@@ -90,9 +97,10 @@ derivation explicitly, including source and resulting content digests.
 - GitOps team: local-main state, deployment, recovery, readiness, and the agreed demo
   execution window. Agree publication, credentials, dispatch, evidence, and cleanup
   ownership before rehearsal; development workers do not operate this cluster.
-- Ticket A: publication/release tooling in isolated paths and branches; agree on the P0
-  package interface before editing shared artifacts. No automatic demo-stack upgrades.
-- Ticket B: additional fixtures/harnesses and contract matrix on isolated branches;
+- Direct-package planning: architecture and contract work remains separate from the
+  fixed compatibility rehearsal until an explicit migration decision.
+- Ticket A: optional catalog/release tooling; it does not block direct invocation or P0.
+- Ticket B: direct-package fixtures/harnesses and contract matrix on isolated branches;
   request a test slot before heavy builds, deployments or GHA runs.
 
 Keep one writer for each shared file and one coordinator for isolated test scheduling.
@@ -103,8 +111,9 @@ work. Request human merge or required approval only with concrete reviewable cha
 
 ## Deferred work
 
-[Ticket A](agentic-ops-publication-lifecycle-ticket.md) owns automated publication and
-release provenance. [Ticket B](customer-authored-task-conformance-ticket.md) owns broader
-authority/isolation and released stable-lane proof. Neither blocks this demo.
+[Ticket A](agentic-ops-publication-lifecycle-ticket.md) now owns optional catalog
+promotion and release provenance. [Ticket B](customer-authored-task-conformance-ticket.md)
+owns direct-package authority/isolation and released stable-lane proof. Neither changes
+the prepared compatibility demo without an explicit migration decision.
 AgentSession, AgentInstance, TaskGraph, DEV readiness, multiple tasks, and live approval
 ceremonies are outside P0.

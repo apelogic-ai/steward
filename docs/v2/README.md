@@ -12,33 +12,41 @@ See the [documentation index](../README.md) for authority order and the
 [deferred-contract register](deferred-implementation-contracts.md) for decisions that
 still require separate design and acceptance.
 
-## Customer demo and delivery follow-ups
+## Customer demo and direct-package follow-up
 
 The initial customer DevInt/DevOps demonstration may use one pre-created,
 pre-approved `agentic-ops` artifact in local-main. It does not require AgentSession,
 DEV readiness, automated publication, release tags, over-envelope demonstrations,
 multiple workflows, or stable-lane evidence.
 
-The [P0 local-main demo ticket](agentic-ops-local-demo-ticket.md) owns repository creation,
-the pre-approved artifact, caller/Identity/runner preparation, publication verification,
-and two agreed rehearsals. It can start before PR #78 is released. GitOps owns local-main
-deployment and readiness; development testing uses isolated, run-owned environments.
+The [P0 local-main demo ticket](agentic-ops-local-demo-ticket.md) owns the prepared
+legacy-compatibility artifact, caller/Identity/runner preparation, publication
+verification, and two agreed rehearsals. PR #78 is merged; GitOps still owns compatible
+release selection, local-main deployment, and readiness. Development testing uses
+isolated, run-owned environments.
 The [GitOps demo handoff](agentic-ops-gitops-demo-handoff.md) records prepared pins,
 operator requirements, and the evidence still needed from a real run.
 
-Follow-up implementation may proceed in parallel with P0, which has priority:
+The proposed [direct immutable package architecture](direct-package-task-invocation.md)
+would let an authorized GHA caller invoke an exact package from its own ratified Git
+source without mandatory catalog publication. It preserves this document's common Task
+application/admission boundary and leaves the frozen `steward.m1/v1` contract unchanged.
+Approval of that proposal precedes new wire or enforcement work.
 
-- [Automate customer-authored artifact publication and release provenance](agentic-ops-publication-lifecycle-ticket.md)
-  owns deterministic package release metadata and create-only Steward catalog
-  publication.
-- [Expand customer-authored GHA Task conformance](customer-authored-task-conformance-ticket.md)
-  owns authority-negative behavior, multiple-workflow isolation, and retained
+Follow-up ownership is:
+
+- [Optional catalog publication and release provenance](agentic-ops-publication-lifecycle-ticket.md)
+  owns curated distribution after direct-source resolution and is not an execution
+  prerequisite.
+- [Expand customer-authored direct-package GHA Task conformance](customer-authored-task-conformance-ticket.md)
+  owns source, receipt, authority-negative, multiple-package isolation, and retained
   local-stable acceptance.
 
 Conformance fixtures must match the contract under test: legacy manual publication is
-not evidence of M1 catalog semantics. Shared package, transport, authorization and
-publication interfaces need explicit ownership. Candidate integration needs applicable
-tests; stable acceptance needs compatible releases and approved promotion. The P0
+not evidence of direct-package or frozen-M1 catalog semantics. Shared package,
+transport, authorization, resolver, and evidence interfaces need explicit ownership.
+Candidate integration needs applicable tests; stable acceptance needs compatible
+releases and approved promotion. The P0
 coordinator schedules isolated heavy tests sequentially. GitOps controls local-main
 changes and the agreed demo rehearsal window; development workers do not operate it.
 

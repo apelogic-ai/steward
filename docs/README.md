@@ -17,9 +17,9 @@ When documents disagree, use this order:
 3. Accepted implementation architecture documents prescribe internal implementation
    targets without claiming that behavior is already present or changing a public wire
    contract.
-4. [`docs/v2/**`](v2/README.md) records accepted post-M1 semantics and explicitly
-   deferred implementation contracts. It is not an implemented or frozen wire
-   contract.
+4. [`docs/v2/**`](v2/README.md) records accepted post-M1 semantics, explicitly
+   deferred implementation contracts, and clearly labeled proposals awaiting decision.
+   It is not an implemented or frozen wire contract.
 5. Historical plans and design explorations are context only.
 
 Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 field.
@@ -33,6 +33,7 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | **Accepted implementation architecture** | Prescriptive internal implementation target; not a claim of current behavior or a public wire contract. |
 | **Accepted post-M1 semantics** | Architecture direction accepted for future implementation; not a public API or claim of implementation. |
 | **Deferred contract** | A wire or implementation decision that still requires separate design and acceptance. |
+| **Proposal** | A reviewable architecture or plan awaiting an explicit decision; not an accepted contract or implementation target. |
 | **Historical** | Retained for context; not current architecture, implementation status, or contract authority. |
 | **Reference** | Supporting operational or upstream material; authority is limited to its stated subject. |
 
@@ -71,6 +72,12 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | [`v2/README.md`](v2/README.md) | **Accepted post-M1 semantics** | Canonical terminology, execution model, lifecycle, and ownership boundaries. |
 | [`v2/deferred-implementation-contracts.md`](v2/deferred-implementation-contracts.md) | **Deferred contract** | The one current register of unresolved post-M1 wire and implementation contracts. |
 | [`v2/documentation-reconciliation-ticket.md`](v2/documentation-reconciliation-ticket.md) | **Accepted post-M1 semantics (decision record)** | Requirements and rationale that established this documentation baseline. |
+
+### Proposals awaiting decision
+
+| Document | Status | Purpose |
+|---|---|---|
+| [`v2/direct-package-task-invocation.md`](v2/direct-package-task-invocation.md) | **Proposal** | Direct invocation of an immutable same-repository package through GHA without mandatory catalog publication, plus its implementation split. |
 
 ### Historical design and planning
 

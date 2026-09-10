@@ -1,6 +1,7 @@
 # P0 agentic-ops demo: GitOps handoff
 
-Status: repository preparation complete; live publication and rehearsal unverified.
+Status: compatibility-path preparation recorded; source repin, live publication, and
+rehearsal remain unverified.
 This is a deployment/readiness handoff, not permission for development workers to
 operate or test the GitOps-managed local-main cluster.
 
@@ -10,14 +11,14 @@ operate or test the GitOps-managed local-main cluster.
 | --- | --- |
 | Repository | apelogic-ai/agentic-ops, private |
 | Repository / owner IDs | 1362055860 / 227278099 |
-| Human-created default main | 268fb6f29779ba145510f54135902c15d0942af9 |
+| Current reviewed default main | 73306cefb4fe12995fcbda29f8e35f1da5bec129 |
 | Caller | .github/workflows/steward-task.yml, main, workflow_dispatch only |
 | Reusable steward-run workflow | a86a227f0f731a8a96628d4628f03b4482ad612b |
 | Nested steward-run action | 0707623836cd4cdf063938e1e049c694397bc31c |
-| Legacy published coordinate | agentic-release-integration-review@1 |
-| Agent binding | codex@0.117.0 |
-| Expected content digest | sha256:9b7e9bf82754b159b3cb1bff72a898a8eb1f0308c1792e283032fbebd4098aaa |
-| Package byte digest | sha256:467705ecb9ebbd9a25504bf87a1fb8f0931bdc7664d378ebd470935d9260a63b |
+| Legacy coordinate to publish/read back | agentic-release-integration-review@2 |
+| Agent binding | codex@0.140.0 |
+| Expected content digest | sha256:e06139e2a0b34796574a58b545da8a286952601b015b9f212fc632b256dd53a1 |
+| Package byte digest | sha256:c6879c59c66a1a1ceac64c825fb953ac60c2897f33f6dc187d1fb20e1a49cce4 |
 | Dedicated runner label | steward-agentic-ops-main |
 
 The repository's immutable OIDC subject setting is enabled. Its non-secret runner,
@@ -27,31 +28,33 @@ No runner was registered or started by this workstream.
 
 [GitOps #164](https://github.com/apelogic-ai/gitops/pull/164) merged the separately
 authorized enforcement-only change. [GitOps #165](https://github.com/apelogic-ai/gitops/pull/165)
-adds only the exact task caller and the local-v5 Identity rollout revision. Human
-review/merge and GitOps-owned rollout are separate from local validation of that PR.
-No bootstrap, actor, Envelope, existing caller, or branch-protection changes are included.
+also merged, adding only the exact task caller and the local-v5 Identity rollout
+revision. GitOps-owned rollout/readiness remains distinct from merge. No bootstrap,
+actor, Envelope, existing caller, or branch-protection changes were included.
 
 ## GitOps and operator preparation
 
 1. Select and record the compatible approved component revisions and image/chart
-   digests. Verify actual deployment against them; do not equate a retained dirty
-   worktree record with a tested #78 release. User updates about #78 are not rollout
-   authority. GitOps owns cluster recovery, deployment, and readiness.
-2. After the policy PR is human-merged, GitOps rolls out the exact Identity mapping
-   through its supported lifecycle. No development tests or ad hoc changes use
-   local-main. Stable promotion requires its own approved release and handoff.
+   digests. PR #78 merged as `c87bece81f2324d83c1177a10be56ae8ceb7111a`,
+   but merge is not a release or rollout. GitOps owns cluster recovery, deployment,
+   and readiness.
+2. Roll out the merged exact Identity mapping through the supported GitOps lifecycle.
+   No development tests or ad hoc changes use local-main. Stable promotion requires
+   its own approved release and handoff.
 3. The host operator prepares a dedicated runner with an appropriate service identity,
    protected files, no ambient infrastructure credentials, and serialized access to
-   the demo host. A prepared, offline-tested hook pins the exact source above; it is
-   not installed and is not filesystem isolation or a cross-runner concurrency lock.
+   the demo host. The earlier offline-tested hook pinned obsolete source `268fb6f` and
+   must not be installed unchanged. Review and regenerate it for the exact source above;
+   a hook is not filesystem isolation or a cross-runner concurrency lock.
    Do not add runner management to the GitOps local lifecycle scripts.
 4. Verify the canonical user, approved provisioned Envelope, real model, native
    ARM64 execution binding, and usable private GitHub connection. The requested task
    needs get_file_contents:read. Existing user connections are not disposable Task
    resources and must not be revoked as Task cleanup.
-5. An authorized publisher uses the package's validated legacy publication request.
-   Read back agent, prompt, coordinate/version, and digest. Version 1 is not yet
-   published by this workstream; if it already exists with different content, stop
+5. For this compatibility-path demo, an authorized publisher uses the package's
+   validated legacy publication request. Read back agent, prompt, coordinate/version,
+   and digest. Version 2 is not known to be published by this workstream; if it already
+   exists with different content, stop
    and prepare a new immutable version rather than overwrite it.
 
 ## Agreed rehearsal window
@@ -69,10 +72,10 @@ useful summary, terminal state, finalization, and sanitized independent evidence
   no alternate source-access credential or path. This proves source retrieval under
   those conditions, not a signed MCP call or a future catalog witness.
 - Corroborate tool execution with the native MCP completed event in the exact
-  UID-bound execution stream. The [pinned Codex human-mode event](https://github.com/openai/codex/blob/4c70bff480af37b1bf1a9b352b8341060fe55755/codex-rs/exec/src/event_processor_with_human_output.rs)
-  reflects the typed tool outcome, but text has no authenticated request identity
-  or argument binding.
-  Do not manufacture request IDs or substitute an agent-authored VERIFIED line.
+  UID-bound execution stream. Verify the deployed Codex version's event semantics
+  before interpreting it; rendered text alone has no authenticated request identity or
+  argument binding. Do not manufacture request IDs or substitute an agent-authored
+  VERIFIED line.
 - GitOps chooses a safe, deployed-version-compatible collector for successful real
   inference records correlated to the runtime key. Aggregate spend alone is not
   request-level evidence. Do not export raw key objects, provider bodies, or logs.
@@ -95,12 +98,14 @@ and a new unchanged-pin rehearsal pair.
 
 - The P0 package has 19 passing local tests and successful source-validation CI;
   this is not a successful governed Task receipt.
-- [Agentic-ops #1](https://github.com/apelogic-ai/agentic-ops/pull/1) contains optional
-  offline publication/provenance tooling, not a live publisher. Hold unrelated main
+- [Agentic-ops #1](https://github.com/apelogic-ai/agentic-ops/pull/1) merged optional
+  offline publication/provenance tooling; it is not a live publisher. Hold unrelated main
   changes during the chosen demo rehearsal pair.
 - Ticket B's checker is checkpointed locally. Its full gate failed in an isolated,
   run-owned G-1 setup on SPIRE/etcd timeouts before the security assertion; cleanup
   was verified. The remaining pinned tests and live conformance are not passing claims.
 
-See the [P0 ticket](agentic-ops-local-demo-ticket.md) for the customer outcome and
-the package's demo setup guide for the publication and output contracts.
+See the [P0 ticket](agentic-ops-local-demo-ticket.md) for the compatibility-demo
+outcome. The proposed [direct-package architecture](direct-package-task-invocation.md)
+removes mandatory publication from a future caller, but it is not implemented by this
+handoff.

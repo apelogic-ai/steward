@@ -20,6 +20,7 @@ inputs to that work unless a new decision explicitly adopts them.
 | V2-D08 | Cross-user collaboration | Initial sessions do not grant cross-user participation or authority. |
 | V2-D09 | TaskGraph orchestration | No TaskGraph exists in the accepted baseline; a future contract must justify Steward-owned graph semantics. |
 | V2-D10 | State migration or checkpoint format | No opaque runtime checkpoint or silent interrupted-Task replay exists initially. |
+| V2-D11 | Direct immutable package Task invocation wire, receipt, source authorization, and evidence schemas | A direct source path uses the common Task application service; source and Envelope digests are not authority; frozen `steward.m1/v1` remains unchanged. |
 
 Add a newly discovered deferred post-M1 contract here only when it does not already
 belong to an accepted semantic boundary or an existing versioned contract. Numerical
