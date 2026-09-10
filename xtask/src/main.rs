@@ -1312,6 +1312,10 @@ mod tests {
             .map_err(|error| format!("task lifecycle wrapper is required: {error}"))?;
         let task_callback = fs::read_to_string(root().join("scripts/task-submission-inside.sh"))
             .map_err(|error| format!("task lifecycle image callback is required: {error}"))?;
+        let s2_harness = fs::read_to_string(root().join("scripts/s2-inference-inside.sh"))
+            .map_err(|error| format!("S2 lifecycle harness is required: {error}"))?;
+        let task_dockerfile = fs::read_to_string(root().join("e2e/Dockerfile.task"))
+            .map_err(|error| format!("task lifecycle Dockerfile is required: {error}"))?;
 
         let lifecycle_job = ci_job(&workflow, "e2e-controller-runtime-lifecycle")?;
         let pinned_job = ci_job(&workflow, "pinned")?;
@@ -1340,6 +1344,19 @@ mod tests {
             task_wrapper.contains("scripts/task-submission-inside.sh"),
             "the task lifecycle wrapper must defer image provision until the post-S0 callback"
         );
+        let supervisor_preflight = task_wrapper
+            .find("build-patched-openshell-supervisor.sh")
+            .ok_or_else(|| {
+                "the task lifecycle wrapper must establish the pinned supervisor before building run-scoped images"
+                    .to_owned()
+            })?;
+        let workflow_image_build = task_wrapper.find("docker build").ok_or_else(|| {
+            "the task lifecycle wrapper must build its run-scoped workflow image".to_owned()
+        })?;
+        assert!(
+            supervisor_preflight < workflow_image_build,
+            "the pinned supervisor build must complete before the run-scoped workflow image is built"
+        );
         assert!(
             !task_wrapper.contains("build-steward-mint-image.sh"),
             "the task lifecycle wrapper must not build the mint image before the long S0 setup gap"
@@ -1348,9 +1365,14 @@ mod tests {
             !task_wrapper.contains("build-patched-mcp-gw.sh"),
             "the task lifecycle wrapper must not build mcp-gw before the long S0 setup gap"
         );
+        assert!(
+            !task_wrapper.contains("capture-proxy.test.ts"),
+            "the task lifecycle wrapper must not require the post-S0 mcp-gw image during preflight"
+        );
         for required in [
             "build-steward-mint-image.sh",
             "build-patched-mcp-gw.sh",
+            "capture-proxy.test.ts",
             "e2e/Dockerfile.task",
             "docker image inspect",
             "exec bash \"${ROOT}/scripts/s2-inference-inside.sh\"",
@@ -1376,6 +1398,10 @@ mod tests {
             .find("exec bash \"${ROOT}/scripts/s2-inference-inside.sh\"")
             .ok_or_else(|| "task callback must enter S2 after image checks".to_owned())?;
         assert!(
+            task_build < mint_build && task_build < mcp_gw_build,
+            "the run-scoped task image must build before the fixed dependency tags are refreshed"
+        );
+        assert!(
             mint_build < image_inspect
                 && mcp_gw_build < image_inspect
                 && task_build < image_inspect,
@@ -1385,7 +1411,157 @@ mod tests {
             image_inspect < s2_exec,
             "the post-S0 callback must inspect every local image before any kind load in S2"
         );
+        assert!(
+            task_dockerfile
+                .contains("COPY config/internal-authorities ./config/internal-authorities"),
+            "the task lifecycle image must carry the immutable internal authority documents needed by the apiserver library"
+        );
+        assert!(
+            s2_harness.contains(".status.conditions[]?"),
+            "the S2 harness must tolerate a newly created CRD whose status.conditions is temporarily absent"
+        );
+        assert!(
+            !s2_harness.contains("wait --for=condition=Established"),
+            "the S2 harness must not use kubectl wait's nil-conditions race for CRD establishment"
+        );
+        assert!(
+            s2_harness
+                .contains("s#STEWARD_TASK_EXECUTION_BINDING_IMAGE_VALUE#${sandbox_digest_image}#g"),
+            "the S2 harness must replace a value-only execution-binding image placeholder"
+        );
+        assert!(
+            !s2_harness
+                .contains("s#STEWARD_TASK_EXECUTION_BINDING_IMAGE#${sandbox_digest_image}#g"),
+            "the S2 harness must not replace the execution-binding environment variable name"
+        );
+        let task_server_rollout = s2_harness
+            .find("rollout status deployment/steward-task-server")
+            .ok_or_else(|| "the Task server rollout gate is missing".to_owned())?;
+        let provider_seed = s2_harness
+            .find("wait --for=condition=complete job/seed-mcp-gw")
+            .ok_or_else(|| "the provider fixture seed gate is missing".to_owned())?;
+        assert!(
+            task_server_rollout < provider_seed,
+            "the Task server must register its canonical fixture identity before provider seeding waits for that identity"
+        );
+        Ok(())
+    }
 
+    #[test]
+    fn durable_task_orchestration_migration_declares_the_recovery_boundary() -> Result<(), String> {
+        let migration_path = root().join("migrations/0028_durable_task_runtime_orchestration.sql");
+        let migration = fs::read_to_string(&migration_path).map_err(|error| {
+            format!(
+                "the durable Task orchestration migration must exist at {}: {error}",
+                migration_path.display()
+            )
+        })?;
+
+        for required in [
+            "CREATE TABLE task_runtime_operations",
+            "CREATE TABLE task_execution_attempts",
+            "CREATE TABLE external_effect_outbox",
+            "CREATE TABLE task_orchestration_journal",
+            "generation bigint",
+            "runtime_create_pending",
+            "runtime_observed",
+            "approval_pending",
+            "activation_pending",
+            "cleanup_pending",
+            "outcome_unknown",
+            "cancel_requested",
+            "runtime_absent_observed_at",
+            "projections_absent_observed_at",
+            "runtime_create_authorized_at",
+            "task_commands_are_monotonic",
+            "external_effect_outbox_transition_is_monotonic",
+        ] {
+            assert!(
+                migration.contains(required),
+                "the durable Task orchestration migration is missing {required}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn task_orchestration_rollout_is_staged_before_the_new_owner_starts() -> Result<(), String> {
+        let chart = fs::read_to_string(root().join("charts/steward/templates/all.yaml"))
+            .map_err(|error| format!("Steward chart is required: {error}"))?;
+        let controller = fs::read_to_string(root().join("bins/steward-controller/src/main.rs"))
+            .map_err(|error| format!("controller binary is required: {error}"))?;
+        let apiserver = fs::read_to_string(root().join("bins/steward-apiserver/src/main.rs"))
+            .map_err(|error| format!("apiserver binary is required: {error}"))?;
+
+        assert!(
+            chart.matches("STEWARD_TASK_ORCHESTRATION_MODE").count() >= 2
+                && controller.contains("task_orchestration_mode")
+                && apiserver.contains("task_orchestration_mode"),
+            "the initial rollout must put both Task writers behind one explicit staged mode"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_task_operations_revalidate_authority_before_runtime_observation() -> Result<(), String>
+    {
+        let controller = fs::read_to_string(root().join("crates/steward-controller/src/lib.rs"))
+            .map_err(|error| format!("controller source is required: {error}"))?;
+        assert!(
+            controller.contains("revalidate_active_task_authority"),
+            "an active Task must revalidate authority even when execution has not been requested"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retryable_attempt_observation_errors_are_not_terminalized() -> Result<(), String> {
+        let controller = fs::read_to_string(root().join("crates/steward-controller/src/lib.rs"))
+            .map_err(|error| format!("controller source is required: {error}"))?;
+        assert!(
+            controller.contains(".map_err(TaskControllerError::Sandbox)?"),
+            "a retryable sandbox observation failure must preserve the current attempt state"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openshell_attempt_markers_prove_running_process_liveness() -> Result<(), String> {
+        let adapter = fs::read_to_string(root().join("adapters/openshell/src/lib.rs"))
+            .map_err(|error| format!("OpenShell adapter source is required: {error}"))?;
+        assert!(
+            adapter.contains("pid-start")
+                && adapter.contains("kill -0")
+                && adapter.contains("heartbeat")
+                && adapter.contains("now - heartbeat"),
+            "claimed/running attempt markers must carry a cross-exec heartbeat lease and expire without liveness proof"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn absent_cancelled_attempts_expire_into_a_terminal_observation() -> Result<(), String> {
+        let controller = fs::read_to_string(root().join("crates/steward-controller/src/lib.rs"))
+            .map_err(|error| format!("controller source is required: {error}"))?;
+        assert!(
+            controller.contains("terminalize_expired_attempt_observation"),
+            "cancellation must resolve an absent post-start attempt after its observation deadline"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_retires_task_approval_authority_before_finalization() -> Result<(), String> {
+        let store = fs::read_to_string(root().join("crates/steward-store/src/lib.rs"))
+            .map_err(|error| format!("store source is required: {error}"))?;
+        let controller = fs::read_to_string(root().join("crates/steward-controller/src/lib.rs"))
+            .map_err(|error| format!("controller source is required: {error}"))?;
+        assert!(
+            store.contains("retire_task_authority_for_cleanup")
+                && !controller.contains("owned_projections_absent: true"),
+            "cleanup must revoke grants and retire pending approval delivery before recording projection absence"
+        );
         Ok(())
     }
 
@@ -1401,10 +1577,16 @@ mod tests {
             "the versioned Workflow E2E must create its dedicated runtime namespace"
         );
         assert!(
+            harness.contains("wait_for_spire_admission_webhook")
+                && harness.contains("--dry-run=server")
+                && harness.contains("steward-spire-webhook-readiness"),
+            "the versioned Workflow E2E must prove the SPIRE admission webhook accepts requests before applying ClusterSPIFFEID resources"
+        );
+        assert!(
             harness.contains(
-                "elif [[ \"${SLICE}\" == \"task\" ]]; then\n  profile_sources=(\n    \"${ROOT}/config/s5/tool-provider-profile.yaml\"\n    \"${ROOT}/config/task/inference-provider-profile.yaml\"\n  )"
+                "elif [[ \"${SLICE}\" == \"task\" ]]; then\n  profile_sources=(\n    \"${ROOT}/config/s5/tool-provider-profile.yaml\"\n    \"${ROOT}/config/task/tool-provider-profile.yaml\"\n    \"${ROOT}/config/task/inference-provider-profile.yaml\"\n  )"
             ),
-            "the versioned Workflow E2E must install both Envelope-selected provider profiles"
+            "the versioned Workflow E2E must retain the legacy tool profile while installing both execution-binding-selected provider profiles"
         );
         assert!(
             harness.contains("label namespace \"${namespace}\"")
@@ -1427,16 +1609,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_provider_profiles_cover_supported_linux_architectures() -> Result<(), String> {
-        let arm64_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/codex/codex";
-        let amd64_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex";
+    fn task_codex_provider_profiles_cover_supported_linux_architectures() -> Result<(), String> {
+        let arm64_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/bin/codex";
+        let amd64_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex";
         for profile_path in [
-            "config/s5/tool-provider-profile.yaml",
+            "config/task/tool-provider-profile.yaml",
             "config/task/inference-provider-profile.yaml",
-            "config/provider-profile-bundle/v1.1.0/profiles/steward-mcp-gw.json",
-            "config/provider-profile-bundle/v1.1.0/profiles/steward-litellm.json",
-            "config/provider-profile-bundle/v1.2.0/profiles/steward-mcp-gw.json",
-            "config/provider-profile-bundle/v1.2.0/profiles/steward-litellm.json",
         ] {
             let profile = fs::read_to_string(root().join(profile_path)).map_err(|error| {
                 format!("Codex provider profile {profile_path} is required: {error}")
@@ -1456,6 +1634,61 @@ mod tests {
                 && task_e2e.contains("cargo xtask e2e-controller-runtime-lifecycle"),
             "the real Codex MCP-GW E2E must exercise the linux/amd64 provider path in CI"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn production_execution_binding_code_contains_no_deployment_agent_values() -> Result<(), String>
+    {
+        let production_sources = [
+            "crates/steward-types/src/lib.rs",
+            "crates/steward-apiserver/src/execution_bindings.rs",
+            "crates/steward-apiserver/src/tasks.rs",
+            "crates/steward-apiserver/src/workflows.rs",
+            "adapters/openshell/src/lib.rs",
+            "bins/steward-apiserver/src/main.rs",
+        ];
+        let forbidden = [
+            "SUPPORTED_WORKFLOW_AGENT",
+            "codex@0.140.0",
+            "codex-cli 0.140.0",
+            "steward-runtime-providers@1.3.0",
+            "steward-mcp-gw-v1-3-0",
+            "steward-litellm-v1-3-0",
+            "@openai/codex-linux-",
+        ];
+        for path in production_sources {
+            let source = fs::read_to_string(root().join(path))
+                .map_err(|error| format!("read production source {path}: {error}"))?;
+            for value in forbidden {
+                assert!(
+                    !source.contains(value),
+                    "production source {path} embeds deployment-owned value {value}"
+                );
+            }
+        }
+
+        let core_task_sources = [
+            "crates/steward-apiserver/src/execution_bindings.rs",
+            "crates/steward-apiserver/src/tasks.rs",
+        ];
+        let adapter_owned_values = [
+            "codex",
+            "CODEX_HOME",
+            "litellm-litellm",
+            "STEWARD_MCP_GW_BEARER_TOKEN",
+            "openshell-token-grant-placeholder",
+        ];
+        for path in core_task_sources {
+            let source = fs::read_to_string(root().join(path))
+                .map_err(|error| format!("read core Task source {path}: {error}"))?;
+            for value in adapter_owned_values {
+                assert!(
+                    !source.contains(value),
+                    "core Task source {path} embeds adapter-owned value {value}"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2174,8 +2407,9 @@ mod tests {
         );
         assert!(
             sandbox.contains("ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:")
-                && sandbox.contains("codex-cli 0.117.0"),
-            "the real-stack lane must use the existing digest-pinned workflow sandbox contract"
+                && sandbox.contains("@openai/codex@0.140.0")
+                && sandbox.contains("codex-cli 0.140.0"),
+            "the real-stack lane must install and verify the exact approved Workflow agent"
         );
         Ok(())
     }
@@ -2365,7 +2599,7 @@ mod tests {
             "Verify authenticated OpenShell adapter on linux/amd64",
             "cargo xtask e2e-openshell-adapter",
             "Provider profile bundle asset:",
-            "Provider profile bundle identity:",
+            "Provider profile bundle identity: steward-runtime-providers@1.2.0",
             "Provider profile bundle SHA-256:",
             "Provider profile bundle signer identity:",
             "Provider profile bundle source repository:",
@@ -2755,7 +2989,18 @@ mod tests {
         assert!(!apiserver.contains(".Values.secrets.mint"));
         assert!(!apiserver.contains(".Values.secrets.litellm"));
         assert!(!controller.contains(".Values.secrets.mint"));
-        assert!(!controller.contains(".Values.secrets.jira"));
+        assert!(
+            controller.contains("STEWARD_JIRA_TOKEN")
+                && controller.contains("STEWARD_JIRA_BASE_URL")
+                && controller.contains("STEWARD_JIRA_PROJECT_KEY")
+                && controller.contains("STEWARD_JIRA_ACCOUNT_EMAIL")
+                && controller.contains(".Values.secrets.jira"),
+            "the Task approval outbox dispatcher must receive only the Jira decision-channel configuration"
+        );
+        assert!(
+            apiserver.contains("STEWARD_TASK_INFERENCE_ENDPOINT"),
+            "the Codex execution adapter must receive its deployment-owned inference endpoint"
+        );
         assert!(!mint.contains(".Values.secrets.database"));
         assert!(!mint.contains(".Values.secrets.jira"));
         assert!(!mint.contains(".Values.secrets.litellm"));

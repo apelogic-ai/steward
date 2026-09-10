@@ -18,6 +18,41 @@ Migration 0015 appends an immutable, separately-recorded approved Envelope
 snapshot to user-request lifecycle events. Older events intentionally have no
 snapshot rather than inferring one from the original request.
 
+Migration 0028 drains legacy in-flight Task rows and introduces the durable
+Task-runtime orchestration boundary described in
+[`docs/task-runtime-orchestration.md`](../docs/task-runtime-orchestration.md).
+It atomically records immutable Task intent and an operation generation, exact
+runtime UID observations, one observable execution attempt, recoverable
+external-effect outbox state, append-only transition history, and absence
+evidence required before finalization. New v2 writers are fenced from the old
+nullable-UID lifecycle by database constraints and monotonic transition
+triggers.
+
 `cargo xtask migrate-check` rejects edits or renames of migrations already
 present on the comparison base. The S3 and S4 store integration tests apply the
 full set to empty ephemeral Postgres databases.
+
+Migration 0029 introduced a one-active-attempt-per-UID predicate. Migration 0030
+adds `not_started`, fencing never-authorized claims without fabricating a start.
+Migration 0031 supersedes the state-based predicate with explicit runtime leases
+and append-only execution retirement evidence. Unknown outcomes keep their lease
+through finalization; only proven non-start or an exact adapter terminal observation
+permits reuse. Late evidence does not rewrite terminal Task or attempt history.
+
+The 0031 upgrade backfills known terminal observations and preserves every unknown
+lease. It fails closed if older state already contains overlapping unknown/live
+attempts on one UID; it does not silently select a winner. Keep writers staged and
+resolve the original execution environments before migration, rather than inventing
+retirement evidence or deleting immutable history.
+
+Migration 0032 records approval delivery invocation separately from its scheduling
+lease. Lease successors observe the original request instead of creating again;
+cleanup cannot retire an invoked delivery before its external reference is known.
+
+Migration 0033 distinguishes transient internal connection output from immutable
+execution evidence. After the matching connection result becomes terminal, its
+successful Task's response archive can be cleared in the same transaction that
+requests cleanup. The database records an immutable retirement timestamp and
+rejects replacement or restoration. Ordinary Task output, finalized history,
+runtime/attempt identity and result digests remain immutable. This is a narrowly
+approved retention correction, not permission to rewrite an execution result.

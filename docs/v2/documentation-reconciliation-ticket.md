@@ -1,6 +1,17 @@
 # Ticket: Reconcile Steward documentation for M1 and long-running agents
 
-Status: accepted documentation reconciliation decision record
+Status: implemented documentation reconciliation decision record
+
+## Completion
+
+The repository [README](../../README.md) now directs readers to the
+[documentation index](../README.md) before any historical design document. The index
+defines the authority order, the [post-M1 baseline](README.md) holds the accepted
+semantics, and the [deferred-contract register](deferred-implementation-contracts.md)
+is the only current list of unresolved post-M1 contracts.
+
+The reconciliation changed documentation only. It did not modify or reinterpret any
+schema, fixture, or requirement under [`docs/contracts/m1/v1/**`](../contracts/m1/v1/README.md).
 
 ## Problem
 

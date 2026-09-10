@@ -9,8 +9,8 @@ use steward_adapter_openshell::{
     OpenShellConnectionConfig, OpenShellRuntime, OpenShellTaskLogMode,
 };
 use steward_ports::{
-    SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskRequest,
-    SandboxTaskRuntime,
+    SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
+    SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
 };
 use steward_types::{AgentType, RuntimeId, RuntimeRefs};
 use tokio::time::sleep;
@@ -208,6 +208,95 @@ async fn delete_sandbox(
     }
 }
 
+async fn verify_attempt_failure_semantics(
+    runtime: &OpenShellRuntime,
+    sandbox: &SandboxRequest,
+    input_archive: &[u8],
+) -> Result<(), String> {
+    let mut task = SandboxTaskRequest {
+        runtime: sandbox.runtime.clone(),
+        refs: sandbox.refs.clone(),
+        execution_class: SandboxExecutionClass::Agent,
+        agent_type: sandbox.agent_type.clone(),
+        command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()],
+        execution_binding: None,
+    };
+    let attempt = TaskAttemptId("00000000-0000-4000-8000-000000000002".to_owned());
+    // Exercise the pinned transport and a real running command, not a fabricated
+    // marker. A cancellation without acknowledgement must not claim retirement.
+    let observe_cancellation = async {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            match runtime.observe_task(&attempt, &task).await {
+                Ok(SandboxTaskObservation::Running { .. }) => break,
+                Ok(SandboxTaskObservation::Absent | SandboxTaskObservation::Accepted { .. }) => {}
+                other => {
+                    return Err(format!(
+                        "expected a live attempt before cancellation: {other:?}"
+                    ));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("attempt never became observable as running".to_owned());
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        let cancelled = runtime
+            .cancel_task(&attempt, &task)
+            .await
+            .map_err(|error| format!("cancel observation failed: {error:?}"))?;
+        if !matches!(cancelled, SandboxTaskObservation::OutcomeUnknown { .. }) {
+            return Err(format!(
+                "unacknowledged cancellation claimed retirement: {cancelled:?}"
+            ));
+        }
+        Ok::<(), String>(())
+    };
+    let (started, cancelled) = tokio::join!(
+        runtime.start_task(&attempt, &task, input_archive),
+        observe_cancellation,
+    );
+    cancelled?;
+    if !matches!(started, Ok(SandboxTaskObservation::Succeeded { .. })) {
+        return Err(format!(
+            "uncertain cancellation lost eventual terminal evidence: {started:?}"
+        ));
+    }
+
+    let orphan = TaskAttemptId("00000000-0000-4000-8000-000000000003".to_owned());
+    // Kill only this attempt's wrapper inside the run-owned sandbox. Its child
+    // may survive: expiration is evidence of uncertainty, never process absence.
+    task.command[2] = format!(
+        "exec </dev/null >/dev/null 2>&1; kill -KILL \"$(cat /sandbox/.steward-attempts/{}/pid)\"; sleep 40",
+        orphan.0
+    );
+    let _start_observation = runtime.start_task(&orphan, &task, input_archive).await;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match runtime.observe_task(&orphan, &task).await {
+            Ok(SandboxTaskObservation::OutcomeUnknown { .. }) => break,
+            Ok(SandboxTaskObservation::Running { .. }) => {}
+            other => {
+                return Err(format!(
+                    "orphaned wrapper produced false terminal evidence: {other:?}"
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("orphaned running marker remained live indefinitely".to_owned());
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    let retry = runtime
+        .start_task(&orphan, &task, input_archive)
+        .await
+        .map_err(|error| format!("orphan observation retry failed: {error:?}"))?;
+    if !matches!(retry, SandboxTaskObservation::OutcomeUnknown { .. }) {
+        return Err(format!("an orphaned attempt was restarted: {retry:?}"));
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_cleanup()
 -> Result<(), String> {
@@ -263,6 +352,7 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
         models: Vec::new(),
         tools: Vec::new(),
         refs: RuntimeRefs::default(),
+        execution_binding: None,
     };
     let refs = wait_running(&runtime, &request).await?;
 
@@ -279,8 +369,10 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
 
     let run_dir = PathBuf::from(required("STEWARD_RUN_DIR")?);
     let (input_archive, expected_payload) = make_input_archive(&run_dir)?;
+    let attempt_id = TaskAttemptId("00000000-0000-4000-8000-000000000001".to_owned());
     let task_result = runtime
-        .run_task(
+        .start_task(
+            &attempt_id,
             &SandboxTaskRequest {
                 runtime: request.runtime.clone(),
                 refs,
@@ -291,15 +383,29 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
                     "-c".to_owned(),
                     "set -eu; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; cp in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"".to_owned(),
                 ],
+                execution_binding: None,
             },
             &input_archive,
         )
         .await
         .map_err(|error| format!("adapter task round trip failed: {error:?}"))
-        .and_then(|output| output_payload(&run_dir, &output.archive));
+        .and_then(|observation| match observation {
+            SandboxTaskObservation::Succeeded { output, .. } => {
+                output_payload(&run_dir, &output.archive)
+            }
+            other => Err(format!(
+                "adapter task round trip did not produce a terminal success: {other:?}"
+            )),
+        });
 
+    let failure_semantics = if task_result.is_ok() {
+        verify_attempt_failure_semantics(&runtime, &request, &input_archive).await
+    } else {
+        Ok(())
+    };
     let cleanup_result = delete_sandbox(&runtime, &request).await;
     let actual_payload = task_result?;
+    failure_semantics?;
     cleanup_result?;
     assert_eq!(
         Sha256::digest(&actual_payload),

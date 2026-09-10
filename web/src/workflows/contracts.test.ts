@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { workflowReference, workflowRenderRequest, type PublishedWorkflow } from "./contracts";
 
 const repositoryReview: PublishedWorkflow = {
-  agent: "codex@0.117.0",
+  agent: "codex@0.140.0",
   displayName: "Repository review",
   name: "repository-review",
   version: 1,

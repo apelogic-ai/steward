@@ -14,7 +14,7 @@ use steward_store::{
     ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase,
     ConnectionOperationKind as StoredOperationKind, ConnectionOperationRecord,
     ConnectionOperationReservationRequest, ConnectionOperationRetention, ConnectionOperationState,
-    PgStore, StoreError, TaskReservationRequest,
+    PgStore, StoreError, TaskOrchestrationMode, TaskReservationRequest,
 };
 use steward_types::{
     AgentRuntimeSpec, AgentType, CanonicalAuthorityBinding, CanonicalUserId, Email, Principal,
@@ -232,14 +232,20 @@ pub struct GovernedConnectionsBroker<B> {
     store: PgStore,
     config: GovernedConnectionsConfig,
     binding: PhantomData<fn() -> B>,
+    orchestration_mode: TaskOrchestrationMode,
 }
 
 impl<B> GovernedConnectionsBroker<B> {
-    pub fn new(store: PgStore, config: GovernedConnectionsConfig) -> Self {
+    pub fn new(
+        store: PgStore,
+        config: GovernedConnectionsConfig,
+        orchestration_mode: TaskOrchestrationMode,
+    ) -> Self {
         Self {
             store,
             config,
             binding: PhantomData,
+            orchestration_mode,
         }
     }
 
@@ -250,6 +256,9 @@ impl<B> GovernedConnectionsBroker<B> {
         operation: ConnectionOperationKind,
         allow_status_cache: bool,
     ) -> Result<ConnectionOperationRecord, ConnectionBrokerError> {
+        if !self.orchestration_mode.is_active() {
+            return Err(ConnectionBrokerError::Unavailable);
+        }
         let email = Email::parse(display_email.to_owned())
             .map_err(|_| ConnectionBrokerError::Unavailable)?;
         let plan = plan_connection_operation(
@@ -279,7 +288,25 @@ impl<B> GovernedConnectionsBroker<B> {
             namespace: plan.bindings.namespace.clone(),
             runtime_class: plan.bindings.runtime_class.clone(),
         };
+        let service_envelope = steward_connections_v1::envelope();
+        let admission = evaluate(&plan.spec, &service_envelope)
+            .map_err(|_| ConnectionBrokerError::Unavailable)?;
+        // Connection reservations use one identity for the operation and its Task.
+        // Manifest digests must describe the identity the store actually persists.
+        let task_uid = operation_id;
+        let orchestration = super::tasks::task_orchestration_reservation(
+            task_uid,
+            operation_id,
+            &bindings.namespace,
+            &runtime_name,
+            &plan.spec,
+            &service_envelope,
+            None,
+        )
+        .map_err(|_| ConnectionBrokerError::Unavailable)?;
         let task = TaskReservationRequest {
+            task_uid,
+            operation_id,
             idempotency_key: &operation_key,
             submitter_service: CONNECTIONS_SERVICE,
             acting_user: Some(email.as_str()),
@@ -294,12 +321,20 @@ impl<B> GovernedConnectionsBroker<B> {
             user_envelope_revision: None,
             user_envelope_digest: None,
             coding_agent_runtime: "connections-bridge",
+            runtime_uid: None,
             runtime_namespace: &bindings.namespace,
             runtime_name: &runtime_name,
             runtime_ownership: steward_types::RuntimeOwnership::Provisioned,
             runtime_spec: &plan.spec,
             agent_command: &plan.command,
+            execution_binding: None,
             envelope_revision: CONNECTIONS_AUTHORITY_VERSION,
+            service_envelope: &service_envelope,
+            service_envelope_digest: &orchestration.service_envelope_digest,
+            candidate_digest: &orchestration.candidate_digest,
+            admission_decision: &admission,
+            inert_manifest_digest: &orchestration.inert_manifest_digest,
+            active_manifest_digest: &orchestration.active_manifest_digest,
         };
         self.store
             .reserve_connection_operation(&ConnectionOperationReservationRequest {
@@ -527,6 +562,16 @@ impl ConnectionOperationReconciler {
                     .expire_connection_oauth_flow(operation.operation_id)
                     .await?;
             }
+            if let Some(category) = finalized_nonterminal_failure(
+                operation.finalized,
+                operation.operation_state,
+                operation.task_phase,
+            ) {
+                self.store
+                    .fail_connection_operation(operation.operation_id, category)
+                    .await?;
+                continue;
+            }
             if operation.finalized {
                 self.store
                     .reconcile_connection_cleanup_state(operation.operation_id, true)
@@ -611,6 +656,65 @@ impl ConnectionOperationReconciler {
             }
         }
         Ok(())
+    }
+}
+
+fn finalized_nonterminal_failure(
+    finalized: bool,
+    operation_state: ConnectionOperationState,
+    task_phase: steward_types::TaskPhase,
+) -> Option<&'static str> {
+    if !finalized
+        || matches!(
+            operation_state,
+            ConnectionOperationState::Succeeded | ConnectionOperationState::Failed
+        )
+    {
+        return None;
+    }
+    Some(match task_phase {
+        steward_types::TaskPhase::Succeeded => "invalid_bridge_result",
+        steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled => "bridge_failed",
+        steward_types::TaskPhase::Submitted
+        | steward_types::TaskPhase::Parked
+        | steward_types::TaskPhase::Queued
+        | steward_types::TaskPhase::Running => "bridge_finalized_without_terminal_result",
+    })
+}
+
+#[cfg(test)]
+mod finalized_connection_operation_tests {
+    use steward_store::ConnectionOperationState;
+    use steward_types::TaskPhase;
+
+    use super::finalized_nonterminal_failure;
+
+    #[test]
+    fn finalized_failed_bridge_terminalizes_its_connection_operation() {
+        assert_eq!(
+            finalized_nonterminal_failure(
+                true,
+                ConnectionOperationState::Queued,
+                TaskPhase::Failed,
+            ),
+            Some("bridge_failed")
+        );
+        assert_eq!(
+            finalized_nonterminal_failure(
+                true,
+                ConnectionOperationState::Succeeded,
+                TaskPhase::Succeeded,
+            ),
+            None
+        );
+        assert_eq!(
+            finalized_nonterminal_failure(
+                false,
+                ConnectionOperationState::Queued,
+                TaskPhase::Failed,
+            ),
+            None
+        );
     }
 }
 

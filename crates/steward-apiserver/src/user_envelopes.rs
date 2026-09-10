@@ -1072,7 +1072,7 @@ mod tests {
             name: "repository-review".to_owned(),
             version: 1,
             display_name: "Repository review".to_owned(),
-            agent: "codex@0.117.0".to_owned(),
+            agent: "example-agent@1.0.0".to_owned(),
             prompt: "Review the repository state.".to_owned(),
             content_digest:
                 "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),

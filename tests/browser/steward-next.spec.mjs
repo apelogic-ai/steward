@@ -109,7 +109,7 @@ const run = {
   userEnvelopeInstanceId: "runtime-example-1",
   userEnvelopeRevision: 4,
   userEnvelopeDigest: `sha256:${"b".repeat(64)}`,
-  codingAgentRuntime: "codex@0.117.0",
+  codingAgentRuntime: "codex@0.140.0",
   runtimeUid: "runtime-example-1",
   runtimeOwnership: "provisioned",
   phase: "succeeded",
@@ -126,7 +126,7 @@ const workflowRevision = {
   name: "repository-review",
   version: 1,
   displayName: "Repository review",
-  agent: "codex@0.117.0",
+  agent: "codex@0.140.0",
   prompt: "Review the repository state that triggered this GitHub Actions run.",
   contentDigest: `sha256:${"c".repeat(64)}`,
   publishedBy: developerSession.principal.userId,
@@ -988,14 +988,14 @@ test("administrator publishes immutable Workflow revisions through the browser c
     await administrator.page.goto(`${origin}/admin/workflows/new`);
     await administrator.page.getByRole("textbox", { name: "Name", exact: true }).fill("repository-analysis");
     await administrator.page.getByLabel("Display name").fill("Repository analysis");
-    await expect(administrator.page.getByLabel("Agent")).toHaveValue("codex@0.117.0");
+    await expect(administrator.page.getByLabel("Agent")).toHaveValue("codex@0.140.0");
     await administrator.page.getByLabel("Prompt").fill("Analyze the repository state.");
     await administrator.page.getByRole("button", { name: "Publish workflow" }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/workflows/repository-analysis/versions/1`);
     const initial = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/workflows");
     expectMutationProof(initial);
     expect(initial.body).toEqual({
-      agent: "codex@0.117.0",
+      agent: "codex@0.140.0",
       displayName: "Repository analysis",
       name: "repository-analysis",
       prompt: "Analyze the repository state.",
@@ -1009,7 +1009,7 @@ test("administrator publishes immutable Workflow revisions through the browser c
     const next = administrator.mutations.find((mutation) => mutation.path.endsWith("/repository-review/versions"));
     expectMutationProof(next);
     expect(next.body).toEqual({
-      agent: "codex@0.117.0",
+      agent: "codex@0.140.0",
       displayName: "Repository review",
       prompt: "Review the repository state again.",
     });

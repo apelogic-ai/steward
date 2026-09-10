@@ -19,8 +19,6 @@ import {
 } from "@/workflows/api";
 import { workflowReference } from "@/workflows/contracts";
 
-const SUPPORTED_AGENT = "codex@0.117.0";
-
 export function AdminWorkflowsView() {
   const load = useCallback(() => listAdminWorkflows(), []);
   const state = useApiResource<WorkflowListResponse>(load);
@@ -72,6 +70,14 @@ function WorkflowDetail({ workflow }: Readonly<{ workflow: WorkflowRevision }>) 
 }
 
 export function NewWorkflowView({ from }: Readonly<{ from?: WorkflowRevision }>) {
+  const list = useCallback(() => listAdminWorkflows(), []);
+  const state = useApiResource<WorkflowListResponse>(list);
+  return <ResourceBoundary state={state}>{({ agents }) => agents.length === 0 ? (
+    <EmptyState title="No coding agents configured" />
+  ) : <WorkflowForm agents={agents} from={from} />}</ResourceBoundary>;
+}
+
+function WorkflowForm({ agents, from }: Readonly<{ agents: WorkflowListResponse["agents"]; from?: WorkflowRevision }>) {
   const router = useRouter();
   const session = useSession();
   const [submission, setSubmission] = useState<"idle" | "submitting" | MutationFailureState>("idle");
@@ -81,7 +87,7 @@ export function NewWorkflowView({ from }: Readonly<{ from?: WorkflowRevision }>)
     setSubmission("submitting");
     const data = new FormData(event.currentTarget);
     const content = {
-      agent: SUPPORTED_AGENT,
+      agent: String(data.get("agent")),
       displayName: String(data.get("displayName")),
       prompt: String(data.get("prompt")),
     };
@@ -100,7 +106,7 @@ export function NewWorkflowView({ from }: Readonly<{ from?: WorkflowRevision }>)
       <form className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm" onSubmit={submit}>
         <label className="grid gap-2 text-sm font-semibold">Name<input className="min-h-11 rounded-md border px-3 font-normal" defaultValue={from?.name ?? ""} disabled={Boolean(from)} name="name" pattern="[a-z](?:[a-z0-9]|-)*[a-z0-9]" required /></label>
         <label className="grid gap-2 text-sm font-semibold">Display name<input className="min-h-11 rounded-md border px-3 font-normal" defaultValue={from?.displayName ?? ""} name="displayName" required /></label>
-        <label className="grid gap-2 text-sm font-semibold">Agent<select className="min-h-11 rounded-md border bg-panel px-3 font-normal" defaultValue={SUPPORTED_AGENT} name="agent"><option value={SUPPORTED_AGENT}>{SUPPORTED_AGENT}</option></select></label>
+        <label className="grid gap-2 text-sm font-semibold">Agent<select className="min-h-11 rounded-md border bg-panel px-3 font-normal" defaultValue={from?.agent ?? agents[0].agentRef} name="agent" required>{agents.map((agent) => <option key={agent.agentRef} value={agent.agentRef}>{agent.displayName ?? agent.agentRef} · {agent.agentRef}</option>)}</select></label>
         <label className="grid gap-2 text-sm font-semibold">Prompt<textarea className="min-h-52 rounded-md border p-3 font-normal" defaultValue={from?.prompt ?? ""} name="prompt" required /></label>
         {submission !== "idle" && submission !== "submitting" ? <p className="text-sm text-red-800" role="alert">{{ conflict: "This Workflow name or version was published concurrently.", rejected: "The Workflow content was rejected.", forbidden: "The authorization boundary rejected publication.", unavailable: "The Workflow service is unavailable.", error: "The Workflow could not be published." }[submission]}</p> : null}
         <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Publishing…" : from ? "Publish new version" : "Publish workflow"}</button>
@@ -112,8 +118,9 @@ export function NewWorkflowView({ from }: Readonly<{ from?: WorkflowRevision }>)
 export function NewWorkflowVersionView({ name }: Readonly<{ name: string }>) {
   const list = useCallback(() => listAdminWorkflows(), []);
   const state = useApiResource<WorkflowListResponse>(list);
-  return <ResourceBoundary state={state}>{({ workflows }) => {
+  return <ResourceBoundary state={state}>{({ agents, workflows }) => {
     const current = workflows.find((workflow) => workflow.name === name);
-    return current ? <NewWorkflowView from={current} /> : <EmptyState title="No data" />;
+    if (agents.length === 0) return <EmptyState title="No coding agents configured" />;
+    return current ? <WorkflowForm agents={agents} from={current} /> : <EmptyState title="No data" />;
   }}</ResourceBoundary>;
 }

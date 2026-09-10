@@ -180,9 +180,15 @@ spec:
               value: STEWARD_RUN_ID
             - name: STEWARD_TASK_MCP_GW_ENDPOINT
               value: http://hop1-capture-tools.steward-system.svc.cluster.local:8085/mcp
+            - name: STEWARD_TASK_EXECUTION_BINDING_IMAGE
+              value: STEWARD_TASK_EXECUTION_BINDING_IMAGE_VALUE
+            - name: STEWARD_TASK_EXECUTION_BINDING_IMAGE_TWO
+              value: STEWARD_TASK_EXECUTION_BINDING_IMAGE_TWO_VALUE
           ports:
             - name: http
               containerPort: 8082
+            - name: jira
+              containerPort: 8083
           readinessProbe:
             tcpSocket:
               port: http
@@ -203,3 +209,6 @@ spec:
     - name: http
       port: 8082
       targetPort: http
+    - name: jira
+      port: 8083
+      targetPort: jira

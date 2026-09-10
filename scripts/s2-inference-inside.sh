@@ -67,11 +67,15 @@ if [[ "${SLICE}" == "s5" && -z "${STEWARD_POC_API_IMAGE:-}" ]]; then
   echo "STEWARD_POC_API_IMAGE is required from the ephemeral S5 harness" >&2
   exit 2
 fi
-if [[ "${SLICE}" == "task" && -z "${STEWARD_TASK_IMAGE:-}" ]]; then
-  echo "STEWARD_TASK_IMAGE is required from the ephemeral Task harness" >&2
-  exit 2
+if [[ "${SLICE}" == "task" ]]; then
+  for variable in STEWARD_TASK_IMAGE STEWARD_OPENSHELL_SANDBOX_IMAGE_TWO; do
+    if [[ -z "${!variable:-}" ]]; then
+      echo "${variable} is required from the ephemeral Task harness" >&2
+      exit 2
+    fi
+  done
 fi
-for command in cargo curl docker jq kind kubectl openssl sed tar; do
+for command in awk cargo curl docker jq kind kubectl openssl sed tar; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is missing: ${command}" >&2
     exit 2
@@ -128,13 +132,52 @@ if [[ "${SLICE}" == "s5" ]]; then
   kind load docker-image "${STEWARD_POC_API_IMAGE}" --name "${cluster_name}"
 fi
 KUBECTL=(kubectl --kubeconfig "${STEWARD_TEST_KUBECONFIG}" --context "${STEWARD_TEST_KUBE_CONTEXT}")
+
+wait_for_spire_admission_webhook() {
+  for _attempt in {1..120}; do
+    if "${KUBECTL[@]}" create --dry-run=server -f - >/dev/null 2>&1 <<'YAML'
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: steward-spire-webhook-readiness
+spec:
+  spiffeIDTemplate: spiffe://openshell.local/steward/readiness
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: steward-system
+  podSelector:
+    matchLabels:
+      app: steward-spire-webhook-readiness
+YAML
+    then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "SPIRE admission webhook did not accept a server-side dry run within 120 seconds" >&2
+  return 1
+}
+
+wait_for_spire_admission_webhook
 "${KUBECTL[@]}" apply -f "${ROOT}/manifests/agents.apelogic.ai_agentruntimes.yaml"
-"${KUBECTL[@]}" wait --for=condition=Established \
-  crd/agentruntimes.agents.apelogic.ai --timeout=120s
+crd_established="false"
+for _attempt in {1..120}; do
+  if "${KUBECTL[@]}" get crd/agentruntimes.agents.apelogic.ai -o json |
+    jq -e 'any(.status.conditions[]?; .type == "Established" and .status == "True")' >/dev/null; then
+    crd_established="true"
+    break
+  fi
+  sleep 1
+done
+if [[ "${crd_established}" != "true" ]]; then
+  echo "AgentRuntime CRD was not established within 120 seconds" >&2
+  exit 1
+fi
 
 signing_key="${STEWARD_RUN_DIR}/s2-signing-key"
 introspection_client="${STEWARD_RUN_DIR}/s2-introspection-client"
 master_key="${STEWARD_RUN_DIR}/s2-litellm-master-key"
+jira_token="${STEWARD_RUN_DIR}/s2-jira-token"
 encryption_key="${STEWARD_RUN_DIR}/s5-mcp-encryption-key"
 tls_key="${STEWARD_RUN_DIR}/s2-tls-key.pem"
 tls_cert="${STEWARD_RUN_DIR}/s2-tls-cert.pem"
@@ -145,9 +188,11 @@ workload_exchange_ca_cert="${STEWARD_RUN_DIR}/s2-workload-exchange-ca.crt"
 workload_exchange_key="${STEWARD_RUN_DIR}/s2-workload-exchange.key"
 workload_exchange_csr="${STEWARD_RUN_DIR}/s2-workload-exchange.csr"
 workload_exchange_cert="${STEWARD_RUN_DIR}/s2-workload-exchange.crt"
+workload_exchange_extensions="${STEWARD_RUN_DIR}/s2-workload-exchange-extensions.cnf"
 openssl rand 32 >"${signing_key}"
 openssl rand -hex 24 | tr -d '\n' >"${introspection_client}"
 openssl rand -hex 32 | tr -d '\n' >"${master_key}"
+openssl rand -hex 24 | tr -d '\n' >"${jira_token}"
 if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   openssl rand -base64 32 | tr -d '\n' >"${encryption_key}"
 fi
@@ -171,6 +216,12 @@ openssl req -new -newkey rsa:2048 -nodes \
   -addext "extendedKeyUsage=serverAuth" \
   -keyout "${workload_exchange_key}" \
   -out "${workload_exchange_csr}" >/dev/null 2>&1
+printf '%s\n' \
+  'subjectAltName=DNS:workload-exchange.steward-system.svc.cluster.local' \
+  'basicConstraints=critical,CA:FALSE' \
+  'keyUsage=critical,digitalSignature,keyEncipherment' \
+  'extendedKeyUsage=serverAuth' \
+  >"${workload_exchange_extensions}"
 openssl x509 -req \
   -in "${workload_exchange_csr}" \
   -CA "${workload_exchange_ca_cert}" \
@@ -178,12 +229,13 @@ openssl x509 -req \
   -CAcreateserial \
   -days 1 \
   -sha256 \
-  -copy_extensions copy \
+  -extfile "${workload_exchange_extensions}" \
   -out "${workload_exchange_cert}" >/dev/null 2>&1
 chmod 600 \
   "${signing_key}" \
   "${introspection_client}" \
   "${master_key}" \
+  "${jira_token}" \
   "${tls_key}" \
   "${tls_key_der}" \
   "${workload_exchange_ca_key}" \
@@ -205,6 +257,7 @@ done
   --from-file="signing-key=${signing_key}" \
   --from-file="introspection-client=${introspection_client}" \
   --from-file="litellm-master-key=${master_key}" \
+  --from-file="jira-token=${jira_token}" \
   --from-file="tls-cert.der=${tls_cert_der}" \
   --from-file="tls-key.der=${tls_key_der}" \
   --from-file="openshell-ca.crt=${STEWARD_OPENSHELL_CA_CERTIFICATE_FILE}" \
@@ -240,8 +293,14 @@ if [[ "${SLICE}" == "task" ]]; then
     --from-file="codex-responses-fixture.ts=${ROOT}/config/task/codex-responses-fixture.ts" \
     --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
 fi
+task_orchestration_mode="staged"
+if [[ "${SLICE}" == "task" ]]; then
+  task_orchestration_mode="active"
+fi
 rendered_stack="${STEWARD_RUN_DIR}/s2-stack.yaml"
-sed "s#STEWARD_S2_CONTROLLER_IMAGE#${STEWARD_S2_CONTROLLER_IMAGE}#g" \
+sed \
+  -e "s#STEWARD_S2_CONTROLLER_IMAGE#${STEWARD_S2_CONTROLLER_IMAGE}#g" \
+  -e "s#STEWARD_TASK_ORCHESTRATION_MODE_VALUE#${task_orchestration_mode}#g" \
   "${ROOT}/config/s2/stack.yaml" >"${rendered_stack}"
 "${KUBECTL[@]}" apply -f "${rendered_stack}"
 if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
@@ -265,9 +324,32 @@ if [[ "${SLICE}" == "s5" ]]; then
   "${KUBECTL[@]}" apply -f "${rendered_poc_stack}"
 fi
 if [[ "${SLICE}" == "task" ]]; then
+  kind load docker-image "${STEWARD_OPENSHELL_SANDBOX_IMAGE_TWO}" --name "${cluster_name}"
+  sandbox_digest_image() {
+    local tagged_image="$1"
+    local containerd_name="docker.io/${tagged_image}"
+    local digest=""
+    digest="$(
+      docker exec "${cluster_name}-control-plane" ctr -n k8s.io images list |
+        awk -v image="${containerd_name}" '$1 == image { print $3 }'
+    )"
+    if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+      echo "loaded Task sandbox image ${tagged_image} has no exact containerd manifest digest" >&2
+      return 1
+    fi
+    local digest_image="docker.io/${tagged_image%:*}@${digest}"
+    docker exec "${cluster_name}-control-plane" \
+      ctr -n k8s.io images tag "${containerd_name}" "${digest_image}" >/dev/null
+    printf '%s' "${digest_image}"
+  }
+  sandbox_digest_image_one="$(sandbox_digest_image "${STEWARD_OPENSHELL_SANDBOX_IMAGE}")"
+  sandbox_digest_image_two="$(sandbox_digest_image "${STEWARD_OPENSHELL_SANDBOX_IMAGE_TWO}")"
+  sandbox_digest_image="${sandbox_digest_image_one}"
   rendered_task_stack="${STEWARD_RUN_DIR}/task-stack.yaml"
   sed \
     -e "s#STEWARD_TASK_IMAGE#${STEWARD_TASK_IMAGE}#g" \
+    -e "s#STEWARD_TASK_EXECUTION_BINDING_IMAGE_VALUE#${sandbox_digest_image}#g" \
+    -e "s#STEWARD_TASK_EXECUTION_BINDING_IMAGE_TWO_VALUE#${sandbox_digest_image_two}#g" \
     -e "s#STEWARD_RUN_ID#${STEWARD_RUN_ID}#g" \
     "${ROOT}/config/task/stack.yaml" >"${rendered_task_stack}"
   "${KUBECTL[@]}" apply -f "${rendered_task_stack}"
@@ -276,6 +358,10 @@ fi
 "${KUBECTL[@]}" -n steward-system rollout status deployment/litellm --timeout=300s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-mint --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-controller --timeout=300s
+if [[ "${SLICE}" == "task" ]]; then
+  # The provider seed resolves the canonical Task fixture identity registered at startup.
+  "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-task-server --timeout=180s
+fi
 if [[ "${SLICE}" == "s5" || "${SLICE}" == "task" ]]; then
   "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-mint-tools --timeout=180s
   "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-opa --timeout=180s
@@ -289,7 +375,6 @@ if [[ "${SLICE}" == "s5" ]]; then
 fi
 if [[ "${SLICE}" == "task" ]]; then
   "${KUBECTL[@]}" -n litellm rollout status deployment/codex-responses --timeout=180s
-  "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-task-server --timeout=180s
 fi
 
 service_subnet="$(
@@ -311,6 +396,7 @@ if [[ "${SLICE}" == "s5" ]]; then
 elif [[ "${SLICE}" == "task" ]]; then
   profile_sources=(
     "${ROOT}/config/s5/tool-provider-profile.yaml"
+    "${ROOT}/config/task/tool-provider-profile.yaml"
     "${ROOT}/config/task/inference-provider-profile.yaml"
   )
 else

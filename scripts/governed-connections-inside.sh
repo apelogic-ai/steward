@@ -6,6 +6,7 @@ for variable in \
   STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE \
   STEWARD_CONNECTIONS_TEST_MINT_IMAGE \
   STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE \
+  STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE \
   STEWARD_OPENSHELL_ENDPOINT \
   STEWARD_OPENSHELL_CA_CERTIFICATE_FILE \
   STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE \
@@ -25,7 +26,7 @@ do
     exit 2
   fi
 done
-for command in awk cargo curl docker kind kubectl openssl sed tar; do
+for command in awk base64 cargo curl docker kind kubectl openssl sed tar; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is missing: ${command}" >&2
     exit 2
@@ -63,6 +64,7 @@ trap 'exit 143' TERM
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}" --name "${cluster_name}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_MINT_IMAGE}" --name "${cluster_name}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE}" --name "${cluster_name}"
+kind load docker-image "${STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE}" --name "${cluster_name}"
 
 bridge_containerd_name="docker.io/${STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE}"
 bridge_digest="$(
@@ -88,6 +90,45 @@ for namespace in steward-system steward-connections team-a team-b; do
   "${KUBECTL[@]}" label namespace "${namespace}" \
     "steward.test/run-id=${run_id}" --overwrite
 done
+"${KUBECTL[@]}" label namespace steward-connections \
+  "steward.test/connections-admission=true" --overwrite
+
+webhook_key_pem="${STEWARD_RUN_DIR}/connections-webhook-key.pem"
+webhook_key_der="${STEWARD_RUN_DIR}/connections-webhook-key.der"
+webhook_cert_pem="${STEWARD_RUN_DIR}/connections-webhook-cert.pem"
+webhook_cert_der="${STEWARD_RUN_DIR}/connections-webhook-cert.der"
+openssl genpkey \
+  -algorithm RSA \
+  -pkeyopt rsa_keygen_bits:2048 \
+  -out "${webhook_key_pem}" \
+  >/dev/null 2>&1
+openssl req \
+  -new \
+  -x509 \
+  -key "${webhook_key_pem}" \
+  -out "${webhook_cert_pem}" \
+  -days 1 \
+  -subj "/CN=steward-connections-webhook.steward-system.svc" \
+  -addext "subjectAltName=DNS:steward-connections-webhook,DNS:steward-connections-webhook.steward-system.svc,DNS:steward-connections-webhook.steward-system.svc.cluster.local" \
+  >/dev/null 2>&1
+openssl x509 \
+  -in "${webhook_cert_pem}" \
+  -outform DER \
+  -out "${webhook_cert_der}"
+openssl pkcs8 \
+  -topk8 \
+  -nocrypt \
+  -in "${webhook_key_pem}" \
+  -outform DER \
+  -out "${webhook_key_der}"
+chmod 600 "${webhook_key_pem}" "${webhook_key_der}"
+"${KUBECTL[@]}" -n steward-system create secret generic steward-connections-webhook-tls \
+  --from-file="tls-cert.der=${webhook_cert_der}" \
+  --from-file="tls-key.der=${webhook_key_der}" \
+  --dry-run=client -o yaml |
+  "${KUBECTL[@]}" apply -f -
+"${KUBECTL[@]}" -n steward-system label secret steward-connections-webhook-tls \
+  "steward.test/run-id=${run_id}" --overwrite
 
 "${KUBECTL[@]}" -n steward-system create configmap steward-connections-e2e-fixtures \
   --from-file="mcp_tools.rego=${ROOT}/policy/mcp_tools.rego" \
@@ -127,6 +168,89 @@ sed \
   "${ROOT}/config/connections-e2e/stack.yaml" >"${rendered_stack}"
 "${KUBECTL[@]}" apply -f "${rendered_stack}"
 "${KUBECTL[@]}" -n steward-system rollout status deployment/postgres --timeout=180s
+controller_username="$(
+  "${KUBECTL[@]}" auth whoami -o jsonpath='{.status.userInfo.username}'
+)"
+if [[ -z "${controller_username}" ]]; then
+  echo "could not derive the E2E controller Kubernetes username" >&2
+  exit 1
+fi
+webhook_ca_bundle="$(base64 <"${webhook_cert_pem}" | tr -d '\n')"
+cat <<YAML | "${KUBECTL[@]}" apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: steward-connections-webhook
+  namespace: steward-system
+  labels: { steward.test/run-id: "${run_id}" }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: steward-connections-webhook }
+  template:
+    metadata:
+      labels:
+        app: steward-connections-webhook
+        steward.test/run-id: "${run_id}"
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: webhook
+          image: "${STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE}"
+          imagePullPolicy: Never
+          env:
+            - { name: STEWARD_TEST_DATABASE_URL, value: "postgres://steward@postgres.steward-system.svc.cluster.local:5432/steward" }
+            - { name: STEWARD_TEST_CONTROLLER_USERNAME, value: "${controller_username}" }
+            - { name: STEWARD_TEST_TLS_CERT_DER, value: /run/tls/tls-cert.der }
+            - { name: STEWARD_TEST_TLS_KEY_DER, value: /run/tls/tls-key.der }
+          ports: [{ name: https, containerPort: 8443 }]
+          readinessProbe: { tcpSocket: { port: https }, initialDelaySeconds: 2, periodSeconds: 2 }
+          volumeMounts: [{ name: tls, mountPath: /run/tls, readOnly: true }]
+      volumes:
+        - name: tls
+          secret: { secretName: steward-connections-webhook-tls, defaultMode: 0444 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: steward-connections-webhook
+  namespace: steward-system
+  labels: { steward.test/run-id: "${run_id}" }
+spec:
+  selector: { app: steward-connections-webhook }
+  ports: [{ name: https, port: 443, targetPort: https }]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: steward-connections-${run_id}
+  labels: { steward.test/run-id: "${run_id}" }
+webhooks:
+  - name: connection-agentruntime.steward.agents.apelogic.ai
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    matchPolicy: Equivalent
+    timeoutSeconds: 10
+    namespaceSelector:
+      matchLabels:
+        steward.test/connections-admission: "true"
+    clientConfig:
+      service:
+        name: steward-connections-webhook
+        namespace: steward-system
+        path: /validate-agent-runtime
+        port: 443
+      caBundle: "${webhook_ca_bundle}"
+    rules:
+      - apiGroups: ["agents.apelogic.ai"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE"]
+        resources: ["agentruntimes"]
+        scope: Namespaced
+YAML
+"${KUBECTL[@]}" -n steward-system rollout status \
+  deployment/steward-connections-webhook --timeout=180s
 "${KUBECTL[@]}" -n steward-system wait --for=condition=complete job/oauth-migrations --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-opa --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/provider-fixture --timeout=180s

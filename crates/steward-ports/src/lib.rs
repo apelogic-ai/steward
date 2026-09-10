@@ -2,12 +2,44 @@
 
 use std::future::Future;
 
-use steward_types::{AgentType, Budget, ModelRef, RuntimeId, RuntimeRefs, SpendSummary, ToolGrant};
+use steward_types::{
+    AgentType, Budget, DisposableExecutionBinding, ModelRef, RuntimeId, RuntimeRefs, SpendSummary,
+    ToolGrant,
+};
 
 /// Maximum raw tar body accepted by the Task input endpoint.
 pub const MAX_TASK_INPUT_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum raw tar body returned by a Task runtime and persisted as output.
 pub const MAX_TASK_OUTPUT_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Vendor-neutral inputs used to render one immutable Task execution command.
+///
+/// The adapter owns agent-specific configuration and command syntax. Core supplies only the
+/// approved Workflow intent, deployment binding, and optional governed tool endpoint.
+#[derive(Clone, Copy, Debug)]
+pub struct TaskExecutionPlanRequest<'a> {
+    pub workflow_prompt: &'a str,
+    pub model: &'a ModelRef,
+    pub tools: &'a [ToolGrant],
+    pub tool_transport_endpoint: Option<&'a str>,
+    pub binding: &'a DisposableExecutionBinding,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskExecutionPlan {
+    pub command: Vec<String>,
+}
+
+/// Agent-specific renderer for an immutable, server-selected Task execution plan.
+///
+/// This is a class-B execution seam. The implementation belongs in `adapters/<agent>` while
+/// core selects it only through the opaque contract string persisted in the binding.
+pub trait TaskExecutionAdapter: Send + Sync + 'static {
+    fn contract(&self) -> &'static str;
+
+    fn render(&self, request: TaskExecutionPlanRequest<'_>)
+    -> Result<TaskExecutionPlan, PortError>;
+}
 
 /// Maturity derived from whether a non-fake adapter implements a port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,6 +155,10 @@ pub struct SandboxRequest {
     pub models: Vec<ModelRef>,
     pub tools: Vec<ToolGrant>,
     pub refs: RuntimeRefs,
+    /// Immutable deployment binding persisted with a disposable Task.
+    ///
+    /// Legacy and resident runtimes do not carry this value.
+    pub execution_binding: Option<DisposableExecutionBinding>,
 }
 
 /// Controller-owned execution bindings for a short-lived provider-control runtime.
@@ -174,6 +210,8 @@ pub struct SandboxTaskRequest {
     /// The controller reads this only from the persisted runtime spec; callers cannot choose it.
     pub agent_type: AgentType,
     pub command: Vec<String>,
+    /// The exact deployment binding persisted when the Task was reserved.
+    pub execution_binding: Option<DisposableExecutionBinding>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -181,16 +219,55 @@ pub struct SandboxTaskOutput {
     pub archive: Vec<u8>,
 }
 
+/// Immutable, server-authored correlation identity for one Task execution attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskAttemptId(pub String);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SandboxTaskObservation {
+    Absent,
+    Accepted {
+        adapter_observation_id: String,
+    },
+    Running {
+        adapter_observation_id: String,
+    },
+    Succeeded {
+        adapter_observation_id: String,
+        output: SandboxTaskOutput,
+    },
+    Failed {
+        adapter_observation_id: String,
+        reason: String,
+    },
+    OutcomeUnknown {
+        reason: String,
+    },
+}
+
 pub trait SandboxTaskRuntime: Send + Sync + 'static {
     fn provider_control_bindings(&self) -> Option<ProviderControlExecutionBindings> {
         None
     }
 
-    fn run_task(
+    fn start_task(
         &self,
+        attempt_id: &TaskAttemptId,
         request: &SandboxTaskRequest,
         input_archive: &[u8],
-    ) -> impl Future<Output = Result<SandboxTaskOutput, PortError>> + Send;
+    ) -> impl Future<Output = Result<SandboxTaskObservation, PortError>> + Send;
+
+    fn observe_task(
+        &self,
+        attempt_id: &TaskAttemptId,
+        request: &SandboxTaskRequest,
+    ) -> impl Future<Output = Result<SandboxTaskObservation, PortError>> + Send;
+
+    fn cancel_task(
+        &self,
+        attempt_id: &TaskAttemptId,
+        request: &SandboxTaskRequest,
+    ) -> impl Future<Output = Result<SandboxTaskObservation, PortError>> + Send;
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -338,6 +415,19 @@ pub trait DecisionChannel: Send + Sync + 'static {
         &self,
         request: &DecisionRequest,
     ) -> impl Future<Output = Result<DecisionReference, PortError>> + Send;
+
+    /// Read-only recovery of an already invoked request. Absence is not permission
+    /// to create again: a previous request may still be in flight or unindexed.
+    fn observe_request(
+        &self,
+        _request_id: &str,
+    ) -> impl Future<Output = Result<Option<DecisionReference>, PortError>> + Send {
+        async {
+            Err(PortError::Rejected {
+                reason: "decision channel does not support request observation".to_owned(),
+            })
+        }
+    }
 
     fn record_resolution(
         &self,

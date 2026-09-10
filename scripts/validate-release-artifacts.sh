@@ -20,6 +20,7 @@ browser_auth_rendered="$(mktemp)"
 browser_auth_deployment="$(mktemp)"
 task_identity_rendered="$(mktemp)"
 task_identity_deployment="$(mktemp)"
+task_execution_bindings_rendered="$(mktemp)"
 web_rendered="$(mktemp)"
 web_deployment="$(mktemp)"
 external_edge_rendered="$(mktemp)"
@@ -45,7 +46,7 @@ cleanup() {
     "${operator_connections_bridge_apiserver_deployment}" \
     "${operator_connections_bridge_controller_deployment}" "${browser_auth_rendered}" \
     "${browser_auth_deployment}" "${task_identity_rendered}" \
-    "${task_identity_deployment}" \
+    "${task_identity_deployment}" "${task_execution_bindings_rendered}" \
     "${web_rendered}" "${web_deployment}" "${external_edge_rendered}" \
     "${secret_trust_rendered}" \
     "${mint_synthetic_kubeconfig}" "${mint_startup_output}"
@@ -67,6 +68,20 @@ image_values=(
   --set 'runtimeNamespaces[0]=team-a'
   --set-string config.controller.openshellRuntimeClassName=openshell-runc
   --set-string config.apiserver.mcpGatewayEndpoint=https://mcp-gw.example.test/mcp
+)
+task_execution_binding_values=(
+  --set-string config.apiserver.executionBindingsMode=active
+  --set-string 'config.apiserver.executionBindings.bindings[0].agentRef=example-agent@1.2.3'
+  --set-string 'config.apiserver.executionBindings.bindings[0].displayName=Example Agent 1.2.3'
+  --set-string 'config.apiserver.executionBindings.bindings[0].adapter=codex-v1'
+  --set-string 'config.apiserver.executionBindings.bindings[0].image=registry.example.test/agents/example@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  --set-string 'config.apiserver.executionBindings.bindings[0].executable=/opt/example/bin/agent'
+  --set-string 'config.apiserver.executionBindings.bindings[0].versionProbe.arguments[0]=--version'
+  --set-string 'config.apiserver.executionBindings.bindings[0].versionProbe.expectedStdout=example-agent 1.2.3'
+  --set-string 'config.apiserver.executionBindings.bindings[0].providerProfiles.tools.id=example-tools-profile-v7'
+  --set-string 'config.apiserver.executionBindings.bindings[0].providerProfiles.tools.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+  --set-string 'config.apiserver.executionBindings.bindings[0].providerProfiles.inference.id=example-inference-profile-v7'
+  --set-string 'config.apiserver.executionBindings.bindings[0].providerProfiles.inference.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
 )
 stable_bridge_values=(
   --set stableBridge.enabled=true
@@ -113,6 +128,74 @@ helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
   "${image_values[@]}" > "${rendered}"
+if [[ "$(grep -c 'name: STEWARD_TASK_EXECUTION_BINDINGS_FILE' "${rendered}")" != "1" ]] ||
+  ! grep -Fq 'name: STEWARD_TASK_EXECUTION_BINDINGS_MODE, value: "staged"' "${rendered}" ||
+  ! grep -Fq '\"apiVersion\":\"steward.execution-bindings/v1\"' "${rendered}" ||
+  ! grep -Fq '\"bindings\":[]' "${rendered}"
+then
+  echo "the empty execution binding catalog must be mounted only in the apiserver" >&2
+  exit 1
+fi
+catalog_fixture_directory="${root}/charts/steward/testdata/execution-bindings"
+if ! helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  "${image_values[@]}" \
+  --set-string config.apiserver.executionBindingsMode=active \
+  --set-json "config.apiserver.executionBindings=$(<"${catalog_fixture_directory}/valid.json")" \
+  >/dev/null
+then
+  echo "Helm rejected the runtime-valid execution binding parity fixture" >&2
+  exit 1
+fi
+for invalid_catalog in "${catalog_fixture_directory}"/invalid-*.json; do
+  if helm template steward "${root}/charts/steward" \
+    --namespace steward \
+    "${image_values[@]}" \
+    --set-string config.apiserver.executionBindingsMode=active \
+    --set-json "config.apiserver.executionBindings=$(<"${invalid_catalog}")" \
+    >/dev/null 2>&1
+  then
+    echo "Helm accepted runtime-invalid execution binding parity fixture ${invalid_catalog}" >&2
+    exit 1
+  fi
+done
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  "${task_execution_binding_values[@]}" \
+  > "${task_execution_bindings_rendered}"
+if [[ "$(grep -c 'name: STEWARD_TASK_EXECUTION_BINDINGS_FILE' \
+  "${task_execution_bindings_rendered}")" != "1" ]]; then
+  echo "configured execution binding catalog must reach only the apiserver file mount" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  "${image_values[@]}" \
+  "${task_execution_binding_values[@]}" \
+  --set-string 'config.apiserver.executionBindings.bindings[0].image=registry.example.test/agents/example:latest' \
+  >/dev/null 2>&1
+then
+  echo "structured execution binding values must reject mutable image tags" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  "${image_values[@]}" \
+  "${task_execution_binding_values[@]}" \
+  --set-string 'config.apiserver.executionBindings.bindings[0].credential=forbidden' \
+  >/dev/null 2>&1
+then
+  echo "structured execution binding values must reject unknown fields" >&2
+  exit 1
+fi
+if ! grep -q 'example-tools-profile-v7' "${task_execution_bindings_rendered}" ||
+  cmp -s "${rendered}" "${task_execution_bindings_rendered}"
+then
+  echo "configured execution binding content must change the immutable ConfigMap and rollout" >&2
+  exit 1
+fi
 
 if ! helm template steward "${root}/charts/steward" \
   --namespace steward \

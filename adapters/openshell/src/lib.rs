@@ -1,7 +1,7 @@
 //! Thin OpenShell integration seam.
 
 #[cfg(feature = "runtime")]
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 #[cfg(feature = "runtime")]
 use std::future::Future;
 #[cfg(feature = "runtime")]
@@ -44,7 +44,8 @@ use steward_ports::PortError;
 #[cfg(feature = "runtime")]
 use steward_ports::{
     ProviderControlExecutionBindings, SandboxExecutionClass, SandboxObservation, SandboxRequest,
-    SandboxRuntime, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
+    SandboxRuntime, SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest,
+    SandboxTaskRuntime, TaskAttemptId,
 };
 #[cfg(feature = "runtime")]
 use steward_types::{AgentType, RuntimeRefs};
@@ -60,6 +61,8 @@ const NAME_LENGTH: usize = 19;
 const HASH_CHARACTERS: usize = NAME_LENGTH - 2;
 const LOWER_BASE36: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 #[cfg(feature = "runtime")]
+const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+#[cfg(feature = "runtime")]
 const TAR_BLOCK_BYTES: usize = 512;
 #[cfg(feature = "runtime")]
 const STAGING_EXEC_STDIN_CHUNK_BYTES: usize = 512 * 1024;
@@ -69,10 +72,10 @@ const KUBERNETES_DNS_SUBDOMAIN_MAX_LENGTH: usize = 253;
 const KUBERNETES_DNS_LABEL_MAX_LENGTH: usize = 63;
 #[cfg(feature = "runtime")]
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
+#[cfg(feature = "runtime")]
+const EXECUTION_BINDING_LABEL: &str = "agents.apelogic.ai/execution-binding";
 /// Server-authored agent type for the one-shot Connections bridge operation.
 pub const CONNECTIONS_BRIDGE_AGENT_TYPE: &str = "connections-bridge";
-/// The sole immutable Workflow agent supported by this slice.
-pub const WORKFLOW_CODEX_AGENT_TYPE: &str = "codex@0.117.0";
 #[cfg(feature = "runtime")]
 const TOOL_PROVIDER: &str = "steward-mcp-gw";
 #[cfg(feature = "runtime")]
@@ -104,6 +107,7 @@ fn provider_reconciliation(attached: bool, desired: bool) -> Option<ProviderReco
         (false, false) | (true, true) => None,
     }
 }
+
 #[cfg(feature = "identity")]
 const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
 #[cfg(feature = "identity")]
@@ -280,13 +284,98 @@ pub fn stable_name(kind: NameKind, identity: &[u8]) -> String {
 }
 
 #[cfg(feature = "runtime")]
+fn execution_binding_label_value(binding_digest: &str) -> String {
+    let digest = binding_digest
+        .strip_prefix("sha256:")
+        .and_then(|value| (value.len() == 64).then_some(value))
+        .unwrap_or(binding_digest);
+    let digest = Sha256::digest(digest.as_bytes());
+    let mut label = String::with_capacity(63);
+    label.push_str("sha256-");
+    for byte in digest.iter().take(28) {
+        label.push(char::from(LOWER_HEX[usize::from(byte >> 4)]));
+        label.push(char::from(LOWER_HEX[usize::from(byte & 0x0f)]));
+    }
+    label
+}
+
+#[cfg(feature = "runtime")]
 struct OpenShellProjection {
     workspace: String,
     workspace_key: String,
     sandbox: String,
     providers: Vec<String>,
+    managed_providers: Vec<String>,
     runtime_uid: String,
     image: Option<String>,
+    execution_binding_digest: Option<String>,
+}
+
+#[cfg(feature = "runtime")]
+fn provider_reconciliation_targets(projection: &OpenShellProjection) -> Vec<(String, bool)> {
+    let mut targets = projection
+        .managed_providers
+        .iter()
+        .cloned()
+        .map(|provider| {
+            let desired = projection.providers.iter().any(|value| value == &provider);
+            (provider, desired)
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|(_, desired)| *desired);
+    targets
+}
+
+#[cfg(feature = "runtime")]
+fn observed_managed_providers(
+    providers: &[Provider],
+    workspace: &str,
+    managed_providers: &[String],
+) -> Result<BTreeSet<String>, PortError> {
+    let managed = managed_providers
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut observed = BTreeSet::new();
+    for provider in providers {
+        let metadata_name = provider
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.name.as_str());
+        let provider_type = provider.r#type.as_str();
+        let managed_name = metadata_name
+            .filter(|name| managed.contains(name))
+            .or_else(|| managed.contains(provider_type).then_some(provider_type));
+        let Some(managed_name) = managed_name else {
+            continue;
+        };
+        validate_provider(provider, workspace, managed_name)?;
+        if !observed.insert(managed_name.to_owned()) {
+            return Err(PortError::Rejected {
+                reason: "OpenShell returned duplicate Steward provider attachments".to_owned(),
+            });
+        }
+    }
+    Ok(observed)
+}
+
+#[cfg(feature = "runtime")]
+fn provider_reconciliation_plan(
+    projection: &OpenShellProjection,
+    observed: &[Provider],
+) -> Result<Vec<(String, ProviderReconciliation)>, PortError> {
+    let observed = observed_managed_providers(
+        observed,
+        &projection.workspace,
+        &projection.managed_providers,
+    )?;
+    Ok(provider_reconciliation_targets(projection)
+        .into_iter()
+        .filter_map(|(provider, desired)| {
+            provider_reconciliation(observed.contains(&provider), desired)
+                .map(|action| (provider, action))
+        })
+        .collect())
 }
 
 #[cfg(feature = "runtime")]
@@ -315,11 +404,22 @@ fn deletion_names(request: &SandboxRequest) -> (String, String) {
 fn bridge_image_for_execution(
     agent_type: &AgentType,
     execution_class: SandboxExecutionClass,
+    execution_binding: Option<&steward_types::DisposableExecutionBinding>,
     stable_bridge_image: Option<&str>,
     connections_bridge_image: Option<&str>,
 ) -> Result<Option<String>, PortError> {
+    if let Some(binding) = execution_binding {
+        validate_disposable_execution_binding(binding)?;
+        if execution_class != SandboxExecutionClass::Agent || binding.agent_ref != agent_type.name {
+            return Err(PortError::Rejected {
+                reason: "persisted execution binding does not match the requested agent runtime"
+                    .to_owned(),
+            });
+        }
+        return Ok(Some(binding.image.clone()));
+    }
     match (agent_type.name.as_str(), execution_class) {
-        ("base" | WORKFLOW_CODEX_AGENT_TYPE, SandboxExecutionClass::Agent) => Ok(None),
+        ("base", SandboxExecutionClass::Agent) => Ok(None),
         (CONNECTIONS_BRIDGE_AGENT_TYPE, SandboxExecutionClass::Agent) => stable_bridge_image
             .filter(|image| is_digest_pinned_image(image))
             .map(str::to_owned)
@@ -343,10 +443,43 @@ fn bridge_image_for_execution(
 }
 
 #[cfg(feature = "runtime")]
-fn output_archive_command(agent_type: &AgentType) -> &'static str {
+fn validate_disposable_execution_binding(
+    binding: &steward_types::DisposableExecutionBinding,
+) -> Result<(), PortError> {
+    binding
+        .validate()
+        .map_err(|reason| PortError::Rejected { reason })?;
+    if binding.adapter != "codex-v1" {
+        return Err(PortError::Rejected {
+            reason: format!(
+                "persisted execution binding uses unsupported adapter {}",
+                binding.adapter
+            ),
+        });
+    }
+    let mut digest = Sha256::new();
+    digest.update(steward_types::TASK_EXECUTION_BINDING_DIGEST_DOMAIN);
+    digest.update(
+        binding
+            .canonical_content()
+            .map_err(|reason| PortError::Rejected { reason })?,
+    );
+    if format!("sha256:{:x}", digest.finalize()) != binding.binding_digest {
+        return Err(PortError::Rejected {
+            reason: "persisted execution binding digest does not match its content".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "runtime")]
+fn output_archive_command(
+    agent_type: &AgentType,
+    execution_binding: Option<&steward_types::DisposableExecutionBinding>,
+) -> &'static str {
     if agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE {
         "set -eu; test -f /sandbox/steward-output/response.json; tar -cf - -C /sandbox/steward-output response.json"
-    } else if agent_type.name == WORKFLOW_CODEX_AGENT_TYPE {
+    } else if execution_binding.is_some() {
         "set -eu; test -s /sandbox/steward-output/result.txt; test -d /sandbox/steward-output/out; tar -cf - -C /sandbox/steward-output out"
     } else {
         "set -eu; tar -cf - -C /sandbox/steward-output ."
@@ -446,6 +579,23 @@ fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
         "network"
     } else {
         "agent"
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn attach_task_agent_failure_category(
+    observation: SandboxTaskObservation,
+    stderr: &[u8],
+) -> SandboxTaskObservation {
+    match observation {
+        SandboxTaskObservation::Failed {
+            adapter_observation_id,
+            ..
+        } => SandboxTaskObservation::Failed {
+            adapter_observation_id,
+            reason: task_agent_failure_category(stderr).to_owned(),
+        },
+        observation => observation,
     }
 }
 
@@ -597,22 +747,67 @@ fn project_request(
     let image = bridge_image_for_execution(
         &request.agent_type,
         request.execution_class,
+        request.execution_binding.as_ref(),
         stable_bridge_image,
         connections_bridge_image,
     )?;
+    let (tool_provider, inference_provider) = request.execution_binding.as_ref().map_or(
+        (Some(TOOL_PROVIDER), Some(INFERENCE_PROVIDER)),
+        |binding| {
+            (
+                binding
+                    .provider_profiles
+                    .tools
+                    .as_ref()
+                    .map(|profile| profile.id.as_str()),
+                binding
+                    .provider_profiles
+                    .inference
+                    .as_ref()
+                    .map(|profile| profile.id.as_str()),
+            )
+        },
+    );
+    if !request.tools.is_empty() && tool_provider.is_none() {
+        return Err(PortError::Rejected {
+            reason: "persisted execution binding has no tool provider profile".to_owned(),
+        });
+    }
+    if !request.models.is_empty() && inference_provider.is_none() {
+        return Err(PortError::Rejected {
+            reason: "persisted execution binding has no inference provider profile".to_owned(),
+        });
+    }
+    let mut providers = Vec::new();
+    for provider in [
+        (!request.tools.is_empty()).then(|| tool_provider.unwrap_or_default()),
+        (!request.models.is_empty()).then(|| inference_provider.unwrap_or_default()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !providers.iter().any(|desired| desired == provider) {
+            providers.push(provider.to_owned());
+        }
+    }
+    let mut managed_providers = vec![TOOL_PROVIDER.to_owned(), INFERENCE_PROVIDER.to_owned()];
+    for provider in [tool_provider, inference_provider].into_iter().flatten() {
+        if !managed_providers.iter().any(|managed| managed == provider) {
+            managed_providers.push(provider.to_owned());
+        }
+    }
     Ok(OpenShellProjection {
         workspace: stable_name(NameKind::Workspace, request.workspace_key.as_bytes()),
         workspace_key: request.workspace_key.clone(),
         sandbox: stable_name(NameKind::Sandbox, request.runtime.0.as_bytes()),
-        providers: [
-            (!request.tools.is_empty()).then(|| TOOL_PROVIDER.to_owned()),
-            (!request.models.is_empty()).then(|| INFERENCE_PROVIDER.to_owned()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect(),
+        providers,
+        managed_providers,
         runtime_uid: request.runtime.0.clone(),
         image,
+        execution_binding_digest: request
+            .execution_binding
+            .as_ref()
+            .map(|binding| binding.binding_digest.clone()),
     })
 }
 
@@ -620,6 +815,12 @@ fn project_request(
 fn sandbox_spec(projection: &OpenShellProjection) -> SandboxSpec {
     let mut labels = HashMap::new();
     labels.insert(RUNTIME_UID_LABEL.to_owned(), projection.runtime_uid.clone());
+    if let Some(binding_digest) = &projection.execution_binding_digest {
+        labels.insert(
+            EXECUTION_BINDING_LABEL.to_owned(),
+            execution_binding_label_value(binding_digest),
+        );
+    }
     SandboxSpec {
         name: Some(projection.sandbox.clone()),
         image: projection.image.clone(),
@@ -1587,43 +1788,20 @@ impl OpenShellRuntime {
             .map_err(raw_port_failure)
     }
 
-    async fn provider_is_attached(
+    async fn attached_providers(
         &self,
         workspace: &str,
         sandbox: &str,
-        provider_name: &str,
-    ) -> Result<bool, PortError> {
+    ) -> Result<Vec<Provider>, PortError> {
         let mut client = self.authenticated_client().await?.raw_grpc();
-        let providers = client
+        let response = client
             .list_sandbox_providers(ListSandboxProvidersRequest {
                 sandbox_name: sandbox.to_owned(),
                 workspace: workspace.to_owned(),
             })
             .await
-            .map_err(raw_port_failure)?
-            .into_inner()
-            .providers;
-        let attached = providers
-            .iter()
-            .filter(|provider| {
-                provider
-                    .metadata
-                    .as_ref()
-                    .map(|metadata| metadata.name.as_str())
-                    == Some(provider_name)
-            })
-            .collect::<Vec<_>>();
-        let [provider] = attached.as_slice() else {
-            return if attached.is_empty() {
-                Ok(false)
-            } else {
-                Err(PortError::Rejected {
-                    reason: "OpenShell returned duplicate Steward provider attachments".to_owned(),
-                })
-            };
-        };
-        validate_provider(provider, workspace, provider_name)?;
-        Ok(true)
+            .map_err(raw_port_failure)?;
+        Ok(response.into_inner().providers)
     }
 
     async fn detach_provider(
@@ -1646,18 +1824,15 @@ impl OpenShellRuntime {
             .map_err(raw_port_failure)
     }
 
-    async fn reconcile_provider(
+    async fn apply_provider_reconciliation(
         &self,
         workspace: &str,
         sandbox: &str,
         provider_name: &str,
-        desired: bool,
+        reconciliation: ProviderReconciliation,
     ) -> Result<(), PortError> {
-        let attached = self
-            .provider_is_attached(workspace, sandbox, provider_name)
-            .await?;
-        match provider_reconciliation(attached, desired) {
-            Some(ProviderReconciliation::Attach) => {
+        match reconciliation {
+            ProviderReconciliation::Attach => {
                 let resource_version = self
                     .authenticated_client()
                     .await?
@@ -1669,7 +1844,7 @@ impl OpenShellRuntime {
                 self.attach_provider(workspace, sandbox, provider_name, resource_version)
                     .await
             }
-            Some(ProviderReconciliation::Detach) => {
+            ProviderReconciliation::Detach => {
                 let resource_version = self
                     .authenticated_client()
                     .await?
@@ -1681,7 +1856,6 @@ impl OpenShellRuntime {
                 self.detach_provider(workspace, sandbox, provider_name, resource_version)
                     .await
             }
-            None => Ok(()),
         }
     }
 }
@@ -1698,7 +1872,10 @@ fn validate_provider(
         .ok_or_else(|| PortError::Rejected {
             reason: "OpenShell provider has no identity metadata".to_owned(),
         })?;
-    if provider.r#type != provider_name || metadata.workspace != workspace {
+    if metadata.name != provider_name
+        || provider.r#type != provider_name
+        || metadata.workspace != workspace
+    {
         return Err(PortError::Rejected {
             reason: "provider name resolved to a different type or workspace".to_owned(),
         });
@@ -1872,6 +2049,16 @@ impl SandboxRuntime for OpenShellRuntime {
                 reason: "sandbox name resolved to a different runtime UID".to_owned(),
             });
         }
+        let expected_execution_binding_label = projection
+            .execution_binding_digest
+            .as_deref()
+            .map(execution_binding_label_value);
+        if expected_execution_binding_label.as_ref() != snapshot.labels.get(EXECUTION_BINDING_LABEL)
+        {
+            return Err(PortError::Rejected {
+                reason: "sandbox does not match the persisted execution binding".to_owned(),
+            });
+        }
         self.resolve_raw_sandbox_binding(
             &projection.workspace,
             &projection.sandbox,
@@ -1880,17 +2067,37 @@ impl SandboxRuntime for OpenShellRuntime {
             false,
         )
         .await?;
-        for provider_name in [TOOL_PROVIDER, INFERENCE_PROVIDER] {
-            self.reconcile_provider(
+        let observed = self
+            .attached_providers(&projection.workspace, &projection.sandbox)
+            .await?;
+        let provider_plan = provider_reconciliation_plan(&projection, &observed)?;
+        for (provider_name, reconciliation) in &provider_plan {
+            self.apply_provider_reconciliation(
                 &projection.workspace,
                 &projection.sandbox,
                 provider_name,
-                projection
-                    .providers
-                    .iter()
-                    .any(|provider| provider == provider_name),
+                *reconciliation,
             )
             .await?;
+        }
+        let reobserved = self
+            .attached_providers(&projection.workspace, &projection.sandbox)
+            .await?;
+        let actual = observed_managed_providers(
+            &reobserved,
+            &projection.workspace,
+            &projection.managed_providers,
+        )?;
+        let desired = projection
+            .providers
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if actual != desired {
+            return Err(PortError::Failed {
+                reason: "OpenShell provider attachments did not converge to desired state"
+                    .to_owned(),
+            });
         }
         let refs = runtime_refs(&projection);
         match snapshot.phase {
@@ -1929,11 +2136,12 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         provider_control_execution_bindings(self)
     }
 
-    async fn run_task(
+    async fn start_task(
         &self,
+        attempt_id: &TaskAttemptId,
         request: &SandboxTaskRequest,
         input_archive: &[u8],
-    ) -> Result<SandboxTaskOutput, PortError> {
+    ) -> Result<SandboxTaskObservation, PortError> {
         let workspace = request
             .refs
             .workspace
@@ -1976,9 +2184,20 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         let expected_image = bridge_image_for_execution(
             &request.agent_type,
             request.execution_class,
+            request.execution_binding.as_ref(),
             self.stable_bridge_image.as_deref(),
             self.bridge_image.as_deref(),
         )?;
+        let expected_execution_binding_label = request
+            .execution_binding
+            .as_ref()
+            .map(|binding| execution_binding_label_value(&binding.binding_digest));
+        if expected_execution_binding_label.as_ref() != snapshot.labels.get(EXECUTION_BINDING_LABEL)
+        {
+            return Err(PortError::Rejected {
+                reason: "task sandbox does not match the persisted execution binding".to_owned(),
+            });
+        }
         self.resolve_raw_sandbox_binding(
             workspace,
             sandbox,
@@ -1987,6 +2206,33 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             true,
         )
         .await?;
+        let attempt_directory = task_attempt_directory(attempt_id)?;
+        let claim = self
+            .authenticated_client()
+            .await?
+            .workspace(workspace)
+            .exec(
+                sandbox,
+                &[
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    task_attempt_claim_command(&attempt_directory),
+                ],
+                ExecOptions {
+                    timeout: Some(StdDuration::from_secs(120)),
+                    ..ExecOptions::default()
+                },
+            )
+            .await
+            .map_err(port_failure)?;
+        if claim.exit_code == 17 {
+            return self.observe_task(attempt_id, request).await;
+        }
+        if claim.exit_code != 0 {
+            return Err(PortError::Failed {
+                reason: "Task attempt marker could not be reserved".to_owned(),
+            });
+        }
         self.stage_input_archive(workspace, sandbox, input_archive)
             .await?;
         let sandbox_id = self
@@ -2013,10 +2259,17 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             })?;
             environment.insert("STEWARD_MCP_GW_ORIGIN".to_owned(), origin.to_owned());
         }
+        let output_archive_command =
+            output_archive_command(&request.agent_type, request.execution_binding.as_ref());
+        let wrapped_command = task_attempt_execution_command(
+            &attempt_directory,
+            &request.command,
+            output_archive_command,
+        );
         let executed = self
             .exec_task_process(
                 &sandbox_id,
-                &request.command,
+                &["/bin/sh".to_owned(), "-c".to_owned(), wrapped_command],
                 environment,
                 request.execution_class,
                 TaskProcessLogContext {
@@ -2025,18 +2278,62 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                     sandbox,
                 },
             )
-            .await?;
-        if executed.exit_code != 0 {
-            let category = task_agent_failure_category(&executed.stderr);
-            return Err(PortError::Failed {
-                reason: format!(
-                    "task agent exited with code {} (diagnostic-category={category})",
-                    executed.exit_code
-                ),
+            .await;
+        let execution_error = match executed {
+            Ok(executed) => {
+                return self
+                    .observe_task(attempt_id, request)
+                    .await
+                    .map(|observation| {
+                        attach_task_agent_failure_category(observation, &executed.stderr)
+                    });
+            }
+            Err(execution_error) => execution_error,
+        };
+        match self.observe_task(attempt_id, request).await {
+            Ok(SandboxTaskObservation::Absent) => Err(execution_error),
+            Ok(observation) => Ok(observation),
+            Err(_) => Err(execution_error),
+        }
+    }
+
+    async fn observe_task(
+        &self,
+        attempt_id: &TaskAttemptId,
+        request: &SandboxTaskRequest,
+    ) -> Result<SandboxTaskObservation, PortError> {
+        let workspace = request
+            .refs
+            .workspace
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PortError::Rejected {
+                reason: "task runtime has no sandbox workspace reference".to_owned(),
+            })?;
+        let sandbox = request
+            .refs
+            .sandbox
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PortError::Rejected {
+                reason: "task runtime has no sandbox name reference".to_owned(),
+            })?;
+        let snapshot = self
+            .authenticated_client()
+            .await?
+            .workspace(workspace)
+            .get_sandbox(sandbox)
+            .await
+            .map_err(port_failure)?;
+        if snapshot.labels.get(RUNTIME_UID_LABEL).map(String::as_str)
+            != Some(request.runtime.0.as_str())
+        {
+            return Err(PortError::Rejected {
+                reason: "task sandbox is bound to a different runtime UID".to_owned(),
             });
         }
-        let output_archive_command = output_archive_command(&request.agent_type);
-        let collected = self
+        let attempt_directory = task_attempt_directory(attempt_id)?;
+        let observed = self
             .authenticated_client()
             .await?
             .workspace(workspace)
@@ -2045,7 +2342,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 &[
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    output_archive_command.to_owned(),
+                    task_attempt_observation_command(&attempt_directory),
                 ],
                 ExecOptions {
                     timeout: Some(StdDuration::from_secs(120)),
@@ -2054,23 +2351,174 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             )
             .await
             .map_err(port_failure)?;
-        if collected.exit_code != 0 {
+        if observed.exit_code == 44 {
+            return Ok(SandboxTaskObservation::Absent);
+        }
+        if observed.exit_code != 0 {
             return Err(PortError::Failed {
-                reason: "task output archive could not be collected".to_owned(),
+                reason: "Task attempt marker could not be observed".to_owned(),
             });
         }
-        if is_connections_bridge {
-            validate_connections_bridge_archive(&collected.stdout, "response.json")?;
+        let (state, payload) = split_task_attempt_observation(&observed.stdout)?;
+        let correlation = attempt_id.0.clone();
+        match state {
+            "claimed" => Ok(SandboxTaskObservation::Accepted {
+                adapter_observation_id: correlation,
+            }),
+            "running" => Ok(SandboxTaskObservation::Running {
+                adapter_observation_id: correlation,
+            }),
+            "succeeded" => {
+                if request.agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE {
+                    validate_connections_bridge_archive(payload, "response.json")?;
+                }
+                Ok(SandboxTaskObservation::Succeeded {
+                    adapter_observation_id: correlation,
+                    output: SandboxTaskOutput {
+                        archive: payload.to_vec(),
+                    },
+                })
+            }
+            "failed" => Ok(SandboxTaskObservation::Failed {
+                adapter_observation_id: correlation,
+                reason: "task agent failed; inspect the bounded controller diagnostic".to_owned(),
+            }),
+            "outcome_unknown" => Ok(SandboxTaskObservation::OutcomeUnknown {
+                reason: "Task attempt process is no longer live without a terminal marker"
+                    .to_owned(),
+            }),
+            _ => Ok(SandboxTaskObservation::OutcomeUnknown {
+                reason: "Task attempt marker has an unknown state".to_owned(),
+            }),
         }
-        Ok(SandboxTaskOutput {
-            archive: collected.stdout,
-        })
+    }
+
+    async fn cancel_task(
+        &self,
+        attempt_id: &TaskAttemptId,
+        request: &SandboxTaskRequest,
+    ) -> Result<SandboxTaskObservation, PortError> {
+        match self.observe_task(attempt_id, request).await? {
+            terminal @ (SandboxTaskObservation::Absent
+            | SandboxTaskObservation::Succeeded { .. }
+            | SandboxTaskObservation::Failed { .. }
+            | SandboxTaskObservation::OutcomeUnknown { .. }) => Ok(terminal),
+            SandboxTaskObservation::Accepted { .. } | SandboxTaskObservation::Running { .. } => {
+                Ok(SandboxTaskObservation::OutcomeUnknown {
+                    reason: "OpenShell does not expose a proven attempt-scoped cancellation acknowledgement"
+                        .to_owned(),
+                })
+            }
+        }
     }
 }
 
 #[cfg(feature = "runtime")]
 fn staging_archive_chunks(input_archive: &[u8]) -> std::slice::Chunks<'_, u8> {
     input_archive.chunks(STAGING_EXEC_STDIN_CHUNK_BYTES)
+}
+
+#[cfg(feature = "runtime")]
+fn task_attempt_directory(attempt_id: &TaskAttemptId) -> Result<String, PortError> {
+    let value = attempt_id.0.as_str();
+    let canonical_shape = value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        });
+    if !canonical_shape {
+        return Err(PortError::Rejected {
+            reason: "invalid Task attempt identity".to_owned(),
+        });
+    }
+    Ok(format!("/sandbox/.steward-attempts/{value}"))
+}
+
+#[cfg(feature = "runtime")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(feature = "runtime")]
+fn task_attempt_claim_command(directory: &str) -> String {
+    let directory = shell_quote(directory);
+    format!(
+        "set -eu; mkdir -p /sandbox/.steward-attempts; \
+         if mkdir {directory} 2>/dev/null; then printf claimed > {directory}/state; \
+         else exit 17; fi"
+    )
+}
+
+#[cfg(feature = "runtime")]
+fn task_attempt_execution_command(
+    directory: &str,
+    command: &[String],
+    output_archive_command: &str,
+) -> String {
+    let directory = shell_quote(directory);
+    let command = command
+        .iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "set +e; pid=$$; pid_start=$(awk '{{print $22}}' /proc/$$/stat) || exit 70; \
+         printf '%s' \"$pid\" > {directory}/pid; \
+         printf '%s' \"$pid_start\" > {directory}/pid-start; \
+         date +%s > {directory}/heartbeat.tmp; \
+         mv {directory}/heartbeat.tmp {directory}/heartbeat; \
+         (while current_start=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null) \
+             && kill -0 \"$pid\" 2>/dev/null && [ \"$current_start\" = \"$pid_start\" ]; do \
+           date +%s > {directory}/heartbeat.tmp; \
+           mv {directory}/heartbeat.tmp {directory}/heartbeat; sleep 5; done) & \
+         heartbeat_pid=$!; \
+         trap 'kill \"$heartbeat_pid\" 2>/dev/null || true; wait \"$heartbeat_pid\" 2>/dev/null || true' EXIT; \
+         printf running > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; \
+         {command}; status=$?; \
+         if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
+           printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi; \
+         ({output_archive_command}) > {directory}/output.tar; status=$?; \
+         if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
+           printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi; \
+         printf succeeded > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state"
+    )
+}
+
+#[cfg(feature = "runtime")]
+fn task_attempt_observation_command(directory: &str) -> String {
+    let directory = shell_quote(directory);
+    format!(
+        "set -eu; test -d {directory} || exit 44; state=$(cat {directory}/state); \
+         if [ \"$state\" = running ]; then \
+           heartbeat=$(cat {directory}/heartbeat 2>/dev/null || true); now=$(date +%s); \
+           case \"$heartbeat:$now\" in *[!0-9:]*|:|*:) live=false ;; \
+             *) age=$((now - heartbeat)); \
+                if [ \"$age\" -ge 0 ] && [ \"$age\" -le 30 ]; \
+                then live=true; else live=false; fi ;; \
+           esac; \
+           if [ \"$live\" != true ]; then state=outcome_unknown; \
+             printf outcome_unknown > {directory}/state.tmp; \
+             mv {directory}/state.tmp {directory}/state; fi; \
+         fi; \
+         printf '%s\\n' \"$state\"; \
+         if [ \"$state\" = succeeded ]; then cat {directory}/output.tar; fi"
+    )
+}
+
+#[cfg(feature = "runtime")]
+fn split_task_attempt_observation(bytes: &[u8]) -> Result<(&str, &[u8]), PortError> {
+    let Some(separator) = bytes.iter().position(|byte| *byte == b'\n') else {
+        return Err(PortError::Failed {
+            reason: "Task attempt observation is malformed".to_owned(),
+        });
+    };
+    let state = std::str::from_utf8(&bytes[..separator]).map_err(|_| PortError::Failed {
+        reason: "Task attempt state is not UTF-8".to_owned(),
+    })?;
+    Ok((state, &bytes[separator + 1..]))
 }
 
 #[cfg(feature = "runtime")]
@@ -2137,7 +2585,7 @@ mod tests {
     use std::time::Duration;
 
     #[cfg(feature = "runtime")]
-    use openshell_sdk::raw::proto::datamodel::v1::ObjectMeta;
+    use openshell_sdk::raw::proto::datamodel::v1::{ObjectMeta, Provider};
     #[cfg(feature = "runtime")]
     use openshell_sdk::raw::proto::{
         ExecSandboxEvent, ExecSandboxExit, ExecSandboxStderr, ExecSandboxStdout,
@@ -2148,31 +2596,67 @@ mod tests {
     #[cfg(feature = "runtime")]
     use reqwest::{Client as HttpClient, Url};
     #[cfg(feature = "runtime")]
+    use sha2::{Digest, Sha256};
+    #[cfg(feature = "runtime")]
     use tokio::sync::{Mutex, mpsc as tokio_mpsc};
 
     #[cfg(feature = "runtime")]
-    use steward_ports::{PortError, SandboxExecutionClass, SandboxRequest};
+    use steward_ports::{
+        PortError, SandboxExecutionClass, SandboxRequest, SandboxTaskObservation,
+        SandboxTaskOutput, TaskAttemptId,
+    };
     #[cfg(feature = "runtime")]
-    use steward_types::{AgentType, RuntimeId, RuntimeRefs, ToolGrant};
+    use steward_types::{
+        AgentType, DisposableExecutionBinding, ExecutionProviderProfile, ExecutionProviderProfiles,
+        ExecutionVersionProbe, ModelRef, RuntimeId, RuntimeRefs,
+        TASK_EXECUTION_BINDING_SCHEMA_VERSION, ToolGrant,
+    };
 
-    #[cfg(feature = "runtime")]
-    use super::RUNTIME_UID_LABEL;
     #[cfg(feature = "runtime")]
     use super::validate_connections_bridge_archive;
     #[cfg(feature = "runtime")]
     use super::{
-        CONNECTIONS_BRIDGE_AGENT_TYPE, OpenShellConnectionConfig, OpenShellTaskLogMode,
-        ProviderReconciliation, STAGING_EXEC_STDIN_CHUNK_BYTES, SandboxDeleteClient,
-        TaskProcessEventStream, TaskProcessLogContext, TaskProcessLogSink, TaskProcessStream,
-        WorkloadExchangeTokenProvider, collect_task_process_stream, delete_owned_sandbox,
+        CONNECTIONS_BRIDGE_AGENT_TYPE, INFERENCE_PROVIDER, OpenShellConnectionConfig,
+        OpenShellTaskLogMode, ProviderReconciliation, STAGING_EXEC_STDIN_CHUNK_BYTES,
+        SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream, TaskProcessLogContext,
+        TaskProcessLogSink, TaskProcessStream, WorkloadExchangeTokenProvider,
+        attach_task_agent_failure_category, collect_task_process_stream, delete_owned_sandbox,
         deletion_names, load_source_credential, output_archive_command, project_request,
-        provider_reconciliation, sandbox_spec, staging_append_command, staging_archive_chunks,
-        staging_extract_command, staging_prepare_command, task_agent_failure_category,
-        task_process_log_record, validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
+        provider_reconciliation, provider_reconciliation_plan, provider_reconciliation_targets,
+        sandbox_spec, staging_append_command, staging_archive_chunks, staging_extract_command,
+        staging_prepare_command, task_agent_failure_category, task_attempt_directory,
+        task_attempt_execution_command, task_attempt_observation_command, task_process_log_record,
+        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
     };
+    #[cfg(feature = "runtime")]
+    use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
     #[cfg(feature = "identity")]
     use super::{IdentityResolutionError, SANDBOX_ID_LABEL, binding_from_sandbox};
     use super::{NameKind, stable_name};
+
+    #[cfg(feature = "runtime")]
+    fn seal_binding(binding: &mut DisposableExecutionBinding) -> Result<(), String> {
+        let mut digest = Sha256::new();
+        digest.update(steward_types::TASK_EXECUTION_BINDING_DIGEST_DOMAIN);
+        digest.update(binding.canonical_content()?);
+        let digest = format!("sha256:{:x}", digest.finalize());
+        binding.binding_id.clone_from(&digest);
+        binding.binding_digest = digest;
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    fn attached_provider(name: &str, workspace: &str) -> Provider {
+        Provider {
+            metadata: Some(ObjectMeta {
+                name: name.to_owned(),
+                workspace: workspace.to_owned(),
+                ..ObjectMeta::default()
+            }),
+            r#type: name.to_owned(),
+            ..Provider::default()
+        }
+    }
 
     #[cfg(feature = "runtime")]
     struct QueuedTaskProcessEventStream {
@@ -2538,20 +3022,20 @@ mod tests {
             .split("impl SandboxTaskRuntime for OpenShellRuntime")
             .nth(1)
             .ok_or_else(|| "SandboxTaskRuntime implementation was not found".to_owned())?;
-        let run_task = implementation
-            .split("async fn run_task")
+        let start_task = implementation
+            .split("async fn start_task")
             .nth(1)
             .and_then(|value| value.split("async fn").next())
-            .ok_or_else(|| "run_task implementation was not found".to_owned())?;
-        let staging = run_task
+            .ok_or_else(|| "start_task implementation was not found".to_owned())?;
+        let staging = start_task
             .find(".stage_input_archive(")
             .ok_or_else(|| "task input staging call was not found".to_owned())?;
-        let resolution = run_task
+        let resolution = start_task
             .rfind(".resolve_raw_sandbox_binding(")
             .ok_or_else(|| {
                 "task sandbox ID is not re-resolved and verified after staging".to_owned()
             })?;
-        let execution = run_task
+        let execution = start_task
             .find(".exec_task_process(")
             .ok_or_else(|| "task process execution call was not found".to_owned())?;
 
@@ -2560,12 +3044,12 @@ mod tests {
             "the exact sandbox ID must be resolved after name-based staging and before raw execution"
         );
         assert!(
-            run_task[staging..resolution].contains("let sandbox_id =")
-                && run_task[execution..].contains("&sandbox_id,"),
+            start_task[staging..resolution].contains("let sandbox_id =")
+                && start_task[execution..].contains("&sandbox_id,"),
             "raw execution must use the post-staging verified sandbox ID"
         );
         assert!(
-            !run_task[execution..].contains("&snapshot.id,"),
+            !start_task[execution..].contains("&snapshot.id,"),
             "raw execution must not reuse the pre-staging sandbox ID"
         );
         Ok(())
@@ -2739,6 +3223,45 @@ mod tests {
                 .contains("tar -xf /sandbox/steward-input.tar -C /sandbox/steward-input")
         );
         assert!(staging_extract_command().contains("rm -f /sandbox/steward-input.tar"));
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn task_attempt_identity_cannot_escape_its_sandbox_directory() {
+        assert_eq!(
+            task_attempt_directory(&TaskAttemptId(
+                "01234567-89ab-cdef-0123-456789abcdef".to_owned()
+            ))
+            .as_deref(),
+            Ok("/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef")
+        );
+        for malicious in ["../other", "attempt;replay", "", "01234567-89ab-cdef"] {
+            assert!(
+                matches!(
+                    task_attempt_directory(&TaskAttemptId(malicious.to_owned())),
+                    Err(PortError::Rejected { .. })
+                ),
+                "attempt identity {malicious:?} must not reach an adapter command"
+            );
+        }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn task_attempt_marker_uses_a_cross_exec_liveness_lease() {
+        let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
+        let execution =
+            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true");
+        assert!(execution.contains("pid=$$"));
+        assert!(execution.contains("/proc/$$/stat"));
+        assert!(execution.contains("heartbeat"));
+
+        let observation = task_attempt_observation_command(directory);
+        assert!(observation.contains("heartbeat"));
+        assert!(observation.contains("now - heartbeat"));
+        assert!(!observation.contains("/proc/$pid/stat"));
+        assert!(!observation.contains("kill -0 \"$pid\""));
+        assert!(observation.contains("state=outcome_unknown"));
     }
 
     #[cfg(feature = "runtime")]
@@ -3223,6 +3746,7 @@ mod tests {
                 models: Vec::new(),
                 tools: Vec::new(),
                 refs: RuntimeRefs::default(),
+                execution_binding: None,
             },
             None,
             None,
@@ -3242,8 +3766,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn approved_codex_workflow_uses_the_gateway_default_image_and_unknown_agents_fail_closed()
-    -> Result<(), String> {
+    fn unbound_versioned_agents_fail_closed() {
         let request = |agent_type: &str| SandboxRequest {
             runtime: RuntimeId("runtime-uid-a".to_owned()),
             workspace_key: "team-a".to_owned(),
@@ -3254,31 +3777,288 @@ mod tests {
             models: Vec::new(),
             tools: Vec::new(),
             refs: RuntimeRefs::default(),
+            execution_binding: None,
         };
 
-        let projection = project_request(&request("codex@0.117.0"), None, None)
-            .map_err(|error| format!("approved Workflow agent was rejected: {error:?}"))?;
         assert!(
-            sandbox_spec(&projection).image.is_none(),
-            "the approved agent must not let Steward select an OpenShell image"
+            project_request(&request("example-agent@1.0.0"), None, None).is_err(),
+            "a versioned agent without a persisted deployment binding must fail closed"
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn persisted_disposable_binding_selects_exact_image_and_provider_profiles() -> Result<(), String>
+    {
+        let mut binding = DisposableExecutionBinding {
+            schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+            binding_id: format!("sha256:{}", "a".repeat(64)),
+            binding_digest: format!("sha256:{}", "a".repeat(64)),
+            agent_ref: "example-agent@1.0.0".to_owned(),
+            display_name: Some("Example Agent".to_owned()),
+            adapter: "codex-v1".to_owned(),
+            image: format!(
+                "registry.example.test/agents/example@sha256:{}",
+                "b".repeat(64)
+            ),
+            executable: "/opt/example/bin/agent".to_owned(),
+            version_probe: ExecutionVersionProbe {
+                arguments: vec!["--version".to_owned()],
+                expected_stdout: "example-agent 1.0.0".to_owned(),
+            },
+            provider_profiles: ExecutionProviderProfiles {
+                tools: Some(ExecutionProviderProfile {
+                    id: "example-tools-profile-v7".to_owned(),
+                    digest: format!("sha256:{}", "c".repeat(64)),
+                }),
+                inference: Some(ExecutionProviderProfile {
+                    id: "example-inference-profile-v7".to_owned(),
+                    digest: format!("sha256:{}", "d".repeat(64)),
+                }),
+            },
+        };
+        seal_binding(&mut binding)?;
+        let projection = project_request(
+            &SandboxRequest {
+                runtime: RuntimeId("runtime-uid-a".to_owned()),
+                workspace_key: "team-a".to_owned(),
+                execution_class: SandboxExecutionClass::Agent,
+                agent_type: AgentType {
+                    name: binding.agent_ref.clone(),
+                },
+                models: vec![ModelRef {
+                    provider: "litellm".to_owned(),
+                    model: "test-model".to_owned(),
+                }],
+                tools: vec![ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "repository".to_owned(),
+                    action: "get_file_contents".to_owned(),
+                }],
+                refs: RuntimeRefs::default(),
+                execution_binding: Some(binding.clone()),
+            },
+            Some("registry.example.test/unrelated@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+            None,
+        )
+        .map_err(|error| format!("persisted binding was rejected: {error:?}"))?;
+
+        assert_eq!(projection.image.as_deref(), Some(binding.image.as_str()));
+        assert_eq!(
+            projection.providers,
+            ["example-tools-profile-v7", "example-inference-profile-v7"],
+            "the persisted binding must select the exact deployment-owned OpenShell profiles"
+        );
+        let execution_binding_label = sandbox_spec(&projection)
+            .labels
+            .get(EXECUTION_BINDING_LABEL)
+            .cloned()
+            .ok_or_else(|| "sandbox must carry an execution-binding label".to_owned())?;
+        assert_ne!(
+            execution_binding_label, binding.binding_digest,
+            "the exact binding digest must be encoded for OpenShell label compatibility"
         );
         assert!(
-            project_request(&request("codex@latest"), None, None).is_err(),
-            "an unpinned agent reference must fail closed"
+            execution_binding_label.starts_with("sha256-"),
+            "the label must identify its deterministic digest encoding"
+        );
+        assert_eq!(
+            execution_binding_label.len(),
+            63,
+            "the digest label must fit the Kubernetes/OpenShell label-value limit"
         );
         assert!(
-            project_request(&request("other-agent@1"), None, None).is_err(),
-            "an unpublished agent reference must fail closed"
+            execution_binding_label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
+            "the digest label must use only OpenShell-compatible characters"
+        );
+
+        let mut incomplete = binding.clone();
+        incomplete.provider_profiles.tools = None;
+        seal_binding(&mut incomplete)?;
+        assert!(
+            project_request(
+                &SandboxRequest {
+                    runtime: RuntimeId("runtime-uid-b".to_owned()),
+                    workspace_key: "team-a".to_owned(),
+                    execution_class: SandboxExecutionClass::Agent,
+                    agent_type: AgentType {
+                        name: incomplete.agent_ref.clone(),
+                    },
+                    models: vec![ModelRef {
+                        provider: "litellm".to_owned(),
+                        model: "test-model".to_owned(),
+                    }],
+                    tools: vec![ToolGrant {
+                        provider: "github".to_owned(),
+                        resource: "repository".to_owned(),
+                        action: "get_file_contents".to_owned(),
+                    }],
+                    refs: RuntimeRefs::default(),
+                    execution_binding: Some(incomplete),
+                },
+                None,
+                None,
+            )
+            .is_err(),
+            "a required profile missing from the persisted binding must fail before sandbox creation"
+        );
+
+        let mut tampered = binding.clone();
+        tampered.executable = "/opt/example/bin/other-agent".to_owned();
+        assert!(
+            matches!(
+                project_request(
+                    &SandboxRequest {
+                        runtime: RuntimeId("runtime-uid-c".to_owned()),
+                        workspace_key: "team-a".to_owned(),
+                        execution_class: SandboxExecutionClass::Agent,
+                        agent_type: AgentType {
+                            name: tampered.agent_ref.clone(),
+                        },
+                        models: Vec::new(),
+                        tools: Vec::new(),
+                        refs: RuntimeRefs::default(),
+                        execution_binding: Some(tampered),
+                    },
+                    None,
+                    None,
+                ),
+                Err(PortError::Rejected { ref reason }) if reason.contains("digest")
+            ),
+            "runtime projection must recompute the content-bound digest"
+        );
+
+        let mut unsupported = binding.clone();
+        unsupported.adapter = "future-v1".to_owned();
+        seal_binding(&mut unsupported)?;
+        assert!(
+            matches!(
+                project_request(
+                    &SandboxRequest {
+                        runtime: RuntimeId("runtime-uid-d".to_owned()),
+                        workspace_key: "team-a".to_owned(),
+                        execution_class: SandboxExecutionClass::Agent,
+                        agent_type: AgentType {
+                            name: unsupported.agent_ref.clone(),
+                        },
+                        models: Vec::new(),
+                        tools: Vec::new(),
+                        refs: RuntimeRefs::default(),
+                        execution_binding: Some(unsupported),
+                    },
+                    None,
+                    None,
+                ),
+                Err(PortError::Rejected { ref reason }) if reason.contains("unsupported adapter")
+            ),
+            "a rollback must not interpret a persisted newer adapter with Codex semantics"
         );
         Ok(())
     }
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn approved_codex_workflow_validates_the_standard_result_and_archives_declared_outputs() {
-        let command = output_archive_command(&AgentType {
-            name: "codex@0.117.0".to_owned(),
-        });
+    fn versioned_provider_reconciliation_converges_the_complete_managed_set() -> Result<(), String>
+    {
+        let mut binding = DisposableExecutionBinding {
+            schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+            binding_id: format!("sha256:{}", "a".repeat(64)),
+            binding_digest: format!("sha256:{}", "a".repeat(64)),
+            agent_ref: "example-agent@1.0.0".to_owned(),
+            display_name: None,
+            adapter: "codex-v1".to_owned(),
+            image: format!(
+                "registry.example.test/agents/example@sha256:{}",
+                "b".repeat(64)
+            ),
+            executable: "/opt/example/bin/agent".to_owned(),
+            version_probe: ExecutionVersionProbe {
+                arguments: vec!["--version".to_owned()],
+                expected_stdout: "example-agent 1.0.0".to_owned(),
+            },
+            provider_profiles: ExecutionProviderProfiles {
+                tools: Some(ExecutionProviderProfile {
+                    id: "example-tools-profile-v7".to_owned(),
+                    digest: format!("sha256:{}", "c".repeat(64)),
+                }),
+                inference: Some(ExecutionProviderProfile {
+                    id: "example-inference-profile-v7".to_owned(),
+                    digest: format!("sha256:{}", "d".repeat(64)),
+                }),
+            },
+        };
+        seal_binding(&mut binding)?;
+        let projection = project_request(
+            &SandboxRequest {
+                runtime: RuntimeId("runtime-uid-a".to_owned()),
+                workspace_key: "team-a".to_owned(),
+                execution_class: SandboxExecutionClass::Agent,
+                agent_type: AgentType {
+                    name: binding.agent_ref.clone(),
+                },
+                models: Vec::new(),
+                tools: vec![ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "repository".to_owned(),
+                    action: "read".to_owned(),
+                }],
+                refs: RuntimeRefs::default(),
+                execution_binding: Some(binding),
+            },
+            None,
+            None,
+        )
+        .map_err(|error| format!("runtime projection failed: {error:?}"))?;
+
+        assert_eq!(
+            provider_reconciliation_targets(&projection),
+            [
+                (TOOL_PROVIDER.to_owned(), false),
+                (INFERENCE_PROVIDER.to_owned(), false),
+                ("example-inference-profile-v7".to_owned(), false),
+                ("example-tools-profile-v7".to_owned(), true),
+            ],
+            "legacy and omitted versioned providers must detach before the one desired provider attaches"
+        );
+        assert!(
+            !projection
+                .managed_providers
+                .iter()
+                .any(|provider| provider == "customer-managed-provider"),
+            "provider convergence must not target attachments Steward does not own"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn bound_workflow_validates_the_standard_result_and_archives_declared_outputs() {
+        let binding = DisposableExecutionBinding {
+            schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+            binding_id: format!("sha256:{}", "a".repeat(64)),
+            binding_digest: format!("sha256:{}", "a".repeat(64)),
+            agent_ref: "example-agent@1.0.0".to_owned(),
+            display_name: None,
+            adapter: "codex-v1".to_owned(),
+            image: format!(
+                "registry.example.test/agents/example@sha256:{}",
+                "b".repeat(64)
+            ),
+            executable: "/opt/example/bin/agent".to_owned(),
+            version_probe: ExecutionVersionProbe {
+                arguments: vec!["--version".to_owned()],
+                expected_stdout: "example-agent 1.0.0".to_owned(),
+            },
+            provider_profiles: ExecutionProviderProfiles::default(),
+        };
+        let command = output_archive_command(
+            &AgentType {
+                name: binding.agent_ref.clone(),
+            },
+            Some(&binding),
+        );
         assert!(
             command.contains("test -s /sandbox/steward-output/result.txt"),
             "the runtime must reject a missing or empty standard result"
@@ -3306,6 +4086,7 @@ mod tests {
             models: Vec::new(),
             tools: Vec::new(),
             refs: RuntimeRefs::default(),
+            execution_binding: None,
         };
         assert!(
             project_request(&request, None, None).is_err(),
@@ -3551,6 +4332,7 @@ mod tests {
                 sandbox: Some("sandbox-recorded".to_owned()),
                 litellm_key: Some("key-recorded".to_owned()),
             },
+            execution_binding: None,
         };
 
         assert_eq!(
@@ -3581,6 +4363,7 @@ mod tests {
                     action: "read".to_owned(),
                 }],
                 refs: RuntimeRefs::default(),
+                execution_binding: None,
             },
             None,
             None,
@@ -3612,6 +4395,7 @@ mod tests {
                 }],
                 tools: Vec::new(),
                 refs: RuntimeRefs::default(),
+                execution_binding: None,
             },
             None,
             None,
@@ -3694,12 +4478,170 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn removing_tool_authority_plans_provider_detach() {
+    fn failed_task_observation_uses_the_safe_stderr_category() {
         assert_eq!(
-            provider_reconciliation(true, false),
-            Some(ProviderReconciliation::Detach),
-            "removing all tool grants must detach the Steward gateway provider"
+            attach_task_agent_failure_category(
+                SandboxTaskObservation::Failed {
+                    adapter_observation_id: "attempt-a".to_owned(),
+                    reason: "raw failure".to_owned(),
+                },
+                b"steward-connections-bridge: bridge MCP-GW rejected runtime authorization",
+            ),
+            SandboxTaskObservation::Failed {
+                adapter_observation_id: "attempt-a".to_owned(),
+                reason: "bridge-runtime-authorization".to_owned(),
+            },
+            "provider-control stderr must be reduced to an allowlisted category before persistence"
         );
+
+        assert_eq!(
+            attach_task_agent_failure_category(
+                SandboxTaskObservation::Succeeded {
+                    adapter_observation_id: "attempt-b".to_owned(),
+                    output: SandboxTaskOutput {
+                        archive: vec![1, 2, 3],
+                    },
+                },
+                b"opaque stderr",
+            ),
+            SandboxTaskObservation::Succeeded {
+                adapter_observation_id: "attempt-b".to_owned(),
+                output: SandboxTaskOutput {
+                    archive: vec![1, 2, 3],
+                },
+            },
+            "successful observations must remain unchanged"
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn removing_tool_authority_plans_provider_detach() -> Result<(), String> {
+        let projection = project_request(
+            &SandboxRequest {
+                runtime: RuntimeId("runtime-uid-a".to_owned()),
+                workspace_key: "team-a".to_owned(),
+                execution_class: SandboxExecutionClass::Agent,
+                agent_type: AgentType {
+                    name: "base".to_owned(),
+                },
+                models: Vec::new(),
+                tools: Vec::new(),
+                refs: RuntimeRefs::default(),
+                execution_binding: None,
+            },
+            None,
+            None,
+        )
+        .map_err(|error| format!("provider-removal projection failed: {error:?}"))?;
+        assert_eq!(
+            provider_reconciliation_targets(&projection),
+            [
+                (TOOL_PROVIDER.to_owned(), false),
+                (INFERENCE_PROVIDER.to_owned(), false),
+            ],
+            "removing all authority must explicitly reconcile both Steward providers absent"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn provider_plan_detaches_managed_extras_before_attach_and_preserves_unmanaged_entries()
+    -> Result<(), String> {
+        let projection = project_request(
+            &SandboxRequest {
+                runtime: RuntimeId("runtime-uid-a".to_owned()),
+                workspace_key: "team-a".to_owned(),
+                execution_class: SandboxExecutionClass::Agent,
+                agent_type: AgentType {
+                    name: "base".to_owned(),
+                },
+                models: Vec::new(),
+                tools: vec![ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "repository".to_owned(),
+                    action: "read".to_owned(),
+                }],
+                refs: RuntimeRefs::default(),
+                execution_binding: None,
+            },
+            None,
+            None,
+        )
+        .map_err(|error| format!("runtime projection failed: {error:?}"))?;
+        let observed = [
+            attached_provider(INFERENCE_PROVIDER, &projection.workspace),
+            attached_provider("customer-managed-provider", &projection.workspace),
+        ];
+
+        assert_eq!(
+            provider_reconciliation_plan(&projection, &observed)
+                .map_err(|error| format!("provider plan failed: {error:?}"))?,
+            [
+                (
+                    INFERENCE_PROVIDER.to_owned(),
+                    ProviderReconciliation::Detach,
+                ),
+                (TOOL_PROVIDER.to_owned(), ProviderReconciliation::Attach),
+            ],
+            "the complete managed set must converge subtractively before additions without touching non-Steward attachments"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn provider_plan_is_idempotent_and_rejects_duplicate_or_malformed_managed_entries()
+    -> Result<(), String> {
+        let projection = project_request(
+            &SandboxRequest {
+                runtime: RuntimeId("runtime-uid-a".to_owned()),
+                workspace_key: "team-a".to_owned(),
+                execution_class: SandboxExecutionClass::Agent,
+                agent_type: AgentType {
+                    name: "base".to_owned(),
+                },
+                models: Vec::new(),
+                tools: vec![ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "repository".to_owned(),
+                    action: "read".to_owned(),
+                }],
+                refs: RuntimeRefs::default(),
+                execution_binding: None,
+            },
+            None,
+            None,
+        )
+        .map_err(|error| format!("runtime projection failed: {error:?}"))?;
+        let desired = attached_provider(TOOL_PROVIDER, &projection.workspace);
+        assert!(
+            provider_reconciliation_plan(&projection, std::slice::from_ref(&desired))
+                .map_err(|error| format!("idempotent provider plan failed: {error:?}"))?
+                .is_empty(),
+            "an exact observed provider set must be a no-op"
+        );
+        assert!(
+            matches!(
+                provider_reconciliation_plan(&projection, &[desired.clone(), desired]),
+                Err(PortError::Rejected { ref reason }) if reason.contains("duplicate")
+            ),
+            "duplicate Steward-managed attachments must fail closed"
+        );
+        let malformed = Provider {
+            metadata: None,
+            r#type: TOOL_PROVIDER.to_owned(),
+            ..Provider::default()
+        };
+        assert!(
+            matches!(
+                provider_reconciliation_plan(&projection, &[malformed]),
+                Err(PortError::Rejected { ref reason }) if reason.contains("identity metadata")
+            ),
+            "a malformed Steward-managed attachment must fail closed"
+        );
+        Ok(())
     }
 
     #[cfg(feature = "runtime")]

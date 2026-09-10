@@ -1,0 +1,11 @@
+{
+  "apiVersion": "steward.execution-bindings/v1",
+  "bindings": [{
+    "agentRef": "codex@1.2.3",
+    "adapter": "codex-v1",
+    "image": "registry.example.test/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/agent\u0040sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "executable": "/opt/example/bin/agent",
+    "versionProbe": {"arguments": ["--version"], "expectedStdout": "codex 1.2.3"},
+    "providerProfiles": {}
+  }]
+}

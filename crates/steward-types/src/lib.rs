@@ -9,6 +9,9 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
 pub const PENDING_APPROVAL_ANNOTATION: &str = "agents.apelogic.ai/pending-approval";
+pub const TASK_EXECUTION_BINDING_ANNOTATION: &str = "agents.apelogic.ai/task-execution-binding";
+pub const TASK_EXECUTION_BINDING_SCHEMA_VERSION: &str = "steward/task-execution-binding/v1";
+pub const TASK_EXECUTION_BINDING_DIGEST_DOMAIN: &[u8] = b"steward.execution-bindings/v1\0";
 
 pub fn runtime_activated_condition(observed_generation: i64) -> Condition {
     Condition {
@@ -580,6 +583,388 @@ pub struct AgentType {
     pub name: String,
 }
 
+/// An immutable server-resolved execution binding persisted with a Task.
+///
+/// This is deliberately separate from `AgentRuntimeSpec`: portable artifacts and public
+/// runtime requests cannot select deployment images, executable paths, native profiles, or
+/// execution lifetime.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum TaskExecutionBinding {
+    Disposable(DisposableExecutionBinding),
+    Resident(ResidentExecutionBinding),
+}
+
+impl TaskExecutionBinding {
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Disposable(binding) => binding.validate(),
+            Self::Resident(binding) => binding.validate(),
+        }
+    }
+
+    pub const fn task_owns_runtime(&self) -> bool {
+        matches!(self, Self::Disposable(_))
+    }
+
+    pub const fn disposable(&self) -> Option<&DisposableExecutionBinding> {
+        match self {
+            Self::Disposable(binding) => Some(binding),
+            Self::Resident(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DisposableExecutionBinding {
+    pub schema_version: String,
+    pub binding_id: String,
+    pub binding_digest: String,
+    pub agent_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub adapter: String,
+    pub image: String,
+    pub executable: String,
+    pub version_probe: ExecutionVersionProbe,
+    pub provider_profiles: ExecutionProviderProfiles,
+}
+
+impl DisposableExecutionBinding {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != TASK_EXECUTION_BINDING_SCHEMA_VERSION
+            || !valid_sha256_digest(&self.binding_id)
+            || !valid_sha256_digest(&self.binding_digest)
+            || self.binding_id != self.binding_digest
+            || !valid_versioned_binding_reference(&self.agent_ref)
+            || self
+                .display_name
+                .as_deref()
+                .is_some_and(|value| !valid_bounded_display_name(value))
+            || !valid_binding_slug(&self.adapter)
+            || !valid_digest_pinned_image(&self.image)
+            || !valid_absolute_executable(&self.executable)
+            || self.version_probe.validate().is_err()
+            || self.provider_profiles.validate().is_err()
+        {
+            return Err("disposable execution binding is incomplete or mutable".to_owned());
+        }
+        Ok(())
+    }
+
+    pub fn canonical_content(&self) -> Result<Vec<u8>, String> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Content<'a> {
+            agent_ref: &'a str,
+            adapter: &'a str,
+            image: &'a str,
+            executable: &'a str,
+            version_probe: &'a ExecutionVersionProbe,
+            provider_profiles: &'a ExecutionProviderProfiles,
+        }
+
+        serde_json::to_vec(&Content {
+            agent_ref: &self.agent_ref,
+            adapter: &self.adapter,
+            image: &self.image,
+            executable: &self.executable,
+            version_probe: &self.version_probe,
+            provider_profiles: &self.provider_profiles,
+        })
+        .map_err(|error| format!("execution binding cannot be canonicalized: {error}"))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionVersionProbe {
+    pub arguments: Vec<String>,
+    pub expected_stdout: String,
+}
+
+impl ExecutionVersionProbe {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.arguments.is_empty()
+            || self.arguments.len() > 8
+            || self.arguments.iter().any(|argument| {
+                argument.is_empty()
+                    || argument.chars().count() > 128
+                    || argument.chars().any(char::is_control)
+            })
+            || !valid_bounded_binding_scalar(&self.expected_stdout)
+        {
+            return Err("execution version probe is invalid or unbounded".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionProviderProfiles {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ExecutionProviderProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<ExecutionProviderProfile>,
+}
+
+impl ExecutionProviderProfiles {
+    pub fn validate(&self) -> Result<(), String> {
+        for profile in [&self.tools, &self.inference].into_iter().flatten() {
+            profile.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionProviderProfile {
+    pub id: String,
+    pub digest: String,
+}
+
+impl ExecutionProviderProfile {
+    pub fn validate(&self) -> Result<(), String> {
+        if !valid_bounded_binding_scalar(&self.id)
+            || self.id.chars().any(char::is_whitespace)
+            || !valid_sha256_digest(&self.digest)
+        {
+            return Err("execution provider profile is incomplete or mutable".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Exact lease pins required before a Task may use an AgentInstance-owned runtime.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResidentExecutionBinding {
+    pub schema_version: String,
+    pub binding_id: String,
+    pub binding_digest: String,
+    pub owner_user_id: CanonicalUserId,
+    pub agent_instance_id: String,
+    pub agent_instance_revision: i64,
+    pub runtime_uid: RuntimeId,
+    pub runtime_spec_digest: String,
+    pub standing_authority_digest: String,
+    pub deployment_binding_digest: String,
+    pub freshness_generation: i64,
+}
+
+/// Controller-observed facts compared with an immutable resident binding before dispatch.
+pub struct ResidentExecutionContext<'a> {
+    pub owner_user_id: &'a CanonicalUserId,
+    pub agent_instance_id: &'a str,
+    pub agent_instance_revision: i64,
+    pub runtime_uid: &'a RuntimeId,
+    pub runtime_spec_digest: &'a str,
+    pub standing_authority_digest: &'a str,
+    pub deployment_binding_digest: &'a str,
+    pub freshness_generation: i64,
+}
+
+impl ResidentExecutionBinding {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != TASK_EXECUTION_BINDING_SCHEMA_VERSION
+            || !valid_binding_slug(&self.binding_id)
+            || !valid_sha256_digest(&self.binding_digest)
+            || !valid_binding_slug(&self.agent_instance_id)
+            || self.agent_instance_revision <= 0
+            || self.runtime_uid.0.is_empty()
+            || self.runtime_uid.0.len() > 255
+            || self.runtime_uid.0.chars().any(char::is_control)
+            || !valid_sha256_digest(&self.runtime_spec_digest)
+            || !valid_sha256_digest(&self.standing_authority_digest)
+            || !valid_sha256_digest(&self.deployment_binding_digest)
+            || self.freshness_generation <= 0
+        {
+            return Err("resident execution binding is incomplete or mutable".to_owned());
+        }
+        Ok(())
+    }
+
+    pub fn matches_context(&self, context: &ResidentExecutionContext<'_>) -> bool {
+        self.validate().is_ok()
+            && &self.owner_user_id == context.owner_user_id
+            && self.agent_instance_id == context.agent_instance_id
+            && self.agent_instance_revision == context.agent_instance_revision
+            && &self.runtime_uid == context.runtime_uid
+            && self.runtime_spec_digest == context.runtime_spec_digest
+            && self.standing_authority_digest == context.standing_authority_digest
+            && self.deployment_binding_digest == context.deployment_binding_digest
+            && self.freshness_generation == context.freshness_generation
+    }
+}
+
+fn valid_binding_slug(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_lowercase()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn valid_versioned_binding_reference(value: &str) -> bool {
+    let Some((name, version)) = value.rsplit_once('@') else {
+        return false;
+    };
+    !name.is_empty()
+        && !version.is_empty()
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && version.as_bytes()[0].is_ascii_digit()
+        && version != "latest"
+        && value.len() <= 255
+        && !name.contains('@')
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'-' | b'_' | b'.' | b'/')
+        })
+        && version.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'-' | b'_' | b'.' | b'+')
+        })
+}
+
+fn valid_digest_pinned_image(value: &str) -> bool {
+    const SHA256_SUFFIX_BYTES: usize = "@sha256:".len() + 64;
+    const OCI_REPOSITORY_MAX_BYTES: usize = 255;
+    if value.len() > OCI_REPOSITORY_MAX_BYTES + SHA256_SUFFIX_BYTES {
+        return false;
+    }
+    let Some((repository, digest)) = value.split_once("@sha256:") else {
+        return false;
+    };
+    if repository.len() > OCI_REPOSITORY_MAX_BYTES || repository.contains('@') {
+        return false;
+    }
+    let mut components = repository.split('/');
+    let Some(registry) = components.next() else {
+        return false;
+    };
+    valid_oci_registry(registry)
+        && components.clone().next().is_some()
+        && components.all(valid_oci_path_component)
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_oci_registry(value: &str) -> bool {
+    let (host, port) = value
+        .split_once(':')
+        .map_or((value, None), |(host, port)| (host, Some(port)));
+    if host.contains(':')
+        || port.is_some_and(|port| {
+            port.is_empty()
+                || port.len() > 5
+                || port.starts_with('0')
+                || !port.bytes().all(|byte| byte.is_ascii_digit())
+                || port.parse::<u16>().ok().is_none_or(|port| port == 0)
+        })
+    {
+        return false;
+    }
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            !bytes.is_empty()
+                && bytes.len() <= 63
+                && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+                && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        })
+}
+
+fn valid_oci_path_component(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return false;
+    }
+    let mut index = 1;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_lowercase() || bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        match bytes[index] {
+            b'.' => index += 1,
+            b'_' => {
+                index += 1;
+                if bytes.get(index) == Some(&b'_') {
+                    index += 1;
+                }
+            }
+            b'-' => {
+                while bytes.get(index) == Some(&b'-') {
+                    index += 1;
+                }
+            }
+            _ => return false,
+        }
+        if bytes
+            .get(index)
+            .is_none_or(|byte| !byte.is_ascii_lowercase() && !byte.is_ascii_digit())
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn valid_absolute_executable(value: &str) -> bool {
+    value.starts_with('/')
+        && value.len() <= 1024
+        && !value.ends_with('/')
+        && !value.contains("//")
+        && !value
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'.' | b'-'))
+}
+
+fn valid_bounded_binding_scalar(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= 255
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_bounded_display_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= 200
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRef {
@@ -747,8 +1132,162 @@ mod tests {
     use super::{
         CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION, CANONICAL_PRINCIPAL_SCHEMA_VERSION,
         CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
-        OrganizationIdentityPolicy, Principal, agent_runtime_crd,
+        OrganizationIdentityPolicy, Principal, ResidentExecutionBinding, ResidentExecutionContext,
+        RuntimeId, TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding, agent_runtime_crd,
+        valid_digest_pinned_image,
     };
+
+    fn digest(byte: char) -> String {
+        format!("sha256:{}", byte.to_string().repeat(64))
+    }
+
+    fn resident_binding() -> Result<ResidentExecutionBinding, String> {
+        Ok(ResidentExecutionBinding {
+            schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+            binding_id: "resident-agent-instance-v1".to_owned(),
+            binding_digest: digest('a'),
+            owner_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
+            agent_instance_id: "agent-instance-01".to_owned(),
+            agent_instance_revision: 3,
+            runtime_uid: RuntimeId("runtime-uid-01".to_owned()),
+            runtime_spec_digest: digest('b'),
+            standing_authority_digest: digest('c'),
+            deployment_binding_digest: digest('d'),
+            freshness_generation: 7,
+        })
+    }
+
+    #[test]
+    fn resident_execution_binding_rejects_every_cross_lease_dimension() -> Result<(), String> {
+        let binding = resident_binding()?;
+        binding.validate()?;
+        let other_owner = CanonicalUserId::parse("usr_abcdef0123456789abcdef0123456789")?;
+        let other_runtime = RuntimeId("runtime-uid-02".to_owned());
+        let contexts = [
+            ResidentExecutionContext {
+                owner_user_id: &other_owner,
+                agent_instance_id: &binding.agent_instance_id,
+                agent_instance_revision: binding.agent_instance_revision,
+                runtime_uid: &binding.runtime_uid,
+                runtime_spec_digest: &binding.runtime_spec_digest,
+                standing_authority_digest: &binding.standing_authority_digest,
+                deployment_binding_digest: &binding.deployment_binding_digest,
+                freshness_generation: binding.freshness_generation,
+            },
+            ResidentExecutionContext {
+                owner_user_id: &binding.owner_user_id,
+                agent_instance_id: "agent-instance-02",
+                agent_instance_revision: binding.agent_instance_revision,
+                runtime_uid: &binding.runtime_uid,
+                runtime_spec_digest: &binding.runtime_spec_digest,
+                standing_authority_digest: &binding.standing_authority_digest,
+                deployment_binding_digest: &binding.deployment_binding_digest,
+                freshness_generation: binding.freshness_generation,
+            },
+            ResidentExecutionContext {
+                owner_user_id: &binding.owner_user_id,
+                agent_instance_id: &binding.agent_instance_id,
+                agent_instance_revision: 4,
+                runtime_uid: &binding.runtime_uid,
+                runtime_spec_digest: &binding.runtime_spec_digest,
+                standing_authority_digest: &binding.standing_authority_digest,
+                deployment_binding_digest: &binding.deployment_binding_digest,
+                freshness_generation: binding.freshness_generation,
+            },
+            ResidentExecutionContext {
+                owner_user_id: &binding.owner_user_id,
+                agent_instance_id: &binding.agent_instance_id,
+                agent_instance_revision: binding.agent_instance_revision,
+                runtime_uid: &other_runtime,
+                runtime_spec_digest: &binding.runtime_spec_digest,
+                standing_authority_digest: &binding.standing_authority_digest,
+                deployment_binding_digest: &binding.deployment_binding_digest,
+                freshness_generation: binding.freshness_generation,
+            },
+            ResidentExecutionContext {
+                owner_user_id: &binding.owner_user_id,
+                agent_instance_id: &binding.agent_instance_id,
+                agent_instance_revision: binding.agent_instance_revision,
+                runtime_uid: &binding.runtime_uid,
+                runtime_spec_digest: &digest('e'),
+                standing_authority_digest: &binding.standing_authority_digest,
+                deployment_binding_digest: &binding.deployment_binding_digest,
+                freshness_generation: binding.freshness_generation,
+            },
+            ResidentExecutionContext {
+                owner_user_id: &binding.owner_user_id,
+                agent_instance_id: &binding.agent_instance_id,
+                agent_instance_revision: binding.agent_instance_revision,
+                runtime_uid: &binding.runtime_uid,
+                runtime_spec_digest: &binding.runtime_spec_digest,
+                standing_authority_digest: &digest('e'),
+                deployment_binding_digest: &binding.deployment_binding_digest,
+                freshness_generation: binding.freshness_generation,
+            },
+            ResidentExecutionContext {
+                owner_user_id: &binding.owner_user_id,
+                agent_instance_id: &binding.agent_instance_id,
+                agent_instance_revision: binding.agent_instance_revision,
+                runtime_uid: &binding.runtime_uid,
+                runtime_spec_digest: &binding.runtime_spec_digest,
+                standing_authority_digest: &binding.standing_authority_digest,
+                deployment_binding_digest: &digest('e'),
+                freshness_generation: binding.freshness_generation,
+            },
+            ResidentExecutionContext {
+                owner_user_id: &binding.owner_user_id,
+                agent_instance_id: &binding.agent_instance_id,
+                agent_instance_revision: binding.agent_instance_revision,
+                runtime_uid: &binding.runtime_uid,
+                runtime_spec_digest: &binding.runtime_spec_digest,
+                standing_authority_digest: &binding.standing_authority_digest,
+                deployment_binding_digest: &binding.deployment_binding_digest,
+                freshness_generation: 8,
+            },
+        ];
+        for context in contexts {
+            assert!(
+                !binding.matches_context(&context),
+                "resident dispatch must reject a context that crosses any immutable lease pin"
+            );
+        }
+        let matching = ResidentExecutionContext {
+            owner_user_id: &binding.owner_user_id,
+            agent_instance_id: &binding.agent_instance_id,
+            agent_instance_revision: binding.agent_instance_revision,
+            runtime_uid: &binding.runtime_uid,
+            runtime_spec_digest: &binding.runtime_spec_digest,
+            standing_authority_digest: &binding.standing_authority_digest,
+            deployment_binding_digest: &binding.deployment_binding_digest,
+            freshness_generation: binding.freshness_generation,
+        };
+        assert!(binding.matches_context(&matching));
+        assert!(!TaskExecutionBinding::Resident(binding).task_owns_runtime());
+        Ok(())
+    }
+
+    #[test]
+    fn digest_pinned_images_require_bounded_oci_names() {
+        let digest = "a".repeat(64);
+        assert!(valid_digest_pinned_image(&format!(
+            "registry.example.test:5000/team-a/agent@sha256:{digest}"
+        )));
+        for invalid in [
+            format!("registry::5000/agent@sha256:{digest}"),
+            format!("registry.example.test:00001/agent@sha256:{digest}"),
+            format!("registry.example.test/team-a/-agent@sha256:{digest}"),
+            format!("registry.example.test/team-a/agent..v1@sha256:{digest}"),
+            format!(
+                "registry.example.test/{}/agent@sha256:{digest}",
+                "a".repeat(240)
+            ),
+        ] {
+            assert!(
+                !valid_digest_pinned_image(&invalid),
+                "accepted malformed or unbounded OCI image reference {invalid}"
+            );
+        }
+    }
 
     #[test]
     fn canonical_principal_uses_an_opaque_immutable_id_not_email() -> Result<(), String> {

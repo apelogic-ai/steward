@@ -14,10 +14,13 @@ When documents disagree, use this order:
 2. Current implementation documents describe behavior already present in this
    repository. Source and generated machine-readable contracts remain the final
    evidence of implementation.
-3. [`docs/v2/**`](v2/README.md) records accepted post-M1 semantics and explicitly
+3. Accepted implementation architecture documents prescribe internal implementation
+   targets without claiming that behavior is already present or changing a public wire
+   contract.
+4. [`docs/v2/**`](v2/README.md) records accepted post-M1 semantics and explicitly
    deferred implementation contracts. It is not an implemented or frozen wire
    contract.
-4. Historical plans and design explorations are context only.
+5. Historical plans and design explorations are context only.
 
 Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 field.
 
@@ -27,6 +30,7 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 |---|---|
 | **Frozen contract** | Normative versioned wire behavior; changes require a new compatible contract path. |
 | **Current implementation** | Describes behavior present in the repository at the document's stated scope. |
+| **Accepted implementation architecture** | Prescriptive internal implementation target; not a claim of current behavior or a public wire contract. |
 | **Accepted post-M1 semantics** | Architecture direction accepted for future implementation; not a public API or claim of implementation. |
 | **Deferred contract** | A wire or implementation decision that still requires separate design and acceptance. |
 | **Historical** | Retained for context; not current architecture, implementation status, or contract authority. |
@@ -50,7 +54,15 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | [`browser-session-contract-v1.md`](browser-session-contract-v1.md) | **Current implementation, with stated activation dependency** | Browser authentication and session boundary. |
 | [`canonical-user-identity-v1.md`](canonical-user-identity-v1.md) | **Current implementation** | Canonical person identity and ownership keys. |
 | [`github-actions-generator.md`](github-actions-generator.md) | **Current implementation, renderer scope** | Bounded GitHub Actions YAML generation. |
+| [`installation/execution-bindings.md`](installation/execution-bindings.md) | **Current implementation** | Deployment-neutral coding-agent catalog, validation, Helm installation, and lifecycle behavior. |
+| [`installation/upgrade-execution-bindings.md`](installation/upgrade-execution-bindings.md) | **Current implementation** | Upgrade from implicit coding-agent behavior to explicit deployment bindings. |
 | [`task-submission-api.md`](task-submission-api.md) | **Current pre-M1 compatibility behavior** | Implemented v0.1 Task API; subordinate to the frozen contract for M1. |
+
+### Accepted implementation architecture
+
+| Document | Status | Purpose |
+|---|---|---|
+| [`task-runtime-orchestration.md`](task-runtime-orchestration.md) | **Accepted implementation architecture** | Durable single-owner Task application across Postgres, Kubernetes, approval, execution, and cleanup boundaries. |
 
 ### Accepted post-M1 direction
 

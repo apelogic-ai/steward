@@ -2375,7 +2375,7 @@ mod tests {
     #[test]
     fn neutrality_allows_versioned_workflow_agent_and_schema_identifiers() {
         let violations = neutrality_violations(
-            "\"repository-review@1\" \"codex@0.117.0\" \"steward.workflows/v1\"",
+            "\"repository-review@1\" \"codex@0.140.0\" \"steward.workflows/v1\"",
         );
 
         assert!(

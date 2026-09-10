@@ -68,12 +68,23 @@ tls:
     name: cluster-issuer
     kind: ClusterIssuer
 config:
+  # First deploy the new binaries with staged ownership. Switch to active only after every
+  # legacy controller replica is gone; the same value gates Task intent writers and owner loops.
+  taskOrchestrationMode: staged
   apiserver:
     jiraBaseUrl: https://jira.example.com
     jiraProjectKey: PROJ
     jiraAccountEmail: alice@example.com
     kubernetesTokenReviewAudience: https://kubernetes.default.svc
     taskWorkflowsJson: "[]"
+    # Keep staged for the first binary rollout; activate only after every controller is upgraded.
+    executionBindingsMode: staged
+    # Deployment-owned catalog. An empty list advertises no coding agents and creates no fallback.
+    executionBindings:
+      apiVersion: steward.execution-bindings/v1
+      bindings: []
+    # Exact OpenAI-compatible Responses API endpoint rendered by the Codex adapter.
+    inferenceEndpoint: http://litellm-litellm.litellm.svc.cluster.local:4000/v1
     # Exact streamable HTTP endpoint rendered only into tool-bearing Codex task plans.
     # Empty keeps tool-less tasks available and makes tool-bearing submission fail closed.
     mcpGatewayEndpoint: ""

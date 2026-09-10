@@ -13,7 +13,10 @@ Use these sources instead:
   fields, including the historical M1 `workflow` field whose value resolves a
   `TaskDefinition`;
 - the [post-M1 architecture baseline](v2/README.md) for accepted `TaskDefinition`,
-  `Task`, `AgentInstance`, `AgentRuntime`, and `AgentSession` semantics; and
+  `Task`, `AgentInstance`, `AgentRuntime`, and `AgentSession` semantics;
+- the [durable Task runtime orchestration architecture](task-runtime-orchestration.md)
+  for the accepted single-owner reconciliation, exact-UID binding, execution, and
+  cleanup design; and
 - the [deferred-contract register](v2/deferred-implementation-contracts.md) for future
   contracts that have not been designed or frozen.
 

@@ -3,6 +3,7 @@ use std::fs;
 use std::future::Future;
 use std::path::Path as FilePath;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
@@ -21,26 +22,26 @@ use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, evaluate_with_grants};
-use steward_ports::MAX_TASK_INPUT_ARCHIVE_BYTES;
+use steward_ports::{MAX_TASK_INPUT_ARCHIVE_BYTES, TaskExecutionAdapter, TaskExecutionPlanRequest};
 use steward_store::{
-    EnvelopeRequestRecord, ParkRejection, PgStore, StoreError, TaskRecord, TaskReservationRequest,
+    EnvelopeRequestRecord, PgStore, StoreError, TaskOrchestrationMode, TaskRecord,
+    TaskReservationRequest, TaskRuntimeOperationRecord, TaskRuntimeOwnership,
     WorkflowRevisionRecord,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, Duration,
-    Email, ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, RuntimeOwnership, TaskPhase,
-    ToolGrant,
+    Email, ModelRef, PENDING_APPROVAL_ANNOTATION, Principal, RuntimeOwnership,
+    TaskExecutionBinding, TaskPhase, ToolGrant,
 };
 use uuid::Uuid;
 
 use crate::WorkflowReference;
+use crate::execution_bindings::ExecutionBindingCatalog;
 use crate::{
-    AdmissionLedger, ApiError, BoxFuture, DecisionChannel, KubernetesTokenReviewAudience,
-    RuntimeCreateError, RuntimeRepository, authenticated_token_review_user,
-    file_decision_reference, spec_digest, token_review_request,
+    AdmissionLedger, ApiError, BoxFuture, KubernetesTokenReviewAudience, RuntimeRepository,
+    authenticated_token_review_user, spec_digest, token_review_request,
 };
 
-const SERVICE_PRINCIPAL_ANNOTATION: &str = "agents.apelogic.ai/service-principal";
 const SERVICE_GROUP_PREFIX: &str = "agents.apelogic.ai/service-principal:";
 const ACTING_USER_GROUP_PREFIX: &str = "agents.apelogic.ai/acting-user:";
 const TASK_OWNER_GROUP_PREFIX: &str = "agents.apelogic.ai/task-owner:";
@@ -75,32 +76,161 @@ struct VersionedTaskPlan {
     envelope: EnvelopeRequestRecord,
     spec: AgentRuntimeSpec,
     command: Vec<String>,
+    execution_binding: TaskExecutionBinding,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+trait LegacyRuntimeResolver: Send + Sync {
+    fn get_by_uid<'a>(
+        &'a self,
+        runtime_uid: &'a str,
+    ) -> BoxFuture<'a, Result<AgentRuntime, String>>;
+}
+
+impl<R> LegacyRuntimeResolver for R
+where
+    R: RuntimeRepository,
+{
+    fn get_by_uid<'a>(
+        &'a self,
+        runtime_uid: &'a str,
+    ) -> BoxFuture<'a, Result<AgentRuntime, String>> {
+        RuntimeRepository::get_by_uid(self, runtime_uid)
+    }
+}
+
+#[derive(Clone)]
 pub struct TaskApiConfig {
-    mcp_gateway_endpoint: Option<String>,
+    tool_transport_endpoint: Option<String>,
+    execution_bindings: ExecutionBindingCatalog,
+    execution_adapters: BTreeMap<String, Arc<dyn TaskExecutionAdapter>>,
+    execution_bindings_active: bool,
+    orchestration_mode: TaskOrchestrationMode,
+    legacy_runtime_resolver: Option<Arc<dyn LegacyRuntimeResolver>>,
+}
+
+impl Default for TaskApiConfig {
+    fn default() -> Self {
+        Self {
+            tool_transport_endpoint: None,
+            execution_bindings: ExecutionBindingCatalog::default(),
+            execution_adapters: BTreeMap::new(),
+            execution_bindings_active: false,
+            orchestration_mode: TaskOrchestrationMode::Staged,
+            legacy_runtime_resolver: None,
+        }
+    }
 }
 
 impl TaskApiConfig {
-    pub fn new(mcp_gateway_endpoint: Option<String>) -> Result<Self, String> {
-        let mcp_gateway_endpoint = match mcp_gateway_endpoint {
+    pub fn new(tool_transport_endpoint: Option<String>) -> Result<Self, String> {
+        let tool_transport_endpoint = match tool_transport_endpoint {
             Some(value) if value.is_empty() => None,
-            Some(value) => Some(validate_mcp_gateway_endpoint(value)?),
+            Some(value) => Some(validate_tool_transport_endpoint(value)?),
             None => None,
         };
         Ok(Self {
-            mcp_gateway_endpoint,
+            tool_transport_endpoint,
+            ..Self::default()
         })
+    }
+
+    pub fn with_execution_adapter(
+        mut self,
+        adapter: Arc<dyn TaskExecutionAdapter>,
+    ) -> Result<Self, String> {
+        let contract = adapter.contract();
+        if contract.is_empty()
+            || contract.trim() != contract
+            || contract.chars().any(char::is_control)
+        {
+            return Err("execution adapter contract must be an exact non-empty value".to_owned());
+        }
+        if self
+            .execution_adapters
+            .insert(contract.to_owned(), adapter)
+            .is_some()
+        {
+            return Err(format!(
+                "execution adapter contract {contract} is configured more than once"
+            ));
+        }
+        Ok(self)
+    }
+
+    pub fn with_execution_bindings_json(mut self, value: Option<&str>) -> Result<Self, String> {
+        if let Some(value) = value {
+            self.execution_bindings = ExecutionBindingCatalog::from_json(value)?;
+        }
+        Ok(self)
+    }
+
+    pub fn with_execution_bindings_active(mut self, active: bool) -> Result<Self, String> {
+        if active {
+            for binding in self.execution_bindings.bindings() {
+                if !self.execution_adapters.contains_key(&binding.adapter) {
+                    return Err(format!(
+                        "execution binding {} uses unavailable adapter {}",
+                        binding.agent_ref, binding.adapter
+                    ));
+                }
+            }
+        }
+        self.execution_bindings_active = active;
+        Ok(self)
+    }
+
+    pub fn with_task_orchestration_mode(mut self, mode: TaskOrchestrationMode) -> Self {
+        self.orchestration_mode = mode;
+        self
+    }
+
+    pub fn with_legacy_runtime_resolver<R>(mut self, resolver: R) -> Self
+    where
+        R: RuntimeRepository,
+    {
+        self.legacy_runtime_resolver = Some(Arc::new(resolver));
+        self
+    }
+
+    pub fn execution_binding_refs(&self) -> Vec<String> {
+        if self.execution_bindings_active {
+            self.execution_bindings
+                .bindings()
+                .filter(|binding| self.execution_adapters.contains_key(&binding.adapter))
+                .map(|binding| binding.agent_ref.clone())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn execution_binding_advertisements(
+        &self,
+    ) -> Vec<crate::execution_bindings::ExecutionBindingAdvertisement> {
+        if self.execution_bindings_active {
+            self.execution_bindings
+                .advertisements()
+                .into_iter()
+                .filter(|advertisement| {
+                    self.execution_bindings
+                        .resolve(&advertisement.agent_ref)
+                        .is_some_and(|binding| {
+                            self.execution_adapters.contains_key(&binding.adapter)
+                        })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 }
 
-fn validate_mcp_gateway_endpoint(value: String) -> Result<String, String> {
+fn validate_tool_transport_endpoint(value: String) -> Result<String, String> {
     if value.trim() != value || value.chars().any(char::is_control) {
-        return Err("task MCP-GW endpoint must be an exact HTTP(S) URL".to_owned());
+        return Err("task tool transport endpoint must be an exact HTTP(S) URL".to_owned());
     }
     let endpoint = reqwest::Url::parse(&value)
-        .map_err(|_| "task MCP-GW endpoint must be an exact HTTP(S) URL".to_owned())?;
+        .map_err(|_| "task tool transport endpoint must be an exact HTTP(S) URL".to_owned())?;
     if !matches!(endpoint.scheme(), "http" | "https")
         || endpoint.host_str().is_none()
         || !endpoint.username().is_empty()
@@ -109,7 +239,7 @@ fn validate_mcp_gateway_endpoint(value: String) -> Result<String, String> {
         || endpoint.fragment().is_some()
         || endpoint.port() == Some(0)
     {
-        return Err("task MCP-GW endpoint must be an exact HTTP(S) URL".to_owned());
+        return Err("task tool transport endpoint must be an exact HTTP(S) URL".to_owned());
     }
     Ok(endpoint.to_string())
 }
@@ -144,17 +274,47 @@ fn resolve_versioned_task_plan(
         .ok_or(ApiError::MissingEnvelope)?;
     let [model] = approved.spec.llms.as_slice() else {
         return Err(ApiError::Admission(
-            "versioned Codex Workflows require exactly one approved model".to_owned(),
+            "versioned Workflows require exactly one approved model".to_owned(),
         ));
     };
-    let codex_model = format!("{}/{}", model.provider, model.model);
-    let mcp_gateway_endpoint = if approved.spec.tools.is_empty() {
+    let execution_binding = config
+        .execution_bindings_active
+        .then(|| config.execution_bindings.resolve(&workflow.agent))
+        .flatten()
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::TaskRuntimeContractUnavailable(format!(
+                "logical agent {} has no deployment execution binding",
+                workflow.agent
+            ))
+        })?;
+    if execution_binding.provider_profiles.inference.is_none() {
+        return Err(ApiError::TaskRuntimeContractUnavailable(format!(
+            "logical agent {} has no inference provider profile",
+            workflow.agent
+        )));
+    }
+    if !approved.spec.tools.is_empty() && execution_binding.provider_profiles.tools.is_none() {
+        return Err(ApiError::TaskRuntimeContractUnavailable(format!(
+            "logical agent {} has no tool provider profile",
+            workflow.agent
+        )));
+    }
+    let adapter = config
+        .execution_adapters
+        .get(&execution_binding.adapter)
+        .ok_or_else(|| {
+            ApiError::TaskRuntimeContractUnavailable(format!(
+                "logical agent {} uses an unavailable execution adapter",
+                workflow.agent
+            ))
+        })?;
+    let tool_transport_endpoint = if approved.spec.tools.is_empty() {
         None
     } else {
-        Some(config.mcp_gateway_endpoint.as_deref().ok_or_else(|| {
+        Some(config.tool_transport_endpoint.as_deref().ok_or_else(|| {
             ApiError::TaskRuntimeContractUnavailable(
-                "tool-bearing versioned Codex Workflow requires the MCP-GW runtime contract"
-                    .to_owned(),
+                "tool-bearing versioned Workflow requires a tool transport endpoint".to_owned(),
             )
         })?)
     };
@@ -183,64 +343,27 @@ fn resolve_versioned_task_plan(
         runner: approved.spec.runner.clone(),
         bindings: None,
     };
-    let mut codex_config = concat!(
-        "model_provider = \"litellm\"\n",
-        "approval_policy = \"never\"\n",
-        "web_search = \"disabled\"\n",
-        "[model_providers.litellm]\n",
-        "name = \"LiteLLM\"\n",
-        "base_url = \"http://litellm-litellm.litellm.svc.cluster.local:4000/v1\"\n",
-        "env_key = \"OPENAI_API_KEY\"\n",
-        "wire_api = \"responses\"\n",
-        "requires_openai_auth = false\n",
-    )
-    .to_owned();
-    if let Some(endpoint) = mcp_gateway_endpoint {
-        let encoded_endpoint = serde_json::to_string(endpoint).map_err(|error| {
+    let command = adapter
+        .render(TaskExecutionPlanRequest {
+            workflow_prompt: &workflow.prompt,
+            model,
+            tools: &approved.spec.tools,
+            tool_transport_endpoint,
+            binding: &execution_binding,
+        })
+        .map_err(|error| {
             ApiError::TaskRuntimeContractUnavailable(format!(
-                "failed to render the MCP-GW endpoint: {error}"
+                "logical agent {} execution plan could not be rendered: {error:?}",
+                workflow.agent
             ))
-        })?;
-        codex_config.push_str("[mcp_servers.steward]\nurl = ");
-        codex_config.push_str(&encoded_endpoint);
-        codex_config.push_str("\nbearer_token_env_var = \"STEWARD_MCP_GW_BEARER_TOKEN\"\n");
-    }
-    let mcp_bearer_environment = if mcp_gateway_endpoint.is_some() {
-        "STEWARD_MCP_GW_BEARER_TOKEN=openshell-token-grant-placeholder "
-    } else {
-        ""
-    };
-    let shell_command = format!(
-        concat!(
-            "set -eu; umask 077; ",
-            "test \"$(codex --version)\" = \"codex-cli 0.117.0\"; ",
-            "test \"$#\" -eq 3; ",
-            "export CODEX_HOME=/sandbox/steward-codex; ",
-            "mkdir -p \"$CODEX_HOME\" \"$STEWARD_OUTPUT_DIR/out\"; ",
-            "test ! -e out; ln -s \"$STEWARD_OUTPUT_DIR/out\" out; ",
-            "printf '%s' \"$3\" > \"$CODEX_HOME/config.toml\"; ",
-            "{}",
-            "OPENAI_API_KEY=openshell-token-grant-placeholder ",
-            "codex exec --ephemeral --skip-git-repo-check ",
-            "--sandbox danger-full-access --model \"$2\" ",
-            "--output-last-message \"$STEWARD_OUTPUT_DIR/result.txt\" -- \"$1\""
-        ),
-        mcp_bearer_environment,
-    );
-    let command = vec![
-        "/bin/sh".to_owned(),
-        "-c".to_owned(),
-        shell_command,
-        "steward-workflow".to_owned(),
-        workflow.prompt.clone(),
-        codex_model,
-        codex_config,
-    ];
+        })?
+        .command;
     Ok(VersionedTaskPlan {
         workflow,
         envelope: envelope.clone(),
         spec,
         command,
+        execution_binding: TaskExecutionBinding::Disposable(execution_binding),
     })
 }
 
@@ -789,17 +912,15 @@ pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
         idempotency_key: &'a str,
     ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>>;
 
+    fn task_runtime_operation(
+        &self,
+        task_uid: Uuid,
+    ) -> BoxFuture<'_, Result<Option<TaskRuntimeOperationRecord>, StoreError>>;
+
     fn reserve_task<'a>(
         &'a self,
         request: TaskReservationRequest<'a>,
     ) -> BoxFuture<'a, Result<steward_store::TaskReservation, StoreError>>;
-
-    fn bind_task_runtime<'a>(
-        &'a self,
-        task_uid: Uuid,
-        runtime_uid: &'a str,
-        phase: TaskPhase,
-    ) -> BoxFuture<'a, Result<TaskRecord, StoreError>>;
 
     fn put_task_inputs<'a>(
         &'a self,
@@ -870,22 +991,18 @@ impl TaskSubmissionLedger for PgStore {
         })
     }
 
+    fn task_runtime_operation(
+        &self,
+        task_uid: Uuid,
+    ) -> BoxFuture<'_, Result<Option<TaskRuntimeOperationRecord>, StoreError>> {
+        Box::pin(async move { PgStore::task_runtime_operation(self, task_uid).await })
+    }
+
     fn reserve_task<'a>(
         &'a self,
         request: TaskReservationRequest<'a>,
     ) -> BoxFuture<'a, Result<steward_store::TaskReservation, StoreError>> {
         Box::pin(async move { PgStore::reserve_task(self, &request).await })
-    }
-
-    fn bind_task_runtime<'a>(
-        &'a self,
-        task_uid: Uuid,
-        runtime_uid: &'a str,
-        phase: TaskPhase,
-    ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
-        Box::pin(
-            async move { PgStore::bind_task_runtime(self, task_uid, runtime_uid, phase).await },
-        )
     }
 
     fn put_task_inputs<'a>(
@@ -1001,68 +1118,62 @@ pub struct TaskErrorResponse {
 pub struct TaskArchive(pub Vec<u8>);
 
 #[derive(Clone)]
-struct TaskApiState<R, L, D, I, W> {
-    runtimes: R,
-    ledger: L,
-    decisions: D,
+struct TaskApiState<L, I, W> {
     identities: I,
+    application: TaskApplicationService<L, W>,
+}
+
+/// The single internal application boundary for Task resolution, admission, reservation,
+/// and immutable execution-plan snapshotting.
+#[derive(Clone)]
+struct TaskApplicationService<L, W> {
+    ledger: L,
     workflows: W,
     config: TaskApiConfig,
 }
 
-pub fn task_router<R, L, D, I, W>(
-    runtimes: R,
-    ledger: L,
-    decisions: D,
-    identities: I,
-    workflows: W,
-    config: TaskApiConfig,
-) -> Router
+pub fn task_router<L, I, W>(ledger: L, identities: I, workflows: W, config: TaskApiConfig) -> Router
 where
-    R: RuntimeRepository,
     L: AdmissionLedger + TaskSubmissionLedger,
-    D: DecisionChannel + Clone,
     I: TaskIdentityResolver,
     W: TaskWorkflowCatalog,
 {
     Router::new()
-        .route("/v1/tasks", post(submit_task::<R, L, D, I, W>))
+        .route("/v1/tasks", post(submit_task::<L, I, W>))
         .route(
             "/v1/tasks/{task_uid}/inputs",
-            put(put_task_inputs::<R, L, D, I, W>),
+            put(put_task_inputs::<L, I, W>),
         )
         .route(
             "/v1/tasks/{task_uid}/execute",
-            post(execute_task::<R, L, D, I, W>),
+            post(execute_task::<L, I, W>),
         )
         .route(
             "/v1/tasks/{task_uid}/outputs",
-            get(get_task_outputs::<R, L, D, I, W>),
+            get(get_task_outputs::<L, I, W>),
         )
         .route(
             "/v1/tasks/{task_uid}",
-            get(get_task::<R, L, D, I, W>).delete(delete_task::<R, L, D, I, W>),
+            get(get_task::<L, I, W>).delete(delete_task::<L, I, W>),
         )
         .layer(DefaultBodyLimit::max(MAX_TASK_INPUT_ARCHIVE_BYTES))
         .with_state(TaskApiState {
-            runtimes,
-            ledger,
-            decisions,
             identities,
-            workflows,
-            config,
+            application: TaskApplicationService {
+                ledger,
+                workflows,
+                config,
+            },
         })
 }
 
-async fn get_task_outputs<R, L, D, I, W>(
-    State(state): State<TaskApiState<R, L, D, I, W>>,
+async fn get_task_outputs<L, I, W>(
+    State(state): State<TaskApiState<L, I, W>>,
     Path(task_uid): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response
 where
-    R: RuntimeRepository,
     L: AdmissionLedger + TaskSubmissionLedger,
-    D: DecisionChannel + Clone,
     I: TaskIdentityResolver,
     W: TaskWorkflowCatalog,
 {
@@ -1071,6 +1182,7 @@ where
         Err(error) => return error.into_response(),
     };
     let record = match state
+        .application
         .ledger
         .task_for_submitter(
             task_uid,
@@ -1097,15 +1209,13 @@ where
     }
 }
 
-async fn delete_task<R, L, D, I, W>(
-    State(state): State<TaskApiState<R, L, D, I, W>>,
+async fn delete_task<L, I, W>(
+    State(state): State<TaskApiState<L, I, W>>,
     Path(task_uid): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response
 where
-    R: RuntimeRepository,
     L: AdmissionLedger + TaskSubmissionLedger,
-    D: DecisionChannel + Clone,
     I: TaskIdentityResolver,
     W: TaskWorkflowCatalog,
 {
@@ -1114,6 +1224,7 @@ where
         Err(error) => return error.into_response(),
     };
     match state
+        .application
         .ledger
         .request_task_finalization(
             task_uid,
@@ -1122,7 +1233,7 @@ where
         )
         .await
     {
-        Ok(record) => match status_response(record, Vec::new()) {
+        Ok(record) => match status_response(&state.application.ledger, record, Vec::new()).await {
             Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
             Err(error) => error.into_response(),
         },
@@ -1130,15 +1241,13 @@ where
     }
 }
 
-async fn execute_task<R, L, D, I, W>(
-    State(state): State<TaskApiState<R, L, D, I, W>>,
+async fn execute_task<L, I, W>(
+    State(state): State<TaskApiState<L, I, W>>,
     Path(task_uid): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response
 where
-    R: RuntimeRepository,
     L: AdmissionLedger + TaskSubmissionLedger,
-    D: DecisionChannel + Clone,
     I: TaskIdentityResolver,
     W: TaskWorkflowCatalog,
 {
@@ -1147,6 +1256,7 @@ where
         Err(error) => return error.into_response(),
     };
     match state
+        .application
         .ledger
         .request_task_execution(
             task_uid,
@@ -1155,7 +1265,7 @@ where
         )
         .await
     {
-        Ok(record) => match status_response(record, Vec::new()) {
+        Ok(record) => match status_response(&state.application.ledger, record, Vec::new()).await {
             Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
             Err(error) => error.into_response(),
         },
@@ -1163,15 +1273,13 @@ where
     }
 }
 
-async fn get_task<R, L, D, I, W>(
-    State(state): State<TaskApiState<R, L, D, I, W>>,
+async fn get_task<L, I, W>(
+    State(state): State<TaskApiState<L, I, W>>,
     Path(task_uid): Path<Uuid>,
     headers: HeaderMap,
 ) -> Response
 where
-    R: RuntimeRepository,
     L: AdmissionLedger + TaskSubmissionLedger,
-    D: DecisionChannel + Clone,
     I: TaskIdentityResolver,
     W: TaskWorkflowCatalog,
 {
@@ -1180,6 +1288,7 @@ where
         Err(error) => return error.into_response(),
     };
     let record = match state
+        .application
         .ledger
         .task_for_submitter(
             task_uid,
@@ -1192,22 +1301,20 @@ where
         Ok(None) => return ApiError::Store(StoreError::TaskNotFound).into_response(),
         Err(error) => return ApiError::Store(error).into_response(),
     };
-    match status_response(record, Vec::new()) {
+    match status_response(&state.application.ledger, record, Vec::new()).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => error.into_response(),
     }
 }
 
-async fn put_task_inputs<R, L, D, I, W>(
-    State(state): State<TaskApiState<R, L, D, I, W>>,
+async fn put_task_inputs<L, I, W>(
+    State(state): State<TaskApiState<L, I, W>>,
     Path(task_uid): Path<Uuid>,
     headers: HeaderMap,
     archive: Result<Bytes, BytesRejection>,
 ) -> Response
 where
-    R: RuntimeRepository,
     L: AdmissionLedger + TaskSubmissionLedger,
-    D: DecisionChannel + Clone,
     I: TaskIdentityResolver,
     W: TaskWorkflowCatalog,
 {
@@ -1239,6 +1346,7 @@ where
         Err(error) => return error.into_response(),
     };
     match state
+        .application
         .ledger
         .put_task_inputs(
             task_uid,
@@ -1253,121 +1361,240 @@ where
     }
 }
 
-async fn submit_task<R, L, D, I, W>(
-    State(state): State<TaskApiState<R, L, D, I, W>>,
+async fn submit_task<L, I, W>(
+    State(state): State<TaskApiState<L, I, W>>,
     headers: HeaderMap,
     Json(request): Json<TaskSubmissionRequest>,
 ) -> Response
 where
-    R: RuntimeRepository,
     L: AdmissionLedger + TaskSubmissionLedger,
-    D: DecisionChannel + Clone,
     I: TaskIdentityResolver,
     W: TaskWorkflowCatalog,
 {
-    match submit_task_inner(&state, &headers, &request).await {
+    let idempotency_key = match headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => value,
+        None => {
+            return ApiError::Admission("Idempotency-Key is required".to_owned()).into_response();
+        }
+    };
+    let identity = match resolve_task_identity(&state.identities, &headers).await {
+        Ok(identity) => identity,
+        Err(error) => return error.into_response(),
+    };
+    match state
+        .application
+        .submit(idempotency_key, identity, &request)
+        .await
+    {
         Ok((status, response)) => (status, Json(response)).into_response(),
         Err(error) => error.into_response(),
     }
 }
 
-async fn submit_task_inner<R, L, D, I, W>(
-    state: &TaskApiState<R, L, D, I, W>,
-    headers: &HeaderMap,
-    request: &TaskSubmissionRequest,
-) -> Result<(StatusCode, TaskStatusResponse), ApiError>
+impl<L, W> TaskApplicationService<L, W>
 where
-    R: RuntimeRepository,
     L: AdmissionLedger + TaskSubmissionLedger,
-    D: DecisionChannel + Clone,
-    I: TaskIdentityResolver,
     W: TaskWorkflowCatalog,
 {
-    let idempotency_key = headers
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::Admission("Idempotency-Key is required".to_owned()))?;
-    let identity = resolve_task_identity(&state.identities, headers).await?;
-    if let Some(reference) =
-        versioned_workflow_reference(&request.workflow, request.coding_agent_runtime.as_deref())?
-    {
-        return submit_versioned_task(state, idempotency_key, identity, reference, request).await;
-    }
-    let workflow = state
-        .workflows
-        .workflow(&request.workflow)
-        .ok_or(ApiError::TaskWorkflowNotFound)?;
-    let coding_agent_runtime = request.coding_agent_runtime.as_deref().ok_or_else(|| {
-        ApiError::Admission("legacy workflows require codingAgentRuntime".to_owned())
-    })?;
-    if coding_agent_runtime != workflow.coding_agent_runtime {
-        return Err(ApiError::Admission(
-            "codingAgentRuntime is not selected by the workflow".to_owned(),
-        ));
-    }
-    let spec = AgentRuntimeSpec {
-        principal: Principal::Service {
-            name: identity.service.clone(),
-            acting_user: identity.acting_user.clone(),
-        },
-        owner: identity.owner.clone(),
-        canonical_authority: Some(
-            CanonicalAuthorityBinding::new(
-                identity.canonical_user_id.clone(),
-                identity
-                    .acting_user
-                    .as_ref()
-                    .map(|_| identity.canonical_user_id.clone()),
-            )
-            .map_err(ApiError::Admission)?,
-        ),
-        agent_type: steward_types::AgentType {
-            name: workflow.coding_agent_runtime.clone(),
-        },
-        llms: workflow.llms.clone(),
-        tools: workflow.tools.clone(),
-        budget: workflow.budget.clone(),
-        ttl: workflow.ttl.clone(),
-        runner: steward_types::RunnerRequirements::default(),
-        bindings: None,
-    };
-    let envelope = state
-        .ledger
-        .latest_service_envelope(&identity.service)
-        .await
-        .map_err(ApiError::Store)?
-        .ok_or(ApiError::MissingEnvelope)?;
-    let decision = evaluate_with_grants(&spec, &envelope, &[])
-        .map_err(|error| ApiError::Admission(format!("{error:?}")))?;
-    if let Some(runtime_uid) = request.agent_runtime_uid.as_deref() {
-        if !matches!(decision, AdmissionDecision::Admit) {
+    async fn submit(
+        &self,
+        idempotency_key: &str,
+        identity: TaskIdentity,
+        request: &TaskSubmissionRequest,
+    ) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
+        let reference = versioned_workflow_reference(
+            &request.workflow,
+            request.coding_agent_runtime.as_deref(),
+        )?;
+        if reference.is_none() && request.coding_agent_runtime.is_none() {
             return Err(ApiError::Admission(
-                "adopted runtime is outside the current service envelope".to_owned(),
+                "legacy workflows require codingAgentRuntime".to_owned(),
             ));
         }
-        let runtime = state
-            .runtimes
-            .get_by_uid(runtime_uid)
+        if let Some(record) = self
+            .ledger
+            .task_by_idempotency(
+                &identity.service,
+                identity.canonical_user_id.as_str(),
+                idempotency_key,
+            )
             .await
-            .map_err(ApiError::Runtime)?;
-        let runtime_namespace = runtime
-            .namespace()
-            .ok_or_else(|| ApiError::Runtime("adopted runtime has no namespace".to_owned()))?;
-        if runtime_namespace != workflow.namespace
-            || runtime.spec != spec
-            || runtime
-                .annotations()
-                .contains_key(PENDING_APPROVAL_ANNOTATION)
+            .map_err(ApiError::Store)?
         {
-            return Err(ApiError::Conflict(
-                "adopted runtime does not match the resolved workflow and principal".to_owned(),
+            return self
+                .retry_existing_task(&identity, reference.as_ref(), request, record)
+                .await;
+        }
+        if !self.config.orchestration_mode.is_active() {
+            return Err(ApiError::TaskRuntimeContractUnavailable(
+                "Task submission is disabled during the staged orchestration rollout".to_owned(),
             ));
         }
-        let runtime_name = runtime.name_any();
-        let reservation = state
+        if let Some(reference) = reference {
+            return submit_versioned_task(self, idempotency_key, identity, reference, request)
+                .await;
+        }
+        let workflow = self
+            .workflows
+            .workflow(&request.workflow)
+            .ok_or(ApiError::TaskWorkflowNotFound)?;
+        let coding_agent_runtime = request.coding_agent_runtime.as_deref().ok_or_else(|| {
+            ApiError::Admission("legacy workflows require codingAgentRuntime".to_owned())
+        })?;
+        if coding_agent_runtime != workflow.coding_agent_runtime {
+            return Err(ApiError::Admission(
+                "codingAgentRuntime is not selected by the workflow".to_owned(),
+            ));
+        }
+        let spec = AgentRuntimeSpec {
+            principal: Principal::Service {
+                name: identity.service.clone(),
+                acting_user: identity.acting_user.clone(),
+            },
+            owner: identity.owner.clone(),
+            canonical_authority: Some(
+                CanonicalAuthorityBinding::new(
+                    identity.canonical_user_id.clone(),
+                    identity
+                        .acting_user
+                        .as_ref()
+                        .map(|_| identity.canonical_user_id.clone()),
+                )
+                .map_err(ApiError::Admission)?,
+            ),
+            agent_type: steward_types::AgentType {
+                name: workflow.coding_agent_runtime.clone(),
+            },
+            llms: workflow.llms.clone(),
+            tools: workflow.tools.clone(),
+            budget: workflow.budget.clone(),
+            ttl: workflow.ttl.clone(),
+            runner: steward_types::RunnerRequirements::default(),
+            bindings: None,
+        };
+        let envelope = self
+            .ledger
+            .latest_service_envelope(&identity.service)
+            .await
+            .map_err(ApiError::Store)?
+            .ok_or(ApiError::MissingEnvelope)?;
+        let decision = evaluate_with_grants(&spec, &envelope, &[])
+            .map_err(|error| ApiError::Admission(format!("{error:?}")))?;
+        if let Some(runtime_uid) = request.agent_runtime_uid.as_deref() {
+            if !matches!(decision, AdmissionDecision::Admit) {
+                return Err(ApiError::Admission(
+                    "adopted runtime is outside the current service envelope".to_owned(),
+                ));
+            }
+            let resolver = self
+                .config
+                .legacy_runtime_resolver
+                .as_ref()
+                .ok_or_else(|| {
+                    ApiError::TaskRuntimeContractUnavailable(
+                        "legacy adopted-runtime resolution is unavailable".to_owned(),
+                    )
+                })?;
+            let runtime = resolver
+                .get_by_uid(runtime_uid)
+                .await
+                .map_err(ApiError::Runtime)?;
+            let runtime_namespace = runtime
+                .namespace()
+                .ok_or_else(|| ApiError::Runtime("adopted runtime has no namespace".to_owned()))?;
+            if runtime.metadata.uid.as_deref() != Some(runtime_uid)
+                || runtime_namespace != workflow.namespace
+                || runtime.spec != spec
+                || runtime
+                    .annotations()
+                    .contains_key(PENDING_APPROVAL_ANNOTATION)
+            {
+                return Err(ApiError::Conflict(
+                    "adopted runtime does not match the resolved workflow and principal".to_owned(),
+                ));
+            }
+            let runtime_name = runtime.name_any();
+            let task_uid = Uuid::new_v4();
+            let operation_id = Uuid::new_v4();
+            let orchestration = task_orchestration_reservation(
+                task_uid,
+                operation_id,
+                &runtime_namespace,
+                &runtime_name,
+                &spec,
+                &envelope,
+                None,
+            )?;
+            let reservation = self
+                .ledger
+                .reserve_task(TaskReservationRequest {
+                    task_uid,
+                    operation_id,
+                    idempotency_key,
+                    submitter_service: &identity.service,
+                    acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
+                    acting_user_id: identity
+                        .acting_user
+                        .as_ref()
+                        .map(|_| identity.canonical_user_id.as_str()),
+                    owner: &identity.owner.0,
+                    owner_user_id: identity.canonical_user_id.as_str(),
+                    workflow: &workflow.name,
+                    workflow_name: None,
+                    workflow_version: None,
+                    workflow_digest: None,
+                    user_envelope_instance_id: None,
+                    user_envelope_revision: None,
+                    user_envelope_digest: None,
+                    coding_agent_runtime: &workflow.coding_agent_runtime,
+                    runtime_uid: Some(runtime_uid),
+                    runtime_namespace: &runtime_namespace,
+                    runtime_name: &runtime_name,
+                    runtime_ownership: RuntimeOwnership::Adopted,
+                    runtime_spec: &spec,
+                    agent_command: &workflow.command,
+                    execution_binding: None,
+                    envelope_revision: envelope.revision,
+                    service_envelope: &envelope,
+                    service_envelope_digest: &orchestration.service_envelope_digest,
+                    candidate_digest: &orchestration.candidate_digest,
+                    admission_decision: &decision,
+                    inert_manifest_digest: &orchestration.inert_manifest_digest,
+                    active_manifest_digest: &orchestration.active_manifest_digest,
+                })
+                .await;
+            return self
+                .finish_task_reservation(
+                    &identity,
+                    None,
+                    request,
+                    idempotency_key,
+                    reservation,
+                    Vec::new(),
+                )
+                .await;
+        }
+        let task_uid = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let runtime_name = stable_task_runtime_name(operation_id);
+        let orchestration = task_orchestration_reservation(
+            task_uid,
+            operation_id,
+            &workflow.namespace,
+            &runtime_name,
+            &spec,
+            &envelope,
+            None,
+        )?;
+        let reservation = self
             .ledger
             .reserve_task(TaskReservationRequest {
+                task_uid,
+                operation_id,
                 idempotency_key,
                 submitter_service: &identity.service,
                 acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
@@ -1385,111 +1612,112 @@ where
                 user_envelope_revision: None,
                 user_envelope_digest: None,
                 coding_agent_runtime: &workflow.coding_agent_runtime,
-                runtime_namespace: &runtime_namespace,
+                runtime_uid: None,
+                runtime_namespace: &workflow.namespace,
                 runtime_name: &runtime_name,
-                runtime_ownership: RuntimeOwnership::Adopted,
+                runtime_ownership: RuntimeOwnership::Provisioned,
                 runtime_spec: &spec,
                 agent_command: &workflow.command,
+                execution_binding: None,
                 envelope_revision: envelope.revision,
+                service_envelope: &envelope,
+                service_envelope_digest: &orchestration.service_envelope_digest,
+                candidate_digest: &orchestration.candidate_digest,
+                admission_decision: &decision,
+                inert_manifest_digest: &orchestration.inert_manifest_digest,
+                active_manifest_digest: &orchestration.active_manifest_digest,
             })
-            .await
-            .map_err(ApiError::Store)?;
-        let record = if reservation.record.runtime_uid.is_none() {
-            state
+            .await;
+        let deltas = admission_deltas(&decision);
+        self.finish_task_reservation(
+            &identity,
+            None,
+            request,
+            idempotency_key,
+            reservation,
+            deltas,
+        )
+        .await
+    }
+
+    async fn finish_task_reservation(
+        &self,
+        identity: &TaskIdentity,
+        reference: Option<&WorkflowReference>,
+        request: &TaskSubmissionRequest,
+        idempotency_key: &str,
+        reservation: Result<steward_store::TaskReservation, StoreError>,
+        deltas: Vec<AdmissionDelta>,
+    ) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
+        let record = match reservation {
+            Ok(reservation) if reservation.inserted => {
+                return task_response(&self.ledger, reservation.record, deltas).await;
+            }
+            Ok(reservation) => reservation.record,
+            Err(StoreError::TaskIdempotencyConflict) => self
                 .ledger
-                .bind_task_runtime(
-                    reservation.record.task_uid,
-                    runtime_uid,
-                    TaskPhase::Submitted,
+                .task_by_idempotency(
+                    &identity.service,
+                    identity.canonical_user_id.as_str(),
+                    idempotency_key,
                 )
                 .await
                 .map_err(ApiError::Store)?
-        } else {
-            reservation.record
+                .ok_or(ApiError::Store(StoreError::TaskIdempotencyConflict))?,
+            Err(error) => return Err(ApiError::Store(error)),
         };
-        return task_response(record, Vec::new());
-    }
-    let runtime_name = stable_task_runtime_name(
-        &identity.service,
-        identity.canonical_user_id.as_str(),
-        idempotency_key,
-    );
-    let reservation = state
-        .ledger
-        .reserve_task(TaskReservationRequest {
-            idempotency_key,
-            submitter_service: &identity.service,
-            acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
-            acting_user_id: identity
-                .acting_user
-                .as_ref()
-                .map(|_| identity.canonical_user_id.as_str()),
-            owner: &identity.owner.0,
-            owner_user_id: identity.canonical_user_id.as_str(),
-            workflow: &workflow.name,
-            workflow_name: None,
-            workflow_version: None,
-            workflow_digest: None,
-            user_envelope_instance_id: None,
-            user_envelope_revision: None,
-            user_envelope_digest: None,
-            coding_agent_runtime: &workflow.coding_agent_runtime,
-            runtime_namespace: &workflow.namespace,
-            runtime_name: &runtime_name,
-            runtime_ownership: RuntimeOwnership::Provisioned,
-            runtime_spec: &spec,
-            agent_command: &workflow.command,
-            envelope_revision: envelope.revision,
-        })
-        .await
-        .map_err(ApiError::Store)?;
-    if !reservation.inserted && reservation.record.runtime_uid.is_some() {
-        return task_response(reservation.record, Vec::new());
+        self.retry_existing_task(identity, reference, request, record)
+            .await
     }
 
-    if matches!(&decision, AdmissionDecision::Admit) {
-        return task_response(reservation.record, Vec::new());
+    async fn retry_existing_task(
+        &self,
+        identity: &TaskIdentity,
+        reference: Option<&WorkflowReference>,
+        request: &TaskSubmissionRequest,
+        record: TaskRecord,
+    ) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
+        let expected_runtime_uid = if request.agent_runtime_uid.is_some() {
+            if record.orchestration_version == 1 {
+                record.runtime_uid.clone()
+            } else {
+                self.ledger
+                    .task_runtime_operation(record.task_uid)
+                    .await
+                    .map_err(ApiError::Store)?
+                    .and_then(|operation| operation.expected_runtime_uid)
+            }
+        } else {
+            None
+        };
+        validate_task_retry(
+            identity,
+            reference,
+            request,
+            expected_runtime_uid.as_deref(),
+            &record,
+        )?;
+        let deltas = record.original_admission_deltas.clone().unwrap_or_default();
+        if reference.is_some() {
+            Ok((
+                StatusCode::OK,
+                status_response(&self.ledger, record, deltas).await?,
+            ))
+        } else {
+            task_response(&self.ledger, record, deltas).await
+        }
     }
-
-    let (runtime, phase, deltas) = create_task_runtime(
-        &state.runtimes,
-        &state.ledger,
-        &state.decisions,
-        TaskRuntimePlan {
-            namespace: &workflow.namespace,
-            name: &runtime_name,
-            service: &identity.service,
-            proposed_spec: &spec,
-            envelope: &envelope,
-            decision,
-        },
-    )
-    .await?;
-    let runtime_uid = runtime
-        .metadata
-        .uid
-        .as_deref()
-        .ok_or(ApiError::MissingRuntimeUid)?;
-    let record = state
-        .ledger
-        .bind_task_runtime(reservation.record.task_uid, runtime_uid, phase)
-        .await
-        .map_err(ApiError::Store)?;
-    task_response(record, deltas)
 }
 
-async fn submit_versioned_task<R, L, D, I, W>(
-    state: &TaskApiState<R, L, D, I, W>,
+async fn submit_versioned_task<L, W>(
+    application: &TaskApplicationService<L, W>,
     idempotency_key: &str,
     identity: TaskIdentity,
     reference: WorkflowReference,
     request: &TaskSubmissionRequest,
 ) -> Result<(StatusCode, TaskStatusResponse), ApiError>
 where
-    R: RuntimeRepository,
     L: AdmissionLedger + TaskSubmissionLedger,
-    D: DecisionChannel + Clone,
-    I: TaskIdentityResolver,
     W: TaskWorkflowCatalog,
 {
     if request.agent_runtime_uid.is_some() {
@@ -1497,30 +1725,18 @@ where
             "versioned Workflows use a server-owned runtime path".to_owned(),
         ));
     }
-    if let Some(record) = state
-        .ledger
-        .task_by_idempotency(
-            &identity.service,
-            identity.canonical_user_id.as_str(),
-            idempotency_key,
-        )
-        .await
-        .map_err(ApiError::Store)?
-    {
-        return versioned_task_retry_response(&identity, &reference, record);
-    }
-    let workflow = state
+    let workflow = application
         .ledger
         .workflow_revision(&reference.name, reference.version)
         .await
         .map_err(ApiError::Store)?
         .ok_or(ApiError::TaskWorkflowNotFound)?;
-    let envelopes = state
+    let envelopes = application
         .ledger
         .active_provisioned_user_envelopes(&identity.canonical_user_id)
         .await
         .map_err(ApiError::Store)?;
-    let plan = resolve_versioned_task_plan(&identity, workflow, envelopes, &state.config)?;
+    let plan = resolve_versioned_task_plan(&identity, workflow, envelopes, &application.config)?;
     let user_envelope = plan
         .envelope
         .approved_envelope
@@ -1535,7 +1751,7 @@ where
             "Workflow runtime exceeds its pinned User Envelope".to_owned(),
         ));
     }
-    let service_envelope = state
+    let service_envelope = application
         .ledger
         .latest_service_envelope(&identity.service)
         .await
@@ -1544,11 +1760,18 @@ where
     let decision = evaluate_with_grants(&plan.spec, &service_envelope, &[])
         .map_err(|error| ApiError::Admission(format!("{error:?}")))?;
     let workflow_reference = format!("{}@{}", plan.workflow.name, plan.workflow.version);
-    let runtime_name = stable_task_runtime_name(
-        &identity.service,
-        identity.canonical_user_id.as_str(),
-        idempotency_key,
-    );
+    let task_uid = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let runtime_name = stable_task_runtime_name(operation_id);
+    let orchestration = task_orchestration_reservation(
+        task_uid,
+        operation_id,
+        VERSIONED_WORKFLOW_NAMESPACE,
+        &runtime_name,
+        &plan.spec,
+        &service_envelope,
+        Some(&plan.execution_binding),
+    )?;
     let envelope_instance_id = plan
         .envelope
         .envelope_instance_id
@@ -1559,9 +1782,11 @@ where
         .envelope_digest
         .as_deref()
         .ok_or(ApiError::MissingEnvelope)?;
-    let reservation = match state
+    let reservation = application
         .ledger
         .reserve_task(TaskReservationRequest {
+            task_uid,
+            operation_id,
             idempotency_key,
             submitter_service: &identity.service,
             acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
@@ -1579,88 +1804,97 @@ where
             user_envelope_revision: Some(user_envelope.revision),
             user_envelope_digest: Some(envelope_digest),
             coding_agent_runtime: &plan.workflow.agent,
+            runtime_uid: None,
             runtime_namespace: VERSIONED_WORKFLOW_NAMESPACE,
             runtime_name: &runtime_name,
             runtime_ownership: RuntimeOwnership::Provisioned,
             runtime_spec: &plan.spec,
             agent_command: &plan.command,
+            execution_binding: Some(&plan.execution_binding),
             envelope_revision: service_envelope.revision,
+            service_envelope: &service_envelope,
+            service_envelope_digest: &orchestration.service_envelope_digest,
+            candidate_digest: &orchestration.candidate_digest,
+            admission_decision: &decision,
+            inert_manifest_digest: &orchestration.inert_manifest_digest,
+            active_manifest_digest: &orchestration.active_manifest_digest,
         })
+        .await;
+    let deltas = admission_deltas(&decision);
+    application
+        .finish_task_reservation(
+            &identity,
+            Some(&reference),
+            request,
+            idempotency_key,
+            reservation,
+            deltas,
+        )
         .await
-    {
-        Ok(reservation) => reservation,
-        Err(StoreError::TaskIdempotencyConflict) => {
-            let record = state
-                .ledger
-                .task_by_idempotency(
-                    &identity.service,
-                    identity.canonical_user_id.as_str(),
-                    idempotency_key,
-                )
-                .await
-                .map_err(ApiError::Store)?
-                .ok_or(ApiError::Store(StoreError::TaskIdempotencyConflict))?;
-            return versioned_task_retry_response(&identity, &reference, record);
-        }
-        Err(error) => return Err(ApiError::Store(error)),
-    };
-    if !reservation.inserted && reservation.record.runtime_uid.is_some() {
-        return task_response(reservation.record, Vec::new());
-    }
-    if matches!(&decision, AdmissionDecision::Admit) {
-        return task_response(reservation.record, Vec::new());
-    }
-    let (runtime, phase, deltas) = create_task_runtime(
-        &state.runtimes,
-        &state.ledger,
-        &state.decisions,
-        TaskRuntimePlan {
-            namespace: VERSIONED_WORKFLOW_NAMESPACE,
-            name: &runtime_name,
-            service: &identity.service,
-            proposed_spec: &plan.spec,
-            envelope: &service_envelope,
-            decision,
-        },
-    )
-    .await?;
-    let runtime_uid = runtime
-        .metadata
-        .uid
-        .as_deref()
-        .ok_or(ApiError::MissingRuntimeUid)?;
-    let record = state
-        .ledger
-        .bind_task_runtime(reservation.record.task_uid, runtime_uid, phase)
-        .await
-        .map_err(ApiError::Store)?;
-    task_response(record, deltas)
 }
 
-fn versioned_task_retry_response(
+fn validate_task_retry(
     identity: &TaskIdentity,
-    reference: &WorkflowReference,
-    record: TaskRecord,
-) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
+    reference: Option<&WorkflowReference>,
+    request: &TaskSubmissionRequest,
+    expected_runtime_uid: Option<&str>,
+    record: &TaskRecord,
+) -> Result<(), ApiError> {
     let acting_user = identity.acting_user.as_ref().map(|email| email.0.as_str());
     let acting_user_id = identity
         .acting_user
         .as_ref()
         .map(|_| identity.canonical_user_id.as_str());
-    let workflow_reference = format!("{}@{}", reference.name, reference.version);
     if record.identity_binding_state != "bound"
         || record.submitter_service != identity.service
         || record.acting_user.as_deref() != acting_user
         || record.acting_user_id.as_deref() != acting_user_id
         || record.owner != identity.owner.0
         || record.owner_user_id.as_deref() != Some(identity.canonical_user_id.as_str())
-        || record.workflow != workflow_reference
-        || record.workflow_name.as_deref() != Some(reference.name.as_str())
-        || record.workflow_version != Some(reference.version)
     {
         return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
     }
-    task_response(record, Vec::new())
+    match reference {
+        Some(reference) => {
+            let workflow_reference = format!("{}@{}", reference.name, reference.version);
+            if request.agent_runtime_uid.is_some()
+                || record.workflow != workflow_reference
+                || record.workflow_name.as_deref() != Some(reference.name.as_str())
+                || record.workflow_version != Some(reference.version)
+                || record.runtime_ownership != RuntimeOwnership::Provisioned
+            {
+                return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
+            }
+        }
+        None => {
+            let requested_runtime = request.coding_agent_runtime.as_deref().ok_or_else(|| {
+                ApiError::Admission("legacy workflows require codingAgentRuntime".to_owned())
+            })?;
+            let runtime_binding_matches = match request.agent_runtime_uid.as_deref() {
+                Some(runtime_uid) => {
+                    record.runtime_ownership == RuntimeOwnership::Adopted
+                        && expected_runtime_uid == Some(runtime_uid)
+                        && record
+                            .runtime_uid
+                            .as_deref()
+                            .is_none_or(|observed_uid| observed_uid == runtime_uid)
+                }
+                None => {
+                    expected_runtime_uid.is_none()
+                        && record.runtime_ownership == RuntimeOwnership::Provisioned
+                }
+            };
+            if record.workflow != request.workflow
+                || record.workflow_name.is_some()
+                || record.workflow_version.is_some()
+                || record.coding_agent_runtime != requested_runtime
+                || !runtime_binding_matches
+            {
+                return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn resolve_task_identity<I: TaskIdentityResolver>(
@@ -1682,123 +1916,114 @@ async fn resolve_task_identity<I: TaskIdentityResolver>(
         })
 }
 
-struct TaskRuntimePlan<'a> {
-    namespace: &'a str,
-    name: &'a str,
-    service: &'a str,
-    proposed_spec: &'a AgentRuntimeSpec,
-    envelope: &'a Envelope,
-    decision: AdmissionDecision,
+pub(crate) struct TaskOrchestrationReservation {
+    pub(crate) candidate_digest: String,
+    pub(crate) service_envelope_digest: String,
+    pub(crate) inert_manifest_digest: String,
+    pub(crate) active_manifest_digest: String,
 }
 
-async fn create_task_runtime<R, L, D>(
-    runtimes: &R,
-    ledger: &L,
-    decisions: &D,
-    plan: TaskRuntimePlan<'_>,
-) -> Result<(AgentRuntime, TaskPhase, Vec<AdmissionDelta>), ApiError>
-where
-    R: RuntimeRepository,
-    L: AdmissionLedger,
-    D: DecisionChannel,
-{
-    let mut runtime = AgentRuntime::new(plan.name, plan.proposed_spec.clone());
-    runtime.metadata.namespace = Some(plan.namespace.to_owned());
-    runtime.metadata.annotations = Some(BTreeMap::from([(
-        SERVICE_PRINCIPAL_ANNOTATION.to_owned(),
-        plan.service.to_owned(),
-    )]));
-    let AdmissionDecision::Reject { deltas } = plan.decision else {
-        let created = create_or_get_matching_runtime(runtimes, plan.namespace, &runtime).await?;
-        return Ok((created, TaskPhase::Submitted, Vec::new()));
+pub(crate) fn task_orchestration_reservation(
+    task_uid: Uuid,
+    operation_id: Uuid,
+    runtime_namespace: &str,
+    runtime_name: &str,
+    spec: &AgentRuntimeSpec,
+    envelope: &Envelope,
+    execution_binding: Option<&TaskExecutionBinding>,
+) -> Result<TaskOrchestrationReservation, ApiError> {
+    let mut inert = spec.clone();
+    inert.llms.clear();
+    inert.tools.clear();
+    inert.budget.monthly_limit = "0".to_owned();
+    inert.budget.single_run_limit = Some("0".to_owned());
+    inert.budget.currency = envelope.spec.budget.currency.clone();
+    let candidate_digest = format!("sha256:{}", spec_digest(spec)?);
+    let digest = |mode, desired_spec| {
+        serialized_digest(&serde_json::json!({
+            "schemaVersion": "steward-task-runtime-manifest/v1",
+            "taskUid": task_uid,
+            "operationId": operation_id,
+            "runtimeNamespace": runtime_namespace,
+            "runtimeName": runtime_name,
+            "mode": mode,
+            "spec": desired_spec,
+            "executionBinding": execution_binding,
+        }))
     };
-    let proposed_digest = spec_digest(plan.proposed_spec)?;
-    runtime.spec.llms.clear();
-    runtime.spec.tools.clear();
-    runtime.spec.budget.monthly_limit = "0".to_owned();
-    runtime.spec.budget.currency = plan.envelope.spec.budget.currency.clone();
-    runtime.spec.ttl = plan.envelope.spec.ttl.clone();
-    runtime.metadata.annotations.get_or_insert_default().insert(
-        PENDING_APPROVAL_ANNOTATION.to_owned(),
-        proposed_digest.clone(),
-    );
-    let created = create_or_get_matching_runtime(runtimes, plan.namespace, &runtime).await?;
-    let runtime_uid = created
-        .metadata
-        .uid
-        .as_deref()
-        .ok_or(ApiError::MissingRuntimeUid)?;
-    let base_digest = spec_digest(&created.spec)?;
-    let parked = ledger
-        .park_rejection(ParkRejection {
-            runtime_uid,
-            runtime_namespace: plan.namespace,
-            runtime_name: plan.name,
-            spec_digest: &proposed_digest,
-            base_spec_digest: &base_digest,
-            base_pending_approval_digest: Some(&proposed_digest),
-            base_spec: &created.spec,
-            envelope_revision: plan.envelope.revision,
-            deltas: &deltas,
-            proposed_spec: plan.proposed_spec,
-            actor: plan.service,
-            member_role: plan.service,
-        })
-        .await
-        .map_err(ApiError::Store)?;
-    if parked.decision_key.is_none() || parked.evidence_url.is_none() {
-        file_decision_reference(ledger, decisions, parked.approval_id).await?;
-    }
-    Ok((created, TaskPhase::Parked, deltas))
+    Ok(TaskOrchestrationReservation {
+        candidate_digest: candidate_digest.clone(),
+        service_envelope_digest: serialized_digest(envelope)?,
+        inert_manifest_digest: digest("inert", &inert)?,
+        active_manifest_digest: digest("active", spec)?,
+    })
 }
 
-async fn create_or_get_matching_runtime<R: RuntimeRepository>(
-    runtimes: &R,
-    namespace: &str,
-    runtime: &AgentRuntime,
-) -> Result<AgentRuntime, ApiError> {
-    match runtimes.create_as_authority(namespace, runtime).await {
-        Ok(created) => Ok(created),
-        Err(RuntimeCreateError::Kubernetes { status: 409, .. }) => {
-            let existing = runtimes
-                .get(
-                    namespace,
-                    &runtime.metadata.name.clone().unwrap_or_default(),
-                )
-                .await
-                .map_err(ApiError::Runtime)?;
-            if existing.spec != runtime.spec || existing.annotations() != runtime.annotations() {
-                return Err(ApiError::Conflict(
-                    "task runtime name is bound to unrelated desired state".to_owned(),
-                ));
-            }
-            Ok(existing)
-        }
-        Err(error) => Err(ApiError::RuntimeCreate(error)),
-    }
+fn serialized_digest<T: Serialize>(value: &T) -> Result<String, ApiError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| {
+        ApiError::TaskRuntimeContractUnavailable(
+            "durable Task orchestration input cannot be serialized".to_owned(),
+        )
+    })?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
-fn task_response(
+async fn task_response<L: TaskSubmissionLedger>(
+    ledger: &L,
     record: TaskRecord,
     deltas: Vec<AdmissionDelta>,
 ) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
     let status = if record.runtime_uid.is_none() || record.phase == TaskPhase::Parked {
         StatusCode::ACCEPTED
-    } else if record.finalized {
+    } else if record.finalized && record.workflow_name.is_some() {
         StatusCode::OK
     } else {
         StatusCode::CREATED
     };
-    Ok((status, status_response(record, deltas)?))
+    Ok((status, status_response(ledger, record, deltas).await?))
 }
 
-fn status_response(
+fn admission_deltas(decision: &AdmissionDecision) -> Vec<AdmissionDelta> {
+    match decision {
+        AdmissionDecision::Admit => Vec::new(),
+        AdmissionDecision::Reject { deltas } => deltas.clone(),
+    }
+}
+
+async fn status_response<L: TaskSubmissionLedger>(
+    ledger: &L,
     record: TaskRecord,
     deltas: Vec<AdmissionDelta>,
 ) -> Result<TaskStatusResponse, ApiError> {
+    // The frozen legacy caller requires an adopted target UID in every response.
+    // This is a read-only projection of server-validated immutable intent, not
+    // evidence of controller binding. M1 and durable runtime_uid stay unchanged.
+    let runtime_uid = if record.runtime_uid.is_none()
+        && record.runtime_ownership == RuntimeOwnership::Adopted
+        && record.workflow_name.is_none()
+    {
+        let operation = ledger
+            .task_runtime_operation(record.task_uid)
+            .await
+            .map_err(ApiError::Store)?
+            .filter(|operation| {
+                operation.task_uid == record.task_uid
+                    && Some(operation.operation_id) == record.orchestration_operation_id
+                    && operation.runtime_ownership == TaskRuntimeOwnership::Adopted
+            })
+            .ok_or(ApiError::Store(StoreError::InvalidTaskTransition))?;
+        Some(
+            operation
+                .expected_runtime_uid
+                .filter(|uid| !uid.is_empty())
+                .ok_or(ApiError::Store(StoreError::InvalidTaskTransition))?,
+        )
+    } else {
+        record.runtime_uid
+    };
     Ok(TaskStatusResponse {
         task_uid: record.task_uid,
-        runtime_uid: record.runtime_uid,
+        runtime_uid,
         phase: record.phase,
         runtime_ownership: record.runtime_ownership,
         finalized: record.finalized,
@@ -1807,34 +2032,106 @@ fn status_response(
     })
 }
 
-fn stable_task_runtime_name(
-    service: &str,
-    canonical_owner_user_id: &str,
-    idempotency_key: &str,
-) -> String {
-    let digest = Sha256::digest(
-        format!("{service}\0{canonical_owner_user_id}\0{idempotency_key}").as_bytes(),
-    );
-    let suffix = digest[..10]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("task-{suffix}")
+fn stable_task_runtime_name(operation_id: Uuid) -> String {
+    format!("task-{}", operation_id.simple())
 }
 
 #[cfg(test)]
 mod workflow_request_tests {
+    use std::sync::Arc;
+
     use super::{
         StaticTaskWorkflowCatalog, TaskApiConfig, TaskWorkflowCatalog, resolve_versioned_task_plan,
-        versioned_workflow_reference,
+        stable_task_runtime_name, task_orchestration_reservation, versioned_workflow_reference,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{Envelope, EnvelopeSpec};
+    use steward_ports::{
+        PortError, TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest,
+    };
     use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, WorkflowRevisionRecord};
     use steward_types::{
         Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
     };
     use uuid::Uuid;
+
+    struct ExampleExecutionAdapter;
+
+    impl TaskExecutionAdapter for ExampleExecutionAdapter {
+        fn contract(&self) -> &'static str {
+            "example-v1"
+        }
+
+        fn render(
+            &self,
+            request: TaskExecutionPlanRequest<'_>,
+        ) -> Result<TaskExecutionPlan, PortError> {
+            let mut command = vec![
+                "example-runner".to_owned(),
+                "--prompt".to_owned(),
+                request.workflow_prompt.to_owned(),
+                "--model".to_owned(),
+                format!("{}/{}", request.model.provider, request.model.model),
+                "--executable".to_owned(),
+                request.binding.executable.clone(),
+                "--expected-version".to_owned(),
+                request.binding.version_probe.expected_stdout.clone(),
+            ];
+            command.extend(request.binding.version_probe.arguments.iter().cloned());
+            if let Some(endpoint) = request.tool_transport_endpoint {
+                command.push("--tool-transport".to_owned());
+                command.push(endpoint.to_owned());
+            }
+            Ok(TaskExecutionPlan { command })
+        }
+    }
+
+    fn execution_catalog(agent_ref: &str, image_byte: char) -> Result<String, String> {
+        let image = format!(
+            "registry.example.test/steward/agent@sha256:{}",
+            image_byte.to_string().repeat(64)
+        );
+        let executable = "/opt/steward/agent";
+        let expected_version = format!(
+            "example-agent {}",
+            agent_ref
+                .rsplit_once('@')
+                .map_or("", |(_, version)| version)
+        );
+        serde_json::to_string(&serde_json::json!({
+            "apiVersion": "steward.execution-bindings/v1",
+            "bindings": [{
+                "agentRef": agent_ref,
+                "displayName": format!("Agent {agent_ref}"),
+                "adapter": "example-v1",
+                "image": image,
+                "executable": executable,
+                "versionProbe": {
+                    "arguments": ["--version"],
+                    "expectedStdout": expected_version
+                },
+                "providerProfiles": {
+                    "tools": {
+                        "id": "example-tools-profile-v7",
+                        "digest": format!("sha256:{}", "c".repeat(64))
+                    },
+                    "inference": {
+                        "id": "example-inference-profile-v7",
+                        "digest": format!("sha256:{}", "d".repeat(64))
+                    }
+                }
+            }]
+        }))
+        .map_err(|error| error.to_string())
+    }
+
+    fn task_config(endpoint: Option<&str>) -> Result<TaskApiConfig, String> {
+        let workflow = workflow();
+        TaskApiConfig::new(endpoint.map(str::to_owned))?
+            .with_execution_adapter(Arc::new(ExampleExecutionAdapter))?
+            .with_execution_bindings_json(Some(&execution_catalog(&workflow.agent, 'a')?))?
+            .with_execution_bindings_active(true)
+    }
 
     #[test]
     fn versioned_workflow_rejects_caller_selected_coding_runtime() {
@@ -1842,6 +2139,79 @@ mod workflow_request_tests {
             versioned_workflow_reference("repository-review@1", Some("base")).is_err(),
             "versioned Workflow requests must not let the caller select the coding runtime"
         );
+    }
+
+    #[test]
+    fn task_orchestration_candidate_digest_is_a_valid_sha256_reference() -> Result<(), String> {
+        let identity = identity("usr_0123456789abcdef0123456789abcdef")?;
+        let plan = resolve_versioned_task_plan(
+            &identity,
+            workflow(),
+            vec![provisioned_envelope(identity.canonical_user_id.as_str())?],
+            &task_config(Some("https://mcp-gw.example.test/mcp"))?,
+        )
+        .map_err(|error| format!("resolve Task plan: {error:?}"))?;
+        let envelope = plan
+            .envelope
+            .approved_envelope
+            .as_ref()
+            .ok_or_else(|| "resolved Task plan omitted its approved Envelope".to_owned())?;
+        let operation_id = Uuid::new_v4();
+        let runtime_name = stable_task_runtime_name(operation_id);
+        let reservation = task_orchestration_reservation(
+            Uuid::new_v4(),
+            operation_id,
+            "steward-workflows",
+            &runtime_name,
+            &plan.spec,
+            envelope,
+            Some(&plan.execution_binding),
+        )
+        .map_err(|error| format!("derive Task orchestration intent: {error:?}"))?;
+
+        assert!(
+            reservation.candidate_digest.starts_with("sha256:")
+                && reservation.candidate_digest.len() == 71,
+            "the persisted candidate digest must use the sha256:<64 lowercase hex> contract"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staged_execution_catalog_is_validated_but_not_advertised_or_selected() -> Result<(), String>
+    {
+        let workflow = workflow();
+        let config = TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
+            .with_execution_adapter(Arc::new(ExampleExecutionAdapter))?
+            .with_execution_bindings_json(Some(&execution_catalog(&workflow.agent, 'a')?))?;
+        assert!(config.execution_binding_refs().is_empty());
+        assert!(config.execution_binding_advertisements().is_empty());
+        assert!(
+            resolve_versioned_task_plan(
+                &identity("usr_0123456789abcdef0123456789abcdef")?,
+                workflow,
+                vec![provisioned_envelope(
+                    "usr_0123456789abcdef0123456789abcdef",
+                )?],
+                &config,
+            )
+            .is_err(),
+            "the first rollout stage must not let a new apiserver feed bindings to an old controller"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_execution_catalog_rejects_an_unregistered_adapter() -> Result<(), String> {
+        let workflow = workflow();
+        let result = TaskApiConfig::new(None)?
+            .with_execution_bindings_json(Some(&execution_catalog(&workflow.agent, 'a')?))?
+            .with_execution_bindings_active(true);
+        assert!(
+            result.is_err(),
+            "an active catalog must fail startup when no implementation owns its adapter contract"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1869,7 +2239,7 @@ mod workflow_request_tests {
     }
 
     #[test]
-    fn task_mcp_gateway_endpoint_rejects_ambiguous_or_credentialed_urls() -> Result<(), String> {
+    fn task_tool_transport_endpoint_rejects_ambiguous_or_credentialed_urls() -> Result<(), String> {
         for endpoint in [
             " https://mcp-gw.example.test/mcp",
             "https://mcp-gw.example.test/m\tcp",
@@ -1882,13 +2252,13 @@ mod workflow_request_tests {
         ] {
             assert!(
                 TaskApiConfig::new(Some(endpoint.to_owned())).is_err(),
-                "invalid task MCP-GW endpoint {endpoint:?} must fail configuration"
+                "invalid task tool transport endpoint {endpoint:?} must fail configuration"
             );
         }
 
         let normalized = TaskApiConfig::new(Some("HTTPS://MCP-GW.EXAMPLE.TEST/mcp".to_owned()))?;
         assert_eq!(
-            normalized.mcp_gateway_endpoint.as_deref(),
+            normalized.tool_transport_endpoint.as_deref(),
             Some("https://mcp-gw.example.test/mcp"),
             "the rendered contract must use the URL parser's normalized representation"
         );
@@ -1909,7 +2279,7 @@ mod workflow_request_tests {
             name: "repository-review".to_owned(),
             version: 1,
             display_name: "Repository review".to_owned(),
-            agent: "codex@0.117.0".to_owned(),
+            agent: "example-agent@1.0.0".to_owned(),
             prompt: "Review the repository state.".to_owned(),
             content_digest: "workflow-digest".to_owned(),
             published_by: "usr_abcdef0123456789abcdef0123456789".to_owned(),
@@ -2011,12 +2381,12 @@ mod workflow_request_tests {
             vec![provisioned_envelope(
                 "usr_0123456789abcdef0123456789abcdef",
             )?],
-            &TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?,
+            &task_config(Some("https://mcp-gw.example.test/mcp"))?,
         )
         .map_err(|error| format!("one exact owned provisioned Envelope was rejected: {error:?}"))?;
         assert_eq!(plan.workflow.name, "repository-review");
         assert_eq!(plan.workflow.version, 1);
-        assert_eq!(plan.spec.agent_type.name, "codex@0.117.0");
+        assert_eq!(plan.spec.agent_type.name, "example-agent@1.0.0");
         assert_eq!(plan.spec.llms[0].model, "gpt-5.4");
         assert_eq!(plan.spec.tools[0].provider, "github");
         assert_eq!(plan.spec.budget.monthly_limit, "10.00");
@@ -2028,58 +2398,25 @@ mod workflow_request_tests {
             Some("env_instance_01")
         );
         assert_eq!(
-            plan.command.get(4).map(String::as_str),
+            plan.command.get(2).map(String::as_str),
             Some("Review the repository state."),
             "the immutable Workflow prompt must be a separate argument to the server-owned command"
         );
         assert!(
             plan.command
                 .iter()
-                .any(|argument| argument.contains("codex-cli 0.117.0")),
-            "the server-owned command must fail closed unless the sandbox exposes the exact approved Codex version"
-        );
-        let shell_command = &plan.command[2];
-        let codex_config = &plan.command[6];
-        assert!(
-            shell_command.contains("OPENAI_API_KEY=openshell-token-grant-placeholder"),
-            "Codex must present a non-secret placeholder for OpenShell's runtime token grant"
-        );
-        assert!(
-            codex_config.contains("litellm-litellm.litellm.svc.cluster.local:4000/v1"),
-            "Codex must send inference to the OpenShell-governed LiteLLM endpoint"
-        );
-        assert!(
-            codex_config.contains("[mcp_servers.steward]")
-                && codex_config.contains("https://mcp-gw.example.test/mcp")
-                && codex_config.contains("bearer_token_env_var = \"STEWARD_MCP_GW_BEARER_TOKEN\""),
-            "tool-bearing Codex plans must configure the server-selected streamable HTTP MCP-GW endpoint"
-        );
-        assert!(
-            shell_command
-                .contains("STEWARD_MCP_GW_BEARER_TOKEN=openshell-token-grant-placeholder",),
-            "Codex must present only OpenShell's non-secret provider placeholder to MCP-GW"
-        );
-        assert!(
-            shell_command.contains("--model \"$2\""),
-            "Codex must use the model selected by the approved envelope"
-        );
-        assert!(
-            shell_command.contains("ln -s \"$STEWARD_OUTPUT_DIR/out\" out"),
-            "the declared out binding must resolve to Steward's collected output root"
-        );
-        assert!(
-            !shell_command.contains("$STEWARD_OUTPUT_DIR/out/result.txt"),
-            "Steward must not overwrite a Workflow-owned declared output with Codex metadata"
-        );
-        assert!(
-            shell_command.contains("--ephemeral")
-                && shell_command.contains("--sandbox danger-full-access"),
-            "Codex must leave persistence and sandboxing to the disposable OpenShell runtime"
+                .any(|argument| argument.contains("example-agent 1.0.0")),
+            "the server-owned command must fail closed unless the sandbox exposes the exact configured version"
         );
         assert_eq!(
-            plan.command.get(5).map(String::as_str),
+            plan.command.get(4).map(String::as_str),
             Some("openai/gpt-5.4"),
             "the approved provider and model must be passed as an opaque shell argument"
+        );
+        assert_eq!(
+            plan.command.last().map(String::as_str),
+            Some("https://mcp-gw.example.test/mcp"),
+            "the registered adapter must receive the validated server-owned tool endpoint"
         );
         assert!(
             plan.command
@@ -2091,7 +2428,56 @@ mod workflow_request_tests {
     }
 
     #[test]
-    fn tool_less_versioned_task_plan_contains_no_mcp_server() -> Result<(), String> {
+    fn versioned_task_persists_the_exact_deployment_binding_before_reservation()
+    -> Result<(), String> {
+        let mut selected_workflow = workflow();
+        selected_workflow.agent = "example-agent@2.0.0".to_owned();
+        let catalog = execution_catalog(&selected_workflow.agent, 'b')?;
+        let config = TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
+            .with_execution_adapter(Arc::new(ExampleExecutionAdapter))?
+            .with_execution_bindings_json(Some(&catalog))?
+            .with_execution_bindings_active(true)?;
+        let plan = resolve_versioned_task_plan(
+            &identity("usr_0123456789abcdef0123456789abcdef")?,
+            selected_workflow,
+            vec![provisioned_envelope(
+                "usr_0123456789abcdef0123456789abcdef",
+            )?],
+            &config,
+        )
+        .map_err(|error| format!("approved exact binding was rejected: {error:?}"))?;
+
+        let binding = plan
+            .execution_binding
+            .disposable()
+            .ok_or_else(|| "resolved Task did not retain its deployment binding".to_owned())?;
+        assert_eq!(binding.agent_ref, "example-agent@2.0.0");
+        assert_eq!(plan.command.get(6), Some(&binding.executable));
+        assert_eq!(
+            plan.command.get(8),
+            Some(&binding.version_probe.expected_stdout)
+        );
+        assert_eq!(plan.command.get(9).map(String::as_str), Some("--version"));
+        assert_eq!(config.execution_binding_refs(), ["example-agent@2.0.0"]);
+
+        let mut unavailable = workflow();
+        unavailable.agent = "example-agent@3.0.0".to_owned();
+        assert!(matches!(
+            resolve_versioned_task_plan(
+                &identity("usr_0123456789abcdef0123456789abcdef")?,
+                unavailable,
+                vec![provisioned_envelope(
+                    "usr_0123456789abcdef0123456789abcdef",
+                )?],
+                &config,
+            ),
+            Err(ApiError::TaskRuntimeContractUnavailable(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn tool_less_versioned_task_plan_contains_no_tool_transport() -> Result<(), String> {
         let mut envelope = provisioned_envelope("usr_0123456789abcdef0123456789abcdef")?;
         envelope.requested_envelope.spec.tools.clear();
         envelope
@@ -2105,34 +2491,84 @@ mod workflow_request_tests {
             &identity("usr_0123456789abcdef0123456789abcdef")?,
             workflow(),
             vec![envelope],
-            &TaskApiConfig::default(),
+            &task_config(None)?,
         )
         .map_err(|error| format!("tool-less versioned Task was rejected: {error:?}"))?;
-        let shell_command = &plan.command[2];
-        let codex_config = &plan.command[6];
         assert!(
-            !codex_config.contains("[mcp_servers.")
-                && !codex_config.contains("STEWARD_MCP_GW_BEARER_TOKEN")
-                && !shell_command.contains("STEWARD_MCP_GW_BEARER_TOKEN"),
-            "unused Envelope capacity must not add an MCP server or bearer placeholder"
+            !plan
+                .command
+                .iter()
+                .any(|argument| argument == "--tool-transport"),
+            "unused Envelope capacity must not add a tool transport"
         );
         Ok(())
     }
 
     #[test]
-    fn tool_bearing_versioned_task_fails_without_mcp_gateway_contract() -> Result<(), String> {
+    fn tool_bearing_versioned_task_fails_without_tool_transport_contract() -> Result<(), String> {
         let result = resolve_versioned_task_plan(
             &identity("usr_0123456789abcdef0123456789abcdef")?,
             workflow(),
             vec![provisioned_envelope(
                 "usr_0123456789abcdef0123456789abcdef",
             )?],
-            &TaskApiConfig::default(),
+            &task_config(None)?,
         );
         assert!(
             matches!(result, Err(ApiError::TaskRuntimeContractUnavailable(_))),
-            "tool-bearing Codex plans must fail before execution when MCP-GW is unavailable"
+            "tool-bearing plans must fail before execution when the tool transport is unavailable"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_execution_catalog_fails_before_versioned_task_reservation() -> Result<(), String> {
+        let result = resolve_versioned_task_plan(
+            &identity("usr_0123456789abcdef0123456789abcdef")?,
+            workflow(),
+            vec![provisioned_envelope(
+                "usr_0123456789abcdef0123456789abcdef",
+            )?],
+            &TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?,
+        );
+        assert!(matches!(
+            result,
+            Err(ApiError::TaskRuntimeContractUnavailable(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_required_provider_profiles_fail_before_versioned_task_reservation()
+    -> Result<(), String> {
+        for profile in ["tools", "inference"] {
+            let mut catalog = serde_json::from_str::<serde_json::Value>(&execution_catalog(
+                &workflow().agent,
+                'a',
+            )?)
+            .map_err(|error| error.to_string())?;
+            catalog
+                .pointer_mut("/bindings/0/providerProfiles")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| "fixture provider profiles are missing".to_owned())?
+                .remove(profile);
+            let config = TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
+                .with_execution_adapter(Arc::new(ExampleExecutionAdapter))?
+                .with_execution_bindings_json(Some(&catalog.to_string()))?
+                .with_execution_bindings_active(true)?;
+            let result = resolve_versioned_task_plan(
+                &identity("usr_0123456789abcdef0123456789abcdef")?,
+                workflow(),
+                vec![provisioned_envelope(
+                    "usr_0123456789abcdef0123456789abcdef",
+                )?],
+                &config,
+            );
+            assert!(
+                matches!(result, Err(ApiError::TaskRuntimeContractUnavailable(_))),
+                "missing {profile} profile must fail before Task reservation"
+            );
+        }
         Ok(())
     }
 }

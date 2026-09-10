@@ -492,6 +492,19 @@ spec:
               value: system:serviceaccount:steward-system:steward-poc-api
             - name: STEWARD_DATABASE_URL
               value: postgres://steward@postgres.steward-system.svc.cluster.local:5432/steward
+            - name: STEWARD_TASK_ORCHESTRATION_MODE
+              value: STEWARD_TASK_ORCHESTRATION_MODE_VALUE
+            - name: STEWARD_JIRA_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: steward-s2-secrets
+                  key: jira-token
+            - name: STEWARD_JIRA_BASE_URL
+              value: http://steward-task-server.steward-system.svc.cluster.local:8083
+            - name: STEWARD_JIRA_PROJECT_KEY
+              value: PROJ
+            - name: STEWARD_JIRA_ACCOUNT_EMAIL
+              value: jira-bot@example.com
             - name: STEWARD_LITELLM_MASTER_KEY
               valueFrom:
                 secretKeyRef:

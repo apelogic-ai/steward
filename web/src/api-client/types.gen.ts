@@ -342,6 +342,11 @@ export type EnvelopeTemplatesResponse = {
     templates: Array<AvailableEnvelopeTemplate>;
 };
 
+export type ExecutionBindingAdvertisement = {
+    agentRef: string;
+    displayName?: string | null;
+};
+
 export type GeneratedGithubActionsWorkflow = {
     contentType: string;
     schemaVersion: string;
@@ -540,6 +545,10 @@ export type UserEnvelopeRequest = {
 };
 
 export type WorkflowListResponse = {
+    /**
+     * Exact logical agent references from the deployment-owned execution catalog.
+     */
+    agents: Array<ExecutionBindingAdvertisement>;
     apiVersion: string;
     workflows: Array<WorkflowRevisionView>;
 };
@@ -1810,11 +1819,15 @@ export type TaskSubmissionContractError = TaskSubmissionContractErrors[keyof Tas
 
 export type TaskSubmissionContractResponses = {
     /**
-     * Task adopts an already-bound runtime
+     * An exact versioned-Workflow retry returns the existing Task under the frozen M1 contract; the request performs no runtime lifecycle effect
+     */
+    200: TaskStatusResponse;
+    /**
+     * An exact legacy retry returns an existing Task whose runtime binding has already been observed by the controller; the request performs no runtime lifecycle effect
      */
     201: TaskStatusResponse;
     /**
-     * Task is accepted for controller-owned runtime creation or parked on a governed approval hold; runtimeUid is null until the controller binds the exact runtime UID
+     * A new Task is accepted for controller-owned runtime creation, exact legacy adopted-runtime observation, or a governed approval hold. Legacy adoption projects the immutable server-validated target runtimeUid for caller compatibility, not binding or readiness evidence; otherwise runtimeUid is null until controller binding
      */
     202: TaskStatusResponse;
 };
