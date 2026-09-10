@@ -1,111 +1,89 @@
-# P0 agentic-ops demo: GitOps handoff
+# DP-O01: GitOps and Steward UI demo activation
 
-Status: compatibility-path preparation recorded; source repin, live publication, and
-rehearsal remain unverified.
-This is a deployment/readiness handoff, not permission for development workers to
-operate or test the GitOps-managed local-main cluster.
+Priority: P0 integration
 
-## Reviewed source and caller
+Status: preparation may start; final activation waits for reviewed component releases
 
-| Item | Prepared value |
-| --- | --- |
-| Repository | apelogic-ai/agentic-ops, private |
-| Repository / owner IDs | 1362055860 / 227278099 |
-| Current reviewed default main | 73306cefb4fe12995fcbda29f8e35f1da5bec129 |
-| Caller | .github/workflows/steward-task.yml, main, workflow_dispatch only |
-| Reusable steward-run workflow | a86a227f0f731a8a96628d4628f03b4482ad612b |
-| Nested steward-run action | 0707623836cd4cdf063938e1e049c694397bc31c |
-| Legacy coordinate to publish/read back | agentic-release-integration-review@2 |
-| Agent binding | codex@0.140.0 |
-| Expected content digest | sha256:e06139e2a0b34796574a58b545da8a286952601b015b9f212fc632b256dd53a1 |
-| Package byte digest | sha256:c6879c59c66a1a1ceac64c825fb953ac60c2897f33f6dc187d1fb20e1a49cce4 |
-| Dedicated runner label | steward-agentic-ops-main |
+## Goal
 
-The repository's immutable OIDC subject setting is enabled. Its non-secret runner,
-Steward URL, Identity URL/audience, and host CA-reference variables are configured;
-the host operator must verify them against the actual prepared demo environment.
-No runner was registered or started by this workstream.
+Prepare and activate the retained local-main demonstration without using that
+environment for product development or destructive testing. GitOps owns the cluster,
+its state, and all deployment changes.
 
-[GitOps #164](https://github.com/apelogic-ai/gitops/pull/164) merged the separately
-authorized enforcement-only change. [GitOps #165](https://github.com/apelogic-ai/gitops/pull/165)
-also merged, adding only the exact task caller and the local-v5 Identity rollout
-revision. GitOps-owned rollout/readiness remains distinct from merge. No bootstrap,
-actor, Envelope, existing caller, or branch-protection changes were included.
+## Inputs expected from implementation tickets
 
-## GitOps and operator preparation
+- immutable Steward release containing DP-G01 and DP-S01;
+- immutable Identity release containing DP-I01;
+- immutable `steward-run` reusable-workflow pin containing DP-R01;
+- exact `agentic-ops` package commit from DP-A01;
+- exact GitHub App configuration and admitted repository IDs;
+- package and invocation schemas from DP-C01; and
+- the P0 verifier and evidence checklist from DP-P00.
 
-1. Select and record the compatible approved component revisions and image/chart
-   digests. PR #78 merged as `c87bece81f2324d83c1177a10be56ae8ceb7111a`,
-   but merge is not a release or rollout. GitOps owns cluster recovery, deployment,
-   and readiness.
-2. Roll out the merged exact Identity mapping through the supported GitOps lifecycle.
-   No development tests or ad hoc changes use local-main. Stable promotion requires
-   its own approved release and handoff.
-3. The host operator prepares a dedicated runner with an appropriate service identity,
-   protected files, no ambient infrastructure credentials, and serialized access to
-   the demo host. The earlier offline-tested hook pinned obsolete source `268fb6f` and
-   must not be installed unchanged. Review and regenerate it for the exact source above;
-   a hook is not filesystem isolation or a cross-runner concurrency lock.
-   Do not add runner management to the GitOps local lifecycle scripts.
-4. Verify the canonical user, approved provisioned Envelope, real model, native
-   ARM64 execution binding, and usable private GitHub connection. The requested task
-   needs get_file_contents:read. Existing user connections are not disposable Task
-   resources and must not be revoked as Task cleanup.
-5. For this compatibility-path demo, an authorized publisher uses the package's
-   validated legacy publication request. Read back agent, prompt, coordinate/version,
-   and digest. Version 2 is not known to be published by this workstream; if it already
-   exists with different content, stop
-   and prepare a new immutable version rather than overwrite it.
+## Work that may start early
 
-## Agreed rehearsal window
+- prepare the neutral `apelogic-ai/gitops` caller workflow and checked-in invocation
+  manifest with placeholders for reviewed immutable pins;
+- prepare strict workflow-dispatch validation for
+  `https://github.com/apelogic-ai/gitops/actions/runs/<numeric-run-id>`;
+- prepare `in/request.json` and declared output handling;
+- inventory the existing read-only GitHub App installation and required repository
+  access;
+- identify an existing suitable Envelope or document the UI steps to create one;
+- prepare preflight checks, evidence capture, rollback, and state-preserving restart
+  procedures; and
+- prepare source authorization and GitHub connection prerequisites.
 
-Run two ordinary GHA dispatches against unchanged reviewed pins only after GitOps
-confirms readiness and agrees the window. The release scenario is synthetic; model
-inference, governed source access, runtime execution, and cleanup must be real.
+These preparations must not deploy unreleased product revisions to local-main or use
+the retained cluster to diagnose product implementation defects.
 
-For each run, capture the exact source commit, GHA run/attempt, Task/runtime UID,
-useful summary, terminal state, finalization, and sanitized independent evidence:
+## Final activation
 
-- The hosted verifier checks an unpredictable marker read from the private README
-  at the source commit. Keep the expected marker outside the Task's prompt, inputs,
-  uploaded files, environment, checkout, and earlier context. Verify the sandbox has
-  no alternate source-access credential or path. This proves source retrieval under
-  those conditions, not a signed MCP call or a future catalog witness.
-- Corroborate tool execution with the native MCP completed event in the exact
-  UID-bound execution stream. Verify the deployed Codex version's event semantics
-  before interpreting it; rendered text alone has no authenticated request identity or
-  argument binding. Do not manufacture request IDs or substitute an agent-authored
-  VERIFIED line.
-- GitOps chooses a safe, deployed-version-compatible collector for successful real
-  inference records correlated to the runtime key. Aggregate spend alone is not
-  request-level evidence. Do not export raw key objects, provider bodies, or logs.
-- Confirm exact disposable runtime/sandbox/Secret absence and runtime model-key
-  cleanup. These resources may occupy different namespaces. Shared provider
-  definitions and pre-existing user OAuth connections need not disappear. Record
-  any authority-revocation property that lacks a direct observation as unverified.
+After all reviewed releases and exact source commits exist, GitOps:
 
-Full task-I/O logs can contain sensitive material; GitOps must project only the
-necessary non-secret evidence before saving or sharing it. Missing evidence is a
-recorded gap, not a passing assertion. Formal Ticket B request-level conformance is
-not replaced by this narrower attended demonstration.
+1. updates deployment and reusable-workflow pins through its normal PR process;
+2. installs or confirms the read-only GitHub App on the admitted caller and source
+   repositories;
+3. configures stable external repository identities and the cross-repository source
+   binding;
+4. creates or selects the bounded Envelope in Steward UI and approves it;
+5. records the UI-approved `steward:sha256` digest in the invocation manifest;
+6. confirms the demo user has an active GitHub connection through MCP-GW;
+7. reconciles or restarts local-main using only state-preserving GitOps procedures;
+8. runs preflight without resetting data;
+9. dispatches the end-to-end demo workflow; and
+10. retains the required Task, runtime, transcript, provider-call, output, and cleanup
+    evidence.
 
-Keep an owner, purpose, retention deadline, and exact scoped cleanup action for
-every retained demo service, runner, credential, and connection. Do not remove
-unrelated state. A later main commit requires source review, deliberate hook repin,
-and a new unchanged-pin rehearsal pair.
+## Required configuration
 
-## Development work remains separate
+- Identity accepts only the pinned reusable workflow and preserves verified source
+  provenance through TokenReview.
+- Steward trusts only configured Identity issuers and source repository bindings.
+- The GitHub source adapter can mint short-lived installation tokens with metadata
+  and contents read access only.
+- The caller's active Envelope digest matches the invocation manifest.
+- The Envelope permits the selected model and the exact read-only GitHub MCP tools
+  required by the release-summary prompt.
+- OpenShell attaches only desired providers.
+- LiteLLM and MCP-GW are healthy and reachable through the governed runtime path.
+- Successful-run diagnostic replay is enabled only by the reviewed manifest.
 
-- The P0 package has 19 passing local tests and successful source-validation CI;
-  this is not a successful governed Task receipt.
-- [Agentic-ops #1](https://github.com/apelogic-ai/agentic-ops/pull/1) merged optional
-  offline publication/provenance tooling; it is not a live publisher. Hold unrelated main
-  changes during the chosen demo rehearsal pair.
-- Ticket B's checker is checkpointed locally. Its full gate failed in an isolated,
-  run-owned G-1 setup on SPIRE/etcd timeouts before the security assertion; cleanup
-  was verified. The remaining pinned tests and live conformance are not passing claims.
+## Verification
 
-See the [P0 ticket](agentic-ops-local-demo-ticket.md) for the compatibility-demo
-outcome. The proposed [direct-package architecture](direct-package-task-invocation.md)
-removes mandatory publication from a future caller, but it is not implemented by this
-handoff.
+- prove exact manifest capture from the verified triggered commit;
+- prove cross-repository package retrieval at the declared exact commit;
+- prove the recorded closure digest is stable on retry;
+- prove Task evidence records external repository identities and exact commits;
+- prove a real GitHub MCP call succeeds as the resolved user;
+- prove the generated release-summary output is returned to GHA;
+- prove stdout and stderr are replayed under labelled GHA groups with the sensitive
+  output warning; and
+- prove finalization and cleanup complete while retained cluster state remains intact.
+
+## Safety boundary
+
+The local-main cluster is unavailable for implementation testing. Product teams use
+their own explicit disposable environments. GitOps alone performs final activation,
+preflight, and the demo run. No reset, broad prune, database deletion, namespace
+replacement, or unowned-resource deletion is part of this ticket.

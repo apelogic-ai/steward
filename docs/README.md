@@ -64,6 +64,7 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | Document | Status | Purpose |
 |---|---|---|
 | [`task-runtime-orchestration.md`](task-runtime-orchestration.md) | **Accepted implementation architecture** | Durable single-owner Task application across Postgres, Kubernetes, approval, execution, and cleanup boundaries. |
+| [`v2/direct-package-task-invocation.md`](v2/direct-package-task-invocation.md) | **Accepted implementation architecture** | Direct invocation of exact Git packages through GHA, administrator-approved Envelope authority, and the common Task service. |
 
 ### Accepted post-M1 direction
 
@@ -72,12 +73,6 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | [`v2/README.md`](v2/README.md) | **Accepted post-M1 semantics** | Canonical terminology, execution model, lifecycle, and ownership boundaries. |
 | [`v2/deferred-implementation-contracts.md`](v2/deferred-implementation-contracts.md) | **Deferred contract** | The one current register of unresolved post-M1 wire and implementation contracts. |
 | [`v2/documentation-reconciliation-ticket.md`](v2/documentation-reconciliation-ticket.md) | **Accepted post-M1 semantics (decision record)** | Requirements and rationale that established this documentation baseline. |
-
-### Proposals awaiting decision
-
-| Document | Status | Purpose |
-|---|---|---|
-| [`v2/direct-package-task-invocation.md`](v2/direct-package-task-invocation.md) | **Proposal** | Direct invocation of an immutable same-repository package through GHA without mandatory catalog publication, plus its implementation split. |
 
 ### Historical design and planning
 
