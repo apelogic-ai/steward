@@ -29,6 +29,7 @@ publication, release tags, multiple workflows, or stable-lane breadth.
 
 Implementation ownership is split into independently reviewable tickets:
 
+- [live delivery status and immutable handoffs](direct-package-delivery-status.md);
 - [DP-C01: direct-package contracts](direct-package-contract-ticket.md);
 - [DP-I01: verified source provenance](identity-source-provenance-ticket.md);
 - [DP-G01: Git source port and GitHub adapter](github-source-adapter-ticket.md);
