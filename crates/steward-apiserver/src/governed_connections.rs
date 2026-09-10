@@ -562,6 +562,16 @@ impl ConnectionOperationReconciler {
                     .expire_connection_oauth_flow(operation.operation_id)
                     .await?;
             }
+            if let Some(category) = finalized_nonterminal_failure(
+                operation.finalized,
+                operation.operation_state,
+                operation.task_phase,
+            ) {
+                self.store
+                    .fail_connection_operation(operation.operation_id, category)
+                    .await?;
+                continue;
+            }
             if operation.finalized {
                 self.store
                     .reconcile_connection_cleanup_state(operation.operation_id, true)
@@ -646,6 +656,65 @@ impl ConnectionOperationReconciler {
             }
         }
         Ok(())
+    }
+}
+
+fn finalized_nonterminal_failure(
+    finalized: bool,
+    operation_state: ConnectionOperationState,
+    task_phase: steward_types::TaskPhase,
+) -> Option<&'static str> {
+    if !finalized
+        || matches!(
+            operation_state,
+            ConnectionOperationState::Succeeded | ConnectionOperationState::Failed
+        )
+    {
+        return None;
+    }
+    Some(match task_phase {
+        steward_types::TaskPhase::Succeeded => "invalid_bridge_result",
+        steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled => "bridge_failed",
+        steward_types::TaskPhase::Submitted
+        | steward_types::TaskPhase::Parked
+        | steward_types::TaskPhase::Queued
+        | steward_types::TaskPhase::Running => "bridge_finalized_without_terminal_result",
+    })
+}
+
+#[cfg(test)]
+mod finalized_connection_operation_tests {
+    use steward_store::ConnectionOperationState;
+    use steward_types::TaskPhase;
+
+    use super::finalized_nonterminal_failure;
+
+    #[test]
+    fn finalized_failed_bridge_terminalizes_its_connection_operation() {
+        assert_eq!(
+            finalized_nonterminal_failure(
+                true,
+                ConnectionOperationState::Queued,
+                TaskPhase::Failed,
+            ),
+            Some("bridge_failed")
+        );
+        assert_eq!(
+            finalized_nonterminal_failure(
+                true,
+                ConnectionOperationState::Succeeded,
+                TaskPhase::Succeeded,
+            ),
+            None
+        );
+        assert_eq!(
+            finalized_nonterminal_failure(
+                false,
+                ConnectionOperationState::Queued,
+                TaskPhase::Failed,
+            ),
+            None
+        );
     }
 }
 
