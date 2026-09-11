@@ -99,3 +99,23 @@ security and execution slices are under development.
 - This design needs no new S01 dependency, CRD change, `steward-mint` change, or
   existing-field semantic rewrite. The additive migration and normal client
   regeneration do not require an exception to repository rules.
+
+## Recorded post-demo hardening debt
+
+The P0 demo still requires transactional exact-Envelope validation before Task
+reservation, revalidation before every resumable external runtime-create effect,
+baseline activation validation, and the existing claim/start fences. The following
+additional adversarial coverage is explicitly deferred until after the demo; this
+deferral does not relax those runtime checks:
+
+- exhaustively exercise Envelope replacement at `RuntimeObserved`,
+  `ApprovalPending`, both `ActivationPending` windows, and after the durable start
+  linearization point;
+- add a bounded concurrent User-Envelope replacement/service-Envelope revision test
+  that proves the User-then-service lock order cannot deadlock;
+- expand malformed persisted-evidence coverage across every identity, revision,
+  digest, and approved-snapshot field;
+- prove journal-event uniqueness and the absence of duplicate operation, runtime,
+  attempt, or lease allocation across every stale-worker retry stage; and
+- extend mid-lifecycle source-authorization revocation tests beyond the P0
+  pre-admission boundary.

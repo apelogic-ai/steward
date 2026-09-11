@@ -16,7 +16,7 @@ contracts remain authoritative; this record does not relax their exit criteria.
 | DP-C01 | `apelogic-ai/steward` | merged | PR `#83` merged as `ba4c062`; reviewed implementation head `103919e` was full-gate green. |
 | DP-I01 | `github-oidc-exchange` | merged | PR `#31` merged as `f2e33ae`; provenance, amd64 quality/Trivy, native ARM, and Kubernetes replay were green. |
 | DP-G01 | `apelogic-ai/steward` | merged | PR `#84` merged as `8c2ca03`; reviewed head `b93d611` was focused-, full-gate-, conformance-, and pre-push-green. |
-| DP-S01 | `apelogic-ai/steward` | in progress | Clean three-commit stack through `51f0dd2` on merged G01; immutable reservation and five fail-closed pre-admission cases are green. Exact-Envelope lifecycle revalidation is in progress. |
+| DP-S01 | `apelogic-ai/steward` | in progress | Demo-critical exact-Envelope effect fences are in progress on the clean G01-based stack; the broader adversarial stage matrix is recorded as post-demo debt. |
 | DP-R01 | `apelogic-ai/steward-run` | merged | Pin-correction PR `#33` merged as `139221e`; repository and complete Action round-trip were green. |
 | DP-R02 | `apelogic-ai/steward-run` | merged | PR `apelogic-ai/steward-run#32` merged as `a7bc15c`; live scan reported zero critical and zero accepted findings. |
 | DP-A01 | `apelogic-ai/agentic-ops` | merged | PR `apelogic-ai/agentic-ops#4` merged as `cca19bc`; package validation is green. |
