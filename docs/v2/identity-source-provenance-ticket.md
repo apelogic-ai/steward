@@ -2,7 +2,8 @@
 
 Priority: P0
 
-Status: CI pending in `apelogic-ai/github-oidc-exchange#31` at `4f7a685`
+Status: CI maintenance pending in `apelogic-ai/github-oidc-exchange#32` at `13a89de`;
+provenance implementation remains `#31` at `4f7a685`
 
 ## Goal
 
@@ -61,4 +62,7 @@ GitOps-owned local-main cluster.
 - repository dot-segment and noncanonical run-attempt mutations: rejected by focused
   regressions; and
 - local Rust, Helm, release validation, amd64 image build, and container smoke gates:
-  green.
+  green; and
+- isolated CI maintenance: `apelogic-ai/github-oidc-exchange#32` at `13a89de`
+  replaces the timing-out emulated ARM smoke with the same check on the native
+  `ubuntu-24.04-arm` runner without changing release publication.

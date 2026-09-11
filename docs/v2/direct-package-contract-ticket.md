@@ -2,7 +2,8 @@
 
 Priority: P0 foundation
 
-Status: ready to start
+Status: implementation checkpoint `042e8aa`; neutrality maintenance review pending in
+`apelogic-ai/steward#82` at `fa921f6`
 
 ## Goal
 
