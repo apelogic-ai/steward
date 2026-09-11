@@ -14,7 +14,7 @@ contracts remain authoritative; this record does not relax their exit criteria.
 |---|---|---|---|
 | DP-P00 | `apelogic-ai/steward` | in progress | Coordinates the complete demo evidence. |
 | DP-C01 | `apelogic-ai/steward` | review | PR `apelogic-ai/steward#83` at `320b79f` is full-gate green and cleanly mergeable. |
-| DP-I01 | `github-oidc-exchange` | CI | PR `#31` integrated current `main` at `1f9fe99`; native ARM and Kubernetes are green while amd64 quality completes. |
+| DP-I01 | `github-oidc-exchange` | merged | PR `#31` merged as `f2e33ae`; provenance, amd64 quality/Trivy, native ARM, and Kubernetes replay were green. |
 | DP-G01 | `apelogic-ai/steward` | red checkpoint | Approved port and dependency boundary compiles; first uninstalled-App negative executes and is red against the provisional stub. |
 | DP-S01 | `apelogic-ai/steward` | red checkpoint | Five pre-reservation escape tests are retained locally at `bf53e91`; implementation depends on DP-G01 and DP-I01. |
 | DP-R01 | `apelogic-ai/steward-run` | merged | PR `apelogic-ai/steward-run#31` merged as `fd090be`; image CI, vulnerability policy, and full round-trip were green. |
@@ -34,7 +34,7 @@ or mutable environment state.
 | Producer | Consumer | Handoff | State |
 |---|---|---|---|
 | DP-C01 | DP-I01, DP-G01, DP-S01, DP-R01, DP-A01 | PR `apelogic-ai/steward#83`, exact head `320b79f`; neutrality maintenance merged as `cc19487` | review pending |
-| DP-I01 | DP-S01, DP-O01 | PR `apelogic-ai/github-oidc-exchange#31`, integrated head `1f9fe99`, contract checkpoint `042e8aa`; native-ARM maintenance merged as `6d4c106` | final amd64 CI and review pending |
+| DP-I01 | DP-S01, DP-O01 | merged source `f2e33ae`, implementation/integrated head `1f9fe99`, contract checkpoint `042e8aa`; native-ARM maintenance merged as `6d4c106` | ready for immutable deployment pin |
 | DP-G01 | DP-S01, DP-O01 | reviewed Git source adapter release/configuration contract | pending |
 | DP-R02 | DP-R01 | merged commit `a7bc15c`, implementation `e73f931`, green live scan | incorporated in `79b9f42` |
 | DP-R01 | DP-O01 | merged source commit `fd090be`, implementation `79b9f42`, contract checkpoint `042e8aa` | ready for immutable caller pin |

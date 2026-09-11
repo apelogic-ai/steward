@@ -2,8 +2,7 @@
 
 Priority: P0
 
-Status: provenance PR `#31` integrated current `main` at `1f9fe99`; native ARM and
-Kubernetes checks are green while amd64 quality completes
+Status: merged by `apelogic-ai/github-oidc-exchange#31` as `f2e33ae`
 
 ## Goal
 
@@ -60,11 +59,14 @@ GitOps-owned local-main cluster.
 - exact provenance field compatibility: independently reviewed with no contract
   corrections required;
 - repository dot-segment and noncanonical run-attempt mutations: rejected by focused
-  regressions; and
+  regressions;
 - local Rust, Helm, release validation, amd64 image build, and container smoke gates:
-  green; and
+  green;
 - isolated CI maintenance: `apelogic-ai/github-oidc-exchange#32` at `13a89de`
   replaces the timing-out emulated ARM smoke with the same check on the native
   `ubuntu-24.04-arm` runner without changing release publication; its native ARM,
   unchanged amd64 quality and Trivy, and Kubernetes replay jobs are green; and
-- maintenance merged source: `6d4c106`.
+- maintenance merged source: `6d4c106`;
+- provenance implementation/integrated head: `1f9fe99`;
+- provenance merged source: `f2e33ae`; and
+- final quality, native ARM, and Kubernetes replay checks: green.
