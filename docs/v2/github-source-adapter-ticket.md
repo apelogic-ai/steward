@@ -2,7 +2,8 @@
 
 Priority: P0
 
-Status: design-audited; production edits wait for DP-C01 and dependency approval
+Status: implementation in progress from the corrected DP-C01 contract head;
+dependency boundary approved
 
 ## Goal
 
@@ -65,5 +66,5 @@ for adapter development.
 The adapter crate adds no new third-party version. Its proposed direct dependencies
 are the already workspace-pinned `base64`, `jsonwebtoken`, `reqwest`, `serde`, and
 `serde_json`, plus internal `steward-ports` and `steward-types`; loopback integration
-tests use the already pinned `tokio` as a dev-dependency. Production edits require the
-maintainer's advance dependency approval.
+tests use the already pinned `tokio` as a dev-dependency. The maintainer approved this
+exact dependency boundary before production edits began.
