@@ -21,6 +21,7 @@ browser_auth_deployment="$(mktemp)"
 task_identity_rendered="$(mktemp)"
 task_identity_deployment="$(mktemp)"
 task_execution_bindings_rendered="$(mktemp)"
+github_source_rendered="$(mktemp)"
 web_rendered="$(mktemp)"
 web_deployment="$(mktemp)"
 external_edge_rendered="$(mktemp)"
@@ -47,6 +48,7 @@ cleanup() {
     "${operator_connections_bridge_controller_deployment}" "${browser_auth_rendered}" \
     "${browser_auth_deployment}" "${task_identity_rendered}" \
     "${task_identity_deployment}" "${task_execution_bindings_rendered}" \
+    "${github_source_rendered}" \
     "${web_rendered}" "${web_deployment}" "${external_edge_rendered}" \
     "${secret_trust_rendered}" \
     "${mint_synthetic_kubeconfig}" "${mint_startup_output}"
@@ -136,6 +138,45 @@ then
   echo "the empty execution binding catalog must be mounted only in the apiserver" >&2
   exit 1
 fi
+if grep -q 'STEWARD_GITHUB_SOURCE_' "${rendered}"; then
+  echo "disabled GitHub source resolution must not render credentials or bindings" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  "${image_values[@]}" \
+  --set githubSource.enabled=true >/dev/null 2>&1
+then
+  echo "enabled GitHub source resolution without App credentials must fail chart validation" >&2
+  exit 1
+fi
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  "${image_values[@]}" \
+  --set githubSource.enabled=true \
+  --set-string githubSource.appId=123456 \
+  --set-string githubSource.privateKeySecret.name=steward-github-source \
+  --set-string githubSource.privateKeySecret.key=private-key.pem \
+  --set-string githubSource.bindings.contractVersion=steward.source-repository-bindings/v1 \
+  --set-string 'githubSource.bindings.bindings[0].caller.ownerId=7890' \
+  --set-string 'githubSource.bindings.bindings[0].caller.repositoryId=123456' \
+  --set-string 'githubSource.bindings.bindings[0].source.ownerId=7890' \
+  --set-string 'githubSource.bindings.bindings[0].source.repositoryId=654321' \
+  --set-string 'networkPolicy.githubApiCidrs[0]=192.0.2.10/32' \
+  > "${github_source_rendered}"
+for required_github_source_fragment in \
+  'name: STEWARD_GITHUB_SOURCE_APP_ID' \
+  'name: STEWARD_GITHUB_SOURCE_PRIVATE_KEY_FILE' \
+  'name: STEWARD_SOURCE_REPOSITORY_BINDINGS_FILE' \
+  'secretName: steward-github-source' \
+  '\"contractVersion\":\"steward.source-repository-bindings/v1\"' \
+  'ipBlock: { cidr: 192.0.2.10/32 }'
+do
+  if ! grep -Fq "${required_github_source_fragment}" "${github_source_rendered}"; then
+    echo "configured GitHub source resolution did not render ${required_github_source_fragment}" >&2
+    exit 1
+  fi
+done
 catalog_fixture_directory="${root}/charts/steward/testdata/execution-bindings"
 if ! helm template steward "${root}/charts/steward" \
   --namespace steward \

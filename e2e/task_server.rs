@@ -60,6 +60,7 @@ impl TestTaskIdentities {
                     acting_user: Some(alice.display_email.clone()),
                     owner: alice.display_email.clone(),
                     canonical_user_id: alice.user_id.clone(),
+                    source_provenance: None,
                 },
             );
         }
@@ -70,6 +71,7 @@ impl TestTaskIdentities {
                 acting_user: None,
                 owner: scheduled.display_email.clone(),
                 canonical_user_id: scheduled.user_id.clone(),
+                source_provenance: None,
             },
         );
         Self {

@@ -12,6 +12,7 @@ kube = { workspace = true, features = ["client", "ring", "rustls-tls"] } # Authe
 steward-adapter-codex = { path = "../../adapters/codex", version = "=0.0.0" } # Renders Codex-specific disposable Task commands behind the neutral execution adapter seam.
 steward-adapter-jira = { path = "../../adapters/jira", version = "=0.0.0" } # Delivers escalation decisions without leaking Jira types into core.
 steward-adapter-github-artifact = { path = "../../adapters/github-artifact", version = "=0.0.0" } # Verifies the same digest-pinned bridge artifact used by controller provisioning.
+steward-adapter-github-source = { path = "../../adapters/github-source", version = "=0.0.0" } # Resolves exact direct-package Git objects through a read-only GitHub App.
 steward-apiserver = { path = "../../crates/steward-apiserver", version = "=0.0.0" } # Provides the single authenticated REST admission router.
 steward-store = { path = "../../crates/steward-store", version = "=0.0.0" } # Persists immutable envelopes, decisions, approvals, and instance grants.
 steward-types = { path = "../../crates/steward-types", version = "=0.0.0" } # Parses opaque canonical user IDs for the explicit local-RBAC bootstrap command.

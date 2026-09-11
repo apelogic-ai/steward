@@ -63,6 +63,16 @@ taskIdentity:
   publicJwksConfigMap:
     name: ""
     key: ""
+githubSource:
+  # Enables exact Git object retrieval for direct Task packages through a read-only GitHub App.
+  enabled: false
+  appId: ""
+  privateKeySecret:
+    name: ""
+    key: ""
+  bindings:
+    contractVersion: steward.source-repository-bindings/v1
+    bindings: []
 tls:
   issuerRef:
     name: cluster-issuer
@@ -138,6 +148,7 @@ networkPolicy:
   postgresCidrs: []
   jiraCidrs: []
   browserAuthEgressCidrs: []
+  githubApiCidrs: []
   ingressNamespace: ingress-nginx
   burbleNamespace: burble
   arcNamespace: arc-runners

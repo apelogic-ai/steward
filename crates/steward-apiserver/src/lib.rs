@@ -30,8 +30,9 @@ pub use github_actions::{
 };
 
 pub use tasks::{
-    ConfiguredTaskIdentityResolver, KubernetesTaskIdentityResolver, StaticTaskWorkflowCatalog,
-    TaskAdmissionDelta, TaskApiConfig, TaskArchive, TaskAuthenticationError, TaskErrorResponse,
+    ConfiguredTaskIdentityResolver, KubernetesTaskIdentityResolver,
+    MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, StaticTaskWorkflowCatalog, TaskAdmissionDelta,
+    TaskApiConfig, TaskArchive, TaskAuthenticationError, TaskCreateRequest, TaskErrorResponse,
     TaskIdentity, TaskIdentityResolver, TaskStatusResponse, TaskSubmissionLedger,
     TaskSubmissionRequest, TaskWorkflow, TaskWorkflowCatalog, task_router,
 };
@@ -378,6 +379,7 @@ pub struct GrantRevocationRequest {
         CreateRuntimeRequest,
         BudgetIncrease,
         TaskSubmissionRequest,
+        TaskCreateRequest,
         TaskStatusResponse,
         TaskAdmissionDelta,
         TaskArchive,
@@ -475,7 +477,7 @@ pub async fn budget_increase_contract() {}
 #[utoipa::path(
     post,
     path = "/v1/tasks",
-    request_body(content = TaskSubmissionRequest, content_type = "application/json"),
+    request_body(content = TaskCreateRequest, content_type = "application/json"),
     params(
         ("Idempotency-Key" = String, Header, description = "Submitter-scoped upstream job identity")
     ),
@@ -802,6 +804,7 @@ pub enum ApiError {
     NoActiveGrants,
     TaskAuthentication,
     TaskAuthenticationUnavailable,
+    TaskSourceUnauthorized(String),
     TaskWorkflowNotFound,
     TaskNotReady,
     TaskOutputNotReady,
@@ -2107,6 +2110,7 @@ impl IntoResponse for ApiError {
             }
             Self::PrincipalMismatch => StatusCode::FORBIDDEN,
             Self::TaskAuthentication => StatusCode::UNAUTHORIZED,
+            Self::TaskSourceUnauthorized(_) => StatusCode::FORBIDDEN,
             Self::TaskAuthenticationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::TaskWorkflowNotFound
             | Self::Store(
@@ -3051,6 +3055,7 @@ mod tests {
     use axum::response::Response;
     use k8s_openapi::api::authentication::v1::{TokenReviewStatus, UserInfo};
     use kube::ResourceExt;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration as StdDuration;
@@ -3059,8 +3064,9 @@ mod tests {
         AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec,
     };
     use steward_ports::{
-        DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
-        TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest,
+        DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, GitFile,
+        GitFileRequest, GitHostingPlane, GitRepositoryIdentity, PortError, TaskExecutionAdapter,
+        TaskExecutionPlan, TaskExecutionPlanRequest,
     };
     use steward_store::{
         AdmissionApprovalState, AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunSpend,
@@ -3071,6 +3077,9 @@ mod tests {
         PendingEnvelopeRequest, StoreError, TaskAdmissionLookup, TaskAdmissionRecord,
         TaskOrchestrationState, TaskRecord, TaskReservation, TaskReservationRequest,
         TaskRuntimeOperationRecord, TaskRuntimeOwnership, WorkflowRevisionRecord,
+    };
+    use steward_types::direct_package::{
+        ExactGitCommit, RepositoryUrl, SourceProvenance, StableProviderId,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding,
@@ -3246,6 +3255,152 @@ mod tests {
     #[derive(Clone)]
     struct FakeTaskIdentityResolver;
 
+    fn source_provenance() -> Result<SourceProvenance, TaskAuthenticationError> {
+        serde_json::from_str(include_str!(
+            "../../../docs/contracts/task/v2/fixtures/positive/source-provenance.json"
+        ))
+        .map_err(|_| TaskAuthenticationError::InvalidCredentials)
+    }
+
+    #[derive(Clone)]
+    struct FakeDirectGit {
+        repositories: Arc<BTreeMap<String, GitRepositoryIdentity>>,
+        files: Arc<BTreeMap<(String, String, String), Vec<u8>>>,
+        wrong_object_path: Option<String>,
+        reads: Arc<Mutex<Vec<(String, String, String)>>>,
+    }
+
+    impl GitHostingPlane for FakeDirectGit {
+        async fn resolve_repository(
+            &self,
+            repository: &RepositoryUrl,
+        ) -> Result<GitRepositoryIdentity, PortError> {
+            self.repositories
+                .get(repository.as_str())
+                .cloned()
+                .ok_or_else(|| PortError::Rejected {
+                    reason: "repository is not present in the deterministic fake".to_owned(),
+                })
+        }
+
+        async fn read_file(&self, request: &GitFileRequest) -> Result<GitFile, PortError> {
+            let key = (
+                request.repository.repository.as_str().to_owned(),
+                request.commit.as_str().to_owned(),
+                request.path.as_str().to_owned(),
+            );
+            self.reads
+                .lock()
+                .map_err(|_| PortError::Failed {
+                    reason: "deterministic fake read ledger was poisoned".to_owned(),
+                })?
+                .push(key.clone());
+            let bytes = self
+                .files
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| PortError::Rejected {
+                    reason: "exact file is absent from the deterministic fake".to_owned(),
+                })?;
+            let commit = if self.wrong_object_path.as_deref() == Some(request.path.as_str()) {
+                ExactGitCommit::parse(format!("git:sha1:{}", "f".repeat(40)))
+                    .map_err(|reason| PortError::Failed { reason })?
+            } else {
+                request.commit.clone()
+            };
+            Ok(GitFile {
+                repository: request.repository.clone(),
+                commit,
+                path: request.path.clone(),
+                bytes,
+            })
+        }
+    }
+
+    fn direct_git_fixture(
+        manifest: serde_json::Value,
+        definition: serde_json::Value,
+        wrong_object_path: Option<&str>,
+    ) -> Result<FakeDirectGit, String> {
+        let caller = RepositoryUrl::parse("https://github.com/example-org/caller.git")?;
+        let source = RepositoryUrl::parse("https://github.com/example-org/agentic-ops.git")?;
+        let caller_identity = GitRepositoryIdentity {
+            repository: caller.clone(),
+            repository_id: StableProviderId::parse("123456")?,
+            repository_owner_id: StableProviderId::parse("7890")?,
+        };
+        let source_identity = GitRepositoryIdentity {
+            repository: source.clone(),
+            repository_id: StableProviderId::parse("654321")?,
+            repository_owner_id: StableProviderId::parse("7890")?,
+        };
+        let invocation_path = ".steward/tasks/release-summary.json";
+        let definition_path = "catalog/release-summary/v1/task-definition.json";
+        let prompt_path = "catalog/release-summary/v1/prompt.md";
+        Ok(FakeDirectGit {
+            repositories: Arc::new(BTreeMap::from([
+                (caller.as_str().to_owned(), caller_identity),
+                (source.as_str().to_owned(), source_identity),
+            ])),
+            files: Arc::new(BTreeMap::from([
+                (
+                    (
+                        caller.as_str().to_owned(),
+                        format!("git:sha1:{}", "c".repeat(40)),
+                        invocation_path.to_owned(),
+                    ),
+                    serde_json::to_vec(&manifest).map_err(|error| error.to_string())?,
+                ),
+                (
+                    (
+                        source.as_str().to_owned(),
+                        format!("git:sha1:{}", "a".repeat(40)),
+                        definition_path.to_owned(),
+                    ),
+                    serde_json::to_vec(&definition).map_err(|error| error.to_string())?,
+                ),
+                (
+                    (
+                        source.as_str().to_owned(),
+                        format!("git:sha1:{}", "a".repeat(40)),
+                        prompt_path.to_owned(),
+                    ),
+                    b"Summarize the supplied repository evidence.\n".to_vec(),
+                ),
+            ])),
+            wrong_object_path: wrong_object_path.map(str::to_owned),
+            reads: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    fn direct_manifest() -> Result<serde_json::Value, String> {
+        serde_json::from_str(include_str!(
+            "../../../docs/contracts/task/v2/fixtures/positive/invocation-manifest.json"
+        ))
+        .map_err(|error| format!("checked-in direct manifest fixture is invalid: {error}"))
+    }
+
+    fn direct_definition_no_skills() -> Result<serde_json::Value, String> {
+        serde_json::from_str(include_str!(
+            "../../../docs/contracts/task/v2/fixtures/positive/task-definition-no-skills.json"
+        ))
+        .map_err(|error| format!("checked-in direct TaskDefinition fixture is invalid: {error}"))
+    }
+
+    fn authorize_direct_source(ledger: &FakeLedger) -> Result<(), String> {
+        ledger
+            .source_repository_bindings
+            .lock()
+            .map_err(|_| "fake source-repository binding lock was poisoned".to_owned())?
+            .push((
+                "7890".to_owned(),
+                "123456".to_owned(),
+                "7890".to_owned(),
+                "654321".to_owned(),
+            ));
+        Ok(())
+    }
+
     impl TaskIdentityResolver for FakeTaskIdentityResolver {
         fn resolve<'a>(
             &'a self,
@@ -3267,6 +3422,7 @@ mod tests {
                             "usr_0123456789abcdef0123456789abcdef",
                         )
                         .map_err(|_| TaskAuthenticationError::InvalidCredentials)?,
+                        source_provenance: Some(source_provenance()?),
                     }),
                     "github-bob-assertion" => Ok(TaskIdentity {
                         service: "steward-run".to_owned(),
@@ -3276,6 +3432,7 @@ mod tests {
                             "usr_abcdef0123456789abcdef0123456789",
                         )
                         .map_err(|_| TaskAuthenticationError::InvalidCredentials)?,
+                        source_provenance: Some(source_provenance()?),
                     }),
                     "github-renamed-assertion" => Ok(TaskIdentity {
                         service: "steward-run".to_owned(),
@@ -3285,6 +3442,7 @@ mod tests {
                             "usr_0123456789abcdef0123456789abcdef",
                         )
                         .map_err(|_| TaskAuthenticationError::InvalidCredentials)?,
+                        source_provenance: Some(source_provenance()?),
                     }),
                     "scheduled-assertion" => Ok(TaskIdentity {
                         service: "scheduled-scanner".to_owned(),
@@ -3294,6 +3452,7 @@ mod tests {
                             "usr_456789abcdef0123456789abcdef0123",
                         )
                         .map_err(|_| TaskAuthenticationError::InvalidCredentials)?,
+                        source_provenance: None,
                     }),
                     _ => Err(TaskAuthenticationError::InvalidCredentials),
                 }
@@ -4561,6 +4720,23 @@ mod tests {
         let status = document
             .pointer("/components/schemas/TaskStatusResponse")
             .ok_or_else(|| "TaskStatusResponse schema is absent".to_owned())?;
+        assert_eq!(
+            status.pointer("/oneOf/0/$ref"),
+            Some(&serde_json::json!(
+                "#/components/schemas/LegacyTaskStatusResponse"
+            )),
+            "Task status must retain the existing response as one additive union member"
+        );
+        assert_eq!(
+            status.pointer("/oneOf/1/$ref"),
+            Some(&serde_json::json!(
+                "#/components/schemas/DirectTaskStatusResponse"
+            )),
+            "Task status must publish the direct-package response as one additive union member"
+        );
+        let legacy_status = document
+            .pointer("/components/schemas/LegacyTaskStatusResponse")
+            .ok_or_else(|| "legacy Task status schema is absent".to_owned())?;
         for property in [
             "taskUid",
             "runtimeUid",
@@ -4571,8 +4747,21 @@ mod tests {
             "deltas",
         ] {
             assert!(
-                status.pointer(&format!("/properties/{property}")).is_some(),
-                "TaskStatusResponse is missing {property}"
+                legacy_status
+                    .pointer(&format!("/properties/{property}"))
+                    .is_some(),
+                "legacy Task status is missing {property}"
+            );
+        }
+        let direct_status = document
+            .pointer("/components/schemas/DirectTaskStatusResponse")
+            .ok_or_else(|| "direct Task status schema is absent".to_owned())?;
+        for property in ["contractVersion", "taskUid", "diagnostics", "evidence"] {
+            assert!(
+                direct_status
+                    .pointer(&format!("/properties/{property}"))
+                    .is_some(),
+                "direct Task status is missing {property}"
             );
         }
         assert_eq!(
@@ -4708,6 +4897,8 @@ mod tests {
     struct SlowDecisionChannel {
         requests: Arc<AtomicUsize>,
     }
+
+    type SourceRepositoryBindings = Arc<Mutex<Vec<(String, String, String, String)>>>;
 
     #[derive(Clone)]
     struct ApprovalDuringDecisionFiling {
@@ -5298,6 +5489,7 @@ mod tests {
         agent_runs: Arc<Mutex<Vec<AgentRunRecord>>>,
         agent_run_events: AgentRunEvents,
         service_envelope_authors: Arc<Mutex<Vec<(String, String)>>>,
+        source_repository_bindings: SourceRepositoryBindings,
     }
 
     #[derive(Clone)]
@@ -6121,6 +6313,63 @@ mod tests {
     }
 
     impl TaskSubmissionLedger for FakeLedger {
+        fn active_source_repository_binding<'a>(
+            &'a self,
+            caller: &'a steward_types::direct_package::TriggerRepository,
+            source: &'a steward_ports::GitRepositoryIdentity,
+        ) -> BoxFuture<'a, Result<bool, StoreError>> {
+            Box::pin(async move {
+                self.source_repository_bindings
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake source-repository binding lock was poisoned".to_owned(),
+                        )
+                    })
+                    .map(|bindings| {
+                        bindings.iter().any(
+                            |(caller_owner, caller_repository, source_owner, source_repository)| {
+                                caller_owner == caller.owner_id.as_str()
+                                    && caller_repository == caller.id.as_str()
+                                    && source_owner == source.repository_owner_id.as_str()
+                                    && source_repository == source.repository_id.as_str()
+                            },
+                        )
+                    })
+            })
+        }
+
+        fn active_provisioned_user_envelopes_by_digest<'a>(
+            &'a self,
+            owner_user_id: &'a CanonicalUserId,
+            digest: &'a steward_types::direct_package::EnvelopeDigest,
+        ) -> BoxFuture<'a, Result<Vec<EnvelopeRequestRecord>, StoreError>> {
+            Box::pin(async move {
+                let store_digest = digest
+                    .as_str()
+                    .strip_prefix("steward:")
+                    .ok_or(StoreError::InvalidEnvelopeRequest)?;
+                self.user_envelopes
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake User Envelope ledger lock was poisoned".to_owned(),
+                        )
+                    })
+                    .map(|envelopes| {
+                        envelopes
+                            .iter()
+                            .filter(|envelope| {
+                                envelope.owner_user_id == *owner_user_id
+                                    && envelope.status == EnvelopeRequestStatus::Provisioned
+                                    && envelope.envelope_digest.as_deref() == Some(store_digest)
+                            })
+                            .cloned()
+                            .collect()
+                    })
+            })
+        }
+
         fn workflow_revision<'a>(
             &'a self,
             name: &'a str,
@@ -6273,6 +6522,7 @@ mod tests {
                     runtime_spec: request.runtime_spec.clone(),
                     agent_command: request.agent_command.to_vec(),
                     execution_binding: request.execution_binding.cloned(),
+                    direct_task_evidence: request.direct_task_evidence.cloned(),
                     envelope_revision: request.envelope_revision,
                     orchestration_version: 2,
                     orchestration_operation_id: Some(operation_id),
@@ -6506,6 +6756,7 @@ mod tests {
             agent_runs: Arc::new(Mutex::new(Vec::new())),
             agent_run_events: Arc::new(Mutex::new(Vec::new())),
             service_envelope_authors: Arc::new(Mutex::new(Vec::new())),
+            source_repository_bindings: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -8794,6 +9045,354 @@ mod tests {
         Ok(())
     }
 
+    async fn assert_direct_rejection_before_reservation(
+        ledger: &FakeLedger,
+        app: axum::Router,
+        idempotency_key: &str,
+        expected_status: StatusCode,
+        expected_error: &str,
+    ) -> Result<(), String> {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", idempotency_key)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build direct-package request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit direct package: {error}"))?;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read direct-package response: {error}"))?;
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, expected_status, "unexpected response body: {body}");
+        assert!(
+            body.contains(expected_error),
+            "expected response containing {expected_error:?}, got {body:?}"
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .is_empty(),
+            "a rejected direct package must not reserve a Task"
+        );
+        assert!(
+            ledger
+                .task_operations
+                .lock()
+                .map_err(|_| "fake task-operation ledger lock was poisoned")?
+                .is_empty(),
+            "a rejected direct package must not create a runtime operation"
+        );
+        Ok(())
+    }
+
+    fn direct_test_app(ledger: FakeLedger, git: FakeDirectGit) -> Result<axum::Router, String> {
+        Ok(task_router(
+            ledger,
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            task_api_config()?.with_git_hosting_plane(git),
+        ))
+    }
+
+    fn direct_source_bindings_json(source_repository_id: &str) -> String {
+        serde_json::json!({
+            "contractVersion": "steward.source-repository-bindings/v1",
+            "bindings": [{
+                "caller": {"ownerId": "7890", "repositoryId": "123456"},
+                "source": {"ownerId": "7890", "repositoryId": source_repository_id}
+            }]
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn configured_stable_repository_binding_authorizes_cross_repository_source()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let config = task_api_config()?
+            .with_git_hosting_plane(git)
+            .with_source_repository_bindings_json(Some(&direct_source_bindings_json("654321")))?;
+        let app = task_router(
+            ledger.clone(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            config,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "configured-source-binding")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build direct-package request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit direct package: {error}"))?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn configured_repository_binding_rejects_a_different_stable_source_identity()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let git = direct_git_fixture(direct_manifest()?, direct_definition_no_skills()?, None)?;
+        let config = task_api_config()?
+            .with_git_hosting_plane(git)
+            .with_source_repository_bindings_json(Some(&direct_source_bindings_json("654322")))?;
+        let app = task_router(
+            ledger.clone(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            config,
+        );
+
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "configured-source-binding-mismatch",
+            StatusCode::FORBIDDEN,
+            "source repository is not authorized",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_package_rejects_unauthorized_source_before_read_or_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let git = direct_git_fixture(direct_manifest()?, direct_definition_no_skills()?, None)?;
+        let reads = git.reads.clone();
+        let app = direct_test_app(ledger.clone(), git)?;
+
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-unauthorized-source",
+            StatusCode::FORBIDDEN,
+            "source repository is not authorized",
+        )
+        .await?;
+        assert_eq!(
+            reads
+                .lock()
+                .map_err(|_| "fake Git read ledger was poisoned")?
+                .len(),
+            1,
+            "source authorization must happen after the signed invocation is read but before package content"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_package_rejects_wrong_exact_git_object_before_reservation() -> Result<(), String>
+    {
+        let ledger = versioned_task_ledger()?;
+        let git = direct_git_fixture(
+            direct_manifest()?,
+            direct_definition_no_skills()?,
+            Some(".steward/tasks/release-summary.json"),
+        )?;
+        let app = direct_test_app(ledger.clone(), git)?;
+
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-wrong-object",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "exact source object",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_package_rejects_inactive_exact_envelope_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        ledger
+            .user_envelopes
+            .lock()
+            .map_err(|_| "fake User Envelope ledger lock was poisoned")?
+            .clear();
+        let git = direct_git_fixture(direct_manifest()?, direct_definition_no_skills()?, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-inactive-envelope",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "selected Envelope is not active",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_package_rejects_over_authority_requirements_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let requirements_fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/contracts/task/v2/fixtures/positive/task-definition-with-requires.json"
+        ))
+        .map_err(|error| format!("checked-in direct TaskDefinition fixture is invalid: {error}"))?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["requires"] = requirements_fixture["requires"].clone();
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-over-authority",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "exceed the selected Envelope",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_package_rejects_cross_repository_git_trigger_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut manifest = direct_manifest()?;
+        manifest["package"]["commit"] = serde_json::json!("git:trigger");
+        let git = direct_git_fixture(manifest, direct_definition_no_skills()?, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-cross-repository-trigger",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "git:trigger",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_package_resolves_closure_and_reserves_exact_evidence() -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "direct-success")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build direct-package request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit direct package: {error}"))?;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read direct-package response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("direct-package response was not JSON: {error}"))?;
+
+        assert_eq!(status, StatusCode::ACCEPTED, "unexpected response: {body}");
+        assert_eq!(
+            body.pointer("/contractVersion")
+                .and_then(|value| value.as_str()),
+            Some("steward.task/v2")
+        );
+        assert_eq!(
+            body.pointer("/evidence/sourceProvenance/repository/id")
+                .and_then(|value| value.as_str()),
+            Some("123456")
+        );
+        assert_eq!(
+            body.pointer("/evidence/package/repositoryId")
+                .and_then(|value| value.as_str()),
+            Some("654321")
+        );
+        assert_eq!(
+            body.pointer("/evidence/closure/entries/0/kind")
+                .and_then(|value| value.as_str()),
+            Some("prompt"),
+            "closure entries must be sorted by exact path"
+        );
+        assert_eq!(
+            body.pointer("/evidence/closure/entries/1/kind")
+                .and_then(|value| value.as_str()),
+            Some("task_definition")
+        );
+        assert_eq!(
+            body.pointer("/diagnostics/executionLog")
+                .and_then(|value| value.as_str()),
+            Some("full")
+        );
+        assert_eq!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .len(),
+            1
+        );
+        assert_eq!(
+            ledger
+                .task_operations
+                .lock()
+                .map_err(|_| "fake task-operation ledger lock was poisoned")?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn versioned_task_route_resolves_exact_workflow_and_pins_user_envelope()
     -> Result<(), String> {
@@ -9769,6 +10368,7 @@ mod tests {
                 runtime_spec: &spec,
                 agent_command: &workflow.command,
                 execution_binding: None,
+                direct_task_evidence: None,
                 envelope_revision: 3,
                 service_envelope: &service_envelope,
                 service_envelope_digest: &intent_digest,
@@ -9969,6 +10569,7 @@ mod tests {
                 runtime_spec: &spec,
                 agent_command: &workflow.command,
                 execution_binding: None,
+                direct_task_evidence: None,
                 envelope_revision: 3,
                 service_envelope: &service_envelope,
                 service_envelope_digest: &intent_digest,

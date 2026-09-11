@@ -4023,6 +4023,7 @@ dependencies = [
  "kube",
  "steward-adapter-codex",
  "steward-adapter-github-artifact",
+ "steward-adapter-github-source",
  "steward-adapter-jira",
  "steward-apiserver",
  "steward-store",

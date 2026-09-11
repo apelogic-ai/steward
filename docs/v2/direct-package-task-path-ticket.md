@@ -2,7 +2,7 @@
 
 Priority: P0
 
-Status: contract tests may start after DP-C01; implementation depends on DP-G01
+Status: red server-path tests active; implementation depends on DP-G01
 
 ## Goal
 
@@ -50,3 +50,33 @@ its existing route and resolver.
 
 Test scaffolding may start after DP-C01. Source-backed implementation waits for DP-G01.
 Coordinate final integration with DP-I01 and DP-R01; serialize heavy integration lanes.
+
+## Integration seam map
+
+The first red checkpoint is based on DP-C01 commit
+`042e8aa96a66d8927b50dc253509a5d437a5eeec`. It exercises the existing
+`POST /v1/tasks` boundary with the frozen direct-submission body and proves that the
+five initial escape cases must fail before the fake Task ledger observes a
+reservation.
+
+DP-S01 should integrate through these existing boundaries:
+
+1. extend the authenticated Task identity with DP-I01's validated
+   `SourceProvenance`; do not accept provenance in the request body;
+2. add the DP-G01 provider-neutral source resolver to `TaskApiConfig` and use it to
+   resolve the invocation manifest and package closure before reservation;
+3. add caller-to-repository authorization and active Envelope-by-digest lookup to the
+   Task ledger boundary, keeping stable external repository IDs at the authorization
+   edge;
+4. translate the resolved `DirectTaskDefinition` into the existing
+   `AgentRuntimeSpec`, execution adapter request, admission decision, and
+   `TaskReservationRequest` path instead of adding another runtime write path; and
+5. persist the complete `DirectTaskBindingEvidence` and snapshotted diagnostics with
+   the reservation before exposing the existing input, execute, poll, output, and
+   finalization routes.
+
+The current red test uses scenario-named invocation paths until DP-G01's fake source
+port is available. On integration, those paths must resolve to deterministic fake Git
+objects; they must not become special production values. Retry immutability,
+revocation, omitted-skills, diagnostics exclusion, successful execution, and exact
+evidence assertions remain to be added after the port and persistence shapes land.

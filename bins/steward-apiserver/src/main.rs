@@ -8,13 +8,15 @@ use std::time::Duration;
 use axum::serve::Listener;
 use steward_adapter_codex::CodexTaskExecutionAdapter;
 use steward_adapter_github_artifact::GitHubArtifactVerifier;
+use steward_adapter_github_source::{GitHubAppCredentials, GitHubSourceAdapter};
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
 use steward_apiserver::{
     ConfiguredTaskIdentityResolver, ExecutionBindingCatalog,
     IdentityOrKubernetesTokenAuthenticator, KubeRuntimeRepository, KubernetesTokenAuthenticator,
-    KubernetesTokenReviewAudience, MAX_EXECUTION_BINDING_CATALOG_BYTES, StaticTaskWorkflowCatalog,
-    TaskApiConfig, agent_runs_ui, browser_admin, browser_auth, connections, google_oidc,
-    governed_connections, router, stable_runtime_bridge, task_router, user_envelopes, workflows,
+    KubernetesTokenReviewAudience, MAX_EXECUTION_BINDING_CATALOG_BYTES,
+    MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, StaticTaskWorkflowCatalog, TaskApiConfig, agent_runs_ui,
+    browser_admin, browser_auth, connections, google_oidc, governed_connections, router,
+    stable_runtime_bridge, task_router, user_envelopes, workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
@@ -95,6 +97,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let task_execution_bindings_json = configured_execution_bindings_json()?;
+    let source_repository_bindings_json = configured_source_repository_bindings_json()?;
+    let github_source = configured_github_source_adapter()?;
     let task_execution_bindings_active = execution_bindings_active().map_err(io::Error::other)?;
     let task_execution_adapter = CodexTaskExecutionAdapter::new(required(
         "STEWARD_TASK_INFERENCE_ENDPOINT",
@@ -109,8 +113,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .and_then(|config| {
             config.with_execution_bindings_json(task_execution_bindings_json.as_deref())
         })
+        .and_then(|config| {
+            config.with_source_repository_bindings_json(source_repository_bindings_json.as_deref())
+        })
         .and_then(|config| config.with_execution_bindings_active(task_execution_bindings_active))
         .map_err(io::Error::other)?;
+    let task_api_config = match github_source {
+        Some(adapter) => task_api_config.with_git_hosting_plane(adapter),
+        None => task_api_config,
+    };
     let workflow_agents = task_api_config.execution_binding_advertisements();
     let runtimes = KubeRuntimeRepository::new(client);
     let browser = browser_application_router(
@@ -177,6 +188,117 @@ fn configured_execution_bindings_json() -> Result<Option<String>, io::Error> {
         )),
         (None, Some(path)) => read_execution_binding_catalog(&path).map(Some),
         (None, None) => Ok(None),
+    }
+}
+
+fn configured_source_repository_bindings_json() -> Result<Option<String>, io::Error> {
+    configured_bounded_json(
+        "STEWARD_SOURCE_REPOSITORY_BINDINGS_JSON",
+        "STEWARD_SOURCE_REPOSITORY_BINDINGS_FILE",
+        MAX_SOURCE_REPOSITORY_BINDINGS_BYTES,
+        "source repository binding catalog",
+    )
+}
+
+fn configured_bounded_json(
+    inline_name: &str,
+    file_name: &str,
+    max_bytes: usize,
+    description: &str,
+) -> Result<Option<String>, io::Error> {
+    let inline = match env::var(inline_name) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::other(format!("{inline_name} must be Unicode")));
+        }
+    };
+    let file = match env::var(file_name) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::other(format!("{file_name} must be Unicode")));
+        }
+    };
+    match (inline, file) {
+        (Some(_), Some(_)) => Err(io::Error::other(format!(
+            "configure exactly one of {inline_name} or {file_name}"
+        ))),
+        (Some(value), None) if value.len() > max_bytes => Err(io::Error::other(format!(
+            "{description} exceeds {max_bytes} bytes"
+        ))),
+        (Some(value), None) => Ok(Some(value)),
+        (None, Some(path)) if path.is_empty() => Err(io::Error::other(format!(
+            "{file_name} must be a non-empty path"
+        ))),
+        (None, Some(path)) => {
+            let metadata = fs::metadata(&path)
+                .map_err(|error| io::Error::other(format!("read {description} {path}: {error}")))?;
+            if metadata.len() > max_bytes as u64 {
+                return Err(io::Error::other(format!(
+                    "{description} exceeds {max_bytes} bytes"
+                )));
+            }
+            fs::read_to_string(&path)
+                .map(Some)
+                .map_err(|error| io::Error::other(format!("read {description} {path}: {error}")))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+fn configured_github_source_adapter() -> Result<Option<GitHubSourceAdapter>, io::Error> {
+    let app_id = optional_unicode_environment("STEWARD_GITHUB_SOURCE_APP_ID")?;
+    let private_key_file = optional_unicode_environment("STEWARD_GITHUB_SOURCE_PRIVATE_KEY_FILE")?;
+    github_source_adapter_from_values(app_id, private_key_file)
+}
+
+fn github_source_adapter_from_values(
+    app_id: Option<String>,
+    private_key_file: Option<String>,
+) -> Result<Option<GitHubSourceAdapter>, io::Error> {
+    let (app_id, private_key_file) = match (app_id, private_key_file) {
+        (None, None) => return Ok(None),
+        (Some(app_id), Some(private_key_file)) => (app_id, private_key_file),
+        _ => {
+            return Err(io::Error::other(
+                "STEWARD_GITHUB_SOURCE_APP_ID and STEWARD_GITHUB_SOURCE_PRIVATE_KEY_FILE must be configured together",
+            ));
+        }
+    };
+    if private_key_file.is_empty() {
+        return Err(io::Error::other(
+            "STEWARD_GITHUB_SOURCE_PRIVATE_KEY_FILE must be a non-empty path",
+        ));
+    }
+    let app_id = app_id
+        .parse::<u64>()
+        .map_err(|_| io::Error::other("STEWARD_GITHUB_SOURCE_APP_ID must be a positive integer"))?;
+    let metadata = fs::metadata(&private_key_file).map_err(|error| {
+        io::Error::other(format!("read GitHub source App private key: {error}"))
+    })?;
+    if metadata.len() == 0 || metadata.len() > 64 * 1024 {
+        return Err(io::Error::other(
+            "GitHub source App private key must contain at most 65536 bytes",
+        ));
+    }
+    let private_key = fs::read(&private_key_file).map_err(|error| {
+        io::Error::other(format!("read GitHub source App private key: {error}"))
+    })?;
+    let credentials = GitHubAppCredentials::new(app_id, private_key)
+        .map_err(|_| io::Error::other("GitHub source App credentials are invalid"))?;
+    GitHubSourceAdapter::new(credentials)
+        .map(Some)
+        .map_err(|_| io::Error::other("GitHub source adapter configuration is invalid"))
+}
+
+fn optional_unicode_environment(name: &str) -> Result<Option<String>, io::Error> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(io::Error::other(format!("{name} must be Unicode")))
+        }
     }
 }
 
@@ -658,9 +780,9 @@ mod tests {
 
     use super::{
         KubernetesTokenReviewAudience, TlsListener, bootstrap_rbac_arguments, decode_tls_material,
-        install_rustls_crypto_provider, kubernetes_token_review_audience,
-        parse_execution_bindings_mode, stable_bridge_configuration_from_values,
-        validate_execution_bindings,
+        github_source_adapter_from_values, install_rustls_crypto_provider,
+        kubernetes_token_review_audience, parse_execution_bindings_mode,
+        stable_bridge_configuration_from_values, validate_execution_bindings,
     };
 
     #[test]
@@ -681,6 +803,35 @@ mod tests {
         for invalid in ["", "enabled", "Active", " active"] {
             assert!(parse_execution_bindings_mode(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn github_source_configuration_is_optional_but_never_partial_or_ambiguous() {
+        assert!(
+            github_source_adapter_from_values(None, None)
+                .is_ok_and(|configured| configured.is_none())
+        );
+        assert!(
+            github_source_adapter_from_values(Some("123".to_owned()), None).is_err(),
+            "an App ID without its mounted key must fail startup"
+        );
+        assert!(
+            github_source_adapter_from_values(None, Some("/run/secret/key.pem".to_owned()))
+                .is_err(),
+            "a mounted key without its App ID must fail startup"
+        );
+        assert!(
+            github_source_adapter_from_values(
+                Some("not-an-id".to_owned()),
+                Some("/run/secret/key.pem".to_owned())
+            )
+            .is_err(),
+            "an invalid App ID must fail before any key read"
+        );
+        assert!(
+            github_source_adapter_from_values(Some("123".to_owned()), Some(String::new())).is_err(),
+            "an empty key path must fail startup"
+        );
     }
 
     #[test]

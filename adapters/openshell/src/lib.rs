@@ -48,6 +48,11 @@ use steward_ports::{
     SandboxTaskRuntime, TaskAttemptId,
 };
 #[cfg(feature = "runtime")]
+use steward_types::direct_package::{
+    EXECUTION_STDERR_ARCHIVE_PATH, EXECUTION_STDOUT_ARCHIVE_PATH, ExecutionLogMode,
+    MAX_EXECUTION_STREAM_BYTES, MAX_EXECUTION_TRANSCRIPT_BYTES,
+};
+#[cfg(feature = "runtime")]
 use steward_types::{AgentType, RuntimeRefs};
 #[cfg(feature = "runtime")]
 use tokio::sync::Mutex;
@@ -2265,6 +2270,8 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             &attempt_directory,
             &request.command,
             output_archive_command,
+            request.execution_class == SandboxExecutionClass::Agent
+                && request.diagnostics.execution_log == ExecutionLogMode::Full,
         );
         let executed = self
             .exec_task_process(
@@ -2457,13 +2464,46 @@ fn task_attempt_execution_command(
     directory: &str,
     command: &[String],
     output_archive_command: &str,
+    capture_transcript: bool,
 ) -> String {
+    let diagnostics_directory = format!("{directory}/.steward/diagnostics");
+    let stdout_path = format!("{directory}/{EXECUTION_STDOUT_ARCHIVE_PATH}");
+    let stderr_path = format!("{directory}/{EXECUTION_STDERR_ARCHIVE_PATH}");
     let directory = shell_quote(directory);
+    let diagnostics_directory = shell_quote(&diagnostics_directory);
+    let stdout_path = shell_quote(&stdout_path);
+    let stderr_path = shell_quote(&stderr_path);
     let command = command
         .iter()
         .map(|argument| shell_quote(argument))
         .collect::<Vec<_>>()
         .join(" ");
+    let (execution, archive_transcript) = if capture_transcript {
+        (
+            format!(
+                "mkdir -p {diagnostics_directory}; \
+                 ({command}) > {stdout_path} 2> {stderr_path}; status=$?; \
+                 if ! stdout_size=$(wc -c < {stdout_path}) \
+                    || ! stderr_size=$(wc -c < {stderr_path}); then status=70; \
+                 else transcript_size=$((stdout_size + stderr_size)); \
+                   if [ \"$stdout_size\" -gt {MAX_EXECUTION_STREAM_BYTES} ] \
+                      || [ \"$stderr_size\" -gt {MAX_EXECUTION_STREAM_BYTES} ] \
+                      || [ \"$transcript_size\" -gt {MAX_EXECUTION_TRANSCRIPT_BYTES} ]; then \
+                     printf '%s\\n' 'Task execution transcript exceeded its bounded archive contract' >&2; \
+                     status=74; \
+                   else cat {stdout_path}; cat {stderr_path} >&2; fi; \
+                 fi"
+            ),
+            format!(
+                "tar -rf {directory}/output.tar -C {directory} \
+                   {EXECUTION_STDOUT_ARCHIVE_PATH} {EXECUTION_STDERR_ARCHIVE_PATH}; status=$?; \
+                 if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
+                   printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi;"
+            ),
+        )
+    } else {
+        (format!("{command}; status=$?"), String::new())
+    };
     format!(
         "set +e; pid=$$; pid_start=$(awk '{{print $22}}' /proc/$$/stat) || exit 70; \
          printf '%s' \"$pid\" > {directory}/pid; \
@@ -2477,12 +2517,13 @@ fn task_attempt_execution_command(
          heartbeat_pid=$!; \
          trap 'kill \"$heartbeat_pid\" 2>/dev/null || true; wait \"$heartbeat_pid\" 2>/dev/null || true' EXIT; \
          printf running > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; \
-         {command}; status=$?; \
+         {execution}; \
          if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
            printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi; \
          ({output_archive_command}) > {directory}/output.tar; status=$?; \
          if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
            printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi; \
+         {archive_transcript} \
          printf succeeded > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state"
     )
 }
@@ -3251,7 +3292,7 @@ mod tests {
     fn task_attempt_marker_uses_a_cross_exec_liveness_lease() {
         let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
         let execution =
-            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true");
+            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true", false);
         assert!(execution.contains("pid=$$"));
         assert!(execution.contains("/proc/$$/stat"));
         assert!(execution.contains("heartbeat"));
@@ -3262,6 +3303,48 @@ mod tests {
         assert!(!observation.contains("/proc/$pid/stat"));
         assert!(!observation.contains("kill -0 \"$pid\""));
         assert!(observation.contains("state=outcome_unknown"));
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn successful_task_execution_archives_bounded_stdout_and_stderr() {
+        let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
+        let execution =
+            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true", true);
+
+        assert!(execution.contains(steward_types::direct_package::EXECUTION_STDOUT_ARCHIVE_PATH));
+        assert!(execution.contains(steward_types::direct_package::EXECUTION_STDERR_ARCHIVE_PATH));
+        assert!(
+            execution
+                .contains(&steward_types::direct_package::MAX_EXECUTION_STREAM_BYTES.to_string())
+        );
+        assert!(
+            execution.contains(
+                &steward_types::direct_package::MAX_EXECUTION_TRANSCRIPT_BYTES.to_string()
+            )
+        );
+        assert!(
+            matches!(
+                (
+                    execution.find("tar -rf"),
+                    execution.find("printf succeeded")
+                ),
+                (Some(append), Some(succeeded)) if append < succeeded
+            ),
+            "diagnostics must be appended durably before the successful marker"
+        );
+        assert!(
+            std::process::Command::new("/bin/sh")
+                .args(["-n", "-c", &execution])
+                .status()
+                .is_ok_and(|status| status.success()),
+            "the bounded transcript wrapper must be valid POSIX shell"
+        );
+
+        let disabled =
+            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true", false);
+        assert!(!disabled.contains(steward_types::direct_package::EXECUTION_STDOUT_ARCHIVE_PATH));
+        assert!(!disabled.contains(steward_types::direct_package::EXECUTION_STDERR_ARCHIVE_PATH));
     }
 
     #[cfg(feature = "runtime")]
