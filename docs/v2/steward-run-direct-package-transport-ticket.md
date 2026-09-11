@@ -2,8 +2,8 @@
 
 Priority: P0
 
-Status: merged by `apelogic-ai/steward-run#31` as
-`fd090be213b3f4d777bcfacc367e0cdbd574400b`
+Status: implementation merged by `apelogic-ai/steward-run#31` as `fd090be`; immutable
+nested-action pin correction in progress
 
 ## Goal
 
@@ -65,3 +65,13 @@ CVE-2026-58016 in the pinned Actions runner base image. DP-R02 removed that buil
 package chain without accepting the finding or weakening the policy and is now merged.
 The current DP-R01 head contains that remediation; image CI, live vulnerability-policy
 enforcement, and the complete round-trip are green.
+
+## Post-merge handoff correction
+
+The merged self-hosted reusable workflow exposes `invocation-path`, but it still
+invokes nested action commit `0707623`, whose action contract is legacy-only. Therefore
+`fd090be` is not itself a usable immutable caller pin despite the implementation and
+round-trip being green on the feature branch. An isolated follow-up must pin that
+nested action to the merged direct-transport implementation, rerun the complete
+workflow/action contract and round-trip, and produce the new reusable-workflow commit
+for DP-O01. No mutable ref is an acceptable substitute.
