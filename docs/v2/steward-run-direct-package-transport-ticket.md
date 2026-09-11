@@ -62,4 +62,4 @@ The GitHub round-trip workflow is green. The separate CI vulnerability gate repo
 four affected GLib packages for CVE-2026-58016 in the unchanged, pinned Actions
 runner base image. The scanner reports no fixed package version. This ticket neither
 accepts the finding nor weakens the security policy; remediation remains a separate
-baseline decision.
+baseline decision tracked by DP-R02.
