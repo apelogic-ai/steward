@@ -21,11 +21,13 @@ use steward_store::{
     ApproveAdmission, BrowserRbacAssignment, BrowserRbacAssignmentAction,
     BrowserRbacAssignmentChange, ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase,
     ConnectionOperationKind, ConnectionOperationReservation, ConnectionOperationReservationRequest,
-    ConnectionOperationRetention, ConnectionOperationState, ParkRejection, PgStore, StoreError,
+    ConnectionOperationRetention, ConnectionOperationState, EnvelopeRequestReservationRequest,
+    EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, ParkRejection, PgStore, StoreError,
     TaskActivationObservation, TaskCleanupObservation, TaskExecutionAttemptState,
     TaskExecutionObservation, TaskExecutionTransition, TaskOperationTransition,
     TaskOrchestrationState, TaskReservationRequest,
 };
+use steward_types::direct_package::DirectTaskBindingEvidence;
 use steward_types::{
     AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding, CanonicalUserId, Duration,
     Email, ModelRef, OrganizationId, OrganizationIdentity, OrganizationIdentityMigration,
@@ -2426,6 +2428,583 @@ fn proposed_spec() -> AgentRuntimeSpec {
         runner: RunnerRequirements::default(),
         bindings: None,
     }
+}
+
+fn direct_task_evidence(
+    task_uid: Uuid,
+    envelope_request_id: Uuid,
+    envelope_revision: i64,
+    envelope_digest: &str,
+) -> Result<DirectTaskBindingEvidence, Box<dyn Error>> {
+    let mut value = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../docs/contracts/task/v2/fixtures/positive/task-binding-evidence.json"
+    ))?;
+    value["taskUid"] = task_uid.to_string().into();
+    value["envelope"]["uid"] = envelope_request_id.to_string().into();
+    value["envelope"]["revision"] = envelope_revision.into();
+    value["envelope"]["digest"] = format!("steward:{envelope_digest}").into();
+    Ok(serde_json::from_value(value)?)
+}
+
+struct ActiveDirectTaskFixture {
+    store: PgStore,
+    suffix: String,
+    service: String,
+    member_role: String,
+    owner_user_id: CanonicalUserId,
+    owner: Email,
+    authority: Envelope,
+    envelope_request_id: Uuid,
+    envelope_instance_id: String,
+    envelope_digest: String,
+    service_envelope_digest: String,
+}
+
+impl ActiveDirectTaskFixture {
+    async fn new(database_url: &str, label: &str) -> Result<Self, Box<dyn Error>> {
+        let store = isolated_approval_queue_store(database_url).await?;
+        let suffix = format!(
+            "{label}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)?
+                .as_nanos()
+        );
+        let service = format!("direct-envelope-{suffix}");
+        let member_role = format!("direct-role-{suffix}");
+        let identity = store
+            .register_canonical_identity(
+                &google_identity(
+                    format!("direct-envelope-subject-{suffix}"),
+                    format!("alice-{suffix}@example.com"),
+                )?,
+                "test-bootstrap",
+            )
+            .await?;
+        let authority = envelope("250.00", 1);
+        store
+            .insert_service_envelope(&service, &authority, "admin@example.com")
+            .await?;
+        store
+            .insert_envelope(&member_role, &authority, "admin@example.com")
+            .await?;
+        let envelope_request = store
+            .reserve_envelope_request(EnvelopeRequestReservationRequest {
+                owner_user_id: &identity.user_id,
+                template_id: &member_role,
+                template_revision: authority.revision,
+                requested_envelope: &authority,
+                idempotency_key: &format!("direct-envelope-request-{suffix}"),
+                actor: identity.user_id.as_str(),
+            })
+            .await?;
+        let envelope_instance_id = format!("env_direct_{suffix}");
+        let envelope_digest = format!("sha256:{}", "b".repeat(64));
+        store
+            .append_envelope_request_status(
+                envelope_request.record.id,
+                EnvelopeRequestStatusUpdate {
+                    from: EnvelopeRequestStatus::Pending,
+                    to: EnvelopeRequestStatus::Provisioned,
+                    approval_id: None,
+                    envelope_instance_id: Some(&envelope_instance_id),
+                    envelope_digest: Some(&envelope_digest),
+                    reason: None,
+                    approved_envelope: Some(&authority),
+                    actor: identity.user_id.as_str(),
+                },
+            )
+            .await?;
+        Ok(Self {
+            store,
+            suffix,
+            service,
+            member_role,
+            owner_user_id: identity.user_id,
+            owner: identity.display_email,
+            authority,
+            envelope_request_id: envelope_request.record.id,
+            envelope_instance_id,
+            envelope_digest,
+            service_envelope_digest: format!("sha256:{}", "e".repeat(64)),
+        })
+    }
+
+    async fn try_reserve_task(
+        &self,
+        label: &str,
+    ) -> Result<Result<steward_store::TaskReservation, StoreError>, Box<dyn Error>> {
+        let task_uid = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let runtime_name = format!("task-{}", operation_id.simple());
+        let mut spec = proposed_spec();
+        spec.principal = Principal::Service {
+            name: self.service.clone(),
+            acting_user: Some(self.owner.clone()),
+        };
+        spec.owner = self.owner.clone();
+        spec.canonical_authority = Some(CanonicalAuthorityBinding::new(
+            self.owner_user_id.clone(),
+            Some(self.owner_user_id.clone()),
+        )?);
+        let decision = evaluate(&spec, &self.authority)
+            .map_err(|error| io::Error::other(format!("evaluate direct Task: {error:?}")))?;
+        assert_eq!(decision, AdmissionDecision::Admit);
+        let evidence = direct_task_evidence(
+            task_uid,
+            self.envelope_request_id,
+            self.authority.revision,
+            &self.envelope_digest,
+        )?;
+        let command = vec!["agent-v1".to_owned()];
+        let candidate_digest = format!("sha256:{}", "c".repeat(64));
+        let inert_digest = format!("sha256:{}", "d".repeat(64));
+        Ok(self
+            .store
+            .reserve_task(&TaskReservationRequest {
+                task_uid,
+                operation_id,
+                idempotency_key: &format!("direct-task-{label}-{}", self.suffix),
+                submitter_service: &self.service,
+                acting_user: Some(self.owner.as_str()),
+                acting_user_id: Some(self.owner_user_id.as_str()),
+                owner: self.owner.as_str(),
+                owner_user_id: self.owner_user_id.as_str(),
+                workflow: "direct:release-summary@v1",
+                workflow_name: None,
+                workflow_version: None,
+                workflow_digest: None,
+                user_envelope_instance_id: Some(&self.envelope_instance_id),
+                user_envelope_revision: Some(self.authority.revision),
+                user_envelope_digest: Some(&self.envelope_digest),
+                coding_agent_runtime: "agent-v1",
+                runtime_uid: None,
+                runtime_namespace: "steward-test",
+                runtime_name: &runtime_name,
+                runtime_ownership: RuntimeOwnership::Provisioned,
+                runtime_spec: &spec,
+                agent_command: &command,
+                execution_binding: None,
+                direct_task_evidence: Some(&evidence),
+                envelope_revision: self.authority.revision,
+                service_envelope: &self.authority,
+                service_envelope_digest: &self.service_envelope_digest,
+                candidate_digest: &candidate_digest,
+                admission_decision: &decision,
+                inert_manifest_digest: &inert_digest,
+                active_manifest_digest: &candidate_digest,
+            })
+            .await)
+    }
+
+    async fn reserve_task(&self, label: &str) -> Result<Uuid, Box<dyn Error>> {
+        let reservation = self.try_reserve_task(label).await??;
+        assert!(reservation.inserted);
+        Ok(reservation.record.task_uid)
+    }
+
+    async fn supersede_envelope(&self, label: &str) -> Result<(), Box<dyn Error>> {
+        let replacement = self
+            .store
+            .reserve_envelope_request(EnvelopeRequestReservationRequest {
+                owner_user_id: &self.owner_user_id,
+                template_id: &self.member_role,
+                template_revision: self.authority.revision,
+                requested_envelope: &self.authority,
+                idempotency_key: &format!("replacement-{label}-{}", self.suffix),
+                actor: self.owner_user_id.as_str(),
+            })
+            .await?;
+        let replacement_instance_id = format!("env_direct_replacement_{label}_{}", self.suffix);
+        // Reusing the same approved bytes and digest must still revoke the prior exact
+        // request/instance selection.
+        let replacement_digest = self.envelope_digest.clone();
+        self.store
+            .append_envelope_request_status(
+                replacement.record.id,
+                EnvelopeRequestStatusUpdate {
+                    from: EnvelopeRequestStatus::Pending,
+                    to: EnvelopeRequestStatus::Provisioned,
+                    approval_id: None,
+                    envelope_instance_id: Some(&replacement_instance_id),
+                    envelope_digest: Some(&replacement_digest),
+                    reason: None,
+                    approved_envelope: Some(&self.authority),
+                    actor: self.owner_user_id.as_str(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn activate_task(&self, task_uid: Uuid, runtime_uid: &str) -> Result<(), Box<dyn Error>> {
+        assert!(matches!(
+            self.store
+                .authorize_task_runtime_creation(task_uid, 1, "controller-a")
+                .await?,
+            TaskOperationTransition::Applied(_)
+        ));
+        assert!(matches!(
+            self.store
+                .record_task_runtime_observed(
+                    task_uid,
+                    2,
+                    runtime_uid,
+                    "resource-version-a",
+                    "controller-a",
+                )
+                .await?,
+            TaskOperationTransition::Applied(_)
+        ));
+        assert!(matches!(
+            self.store
+                .decide_task_runtime_authority(
+                    task_uid,
+                    3,
+                    &self.authority,
+                    &self.service_envelope_digest,
+                    "controller-a",
+                )
+                .await?,
+            TaskOperationTransition::Applied(_)
+        ));
+        assert!(matches!(
+            self.store
+                .decide_task_runtime_authority(
+                    task_uid,
+                    4,
+                    &self.authority,
+                    &self.service_envelope_digest,
+                    "controller-a",
+                )
+                .await?,
+            TaskOperationTransition::Applied(_)
+        ));
+        assert!(matches!(
+            self.store
+                .record_task_activation_observed(
+                    task_uid,
+                    5,
+                    &TaskActivationObservation {
+                        runtime_uid,
+                        resource_version: "resource-version-active",
+                        active_manifest_digest: &format!("sha256:{}", "c".repeat(64)),
+                        provider_set_ready: true,
+                    },
+                    "controller-a",
+                )
+                .await?,
+            TaskOperationTransition::Applied(_)
+        ));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn direct_task_stale_user_envelope_fences_attempt_and_start()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Task Postgres test")
+    })?;
+
+    let before_attempt = ActiveDirectTaskFixture::new(&database_url, "before-attempt").await?;
+    let attempt_task = before_attempt.reserve_task("attempt").await?;
+    before_attempt
+        .activate_task(attempt_task, "runtime-before-attempt")
+        .await?;
+    before_attempt
+        .store
+        .put_task_inputs(
+            attempt_task,
+            &before_attempt.service,
+            before_attempt.owner_user_id.as_str(),
+            b"fixture-input",
+        )
+        .await?;
+    before_attempt
+        .store
+        .request_task_execution(
+            attempt_task,
+            &before_attempt.service,
+            before_attempt.owner_user_id.as_str(),
+        )
+        .await?;
+    before_attempt.supersede_envelope("attempt").await?;
+    assert!(matches!(
+        before_attempt
+            .store
+            .claim_task_execution_attempt(
+                attempt_task,
+                &format!("sha256:{}", "1".repeat(64)),
+                &format!("sha256:{}", "2".repeat(64)),
+                "controller-a",
+            )
+            .await?,
+        TaskExecutionTransition::AuthorityInactive { attempt: None, .. }
+    ));
+    assert!(before_attempt
+        .store
+        .task_execution_attempt(attempt_task)
+        .await?
+        .is_none());
+
+    let before_start = ActiveDirectTaskFixture::new(&database_url, "before-start").await?;
+    let start_task = before_start.reserve_task("start").await?;
+    before_start
+        .activate_task(start_task, "runtime-before-start")
+        .await?;
+    before_start
+        .store
+        .put_task_inputs(
+            start_task,
+            &before_start.service,
+            before_start.owner_user_id.as_str(),
+            b"fixture-input",
+        )
+        .await?;
+    before_start
+        .store
+        .request_task_execution(
+            start_task,
+            &before_start.service,
+            before_start.owner_user_id.as_str(),
+        )
+        .await?;
+    let attempt = match before_start
+        .store
+        .claim_task_execution_attempt(
+            start_task,
+            &format!("sha256:{}", "1".repeat(64)),
+            &format!("sha256:{}", "2".repeat(64)),
+            "controller-a",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Created(attempt) => attempt,
+        other => return Err(io::Error::other(format!("unexpected attempt: {other:?}")).into()),
+    };
+    before_start.supersede_envelope("start").await?;
+    let transition = before_start
+        .store
+        .authorize_task_execution_start(attempt.attempt_id, 1, "controller-a")
+        .await?;
+    assert!(matches!(
+        transition,
+        TaskExecutionTransition::AuthorityInactive { .. }
+    ));
+    let fenced = before_start
+        .store
+        .task_execution_attempt(start_task)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert!(fenced.start_invoked_at.is_none());
+    assert_eq!(fenced.state, TaskExecutionAttemptState::NotStarted);
+    assert!(!before_start
+        .store
+        .task_execution_holds_runtime_lease(fenced.attempt_id)
+        .await?);
+    let task = before_start
+        .store
+        .task(start_task)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(task.phase, TaskPhase::Failed);
+    assert!(task.finalize_requested);
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_task_reservation_revalidates_exact_user_envelope()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Task Postgres test")
+    })?;
+    let fixture = ActiveDirectTaskFixture::new(&database_url, "before-reserve").await?;
+    fixture.supersede_envelope("same-content").await?;
+    assert!(matches!(
+        fixture.try_reserve_task("stale").await?,
+        Err(StoreError::StaleEnvelope)
+    ));
+    let task_count = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM task_submissions")
+        .fetch_one(fixture.store.pool())
+        .await?;
+    let operation_count =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM task_runtime_operations")
+            .fetch_one(fixture.store.pool())
+            .await?;
+    assert_eq!(task_count, 0);
+    assert_eq!(operation_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_task_runtime_create_pending_revalidates_before_effect()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Task Postgres test")
+    })?;
+    let fixture = ActiveDirectTaskFixture::new(&database_url, "create-pending").await?;
+    let task_uid = fixture.reserve_task("create-pending").await?;
+    assert!(matches!(
+        fixture
+            .store
+            .authorize_task_runtime_creation(task_uid, 1, "controller-a")
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    fixture.supersede_envelope("create-pending").await?;
+    assert!(matches!(
+        fixture
+            .store
+            .authorize_task_runtime_creation(task_uid, 2, "controller-b")
+            .await?,
+        TaskOperationTransition::AuthorityInactive { .. }
+    ));
+    let operation = fixture
+        .store
+        .task_runtime_operation(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(operation.state, TaskOrchestrationState::CleanupPending);
+    assert!(operation.runtime_uid.is_none());
+    assert!(matches!(
+        fixture
+            .store
+            .authorize_task_runtime_creation(task_uid, 2, "controller-c")
+            .await?,
+        TaskOperationTransition::Superseded(_)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_task_runtime_authority_rejects_stale_exact_user_envelope()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Task Postgres test")
+    })?;
+    let fixture = ActiveDirectTaskFixture::new(&database_url, "runtime-observed").await?;
+    let task_uid = fixture.reserve_task("runtime-observed").await?;
+    assert!(matches!(
+        fixture
+            .store
+            .authorize_task_runtime_creation(task_uid, 1, "controller-a")
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    assert!(matches!(
+        fixture
+            .store
+            .record_task_runtime_observed(
+                task_uid,
+                2,
+                "runtime-observed-uid",
+                "resource-version-observed",
+                "controller-a",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    fixture.supersede_envelope("runtime-observed").await?;
+    assert!(matches!(
+        fixture
+            .store
+            .decide_task_runtime_authority(
+                task_uid,
+                3,
+                &fixture.authority,
+                &fixture.service_envelope_digest,
+                "controller-b",
+            )
+            .await?,
+        TaskOperationTransition::AuthorityInactive { .. }
+    ));
+    let approval_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM approvals WHERE id IN (\
+             SELECT approval_id FROM external_effect_outbox WHERE task_uid = $1)",
+    )
+    .bind(task_uid)
+    .fetch_one(fixture.store.pool())
+    .await?;
+    let effect_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM external_effect_outbox WHERE task_uid = $1",
+    )
+    .bind(task_uid)
+    .fetch_one(fixture.store.pool())
+    .await?;
+    assert_eq!(approval_count, 0);
+    assert_eq!(effect_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_task_stale_user_envelope_terminalizes_before_runtime_creation()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Task Postgres test")
+    })?;
+    let fixture = ActiveDirectTaskFixture::new(&database_url, "before-create").await?;
+    let task_uid = fixture.reserve_task("before-create").await?;
+    fixture.supersede_envelope("before-create").await?;
+    let transition = fixture
+        .store
+        .authorize_task_runtime_creation(task_uid, 1, "controller-a")
+        .await?;
+    assert!(matches!(
+        transition,
+        TaskOperationTransition::AuthorityInactive { .. }
+    ));
+    let operation = fixture
+        .store
+        .task_runtime_operation(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(operation.state, TaskOrchestrationState::CleanupPending);
+    assert!(operation.runtime_create_authorized_at.is_none());
+    let task = fixture
+        .store
+        .task(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(task.phase, TaskPhase::Failed);
+    assert!(task.finalize_requested);
+    assert_eq!(task.failure_reason.as_deref(), Some("user_envelope_inactive"));
+
+    assert!(matches!(
+        fixture
+            .store
+            .authorize_task_runtime_creation(task_uid, 1, "controller-b")
+            .await?,
+        TaskOperationTransition::Superseded(_)
+    ));
+    assert!(matches!(
+        fixture
+            .store
+            .record_task_cleanup_complete(
+                task_uid,
+                2,
+                TaskCleanupObservation {
+                    exact_runtime_absent: false,
+                },
+                "controller-b",
+            )
+            .await?,
+        TaskOperationTransition::Applied(_)
+    ));
+    let finalized = fixture
+        .store
+        .task_runtime_operation(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(finalized.state, TaskOrchestrationState::Finalized);
+    let inactive_events = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM task_orchestration_journal \
+         WHERE task_uid = $1 AND event_kind = 'runtime_creation_user_envelope_inactive'",
+    )
+    .bind(task_uid)
+    .fetch_one(fixture.store.pool())
+    .await?;
+    assert_eq!(inactive_events, 1);
+    Ok(())
 }
 
 #[tokio::test]

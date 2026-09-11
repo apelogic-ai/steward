@@ -1799,6 +1799,11 @@ impl PgStore {
             .map(task_record)
             .transpose()?
             .ok_or(StoreError::TaskNotFound)?;
+        if task.direct_task_evidence.is_some()
+            && !direct_user_envelope_authority_active(transaction, &task).await?
+        {
+            return Ok((task, EffectiveTaskAuthority::Inactive));
+        }
         lock_envelope_scope(
             transaction,
             EnvelopeScopeKind::Service,
@@ -2891,6 +2896,20 @@ impl PgStore {
             AdmissionDecision::Reject { deltas } => ("parked", "reject", deltas.clone()),
         };
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        if let Some(evidence) = request.direct_task_evidence
+            && !direct_user_envelope_evidence_active(
+                &mut transaction,
+                evidence,
+                request.owner_user_id,
+                request.user_envelope_instance_id,
+                request.user_envelope_revision,
+                request.user_envelope_digest,
+                request.runtime_spec,
+            )
+            .await?
+        {
+            return Err(StoreError::StaleEnvelope);
+        }
         if let Some(record) = sqlx::query(
             "SELECT * FROM task_submissions \
              WHERE submitter_service = $1 AND owner_user_id = $2 \
@@ -3395,6 +3414,66 @@ impl PgStore {
             return Err(StoreError::InvalidTaskTransition);
         }
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let task = task_in_transaction_for_update(&mut transaction, task_uid).await?;
+        let current =
+            task_runtime_operation_in_transaction_for_update(&mut transaction, task_uid).await?;
+        if current.generation != expected_generation
+            || !matches!(
+                current.state,
+                TaskOrchestrationState::IntentRecorded
+                    | TaskOrchestrationState::RuntimeCreatePending
+            )
+            || current.runtime_ownership != TaskRuntimeOwnership::Provisioned
+        {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(TaskOperationTransition::Superseded(current));
+        }
+        if task.direct_task_evidence.is_some()
+            && !direct_user_envelope_authority_active(&mut transaction, &task).await?
+        {
+            sqlx::query(
+                "UPDATE task_runtime_operations \
+                 SET state = 'cleanup_pending', generation = generation + 1, \
+                     cleanup_requested_at = now(), last_error_code = 'user_envelope_inactive', \
+                     retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = now() \
+                 WHERE task_uid = $1 AND generation = $2 AND state = $3",
+            )
+            .bind(task_uid)
+            .bind(expected_generation)
+            .bind(current.state.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            sqlx::query(
+                "UPDATE task_submissions \
+                 SET phase = 'failed', finalize_requested = true, \
+                     failure_reason = COALESCE(failure_reason, 'user_envelope_inactive'), \
+                     updated_at = now() WHERE task_uid = $1 AND NOT finalized",
+            )
+            .bind(task_uid)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            append_task_orchestration_journal(
+                &mut transaction,
+                task_uid,
+                expected_generation + 1,
+                TaskOrchestrationState::CleanupPending,
+                "runtime_creation_user_envelope_inactive",
+                actor,
+            )
+            .await?;
+            let current = task_runtime_operation_in_transaction(&mut transaction, task_uid).await?;
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(TaskOperationTransition::AuthorityInactive {
+                current,
+                reason: "user_envelope_inactive",
+            });
+        }
+        if current.state == TaskOrchestrationState::RuntimeCreatePending {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(TaskOperationTransition::AlreadyApplied(current));
+        }
         let updated = sqlx::query(
             "UPDATE task_runtime_operations operations \
              SET state = 'runtime_create_pending', generation = generation + 1, \
@@ -3524,6 +3603,8 @@ impl PgStore {
             transaction.commit().await.map_err(database_error)?;
             return Ok(TaskOperationTransition::Superseded(current));
         }
+        let direct_user_envelope_active =
+            direct_user_envelope_authority_active(&mut transaction, &task).await?;
         let termination_requested = task.finalize_requested || task.cancel_requested;
         let internal_authority = task.internal_authority_id.is_some()
             && task.internal_authority_version.is_some()
@@ -3570,7 +3651,11 @@ impl PgStore {
         if current.state == TaskOrchestrationState::ActivationPending && !termination_requested {
             let authority_is_current = match current.activation_authority_kind.as_deref() {
                 Some("internal") => internal_authority,
-                Some("baseline") => !internal_authority && decision == AdmissionDecision::Admit,
+                Some("baseline") => {
+                    !internal_authority
+                        && direct_user_envelope_active
+                        && decision == AdmissionDecision::Admit
+                }
                 Some("grant") => {
                     let runtime_uid = current
                         .runtime_uid
@@ -3642,7 +3727,8 @@ impl PgStore {
         }
         if current.state == TaskOrchestrationState::RuntimeObserved
             && !termination_requested
-            && (internal_authority || decision == AdmissionDecision::Admit)
+            && (internal_authority
+                || (direct_user_envelope_active && decision == AdmissionDecision::Admit))
         {
             let authority_kind = if internal_authority {
                 "internal"
@@ -3688,6 +3774,7 @@ impl PgStore {
 
         let approval_can_be_materialized = current.state == TaskOrchestrationState::RuntimeObserved
             && !termination_requested
+            && direct_user_envelope_active
             && task.original_admission_decision.as_deref() == Some("reject")
             && !task
                 .original_admission_deltas
@@ -6111,6 +6198,105 @@ impl PgStore {
         .map_err(database_error)?;
         row.map(task_record).transpose()
     }
+}
+
+async fn direct_user_envelope_authority_active(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    task: &TaskRecord,
+) -> Result<bool, StoreError> {
+    let Some(evidence) = task.direct_task_evidence.as_ref() else {
+        return Ok(true);
+    };
+    let Some(owner_user_id) = task.owner_user_id.as_deref() else {
+        return Ok(false);
+    };
+    direct_user_envelope_evidence_active(
+        transaction,
+        evidence,
+        owner_user_id,
+        task.user_envelope_instance_id.as_deref(),
+        task.user_envelope_revision,
+        task.user_envelope_digest.as_deref(),
+        &task.runtime_spec,
+    )
+    .await
+}
+
+async fn direct_user_envelope_evidence_active(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    evidence: &DirectTaskBindingEvidence,
+    owner_user_id: &str,
+    user_envelope_instance_id: Option<&str>,
+    user_envelope_revision: Option<i64>,
+    user_envelope_digest: Option<&str>,
+    runtime_spec: &AgentRuntimeSpec,
+) -> Result<bool, StoreError> {
+    let Ok(envelope_request_id) = Uuid::parse_str(evidence.envelope.uid.as_str()) else {
+        return Ok(false);
+    };
+    let Ok(envelope_revision) = i64::try_from(evidence.envelope.revision) else {
+        return Ok(false);
+    };
+    let Some(evidence_digest) = evidence.envelope.digest.as_str().strip_prefix("steward:") else {
+        return Ok(false);
+    };
+    if user_envelope_revision != Some(envelope_revision)
+        || user_envelope_digest != Some(evidence_digest)
+    {
+        return Ok(false);
+    }
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("active-user-envelope:{owner_user_id}"))
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    let row = sqlx::query(
+        "SELECT requests.owner_user_id, status.status, status.envelope_instance_id, \
+                status.envelope_digest, status.approved_envelope \
+         FROM envelope_requests requests \
+         JOIN LATERAL ( \
+             SELECT events.status, events.envelope_instance_id, events.envelope_digest, \
+                    events.approved_envelope \
+             FROM envelope_request_events events \
+             WHERE events.request_id = requests.id \
+             ORDER BY events.at DESC, events.id DESC LIMIT 1 \
+         ) status ON true \
+         WHERE requests.id = $1",
+    )
+    .bind(envelope_request_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let approved_envelope = row
+        .try_get::<Option<Json<Envelope>>, _>("approved_envelope")
+        .map_err(database_error)?
+        .map(|value| value.0);
+    Ok(row
+        .try_get::<String, _>("owner_user_id")
+        .map_err(database_error)?
+        == owner_user_id
+        && row.try_get::<String, _>("status").map_err(database_error)? == "provisioned"
+        && row
+            .try_get::<Option<String>, _>("envelope_instance_id")
+            .map_err(database_error)?
+            .as_deref()
+            == user_envelope_instance_id
+        && row
+            .try_get::<Option<String>, _>("envelope_digest")
+            .map_err(database_error)?
+            .as_deref()
+            == Some(evidence_digest)
+        && approved_envelope.as_ref().is_some_and(|envelope| {
+            envelope.revision == envelope_revision
+                && matches!(
+                    evaluate(runtime_spec, envelope),
+                    Ok(AdmissionDecision::Admit)
+                )
+        }))
 }
 
 pub struct TaskReservationRequest<'a> {

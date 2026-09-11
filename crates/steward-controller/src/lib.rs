@@ -1382,6 +1382,23 @@ async fn reconcile_runtime_creation(
     authority: &PgStore,
     work: &TaskOrchestrationWorkItem,
 ) -> Result<(), TaskControllerError> {
+    match authority
+        .authorize_task_runtime_creation(
+            work.task.task_uid,
+            work.operation.generation,
+            TASK_ORCHESTRATOR_ACTOR,
+        )
+        .await
+        .map_err(TaskControllerError::Store)?
+    {
+        steward_store::TaskOperationTransition::AlreadyApplied(current)
+            if current.state == TaskOrchestrationState::RuntimeCreatePending => {}
+        steward_store::TaskOperationTransition::Applied(_)
+        | steward_store::TaskOperationTransition::AlreadyApplied(_)
+        | steward_store::TaskOperationTransition::Superseded(_)
+        | steward_store::TaskOperationTransition::AuthorityInactive { .. }
+        | steward_store::TaskOperationTransition::InvariantViolation { .. } => return Ok(()),
+    }
     let envelope = task_immutable_envelope(authority, &work.task).await?;
     let expected = orchestrated_task_runtime_manifest(work, Some(&envelope), false)?;
     let api = Api::<AgentRuntime>::namespaced(client.clone(), &work.operation.runtime_namespace);
