@@ -53,9 +53,11 @@ caller-to-source authorization, canonicalization, and the closure digest.
 ## Parallel boundary
 
 May proceed alongside DP-I01, DP-R01, and DP-A01 after DP-C01. DP-S01 depends on the
-port and adapter. The initial DP-S01 package path remains limited to the invoking
-repository at its exact triggered commit; transport support for multiple admitted
-repositories does not enable a cross-repository package closure. Do not use local-main
+port and adapter. The initial demo intentionally resolves an explicit `git:sha1`
+package from an authorized source repository distinct from the invoking repository;
+DP-S01 requires the active caller-to-source binding before trusting its content.
+`git:trigger` remains limited to the invoking repository. Transport support for
+multiple repositories never grants that authorization by itself. Do not use local-main
 for adapter development.
 
 ## Planned dependency boundary
