@@ -5881,6 +5881,20 @@ async fn consumed_connection_output_retires_without_rewriting_execution_history(
                 .to_mut()
                 .retain(|migration| migration.version <= 32);
             historical.run(&pool).await?;
+            // The current store decoder includes the later direct-package evidence
+            // column. Add only its nullable shape while arranging the legacy
+            // connection-output state, then remove it before exercising the real
+            // append-only migrations below.
+            sqlx::query("ALTER TABLE task_submissions ADD COLUMN direct_task_evidence jsonb")
+                .execute(&pool)
+                .await?;
+            sqlx::query(
+                "ALTER TABLE task_execution_attempts \
+                    ADD COLUMN execution_stdout bytea, \
+                    ADD COLUMN execution_stderr bytea",
+            )
+            .execute(&pool)
+            .await?;
         } else {
             store.migrate().await?;
         }
@@ -5987,11 +6001,23 @@ async fn consumed_connection_output_retires_without_rewriting_execution_history(
                     .await,
                 Err(StoreError::Database(_))
             ));
-            let before = store
-                .task(task_uid)
-                .await?
-                .ok_or(StoreError::TaskNotFound)?;
+            let before = sqlx::query_as::<_, (String, Option<Vec<u8>>)>(
+                "SELECT phase, output_archive FROM task_submissions WHERE task_uid = $1",
+            )
+            .bind(task_uid)
+            .fetch_one(store.pool())
+            .await?;
             let history_before = store.task_execution_attempt(task_uid).await?;
+            sqlx::query("ALTER TABLE task_submissions DROP COLUMN direct_task_evidence")
+                .execute(store.pool())
+                .await?;
+            sqlx::query(
+                "ALTER TABLE task_execution_attempts \
+                    DROP COLUMN execution_stdout, \
+                    DROP COLUMN execution_stderr",
+            )
+            .execute(store.pool())
+            .await?;
             store.migrate().await?;
             // The staged rollout replaces the old processes. Reconnect after
             // DDL rather than reusing pre-upgrade SELECT * statement caches.
@@ -6001,7 +6027,13 @@ async fn consumed_connection_output_retires_without_rewriting_execution_history(
                 .connect_with(options)
                 .await?;
             store = PgStore::new(pool.clone());
-            assert_eq!(store.task(task_uid).await?, Some(before));
+            let after = sqlx::query_as::<_, (String, Option<Vec<u8>>)>(
+                "SELECT phase, output_archive FROM task_submissions WHERE task_uid = $1",
+            )
+            .bind(task_uid)
+            .fetch_one(store.pool())
+            .await?;
+            assert_eq!(after, before);
             assert_eq!(
                 store.task_execution_attempt(task_uid).await?,
                 history_before
