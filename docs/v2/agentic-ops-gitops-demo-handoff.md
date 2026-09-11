@@ -2,9 +2,9 @@
 
 Priority: P0 integration
 
-Status: neutral target-fixture implementation is in review as
-`apelogic-ai/gitops#176` at `e48300b`, locally and CI green with a clean merge state;
-final activation waits for reviewed merged component commits
+Status: neutral target-fixture PR `apelogic-ai/gitops#176` merged as `f8ec588`
+(reviewed head `e48300b`); final activation waits for reviewed merged component
+commits
 
 ## Goal
 
