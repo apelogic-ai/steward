@@ -1,0 +1,6 @@
+{
+  "canonicalization": "RFC8785",
+  "algorithm": "sha256",
+  "document": "package-closure.canonical.json",
+  "digest": "steward:sha256:82bac7f1c28cc851e94be8bc10e9dfe563f5c940eb5e979edb91fc84fd0d0ef4"
+}

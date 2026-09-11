@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "steward.task-definition/v2",
+  "name": "repository-review",
+  "version": 2,
+  "runtime": {
+    "agentRef": "example-agent@1.2.3"
+  },
+  "prompt": "prompt.md",
+  "skills": [
+    "skills/repository-inspection/skill.json"
+  ],
+  "outputs": [
+    {
+      "path": "out/report.md",
+      "kind": "file",
+      "required": true
+    }
+  ],
+  "requires": {
+    "execution": {
+      "capabilities": ["shell"]
+    },
+    "authority": {
+      "llms": [
+        { "provider": "litellm", "model": "review-model" }
+      ],
+      "tools": [
+        { "provider": "github", "resource": "actions", "action": "read" }
+      ],
+      "budget": {
+        "monthlyLimit": "50.00",
+        "singleRunLimit": "2.00",
+        "currency": "USD"
+      },
+      "ttl": "1h",
+      "runner": {
+        "platforms": ["linux"],
+        "memory": "2Gi",
+        "compute": "1000m",
+        "storage": "4Gi"
+      }
+    }
+  }
+}

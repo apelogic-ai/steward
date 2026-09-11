@@ -1,0 +1,49 @@
+{
+  "schemaVersion": "steward.contracts/manifest/v1",
+  "contractVersion": "steward.task/v2",
+  "schema": "schemas/direct-package.schema.json",
+  "definitions": [
+    { "name": "directTaskSubmission", "ref": "#/$defs/directTaskSubmission" },
+    { "name": "invocationManifest", "ref": "#/$defs/invocationManifest" },
+    { "name": "directTaskStatusResponse", "ref": "#/$defs/directTaskStatusResponse" },
+    { "name": "taskDefinition", "ref": "#/$defs/taskDefinition" },
+    { "name": "instructionSkill", "ref": "#/$defs/instructionSkill" },
+    { "name": "sourceProvenance", "ref": "#/$defs/sourceProvenance" },
+    { "name": "packageClosure", "ref": "#/$defs/packageClosure" },
+    { "name": "taskBindingEvidence", "ref": "#/$defs/taskBindingEvidence" }
+  ],
+  "fixtures": [
+    { "path": "fixtures/positive/direct-task-submission.json", "definition": "directTaskSubmission", "valid": true },
+    { "path": "fixtures/positive/invocation-manifest.json", "definition": "invocationManifest", "valid": true },
+    { "path": "fixtures/positive/invocation-manifest-trigger.json", "definition": "invocationManifest", "valid": true },
+    { "path": "fixtures/positive/direct-task-status.json", "definition": "directTaskStatusResponse", "valid": true },
+    { "path": "fixtures/positive/task-definition-no-skills.json", "definition": "taskDefinition", "valid": true },
+    { "path": "fixtures/positive/task-definition-with-requires.json", "definition": "taskDefinition", "valid": true },
+    { "path": "fixtures/positive/instruction-skill-default-kind.json", "definition": "instructionSkill", "valid": true },
+    { "path": "fixtures/positive/source-provenance.json", "definition": "sourceProvenance", "valid": true },
+    { "path": "fixtures/positive/package-closure.json", "definition": "packageClosure", "valid": true },
+    { "path": "fixtures/positive/task-binding-evidence.json", "definition": "taskBindingEvidence", "valid": true },
+    { "path": "fixtures/negative/submission-unknown-contract.json", "definition": "directTaskSubmission", "valid": false },
+    { "path": "fixtures/negative/invocation-unknown-field.json", "definition": "invocationManifest", "valid": false },
+    { "path": "fixtures/negative/invocation-mutable-ref.json", "definition": "invocationManifest", "valid": false },
+    { "path": "fixtures/negative/invocation-path-traversal.json", "definition": "invocationManifest", "valid": false },
+    { "path": "fixtures/negative/invocation-trigger-cross-repository.json", "definition": "invocationManifest", "valid": false, "semantic": "invoking repository differs" },
+    { "path": "fixtures/negative/invocation-unknown-diagnostics.json", "definition": "invocationManifest", "valid": false },
+    { "path": "fixtures/negative/task-definition-partial-requires.json", "definition": "taskDefinition", "valid": false },
+    { "path": "fixtures/negative/task-definition-duplicate-skills.json", "definition": "taskDefinition", "valid": false },
+    { "path": "fixtures/negative/task-definition-output-escape.json", "definition": "taskDefinition", "valid": false },
+    { "path": "fixtures/negative/instruction-skill-executable.json", "definition": "instructionSkill", "valid": false },
+    { "path": "fixtures/negative/package-closure-duplicate-path.json", "definition": "packageClosure", "valid": false, "semantic": "duplicate logical path" },
+    { "path": "fixtures/negative/package-closure-missing-task-definition.json", "definition": "packageClosure", "valid": false, "semantic": "missing TaskDefinition entry point" },
+    { "path": "fixtures/negative/package-closure-mismatched-task-definition.json", "definition": "packageClosure", "valid": false, "semantic": "TaskDefinition kind does not match entry point" },
+    { "path": "fixtures/negative/source-provenance-token-injection.json", "definition": "sourceProvenance", "valid": false },
+    { "path": "fixtures/compatibility/frozen-v1-task-definition.json", "definition": "taskDefinition", "valid": false, "category": "frozen_v1_compatibility" }
+  ],
+  "vectors": [
+    {
+      "source": "fixtures/positive/package-closure.json",
+      "canonical": "vectors/package-closure.canonical.json",
+      "digest": "vectors/package-closure-digest.json"
+    }
+  ]
+}

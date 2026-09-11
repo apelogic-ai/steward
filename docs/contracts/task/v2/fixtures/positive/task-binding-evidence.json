@@ -1,0 +1,98 @@
+{
+  "schemaVersion": "steward.task/source-authority-evidence/v1",
+  "taskUid": "11111111-1111-4111-8111-111111111111",
+  "sourceProvenance": {
+    "contractVersion": "steward.source-provenance/v1",
+    "provider": "github",
+    "repository": {
+      "id": "123456",
+      "ownerId": "7890",
+      "name": "example-org/caller"
+    },
+    "triggeredSha": "git:sha1:cccccccccccccccccccccccccccccccccccccccc",
+    "run": {
+      "id": "900001",
+      "attempt": 1
+    },
+    "event": "workflow_dispatch",
+    "ref": "refs/heads/main",
+    "actorId": "24680",
+    "actor": "alice",
+    "callerWorkflow": {
+      "ref": "example-org/caller/.github/workflows/review.yml@refs/heads/main",
+      "sha": "git:sha1:dddddddddddddddddddddddddddddddddddddddd"
+    },
+    "reusableWorkflow": {
+      "ref": "example-org/steward-run/.github/workflows/steward-task.yml@refs/tags/v1.0.0",
+      "sha": "git:sha1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  },
+  "invocation": {
+    "repository": "https://github.com/example-org/caller.git",
+    "repositoryId": "123456",
+    "repositoryOwnerId": "7890",
+    "commit": "git:sha1:cccccccccccccccccccccccccccccccccccccccc",
+    "path": ".steward/tasks/release-summary.json",
+    "contentDigest": "steward:sha256:3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "package": {
+    "repository": "https://github.com/example-org/agentic-ops.git",
+    "repositoryId": "654321",
+    "repositoryOwnerId": "7890",
+    "commit": "git:sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "path": "catalog/release-summary/v1/task-definition.json",
+    "contentDigest": "steward:sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "closure": {
+    "contractVersion": "steward.package-closure/v1",
+    "entryPoint": "catalog/release-summary/v1/task-definition.json",
+    "entries": [
+      {
+        "kind": "prompt",
+        "path": "catalog/release-summary/v1/prompt.md",
+        "digest": "steward:sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sizeBytes": 1200
+      },
+      {
+        "kind": "task_definition",
+        "path": "catalog/release-summary/v1/task-definition.json",
+        "digest": "steward:sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "sizeBytes": 301
+      }
+    ]
+  },
+  "closureDigest": "steward:sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "envelope": {
+    "uid": "22222222-2222-4222-8222-222222222222",
+    "revision": 3,
+    "digest": "steward:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "effectiveRequirements": {
+    "execution": {
+      "capabilities": ["shell"]
+    },
+    "authority": {
+      "llms": [
+        { "provider": "litellm", "model": "review-model" }
+      ],
+      "tools": [
+        { "provider": "github", "resource": "actions", "action": "read" }
+      ],
+      "budget": {
+        "monthlyLimit": "50.00",
+        "singleRunLimit": "2.00",
+        "currency": "USD"
+      },
+      "ttl": "1h",
+      "runner": {
+        "platforms": ["linux"],
+        "memory": "2Gi",
+        "compute": "1000m",
+        "storage": "4Gi"
+      }
+    }
+  },
+  "diagnostics": {
+    "executionLog": "full"
+  }
+}

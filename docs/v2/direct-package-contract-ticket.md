@@ -2,7 +2,7 @@
 
 Priority: P0 foundation
 
-Status: ready to start
+Status: implementation in progress on `feat/direct-package-contract`
 
 ## Goal
 
@@ -61,3 +61,14 @@ modified.
 This ticket lands first. The four independent implementation lanes may start from its
 reviewed contract commit. Wire-compatible corrections are coordinated here rather than
 made independently in consumers.
+
+## Implementation record
+
+- [x] additive Rust wire types and strict semantic validation;
+- [x] authoritative JSON Schema and positive, negative, and v1 compatibility fixtures;
+- [x] signed `source_provenance` exchange-JWT claim and authenticated v2 diagnostics
+  response projection;
+- [x] deterministic closure canonicalization and digest vector;
+- [x] reserved successful-run transcript paths and bounds;
+- [ ] repository gate and reviewed contract commit;
+- [ ] downstream lane synchronization against the exact commit.
