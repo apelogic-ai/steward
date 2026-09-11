@@ -1015,17 +1015,23 @@ test("failed run phases expose stdout and stderr as escaped sensitive output", a
     await developer.context.addCookies([{ name: "execution-log-session", value: "present", url: origin }]);
     await developer.page.goto(`${origin}/runs/${taskUid}`);
     const failedPhase = developer.page.locator("li").filter({ has: developer.page.getByText("failed", { exact: true }) });
-    await expect(failedPhase.getByRole("button", { name: "View stdout" })).toBeVisible();
-    await expect(failedPhase.getByRole("button", { name: "View stderr" })).toBeVisible();
+    const stdoutLink = failedPhase.getByRole("link", { name: "View stdout" });
+    const stderrLink = failedPhase.getByRole("link", { name: "View stderr" });
+    await expect(stdoutLink).toHaveAttribute("href", `/runs/${taskUid}/logs/stdout`);
+    await expect(stderrLink).toHaveAttribute("href", `/runs/${taskUid}/logs/stderr`);
 
-    await failedPhase.getByRole("button", { name: "View stdout" }).click();
-    const viewer = failedPhase.getByRole("region", { name: "Execution log" });
+    await stdoutLink.click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}/logs/stdout`);
+    const viewer = developer.page.getByRole("region", { name: "Execution log" });
     await expect(viewer.getByRole("heading", { name: "stdout log" })).toBeVisible();
     await expect(viewer.getByText("Sensitive output warning", { exact: true })).toBeVisible();
     await expect(viewer.locator("pre")).toHaveText("checked repository\n<script id=executed>bad()</script>\n");
     await expect(developer.page.locator("#executed")).toHaveCount(0);
 
-    await failedPhase.getByRole("button", { name: "View stderr" }).click();
+    await developer.page.getByRole("link", { name: "Back to run" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}`);
+    await developer.page.getByRole("link", { name: "View stderr" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}/logs/stderr`);
     await expect(viewer.getByRole("heading", { name: "stderr log" })).toBeVisible();
     await expect(viewer.locator("pre")).toHaveText("tool call failed: example\n");
 
@@ -1056,8 +1062,9 @@ test("administrator run logs use the administrator boundary and report unavailab
   try {
     await administrator.page.goto(`${origin}/admin/runs/${taskUid}`);
     const succeededPhase = administrator.page.locator("li").filter({ has: administrator.page.getByText("succeeded", { exact: true }) });
-    await succeededPhase.getByRole("button", { name: "View stderr" }).click();
-    await expect(succeededPhase.getByRole("status")).toHaveText("stderr log is unavailable for this run.");
+    await succeededPhase.getByRole("link", { name: "View stderr" }).click();
+    await expect(administrator.page).toHaveURL(`${origin}/admin/runs/${taskUid}/logs/stderr`);
+    await expect(administrator.page.getByRole("status")).toHaveText("stderr log is unavailable for this run.");
     expect(administrator.executionLogRequests).toHaveLength(1);
     expect(new URL(administrator.executionLogRequests[0].url()).pathname).toBe(
       `/admin/api/v1/all-runs/${taskUid}/logs/stderr`,
