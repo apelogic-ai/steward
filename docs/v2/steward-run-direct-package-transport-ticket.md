@@ -3,7 +3,7 @@
 Priority: P0
 
 Status: implementation merged by `apelogic-ai/steward-run#31` as `fd090be`; immutable
-nested-action pin correction in progress
+nested-action pin correction is `apelogic-ai/steward-run#33` at `2cbfe5f`
 
 ## Goal
 
@@ -75,3 +75,7 @@ round-trip being green on the feature branch. An isolated follow-up must pin tha
 nested action to the merged direct-transport implementation, rerun the complete
 workflow/action contract and round-trip, and produce the new reusable-workflow commit
 for DP-O01. No mutable ref is an acceptable substitute.
+
+The focused red proof rejected the legacy-only nested action pin. At correction commit
+`2cbfe5f`, all 152 repository tests, build, thin-shell, checked-in distribution, and
+production dependency audit are green; GitHub CI and Action round-trip remain pending.
