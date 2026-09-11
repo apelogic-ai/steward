@@ -2465,9 +2465,7 @@ impl ActiveDirectTaskFixture {
         let store = isolated_approval_queue_store(database_url).await?;
         let suffix = format!(
             "{label}-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)?
-                .as_nanos()
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
         );
         let service = format!("direct-envelope-{suffix}");
         let member_role = format!("direct-role-{suffix}");
@@ -2700,8 +2698,7 @@ impl ActiveDirectTaskFixture {
 }
 
 #[tokio::test]
-async fn direct_task_stale_user_envelope_fences_attempt_and_start()
--> Result<(), Box<dyn Error>> {
+async fn direct_task_stale_user_envelope_fences_attempt_and_start() -> Result<(), Box<dyn Error>> {
     let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
         io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Task Postgres test")
     })?;
@@ -2741,11 +2738,13 @@ async fn direct_task_stale_user_envelope_fences_attempt_and_start()
             .await?,
         TaskExecutionTransition::AuthorityInactive { attempt: None, .. }
     ));
-    assert!(before_attempt
-        .store
-        .task_execution_attempt(attempt_task)
-        .await?
-        .is_none());
+    assert!(
+        before_attempt
+            .store
+            .task_execution_attempt(attempt_task)
+            .await?
+            .is_none()
+    );
 
     let before_start = ActiveDirectTaskFixture::new(&database_url, "before-start").await?;
     let start_task = before_start.reserve_task("start").await?;
@@ -2798,10 +2797,12 @@ async fn direct_task_stale_user_envelope_fences_attempt_and_start()
         .ok_or(StoreError::TaskNotFound)?;
     assert!(fenced.start_invoked_at.is_none());
     assert_eq!(fenced.state, TaskExecutionAttemptState::NotStarted);
-    assert!(!before_start
-        .store
-        .task_execution_holds_runtime_lease(fenced.attempt_id)
-        .await?);
+    assert!(
+        !before_start
+            .store
+            .task_execution_holds_runtime_lease(fenced.attempt_id)
+            .await?
+    );
     let task = before_start
         .store
         .task(start_task)
@@ -2813,8 +2814,7 @@ async fn direct_task_stale_user_envelope_fences_attempt_and_start()
 }
 
 #[tokio::test]
-async fn direct_task_reservation_revalidates_exact_user_envelope()
--> Result<(), Box<dyn Error>> {
+async fn direct_task_reservation_revalidates_exact_user_envelope() -> Result<(), Box<dyn Error>> {
     let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
         io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Task Postgres test")
     })?;
@@ -2837,8 +2837,8 @@ async fn direct_task_reservation_revalidates_exact_user_envelope()
 }
 
 #[tokio::test]
-async fn direct_task_runtime_create_pending_revalidates_before_effect()
--> Result<(), Box<dyn Error>> {
+async fn direct_task_runtime_create_pending_revalidates_before_effect() -> Result<(), Box<dyn Error>>
+{
     let database_url = env::var("STEWARD_TEST_DATABASE_URL").map_err(|_| {
         io::Error::other("STEWARD_TEST_DATABASE_URL is required for the Task Postgres test")
     })?;
@@ -2967,7 +2967,10 @@ async fn direct_task_stale_user_envelope_terminalizes_before_runtime_creation()
         .ok_or(StoreError::TaskNotFound)?;
     assert_eq!(task.phase, TaskPhase::Failed);
     assert!(task.finalize_requested);
-    assert_eq!(task.failure_reason.as_deref(), Some("user_envelope_inactive"));
+    assert_eq!(
+        task.failure_reason.as_deref(),
+        Some("user_envelope_inactive")
+    );
 
     assert!(matches!(
         fixture
