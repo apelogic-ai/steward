@@ -29,11 +29,13 @@ publication, release tags, multiple workflows, or stable-lane breadth.
 
 Implementation ownership is split into independently reviewable tickets:
 
+- [live delivery status and immutable handoffs](direct-package-delivery-status.md);
 - [DP-C01: direct-package contracts](direct-package-contract-ticket.md);
 - [DP-I01: verified source provenance](identity-source-provenance-ticket.md);
 - [DP-G01: Git source port and GitHub adapter](github-source-adapter-ticket.md);
 - [DP-S01: Steward direct Task path](direct-package-task-path-ticket.md);
 - [DP-R01: runner transport and transcript](steward-run-direct-package-transport-ticket.md);
+- [DP-R02: runner image security remediation](steward-run-runner-image-remediation-ticket.md);
 - [DP-A01: neutral release-summary package](agentic-ops-release-summary-package-ticket.md);
 - [DP-O01: GitOps/UI activation](agentic-ops-gitops-demo-handoff.md); and
 - [DP-P00: P0 demo coordination](agentic-ops-local-demo-ticket.md).

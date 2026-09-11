@@ -2,7 +2,8 @@
 
 Priority: P0
 
-Status: blocked only on DP-C01 contract freeze
+Status: implementation merged by `apelogic-ai/steward-run#31` as `fd090be`; immutable
+nested-action pin correction merged by `#33` as `139221e`
 
 ## Goal
 
@@ -12,7 +13,8 @@ metadata behavior.
 
 ## Scope
 
-- add required `invocation-path` input for the v2 reusable workflow;
+- add `invocation-path` for the direct-package flow, mutually exclusive with the
+  legacy `workflow` input;
 - send the path and GitHub trigger metadata, never manifest or package bytes;
 - retain the current per-run input archive flow;
 - poll the same Task resource and download declared outputs after success;
@@ -46,3 +48,36 @@ agent-specific JSON events. It presents the original process streams.
 
 May proceed alongside DP-I01, DP-G01, and DP-A01 after DP-C01. It uses a mock server
 for client tests; the real MCP proof belongs to the final P0 integration.
+
+## Implementation evidence
+
+- contract checkpoint: Steward DP-C01 commit `042e8aa`;
+- implementation: `apelogic-ai/steward-run#31` at commit `79b9f42`;
+- immutable merged source commit:
+  `fd090be213b3f4d777bcfacc367e0cdbd574400b`;
+- full `npm run check`: green, including 151 tests, typecheck, build, thin-shell
+  validation, and checked-in bundle verification; and
+- bundled E2E: green for path-only v2 submission, authenticated transcript replay,
+  workflow-command suppression, output handling, and unconditional finalization.
+
+The earlier CI vulnerability gate reported four affected GLib packages for
+CVE-2026-58016 in the pinned Actions runner base image. DP-R02 removed that build-only
+package chain without accepting the finding or weakening the policy and is now merged.
+The current DP-R01 head contains that remediation; image CI, live vulnerability-policy
+enforcement, and the complete round-trip are green.
+
+## Post-merge handoff correction
+
+The merged self-hosted reusable workflow exposes `invocation-path`, but it still
+invokes nested action commit `0707623`, whose action contract is legacy-only. Therefore
+`fd090be` is not itself a usable immutable caller pin despite the implementation and
+round-trip being green on the feature branch. An isolated follow-up must pin that
+nested action to the merged direct-transport implementation, rerun the complete
+workflow/action contract and round-trip, and produce the new reusable-workflow commit
+for DP-O01. No mutable ref is an acceptable substitute.
+
+The focused red proof rejected the legacy-only nested action pin. At correction commit
+`2cbfe5f`, all 152 repository tests, build, thin-shell, checked-in distribution, and
+production dependency audit are green. GitHub CI and the complete seed, governed, and
+verification Action round-trip are also green. DP-O01 uses merge commit `139221e` as
+the reusable-workflow pin; its nested action remains pinned to `fd090be`.

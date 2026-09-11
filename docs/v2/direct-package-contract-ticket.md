@@ -2,7 +2,7 @@
 
 Priority: P0 foundation
 
-Status: implementation in progress on `feat/direct-package-contract`
+Status: merged by `apelogic-ai/steward#83` as `ba4c062`
 
 ## Goal
 
@@ -34,7 +34,7 @@ modified.
 - instruction-only is the default and only initial skill kind;
 - omitted `requires` expands to the selected Envelope's full approved authority
   values, including explicit null optional maxima;
-- present `requires` is a complete narrower request;
+- present `requires` is a complete narrower authority request;
 - execution behavior comes only from the immutable deployment-owned `runtime.agentRef`
   binding; packages cannot declare unverified execution capabilities;
 - omitted diagnostics means no caller-visible execution log; and
@@ -48,7 +48,8 @@ modified.
 - duplicate paths, cycles, cross-source dependencies, and non-canonical encodings are
   rejected;
 - unknown skill kinds cannot execute;
-- partial present `requires` is invalid; and
+- partial present `requires` and ungrounded execution-capability requests are invalid;
+  and
 - unknown diagnostic modes cannot enable logging.
 
 ## Exit criteria
@@ -76,5 +77,16 @@ made independently in consumers.
 - [x] effective authority evidence preserves nullable Envelope maxima and rejects
   package-authored execution capabilities without a verifiable authority source;
 - [x] reserved successful-run transcript paths and bounds;
-- [ ] repository gate and reviewed contract commit;
-- [ ] downstream lane synchronization against the exact commit.
+- [x] repository gate and reviewed contract commit; and
+- [x] downstream lane synchronization against the exact commit.
+
+## Implementation evidence
+
+- reviewed implementation head: `103919e`;
+- merged source: `ba4c062`;
+- all 27 JSON Schema fixtures, Rust/schema parity, frozen-v1 byte identity, closure
+  digest and source-binding integrity regressions: green; and
+- full `cargo xtask ci`, pinned conformance, and the pre-push full quality gate: green.
+
+The final correction binds invocation identity to signed provenance, package metadata
+to the closure entry, and the claimed closure digest to recomputed canonical bytes.

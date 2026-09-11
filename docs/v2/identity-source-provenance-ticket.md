@@ -2,13 +2,13 @@
 
 Priority: P0
 
-Status: blocked only on DP-C01 contract freeze
+Status: merged by `apelogic-ai/github-oidc-exchange#31` as `f2e33ae`
 
 ## Goal
 
-Extend the existing GitHub OIDC exchange and Kubernetes TokenReview path so Steward
-can bind a direct-package request to the actual repository, workflow, run, and commit
-verified by Identity.
+Extend the existing GitHub OIDC exchange JWT and Steward
+`IdentityTaskIdentityResolver` so Steward can bind a direct-package request to the
+actual repository, workflow, run, and commit verified by Identity.
 
 ## Scope
 
@@ -17,13 +17,17 @@ verified by Identity.
 - carry stable repository and owner IDs, repository name, exact SHA, run and
   run-attempt IDs, event, ref, actor, and caller/reusable-workflow refs and SHAs through
   the exchanged identity;
-- expose the ratified values to Steward through the existing TokenReview boundary;
+- expose the ratified values as signed structured exchange-JWT claims verified by the
+  existing Identity resolver;
 - retain the existing canonical user and group mapping; and
 - define bounded failure categories suitable for the caller without echoing tokens or
   raw assertions.
 
 This is additive provenance on the existing Identity-to-Principal path. It does not
-create another identity system or let Git metadata own Steward runtime authority.
+create another identity system, encode source provenance into Kubernetes groups, send
+the exchanged GitHub JWT through Kubernetes TokenReview, or let Git metadata own
+Steward runtime authority. Kubernetes TokenReview remains the alternate
+service-account authentication path.
 
 ## Negative tests
 
@@ -36,7 +40,8 @@ create another identity system or let Git metadata own Steward runtime authority
 
 ## Exit criteria
 
-- positive exchange and TokenReview tests expose every DP-C01 provenance field;
+- positive exchange and direct Identity-resolver tests expose every DP-C01 provenance
+  field;
 - mutation and replay tests fail before Steward source resolution;
 - existing user identity behavior remains compatible; and
 - Steward can verify `invocation-path` against the ratified trigger repository and
@@ -46,3 +51,22 @@ create another identity system or let Git metadata own Steward runtime authority
 
 May proceed alongside DP-G01, DP-R01, and DP-A01 after DP-C01. It does not require the
 GitOps-owned local-main cluster.
+
+## Implementation evidence
+
+- implementation: `apelogic-ai/github-oidc-exchange#31` at commit `4f7a685`;
+- contract checkpoint: Steward DP-C01 commit `042e8aa`;
+- exact provenance field compatibility: independently reviewed with no contract
+  corrections required;
+- repository dot-segment and noncanonical run-attempt mutations: rejected by focused
+  regressions;
+- local Rust, Helm, release validation, amd64 image build, and container smoke gates:
+  green;
+- isolated CI maintenance: `apelogic-ai/github-oidc-exchange#32` at `13a89de`
+  replaces the timing-out emulated ARM smoke with the same check on the native
+  `ubuntu-24.04-arm` runner without changing release publication; its native ARM,
+  unchanged amd64 quality and Trivy, and Kubernetes replay jobs are green; and
+- maintenance merged source: `6d4c106`;
+- provenance implementation/integrated head: `1f9fe99`;
+- provenance merged source: `f2e33ae`; and
+- final quality, native ARM, and Kubernetes replay checks: green.
