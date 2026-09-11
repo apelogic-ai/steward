@@ -20,7 +20,7 @@ contracts remain authoritative; this record does not relax their exit criteria.
 | DP-R01 | `apelogic-ai/steward-run` | merged | Pin-correction PR `#33` merged as `139221e`; repository and complete Action round-trip were green. |
 | DP-R02 | `apelogic-ai/steward-run` | merged | PR `apelogic-ai/steward-run#32` merged as `a7bc15c`; live scan reported zero critical and zero accepted findings. |
 | DP-A01 | `apelogic-ai/agentic-ops` | merged | PR `apelogic-ai/agentic-ops#4` merged as `cca19bc`; package validation is green. |
-| DP-O01 | `apelogic-ai/gitops` | review | Final activation PR `apelogic-ai/gitops#177` at exact head `5f4bac1` is locally and CI green, clean, and mergeable. No cluster mutation. |
+| DP-O01 | `apelogic-ai/gitops` | activation ready | Final activation PR `apelogic-ai/gitops#177` merged as `b688f95`; reviewed head `5f4bac1` was locally and CI green. No cluster mutation. |
 | DP-P01 | `apelogic-ai/steward` | post-P0 | Optional catalog publication and release provenance. |
 | DP-T01 | `apelogic-ai/steward` | post-P0 | Multiple-package/workflow and stable-lane conformance. |
 | DP-D01 | `apelogic-ai/steward` | post-P0 | Durable failed, cancelled, and rejected Task diagnostics. |
@@ -41,7 +41,7 @@ or mutable environment state.
 | DP-A01 | DP-O01 | merged source commit `cca19bc`, closure `steward:sha256:79a68a6e3f7a21d37c4da0594555d409999562b3d1778641f743ec0e290118a8` | ready for caller pin |
 | DP-S01 | DP-O01 | merged source `3d6a76b`, reviewed head `99c5e0b`; full gate, 5/5 real-Postgres regressions, and authenticated OpenShell transcript E2E green with cleanup verified | complete |
 | DP-O01 fixture | DP-O01 activation | merged GitOps source `f8ec588`, reviewed implementation head `e48300b` | complete |
-| DP-O01 | DP-P00 | PR `apelogic-ai/gitops#177`, exact head `5f4bac1`; full local repository validation and GitHub `manifests` check green | merge pending, then GitOps-owned activation |
+| DP-O01 | DP-P00 | merged GitOps source `b688f95`, reviewed head `5f4bac1`; full local repository validation and GitHub `manifests` check green | GitOps-owned activation pending |
 
 ## Operating constraints
 
