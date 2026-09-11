@@ -2,8 +2,8 @@
 
 Priority: P0 foundation
 
-Status: implementation checkpoint `042e8aa`; neutrality maintenance review pending in
-`apelogic-ai/steward#82` at `fa921f6`
+Status: corrected implementation checkpoint `d4d8dc4`; neutrality maintenance review
+pending in `apelogic-ai/steward#82` at `fa921f6`
 
 ## Goal
 
@@ -33,7 +33,9 @@ modified.
 - omitted or empty skills means no skills;
 - instruction-only is the default and only initial skill kind;
 - omitted `requires` expands to the selected Envelope's full approved values;
-- present `requires` is a complete narrower request;
+- present `requires` is a complete narrower authority request;
+- nullable approved maxima remain explicit `null` in expanded evidence rather than
+  being omitted or invented;
 - omitted diagnostics means no caller-visible execution log; and
 - `diagnostics.executionLog: full` requests successful stdout/stderr replay.
 
@@ -45,7 +47,8 @@ modified.
 - duplicate paths, cycles, cross-source dependencies, and non-canonical encodings are
   rejected;
 - unknown skill kinds cannot execute;
-- partial present `requires` is invalid; and
+- partial present `requires` and ungrounded execution-capability requests are invalid;
+  and
 - unknown diagnostic modes cannot enable logging.
 
 ## Exit criteria
@@ -62,3 +65,12 @@ modified.
 This ticket lands first. The four independent implementation lanes may start from its
 reviewed contract commit. Wire-compatible corrections are coordinated here rather than
 made independently in consumers.
+
+## Implementation evidence
+
+- initial checkpoint: `042e8aa`;
+- authority-evidence correction: `d4d8dc4`;
+- focused contract tests, all Steward type tests, Clippy, formatting, all 27 JSON
+  Schema fixtures, and diff checks: green; and
+- full `cargo xtask ci` waits only for isolated neutrality maintenance PR
+  `apelogic-ai/steward#82` to merge.
