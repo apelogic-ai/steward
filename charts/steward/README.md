@@ -60,6 +60,7 @@ The chart references five existing Secrets and never creates their values:
 | `steward-openshell-client` | `ca.crt`, `tls.crt`, `tls.key` | controller |
 | `steward-mint` | `signing-key`, `introspection-credential` | mint |
 | browser-auth Secret (selected only when `browserAuth.enabled=true`) | configured client-secret key | apiserver |
+| GitHub source App Secret (selected only when `githubSource.enabled=true`) | configured PEM private-key key | apiserver |
 
 The controller also requires the public workload-exchange CA bundle selected
 by `workloadExchangeTrust.kind`, `workloadExchangeTrust.name`, and
@@ -96,6 +97,23 @@ adapter is responsible for maintaining the approved resolver/egress policy as
 Google's endpoints evolve. A local isolated lane may instead set
 `networkPolicy.enabled=false`; that is not a substitute for a production
 egress policy.
+
+## Direct package source resolution
+
+`githubSource` defaults to disabled. Enabling it is an atomic apiserver-only
+configuration: the chart requires a positive GitHub App ID, an existing Secret
+name and key containing its PEM private key, and at least one
+`networkPolicy.githubApiCidrs` entry while NetworkPolicy is enabled. The private
+key is mounted read-only and its bytes never enter Helm values or an environment
+variable. Steward uses the App only to resolve exact Git objects; it does not
+accept caller-uploaded package bytes.
+
+`githubSource.bindings` authorizes exact caller-to-source repository pairs by
+stable GitHub owner and repository IDs. The chart renders that non-secret
+catalog into an immutable content-addressed ConfigMap and rolls the apiserver
+when it changes. Repository names remain audit metadata and cannot substitute
+for these IDs. The deployment adapter resolves and maintains the approved
+GitHub API CIDRs; the portable chart opens HTTPS egress only to those entries.
 
 ## Governed provider connections
 

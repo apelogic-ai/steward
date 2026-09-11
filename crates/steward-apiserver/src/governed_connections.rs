@@ -328,6 +328,7 @@ impl<B> GovernedConnectionsBroker<B> {
             runtime_spec: &plan.spec,
             agent_command: &plan.command,
             execution_binding: None,
+            direct_task_evidence: None,
             envelope_revision: CONNECTIONS_AUTHORITY_VERSION,
             service_envelope: &service_envelope,
             service_envelope_digest: &orchestration.service_envelope_digest,

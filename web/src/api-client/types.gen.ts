@@ -119,6 +119,14 @@ export type ApprovalRequest = {
     rationale: string;
 };
 
+export type AuthorityRequirements = {
+    budget: BudgetRequirement;
+    llms: Array<ModelRequirement>;
+    runner: RunnerRequirement;
+    tools: Array<ToolRequirement>;
+    ttl: Duration;
+};
+
 export type AvailableEnvelopeTemplate = {
     autoProvisionThreshold?: null | BrowserEnvelope;
     ceiling: BrowserEnvelope;
@@ -128,6 +136,10 @@ export type AvailableEnvelopeTemplate = {
 };
 
 export type BindingRef = string;
+
+export type BoundedRef = string;
+
+export type BoundedText = string;
 
 export type BrowserApprovalView = {
     actor: string;
@@ -274,6 +286,12 @@ export type BudgetIncrease = {
     amount: string;
 };
 
+export type BudgetRequirement = {
+    currency: Currency;
+    monthlyLimit: Decimal;
+    singleRunLimit?: null | Decimal;
+};
+
 /**
  * Minimum stable person binding carried by a live AgentRuntime.
  *
@@ -292,6 +310,15 @@ export type CanonicalAuthorityBinding = {
  */
 export type CanonicalUserId = string;
 
+export type ClosureEntry = {
+    digest: ContentDigest;
+    kind: ClosureEntryKind;
+    path: RelativePath;
+    sizeBytes: number;
+};
+
+export type ClosureEntryKind = 'task_definition' | 'prompt' | 'instruction_skill' | 'instructions' | 'asset';
+
 export type ConnectionOperationErrorResponse = {
     apiVersion: string;
     error: string;
@@ -305,6 +332,8 @@ export type ConnectionStatusResponse = {
     status: ProviderConnectionStatus;
 };
 
+export type ContentDigest = string;
+
 export type CreateEnvelopeRequestBody = {
     idempotencyKey: string;
     requestedEnvelope: BrowserEnvelope;
@@ -317,6 +346,93 @@ export type CreateRuntimeRequest = {
     spec: AgentRuntimeSpec;
 };
 
+export type Currency = string;
+
+export type Decimal = string;
+
+export type DiagnosticsRequest = {
+    executionLog?: ExecutionLogMode;
+};
+
+export type DirectAdmissionDelta = {
+    ceiling: Decimal;
+    currency: Currency;
+    dimension: 'budget';
+    requested: Decimal;
+} | {
+    ceiling: Decimal;
+    currency: Currency;
+    dimension: 'singleRunBudget';
+    requested?: null | Decimal;
+} | {
+    ceiling: Duration;
+    dimension: 'ttl';
+    requested: Duration;
+} | {
+    ceiling: Array<ModelRequirement>;
+    dimension: 'models';
+    requested: Array<ModelRequirement>;
+} | {
+    ceiling: Array<ToolRequirement>;
+    dimension: 'tools';
+    requested: Array<ToolRequirement>;
+} | {
+    ceiling: Array<RunnerPlatform>;
+    dimension: 'runnerPlatforms';
+    requested: Array<RunnerPlatform>;
+} | {
+    ceiling?: null | ResourceQuantity;
+    dimension: 'runnerMemory';
+    requested: ResourceQuantity;
+} | {
+    ceiling?: null | ResourceQuantity;
+    dimension: 'runnerCompute';
+    requested: ResourceQuantity;
+} | {
+    ceiling?: null | ResourceQuantity;
+    dimension: 'runnerStorage';
+    requested: ResourceQuantity;
+};
+
+export type DirectRequirements = {
+    authority: AuthorityRequirements;
+};
+
+export type DirectRuntimeOwnership = 'provisioned' | 'adopted';
+
+export type DirectTaskBindingEvidence = {
+    closure: PackageClosure;
+    closureDigest: ContentDigest;
+    diagnostics: DiagnosticsRequest;
+    effectiveRequirements: DirectRequirements;
+    envelope: EnvelopeEvidence;
+    invocation: ResolvedSource;
+    package: ResolvedSource;
+    schemaVersion: string;
+    sourceProvenance: SourceProvenance;
+    taskUid: Uuid;
+};
+
+export type DirectTaskPhase = 'submitted' | 'parked' | 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+
+export type DirectTaskStatusResponse = {
+    contractVersion: string;
+    deltas?: Array<DirectAdmissionDelta>;
+    diagnostics: DiagnosticsRequest;
+    evidence: DirectTaskBindingEvidence;
+    failureReason?: null | BoundedText;
+    finalized: boolean;
+    phase: DirectTaskPhase;
+    runtimeOwnership: DirectRuntimeOwnership;
+    runtimeUid?: null | BoundedText;
+    taskUid: Uuid;
+};
+
+export type DirectTaskSubmission = {
+    contractVersion: string;
+    invocationPath: RelativePath;
+};
+
 export type DisconnectConnectionRequest = {
     confirm: boolean;
 };
@@ -324,6 +440,14 @@ export type DisconnectConnectionRequest = {
 export type Duration = string;
 
 export type Email = string;
+
+export type EnvelopeDigest = string;
+
+export type EnvelopeEvidence = {
+    digest: EnvelopeDigest;
+    revision: number;
+    uid: Uuid;
+};
 
 export type EnvelopeRequestResponse = {
     apiVersion: string;
@@ -342,10 +466,14 @@ export type EnvelopeTemplatesResponse = {
     templates: Array<AvailableEnvelopeTemplate>;
 };
 
+export type ExactGitCommit = string;
+
 export type ExecutionBindingAdvertisement = {
     agentRef: string;
     displayName?: string | null;
 };
+
+export type ExecutionLogMode = 'off' | 'full';
 
 export type GeneratedGithubActionsWorkflow = {
     contentType: string;
@@ -365,15 +493,36 @@ export type GithubActionsWorkflowResponse = {
  */
 export type KubernetesQuantity = string;
 
+export type LegacyTaskStatusResponse = {
+    deltas?: Array<TaskAdmissionDelta>;
+    failureReason?: string | null;
+    finalized: boolean;
+    phase: TaskPhase;
+    runtimeOwnership: RuntimeOwnership;
+    runtimeUid?: string | null;
+    taskUid: string;
+};
+
 export type ModelRef = {
     model: string;
     provider: string;
+};
+
+export type ModelRequirement = {
+    model: BoundedText;
+    provider: Slug;
 };
 
 export type MyRunsResponse = {
     apiVersion: string;
     nextCursor?: string | null;
     runs: Array<BrowserRunView>;
+};
+
+export type PackageClosure = {
+    contractVersion: string;
+    entries: Array<ClosureEntry>;
+    entryPoint: RelativePath;
 };
 
 export type Principal = {
@@ -423,14 +572,36 @@ export type RejectEnvelopeRequestBody = {
     reason?: string | null;
 };
 
+export type RelativePath = string;
+
 export type RenderGithubActionsWorkflowBody = {
     workflow: string;
 };
+
+export type RepositoryUrl = string;
+
+export type ResolvedSource = {
+    commit: ExactGitCommit;
+    contentDigest: ContentDigest;
+    path: RelativePath;
+    repository: RepositoryUrl;
+    repositoryId: StableProviderId;
+    repositoryOwnerId: StableProviderId;
+};
+
+export type ResourceQuantity = string;
 
 /**
  * Canonical platform names accepted by the governed runner contract.
  */
 export type RunnerPlatform = 'linux' | 'mac' | 'windows';
+
+export type RunnerRequirement = {
+    compute?: null | ResourceQuantity;
+    memory?: null | ResourceQuantity;
+    platforms: Array<RunnerPlatform>;
+    storage?: null | ResourceQuantity;
+};
 
 export type RunnerRequirements = {
     compute?: null | KubernetesQuantity;
@@ -455,6 +626,26 @@ export type SessionResponse = {
     role: BrowserRole;
     surfaces: Array<string>;
 };
+
+export type Slug = string;
+
+export type SourceProvenance = {
+    actor: BoundedText;
+    actorId: StableProviderId;
+    callerWorkflow: WorkflowIdentity;
+    contractVersion: string;
+    event: BoundedText;
+    provider: SourceProvider;
+    ref: BoundedRef;
+    repository: TriggerRepository;
+    reusableWorkflow: WorkflowIdentity;
+    run: WorkflowRun;
+    triggeredSha: ExactGitCommit;
+};
+
+export type SourceProvider = 'github';
+
+export type StableProviderId = string;
 
 export type StartConnectionResponse = {
     apiVersion: string;
@@ -496,6 +687,8 @@ export type TaskAdmissionDelta = {
  */
 export type TaskArchive = Blob | File;
 
+export type TaskCreateRequest = TaskSubmissionRequest | DirectTaskSubmission;
+
 export type TaskErrorResponse = {
     error: string;
 };
@@ -505,15 +698,7 @@ export type TaskErrorResponse = {
  */
 export type TaskPhase = 'submitted' | 'parked' | 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
-export type TaskStatusResponse = {
-    deltas?: Array<TaskAdmissionDelta>;
-    failureReason?: string | null;
-    finalized: boolean;
-    phase: TaskPhase;
-    runtimeOwnership: RuntimeOwnership;
-    runtimeUid?: string | null;
-    taskUid: string;
-};
+export type TaskStatusResponse = LegacyTaskStatusResponse | DirectTaskStatusResponse;
 
 export type TaskSubmissionRequest = {
     agentRuntimeUid?: string | null;
@@ -525,6 +710,18 @@ export type ToolGrant = {
     action: string;
     provider: string;
     resource: string;
+};
+
+export type ToolRequirement = {
+    action: BoundedText;
+    provider: Slug;
+    resource: BoundedText;
+};
+
+export type TriggerRepository = {
+    id: StableProviderId;
+    name: BoundedText;
+    ownerId: StableProviderId;
 };
 
 export type UserEnvelopeRequest = {
@@ -542,6 +739,13 @@ export type UserEnvelopeRequest = {
     statusTemplateRevision: number;
     templateId: string;
     templateRevision: number;
+};
+
+export type Uuid = string;
+
+export type WorkflowIdentity = {
+    ref: BoundedRef;
+    sha: ExactGitCommit;
 };
 
 export type WorkflowListResponse = {
@@ -567,6 +771,11 @@ export type WorkflowRevisionView = {
     publishedAt: string;
     publishedBy: string;
     version: number;
+};
+
+export type WorkflowRun = {
+    attempt: number;
+    id: StableProviderId;
 };
 
 export type AllRunsData = {
@@ -1772,7 +1981,7 @@ export type BudgetIncreaseContractResponses = {
 };
 
 export type TaskSubmissionContractData = {
-    body: TaskSubmissionRequest;
+    body: TaskCreateRequest;
     headers: {
         /**
          * Submitter-scoped upstream job identity

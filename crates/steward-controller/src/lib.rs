@@ -1382,6 +1382,23 @@ async fn reconcile_runtime_creation(
     authority: &PgStore,
     work: &TaskOrchestrationWorkItem,
 ) -> Result<(), TaskControllerError> {
+    match authority
+        .authorize_task_runtime_creation(
+            work.task.task_uid,
+            work.operation.generation,
+            TASK_ORCHESTRATOR_ACTOR,
+        )
+        .await
+        .map_err(TaskControllerError::Store)?
+    {
+        steward_store::TaskOperationTransition::AlreadyApplied(current)
+            if current.state == TaskOrchestrationState::RuntimeCreatePending => {}
+        steward_store::TaskOperationTransition::Applied(_)
+        | steward_store::TaskOperationTransition::AlreadyApplied(_)
+        | steward_store::TaskOperationTransition::Superseded(_)
+        | steward_store::TaskOperationTransition::AuthorityInactive { .. }
+        | steward_store::TaskOperationTransition::InvariantViolation { .. } => return Ok(()),
+    }
     let envelope = task_immutable_envelope(authority, &work.task).await?;
     let expected = orchestrated_task_runtime_manifest(work, Some(&envelope), false)?;
     let api = Api::<AgentRuntime>::namespaced(client.clone(), &work.operation.runtime_namespace);
@@ -2006,17 +2023,33 @@ fn sandbox_task_request(
     runtime_uid: String,
     refs: RuntimeRefs,
 ) -> SandboxTaskRequest {
+    let execution_class = sandbox_execution_class(&task.runtime_spec);
+    let diagnostics = sandbox_task_diagnostics(execution_class, task.direct_task_evidence.as_ref());
     SandboxTaskRequest {
         runtime: RuntimeId(runtime_uid),
         refs,
-        execution_class: sandbox_execution_class(&task.runtime_spec),
+        execution_class,
         agent_type: task.runtime_spec.agent_type.clone(),
         command: task.agent_command.clone(),
+        diagnostics,
         execution_binding: task
             .execution_binding
             .as_ref()
             .and_then(TaskExecutionBinding::disposable)
             .cloned(),
+    }
+}
+
+fn sandbox_task_diagnostics(
+    execution_class: SandboxExecutionClass,
+    evidence: Option<&steward_types::direct_package::DirectTaskBindingEvidence>,
+) -> steward_types::direct_package::DiagnosticsRequest {
+    if execution_class == SandboxExecutionClass::Agent {
+        evidence
+            .map(|evidence| evidence.diagnostics)
+            .unwrap_or_default()
+    } else {
+        steward_types::direct_package::DiagnosticsRequest::default()
     }
 }
 
@@ -4407,6 +4440,7 @@ mod tests {
         ConnectionOperationRecord, ConnectionOperationState, GrantReversion, StoreError,
         TaskRecord,
     };
+    use steward_types::direct_package::{DirectTaskBindingEvidence, ExecutionLogMode};
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
         CanonicalAuthorityBinding, CanonicalUserId, Duration, Email, ModelRef,
@@ -4423,9 +4457,9 @@ mod tests {
         connection_operation_authority_action, create_task_runtime_inner,
         exhausted_spend_to_preserve, inference_action, provider_control_bindings_match,
         reconcile_once, replace_as_authority, runtime_authority_action, runtime_ttl_action,
-        sandbox_execution_class, server_task_runtime_manifest, status_merge_patch, suspend_runtime,
-        suspend_runtime_with_inference_cleanup, task_output_archive_failure, task_runtime,
-        task_runtime_action, ttl_action,
+        sandbox_execution_class, sandbox_task_diagnostics, server_task_runtime_manifest,
+        status_merge_patch, suspend_runtime, suspend_runtime_with_inference_cleanup,
+        task_output_archive_failure, task_runtime, task_runtime_action, ttl_action,
     };
 
     struct RejectingTaskRuntimeBindingStore;
@@ -4540,6 +4574,7 @@ mod tests {
             runtime_spec: spec,
             agent_command: Vec::new(),
             execution_binding: None,
+            direct_task_evidence: None,
             envelope_revision: 3,
             orchestration_version: 2,
             orchestration_operation_id: Some(
@@ -4890,6 +4925,31 @@ mod tests {
         assert_eq!(
             sandbox_execution_class(&ordinary),
             SandboxExecutionClass::Agent
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_diagnostics_come_only_from_direct_evidence_and_never_provider_control()
+    -> Result<(), String> {
+        let evidence: DirectTaskBindingEvidence = serde_json::from_str(include_str!(
+            "../../../docs/contracts/task/v2/fixtures/positive/task-binding-evidence.json"
+        ))
+        .map_err(|error| format!("parse direct evidence fixture: {error}"))?;
+        assert_eq!(
+            sandbox_task_diagnostics(SandboxExecutionClass::Agent, Some(&evidence)).execution_log,
+            ExecutionLogMode::Full
+        );
+        assert_eq!(
+            sandbox_task_diagnostics(SandboxExecutionClass::Agent, None).execution_log,
+            ExecutionLogMode::Off,
+            "legacy Tasks must not opt into caller-visible transcripts"
+        );
+        assert_eq!(
+            sandbox_task_diagnostics(SandboxExecutionClass::ProviderControl, Some(&evidence))
+                .execution_log,
+            ExecutionLogMode::Off,
+            "provider-control must remain forced off even with malformed direct evidence"
         );
         Ok(())
     }
