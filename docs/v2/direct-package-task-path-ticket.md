@@ -2,8 +2,8 @@
 
 Priority: P0
 
-Status: focused red checkpoint retained locally at `bf53e91`; implementation depends
-on DP-G01 and DP-I01
+Status: red checkpoint `bf53e91` audited; implementation depends on DP-G01, DP-I01,
+and the corrected DP-C01 checkpoint
 
 ## Goal
 
@@ -64,3 +64,33 @@ Coordinate final integration with DP-I01 and DP-R01; serialize heavy integration
 - the frozen versioned-v1 route remains green.
 
 This checkpoint is intentionally not pushed and has no PR while its tests are red.
+
+## Implementation-readiness audit
+
+- The five current cases compile, reach the real `POST /v1/tasks` route, and prove no
+  Task is reserved, but all stop at the same missing-v2 deserialization boundary.
+  After DP-G01, replace them with behavior-specific source and Identity fakes so each
+  named negative reaches its own authorization or admission seam.
+- Add one nullable, immutable direct-package evidence JSON object through a new
+  additive migration. Do not repurpose or relax the existing all-or-none workflow and
+  User-Envelope pin columns, and do not edit migration history.
+- Reservation and idempotent retry compare the complete immutable evidence while
+  accounting for the server-generated winning Task UID. Database constraints and a
+  separate update trigger reject malformed or mutated evidence.
+- Revalidate the exact selected User Envelope before reservation and every runtime or
+  execution effect. A stale selection terminalizes the Task and cleans any inert
+  runtime; it must not create a repeating queued-work loop or later reactivate.
+- Source authorization precedes content trust. The demo's explicit `git:sha1`
+  `gitops` to `agentic-ops` read requires an active caller-to-source binding;
+  `git:trigger` remains same-repository-only.
+- Direct v2 request and status types are additive unions around the unchanged legacy
+  API. Regenerate the web API client through the repository command; never hand-edit
+  generated files.
+- Successful full diagnostics persist exact bounded stdout and stderr in the
+  adapter-owned attempt state before its success marker, then add only the two
+  reserved diagnostic files to the existing output archive. Diagnostics-off,
+  provider-control, failure, overflow, or interrupted postprocessing must not expose a
+  transcript or report success.
+- This design needs no new S01 dependency, CRD change, `steward-mint` change, or
+  existing-field semantic rewrite. The additive migration and normal client
+  regeneration do not require an exception to repository rules.
