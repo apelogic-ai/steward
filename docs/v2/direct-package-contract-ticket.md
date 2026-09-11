@@ -2,8 +2,7 @@
 
 Priority: P0 foundation
 
-Status: adversarial-review correction `103919e` is full-gate green locally; PR
-`apelogic-ai/steward#83` remains at prior head `320b79f` until SSH-key retry
+Status: review pending in `apelogic-ai/steward#83` at exact corrected head `103919e`
 
 ## Goal
 
