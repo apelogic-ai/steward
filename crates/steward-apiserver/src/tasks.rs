@@ -21,12 +21,21 @@ use kube::api::{Api, PostParams};
 use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, evaluate_with_grants};
-use steward_ports::{MAX_TASK_INPUT_ARCHIVE_BYTES, TaskExecutionAdapter, TaskExecutionPlanRequest};
+use steward_admission::{
+    AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec, evaluate_with_grants,
+};
+use steward_ports::{
+    GitFile, GitFileRequest, GitHostingPlane, GitRepositoryIdentity, MAX_TASK_INPUT_ARCHIVE_BYTES,
+    TaskExecutionAdapter, TaskExecutionPlanRequest,
+};
 use steward_store::{
     EnvelopeRequestRecord, PgStore, StoreError, TaskOrchestrationMode, TaskRecord,
     TaskReservationRequest, TaskRuntimeOperationRecord, TaskRuntimeOwnership,
     WorkflowRevisionRecord,
+};
+use steward_types::direct_package::{
+    DirectRequirements, DirectTaskDefinition, DirectTaskSubmission, EnvelopeDigest,
+    InvocationManifest, PackageCommit, RepositoryUrl, SourceProvenance, TriggerRepository,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, Duration,
@@ -79,11 +88,49 @@ struct VersionedTaskPlan {
     execution_binding: TaskExecutionBinding,
 }
 
+struct DirectTaskPreAdmission {
+    definition: DirectTaskDefinition,
+    envelope: EnvelopeRequestRecord,
+    effective_requirements: DirectRequirements,
+    spec: AgentRuntimeSpec,
+}
+
 trait LegacyRuntimeResolver: Send + Sync {
     fn get_by_uid<'a>(
         &'a self,
         runtime_uid: &'a str,
     ) -> BoxFuture<'a, Result<AgentRuntime, String>>;
+}
+
+trait DirectGitResolver: Send + Sync {
+    fn resolve_repository<'a>(
+        &'a self,
+        repository: &'a steward_types::direct_package::RepositoryUrl,
+    ) -> BoxFuture<'a, Result<GitRepositoryIdentity, steward_ports::PortError>>;
+
+    fn read_file<'a>(
+        &'a self,
+        request: &'a GitFileRequest,
+    ) -> BoxFuture<'a, Result<GitFile, steward_ports::PortError>>;
+}
+
+impl<G> DirectGitResolver for G
+where
+    G: GitHostingPlane,
+{
+    fn resolve_repository<'a>(
+        &'a self,
+        repository: &'a steward_types::direct_package::RepositoryUrl,
+    ) -> BoxFuture<'a, Result<GitRepositoryIdentity, steward_ports::PortError>> {
+        Box::pin(GitHostingPlane::resolve_repository(self, repository))
+    }
+
+    fn read_file<'a>(
+        &'a self,
+        request: &'a GitFileRequest,
+    ) -> BoxFuture<'a, Result<GitFile, steward_ports::PortError>> {
+        Box::pin(GitHostingPlane::read_file(self, request))
+    }
 }
 
 impl<R> LegacyRuntimeResolver for R
@@ -106,6 +153,7 @@ pub struct TaskApiConfig {
     execution_bindings_active: bool,
     orchestration_mode: TaskOrchestrationMode,
     legacy_runtime_resolver: Option<Arc<dyn LegacyRuntimeResolver>>,
+    direct_git_resolver: Option<Arc<dyn DirectGitResolver>>,
 }
 
 impl Default for TaskApiConfig {
@@ -117,6 +165,7 @@ impl Default for TaskApiConfig {
             execution_bindings_active: false,
             orchestration_mode: TaskOrchestrationMode::Staged,
             legacy_runtime_resolver: None,
+            direct_git_resolver: None,
         }
     }
 }
@@ -189,6 +238,14 @@ impl TaskApiConfig {
         R: RuntimeRepository,
     {
         self.legacy_runtime_resolver = Some(Arc::new(resolver));
+        self
+    }
+
+    pub fn with_git_hosting_plane<G>(mut self, resolver: G) -> Self
+    where
+        G: GitHostingPlane,
+    {
+        self.direct_git_resolver = Some(Arc::new(resolver));
         self
     }
 
@@ -379,6 +436,9 @@ pub struct TaskIdentity {
     pub acting_user: Option<Email>,
     pub owner: Email,
     pub canonical_user_id: CanonicalUserId,
+    /// Identity-ratified GitHub source provenance. Kubernetes identities and legacy
+    /// Identity credentials intentionally carry no Git source authority.
+    pub source_provenance: Option<SourceProvenance>,
 }
 
 pub trait TaskIdentityResolver: Clone + Send + Sync + 'static {
@@ -535,6 +595,8 @@ struct IdentityTaskClaims {
     email_verified: bool,
     groups: Vec<String>,
     identity_contract: String,
+    #[serde(default)]
+    source_provenance: Option<SourceProvenance>,
 }
 
 impl IdentityTaskIdentityResolver {
@@ -724,18 +786,29 @@ fn validate_identity_task_claims(
     {
         return Err(TaskAuthenticationError::InvalidCredentials);
     }
+    if claims
+        .source_provenance
+        .as_ref()
+        .is_some_and(|provenance| provenance.validate().is_err())
+    {
+        return Err(TaskAuthenticationError::InvalidCredentials);
+    }
     Ok(())
 }
 
 fn task_identity_from_identity_claims(
     claims: IdentityTaskClaims,
 ) -> Result<TaskIdentity, TaskAuthenticationError> {
+    let source_provenance = claims.source_provenance;
     let user = UserInfo {
         username: Some(claims.email),
         groups: Some(claims.groups),
         ..UserInfo::default()
     };
-    task_identity_from_kubernetes_user(&user)
+    task_identity_from_kubernetes_user(&user).map(|mut identity| {
+        identity.source_provenance = source_provenance;
+        identity
+    })
 }
 
 fn valid_identity_issuer(value: &str) -> bool {
@@ -808,6 +881,7 @@ fn task_identity_from_kubernetes_user(
         acting_user,
         owner,
         canonical_user_id,
+        source_provenance: None,
     })
 }
 
@@ -890,6 +964,22 @@ impl TaskWorkflowCatalog for StaticTaskWorkflowCatalog {
 }
 
 pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
+    fn active_source_repository_binding<'a>(
+        &'a self,
+        _caller: &'a TriggerRepository,
+        _source: &'a GitRepositoryIdentity,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async { Ok(false) })
+    }
+
+    fn active_provisioned_user_envelopes_by_digest<'a>(
+        &'a self,
+        _owner_user_id: &'a CanonicalUserId,
+        _digest: &'a EnvelopeDigest,
+    ) -> BoxFuture<'a, Result<Vec<EnvelopeRequestRecord>, StoreError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn workflow_revision<'a>(
         &'a self,
         _name: &'a str,
@@ -953,6 +1043,30 @@ pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
 }
 
 impl TaskSubmissionLedger for PgStore {
+    fn active_provisioned_user_envelopes_by_digest<'a>(
+        &'a self,
+        owner_user_id: &'a CanonicalUserId,
+        digest: &'a EnvelopeDigest,
+    ) -> BoxFuture<'a, Result<Vec<EnvelopeRequestRecord>, StoreError>> {
+        Box::pin(async move {
+            let store_digest = digest
+                .as_str()
+                .strip_prefix("steward:")
+                .ok_or(StoreError::InvalidEnvelopeRequest)?;
+            PgStore::envelope_requests(self, owner_user_id)
+                .await
+                .map(|records| {
+                    records
+                        .into_iter()
+                        .filter(|record| {
+                            record.status == steward_store::EnvelopeRequestStatus::Provisioned
+                                && record.envelope_digest.as_deref() == Some(store_digest)
+                        })
+                        .collect()
+                })
+        })
+    }
+
     fn workflow_revision<'a>(
         &'a self,
         name: &'a str,
@@ -1061,6 +1175,13 @@ pub struct TaskSubmissionRequest {
     pub coding_agent_runtime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_runtime_uid: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum TaskCreateRequest {
+    Existing(TaskSubmissionRequest),
+    Direct(DirectTaskSubmission),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -1364,7 +1485,7 @@ where
 async fn submit_task<L, I, W>(
     State(state): State<TaskApiState<L, I, W>>,
     headers: HeaderMap,
-    Json(request): Json<TaskSubmissionRequest>,
+    Json(request): Json<TaskCreateRequest>,
 ) -> Response
 where
     L: AdmissionLedger + TaskSubmissionLedger,
@@ -1385,11 +1506,21 @@ where
         Ok(identity) => identity,
         Err(error) => return error.into_response(),
     };
-    match state
-        .application
-        .submit(idempotency_key, identity, &request)
-        .await
-    {
+    let result = match request {
+        TaskCreateRequest::Existing(request) => {
+            state
+                .application
+                .submit(idempotency_key, identity, &request)
+                .await
+        }
+        TaskCreateRequest::Direct(request) => {
+            state
+                .application
+                .submit_direct(idempotency_key, identity, &request)
+                .await
+        }
+    };
+    match result {
         Ok((status, response)) => (status, Json(response)).into_response(),
         Err(error) => error.into_response(),
     }
@@ -1400,6 +1531,26 @@ where
     L: AdmissionLedger + TaskSubmissionLedger,
     W: TaskWorkflowCatalog,
 {
+    async fn submit_direct(
+        &self,
+        _idempotency_key: &str,
+        identity: TaskIdentity,
+        request: &DirectTaskSubmission,
+    ) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
+        request.validate().map_err(ApiError::Admission)?;
+        let DirectTaskPreAdmission {
+            definition,
+            envelope,
+            effective_requirements,
+            spec,
+        } = resolve_direct_task_pre_admission(&self.ledger, &self.config, &identity, request)
+            .await?;
+        drop((definition, envelope, effective_requirements, spec));
+        Err(ApiError::TaskRuntimeContractUnavailable(
+            "direct package reservation is unavailable".to_owned(),
+        ))
+    }
+
     async fn submit(
         &self,
         idempotency_key: &str,
@@ -1707,6 +1858,234 @@ where
             task_response(&self.ledger, record, deltas).await
         }
     }
+}
+
+async fn resolve_direct_task_pre_admission<L>(
+    ledger: &L,
+    config: &TaskApiConfig,
+    identity: &TaskIdentity,
+    request: &DirectTaskSubmission,
+) -> Result<DirectTaskPreAdmission, ApiError>
+where
+    L: TaskSubmissionLedger,
+{
+    let provenance = identity
+        .source_provenance
+        .as_ref()
+        .ok_or(ApiError::TaskAuthentication)?;
+    provenance
+        .validate()
+        .map_err(|_| ApiError::TaskAuthentication)?;
+    let git = config.direct_git_resolver.as_ref().ok_or_else(|| {
+        ApiError::TaskRuntimeContractUnavailable(
+            "direct package Git source resolver is unavailable".to_owned(),
+        )
+    })?;
+    let invocation_repository = RepositoryUrl::parse(format!(
+        "https://github.com/{}.git",
+        provenance.repository.name.as_str()
+    ))
+    .map_err(|_| ApiError::TaskAuthentication)?;
+    let invocation_identity = git
+        .resolve_repository(&invocation_repository)
+        .await
+        .map_err(source_port_error)?;
+    if invocation_identity.repository != invocation_repository
+        || invocation_identity.repository_id != provenance.repository.id
+        || invocation_identity.repository_owner_id != provenance.repository.owner_id
+    {
+        return Err(ApiError::TaskAuthentication);
+    }
+    let invocation_request = GitFileRequest {
+        repository: invocation_identity.clone(),
+        commit: provenance.triggered_sha.clone(),
+        path: request.invocation_path.clone(),
+        max_bytes: steward_types::direct_package::MAX_PACKAGE_FILE_BYTES,
+    };
+    let invocation_file = git
+        .read_file(&invocation_request)
+        .await
+        .map_err(source_port_error)?;
+    let invocation_bytes = verified_git_file(invocation_file, &invocation_request)?;
+    let manifest = serde_json::from_slice::<InvocationManifest>(&invocation_bytes)
+        .map_err(|_| ApiError::Admission("invocation manifest is invalid".to_owned()))?;
+    manifest
+        .validate_for_invoking_repository(&invocation_repository)
+        .map_err(ApiError::Admission)?;
+
+    let package_identity = git
+        .resolve_repository(&manifest.package.repository)
+        .await
+        .map_err(source_port_error)?;
+    let same_repository = package_identity == invocation_identity;
+    if !same_repository
+        && !ledger
+            .active_source_repository_binding(&provenance.repository, &package_identity)
+            .await
+            .map_err(ApiError::Store)?
+    {
+        return Err(ApiError::TaskSourceUnauthorized(
+            "source repository is not authorized".to_owned(),
+        ));
+    }
+    let package_commit = match &manifest.package.commit {
+        PackageCommit::Exact(commit) => commit.clone(),
+        PackageCommit::Trigger if same_repository => provenance.triggered_sha.clone(),
+        PackageCommit::Trigger => {
+            return Err(ApiError::Admission(
+                "git:trigger is valid only for the invoking repository".to_owned(),
+            ));
+        }
+    };
+    let definition_request = GitFileRequest {
+        repository: package_identity,
+        commit: package_commit,
+        path: manifest.package.path.clone(),
+        max_bytes: steward_types::direct_package::MAX_PACKAGE_FILE_BYTES,
+    };
+    let definition_file = git
+        .read_file(&definition_request)
+        .await
+        .map_err(source_port_error)?;
+    let definition_bytes = verified_git_file(definition_file, &definition_request)?;
+    let definition = serde_json::from_slice::<DirectTaskDefinition>(&definition_bytes)
+        .map_err(|_| ApiError::Admission("direct TaskDefinition is invalid".to_owned()))?;
+    definition.validate().map_err(ApiError::Admission)?;
+
+    let envelopes = ledger
+        .active_provisioned_user_envelopes_by_digest(
+            &identity.canonical_user_id,
+            &manifest.envelope,
+        )
+        .await
+        .map_err(ApiError::Store)?;
+    let [envelope] = envelopes.as_slice() else {
+        return if envelopes.is_empty() {
+            Err(ApiError::Admission(
+                "the selected Envelope is not active".to_owned(),
+            ))
+        } else {
+            Err(ApiError::Conflict(
+                "multiple active Envelopes have the selected digest".to_owned(),
+            ))
+        };
+    };
+    let approved = envelope
+        .approved_envelope
+        .as_ref()
+        .ok_or_else(|| ApiError::Admission("the selected Envelope is not active".to_owned()))?;
+    let effective_requirements = match &definition.requires {
+        Some(requirements) => requirements.clone(),
+        None => direct_requirements_from_envelope(&approved.spec)?,
+    };
+    let spec = direct_runtime_spec(identity, &definition, &effective_requirements)?;
+    if !matches!(
+        evaluate_with_grants(&spec, approved, &[])
+            .map_err(|error| ApiError::Admission(format!("{error:?}")))?,
+        AdmissionDecision::Admit
+    ) {
+        return Err(ApiError::Admission(
+            "direct package requirements exceed the selected Envelope".to_owned(),
+        ));
+    }
+    Ok(DirectTaskPreAdmission {
+        definition,
+        envelope: envelope.clone(),
+        effective_requirements,
+        spec,
+    })
+}
+
+fn source_port_error(error: steward_ports::PortError) -> ApiError {
+    match error {
+        steward_ports::PortError::Rejected { .. } => {
+            ApiError::Admission("exact source object could not be resolved".to_owned())
+        }
+        steward_ports::PortError::Unsupported { .. } | steward_ports::PortError::Failed { .. } => {
+            ApiError::TaskRuntimeContractUnavailable(
+                "direct package Git source resolver is unavailable".to_owned(),
+            )
+        }
+        _ => ApiError::TaskRuntimeContractUnavailable(
+            "direct package Git source resolver is unavailable".to_owned(),
+        ),
+    }
+}
+
+fn verified_git_file(file: GitFile, request: &GitFileRequest) -> Result<Vec<u8>, ApiError> {
+    if file.repository != request.repository
+        || file.commit != request.commit
+        || file.path != request.path
+        || file.bytes.len() as u64 > request.max_bytes
+    {
+        return Err(ApiError::Admission(
+            "exact source object does not match the requested Git object".to_owned(),
+        ));
+    }
+    Ok(file.bytes)
+}
+
+fn direct_requirements_from_envelope(spec: &EnvelopeSpec) -> Result<DirectRequirements, ApiError> {
+    let mut authority = serde_json::to_value(spec)
+        .map_err(|error| ApiError::Admission(format!("Envelope cannot be projected: {error}")))?;
+    let budget = authority
+        .get_mut("budget")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| ApiError::Admission("Envelope budget is invalid".to_owned()))?;
+    budget
+        .entry("singleRunLimit".to_owned())
+        .or_insert(serde_json::Value::Null);
+    let runner = authority
+        .get_mut("runner")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| {
+            ApiError::Admission("Envelope runner requirements are invalid".to_owned())
+        })?;
+    for field in ["memory", "compute", "storage"] {
+        runner
+            .entry(field.to_owned())
+            .or_insert(serde_json::Value::Null);
+    }
+    serde_json::from_value(serde_json::json!({"authority": authority}))
+        .map_err(|error| ApiError::Admission(format!("Envelope cannot be projected: {error}")))
+}
+
+fn direct_runtime_spec(
+    identity: &TaskIdentity,
+    definition: &DirectTaskDefinition,
+    requirements: &DirectRequirements,
+) -> Result<AgentRuntimeSpec, ApiError> {
+    let authority = serde_json::to_value(&requirements.authority).map_err(|error| {
+        ApiError::Admission(format!("direct requirements cannot be projected: {error}"))
+    })?;
+    let envelope_spec = serde_json::from_value::<EnvelopeSpec>(authority).map_err(|error| {
+        ApiError::Admission(format!("direct requirements cannot be projected: {error}"))
+    })?;
+    let canonical_authority = CanonicalAuthorityBinding::new(
+        identity.canonical_user_id.clone(),
+        identity
+            .acting_user
+            .as_ref()
+            .map(|_| identity.canonical_user_id.clone()),
+    )
+    .map_err(ApiError::Admission)?;
+    Ok(AgentRuntimeSpec {
+        principal: Principal::Service {
+            name: identity.service.clone(),
+            acting_user: identity.acting_user.clone(),
+        },
+        owner: identity.owner.clone(),
+        canonical_authority: Some(canonical_authority),
+        agent_type: steward_types::AgentType {
+            name: definition.runtime.agent_ref.as_str().to_owned(),
+        },
+        llms: envelope_spec.llms,
+        tools: envelope_spec.tools,
+        budget: envelope_spec.budget,
+        ttl: envelope_spec.ttl,
+        runner: envelope_spec.runner,
+        bindings: None,
+    })
 }
 
 async fn submit_versioned_task<L, W>(
@@ -2271,6 +2650,7 @@ mod workflow_request_tests {
             acting_user: Some(Email("alice@example.com".to_owned())),
             owner: Email("alice@example.com".to_owned()),
             canonical_user_id: CanonicalUserId::parse(user_id)?,
+            source_provenance: None,
         })
     }
 
