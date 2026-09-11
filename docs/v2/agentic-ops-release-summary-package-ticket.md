@@ -2,8 +2,7 @@
 
 Priority: P0
 
-Status: `apelogic-ai/agentic-ops#4` remains at `d236fa8`; reviewed local fix
-`5a2930e` awaits one SSH push retry
+Status: CI pending in `apelogic-ai/agentic-ops#4` at `5a2930e`
 
 ## Goal
 
@@ -68,8 +67,7 @@ running Steward environment until final integration.
 - contract checkpoint: Steward DP-C01 commit
   `042e8aa96a66d8927b50dc253509a5d437a5eeec`;
 - implementation: `apelogic-ai/agentic-ops#4` at commit
-  `d236fa879f89fc42f01cb77465e42b7b6e3a0a2b`, with local UTF-8 BOM rejection fix
-  `5a2930e` pending push;
+  `5a2930ee6ab40e8e0a6b1c0e0bbbe46e8b1bb367`;
 - closure digest:
   `steward:sha256:79a68a6e3f7a21d37c4da0594555d409999562b3d1778641f743ec0e290118a8`;
   and

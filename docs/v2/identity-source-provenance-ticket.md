@@ -2,7 +2,7 @@
 
 Priority: P0
 
-Status: blocked only on DP-C01 contract freeze
+Status: CI pending in `apelogic-ai/github-oidc-exchange#31` at `f9835cd`
 
 ## Goal
 
@@ -51,3 +51,12 @@ service-account authentication path.
 
 May proceed alongside DP-G01, DP-R01, and DP-A01 after DP-C01. It does not require the
 GitOps-owned local-main cluster.
+
+## Implementation evidence
+
+- implementation: `apelogic-ai/github-oidc-exchange#31` at commit `f9835cd`;
+- contract checkpoint: Steward DP-C01 commit `042e8aa`;
+- exact provenance field compatibility: independently reviewed with no contract
+  corrections required; and
+- local Rust, Helm, release validation, amd64 image build, and container smoke gates:
+  green.
