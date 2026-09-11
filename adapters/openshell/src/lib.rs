@@ -45,7 +45,7 @@ use steward_ports::PortError;
 use steward_ports::{
     ProviderControlExecutionBindings, SandboxExecutionClass, SandboxObservation, SandboxRequest,
     SandboxRuntime, SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest,
-    SandboxTaskRuntime, TaskAttemptId,
+    SandboxTaskRuntime, SandboxTaskTranscript, TaskAttemptId,
 };
 #[cfg(feature = "runtime")]
 use steward_types::direct_package::{
@@ -600,6 +600,15 @@ fn attach_task_agent_failure_category(
             adapter_observation_id,
             reason: task_agent_failure_category(stderr).to_owned(),
         },
+        SandboxTaskObservation::FailedWithTranscript {
+            adapter_observation_id,
+            transcript,
+            ..
+        } => SandboxTaskObservation::FailedWithTranscript {
+            adapter_observation_id,
+            reason: task_agent_failure_category(stderr).to_owned(),
+            transcript,
+        },
         observation => observation,
     }
 }
@@ -874,6 +883,14 @@ fn task_log_mode_for_execution(
     } else {
         configured
     }
+}
+
+#[cfg(feature = "runtime")]
+fn task_transcript_requested(
+    execution_class: SandboxExecutionClass,
+    execution_log: ExecutionLogMode,
+) -> bool {
+    execution_class == SandboxExecutionClass::Agent && execution_log == ExecutionLogMode::Full
 }
 
 #[cfg(feature = "runtime")]
@@ -1628,6 +1645,73 @@ impl OpenShellRuntime {
         Ok(())
     }
 
+    async fn task_attempt_transcript(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        directory: &str,
+    ) -> Result<SandboxTaskTranscript, PortError> {
+        let scoped = self.authenticated_client().await?.workspace(workspace);
+        let stdout = scoped
+            .exec(
+                sandbox,
+                &[
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    task_attempt_transcript_stream_command(
+                        directory,
+                        EXECUTION_STDOUT_ARCHIVE_PATH,
+                    ),
+                ],
+                ExecOptions {
+                    timeout: Some(StdDuration::from_secs(120)),
+                    ..ExecOptions::default()
+                },
+            )
+            .await
+            .map_err(port_failure)?;
+        if stdout.exit_code != 0 {
+            return Err(PortError::Failed {
+                reason: "Task stdout transcript is unavailable or outside its bounded contract"
+                    .to_owned(),
+            });
+        }
+        let stderr = scoped
+            .exec(
+                sandbox,
+                &[
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    task_attempt_transcript_stream_command(
+                        directory,
+                        EXECUTION_STDERR_ARCHIVE_PATH,
+                    ),
+                ],
+                ExecOptions {
+                    timeout: Some(StdDuration::from_secs(120)),
+                    ..ExecOptions::default()
+                },
+            )
+            .await
+            .map_err(port_failure)?;
+        let stdout_bytes = u64::try_from(stdout.stdout.len()).unwrap_or(u64::MAX);
+        let stderr_bytes = u64::try_from(stderr.stdout.len()).unwrap_or(u64::MAX);
+        if stderr.exit_code != 0
+            || stdout_bytes > MAX_EXECUTION_STREAM_BYTES
+            || stderr_bytes > MAX_EXECUTION_STREAM_BYTES
+            || stdout_bytes.saturating_add(stderr_bytes) > MAX_EXECUTION_TRANSCRIPT_BYTES
+        {
+            return Err(PortError::Failed {
+                reason: "Task execution transcript is unavailable or outside its bounded contract"
+                    .to_owned(),
+            });
+        }
+        Ok(SandboxTaskTranscript {
+            stdout: stdout.stdout,
+            stderr: stderr.stdout,
+        })
+    }
+
     async fn resolve_raw_sandbox_binding(
         &self,
         workspace: &str,
@@ -2270,8 +2354,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             &attempt_directory,
             &request.command,
             output_archive_command,
-            request.execution_class == SandboxExecutionClass::Agent
-                && request.diagnostics.execution_log == ExecutionLogMode::Full,
+            task_transcript_requested(request.execution_class, request.diagnostics.execution_log),
         );
         let executed = self
             .exec_task_process(
@@ -2368,6 +2451,16 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         }
         let (state, payload) = split_task_attempt_observation(&observed.stdout)?;
         let correlation = attempt_id.0.clone();
+        let transcript = if matches!(state, "succeeded" | "failed")
+            && task_transcript_requested(request.execution_class, request.diagnostics.execution_log)
+        {
+            Some(
+                self.task_attempt_transcript(workspace, sandbox, &attempt_directory)
+                    .await?,
+            )
+        } else {
+            None
+        };
         match state {
             "claimed" => Ok(SandboxTaskObservation::Accepted {
                 adapter_observation_id: correlation,
@@ -2379,17 +2472,38 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 if request.agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE {
                     validate_connections_bridge_archive(payload, "response.json")?;
                 }
-                Ok(SandboxTaskObservation::Succeeded {
-                    adapter_observation_id: correlation,
-                    output: SandboxTaskOutput {
-                        archive: payload.to_vec(),
-                    },
+                let output = SandboxTaskOutput {
+                    archive: payload.to_vec(),
+                };
+                Ok(if let Some(transcript) = transcript {
+                    SandboxTaskObservation::SucceededWithTranscript {
+                        adapter_observation_id: correlation,
+                        output,
+                        transcript,
+                    }
+                } else {
+                    SandboxTaskObservation::Succeeded {
+                        adapter_observation_id: correlation,
+                        output,
+                    }
                 })
             }
-            "failed" => Ok(SandboxTaskObservation::Failed {
-                adapter_observation_id: correlation,
-                reason: "task agent failed; inspect the bounded controller diagnostic".to_owned(),
-            }),
+            "failed" => {
+                let reason =
+                    "task agent failed; inspect the bounded controller diagnostic".to_owned();
+                Ok(if let Some(transcript) = transcript {
+                    SandboxTaskObservation::FailedWithTranscript {
+                        adapter_observation_id: correlation,
+                        reason,
+                        transcript,
+                    }
+                } else {
+                    SandboxTaskObservation::Failed {
+                        adapter_observation_id: correlation,
+                        reason,
+                    }
+                })
+            }
             "outcome_unknown" => Ok(SandboxTaskObservation::OutcomeUnknown {
                 reason: "Task attempt process is no longer live without a terminal marker"
                     .to_owned(),
@@ -2408,7 +2522,9 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         match self.observe_task(attempt_id, request).await? {
             terminal @ (SandboxTaskObservation::Absent
             | SandboxTaskObservation::Succeeded { .. }
+            | SandboxTaskObservation::SucceededWithTranscript { .. }
             | SandboxTaskObservation::Failed { .. }
+            | SandboxTaskObservation::FailedWithTranscript { .. }
             | SandboxTaskObservation::OutcomeUnknown { .. }) => Ok(terminal),
             SandboxTaskObservation::Accepted { .. } | SandboxTaskObservation::Running { .. } => {
                 Ok(SandboxTaskObservation::OutcomeUnknown {
@@ -2456,6 +2572,16 @@ fn task_attempt_claim_command(directory: &str) -> String {
         "set -eu; mkdir -p /sandbox/.steward-attempts; \
          if mkdir {directory} 2>/dev/null; then printf claimed > {directory}/state; \
          else exit 17; fi"
+    )
+}
+
+#[cfg(feature = "runtime")]
+fn task_attempt_transcript_stream_command(directory: &str, relative_path: &str) -> String {
+    let path = shell_quote(&format!("{directory}/{relative_path}"));
+    format!(
+        "set -eu; test -f {path}; size=$(wc -c < {path}); \
+         case \"$size\" in ''|*[!0-9]*) exit 65 ;; esac; \
+         test \"$size\" -le {MAX_EXECUTION_STREAM_BYTES}; cat {path}"
     )
 }
 
@@ -2647,6 +2773,8 @@ mod tests {
         SandboxTaskOutput, TaskAttemptId,
     };
     #[cfg(feature = "runtime")]
+    use steward_types::direct_package::ExecutionLogMode;
+    #[cfg(feature = "runtime")]
     use steward_types::{
         AgentType, DisposableExecutionBinding, ExecutionProviderProfile, ExecutionProviderProfiles,
         ExecutionVersionProbe, ModelRef, RuntimeId, RuntimeRefs,
@@ -2666,7 +2794,8 @@ mod tests {
         provider_reconciliation, provider_reconciliation_plan, provider_reconciliation_targets,
         sandbox_spec, staging_append_command, staging_archive_chunks, staging_extract_command,
         staging_prepare_command, task_agent_failure_category, task_attempt_directory,
-        task_attempt_execution_command, task_attempt_observation_command, task_process_log_record,
+        task_attempt_execution_command, task_attempt_observation_command,
+        task_attempt_transcript_stream_command, task_process_log_record, task_transcript_requested,
         validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
     };
     #[cfg(feature = "runtime")]
@@ -3053,6 +3182,18 @@ mod tests {
             OpenShellTaskLogMode::Full,
             "the provider-control logging override must not change long-running agent logging"
         );
+        assert!(!task_transcript_requested(
+            SandboxExecutionClass::ProviderControl,
+            ExecutionLogMode::Full,
+        ));
+        assert!(!task_transcript_requested(
+            SandboxExecutionClass::Agent,
+            ExecutionLogMode::Off,
+        ));
+        assert!(task_transcript_requested(
+            SandboxExecutionClass::Agent,
+            ExecutionLogMode::Full,
+        ));
     }
 
     #[cfg(feature = "runtime")]
@@ -4562,39 +4703,87 @@ mod tests {
     #[cfg(feature = "runtime")]
     #[test]
     fn failed_task_observation_uses_the_safe_stderr_category() {
+        let transcript = steward_ports::SandboxTaskTranscript {
+            stdout: b"collected stdout".to_vec(),
+            stderr: b"collected stderr".to_vec(),
+        };
         assert_eq!(
             attach_task_agent_failure_category(
-                SandboxTaskObservation::Failed {
+                SandboxTaskObservation::FailedWithTranscript {
                     adapter_observation_id: "attempt-a".to_owned(),
                     reason: "raw failure".to_owned(),
+                    transcript: transcript.clone(),
                 },
                 b"steward-connections-bridge: bridge MCP-GW rejected runtime authorization",
             ),
-            SandboxTaskObservation::Failed {
+            SandboxTaskObservation::FailedWithTranscript {
                 adapter_observation_id: "attempt-a".to_owned(),
                 reason: "bridge-runtime-authorization".to_owned(),
+                transcript: transcript.clone(),
             },
-            "provider-control stderr must be reduced to an allowlisted category before persistence"
+            "failure classification must preserve the bounded execution transcript"
         );
 
         assert_eq!(
             attach_task_agent_failure_category(
-                SandboxTaskObservation::Succeeded {
+                SandboxTaskObservation::SucceededWithTranscript {
                     adapter_observation_id: "attempt-b".to_owned(),
                     output: SandboxTaskOutput {
                         archive: vec![1, 2, 3],
                     },
+                    transcript: transcript.clone(),
                 },
                 b"opaque stderr",
             ),
-            SandboxTaskObservation::Succeeded {
+            SandboxTaskObservation::SucceededWithTranscript {
                 adapter_observation_id: "attempt-b".to_owned(),
                 output: SandboxTaskOutput {
                     archive: vec![1, 2, 3],
                 },
+                transcript,
             },
             "successful observations must remain unchanged"
         );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn terminal_transcript_reads_only_the_two_bounded_attempt_files() {
+        let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
+        let stdout = task_attempt_transcript_stream_command(
+            directory,
+            steward_types::direct_package::EXECUTION_STDOUT_ARCHIVE_PATH,
+        );
+        let stderr = task_attempt_transcript_stream_command(
+            directory,
+            steward_types::direct_package::EXECUTION_STDERR_ARCHIVE_PATH,
+        );
+
+        for (command, path) in [
+            (
+                &stdout,
+                steward_types::direct_package::EXECUTION_STDOUT_ARCHIVE_PATH,
+            ),
+            (
+                &stderr,
+                steward_types::direct_package::EXECUTION_STDERR_ARCHIVE_PATH,
+            ),
+        ] {
+            assert!(command.contains(path));
+            assert!(
+                command.contains(
+                    &steward_types::direct_package::MAX_EXECUTION_STREAM_BYTES.to_string()
+                )
+            );
+            assert!(!command.contains("output.tar"));
+            assert!(
+                std::process::Command::new("/bin/sh")
+                    .args(["-n", "-c", command])
+                    .status()
+                    .is_ok_and(|status| status.success()),
+                "the bounded transcript reader must be valid POSIX shell"
+            );
+        }
     }
 
     #[cfg(feature = "runtime")]

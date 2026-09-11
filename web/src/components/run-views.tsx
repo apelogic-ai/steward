@@ -34,6 +34,27 @@ function runtimeLabel(value: string | null | undefined): string {
   return value.split("-", 1)[0] || value;
 }
 
+function isTerminalPhase(phase: string): boolean {
+  return phase === "failed" || phase === "succeeded";
+}
+
+function TerminalPhaseLogs({ admin, taskUid }: Readonly<{ admin: boolean; taskUid: string }>) {
+  const runPath = `${admin ? "/admin/runs" : "/runs"}/${encodeURIComponent(taskUid)}`;
+  return (
+    <div className="mt-3 flex flex-wrap gap-2">
+      {(["stdout", "stderr"] as const).map((stream) => (
+        <a
+          className="inline-flex min-h-11 items-center rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas"
+          href={`${runPath}/logs/${stream}`}
+          key={stream}
+        >
+          View {stream}
+        </a>
+      ))}
+    </div>
+  );
+}
+
 export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; runs: Array<BrowserRunView> }>) {
   if (runs.length === 0) return <EmptyState title="No data" />;
   const newestRuns = [...runs].sort((left, right) => runUpdatedAt(right) - runUpdatedAt(left));
@@ -124,7 +145,12 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
               <li className="relative rounded-panel border bg-panel p-4" key={`${event.at}-${index}`}>
                 <span aria-hidden="true" className="absolute -start-[1.63rem] top-5 size-3 rounded-full bg-brand" />
                 <p className="font-semibold capitalize">{event.kind.replaceAll(/([A-Z])/g, " $1")}</p>
-                {event.kind === "phase" ? <StatusBadge value={event.phase} /> : null}
+                {event.kind === "phase" ? (
+                  <>
+                    <StatusBadge value={event.phase} />
+                    {isTerminalPhase(event.phase) ? <TerminalPhaseLogs admin={admin} taskUid={taskUid} /> : null}
+                  </>
+                ) : null}
                 <time className="mt-2 block text-xs text-muted-ink">{dateTime(event.at)}</time>
               </li>
             ))}

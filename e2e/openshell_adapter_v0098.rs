@@ -405,11 +405,15 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
         .await
         .map_err(|error| format!("adapter task round trip failed: {error:?}"))
         .and_then(|observation| match observation {
-            SandboxTaskObservation::Succeeded { output, .. } => {
+            SandboxTaskObservation::SucceededWithTranscript {
+                output,
+                transcript,
+                ..
+            } if transcript.stdout == b"task-stdout" && transcript.stderr == b"task-stderr" => {
                 output_payload(&run_dir, &output.archive)
             }
             other => Err(format!(
-                "adapter task round trip did not produce a terminal success: {other:?}"
+                "adapter task round trip did not retain its terminal transcript: {other:?}"
             )),
         });
 

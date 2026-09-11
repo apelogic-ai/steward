@@ -17,15 +17,15 @@ use steward_apiserver::governed_connections::{
     plan_connection_operation,
 };
 use steward_store::{
-    AgentRunQuery, AgentRunTimelineKind, AgentRunTimelineProvenance, ApprovalDeliveryTransition,
-    ApproveAdmission, BrowserRbacAssignment, BrowserRbacAssignmentAction,
-    BrowserRbacAssignmentChange, ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase,
-    ConnectionOperationKind, ConnectionOperationReservation, ConnectionOperationReservationRequest,
-    ConnectionOperationRetention, ConnectionOperationState, EnvelopeRequestReservationRequest,
-    EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, ParkRejection, PgStore, StoreError,
-    TaskActivationObservation, TaskCleanupObservation, TaskExecutionAttemptState,
-    TaskExecutionObservation, TaskExecutionTransition, TaskOperationTransition,
-    TaskOrchestrationState, TaskReservationRequest,
+    AgentRunLogStream, AgentRunQuery, AgentRunTimelineKind, AgentRunTimelineProvenance,
+    ApprovalDeliveryTransition, ApproveAdmission, BrowserRbacAssignment,
+    BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, ConnectionExecutionBindingSnapshot,
+    ConnectionOAuthPhase, ConnectionOperationKind, ConnectionOperationReservation,
+    ConnectionOperationReservationRequest, ConnectionOperationRetention, ConnectionOperationState,
+    EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
+    ParkRejection, PgStore, StoreError, TaskActivationObservation, TaskCleanupObservation,
+    TaskExecutionAttemptState, TaskExecutionObservation, TaskExecutionTransition,
+    TaskOperationTransition, TaskOrchestrationState, TaskReservationRequest,
 };
 use steward_types::direct_package::DirectTaskBindingEvidence;
 use steward_types::{
@@ -1949,6 +1949,8 @@ async fn terminal_execution_failure_enters_cleanup_and_authority_loss_preserves_
             TaskExecutionObservation::Failed {
                 adapter_observation_id: "adapter-failed-attempt",
                 reason: "agent_exit_nonzero",
+                execution_stdout: Some(b"failed stdout\n"),
+                execution_stderr: Some(b"failed stderr\n"),
             },
             "controller-a",
         )
@@ -1958,6 +1960,37 @@ async fn terminal_execution_failure_enters_cleanup_and_authority_loss_preserves_
         .await?
         .ok_or(StoreError::TaskNotFound)?;
     assert_eq!(failed_task.phase, TaskPhase::Failed);
+    assert_eq!(
+        store
+            .agent_run_execution_log(
+                failed_task_uid,
+                Some(identity.user_id.as_str()),
+                AgentRunLogStream::Stdout,
+            )
+            .await?,
+        Some(b"failed stdout\n".to_vec())
+    );
+    assert_eq!(
+        store
+            .agent_run_execution_log(
+                failed_task_uid,
+                Some(identity.user_id.as_str()),
+                AgentRunLogStream::Stderr,
+            )
+            .await?,
+        Some(b"failed stderr\n".to_vec())
+    );
+    assert_eq!(
+        store
+            .agent_run_execution_log(
+                failed_task_uid,
+                Some("usr_abcdefabcdefabcdefabcdefabcdefab"),
+                AgentRunLogStream::Stderr,
+            )
+            .await?,
+        None,
+        "execution logs must not cross the browser owner boundary"
+    );
     assert!(
         failed_task.finalize_requested,
         "a terminal execution failure must request runtime cleanup"
@@ -2035,6 +2068,8 @@ async fn terminal_execution_failure_enters_cleanup_and_authority_loss_preserves_
                 result_digest: &format!("sha256:{}", "b".repeat(64)),
                 result_reference: "adapter:succeeded-attempt",
                 output_archive: b"succeeded-output",
+                execution_stdout: Some(b"succeeded stdout\n"),
+                execution_stderr: Some(b"succeeded stderr\n"),
             },
             "controller-a",
         )
@@ -2057,6 +2092,17 @@ async fn terminal_execution_failure_enters_cleanup_and_authority_loss_preserves_
         succeeded_task.phase,
         TaskPhase::Succeeded,
         "authority loss during cleanup must not rewrite a terminal Task phase"
+    );
+    assert_eq!(
+        store
+            .agent_run_execution_log(
+                succeeded_task_uid,
+                Some(identity.user_id.as_str()),
+                AgentRunLogStream::Stdout,
+            )
+            .await?,
+        Some(b"succeeded stdout\n".to_vec()),
+        "successful execution logs remain separate from declared Task outputs"
     );
     assert!(succeeded_task.finalize_requested);
     Ok(())
@@ -3974,6 +4020,8 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
             TaskExecutionObservation::Failed {
                 adapter_observation_id: "exact-late-terminal",
                 reason: "process_exited",
+                execution_stdout: None,
+                execution_stderr: None,
             },
             "controller-b",
         )
@@ -4239,6 +4287,8 @@ async fn task_submission_state_is_idempotent_durable_and_single_claimed()
                     result_digest: &format!("sha256:{}", "a".repeat(64)),
                     result_reference: "adapter:attempt-a",
                     output_archive: b"neutral-output-tar",
+                    execution_stdout: None,
+                    execution_stderr: None,
                 },
                 "controller-a",
             )
@@ -5831,6 +5881,20 @@ async fn consumed_connection_output_retires_without_rewriting_execution_history(
                 .to_mut()
                 .retain(|migration| migration.version <= 32);
             historical.run(&pool).await?;
+            // The current store decoder includes the later direct-package evidence
+            // column. Add only its nullable shape while arranging the legacy
+            // connection-output state, then remove it before exercising the real
+            // append-only migrations below.
+            sqlx::query("ALTER TABLE task_submissions ADD COLUMN direct_task_evidence jsonb")
+                .execute(&pool)
+                .await?;
+            sqlx::query(
+                "ALTER TABLE task_execution_attempts \
+                    ADD COLUMN execution_stdout bytea, \
+                    ADD COLUMN execution_stderr bytea",
+            )
+            .execute(&pool)
+            .await?;
         } else {
             store.migrate().await?;
         }
@@ -5916,6 +5980,8 @@ async fn consumed_connection_output_retires_without_rewriting_execution_history(
                     result_digest: &digest,
                     result_reference: "adapter:result",
                     output_archive: b"neutral transient connection output",
+                    execution_stdout: None,
+                    execution_stderr: None,
                 },
                 "controller-a",
             )
@@ -5935,11 +6001,23 @@ async fn consumed_connection_output_retires_without_rewriting_execution_history(
                     .await,
                 Err(StoreError::Database(_))
             ));
-            let before = store
-                .task(task_uid)
-                .await?
-                .ok_or(StoreError::TaskNotFound)?;
+            let before = sqlx::query_as::<_, (String, Option<Vec<u8>>)>(
+                "SELECT phase, output_archive FROM task_submissions WHERE task_uid = $1",
+            )
+            .bind(task_uid)
+            .fetch_one(store.pool())
+            .await?;
             let history_before = store.task_execution_attempt(task_uid).await?;
+            sqlx::query("ALTER TABLE task_submissions DROP COLUMN direct_task_evidence")
+                .execute(store.pool())
+                .await?;
+            sqlx::query(
+                "ALTER TABLE task_execution_attempts \
+                    DROP COLUMN execution_stdout, \
+                    DROP COLUMN execution_stderr",
+            )
+            .execute(store.pool())
+            .await?;
             store.migrate().await?;
             // The staged rollout replaces the old processes. Reconnect after
             // DDL rather than reusing pre-upgrade SELECT * statement caches.
@@ -5949,7 +6027,13 @@ async fn consumed_connection_output_retires_without_rewriting_execution_history(
                 .connect_with(options)
                 .await?;
             store = PgStore::new(pool.clone());
-            assert_eq!(store.task(task_uid).await?, Some(before));
+            let after = sqlx::query_as::<_, (String, Option<Vec<u8>>)>(
+                "SELECT phase, output_archive FROM task_submissions WHERE task_uid = $1",
+            )
+            .bind(task_uid)
+            .fetch_one(store.pool())
+            .await?;
+            assert_eq!(after, before);
             assert_eq!(
                 store.task_execution_attempt(task_uid).await?,
                 history_before

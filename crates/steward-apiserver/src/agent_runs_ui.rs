@@ -6,14 +6,14 @@
 //! independent at `/admin/api/v1/runs`.
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_store::{
-    AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent, AgentRunTimelineKind,
-    StoreError,
+    AgentRunLogStream, AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent,
+    AgentRunTimelineKind, StoreError,
 };
 use steward_types::{CanonicalUserId, RuntimeOwnership, TaskPhase};
 use uuid::Uuid;
@@ -146,6 +146,10 @@ where
             "/app/api/v1/runs/{task_uid}/timeline",
             get(my_run_timeline::<L>),
         )
+        .route(
+            "/app/api/v1/runs/{task_uid}/logs/{stream}",
+            get(my_run_execution_log::<L>),
+        )
         .with_state(BrowserRunsState { ledger })
 }
 
@@ -159,6 +163,10 @@ where
         .route(
             "/admin/api/v1/all-runs/{task_uid}/timeline",
             get(all_run_timeline::<L>),
+        )
+        .route(
+            "/admin/api/v1/all-runs/{task_uid}/logs/{stream}",
+            get(all_run_execution_log::<L>),
         )
         .with_state(BrowserRunsState { ledger })
 }
@@ -356,6 +364,111 @@ where
 
 #[utoipa::path(
     get,
+    path = "/app/api/v1/runs/{task_uid}/logs/{stream}",
+    params(
+        ("task_uid" = String, Path, format = "uuid"),
+        ("stream" = String, Path, description = "Exact execution stream: stdout or stderr")
+    ),
+    responses(
+        (status = 200, description = "Bounded execution log", content_type = "text/plain"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 404, description = "Terminal execution log was not found in the user's scope"),
+        (status = 503, description = "Run history is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn my_run_execution_log<L>(
+    session: Option<Extension<BrowserSessionContext>>,
+    State(state): State<BrowserRunsState<L>>,
+    Path((task_uid, stream)): Path<(Uuid, String)>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    execution_log_response(
+        &state.ledger,
+        task_uid,
+        Some(session.principal.canonical_user_id.as_str()),
+        &stream,
+    )
+    .await
+}
+
+#[utoipa::path(
+    get,
+    path = "/admin/api/v1/all-runs/{task_uid}/logs/{stream}",
+    params(
+        ("task_uid" = String, Path, format = "uuid"),
+        ("stream" = String, Path, description = "Exact execution stream: stdout or stderr")
+    ),
+    responses(
+        (status = 200, description = "Bounded execution log", content_type = "text/plain"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role is required"),
+        (status = 404, description = "Terminal execution log was not found"),
+        (status = 503, description = "Run history is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn all_run_execution_log<L>(
+    authority: Option<Extension<BrowserAdminAuthority>>,
+    State(state): State<BrowserRunsState<L>>,
+    Path((task_uid, stream)): Path<(Uuid, String)>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    if authority.is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    execution_log_response(&state.ledger, task_uid, None, &stream).await
+}
+
+async fn execution_log_response<L>(
+    ledger: &L,
+    task_uid: Uuid,
+    owner_user_id: Option<&str>,
+    stream: &str,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    let stream = match stream {
+        "stdout" => AgentRunLogStream::Stdout,
+        "stderr" => AgentRunLogStream::Stderr,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    match ledger
+        .agent_run_execution_log(task_uid, owner_user_id, stream)
+        .await
+    {
+        Ok(Some(log)) => execution_log_body(log),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+fn execution_log_body(log: Vec<u8>) -> Response {
+    let mut response = log.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+#[utoipa::path(
+    get,
     path = "/app/api/v1/runs/{task_uid}/timeline",
     params(("task_uid" = String, Path)),
     responses(
@@ -540,6 +653,7 @@ fn browser_runs_error(status: StatusCode) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     use axum::body::{Body, to_bytes};
@@ -556,10 +670,13 @@ mod tests {
         LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service,
     };
 
+    type FakeExecutionLogs = Arc<Mutex<HashMap<(Uuid, AgentRunLogStream), Vec<u8>>>>;
+
     #[derive(Clone, Default)]
     struct FakeLedger {
         records: Arc<Mutex<Vec<AgentRunRecord>>>,
         queries: Arc<Mutex<Vec<AgentRunQuery>>>,
+        logs: FakeExecutionLogs,
     }
 
     impl AgentRunLedger for FakeLedger {
@@ -632,6 +749,35 @@ mod tests {
                         },
                     ]
                 }))
+            })
+        }
+
+        fn agent_run_execution_log<'a>(
+            &'a self,
+            task_uid: Uuid,
+            owner_user_id: Option<&'a str>,
+            stream: AgentRunLogStream,
+        ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>> {
+            Box::pin(async move {
+                let visible = self
+                    .records
+                    .lock()
+                    .map_err(|_| StoreError::InvalidRunQuery)?
+                    .iter()
+                    .any(|record| {
+                        record.task_uid == task_uid
+                            && owner_user_id
+                                .is_none_or(|owner| record.owner_user_id.as_deref() == Some(owner))
+                    });
+                if !visible {
+                    return Ok(None);
+                }
+                Ok(self
+                    .logs
+                    .lock()
+                    .map_err(|_| StoreError::InvalidRunQuery)?
+                    .get(&(task_uid, stream))
+                    .cloned())
             })
         }
     }
@@ -988,6 +1134,127 @@ mod tests {
         assert_eq!(
             ledger.queries.lock().map_err(|_| "lock queries")?[1].task_uid,
             Some(own_task)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_execution_logs_are_owner_scoped_plain_text_and_not_cached()
+    -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let other_owner = "usr_abcdefabcdefabcdefabcdefabcdefab";
+        let own_task = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let other_task = Uuid::parse_str("22222222-2222-4222-8222-222222222222")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .extend([run(own_task, owner), run(other_task, other_owner)]);
+        ledger.logs.lock().map_err(|_| "lock logs")?.insert(
+            (own_task, AgentRunLogStream::Stdout),
+            b"completed\n".to_vec(),
+        );
+        ledger.logs.lock().map_err(|_| "lock logs")?.insert(
+            (other_task, AgentRunLogStream::Stderr),
+            b"failed\n".to_vec(),
+        );
+
+        let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
+        let response = protected_router(ledger.clone(), service)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{own_task}/logs/stdout"))
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build stdout request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute stdout request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain; charset=utf-8"))
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options"),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        assert_eq!(
+            to_bytes(response.into_body(), 1024)
+                .await
+                .map_err(|error| format!("read stdout response: {error}"))?,
+            "completed\n"
+        );
+
+        let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
+        let hidden = protected_router(ledger, service)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{other_task}/logs/stderr"))
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build cross-owner stderr request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute cross-owner stderr request: {error}"))?;
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn administrators_can_read_failed_execution_stderr() -> Result<(), String> {
+        let task_uid = Uuid::parse_str("33333333-3333-4333-8333-333333333333")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        let mut failed = run(task_uid, "usr_abcdefabcdefabcdefabcdefabcdefab");
+        failed.phase = TaskPhase::Failed;
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .push(failed);
+        ledger.logs.lock().map_err(|_| "lock logs")?.insert(
+            (task_uid, AgentRunLogStream::Stderr),
+            b"agent failed\n".to_vec(),
+        );
+
+        let (user_service, user_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
+        let denied = protected_router(ledger.clone(), user_service)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/api/v1/all-runs/{task_uid}/logs/stderr"))
+                    .header(header::COOKIE, user_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build denied stderr request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute denied stderr request: {error}"))?;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let (admin_service, admin_cookie) = signed_in_cookie(LocalFakeIdentity::Admin).await?;
+        let response = protected_router(ledger, admin_service)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/admin/api/v1/all-runs/{task_uid}/logs/stderr"))
+                    .header(header::COOKIE, admin_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build admin stderr request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute admin stderr request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), 1024)
+                .await
+                .map_err(|error| format!("read failed stderr response: {error}"))?,
+            "agent failed\n"
         );
         Ok(())
     }

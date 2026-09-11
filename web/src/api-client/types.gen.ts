@@ -851,6 +851,45 @@ export type AllRunResponses = {
 
 export type AllRunResponse = AllRunResponses[keyof AllRunResponses];
 
+export type AllRunExecutionLogData = {
+    body?: never;
+    path: {
+        task_uid: string;
+        /**
+         * Exact execution stream: stdout or stderr
+         */
+        stream: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/all-runs/{task_uid}/logs/{stream}';
+};
+
+export type AllRunExecutionLogErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Terminal execution log was not found
+     */
+    404: unknown;
+    /**
+     * Run history is unavailable
+     */
+    503: unknown;
+};
+
+export type AllRunExecutionLogResponses = {
+    /**
+     * Bounded execution log
+     */
+    200: unknown;
+};
+
 export type AllRunTimelineData = {
     body?: never;
     path: {
@@ -1841,6 +1880,41 @@ export type MyRunResponses = {
 };
 
 export type MyRunResponse = MyRunResponses[keyof MyRunResponses];
+
+export type MyRunExecutionLogData = {
+    body?: never;
+    path: {
+        task_uid: string;
+        /**
+         * Exact execution stream: stdout or stderr
+         */
+        stream: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/logs/{stream}';
+};
+
+export type MyRunExecutionLogErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Terminal execution log was not found in the user's scope
+     */
+    404: unknown;
+    /**
+     * Run history is unavailable
+     */
+    503: unknown;
+};
+
+export type MyRunExecutionLogResponses = {
+    /**
+     * Bounded execution log
+     */
+    200: unknown;
+};
 
 export type MyRunTimelineData = {
     body?: never;

@@ -225,6 +225,14 @@ pub struct SandboxTaskOutput {
     pub archive: Vec<u8>,
 }
 
+/// Bounded process output captured for an Agent Task when full execution diagnostics were
+/// selected. Provider-control executions never populate this value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SandboxTaskTranscript {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
 /// Immutable, server-authored correlation identity for one Task execution attempt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskAttemptId(pub String);
@@ -242,9 +250,19 @@ pub enum SandboxTaskObservation {
         adapter_observation_id: String,
         output: SandboxTaskOutput,
     },
+    SucceededWithTranscript {
+        adapter_observation_id: String,
+        output: SandboxTaskOutput,
+        transcript: SandboxTaskTranscript,
+    },
     Failed {
         adapter_observation_id: String,
         reason: String,
+    },
+    FailedWithTranscript {
+        adapter_observation_id: String,
+        reason: String,
+        transcript: SandboxTaskTranscript,
     },
     OutcomeUnknown {
         reason: String,
