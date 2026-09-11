@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const DIRECT_TASK_CONTRACT_VERSION: &str = "steward.task/v2";
 pub const DIRECT_TASK_DEFINITION_SCHEMA: &str = "steward.task-definition/v2";
@@ -84,14 +85,29 @@ fn valid_repository_url(value: &str) -> bool {
     let Some((host, path)) = rest.split_once('/') else {
         return false;
     };
-    !host.is_empty()
-        && host.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
-        })
-        && host.contains('.')
+    valid_repository_host(host)
         && path
             .strip_suffix(".git")
             .is_some_and(|path| valid_repository_path(path) && path.contains('/'))
+}
+
+fn valid_repository_host(value: &str) -> bool {
+    let labels = value.split('.').collect::<Vec<_>>();
+    labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && label
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                && label
+                    .bytes()
+                    .last()
+                    .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
 }
 
 fn valid_repository_path(value: &str) -> bool {
@@ -240,10 +256,10 @@ fn valid_duration(value: &str) -> bool {
     let Some(unit) = value.chars().last() else {
         return false;
     };
+    let amount = &value[..value.len() - 1];
     matches!(unit, 's' | 'm' | 'h')
-        && value[..value.len() - 1]
-            .parse::<u64>()
-            .is_ok_and(|amount| amount > 0)
+        && !amount.starts_with('0')
+        && amount.parse::<u64>().is_ok_and(|parsed| parsed > 0)
 }
 
 fn valid_resource_quantity(value: &str) -> bool {
@@ -388,6 +404,7 @@ pub struct DiagnosticsRequest {
 pub struct DirectTaskStatusResponse {
     pub contract_version: String,
     pub task_uid: Uuid,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub runtime_uid: Option<BoundedText>,
     pub phase: DirectTaskPhase,
     pub runtime_ownership: DirectRuntimeOwnership,
@@ -513,10 +530,16 @@ impl DirectTaskDefinition {
         if self.outputs.is_empty() {
             return Err("TaskDefinition must declare at least one output".to_owned());
         }
+        if self.outputs.len() > 32 {
+            return Err("TaskDefinition must declare at most 32 outputs".to_owned());
+        }
         if self.outputs.iter().any(|output| {
             output.path.as_str() != "out" && !output.path.as_str().starts_with("out/")
         }) {
             return Err("declared outputs must remain beneath the out directory".to_owned());
+        }
+        if let Some(requirements) = &self.requires {
+            requirements.validate()?;
         }
         require_unique_paths(self.skills.iter())?;
         require_unique_paths(self.outputs.iter().map(|output| &output.path))
@@ -902,7 +925,46 @@ impl DirectTaskBindingEvidence {
         )?;
         self.source_provenance.validate()?;
         self.closure.validate()?;
-        self.effective_requirements.validate()
+        self.effective_requirements.validate()?;
+        if self.envelope.revision == 0 {
+            return Err("Envelope evidence revision must be positive".to_owned());
+        }
+        if self.invocation.repository_id != self.source_provenance.repository.id
+            || self.invocation.repository_owner_id != self.source_provenance.repository.owner_id
+            || self.invocation.commit != self.source_provenance.triggered_sha
+        {
+            return Err("invocation source differs from its signed source provenance".to_owned());
+        }
+        let expected_invocation_repository = format!(
+            "https://github.com/{}.git",
+            self.source_provenance.repository.name.as_str()
+        );
+        if self.invocation.repository.as_str() != expected_invocation_repository {
+            return Err(
+                "invocation repository differs from its signed source provenance".to_owned(),
+            );
+        }
+        if self.package.path != self.closure.entry_point {
+            return Err("package path differs from the closure entry point".to_owned());
+        }
+        let entry_point_digest = self
+            .closure
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.kind == ClosureEntryKind::TaskDefinition
+                    && entry.path == self.closure.entry_point
+            })
+            .map(|entry| &entry.digest);
+        if entry_point_digest != Some(&self.package.content_digest) {
+            return Err("package digest differs from the closure entry point digest".to_owned());
+        }
+        let actual_closure_digest = Sha256::digest(canonical_json_bytes(&self.closure)?);
+        let actual_closure_digest = format!("steward:sha256:{actual_closure_digest:x}");
+        if self.closure_digest.as_str() != actual_closure_digest {
+            return Err("closure digest does not match the canonical package closure".to_owned());
+        }
+        Ok(())
     }
 }
 

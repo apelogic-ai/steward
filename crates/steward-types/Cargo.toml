@@ -12,6 +12,7 @@ kube = { workspace = true, features = ["derive"] }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 # Publish the vendor-neutral runtime wire contract through the Steward OpenAPI document.
 utoipa.workspace = true
 

@@ -13,7 +13,7 @@
     "repositoryUrl": {
       "type": "string",
       "maxLength": 512,
-      "pattern": "^https://[a-z0-9][a-z0-9.-]*\\.[a-z0-9.-]+/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+\\.git$"
+      "pattern": "^https://(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?/(?!\\.{1,2}(?:/|\\.git$))[A-Za-z0-9._-]+(?:/(?!\\.{1,2}(?:/|\\.git$))[A-Za-z0-9._-]+)+\\.git$"
     },
     "exactGitCommit": {
       "type": "string",

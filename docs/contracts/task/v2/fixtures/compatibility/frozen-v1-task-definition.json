@@ -4,16 +4,25 @@
   "version": 1,
   "agent": "coding-agent@1",
   "prompt": "prompt.test",
-  "skills": ["skills/inspect-repository/skill.test"],
+  "skills": [
+    "skills/inspect-repository/skill.test"
+  ],
   "lock": "dependencies.test",
   "requires": {
     "execution": {
       "schemaVersion": "steward/catalog/execution-requirements/v1",
-      "capabilities": ["shell"]
+      "capabilities": [
+        "shell"
+      ]
     },
     "authority": {
       "schemaVersion": "steward/catalog/authority-requirements/v1",
-      "models": [{ "provider": "litellm", "model": "review-model" }],
+      "models": [
+        {
+          "provider": "litellm",
+          "model": "review-model"
+        }
+      ],
       "tools": [],
       "budget": {
         "currency": "USD",
