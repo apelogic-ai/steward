@@ -34,7 +34,10 @@ coverage, bump the runner base, or include direct-package behavior changes.
   `gir1.2-glib-2.0`, `libglib2.0-0t64`, `libglib2.0-bin`, or `libglib2.0-data`;
 - prove `apt-get check` succeeds after the explicit purge;
 - prove Runner.Listener starts and has no missing linked libraries;
-- preserve Git, jq, Python, unzip, passwordless runner sudo, Docker CLI, and buildx;
+- preserve Git, jq, Python, unzip, and passwordless runner sudo;
+- preserve the existing thin-shell invariant that Docker CLI, dockerd, runc, and
+  buildx are absent from the final Steward runner image; host CI retains the Docker
+  tooling used to build and scan that image;
 - run the existing thin-shell and container smoke checks; and
 - run the live Trivy policy gate against the final image.
 
