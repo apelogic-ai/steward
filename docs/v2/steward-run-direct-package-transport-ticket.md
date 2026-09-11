@@ -2,7 +2,8 @@
 
 Priority: P0
 
-Status: review ready in `apelogic-ai/steward-run#31` at `79b9f42`
+Status: merged by `apelogic-ai/steward-run#31` as
+`fd090be213b3f4d777bcfacc367e0cdbd574400b`
 
 ## Goal
 
@@ -52,6 +53,8 @@ for client tests; the real MCP proof belongs to the final P0 integration.
 
 - contract checkpoint: Steward DP-C01 commit `042e8aa`;
 - implementation: `apelogic-ai/steward-run#31` at commit `79b9f42`;
+- immutable merged source commit:
+  `fd090be213b3f4d777bcfacc367e0cdbd574400b`;
 - full `npm run check`: green, including 151 tests, typecheck, build, thin-shell
   validation, and checked-in bundle verification; and
 - bundled E2E: green for path-only v2 submission, authenticated transcript replay,
