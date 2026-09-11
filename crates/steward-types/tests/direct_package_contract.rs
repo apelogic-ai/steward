@@ -97,6 +97,28 @@ fn positive_wire_fixtures_parse_and_validate() -> Result<(), String> {
 }
 
 #[test]
+fn direct_status_exposes_matching_source_authority_evidence() -> Result<(), String> {
+    let status: DirectTaskStatusResponse = parse("fixtures/positive/direct-task-status.json")?;
+    status.validate()?;
+
+    let mut mismatched_task =
+        serde_json::to_value(&status).map_err(|error| format!("status must serialize: {error}"))?;
+    mismatched_task["taskUid"] = serde_json::json!("33333333-3333-4333-8333-333333333333");
+    let mismatched_task: DirectTaskStatusResponse = serde_json::from_value(mismatched_task)
+        .map_err(|error| format!("mismatched Task status must parse: {error}"))?;
+    assert!(mismatched_task.validate().is_err());
+
+    let mut mismatched_diagnostics =
+        serde_json::to_value(&status).map_err(|error| format!("status must serialize: {error}"))?;
+    mismatched_diagnostics["diagnostics"] = serde_json::json!({"executionLog": "off"});
+    let mismatched_diagnostics: DirectTaskStatusResponse =
+        serde_json::from_value(mismatched_diagnostics)
+            .map_err(|error| format!("mismatched diagnostic status must parse: {error}"))?;
+    assert!(mismatched_diagnostics.validate().is_err());
+    Ok(())
+}
+
+#[test]
 fn malformed_and_privilege_bearing_inputs_fail_closed() -> Result<(), String> {
     let bad_submission: DirectTaskSubmission =
         parse("fixtures/negative/submission-unknown-contract.json")?;

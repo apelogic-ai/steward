@@ -57,8 +57,10 @@ It is not an Envelope UUID. Internal Envelope UID and revision appear only in ev
 
 Missing diagnostics, `{}`, or `executionLog: off` means no caller-visible execution
 transcript. A v2 create/status representation always returns the server-snapshotted
-effective diagnostics object. A runner requires that authenticated `full` signal as
-well as the reserved files before replay; file presence alone grants nothing.
+effective diagnostics object and the immutable source-authority evidence. The status
+and evidence Task UID and diagnostics must match. A runner requires that authenticated
+`full` signal as well as the reserved files before replay; file presence alone grants
+nothing.
 
 ## TaskDefinition and instruction skills
 

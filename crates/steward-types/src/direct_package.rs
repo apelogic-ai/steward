@@ -397,6 +397,7 @@ pub struct DirectTaskStatusResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deltas: Vec<DirectAdmissionDelta>,
     pub diagnostics: DiagnosticsRequest,
+    pub evidence: DirectTaskBindingEvidence,
 }
 
 impl DirectTaskStatusResponse {
@@ -405,7 +406,15 @@ impl DirectTaskStatusResponse {
             &self.contract_version,
             DIRECT_TASK_CONTRACT_VERSION,
             "direct Task status",
-        )
+        )?;
+        self.evidence.validate()?;
+        if self.task_uid != self.evidence.task_uid {
+            return Err("direct Task status and evidence Task UIDs differ".to_owned());
+        }
+        if self.diagnostics != self.evidence.diagnostics {
+            return Err("direct Task status and evidence diagnostics differ".to_owned());
+        }
+        Ok(())
     }
 }
 

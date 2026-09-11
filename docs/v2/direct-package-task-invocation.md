@@ -159,7 +159,9 @@ privilege. Operators should therefore select a deliberately bounded Envelope.
 Steward computes a deterministic digest over the resolved package closure and records
 the repository identity, exact commit, entry path, dependency identities and digest,
 Envelope digest, effective requirements, source provenance, and Task/runtime
-identities. The human-facing reference remains repository, commit, and path.
+identities. The v2 Task status returns that immutable source-authority evidence and
+fails validation if its Task UID or diagnostics disagree with the surrounding status.
+The human-facing reference remains repository, commit, and path.
 
 ## Admission and execution
 

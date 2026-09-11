@@ -18,7 +18,8 @@ Git source, Steward, runner, and package implementations proceed independently.
 - direct instruction-skill schema in which omitted kind means `instruction_only`;
 - deterministic package-closure digest rules;
 - verified source-provenance input shape;
-- immutable Task source/effective-authority evidence shape; and
+- immutable Task source/effective-authority evidence shape;
+- public v2 Task status carrying that immutable evidence; and
 - successful-run stdout/stderr transcript filenames and limits.
 
 The frozen `steward.m1/v1` schemas are inputs for compatibility tests only and are not
