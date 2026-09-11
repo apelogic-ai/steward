@@ -2,8 +2,7 @@
 
 Priority: P0
 
-Status: CI pending in `apelogic-ai/steward-run#31` at `79b9f42`; merged DP-R02
-remediation is incorporated and the fresh round-trip is green
+Status: review ready in `apelogic-ai/steward-run#31` at `79b9f42`
 
 ## Goal
 
@@ -61,4 +60,5 @@ for client tests; the real MCP proof belongs to the final P0 integration.
 The earlier CI vulnerability gate reported four affected GLib packages for
 CVE-2026-58016 in the pinned Actions runner base image. DP-R02 removed that build-only
 package chain without accepting the finding or weakening the policy and is now merged.
-The current DP-R01 head contains that remediation; its fresh image CI is running.
+The current DP-R01 head contains that remediation; image CI, live vulnerability-policy
+enforcement, and the complete round-trip are green.
