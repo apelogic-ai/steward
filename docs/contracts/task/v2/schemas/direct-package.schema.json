@@ -236,18 +236,6 @@
       },
       "additionalProperties": false
     },
-    "executionRequirements": {
-      "type": "object",
-      "required": ["capabilities"],
-      "properties": {
-        "capabilities": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": { "enum": ["shell", "python3"] }
-        }
-      },
-      "additionalProperties": false
-    },
     "modelRequirement": {
       "type": "object",
       "required": ["provider", "model"],
@@ -272,7 +260,12 @@
       "required": ["monthlyLimit", "singleRunLimit", "currency"],
       "properties": {
         "monthlyLimit": { "type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$" },
-        "singleRunLimit": { "type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$" },
+        "singleRunLimit": {
+          "oneOf": [
+            { "type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$" },
+            { "type": "null" }
+          ]
+        },
         "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
       },
       "additionalProperties": false
@@ -286,9 +279,24 @@
           "uniqueItems": true,
           "items": { "enum": ["linux", "mac", "windows"] }
         },
-        "memory": { "type": "string", "minLength": 1, "maxLength": 32 },
-        "compute": { "type": "string", "minLength": 1, "maxLength": 32 },
-        "storage": { "type": "string", "minLength": 1, "maxLength": 32 }
+        "memory": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 32 },
+            { "type": "null" }
+          ]
+        },
+        "compute": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 32 },
+            { "type": "null" }
+          ]
+        },
+        "storage": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 32 },
+            { "type": "null" }
+          ]
+        }
       },
       "additionalProperties": false
     },
@@ -306,9 +314,8 @@
     },
     "directRequirements": {
       "type": "object",
-      "required": ["execution", "authority"],
+      "required": ["authority"],
       "properties": {
-        "execution": { "$ref": "#/$defs/executionRequirements" },
         "authority": { "$ref": "#/$defs/authorityRequirements" }
       },
       "additionalProperties": false

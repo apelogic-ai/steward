@@ -569,21 +569,7 @@ pub enum SkillKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DirectRequirements {
-    pub execution: ExecutionRequirements,
     pub authority: AuthorityRequirements,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ExecutionRequirements {
-    pub capabilities: Vec<ExecutionCapability>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionCapability {
-    Shell,
-    Python3,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -615,7 +601,8 @@ pub struct ToolRequirement {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BudgetRequirement {
     pub monthly_limit: Decimal,
-    pub single_run_limit: Decimal,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub single_run_limit: Option<Decimal>,
     pub currency: Currency,
 }
 
@@ -643,9 +630,12 @@ impl<'de> Deserialize<'de> for Currency {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunnerRequirement {
     pub platforms: Vec<RunnerPlatform>,
-    pub memory: ResourceQuantity,
-    pub compute: ResourceQuantity,
-    pub storage: ResourceQuantity,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub memory: Option<ResourceQuantity>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub compute: Option<ResourceQuantity>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub storage: Option<ResourceQuantity>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -658,11 +648,18 @@ pub enum RunnerPlatform {
 
 impl DirectRequirements {
     pub fn validate(&self) -> Result<(), String> {
-        require_unique_values(&self.execution.capabilities, "execution capability")?;
         require_unique_values(&self.authority.llms, "model requirement")?;
         require_unique_values(&self.authority.tools, "tool requirement")?;
         require_unique_values(&self.authority.runner.platforms, "runner platform")
     }
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 fn require_unique_values<T: Ord + std::fmt::Debug>(values: &[T], kind: &str) -> Result<(), String> {

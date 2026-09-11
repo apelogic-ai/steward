@@ -68,9 +68,6 @@
     "digest": "steward:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
   },
   "effectiveRequirements": {
-    "execution": {
-      "capabilities": ["shell"]
-    },
     "authority": {
       "llms": [
         { "provider": "litellm", "model": "review-model" }
@@ -80,15 +77,15 @@
       ],
       "budget": {
         "monthlyLimit": "50.00",
-        "singleRunLimit": "2.00",
+        "singleRunLimit": null,
         "currency": "USD"
       },
       "ttl": "1h",
       "runner": {
         "platforms": ["linux"],
-        "memory": "2Gi",
-        "compute": "1000m",
-        "storage": "4Gi"
+        "memory": null,
+        "compute": null,
+        "storage": null
       }
     }
   },

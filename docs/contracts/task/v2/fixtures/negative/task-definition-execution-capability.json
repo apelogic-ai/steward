@@ -1,29 +1,21 @@
 {
   "schemaVersion": "steward.task-definition/v2",
-  "name": "repository-review",
-  "version": 2,
+  "name": "release-summary",
+  "version": 1,
   "runtime": {
     "agentRef": "example-agent@1.2.3"
   },
   "prompt": "prompt.md",
-  "skills": [
-    "skills/repository-inspection/skill.json"
-  ],
   "outputs": [
-    {
-      "path": "out/report.md",
-      "kind": "file",
-      "required": true
-    }
+    { "path": "out", "kind": "directory", "required": true }
   ],
   "requires": {
+    "execution": {
+      "capabilities": ["shell"]
+    },
     "authority": {
-      "llms": [
-        { "provider": "litellm", "model": "review-model" }
-      ],
-      "tools": [
-        { "provider": "github", "resource": "actions", "action": "read" }
-      ],
+      "llms": [],
+      "tools": [],
       "budget": {
         "monthlyLimit": "50.00",
         "singleRunLimit": "2.00",

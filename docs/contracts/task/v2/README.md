@@ -79,12 +79,19 @@ Its instruction and asset paths resolve relative to the descriptor directory. A
 future executable kind requires a new skill schema and explicit runtime and Envelope
 authority; this v1 schema can never acquire executable meaning.
 
-Omitted `requires` means the selected Envelope's entire approved execution and
-authority values become effective. A present `requires` object is a complete narrower
-candidate: it contains both `execution` and `authority`, and authority contains all of
-`llms`, `tools`, `budget`, `ttl`, and `runner`. Empty arrays express an explicit empty
-set. Partial objects are invalid. Steward snapshots the resulting complete effective
-requirements in evidence before runtime work.
+Omitted `requires` means the selected Envelope's entire approved authority values
+become effective. A present `requires` object is a complete narrower candidate: its
+`authority` contains all of `llms`, `tools`, `budget`, `ttl`, and `runner`. Empty arrays
+express an explicit empty set. `budget.singleRunLimit` and the runner `memory`,
+`compute`, and `storage` maxima are required but nullable, matching the Envelope's
+legal optional maxima exactly. Partial objects are invalid. Steward snapshots the
+resulting complete effective requirements in evidence before runtime work.
+
+The package does not declare `shell`, `python3`, or other execution capabilities.
+`runtime.agentRef` selects the immutable deployment-owned execution binding, and the
+current binding and Envelope contracts expose no separate execution-capability
+authority to admit. A future capability-bearing contract requires a new schema with a
+verifiable authority source.
 
 ## Signed source provenance
 

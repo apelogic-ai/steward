@@ -83,6 +83,16 @@ fn positive_wire_fixtures_parse_and_validate() -> Result<(), String> {
     let evidence: DirectTaskBindingEvidence =
         parse("fixtures/positive/task-binding-evidence.json")?;
     evidence.validate()?;
+    let evidence_json = serde_json::to_value(&evidence)
+        .map_err(|error| format!("evidence must serialize: {error}"))?;
+    for path in [
+        "/effectiveRequirements/authority/budget/singleRunLimit",
+        "/effectiveRequirements/authority/runner/memory",
+        "/effectiveRequirements/authority/runner/compute",
+        "/effectiveRequirements/authority/runner/storage",
+    ] {
+        assert_eq!(evidence_json.pointer(path), Some(&serde_json::Value::Null));
+    }
     Ok(())
 }
 
@@ -119,6 +129,15 @@ fn malformed_and_privilege_bearing_inputs_fail_closed() -> Result<(), String> {
         )?)
         .is_err()
     );
+    for path in [
+        "fixtures/negative/task-definition-execution-capability.json",
+        "fixtures/negative/task-definition-missing-optional-maxima.json",
+    ] {
+        assert!(
+            serde_json::from_str::<DirectTaskDefinition>(&fixture(path)?).is_err(),
+            "{path}"
+        );
+    }
     let duplicate_skills: DirectTaskDefinition =
         parse("fixtures/negative/task-definition-duplicate-skills.json")?;
     assert!(duplicate_skills.validate().is_err());

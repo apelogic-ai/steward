@@ -30,6 +30,8 @@
     { "path": "fixtures/negative/invocation-trigger-cross-repository.json", "definition": "invocationManifest", "valid": false, "semantic": "invoking repository differs" },
     { "path": "fixtures/negative/invocation-unknown-diagnostics.json", "definition": "invocationManifest", "valid": false },
     { "path": "fixtures/negative/task-definition-partial-requires.json", "definition": "taskDefinition", "valid": false },
+    { "path": "fixtures/negative/task-definition-execution-capability.json", "definition": "taskDefinition", "valid": false },
+    { "path": "fixtures/negative/task-definition-missing-optional-maxima.json", "definition": "taskDefinition", "valid": false },
     { "path": "fixtures/negative/task-definition-duplicate-skills.json", "definition": "taskDefinition", "valid": false },
     { "path": "fixtures/negative/task-definition-output-escape.json", "definition": "taskDefinition", "valid": false },
     { "path": "fixtures/negative/instruction-skill-executable.json", "definition": "instructionSkill", "valid": false },

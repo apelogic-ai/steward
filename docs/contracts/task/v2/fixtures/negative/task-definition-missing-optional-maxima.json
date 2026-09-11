@@ -11,7 +11,16 @@
   ],
   "requires": {
     "authority": {
-      "llms": []
+      "llms": [],
+      "tools": [],
+      "budget": {
+        "monthlyLimit": "50.00",
+        "currency": "USD"
+      },
+      "ttl": "1h",
+      "runner": {
+        "platforms": ["linux"]
+      }
     }
   }
 }
