@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use steward_adapter_fake::IMPLEMENTED_PORTS as FAKE_PORTS;
+use steward_adapter_github_source::IMPLEMENTED_PORTS as GITHUB_SOURCE_PORTS;
 use steward_ports::{Maturity, PORTS};
 use steward_types::agent_runtime_crd;
 use xtask::{
@@ -753,6 +754,7 @@ fn ports_check() -> TaskResult {
 
 fn real_implemented_ports() -> BTreeSet<&'static str> {
     [
+        GITHUB_SOURCE_PORTS.as_slice(),
         steward_adapter_jira::IMPLEMENTED_PORTS.as_slice(),
         steward_adapter_litellm::IMPLEMENTED_PORTS.as_slice(),
         steward_adapter_mcp_gw::IMPLEMENTED_PORTS.as_slice(),
