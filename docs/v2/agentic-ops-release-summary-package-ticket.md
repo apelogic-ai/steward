@@ -2,7 +2,7 @@
 
 Priority: P0
 
-Status: CI pending in `apelogic-ai/agentic-ops#4` at `5a2930e`
+Status: review ready in `apelogic-ai/agentic-ops#4` at `5a2930e`
 
 ## Goal
 
@@ -72,4 +72,5 @@ running Steward environment until final integration.
   `steward:sha256:79a68a6e3f7a21d37c4da0594555d409999562b3d1778641f743ec0e290118a8`;
   and
 - repository validation: green for 95 tests, both package validators, syntax, and
-  diff checks.
+  diff checks; and
+- GitHub validation: green.

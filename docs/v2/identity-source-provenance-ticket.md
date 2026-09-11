@@ -2,7 +2,7 @@
 
 Priority: P0
 
-Status: CI pending in `apelogic-ai/github-oidc-exchange#31` at `f9835cd`
+Status: CI pending in `apelogic-ai/github-oidc-exchange#31` at `4f7a685`
 
 ## Goal
 
@@ -54,9 +54,11 @@ GitOps-owned local-main cluster.
 
 ## Implementation evidence
 
-- implementation: `apelogic-ai/github-oidc-exchange#31` at commit `f9835cd`;
+- implementation: `apelogic-ai/github-oidc-exchange#31` at commit `4f7a685`;
 - contract checkpoint: Steward DP-C01 commit `042e8aa`;
 - exact provenance field compatibility: independently reviewed with no contract
-  corrections required; and
+  corrections required;
+- repository dot-segment and noncanonical run-attempt mutations: rejected by focused
+  regressions; and
 - local Rust, Helm, release validation, amd64 image build, and container smoke gates:
   green.
