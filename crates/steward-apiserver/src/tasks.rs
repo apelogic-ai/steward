@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::future::Future;
 use std::path::Path as FilePath;
@@ -39,7 +39,7 @@ use steward_types::direct_package::{
     DirectTaskPhase, DirectTaskStatusResponse, DirectTaskSubmission, EnvelopeDigest,
     EnvelopeEvidence, InstructionSkill, InvocationManifest, PACKAGE_CLOSURE_CONTRACT_VERSION,
     PackageClosure, PackageCommit, RelativePath, RepositoryUrl, ResolvedSource, SourceProvenance,
-    TASK_BINDING_EVIDENCE_SCHEMA, TriggerRepository, canonical_json_bytes,
+    StableProviderId, TASK_BINDING_EVIDENCE_SCHEMA, TriggerRepository, canonical_json_bytes,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, Duration,
@@ -65,6 +65,32 @@ const MAX_IDENTITY_TASK_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_IDENTITY_JWKS_BYTES: usize = 128 * 1024;
 const MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS: u64 = 300;
 const IDENTITY_CLOCK_SKEW_SECONDS: u64 = 60;
+pub const MAX_SOURCE_REPOSITORY_BINDINGS_BYTES: usize = 1024 * 1024;
+const SOURCE_REPOSITORY_BINDINGS_CONTRACT: &str = "steward.source-repository-bindings/v1";
+const MAX_SOURCE_REPOSITORY_BINDINGS: usize = 1024;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SourceRepositoryBindingsDocument {
+    contract_version: String,
+    bindings: Vec<SourceRepositoryBinding>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SourceRepositoryBinding {
+    caller: SourceRepositoryIdentity,
+    source: SourceRepositoryIdentity,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SourceRepositoryIdentity {
+    owner_id: StableProviderId,
+    repository_id: StableProviderId,
+}
+
+type SourceRepositoryBindingKey = (String, String, String, String);
 
 fn versioned_workflow_reference(
     workflow: &str,
@@ -165,6 +191,7 @@ pub struct TaskApiConfig {
     orchestration_mode: TaskOrchestrationMode,
     legacy_runtime_resolver: Option<Arc<dyn LegacyRuntimeResolver>>,
     direct_git_resolver: Option<Arc<dyn DirectGitResolver>>,
+    source_repository_bindings: BTreeSet<SourceRepositoryBindingKey>,
 }
 
 impl Default for TaskApiConfig {
@@ -177,6 +204,7 @@ impl Default for TaskApiConfig {
             orchestration_mode: TaskOrchestrationMode::Staged,
             legacy_runtime_resolver: None,
             direct_git_resolver: None,
+            source_repository_bindings: BTreeSet::new(),
         }
     }
 }
@@ -258,6 +286,50 @@ impl TaskApiConfig {
     {
         self.direct_git_resolver = Some(Arc::new(resolver));
         self
+    }
+
+    pub fn with_source_repository_bindings_json(
+        mut self,
+        value: Option<&str>,
+    ) -> Result<Self, String> {
+        let Some(value) = value else {
+            return Ok(self);
+        };
+        if value.len() > MAX_SOURCE_REPOSITORY_BINDINGS_BYTES {
+            return Err("source repository binding catalog exceeds 1048576 bytes".to_owned());
+        }
+        let document = serde_json::from_str::<SourceRepositoryBindingsDocument>(value)
+            .map_err(|error| format!("source repository binding catalog is invalid: {error}"))?;
+        if document.contract_version != SOURCE_REPOSITORY_BINDINGS_CONTRACT
+            || document.bindings.len() > MAX_SOURCE_REPOSITORY_BINDINGS
+        {
+            return Err("source repository binding catalog is invalid".to_owned());
+        }
+        for binding in document.bindings {
+            let key = (
+                binding.caller.owner_id.as_str().to_owned(),
+                binding.caller.repository_id.as_str().to_owned(),
+                binding.source.owner_id.as_str().to_owned(),
+                binding.source.repository_id.as_str().to_owned(),
+            );
+            if !self.source_repository_bindings.insert(key) {
+                return Err("source repository binding catalog contains a duplicate".to_owned());
+            }
+        }
+        Ok(self)
+    }
+
+    fn source_repository_is_authorized(
+        &self,
+        caller: &TriggerRepository,
+        source: &GitRepositoryIdentity,
+    ) -> bool {
+        self.source_repository_bindings.contains(&(
+            caller.owner_id.as_str().to_owned(),
+            caller.id.as_str().to_owned(),
+            source.repository_owner_id.as_str().to_owned(),
+            source.repository_id.as_str().to_owned(),
+        ))
     }
 
     pub fn execution_binding_refs(&self) -> Vec<String> {
@@ -2065,6 +2137,7 @@ where
         .map_err(source_port_error)?;
     let same_repository = package_identity == invocation_identity;
     if !same_repository
+        && !config.source_repository_is_authorized(&provenance.repository, &package_identity)
         && !ledger
             .active_source_repository_binding(&provenance.repository, &package_identity)
             .await
@@ -3066,6 +3139,40 @@ mod workflow_request_tests {
             .with_execution_adapter(Arc::new(ExampleExecutionAdapter))?
             .with_execution_bindings_json(Some(&execution_catalog(&workflow.agent, 'a')?))?
             .with_execution_bindings_active(true)
+    }
+
+    #[test]
+    fn source_repository_binding_catalog_rejects_invalid_or_duplicate_entries() {
+        let unknown_field = serde_json::json!({
+            "contractVersion": "steward.source-repository-bindings/v1",
+            "bindings": [{
+                "caller": {"ownerId": "7890", "repositoryId": "123456"},
+                "source": {"ownerId": "7890", "repositoryId": "654321", "name": "ignored"}
+            }]
+        })
+        .to_string();
+        assert!(
+            TaskApiConfig::default()
+                .with_source_repository_bindings_json(Some(&unknown_field))
+                .is_err(),
+            "unknown source identity fields must fail startup parsing"
+        );
+
+        let binding = serde_json::json!({
+            "caller": {"ownerId": "7890", "repositoryId": "123456"},
+            "source": {"ownerId": "7890", "repositoryId": "654321"}
+        });
+        let duplicate = serde_json::json!({
+            "contractVersion": "steward.source-repository-bindings/v1",
+            "bindings": [binding.clone(), binding]
+        })
+        .to_string();
+        assert!(
+            TaskApiConfig::default()
+                .with_source_repository_bindings_json(Some(&duplicate))
+                .is_err(),
+            "duplicate repository authority must fail startup parsing"
+        );
     }
 
     #[test]

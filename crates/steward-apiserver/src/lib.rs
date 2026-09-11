@@ -30,10 +30,11 @@ pub use github_actions::{
 };
 
 pub use tasks::{
-    ConfiguredTaskIdentityResolver, KubernetesTaskIdentityResolver, StaticTaskWorkflowCatalog,
-    TaskAdmissionDelta, TaskApiConfig, TaskArchive, TaskAuthenticationError, TaskCreateRequest,
-    TaskErrorResponse, TaskIdentity, TaskIdentityResolver, TaskStatusResponse,
-    TaskSubmissionLedger, TaskSubmissionRequest, TaskWorkflow, TaskWorkflowCatalog, task_router,
+    ConfiguredTaskIdentityResolver, KubernetesTaskIdentityResolver,
+    MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, StaticTaskWorkflowCatalog, TaskAdmissionDelta,
+    TaskApiConfig, TaskArchive, TaskAuthenticationError, TaskCreateRequest, TaskErrorResponse,
+    TaskIdentity, TaskIdentityResolver, TaskStatusResponse, TaskSubmissionLedger,
+    TaskSubmissionRequest, TaskWorkflow, TaskWorkflowCatalog, task_router,
 };
 pub use workflows::{WorkflowReference, WorkflowReferenceError};
 
@@ -9104,6 +9105,89 @@ mod tests {
             StaticTaskWorkflowCatalog::new([]),
             task_api_config()?.with_git_hosting_plane(git),
         ))
+    }
+
+    fn direct_source_bindings_json(source_repository_id: &str) -> String {
+        serde_json::json!({
+            "contractVersion": "steward.source-repository-bindings/v1",
+            "bindings": [{
+                "caller": {"ownerId": "7890", "repositoryId": "123456"},
+                "source": {"ownerId": "7890", "repositoryId": source_repository_id}
+            }]
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn configured_stable_repository_binding_authorizes_cross_repository_source()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let mut definition = direct_definition_no_skills();
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        let git = direct_git_fixture(direct_manifest(), definition, None)?;
+        let config = task_api_config()?
+            .with_git_hosting_plane(git)
+            .with_source_repository_bindings_json(Some(&direct_source_bindings_json("654321")))?;
+        let app = task_router(
+            ledger.clone(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            config,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "configured-source-binding")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build direct-package request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit direct package: {error}"))?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn configured_repository_binding_rejects_a_different_stable_source_identity()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let git = direct_git_fixture(direct_manifest(), direct_definition_no_skills(), None)?;
+        let config = task_api_config()?
+            .with_git_hosting_plane(git)
+            .with_source_repository_bindings_json(Some(&direct_source_bindings_json("654322")))?;
+        let app = task_router(
+            ledger.clone(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            config,
+        );
+
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "configured-source-binding-mismatch",
+            StatusCode::FORBIDDEN,
+            "source repository is not authorized",
+        )
+        .await
     }
 
     #[tokio::test]

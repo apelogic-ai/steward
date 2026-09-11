@@ -9,6 +9,7 @@
     "browserAuth",
     "workloadExchangeTrust",
     "taskIdentity",
+    "githubSource",
     "tls",
     "config",
     "connectionsBridge",
@@ -199,6 +200,62 @@
             "audience": {"$ref": "#/definitions/nonempty"},
             "publicJwksConfigMap": {
               "properties": {"name": {"$ref": "#/definitions/nonempty"}, "key": {"$ref": "#/definitions/nonempty"}}
+            }
+          }
+        }
+      ]
+    },
+    "githubSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "appId", "privateKeySecret", "bindings"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "appId": {"type": "string"},
+        "privateKeySecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "key"],
+          "properties": {
+            "name": {"type": "string"},
+            "key": {"type": "string"}
+          }
+        },
+        "bindings": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["contractVersion", "bindings"],
+          "properties": {
+            "contractVersion": {"const": "steward.source-repository-bindings/v1"},
+            "bindings": {
+              "type": "array",
+              "maxItems": 1024,
+              "uniqueItems": true,
+              "items": {"$ref": "#/definitions/sourceRepositoryBinding"}
+            }
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "enabled": {"const": false},
+            "appId": {"const": ""},
+            "privateKeySecret": {
+              "properties": {"name": {"const": ""}, "key": {"const": ""}}
+            },
+            "bindings": {"properties": {"bindings": {"maxItems": 0}}}
+          }
+        },
+        {
+          "properties": {
+            "enabled": {"const": true},
+            "appId": {"type": "string", "pattern": "^[1-9][0-9]{0,19}$"},
+            "privateKeySecret": {
+              "properties": {
+                "name": {"$ref": "#/definitions/nonempty"},
+                "key": {"$ref": "#/definitions/nonempty"}
+              }
             }
           }
         }
@@ -553,6 +610,7 @@
         "postgresCidrs",
         "jiraCidrs",
         "browserAuthEgressCidrs",
+        "githubApiCidrs",
         "ingressNamespace",
         "burbleNamespace",
         "arcNamespace",
@@ -569,6 +627,7 @@
         "postgresCidrs": {"$ref": "#/definitions/cidrs"},
         "jiraCidrs": {"$ref": "#/definitions/cidrs"},
         "browserAuthEgressCidrs": {"$ref": "#/definitions/cidrs"},
+        "githubApiCidrs": {"$ref": "#/definitions/cidrs"},
         "ingressNamespace": {"$ref": "#/definitions/nonempty"},
         "burbleNamespace": {"$ref": "#/definitions/nonempty"},
         "arcNamespace": {"$ref": "#/definitions/nonempty"},
@@ -638,6 +697,21 @@
     }
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "githubSource": {"properties": {"enabled": {"const": true}}},
+          "networkPolicy": {"properties": {"enabled": {"const": true}}}
+        }
+      },
+      "then": {
+        "properties": {
+          "networkPolicy": {
+            "properties": {"githubApiCidrs": {"minItems": 1}}
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {
@@ -761,6 +835,24 @@
           "pattern": "^[^\\s\\x00-\\x1F\\x7F]+$"
         },
         "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+      }
+    },
+    "sourceRepositoryBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["caller", "source"],
+      "properties": {
+        "caller": {"$ref": "#/definitions/sourceRepositoryIdentity"},
+        "source": {"$ref": "#/definitions/sourceRepositoryIdentity"}
+      }
+    },
+    "sourceRepositoryIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ownerId", "repositoryId"],
+      "properties": {
+        "ownerId": {"type": "string", "pattern": "^[0-9]{1,20}$"},
+        "repositoryId": {"type": "string", "pattern": "^[0-9]{1,20}$"}
       }
     },
     "secretKey": {
