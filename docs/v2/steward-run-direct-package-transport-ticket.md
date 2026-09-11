@@ -2,7 +2,8 @@
 
 Priority: P0
 
-Status: review ready in `apelogic-ai/steward-run#31` at `63774a6`
+Status: code complete in `apelogic-ai/steward-run#31` at `a2b8d77`; blocked by
+the pinned runner base image's unfixed CVE-2026-58016 security finding
 
 ## Goal
 
@@ -51,8 +52,14 @@ for client tests; the real MCP proof belongs to the final P0 integration.
 ## Implementation evidence
 
 - contract checkpoint: Steward DP-C01 commit `042e8aa`;
-- implementation: `apelogic-ai/steward-run#31` at commit `63774a6`;
+- implementation: `apelogic-ai/steward-run#31` at commit `a2b8d77`;
 - full `npm run check`: green, including 151 tests, typecheck, build, thin-shell
   validation, and checked-in bundle verification; and
 - bundled E2E: green for path-only v2 submission, authenticated transcript replay,
   workflow-command suppression, output handling, and unconditional finalization.
+
+The GitHub round-trip workflow is green. The separate CI vulnerability gate reports
+four affected GLib packages for CVE-2026-58016 in the unchanged, pinned Actions
+runner base image. The scanner reports no fixed package version. This ticket neither
+accepts the finding nor weakens the security policy; remediation remains a separate
+baseline decision.

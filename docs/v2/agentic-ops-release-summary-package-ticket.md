@@ -2,7 +2,7 @@
 
 Priority: P0
 
-Status: package authoring may start after DP-C01
+Status: review ready in `apelogic-ai/agentic-ops#4` at `d236fa8`
 
 ## Goal
 
@@ -61,3 +61,15 @@ and omit absent sections unless their absence caused the run to fail.
 
 May proceed alongside DP-I01, DP-G01, and DP-R01 after DP-C01. It does not require a
 running Steward environment until final integration.
+
+## Implementation evidence
+
+- contract checkpoint: Steward DP-C01 commit
+  `042e8aa96a66d8927b50dc253509a5d437a5eeec`;
+- implementation: `apelogic-ai/agentic-ops#4` at commit
+  `d236fa879f89fc42f01cb77465e42b7b6e3a0a2b`;
+- closure digest:
+  `steward:sha256:79a68a6e3f7a21d37c4da0594555d409999562b3d1778641f743ec0e290118a8`;
+  and
+- repository validation: green for 94 tests, both package validators, syntax, and
+  diff checks.
