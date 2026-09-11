@@ -16,9 +16,9 @@ contracts remain authoritative; this record does not relax their exit criteria.
 | DP-C01 | `apelogic-ai/steward` | gate blocked | Contract checkpoint `042e8aa` is cross-lane compatible; mandatory neutrality gate needs a separately authorized maintenance fix before push. |
 | DP-I01 | `github-oidc-exchange` | push blocked | Implementation and full gates are green at `f9835cd`; one SSH push retry awaits maintainer hardware readiness. |
 | DP-G01 | `apelogic-ai/steward` | queued | Starts after DP-C01 publishes the contract commit and an agent slot is free. |
-| DP-S01 | `apelogic-ai/steward` | blocked | Test preparation follows DP-C01; implementation depends on DP-G01. |
+| DP-S01 | `apelogic-ai/steward` | red checkpoint | Five pre-reservation escape tests are retained locally at `bf53e91`; implementation depends on DP-G01 and DP-I01. |
 | DP-R01 | `apelogic-ai/steward-run` | security gate blocked | PR `apelogic-ai/steward-run#31` at `a2b8d77`; code and round-trip gates are green, but the pinned runner base now reports unfixed critical CVE-2026-58016. |
-| DP-A01 | `apelogic-ai/agentic-ops` | review ready | PR `apelogic-ai/agentic-ops#4` at `d236fa8`; 94 tests and both package validators are green. |
+| DP-A01 | `apelogic-ai/agentic-ops` | push blocked | PR `apelogic-ai/agentic-ops#4` remains at `d236fa8`; reviewed BOM fix `5a2930e` is green locally and awaits one SSH push retry. |
 | DP-O01 | `apelogic-ai/gitops` | waiting | Preparation follows reviewed releases; GitOps alone operates local-main. |
 | DP-P01 | `apelogic-ai/steward` | post-P0 | Optional catalog publication and release provenance. |
 | DP-T01 | `apelogic-ai/steward` | post-P0 | Multiple-package/workflow and stable-lane conformance. |
@@ -36,7 +36,7 @@ or mutable environment state.
 | DP-I01 | DP-S01, DP-O01 | reviewed Identity release and provenance claim contract | pending |
 | DP-G01 | DP-S01, DP-O01 | reviewed Git source adapter release/configuration contract | pending |
 | DP-R01 | DP-O01 | PR `apelogic-ai/steward-run#31`, commit `a2b8d77`, contract checkpoint `042e8aa` | security gate blocked |
-| DP-A01 | DP-O01 | PR `apelogic-ai/agentic-ops#4`, commit `d236fa8`, closure `steward:sha256:79a68a6e3f7a21d37c4da0594555d409999562b3d1778641f743ec0e290118a8` | review pending |
+| DP-A01 | DP-O01 | PR `apelogic-ai/agentic-ops#4`; local fix `5a2930e`; closure `steward:sha256:79a68a6e3f7a21d37c4da0594555d409999562b3d1778641f743ec0e290118a8` | push pending |
 | DP-S01 | DP-O01 | reviewed Steward release and E2E verifier | pending |
 | DP-O01 | DP-P00 | local-main preflight and final demo evidence | pending |
 

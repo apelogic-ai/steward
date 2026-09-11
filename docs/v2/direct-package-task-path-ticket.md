@@ -2,7 +2,8 @@
 
 Priority: P0
 
-Status: contract tests may start after DP-C01; implementation depends on DP-G01
+Status: focused red checkpoint retained locally at `bf53e91`; implementation depends
+on DP-G01 and DP-I01
 
 ## Goal
 
@@ -50,3 +51,16 @@ its existing route and resolver.
 
 Test scaffolding may start after DP-C01. Source-backed implementation waits for DP-G01.
 Coordinate final integration with DP-I01 and DP-R01; serialize heavy integration lanes.
+
+## Test-preparation evidence
+
+- branch: `feat/direct-package-task-path`, based on DP-C01 checkpoint `042e8aa`;
+- local commit: `bf53e91`;
+- five real `POST /v1/tasks` negative cases cover unauthorized source, wrong exact
+  object, inactive Envelope, over-authority requirements, and cross-repository
+  `git:trigger`;
+- every case currently fails at the missing v2 request boundary before Task
+  reservation, as intended; and
+- the frozen versioned-v1 route remains green.
+
+This checkpoint is intentionally not pushed and has no PR while its tests are red.
