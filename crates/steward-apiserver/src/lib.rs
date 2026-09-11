@@ -357,9 +357,11 @@ pub struct GrantRevocationRequest {
         agent_runs_ui::my_runs,
         agent_runs_ui::my_run,
         agent_runs_ui::my_run_timeline,
+        agent_runs_ui::my_run_execution_log,
         agent_runs_ui::all_runs,
         agent_runs_ui::all_run,
         agent_runs_ui::all_run_timeline,
+        agent_runs_ui::all_run_execution_log,
         connections::connection_status,
         connections::start_connection,
         connections::disconnect_connection,
@@ -1217,6 +1219,13 @@ pub trait AgentRunLedger: Clone + Send + Sync + 'static {
         &self,
         task_uid: Uuid,
     ) -> BoxFuture<'_, Result<Option<Vec<AgentRunTimelineEvent>>, StoreError>>;
+
+    fn agent_run_execution_log<'a>(
+        &'a self,
+        task_uid: Uuid,
+        owner_user_id: Option<&'a str>,
+        stream: steward_store::AgentRunLogStream,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>>;
 }
 
 impl AgentRunLedger for PgStore {
@@ -1239,6 +1248,17 @@ impl AgentRunLedger for PgStore {
         task_uid: Uuid,
     ) -> BoxFuture<'_, Result<Option<Vec<AgentRunTimelineEvent>>, StoreError>> {
         Box::pin(async move { PgStore::agent_run_timeline(self, task_uid).await })
+    }
+
+    fn agent_run_execution_log<'a>(
+        &'a self,
+        task_uid: Uuid,
+        owner_user_id: Option<&'a str>,
+        stream: steward_store::AgentRunLogStream,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>> {
+        Box::pin(async move {
+            PgStore::agent_run_execution_log(self, task_uid, owner_user_id, stream).await
+        })
     }
 }
 
@@ -6309,6 +6329,15 @@ mod tests {
                             .map(|(_, events)| events.clone())
                     })
             })
+        }
+
+        fn agent_run_execution_log<'a>(
+            &'a self,
+            _task_uid: Uuid,
+            _owner_user_id: Option<&'a str>,
+            _stream: steward_store::AgentRunLogStream,
+        ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>> {
+            Box::pin(async { Ok(None) })
         }
     }
 

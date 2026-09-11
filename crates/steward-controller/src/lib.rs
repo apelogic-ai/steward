@@ -952,7 +952,10 @@ async fn reconcile_quarantined_execution<R: SandboxTaskRuntime>(
         .map_err(TaskControllerError::Sandbox)?;
     if matches!(
         observation,
-        SandboxTaskObservation::Succeeded { .. } | SandboxTaskObservation::Failed { .. }
+        SandboxTaskObservation::Succeeded { .. }
+            | SandboxTaskObservation::SucceededWithTranscript { .. }
+            | SandboxTaskObservation::Failed { .. }
+            | SandboxTaskObservation::FailedWithTranscript { .. }
     ) {
         persist_execution_observation(authority, &attempt, attempt.generation, observation).await?;
     }
@@ -1954,6 +1957,8 @@ async fn persist_execution_observation(
                         TaskExecutionObservation::Failed {
                             adapter_observation_id: &adapter_observation_id,
                             reason,
+                            execution_stdout: None,
+                            execution_stderr: None,
                         },
                         "task-orchestrator",
                     )
@@ -1970,6 +1975,47 @@ async fn persist_execution_observation(
                             result_digest: &result_digest,
                             result_reference: &result_reference,
                             output_archive: &output.archive,
+                            execution_stdout: None,
+                            execution_stderr: None,
+                        },
+                        "task-orchestrator",
+                    )
+                    .await
+            }
+        }
+        SandboxTaskObservation::SucceededWithTranscript {
+            adapter_observation_id,
+            output,
+            transcript,
+        } => {
+            if let Some(reason) = task_output_archive_failure(output.archive.len()) {
+                authority
+                    .record_task_execution_observation(
+                        attempt.attempt_id,
+                        generation,
+                        TaskExecutionObservation::Failed {
+                            adapter_observation_id: &adapter_observation_id,
+                            reason,
+                            execution_stdout: Some(&transcript.stdout),
+                            execution_stderr: Some(&transcript.stderr),
+                        },
+                        "task-orchestrator",
+                    )
+                    .await
+            } else {
+                let result_digest = bytes_digest(&output.archive);
+                let result_reference = format!("adapter:{adapter_observation_id}");
+                authority
+                    .record_task_execution_observation(
+                        attempt.attempt_id,
+                        generation,
+                        TaskExecutionObservation::Succeeded {
+                            adapter_observation_id: &adapter_observation_id,
+                            result_digest: &result_digest,
+                            result_reference: &result_reference,
+                            output_archive: &output.archive,
+                            execution_stdout: Some(&transcript.stdout),
+                            execution_stderr: Some(&transcript.stderr),
                         },
                         "task-orchestrator",
                     )
@@ -1987,6 +2033,27 @@ async fn persist_execution_observation(
                     TaskExecutionObservation::Failed {
                         adapter_observation_id: &adapter_observation_id,
                         reason: &reason,
+                        execution_stdout: None,
+                        execution_stderr: None,
+                    },
+                    "task-orchestrator",
+                )
+                .await
+        }
+        SandboxTaskObservation::FailedWithTranscript {
+            adapter_observation_id,
+            reason,
+            transcript,
+        } => {
+            authority
+                .record_task_execution_observation(
+                    attempt.attempt_id,
+                    generation,
+                    TaskExecutionObservation::Failed {
+                        adapter_observation_id: &adapter_observation_id,
+                        reason: &reason,
+                        execution_stdout: Some(&transcript.stdout),
+                        execution_stderr: Some(&transcript.stderr),
                     },
                     "task-orchestrator",
                 )

@@ -9,7 +9,7 @@ use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec,
     envelope_is_within, evaluate,
 };
-use steward_types::direct_package::DirectTaskBindingEvidence;
+use steward_types::direct_package::{DirectTaskBindingEvidence, MAX_EXECUTION_STREAM_BYTES};
 use steward_types::{
     AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
     OrganizationIdentity, OrganizationIdentityMigration, TaskExecutionBinding,
@@ -969,6 +969,43 @@ impl PgStore {
             .map_err(database_error)?
             .map(agent_run_record)
             .transpose()
+    }
+
+    /// Return one explicitly enabled, bounded execution stream in the same scope as Runs.
+    /// `None` owner scope is reserved for the browser-administrator read path.
+    pub async fn agent_run_execution_log(
+        &self,
+        task_uid: Uuid,
+        owner_user_id: Option<&str>,
+        stream: AgentRunLogStream,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let mut statement = QueryBuilder::<Postgres>::new("SELECT ");
+        statement.push(match stream {
+            AgentRunLogStream::Stdout => "attempts.execution_stdout",
+            AgentRunLogStream::Stderr => "attempts.execution_stderr",
+        });
+        statement.push(
+            " FROM task_execution_attempts attempts \
+             JOIN task_submissions tasks ON tasks.task_uid = attempts.task_uid \
+             WHERE tasks.task_uid = ",
+        );
+        statement.push_bind(task_uid);
+        statement.push(
+            " AND tasks.phase IN ('succeeded', 'failed') \
+              AND attempts.state IN ('succeeded', 'failed') \
+              AND NOT EXISTS (SELECT 1 FROM connection_operations operations \
+                  WHERE operations.task_uid = tasks.task_uid)",
+        );
+        if let Some(owner_user_id) = owner_user_id {
+            statement.push(" AND tasks.owner_user_id = ");
+            statement.push_bind(owner_user_id);
+        }
+        statement
+            .build_query_scalar::<Option<Vec<u8>>>()
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)
+            .map(Option::flatten)
     }
 
     pub async fn agent_run_timeline(
@@ -4870,6 +4907,8 @@ impl PgStore {
                 result_digest,
                 result_reference,
                 output_archive,
+                execution_stdout,
+                execution_stderr,
             } => {
                 sqlx::query(
                     "UPDATE task_submissions SET phase = 'running', updated_at = now() \
@@ -4884,6 +4923,7 @@ impl PgStore {
                     "UPDATE task_execution_attempts \
                      SET state = 'succeeded', generation = generation + 1, \
                          adapter_observation_id = $3, result_digest = $4, result_reference = $5, \
+                         execution_stdout = $6, execution_stderr = $7, \
                          started_at = COALESCE(started_at, now()), finished_at = now(), \
                          retry_at = NULL, last_error_code = NULL, updated_at = now() \
                      WHERE attempt_id = $1 AND generation = $2 \
@@ -4894,6 +4934,8 @@ impl PgStore {
                 .bind(adapter_observation_id)
                 .bind(result_digest)
                 .bind(result_reference)
+                .bind(execution_stdout)
+                .bind(execution_stderr)
                 .execute(&mut *transaction)
                 .await
                 .map_err(database_error)?;
@@ -4912,11 +4954,14 @@ impl PgStore {
             TaskExecutionObservation::Failed {
                 adapter_observation_id,
                 reason,
+                execution_stdout,
+                execution_stderr,
             } => {
                 sqlx::query(
                     "UPDATE task_execution_attempts \
                      SET state = 'failed', generation = generation + 1, \
                          adapter_observation_id = $3, last_error_code = $4, \
+                         execution_stdout = $5, execution_stderr = $6, \
                          started_at = COALESCE(started_at, now()), finished_at = now(), \
                          retry_at = NULL, updated_at = now() \
                      WHERE attempt_id = $1 AND generation = $2 \
@@ -4926,6 +4971,8 @@ impl PgStore {
                 .bind(expected_generation)
                 .bind(adapter_observation_id)
                 .bind(reason)
+                .bind(execution_stdout)
+                .bind(execution_stderr)
                 .execute(&mut *transaction)
                 .await
                 .map_err(database_error)?;
@@ -6352,6 +6399,12 @@ pub struct AgentRunQuery {
     pub task_uid: Option<Uuid>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AgentRunLogStream {
+    Stdout,
+    Stderr,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentRunPage {
     pub records: Vec<AgentRunRecord>,
@@ -7171,10 +7224,14 @@ pub enum TaskExecutionObservation<'a> {
         result_digest: &'a str,
         result_reference: &'a str,
         output_archive: &'a [u8],
+        execution_stdout: Option<&'a [u8]>,
+        execution_stderr: Option<&'a [u8]>,
     },
     Failed {
         adapter_observation_id: &'a str,
         reason: &'a str,
+        execution_stdout: Option<&'a [u8]>,
+        execution_stderr: Option<&'a [u8]>,
     },
     OutcomeUnknown {
         reason: &'a str,
@@ -7194,18 +7251,57 @@ impl TaskExecutionObservation<'_> {
                 adapter_observation_id,
                 result_digest,
                 result_reference,
+                execution_stdout,
+                execution_stderr,
                 ..
             } => {
                 !adapter_observation_id.is_empty()
                     && valid_sha256_reference(result_digest)
                     && !result_reference.is_empty()
+                    && execution_logs_are_valid(execution_stdout, execution_stderr)
             }
             Self::Failed {
                 adapter_observation_id,
                 reason,
-            } => !adapter_observation_id.is_empty() && !reason.is_empty(),
+                execution_stdout,
+                execution_stderr,
+            } => {
+                !adapter_observation_id.is_empty()
+                    && !reason.is_empty()
+                    && execution_logs_are_valid(execution_stdout, execution_stderr)
+            }
             Self::OutcomeUnknown { reason } => !reason.is_empty(),
         }
+    }
+}
+
+fn execution_logs_are_valid(stdout: Option<&[u8]>, stderr: Option<&[u8]>) -> bool {
+    match (stdout, stderr) {
+        (None, None) => true,
+        (Some(stdout), Some(stderr)) => {
+            stdout.len() as u64 <= MAX_EXECUTION_STREAM_BYTES
+                && stderr.len() as u64 <= MAX_EXECUTION_STREAM_BYTES
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod execution_log_tests {
+    use steward_types::direct_package::MAX_EXECUTION_STREAM_BYTES;
+
+    use super::execution_logs_are_valid;
+
+    #[test]
+    fn logs_must_be_paired_and_individually_bounded() {
+        assert!(execution_logs_are_valid(None, None));
+        assert!(execution_logs_are_valid(Some(b"stdout"), Some(b"stderr")));
+        assert!(!execution_logs_are_valid(Some(b"stdout"), None));
+        assert!(!execution_logs_are_valid(None, Some(b"stderr")));
+
+        let oversized = vec![0; MAX_EXECUTION_STREAM_BYTES as usize + 1];
+        assert!(!execution_logs_are_valid(Some(&oversized), Some(b"stderr")));
+        assert!(!execution_logs_are_valid(Some(b"stdout"), Some(&oversized)));
     }
 }
 

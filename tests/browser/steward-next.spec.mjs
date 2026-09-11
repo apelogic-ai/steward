@@ -408,11 +408,17 @@ async function guardedPage(browser, {
   connectionPhase = "connected",
   emptyCollections = false,
   expectedHttpStatuses = [],
+  executionLogs = {
+    stdout: { body: "agent stdout\n", status: 200 },
+    stderr: { body: "agent stderr\n", status: 200 },
+  },
   mutationFailures = {},
+  runPhase = "succeeded",
   session = developerSession,
   viewport = { width: 1280, height: 800 },
 } = {}) {
   const context = await browser.newContext({ colorScheme, viewport });
+  const executionLogRequests = [];
   const mutations = [];
   web.useMutationFailures(mutationFailures);
   web.useMutationSink(mutations);
@@ -491,12 +497,34 @@ async function guardedPage(browser, {
   });
   await context.route(`${origin}/app/api/v1/runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [run], nextCursor: null }));
   await context.route(`${origin}/app/api/v1/runs/**`, (route) => route.request().url().endsWith("/timeline")
-    ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: "succeeded", at: "2026-08-24T17:03:00Z" }] })
-    : json(route, { apiVersion: "steward.browser-runs/v1", run }));
+    ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
+    : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...run, phase: runPhase } }));
+  await context.route(`${origin}/app/api/v1/runs/${taskUid}/logs/*`, async (route) => {
+    const stream = new URL(route.request().url()).pathname.split("/").at(-1);
+    executionLogRequests.push(route.request());
+    const fixture = executionLogs[stream];
+    await route.fulfill({
+      status: fixture?.status ?? 404,
+      contentType: "text/plain; charset=utf-8",
+      body: fixture?.body ?? "",
+      headers: { "cache-control": "no-store" },
+    });
+  });
   await context.route(`${origin}/admin/api/v1/all-runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [{ ...run, ownerUserId: developerSession.principal.userId }], nextCursor: null }));
   await context.route(`${origin}/admin/api/v1/all-runs/**`, (route) => route.request().url().endsWith("/timeline")
-    ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: "succeeded", at: "2026-08-24T17:03:00Z" }] })
-    : json(route, { apiVersion: "steward.browser-runs/v1", run }));
+    ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
+    : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...run, phase: runPhase } }));
+  await context.route(`${origin}/admin/api/v1/all-runs/${taskUid}/logs/*`, async (route) => {
+    const stream = new URL(route.request().url()).pathname.split("/").at(-1);
+    executionLogRequests.push(route.request());
+    const fixture = executionLogs[stream];
+    await route.fulfill({
+      status: fixture?.status ?? 404,
+      contentType: "text/plain; charset=utf-8",
+      body: fixture?.body ?? "",
+      headers: { "cache-control": "no-store" },
+    });
+  });
   await context.route(`${origin}/admin/api/v1/envelope-templates/**`, async (route) => {
     if (route.request().method() === "POST") {
       await route.continue();
@@ -567,7 +595,7 @@ async function guardedPage(browser, {
   page.on("request", (request) => {
     if (new URL(request.url()).origin !== origin) crossOriginRequests.push(request.url());
   });
-  return { context, page, consoleErrors, crossOriginRequests, httpErrors, mutations };
+  return { context, page, consoleErrors, crossOriginRequests, executionLogRequests, httpErrors, mutations };
 }
 
 async function closeGuardedPage(session) {
@@ -972,6 +1000,70 @@ test("Run detail displays the exact pinned Workflow and User Envelope revision",
     await expect(envelopeRevision).toContainText("4");
   } finally {
     await closeGuardedPage(developer);
+  }
+});
+
+test("failed run phases expose stdout and stderr as escaped sensitive output", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    executionLogs: {
+      stdout: { body: "checked repository\n<script id=executed>bad()</script>\n", status: 200 },
+      stderr: { body: "tool call failed: example\n", status: 200 },
+    },
+    runPhase: "failed",
+  });
+  try {
+    await developer.context.addCookies([{ name: "execution-log-session", value: "present", url: origin }]);
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    const failedPhase = developer.page.locator("li").filter({ has: developer.page.getByText("failed", { exact: true }) });
+    await expect(failedPhase.getByRole("button", { name: "View stdout" })).toBeVisible();
+    await expect(failedPhase.getByRole("button", { name: "View stderr" })).toBeVisible();
+
+    await failedPhase.getByRole("button", { name: "View stdout" }).click();
+    const viewer = failedPhase.getByRole("region", { name: "Execution log" });
+    await expect(viewer.getByRole("heading", { name: "stdout log" })).toBeVisible();
+    await expect(viewer.getByText("Sensitive output warning", { exact: true })).toBeVisible();
+    await expect(viewer.locator("pre")).toHaveText("checked repository\n<script id=executed>bad()</script>\n");
+    await expect(developer.page.locator("#executed")).toHaveCount(0);
+
+    await failedPhase.getByRole("button", { name: "View stderr" }).click();
+    await expect(viewer.getByRole("heading", { name: "stderr log" })).toBeVisible();
+    await expect(viewer.locator("pre")).toHaveText("tool call failed: example\n");
+
+    expect(developer.executionLogRequests.map((request) => new URL(request.url()).pathname)).toEqual([
+      `/app/api/v1/runs/${taskUid}/logs/stdout`,
+      `/app/api/v1/runs/${taskUid}/logs/stderr`,
+    ]);
+    for (const request of developer.executionLogRequests) {
+      expect(new URL(request.url()).origin).toBe(origin);
+      expect(request.headers().accept).toBe("text/plain");
+      expect(request.headers().cookie).toContain("execution-log-session=present");
+    }
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("administrator run logs use the administrator boundary and report unavailable logs", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    executionLogs: {
+      stdout: { body: "", status: 404 },
+      stderr: { body: "", status: 404 },
+    },
+    expectedHttpStatuses: [404],
+    runPhase: "succeeded",
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/runs/${taskUid}`);
+    const succeededPhase = administrator.page.locator("li").filter({ has: administrator.page.getByText("succeeded", { exact: true }) });
+    await succeededPhase.getByRole("button", { name: "View stderr" }).click();
+    await expect(succeededPhase.getByRole("status")).toHaveText("stderr log is unavailable for this run.");
+    expect(administrator.executionLogRequests).toHaveLength(1);
+    expect(new URL(administrator.executionLogRequests[0].url()).pathname).toBe(
+      `/admin/api/v1/all-runs/${taskUid}/logs/stderr`,
+    );
+  } finally {
+    await closeGuardedPage(administrator);
   }
 });
 
