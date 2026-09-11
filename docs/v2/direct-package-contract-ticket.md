@@ -2,8 +2,7 @@
 
 Priority: P0 foundation
 
-Status: corrected rebased head `320b79f`; full repository gate running after
-neutrality maintenance merged as `cc19487`
+Status: review pending in `apelogic-ai/steward#83` at exact head `320b79f`
 
 ## Goal
 
@@ -75,5 +74,6 @@ made independently in consumers.
 - focused contract tests, all Steward type tests, Clippy, formatting, all 27 JSON
   Schema fixtures, status/evidence consistency regressions, and diff checks: green;
   and
-- full `cargo xtask ci` is running after isolated neutrality maintenance PR
-  `apelogic-ai/steward#82` merged as `cc19487`.
+- full `cargo xtask ci`, pinned conformance, and the pre-push full quality gate are
+  green after isolated neutrality maintenance PR `apelogic-ai/steward#82` merged as
+  `cc19487`.

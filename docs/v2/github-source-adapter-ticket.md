@@ -2,8 +2,9 @@
 
 Priority: P0
 
-Status: implementation in progress from the corrected DP-C01 contract head;
-dependency boundary approved
+Status: valid red checkpoint from DP-C01 head `320b79f`; the provider-neutral port
+compiles and the first uninstalled-App security case fails against the provisional
+stub as expected
 
 ## Goal
 

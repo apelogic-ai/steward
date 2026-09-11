@@ -2,8 +2,8 @@
 
 Priority: P0
 
-Status: native-ARM maintenance merged as `6d4c106`; provenance PR `#31` at `4f7a685`
-is integrating current `main` and rerunning CI
+Status: provenance PR `#31` integrated current `main` at `1f9fe99`; native ARM and
+Kubernetes checks are green while amd64 quality completes
 
 ## Goal
 
