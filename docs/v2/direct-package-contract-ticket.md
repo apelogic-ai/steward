@@ -2,7 +2,8 @@
 
 Priority: P0 foundation
 
-Status: review pending in `apelogic-ai/steward#83` at exact head `320b79f`
+Status: adversarial-review correction `103919e` is full-gate green locally; PR
+`apelogic-ai/steward#83` remains at prior head `320b79f` until SSH-key retry
 
 ## Goal
 
@@ -71,9 +72,15 @@ made independently in consumers.
 - authority-evidence correction: `d4d8dc4`;
 - v2 status evidence exposure: `0455bf3`;
 - rebased post-maintenance head: `320b79f`;
+- evidence-binding and repository-gated contract correction: `103919e`;
 - focused contract tests, all Steward type tests, Clippy, formatting, all 27 JSON
   Schema fixtures, status/evidence consistency regressions, and diff checks: green;
   and
 - full `cargo xtask ci`, pinned conformance, and the pre-push full quality gate are
   green after isolated neutrality maintenance PR `apelogic-ai/steward#82` merged as
   `cc19487`.
+
+The correction binds invocation identity to signed provenance, package metadata to the
+closure entry, and the claimed closure digest to recomputed canonical bytes. It also
+aligns Rust and JSON Schema validation, proves frozen-v1 byte identity, and makes the
+manifest-driven fixture matrix part of normal repository tests.

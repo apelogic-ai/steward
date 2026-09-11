@@ -13,10 +13,10 @@ contracts remain authoritative; this record does not relax their exit criteria.
 | Ticket | Repository | State | Current dependency or handoff |
 |---|---|---|---|
 | DP-P00 | `apelogic-ai/steward` | in progress | Coordinates the complete demo evidence. |
-| DP-C01 | `apelogic-ai/steward` | review | PR `apelogic-ai/steward#83` at `320b79f` is full-gate green and cleanly mergeable. |
+| DP-C01 | `apelogic-ai/steward` | push pending | Adversarial-review fixes are full-gate green locally at `103919e`; PR `#83` remains at older head `320b79f` until SSH-key retry. |
 | DP-I01 | `github-oidc-exchange` | merged | PR `#31` merged as `f2e33ae`; provenance, amd64 quality/Trivy, native ARM, and Kubernetes replay were green. |
-| DP-G01 | `apelogic-ai/steward` | red checkpoint | Approved port and dependency boundary compiles; first uninstalled-App negative executes and is red against the provisional stub. |
-| DP-S01 | `apelogic-ai/steward` | red checkpoint | Five pre-reservation escape tests are retained locally at `bf53e91`; implementation depends on DP-G01 and DP-I01. |
+| DP-G01 | `apelogic-ai/steward` | local green | Exact GitHub source adapter is full-gate green at `2e0d2fc`, stacked on C01 `103919e`; publication waits for C01. |
+| DP-S01 | `apelogic-ai/steward` | in progress | Replacing generic red checkpoint `bf53e91` with behavior-specific tests on the green C01/G01 stack. |
 | DP-R01 | `apelogic-ai/steward-run` | review | Pin-correction PR `#33` at `2cbfe5f` is repository- and Action-round-trip-green. |
 | DP-R02 | `apelogic-ai/steward-run` | merged | PR `apelogic-ai/steward-run#32` merged as `a7bc15c`; live scan reported zero critical and zero accepted findings. |
 | DP-A01 | `apelogic-ai/agentic-ops` | merged | PR `apelogic-ai/agentic-ops#4` merged as `cca19bc`; package validation is green. |
@@ -33,9 +33,9 @@ or mutable environment state.
 
 | Producer | Consumer | Handoff | State |
 |---|---|---|---|
-| DP-C01 | DP-I01, DP-G01, DP-S01, DP-R01, DP-A01 | PR `apelogic-ai/steward#83`, exact head `320b79f`; neutrality maintenance merged as `cc19487` | review pending |
+| DP-C01 | DP-I01, DP-G01, DP-S01, DP-R01, DP-A01 | PR `apelogic-ai/steward#83` at remote `320b79f`; reviewed local correction `103919e`; neutrality maintenance merged as `cc19487` | remote update pending |
 | DP-I01 | DP-S01, DP-O01 | merged source `f2e33ae`, implementation/integrated head `1f9fe99`, contract checkpoint `042e8aa`; native-ARM maintenance merged as `6d4c106` | ready for immutable deployment pin |
-| DP-G01 | DP-S01, DP-O01 | reviewed Git source adapter release/configuration contract | pending |
+| DP-G01 | DP-S01, DP-O01 | local green head `2e0d2fc` (`9906ecf` implementation plus `2e0d2fc` negative coverage), stacked on C01 `103919e` | publication waits for C01 |
 | DP-R02 | DP-R01 | merged commit `a7bc15c`, implementation `e73f931`, green live scan | incorporated in `79b9f42` |
 | DP-R01 | DP-O01 | merged source `fd090be`, implementation `79b9f42`, fully green pin-correction PR `#33` at `2cbfe5f`, contract checkpoint `042e8aa` | review pending |
 | DP-A01 | DP-O01 | merged source commit `cca19bc`, closure `steward:sha256:79a68a6e3f7a21d37c4da0594555d409999562b3d1778641f743ec0e290118a8` | ready for caller pin after DP-C01 is published |

@@ -2,9 +2,8 @@
 
 Priority: P0
 
-Status: valid red checkpoint from DP-C01 head `320b79f`; the provider-neutral port
-compiles and the first uninstalled-App security case fails against the provisional
-stub as expected
+Status: full-gate green locally at `2e0d2fc`, stacked on corrected DP-C01 `103919e`;
+publication waits for DP-C01
 
 ## Goal
 
@@ -69,3 +68,13 @@ are the already workspace-pinned `base64`, `jsonwebtoken`, `reqwest`, `serde`, a
 `serde_json`, plus internal `steward-ports` and `steward-types`; loopback integration
 tests use the already pinned `tokio` as a dev-dependency. The maintainer approved this
 exact dependency boundary before production edits began.
+
+## Implementation evidence
+
+- implementation commit: `9906ecf`;
+- adversarial negative-coverage commit: `2e0d2fc`;
+- 13 focused port/adapter tests and focused Clippy: green;
+- full `cargo xtask ci`, including pinned G-1/G-2/G-4/G-5 conformance: green;
+- gate-created ephemeral infrastructure: removed; and
+- branch remains local and unpushed until DP-C01 is reviewed and merged, avoiding a
+  cross-ticket PR or history rewrite.
