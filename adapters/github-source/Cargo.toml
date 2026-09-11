@@ -1,0 +1,22 @@
+[package]
+name = "steward-adapter-github-source"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+base64.workspace = true
+jsonwebtoken = { workspace = true, features = ["use_pem"] }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+steward-ports = { path = "../../crates/steward-ports", version = "=0.0.0" }
+steward-types = { path = "../../crates/steward-types", version = "=0.0.0" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util"] }
+
+[lints]
+workspace = true

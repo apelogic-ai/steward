@@ -2,6 +2,9 @@
 
 use std::future::Future;
 
+use steward_types::direct_package::{
+    ExactGitCommit, RelativePath, RepositoryUrl, StableProviderId,
+};
 use steward_types::{
     AgentType, Budget, DisposableExecutionBinding, ModelRef, RuntimeId, RuntimeRefs, SpendSummary,
     ToolGrant,
@@ -87,7 +90,7 @@ pub const PORTS: [PortDescriptor; 8] = [
     },
     PortDescriptor {
         name: "GitHostingPlane",
-        maturity: Maturity::Provisional,
+        maturity: Maturity::Proven,
     },
 ];
 
@@ -456,6 +459,46 @@ pub trait PolicySink {
     fn publish_bundle(&mut self, revision: &str, bundle: &[u8]) -> Result<(), PortError>;
 }
 
-pub trait GitHostingPlane {
-    fn create_snapshot(&mut self, runtime: &RuntimeId) -> Result<String, PortError>;
+/// Stable provider identity for one canonical Git repository URL.
+///
+/// Repository and owner IDs are scoped to the provider selected by `repository`.
+/// Callers authorize this identity before asking the hosting plane to read bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitRepositoryIdentity {
+    pub repository: RepositoryUrl,
+    pub repository_id: StableProviderId,
+    pub repository_owner_id: StableProviderId,
+}
+
+/// Exact, bounded request for one ordinary file in a Git repository.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitFileRequest {
+    pub repository: GitRepositoryIdentity,
+    pub commit: ExactGitCommit,
+    pub path: RelativePath,
+    pub max_bytes: u64,
+}
+
+/// Deterministic bytes plus the provider-neutral identity revalidated for the read.
+///
+/// This type deliberately omits `Debug`: repository content must not enter logs through
+/// accidental diagnostic formatting.
+#[derive(Clone, Eq, PartialEq)]
+pub struct GitFile {
+    pub repository: GitRepositoryIdentity,
+    pub commit: ExactGitCommit,
+    pub path: RelativePath,
+    pub bytes: Vec<u8>,
+}
+
+pub trait GitHostingPlane: Send + Sync + 'static {
+    fn resolve_repository(
+        &self,
+        repository: &RepositoryUrl,
+    ) -> impl Future<Output = Result<GitRepositoryIdentity, PortError>> + Send;
+
+    fn read_file(
+        &self,
+        request: &GitFileRequest,
+    ) -> impl Future<Output = Result<GitFile, PortError>> + Send;
 }

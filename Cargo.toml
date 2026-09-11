@@ -5,6 +5,7 @@ members = [
     "adapters/codex",
     "adapters/fake",
     "adapters/github-artifact",
+    "adapters/github-source",
     "adapters/jira",
     "adapters/litellm",
     "adapters/mcp-gw",
