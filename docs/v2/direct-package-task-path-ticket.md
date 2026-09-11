@@ -2,8 +2,9 @@
 
 Priority: P0
 
-Status: implementation in progress through `51f0dd2`, a clean three-commit stack on
-merged G01 `8c2ca03`; DP-I01 is merged
+Status: implementation complete locally at `99c5e0b` on merged G01 `8c2ca03`; all
+required gates are green and branch publication waits on the permitted SSH
+hardware-key retry
 
 ## Goal
 
@@ -55,7 +56,7 @@ Coordinate final integration with DP-I01 and DP-R01; serialize heavy integration
 ## Implementation evidence
 
 - branch: `feat/direct-package-task-path`, based directly on merged DP-G01 `8c2ca03`;
-- local commits: `6dc10aa`, `26ba345`, and `51f0dd2`;
+- local candidate head: `99c5e0b`;
 - five real `POST /v1/tasks` negative cases cover unauthorized source, wrong exact
   object, inactive Envelope, over-authority requirements, and cross-repository
   `git:trigger`;
@@ -65,12 +66,19 @@ Coordinate final integration with DP-I01 and DP-R01; serialize heavy integration
   canonical closure digest, expands omitted skills to none, and reserves immutable
   direct-package evidence;
 - the additive immutable evidence migration and reservation/idempotency checks are
-  implemented; and
-- focused store and direct-path tests, all 190 apiserver tests, formatting, and the
-  workspace all-target check are green.
+  implemented;
+- the production GitHub source adapter, bounded stable-ID caller-to-source catalog,
+  read-only App-key mount, and conditional GitHub API egress are wired fail closed;
+- the generated API client is current;
+- successful full diagnostics persist bounded stdout and stderr under only the two
+  reserved output paths before the atomic success marker; and
+- `cargo xtask ci`, five real-Postgres regressions, generated-client verification,
+  and the authenticated OpenShell `0.0.98` runtime E2E are green. The disposable E2E
+  cluster, containers, networks, state, kubeconfig, and processes were verified
+  absent afterward; local-main and stable were untouched.
 
-This checkpoint is intentionally not pushed and has no PR while the remaining
-security and execution slices are under development.
+This candidate is intentionally not pushed until the single rule-governed SSH
+hardware-key retry can complete the final fetch and ancestry check.
 
 ## Implementation-readiness audit
 
