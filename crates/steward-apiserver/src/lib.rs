@@ -8795,6 +8795,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_package_escape_attempts_fail_closed_before_task_reservation()
+    -> Result<(), String> {
+        struct Case {
+            name: &'static str,
+            invocation_path: &'static str,
+            expected_status: StatusCode,
+            expected_error: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "unauthorized source",
+                invocation_path: ".steward/tasks/unauthorized-source.json",
+                expected_status: StatusCode::FORBIDDEN,
+                expected_error: "source repository is not authorized",
+            },
+            Case {
+                name: "wrong exact object",
+                invocation_path: ".steward/tasks/wrong-object.json",
+                expected_status: StatusCode::UNPROCESSABLE_ENTITY,
+                expected_error: "exact source object",
+            },
+            Case {
+                name: "inactive Envelope",
+                invocation_path: ".steward/tasks/inactive-envelope.json",
+                expected_status: StatusCode::UNPROCESSABLE_ENTITY,
+                expected_error: "active Envelope",
+            },
+            Case {
+                name: "over-authority package",
+                invocation_path: ".steward/tasks/over-authority.json",
+                expected_status: StatusCode::UNPROCESSABLE_ENTITY,
+                expected_error: "exceeds the selected Envelope",
+            },
+            Case {
+                name: "trigger repository mismatch",
+                invocation_path: ".steward/tasks/trigger-repository-mismatch.json",
+                expected_status: StatusCode::UNPROCESSABLE_ENTITY,
+                expected_error: "git:trigger",
+            },
+        ];
+        let ledger = versioned_task_ledger()?;
+        let task_rows = ledger.tasks.clone();
+        let app = task_router(
+            ledger,
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            task_api_config()?,
+        );
+        let mut failures = Vec::new();
+
+        for (index, case) in cases.iter().enumerate() {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/tasks")
+                        .header("authorization", "Bearer github-assertion")
+                        .header("idempotency-key", format!("direct-negative-{index}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "contractVersion": "steward.task/v2",
+                                "invocationPath": case.invocation_path,
+                            })
+                            .to_string(),
+                        ))
+                        .map_err(|error| {
+                            format!("build {} direct-package request: {error}", case.name)
+                        })?,
+                )
+                .await
+                .map_err(|error| format!("submit {} direct package: {error}", case.name))?;
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .map_err(|error| format!("read {} response: {error}", case.name))?;
+            let body = String::from_utf8_lossy(&body);
+
+            if status != case.expected_status || !body.contains(case.expected_error) {
+                failures.push(format!(
+                    "{}: expected {} containing {:?}, got {} {:?}",
+                    case.name, case.expected_status, case.expected_error, status, body
+                ));
+            }
+            let reserved = task_rows
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .len();
+            if reserved != 0 {
+                failures.push(format!(
+                    "{}: direct-package rejection reserved {reserved} Task(s)",
+                    case.name
+                ));
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("\n"))
+        }
+    }
+
+    #[tokio::test]
     async fn versioned_task_route_resolves_exact_workflow_and_pins_user_envelope()
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
