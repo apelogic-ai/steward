@@ -2,8 +2,7 @@
 
 Priority: P0
 
-Status: full-gate green locally at `2e0d2fc`, stacked on corrected DP-C01 `103919e`;
-publication waits for DP-C01
+Status: review pending in `apelogic-ai/steward#84` at exact head `b93d611`
 
 ## Goal
 
@@ -71,10 +70,10 @@ exact dependency boundary before production edits began.
 
 ## Implementation evidence
 
-- implementation commit: `9906ecf`;
-- adversarial negative-coverage commit: `2e0d2fc`;
+- rebased implementation commit: `0645d97`;
+- rebased adversarial negative-coverage commit: `b93d611`;
 - 13 focused port/adapter tests and focused Clippy: green;
 - full `cargo xtask ci`, including pinned G-1/G-2/G-4/G-5 conformance: green;
 - gate-created ephemeral infrastructure: removed; and
-- branch remains local and unpushed until DP-C01 is reviewed and merged, avoiding a
-  cross-ticket PR or history rewrite.
+- mandatory pre-push full quality gate: green; and
+- isolated non-draft PR: `apelogic-ai/steward#84`.

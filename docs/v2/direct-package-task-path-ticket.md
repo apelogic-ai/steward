@@ -2,8 +2,8 @@
 
 Priority: P0
 
-Status: red checkpoint `bf53e91` audited; implementation depends on DP-G01, DP-I01,
-and the corrected DP-C01 checkpoint
+Status: implementation in progress from rebased checkpoint `5d6175c` on the reviewed
+C01/G01 stack; DP-I01 is merged
 
 ## Goal
 

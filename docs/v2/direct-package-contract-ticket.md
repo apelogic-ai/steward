@@ -2,7 +2,7 @@
 
 Priority: P0 foundation
 
-Status: review pending in `apelogic-ai/steward#83` at exact corrected head `103919e`
+Status: merged by `apelogic-ai/steward#83` as `ba4c062`
 
 ## Goal
 
@@ -72,6 +72,7 @@ made independently in consumers.
 - v2 status evidence exposure: `0455bf3`;
 - rebased post-maintenance head: `320b79f`;
 - evidence-binding and repository-gated contract correction: `103919e`;
+- merged source: `ba4c062`;
 - focused contract tests, all Steward type tests, Clippy, formatting, all 27 JSON
   Schema fixtures, status/evidence consistency regressions, and diff checks: green;
   and

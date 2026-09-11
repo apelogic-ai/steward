@@ -2,8 +2,8 @@
 
 Priority: P0 integration
 
-Status: repository readiness audited; preparation may start while final activation
-waits for reviewed merged component commits
+Status: strict neutral fixture boundary is valid red at local commit `7ab0753`; final
+activation waits for reviewed merged component commits
 
 ## Goal
 
