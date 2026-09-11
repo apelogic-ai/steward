@@ -2,8 +2,8 @@
 
 Priority: P0
 
-Status: review pending in `apelogic-ai/steward#85` at exact head `99c5e0b` on merged
-G01 `8c2ca03`; all required gates are green
+Status: merged by `apelogic-ai/steward#85` as `3d6a76b`; reviewed head `99c5e0b`
+on merged G01 `8c2ca03` passed all required gates
 
 ## Goal
 
@@ -76,8 +76,7 @@ Coordinate final integration with DP-I01 and DP-R01; serialize heavy integration
   cluster, containers, networks, state, kubeconfig, and processes were verified
   absent afterward; local-main and stable were untouched.
 
-The implementation is published as non-draft PR `apelogic-ai/steward#85`; it remains
-unmerged pending maintainer review.
+The implementation was merged through `apelogic-ai/steward#85` as `3d6a76b`.
 
 ## Implementation-readiness audit
 
