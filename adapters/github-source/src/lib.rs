@@ -1130,6 +1130,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_request_bound_to_a_different_stable_repository() -> Result<(), String> {
+        let mock = MockGitHub::start(authentication_responses())?;
+        let mut mismatched = request()?;
+        mismatched.repository.repository_id = StableProviderId::parse("1002")?;
+        assert_rejected(
+            adapter(&mock)?.read_file(&mismatched).await,
+            "GitHub repository stable identity does not match request",
+        );
+        mock.finish()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_commit_or_path_cannot_produce_a_read() -> Result<(), String> {
+        let mut missing_commit = authentication_responses();
+        missing_commit.push(ResponseSpec::status(404, r#"{"message":"not found"}"#));
+        let mock = MockGitHub::start(missing_commit)?;
+        assert_rejected(
+            adapter(&mock)?.read_file(&request()?).await,
+            "read exact Git commit",
+        );
+        mock.finish()?;
+
+        let mut missing_path = authentication_responses();
+        missing_path.extend([
+            ResponseSpec::json(json!({"sha": COMMIT, "tree": {"sha": ROOT_TREE}})),
+            ResponseSpec::json(json!({
+                "sha": ROOT_TREE,
+                "truncated": false,
+                "tree": []
+            })),
+        ]);
+        let mock = MockGitHub::start(missing_path)?;
+        assert_rejected(
+            adapter(&mock)?.read_file(&request()?).await,
+            "requested Git path does not exist",
+        );
+        mock.finish()?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rejects_stable_identity_replacement_during_read() -> Result<(), String> {
         let mut responses = successful_read_responses();
         responses[7] = metadata(1002, 1000, "example-org/source-a");
