@@ -1,0 +1,9 @@
+{
+  "contractVersion": "steward.task/v2",
+  "package": {
+    "repository": "https://github.com/example-org/caller.git",
+    "commit": "git:trigger",
+    "path": "catalog/release-summary/v1/task-definition.json"
+  },
+  "envelope": "steward:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

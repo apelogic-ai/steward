@@ -1,0 +1,488 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.apelogic.ai/steward/task/v2/direct-package.schema.json",
+  "title": "Steward direct Git package Task contracts",
+  "$defs": {
+    "contractVersion": { "const": "steward.task/v2" },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$"
+    },
+    "repositoryUrl": {
+      "type": "string",
+      "maxLength": 512,
+      "pattern": "^https://(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?/(?!\\.{1,2}(?:/|\\.git$))[A-Za-z0-9._-]+(?:/(?!\\.{1,2}(?:/|\\.git$))[A-Za-z0-9._-]+)+\\.git$"
+    },
+    "exactGitCommit": {
+      "type": "string",
+      "pattern": "^git:sha1:[0-9a-f]{40}$"
+    },
+    "packageCommit": {
+      "oneOf": [
+        { "$ref": "#/$defs/exactGitCommit" },
+        { "const": "git:trigger" }
+      ]
+    },
+    "stewardDigest": {
+      "type": "string",
+      "pattern": "^steward:sha256:[0-9a-f]{64}$"
+    },
+    "providerId": {
+      "type": "string",
+      "pattern": "^[0-9]{1,20}$"
+    },
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}$"
+    },
+    "boundedText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "boundedRef": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "agentRef": {
+      "type": "string",
+      "maxLength": 255,
+      "pattern": "^[a-z][a-z0-9._-]*@[0-9][a-z0-9._+\\-]*$"
+    },
+    "diagnostics": {
+      "type": "object",
+      "properties": {
+        "executionLog": {
+          "enum": ["off", "full"],
+          "default": "off"
+        }
+      },
+      "additionalProperties": false
+    },
+    "packageReference": {
+      "type": "object",
+      "required": ["repository", "commit", "path"],
+      "properties": {
+        "repository": { "$ref": "#/$defs/repositoryUrl" },
+        "commit": { "$ref": "#/$defs/packageCommit" },
+        "path": { "$ref": "#/$defs/relativePath" }
+      },
+      "additionalProperties": false
+    },
+    "directTaskSubmission": {
+      "type": "object",
+      "required": ["contractVersion", "invocationPath"],
+      "properties": {
+        "contractVersion": { "$ref": "#/$defs/contractVersion" },
+        "invocationPath": { "$ref": "#/$defs/relativePath" }
+      },
+      "additionalProperties": false
+    },
+    "invocationManifest": {
+      "type": "object",
+      "required": ["contractVersion", "package", "envelope"],
+      "properties": {
+        "contractVersion": { "$ref": "#/$defs/contractVersion" },
+        "package": { "$ref": "#/$defs/packageReference" },
+        "envelope": { "$ref": "#/$defs/stewardDigest" },
+        "diagnostics": { "$ref": "#/$defs/diagnostics" }
+      },
+      "additionalProperties": false
+    },
+    "directTaskStatusResponse": {
+      "type": "object",
+      "required": [
+        "contractVersion", "taskUid", "runtimeUid", "phase", "runtimeOwnership",
+        "finalized", "diagnostics", "evidence"
+      ],
+      "properties": {
+        "contractVersion": { "$ref": "#/$defs/contractVersion" },
+        "taskUid": { "$ref": "#/$defs/uuid" },
+        "runtimeUid": {
+          "oneOf": [
+            { "$ref": "#/$defs/boundedText" },
+            { "type": "null" }
+          ]
+        },
+        "phase": {
+          "enum": ["submitted", "parked", "queued", "running", "succeeded", "failed", "cancelled"]
+        },
+        "runtimeOwnership": { "enum": ["provisioned", "adopted"] },
+        "finalized": { "type": "boolean" },
+        "failureReason": { "$ref": "#/$defs/boundedText" },
+        "deltas": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/admissionDelta" },
+          "default": []
+        },
+        "diagnostics": { "$ref": "#/$defs/diagnostics" },
+        "evidence": { "$ref": "#/$defs/taskBindingEvidence" }
+      },
+      "additionalProperties": false
+    },
+    "admissionDelta": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["dimension", "requested", "ceiling", "currency"],
+          "properties": {
+            "dimension": { "const": "budget" },
+            "requested": { "type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$" },
+            "ceiling": { "type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$" },
+            "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["dimension", "requested", "ceiling", "currency"],
+          "properties": {
+            "dimension": { "const": "singleRunBudget" },
+            "requested": {
+              "oneOf": [
+                { "type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$" },
+                { "type": "null" }
+              ]
+            },
+            "ceiling": { "type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$" },
+            "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["dimension", "requested", "ceiling"],
+          "properties": {
+            "dimension": { "const": "ttl" },
+            "requested": { "type": "string", "pattern": "^[1-9][0-9]*(?:s|m|h)$" },
+            "ceiling": { "type": "string", "pattern": "^[1-9][0-9]*(?:s|m|h)$" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["dimension", "requested", "ceiling"],
+          "properties": {
+            "dimension": { "const": "models" },
+            "requested": { "type": "array", "items": { "$ref": "#/$defs/modelRequirement" } },
+            "ceiling": { "type": "array", "items": { "$ref": "#/$defs/modelRequirement" } }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["dimension", "requested", "ceiling"],
+          "properties": {
+            "dimension": { "const": "tools" },
+            "requested": { "type": "array", "items": { "$ref": "#/$defs/toolRequirement" } },
+            "ceiling": { "type": "array", "items": { "$ref": "#/$defs/toolRequirement" } }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["dimension", "requested", "ceiling"],
+          "properties": {
+            "dimension": { "const": "runnerPlatforms" },
+            "requested": { "type": "array", "items": { "enum": ["linux", "mac", "windows"] } },
+            "ceiling": { "type": "array", "items": { "enum": ["linux", "mac", "windows"] } }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["dimension", "requested", "ceiling"],
+          "properties": {
+            "dimension": { "enum": ["runnerMemory", "runnerCompute", "runnerStorage"] },
+            "requested": { "type": "string", "minLength": 1, "maxLength": 32 },
+            "ceiling": {
+              "oneOf": [
+                { "type": "string", "minLength": 1, "maxLength": 32 },
+                { "type": "null" }
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "runtimeSelection": {
+      "type": "object",
+      "required": ["agentRef"],
+      "properties": {
+        "agentRef": { "$ref": "#/$defs/agentRef" }
+      },
+      "additionalProperties": false
+    },
+    "declaredOutput": {
+      "type": "object",
+      "required": ["path", "kind", "required"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "maxLength": 512,
+          "pattern": "^out(?:/[A-Za-z0-9._-]+)*$"
+        },
+        "kind": { "enum": ["directory", "file"] },
+        "required": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "modelRequirement": {
+      "type": "object",
+      "required": ["provider", "model"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/slug" },
+        "model": { "$ref": "#/$defs/boundedText" }
+      },
+      "additionalProperties": false
+    },
+    "toolRequirement": {
+      "type": "object",
+      "required": ["provider", "resource", "action"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/slug" },
+        "resource": { "$ref": "#/$defs/boundedText" },
+        "action": { "$ref": "#/$defs/boundedText" }
+      },
+      "additionalProperties": false
+    },
+    "budgetRequirement": {
+      "type": "object",
+      "required": ["monthlyLimit", "singleRunLimit", "currency"],
+      "properties": {
+        "monthlyLimit": { "type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$" },
+        "singleRunLimit": {
+          "oneOf": [
+            { "type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$" },
+            { "type": "null" }
+          ]
+        },
+        "currency": { "type": "string", "pattern": "^[A-Z]{3}$" }
+      },
+      "additionalProperties": false
+    },
+    "runnerRequirement": {
+      "type": "object",
+      "required": ["platforms", "memory", "compute", "storage"],
+      "properties": {
+        "platforms": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["linux", "mac", "windows"] }
+        },
+        "memory": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 32 },
+            { "type": "null" }
+          ]
+        },
+        "compute": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 32 },
+            { "type": "null" }
+          ]
+        },
+        "storage": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 32 },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "authorityRequirements": {
+      "type": "object",
+      "required": ["llms", "tools", "budget", "ttl", "runner"],
+      "properties": {
+        "llms": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/modelRequirement" } },
+        "tools": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/toolRequirement" } },
+        "budget": { "$ref": "#/$defs/budgetRequirement" },
+        "ttl": { "type": "string", "pattern": "^[1-9][0-9]*(?:s|m|h)$" },
+        "runner": { "$ref": "#/$defs/runnerRequirement" }
+      },
+      "additionalProperties": false
+    },
+    "directRequirements": {
+      "type": "object",
+      "required": ["authority"],
+      "properties": {
+        "authority": { "$ref": "#/$defs/authorityRequirements" }
+      },
+      "additionalProperties": false
+    },
+    "taskDefinition": {
+      "type": "object",
+      "required": ["schemaVersion", "name", "version", "runtime", "prompt", "outputs"],
+      "properties": {
+        "schemaVersion": { "const": "steward.task-definition/v2" },
+        "name": { "$ref": "#/$defs/slug" },
+        "version": { "type": "integer", "minimum": 1 },
+        "runtime": { "$ref": "#/$defs/runtimeSelection" },
+        "prompt": { "$ref": "#/$defs/relativePath" },
+        "skills": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relativePath" },
+          "default": []
+        },
+        "outputs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/declaredOutput" }
+        },
+        "requires": { "$ref": "#/$defs/directRequirements" }
+      },
+      "additionalProperties": false
+    },
+    "instructionSkill": {
+      "type": "object",
+      "required": ["schemaVersion", "name", "description", "instructions"],
+      "properties": {
+        "schemaVersion": { "const": "steward.instruction-skill/v1" },
+        "name": { "$ref": "#/$defs/slug" },
+        "description": { "$ref": "#/$defs/boundedText" },
+        "kind": { "const": "instruction_only", "default": "instruction_only" },
+        "instructions": { "$ref": "#/$defs/relativePath" },
+        "assets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relativePath" },
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    },
+    "triggerRepository": {
+      "type": "object",
+      "required": ["id", "ownerId", "name"],
+      "properties": {
+        "id": { "$ref": "#/$defs/providerId" },
+        "ownerId": { "$ref": "#/$defs/providerId" },
+        "name": { "$ref": "#/$defs/boundedText" }
+      },
+      "additionalProperties": false
+    },
+    "workflowRun": {
+      "type": "object",
+      "required": ["id", "attempt"],
+      "properties": {
+        "id": { "$ref": "#/$defs/providerId" },
+        "attempt": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "workflowIdentity": {
+      "type": "object",
+      "required": ["ref", "sha"],
+      "properties": {
+        "ref": { "$ref": "#/$defs/boundedRef" },
+        "sha": { "$ref": "#/$defs/exactGitCommit" }
+      },
+      "additionalProperties": false
+    },
+    "sourceProvenance": {
+      "type": "object",
+      "required": [
+        "contractVersion", "provider", "repository", "triggeredSha", "run", "event",
+        "ref", "actorId", "actor", "callerWorkflow", "reusableWorkflow"
+      ],
+      "properties": {
+        "contractVersion": { "const": "steward.source-provenance/v1" },
+        "provider": { "const": "github" },
+        "repository": { "$ref": "#/$defs/triggerRepository" },
+        "triggeredSha": { "$ref": "#/$defs/exactGitCommit" },
+        "run": { "$ref": "#/$defs/workflowRun" },
+        "event": { "$ref": "#/$defs/boundedText" },
+        "ref": { "$ref": "#/$defs/boundedRef" },
+        "actorId": { "$ref": "#/$defs/providerId" },
+        "actor": { "$ref": "#/$defs/boundedText" },
+        "callerWorkflow": { "$ref": "#/$defs/workflowIdentity" },
+        "reusableWorkflow": { "$ref": "#/$defs/workflowIdentity" }
+      },
+      "additionalProperties": false
+    },
+    "closureEntry": {
+      "type": "object",
+      "required": ["kind", "path", "digest", "sizeBytes"],
+      "properties": {
+        "kind": { "enum": ["task_definition", "prompt", "instruction_skill", "instructions", "asset"] },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "digest": { "$ref": "#/$defs/stewardDigest" },
+        "sizeBytes": { "type": "integer", "minimum": 0, "maximum": 8388608 }
+      },
+      "additionalProperties": false
+    },
+    "packageClosure": {
+      "type": "object",
+      "required": ["contractVersion", "entryPoint", "entries"],
+      "properties": {
+        "contractVersion": { "const": "steward.package-closure/v1" },
+        "entryPoint": { "$ref": "#/$defs/relativePath" },
+        "entries": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/closureEntry" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "resolvedSource": {
+      "type": "object",
+      "required": ["repository", "repositoryId", "repositoryOwnerId", "commit", "path", "contentDigest"],
+      "properties": {
+        "repository": { "$ref": "#/$defs/repositoryUrl" },
+        "repositoryId": { "$ref": "#/$defs/providerId" },
+        "repositoryOwnerId": { "$ref": "#/$defs/providerId" },
+        "commit": { "$ref": "#/$defs/exactGitCommit" },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "contentDigest": { "$ref": "#/$defs/stewardDigest" }
+      },
+      "additionalProperties": false
+    },
+    "envelopeEvidence": {
+      "type": "object",
+      "required": ["uid", "revision", "digest"],
+      "properties": {
+        "uid": { "$ref": "#/$defs/uuid" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "digest": { "$ref": "#/$defs/stewardDigest" }
+      },
+      "additionalProperties": false
+    },
+    "taskBindingEvidence": {
+      "type": "object",
+      "required": [
+        "schemaVersion", "taskUid", "sourceProvenance", "invocation", "package", "closure",
+        "closureDigest", "envelope", "effectiveRequirements", "diagnostics"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "steward.task/source-authority-evidence/v1" },
+        "taskUid": { "$ref": "#/$defs/uuid" },
+        "sourceProvenance": { "$ref": "#/$defs/sourceProvenance" },
+        "invocation": { "$ref": "#/$defs/resolvedSource" },
+        "package": { "$ref": "#/$defs/resolvedSource" },
+        "closure": { "$ref": "#/$defs/packageClosure" },
+        "closureDigest": { "$ref": "#/$defs/stewardDigest" },
+        "envelope": { "$ref": "#/$defs/envelopeEvidence" },
+        "effectiveRequirements": { "$ref": "#/$defs/directRequirements" },
+        "diagnostics": { "$ref": "#/$defs/diagnostics" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

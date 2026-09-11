@@ -2,7 +2,7 @@
 
 Priority: P0 foundation
 
-Status: ready to start
+Status: implementation in progress on `feat/direct-package-contract`
 
 ## Goal
 
@@ -18,7 +18,8 @@ Git source, Steward, runner, and package implementations proceed independently.
 - direct instruction-skill schema in which omitted kind means `instruction_only`;
 - deterministic package-closure digest rules;
 - verified source-provenance input shape;
-- immutable Task source/effective-authority evidence shape; and
+- immutable Task source/effective-authority evidence shape;
+- public v2 Task status carrying that immutable evidence; and
 - successful-run stdout/stderr transcript filenames and limits.
 
 The frozen `steward.m1/v1` schemas are inputs for compatibility tests only and are not
@@ -31,8 +32,11 @@ modified.
 - Envelope values are `steward:sha256:<64-hex>`;
 - omitted or empty skills means no skills;
 - instruction-only is the default and only initial skill kind;
-- omitted `requires` expands to the selected Envelope's full approved values;
+- omitted `requires` expands to the selected Envelope's full approved authority
+  values, including explicit null optional maxima;
 - present `requires` is a complete narrower request;
+- execution behavior comes only from the immutable deployment-owned `runtime.agentRef`
+  binding; packages cannot declare unverified execution capabilities;
 - omitted diagnostics means no caller-visible execution log; and
 - `diagnostics.executionLog: full` requests successful stdout/stderr replay.
 
@@ -61,3 +65,16 @@ modified.
 This ticket lands first. The four independent implementation lanes may start from its
 reviewed contract commit. Wire-compatible corrections are coordinated here rather than
 made independently in consumers.
+
+## Implementation record
+
+- [x] additive Rust wire types and strict semantic validation;
+- [x] authoritative JSON Schema and positive, negative, and v1 compatibility fixtures;
+- [x] signed `source_provenance` exchange-JWT claim and authenticated v2 diagnostics
+  response projection;
+- [x] deterministic closure canonicalization and digest vector;
+- [x] effective authority evidence preserves nullable Envelope maxima and rejects
+  package-authored execution capabilities without a verifiable authority source;
+- [x] reserved successful-run transcript paths and bounds;
+- [ ] repository gate and reviewed contract commit;
+- [ ] downstream lane synchronization against the exact commit.
