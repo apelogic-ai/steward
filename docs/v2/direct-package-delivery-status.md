@@ -13,12 +13,12 @@ contracts remain authoritative; this record does not relax their exit criteria.
 | Ticket | Repository | State | Current dependency or handoff |
 |---|---|---|---|
 | DP-P00 | `apelogic-ai/steward` | in progress | Coordinates the complete demo evidence. |
-| DP-C01 | `apelogic-ai/steward` | in progress | Contract/schema lane; blocks serialization freeze in downstream lanes. |
-| DP-I01 | `github-oidc-exchange` | in progress | Verified provenance belongs in signed exchange-JWT claims consumed by Steward's direct Identity resolver; synchronize exact fields to DP-C01. |
+| DP-C01 | `apelogic-ai/steward` | gate blocked | Contract checkpoint `042e8aa` is cross-lane compatible; mandatory neutrality gate needs a separately authorized maintenance fix before push. |
+| DP-I01 | `github-oidc-exchange` | push blocked | Implementation and full gates are green at `f9835cd`; one SSH push retry awaits maintainer hardware readiness. |
 | DP-G01 | `apelogic-ai/steward` | queued | Starts after DP-C01 publishes the contract commit and an agent slot is free. |
 | DP-S01 | `apelogic-ai/steward` | blocked | Test preparation follows DP-C01; implementation depends on DP-G01. |
-| DP-R01 | `apelogic-ai/steward-run` | in progress | Seam inventory and red tests may proceed; synchronize request names to DP-C01. |
-| DP-A01 | `apelogic-ai/agentic-ops` | queued | Starts after DP-C01 publishes the contract commit and an agent slot is free. |
+| DP-R01 | `apelogic-ai/steward-run` | review ready | PR `apelogic-ai/steward-run#31` at `63774a6`; full local gate and bundled direct-package E2E are green. |
+| DP-A01 | `apelogic-ai/agentic-ops` | in progress | Implementing the contract-pinned, one-prompt GitHub MCP demo package. |
 | DP-O01 | `apelogic-ai/gitops` | waiting | Preparation follows reviewed releases; GitOps alone operates local-main. |
 | DP-P01 | `apelogic-ai/steward` | post-P0 | Optional catalog publication and release provenance. |
 | DP-T01 | `apelogic-ai/steward` | post-P0 | Multiple-package/workflow and stable-lane conformance. |
@@ -35,7 +35,7 @@ or mutable environment state.
 | DP-C01 | DP-I01, DP-G01, DP-S01, DP-R01, DP-A01 | exact contract commit and schema paths | pending |
 | DP-I01 | DP-S01, DP-O01 | reviewed Identity release and provenance claim contract | pending |
 | DP-G01 | DP-S01, DP-O01 | reviewed Git source adapter release/configuration contract | pending |
-| DP-R01 | DP-O01 | reviewed reusable-workflow commit/release | pending |
+| DP-R01 | DP-O01 | PR `apelogic-ai/steward-run#31`, commit `63774a6`, contract checkpoint `042e8aa` | review pending |
 | DP-A01 | DP-O01 | exact package commit, path, and closure validation | pending |
 | DP-S01 | DP-O01 | reviewed Steward release and E2E verifier | pending |
 | DP-O01 | DP-P00 | local-main preflight and final demo evidence | pending |

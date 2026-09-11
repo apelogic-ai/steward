@@ -2,7 +2,7 @@
 
 Priority: P0
 
-Status: blocked only on DP-C01 contract freeze
+Status: review ready in `apelogic-ai/steward-run#31` at `63774a6`
 
 ## Goal
 
@@ -12,7 +12,8 @@ metadata behavior.
 
 ## Scope
 
-- add required `invocation-path` input for the v2 reusable workflow;
+- add `invocation-path` for the direct-package flow, mutually exclusive with the
+  legacy `workflow` input;
 - send the path and GitHub trigger metadata, never manifest or package bytes;
 - retain the current per-run input archive flow;
 - poll the same Task resource and download declared outputs after success;
@@ -46,3 +47,12 @@ agent-specific JSON events. It presents the original process streams.
 
 May proceed alongside DP-I01, DP-G01, and DP-A01 after DP-C01. It uses a mock server
 for client tests; the real MCP proof belongs to the final P0 integration.
+
+## Implementation evidence
+
+- contract checkpoint: Steward DP-C01 commit `042e8aa`;
+- implementation: `apelogic-ai/steward-run#31` at commit `63774a6`;
+- full `npm run check`: green, including 151 tests, typecheck, build, thin-shell
+  validation, and checked-in bundle verification; and
+- bundled E2E: green for path-only v2 submission, authenticated transcript replay,
+  workflow-command suppression, output handling, and unconditional finalization.
