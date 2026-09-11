@@ -1,0 +1,11 @@
+{
+  "contractVersion": "steward.task/v2",
+  "package": {
+    "repository": "https://github.com/example-org/agentic-ops.git",
+    "commit": "git:sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "path": "catalog/release-summary/v1/task-definition.json"
+  },
+  "diagnostics": {
+    "executionLog": "full"
+  }
+}

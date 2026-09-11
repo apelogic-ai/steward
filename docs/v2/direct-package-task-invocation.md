@@ -15,8 +15,9 @@ catalog publication, and richer diagnostics.
 
 A developer or platform engineer authors a versioned Task package in an admitted
 operations repository. A workflow in an admitted caller repository references the
-exact package source and an approved Envelope digest through a checked-in invocation
-manifest. Steward resolves the source itself, admits the effective request, executes
+exact package source through a checked-in invocation manifest. Steward resolves the
+source and the authenticated user's unique active provisioned Envelope, admits the
+effective request, executes
 the Task with the caller's Steward Principal, and returns declared outputs and an
 optional execution transcript to the GitHub Actions run.
 
@@ -32,15 +33,16 @@ The path separates four concerns:
    branch reachability.
 2. **Source authorization.** The external GitHub repository identity must be admitted
    for the caller. Cross-repository use requires an explicit caller-to-source binding.
-3. **Execution authority.** An administrator creates or selects an Envelope in
-   Steward, approves it in the Steward UI, and places its content digest in the
-   invocation manifest. Steward's active caller-to-Envelope binding is authoritative.
+3. **Execution authority.** An administrator provisions an Envelope for the user in
+   Steward and approves it in the Steward UI. Steward's active user-to-Envelope
+   binding is authoritative; product Git does not select its UID, revision, or digest.
 4. **Task ownership.** The existing server-resolved Steward `Principal` owns the Task,
    runtime, provider credentials, and budget. Git identities do not replace it.
 
-Internal database identifiers are never caller-facing authority. Steward may record
-the concrete Envelope instance and revision in evidence, but callers select an
-Envelope only by its approved SHA-256 content digest.
+Internal database identifiers are never caller-facing authority. Steward records the
+resolved Envelope request UID, revision, digest, and approved snapshot in immutable
+Task evidence. During a staged backward-compatible rollout, an existing manifest may
+still carry the approved SHA-256 content digest; new product configuration omits it.
 
 Old Git objects remaining fetchable does not keep an authorization active. Steward
 accepts a source only while the external repository identity and the corresponding
@@ -69,7 +71,6 @@ An initial cross-repository manifest is:
     "commit": "git:sha1:<40-hex>",
     "path": "catalog/release-summary/v1/task-definition.json"
   },
-  "envelope": "steward:sha256:<64-hex>",
   "diagnostics": {
     "executionLog": "full"
   }
@@ -85,7 +86,9 @@ The fields have these meanings:
   exact triggered SHA before admission.
 - `path` is a repository-relative package entry point with no traversal or symlink
   escape.
-- `envelope` is the digest of an active administrator-approved Steward Envelope.
+- optional `envelope` is a temporary compatibility selector for an exact approved
+  digest; omit it in new product configuration so Steward resolves the authenticated
+  user's unique active provisioned Envelope.
 - `diagnostics.executionLog` is optional. Missing means `off`; `full` requests the
   successful-run transcript described below.
 
@@ -146,10 +149,10 @@ wire schemas are owned by the contract ticket, but these semantics are fixed:
 - a future executable-skill kind requires a new schema version plus explicit runtime
   capability and Envelope permission;
 - existing instruction-only packages must never become executable implicitly;
-- `requires` omitted means use the selected Envelope's complete approved authority
+- `requires` omitted means use the resolved Envelope's complete approved authority
   values;
 - `requires` present is a complete, explicit request that must be no broader than the
-  selected Envelope; and
+  resolved Envelope; and
 - Steward records the fully expanded effective requirements in Task evidence.
 
 The v2 package cannot request `shell`, `python3`, or another execution capability.
@@ -159,7 +162,7 @@ execution-capability authority. Adding capability requests requires a new schema
 authority source; package content cannot invent one.
 
 The initial missing-`requires` behavior favors authoring simplicity over least
-privilege. Operators should therefore select a deliberately bounded Envelope.
+privilege. Operators should therefore provision a deliberately bounded Envelope.
 
 Steward computes a deterministic digest over the resolved package closure and records
 the repository identity, exact commit, entry path, dependency identities and digest,
@@ -180,7 +183,8 @@ The server performs, in order:
 3. fetch and validate the invocation manifest at the triggered commit;
 4. authorize the invoking and package repository identities;
 5. resolve and snapshot the exact package closure;
-6. locate an active Envelope for that Principal with the requested digest;
+6. resolve exactly one active provisioned Envelope for the authenticated user, or
+   honor the temporary exact-digest compatibility selector;
 7. expand package requirements and run normal Steward admission;
 8. reserve the Task idempotently with immutable source and authority evidence;
 9. bind or provision the exact runtime through the common PR-78 orchestration path;

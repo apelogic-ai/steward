@@ -2,7 +2,7 @@
 
 Status: active coordination record
 
-Updated: 2026-09-10
+Updated: 2026-09-11
 
 This file tracks implementation state and exact cross-repository handoffs for the
 [accepted direct-package architecture](direct-package-task-invocation.md). Ticket
@@ -17,6 +17,7 @@ contracts remain authoritative; this record does not relax their exit criteria.
 | DP-I01 | `github-oidc-exchange` | merged | PR `#31` merged as `f2e33ae`; provenance, amd64 quality/Trivy, native ARM, and Kubernetes replay were green. |
 | DP-G01 | `apelogic-ai/steward` | merged | PR `#84` merged as `8c2ca03`; reviewed head `b93d611` was focused-, full-gate-, conformance-, and pre-push-green. |
 | DP-S01 | `apelogic-ai/steward` | merged | PR `#85` merged as `3d6a76b`; reviewed head `99c5e0b` was full-gate-, Postgres-, and OpenShell-E2E-green. Broader adversarial coverage is recorded as post-demo debt. |
+| DP-S02 | `apelogic-ai/steward` | in progress | Backward-compatible unique active User Envelope resolution; GitOps pin removal waits for merge and deployment. |
 | DP-R01 | `apelogic-ai/steward-run` | merged | Pin-correction PR `#33` merged as `139221e`; repository and complete Action round-trip were green. |
 | DP-R02 | `apelogic-ai/steward-run` | merged | PR `apelogic-ai/steward-run#32` merged as `a7bc15c`; live scan reported zero critical and zero accepted findings. |
 | DP-A01 | `apelogic-ai/agentic-ops` | merged | PR `apelogic-ai/agentic-ops#4` merged as `cca19bc`; package validation is green. |

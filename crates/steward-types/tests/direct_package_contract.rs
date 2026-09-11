@@ -418,6 +418,16 @@ fn manifest_registers_every_fixture_against_a_resolved_schema_definition() -> Re
 #[test]
 fn schema_and_rust_keep_high_risk_constraints_in_parity() -> Result<(), String> {
     let schema = parse_value("schemas/direct-package.schema.json")?;
+    let invocation_required = schema
+        .pointer("/$defs/invocationManifest/required")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "invocation schema required fields must be an array".to_owned())?;
+    assert!(invocation_required.contains(&serde_json::json!("contractVersion")));
+    assert!(invocation_required.contains(&serde_json::json!("package")));
+    assert!(
+        !invocation_required.contains(&serde_json::json!("envelope")),
+        "product configuration must not require a User Envelope selector"
+    );
     let required = schema
         .pointer("/$defs/directTaskStatusResponse/required")
         .and_then(serde_json::Value::as_array)
@@ -465,6 +475,14 @@ fn positive_wire_fixtures_parse_and_validate() -> Result<(), String> {
     exact.validate_for_invoking_repository(&invoking_repository)?;
     assert_eq!(
         exact.effective_diagnostics().execution_log,
+        ExecutionLogMode::Full
+    );
+
+    let unpinned: InvocationManifest =
+        parse("fixtures/positive/invocation-manifest-unpinned.json")?;
+    unpinned.validate_for_invoking_repository(&invoking_repository)?;
+    assert_eq!(
+        unpinned.effective_diagnostics().execution_log,
         ExecutionLogMode::Full
     );
 

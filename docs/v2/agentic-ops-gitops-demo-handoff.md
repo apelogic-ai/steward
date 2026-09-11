@@ -50,7 +50,7 @@ After all reviewed merged commits and exact source commits exist, GitOps:
 3. configures stable external repository identities and the cross-repository source
    binding;
 4. creates or selects the bounded Envelope in Steward UI and approves it;
-5. records the UI-approved `steward:sha256` digest in the invocation manifest;
+5. confirms the invocation manifest contains no User Envelope selector;
 6. confirms the demo user has an active GitHub connection through MCP-GW;
 7. reconciles or restarts local-main using only state-preserving GitOps procedures;
 8. runs preflight without resetting data;
@@ -66,7 +66,7 @@ After all reviewed merged commits and exact source commits exist, GitOps:
 - Steward trusts only configured Identity issuers and source repository bindings.
 - The GitHub source adapter can mint short-lived installation tokens with metadata
   and contents read access only.
-- The caller's active Envelope digest matches the invocation manifest.
+- The authenticated demo user has exactly one active provisioned Envelope.
 - The Envelope permits the selected model and the exact read-only GitHub MCP tools
   required by the release-summary prompt.
 - OpenShell attaches only desired providers.
@@ -123,5 +123,5 @@ replacement, or unowned-resource deletion is part of this ticket.
 
 The GitOps team later runs the normal clean-main validation, state-preserving
 `scripts/local-lifecycle.sh main update`, and `main verify`, then checks the artifact
-lock, UI-approved Envelope digest, GitHub connection, runner, and App access before
+lock, UI-provisioned User Envelope, GitHub connection, runner, and App access before
 dispatch. No implementation diagnosis or destructive reset occurs on local-main.
