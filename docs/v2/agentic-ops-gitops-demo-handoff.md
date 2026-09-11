@@ -2,8 +2,9 @@
 
 Priority: P0 integration
 
-Status: strict neutral fixture boundary is valid red at local commit `7ab0753`; final
-activation waits for reviewed merged component commits
+Status: neutral target-fixture implementation is in review as
+`apelogic-ai/gitops#176` at `e48300b`, locally and CI green with a clean merge state;
+final activation waits for reviewed merged component commits
 
 ## Goal
 

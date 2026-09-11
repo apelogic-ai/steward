@@ -2,8 +2,8 @@
 
 Priority: P0
 
-Status: implementation in progress from rebased checkpoint `5d6175c` on the reviewed
-C01/G01 stack; DP-I01 is merged
+Status: implementation in progress through `51f0dd2`, a clean three-commit stack on
+merged G01 `8c2ca03`; DP-I01 is merged
 
 ## Goal
 
@@ -52,25 +52,30 @@ its existing route and resolver.
 Test scaffolding may start after DP-C01. Source-backed implementation waits for DP-G01.
 Coordinate final integration with DP-I01 and DP-R01; serialize heavy integration lanes.
 
-## Test-preparation evidence
+## Implementation evidence
 
-- branch: `feat/direct-package-task-path`, based on DP-C01 checkpoint `042e8aa`;
-- local commit: `bf53e91`;
+- branch: `feat/direct-package-task-path`, based directly on merged DP-G01 `8c2ca03`;
+- local commits: `6dc10aa`, `26ba345`, and `51f0dd2`;
 - five real `POST /v1/tasks` negative cases cover unauthorized source, wrong exact
   object, inactive Envelope, over-authority requirements, and cross-repository
   `git:trigger`;
-- every case currently fails at the missing v2 request boundary before Task
-  reservation, as intended; and
-- the frozen versioned-v1 route remains green.
+- every negative reaches its named authorization or admission seam and proves zero
+  Task reservations and zero runtime operations;
+- the successful path resolves exact prompt, skill, and asset content, computes the
+  canonical closure digest, expands omitted skills to none, and reserves immutable
+  direct-package evidence;
+- the additive immutable evidence migration and reservation/idempotency checks are
+  implemented; and
+- focused store and direct-path tests, all 190 apiserver tests, formatting, and the
+  workspace all-target check are green.
 
-This checkpoint is intentionally not pushed and has no PR while its tests are red.
+This checkpoint is intentionally not pushed and has no PR while the remaining
+security and execution slices are under development.
 
 ## Implementation-readiness audit
 
-- The five current cases compile, reach the real `POST /v1/tasks` route, and prove no
-  Task is reserved, but all stop at the same missing-v2 deserialization boundary.
-  After DP-G01, replace them with behavior-specific source and Identity fakes so each
-  named negative reaches its own authorization or admission seam.
+- The five initial cases now use behavior-specific source and Identity fakes and
+  reach their own authorization or admission seams.
 - Add one nullable, immutable direct-package evidence JSON object through a new
   additive migration. Do not repurpose or relax the existing all-or-none workflow and
   User-Envelope pin columns, and do not edit migration history.

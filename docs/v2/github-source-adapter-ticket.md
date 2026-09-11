@@ -2,7 +2,8 @@
 
 Priority: P0
 
-Status: review pending in `apelogic-ai/steward#84` at exact head `b93d611`
+Status: merged by `apelogic-ai/steward#84` as `8c2ca03`; reviewed implementation
+head `b93d611`
 
 ## Goal
 
@@ -76,4 +77,4 @@ exact dependency boundary before production edits began.
 - full `cargo xtask ci`, including pinned G-1/G-2/G-4/G-5 conformance: green;
 - gate-created ephemeral infrastructure: removed; and
 - mandatory pre-push full quality gate: green; and
-- isolated non-draft PR: `apelogic-ai/steward#84`.
+- isolated PR `apelogic-ai/steward#84`, merged as `8c2ca03`.
