@@ -3323,15 +3323,15 @@ mod tests {
                 &steward_types::direct_package::MAX_EXECUTION_TRANSCRIPT_BYTES.to_string()
             )
         );
-        let append = execution
-            .find("tar -rf")
-            .expect("successful diagnostics must be appended to the output archive");
-        let succeeded = execution
-            .find("printf succeeded")
-            .expect("successful execution must retain its atomic marker");
         assert!(
-            append < succeeded,
-            "diagnostics must be durable before the successful marker"
+            matches!(
+                (
+                    execution.find("tar -rf"),
+                    execution.find("printf succeeded")
+                ),
+                (Some(append), Some(succeeded)) if append < succeeded
+            ),
+            "diagnostics must be appended durably before the successful marker"
         );
         assert!(
             std::process::Command::new("/bin/sh")
