@@ -2,7 +2,7 @@
 
 Priority: P0 foundation
 
-Status: corrected implementation checkpoint `d4d8dc4`; neutrality maintenance review
+Status: corrected implementation checkpoint `0455bf3`; neutrality maintenance review
 pending in `apelogic-ai/steward#82` at `fa921f6`
 
 ## Goal
@@ -70,7 +70,9 @@ made independently in consumers.
 
 - initial checkpoint: `042e8aa`;
 - authority-evidence correction: `d4d8dc4`;
+- v2 status evidence exposure: `0455bf3`;
 - focused contract tests, all Steward type tests, Clippy, formatting, all 27 JSON
-  Schema fixtures, and diff checks: green; and
+  Schema fixtures, status/evidence consistency regressions, and diff checks: green;
+  and
 - full `cargo xtask ci` waits only for isolated neutrality maintenance PR
   `apelogic-ai/steward#82` to merge.
