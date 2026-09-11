@@ -4,8 +4,8 @@ Priority: P0 integration
 
 Status: neutral target-fixture PR `apelogic-ai/gitops#176` merged as `f8ec588`
 (reviewed head `e48300b`); final activation is in review as
-`apelogic-ai/gitops#177` at exact head `5f4bac1`, with full local repository
-validation green and no cluster mutation
+`apelogic-ai/gitops#177` at exact head `5f4bac1`, with full local repository and
+GitHub validation green, a clean merge state, and no cluster mutation
 
 ## Goal
 
