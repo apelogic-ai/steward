@@ -4540,6 +4540,7 @@ mod tests {
             runtime_spec: spec,
             agent_command: Vec::new(),
             execution_binding: None,
+            direct_task_evidence: None,
             envelope_revision: 3,
             orchestration_version: 2,
             orchestration_operation_id: Some(

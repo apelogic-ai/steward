@@ -26,7 +26,9 @@ pub const MAX_PACKAGE_CLOSURE_BYTES: u64 = 16 * 1024 * 1024;
 
 macro_rules! validated_string {
     ($name:ident, $validator:ident) => {
-        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+        #[derive(
+            Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, utoipa::ToSchema,
+        )]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -290,7 +292,7 @@ fn require_unique_paths<'a>(
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DirectTaskSubmission {
     pub contract_version: String,
@@ -307,7 +309,7 @@ impl DirectTaskSubmission {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InvocationManifest {
     pub contract_version: String,
@@ -342,7 +344,7 @@ impl InvocationManifest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PackageReference {
     pub repository: RepositoryUrl,
@@ -350,7 +352,7 @@ pub struct PackageReference {
     pub path: RelativePath,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, utoipa::ToSchema)]
 pub enum PackageCommit {
     Exact(ExactGitCommit),
     Trigger,
@@ -384,7 +386,7 @@ impl<'de> Deserialize<'de> for PackageCommit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionLogMode {
     #[default]
@@ -392,14 +394,14 @@ pub enum ExecutionLogMode {
     Full,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DiagnosticsRequest {
     #[serde(default)]
     pub execution_log: ExecutionLogMode,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DirectTaskStatusResponse {
     pub contract_version: String,
@@ -435,7 +437,7 @@ impl DirectTaskStatusResponse {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum DirectTaskPhase {
     Submitted,
@@ -447,14 +449,14 @@ pub enum DirectTaskPhase {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum DirectRuntimeOwnership {
     Provisioned,
     Adopted,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(
     rename_all = "camelCase",
     rename_all_fields = "camelCase",
@@ -502,7 +504,7 @@ pub enum DirectAdmissionDelta {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DirectTaskDefinition {
     pub schema_version: String,
@@ -546,20 +548,20 @@ impl DirectTaskDefinition {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeSelection {
     pub agent_ref: AgentRef,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputKind {
     Directory,
     File,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeclaredOutput {
     pub path: RelativePath,
@@ -567,7 +569,7 @@ pub struct DeclaredOutput {
     pub required: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InstructionSkill {
     pub schema_version: String,
@@ -591,20 +593,20 @@ impl InstructionSkill {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillKind {
     #[default]
     InstructionOnly,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DirectRequirements {
     pub authority: AuthorityRequirements,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthorityRequirements {
     pub llms: Vec<ModelRequirement>,
@@ -614,14 +616,14 @@ pub struct AuthorityRequirements {
     pub runner: RunnerRequirement,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelRequirement {
     pub provider: Slug,
     pub model: BoundedText,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolRequirement {
     pub provider: Slug,
@@ -629,7 +631,7 @@ pub struct ToolRequirement {
     pub action: BoundedText,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BudgetRequirement {
     pub monthly_limit: Decimal,
@@ -638,7 +640,7 @@ pub struct BudgetRequirement {
     pub currency: Currency,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct Currency(String);
 
@@ -658,7 +660,7 @@ impl<'de> Deserialize<'de> for Currency {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunnerRequirement {
     pub platforms: Vec<RunnerPlatform>,
@@ -670,7 +672,9 @@ pub struct RunnerRequirement {
     pub storage: Option<ResourceQuantity>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RunnerPlatform {
     Linux,
@@ -732,7 +736,7 @@ impl PartialOrd for ToolRequirement {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SourceProvenance {
     pub contract_version: String,
@@ -763,13 +767,13 @@ impl SourceProvenance {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceProvider {
     Github,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TriggerRepository {
     pub id: StableProviderId,
@@ -777,14 +781,14 @@ pub struct TriggerRepository {
     pub name: BoundedText,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowRun {
     pub id: StableProviderId,
     pub attempt: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowIdentity {
     #[serde(rename = "ref")]
@@ -792,7 +796,9 @@ pub struct WorkflowIdentity {
     pub sha: ExactGitCommit,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ClosureEntryKind {
     TaskDefinition,
@@ -802,7 +808,9 @@ pub enum ClosureEntryKind {
     Asset,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClosureEntry {
     pub kind: ClosureEntryKind,
@@ -811,7 +819,7 @@ pub struct ClosureEntry {
     pub size_bytes: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PackageClosure {
     pub contract_version: String,
@@ -882,7 +890,7 @@ impl PackageClosure {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResolvedSource {
     pub repository: RepositoryUrl,
@@ -893,7 +901,7 @@ pub struct ResolvedSource {
     pub content_digest: ContentDigest,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnvelopeEvidence {
     pub uid: Uuid,
@@ -901,7 +909,7 @@ pub struct EnvelopeEvidence {
     pub digest: EnvelopeDigest,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DirectTaskBindingEvidence {
     pub schema_version: String,

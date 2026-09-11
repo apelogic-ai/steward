@@ -378,6 +378,7 @@ pub struct GrantRevocationRequest {
         CreateRuntimeRequest,
         BudgetIncrease,
         TaskSubmissionRequest,
+        TaskCreateRequest,
         TaskStatusResponse,
         TaskAdmissionDelta,
         TaskArchive,
@@ -475,7 +476,7 @@ pub async fn budget_increase_contract() {}
 #[utoipa::path(
     post,
     path = "/v1/tasks",
-    request_body(content = TaskSubmissionRequest, content_type = "application/json"),
+    request_body(content = TaskCreateRequest, content_type = "application/json"),
     params(
         ("Idempotency-Key" = String, Header, description = "Submitter-scoped upstream job identity")
     ),
@@ -3334,6 +3335,7 @@ mod tests {
         };
         let invocation_path = ".steward/tasks/release-summary.json";
         let definition_path = "catalog/release-summary/v1/task-definition.json";
+        let prompt_path = "catalog/release-summary/v1/prompt.md";
         Ok(FakeDirectGit {
             repositories: Arc::new(BTreeMap::from([
                 (caller.as_str().to_owned(), caller_identity),
@@ -3355,6 +3357,14 @@ mod tests {
                         definition_path.to_owned(),
                     ),
                     serde_json::to_vec(&definition).map_err(|error| error.to_string())?,
+                ),
+                (
+                    (
+                        source.as_str().to_owned(),
+                        format!("git:sha1:{}", "a".repeat(40)),
+                        prompt_path.to_owned(),
+                    ),
+                    b"Summarize the supplied repository evidence.\n".to_vec(),
                 ),
             ])),
             wrong_object_path: wrong_object_path.map(str::to_owned),
@@ -4709,6 +4719,23 @@ mod tests {
         let status = document
             .pointer("/components/schemas/TaskStatusResponse")
             .ok_or_else(|| "TaskStatusResponse schema is absent".to_owned())?;
+        assert_eq!(
+            status.pointer("/oneOf/0/$ref"),
+            Some(&serde_json::json!(
+                "#/components/schemas/LegacyTaskStatusResponse"
+            )),
+            "Task status must retain the existing response as one additive union member"
+        );
+        assert_eq!(
+            status.pointer("/oneOf/1/$ref"),
+            Some(&serde_json::json!(
+                "#/components/schemas/DirectTaskStatusResponse"
+            )),
+            "Task status must publish the direct-package response as one additive union member"
+        );
+        let legacy_status = document
+            .pointer("/components/schemas/LegacyTaskStatusResponse")
+            .ok_or_else(|| "legacy Task status schema is absent".to_owned())?;
         for property in [
             "taskUid",
             "runtimeUid",
@@ -4719,8 +4746,21 @@ mod tests {
             "deltas",
         ] {
             assert!(
-                status.pointer(&format!("/properties/{property}")).is_some(),
-                "TaskStatusResponse is missing {property}"
+                legacy_status
+                    .pointer(&format!("/properties/{property}"))
+                    .is_some(),
+                "legacy Task status is missing {property}"
+            );
+        }
+        let direct_status = document
+            .pointer("/components/schemas/DirectTaskStatusResponse")
+            .ok_or_else(|| "direct Task status schema is absent".to_owned())?;
+        for property in ["contractVersion", "taskUid", "diagnostics", "evidence"] {
+            assert!(
+                direct_status
+                    .pointer(&format!("/properties/{property}"))
+                    .is_some(),
+                "direct Task status is missing {property}"
             );
         }
         assert_eq!(
@@ -6479,6 +6519,7 @@ mod tests {
                     runtime_spec: request.runtime_spec.clone(),
                     agent_command: request.agent_command.to_vec(),
                     execution_binding: request.execution_binding.cloned(),
+                    direct_task_evidence: request.direct_task_evidence.cloned(),
                     envelope_revision: request.envelope_revision,
                     orchestration_version: 2,
                     orchestration_operation_id: Some(operation_id),
@@ -9141,10 +9182,12 @@ mod tests {
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
         authorize_direct_source(&ledger)?;
-        let definition = serde_json::from_str(include_str!(
+        let requirements_fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../docs/contracts/task/v2/fixtures/positive/task-definition-with-requires.json"
         ))
         .map_err(|error| format!("checked-in direct TaskDefinition fixture is invalid: {error}"))?;
+        let mut definition = direct_definition_no_skills();
+        definition["requires"] = requirements_fixture["requires"].clone();
         let git = direct_git_fixture(direct_manifest(), definition, None)?;
         let app = direct_test_app(ledger.clone(), git)?;
 
@@ -9176,6 +9219,92 @@ mod tests {
             "git:trigger",
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn direct_package_resolves_closure_and_reserves_exact_evidence() -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills();
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        let git = direct_git_fixture(direct_manifest(), definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "direct-success")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build direct-package request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit direct package: {error}"))?;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read direct-package response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("direct-package response was not JSON: {error}"))?;
+
+        assert_eq!(status, StatusCode::ACCEPTED, "unexpected response: {body}");
+        assert_eq!(
+            body.pointer("/contractVersion")
+                .and_then(|value| value.as_str()),
+            Some("steward.task/v2")
+        );
+        assert_eq!(
+            body.pointer("/evidence/sourceProvenance/repository/id")
+                .and_then(|value| value.as_str()),
+            Some("123456")
+        );
+        assert_eq!(
+            body.pointer("/evidence/package/repositoryId")
+                .and_then(|value| value.as_str()),
+            Some("654321")
+        );
+        assert_eq!(
+            body.pointer("/evidence/closure/entries/0/kind")
+                .and_then(|value| value.as_str()),
+            Some("prompt"),
+            "closure entries must be sorted by exact path"
+        );
+        assert_eq!(
+            body.pointer("/evidence/closure/entries/1/kind")
+                .and_then(|value| value.as_str()),
+            Some("task_definition")
+        );
+        assert_eq!(
+            body.pointer("/diagnostics/executionLog")
+                .and_then(|value| value.as_str()),
+            Some("full")
+        );
+        assert_eq!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .len(),
+            1
+        );
+        assert_eq!(
+            ledger
+                .task_operations
+                .lock()
+                .map_err(|_| "fake task-operation ledger lock was poisoned")?
+                .len(),
+            1
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -10153,6 +10282,7 @@ mod tests {
                 runtime_spec: &spec,
                 agent_command: &workflow.command,
                 execution_binding: None,
+                direct_task_evidence: None,
                 envelope_revision: 3,
                 service_envelope: &service_envelope,
                 service_envelope_digest: &intent_digest,
@@ -10353,6 +10483,7 @@ mod tests {
                 runtime_spec: &spec,
                 agent_command: &workflow.command,
                 execution_binding: None,
+                direct_task_evidence: None,
                 envelope_revision: 3,
                 service_envelope: &service_envelope,
                 service_envelope_digest: &intent_digest,

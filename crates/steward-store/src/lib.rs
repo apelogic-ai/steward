@@ -9,6 +9,7 @@ use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec,
     envelope_is_within, evaluate,
 };
+use steward_types::direct_package::DirectTaskBindingEvidence;
 use steward_types::{
     AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
     OrganizationIdentity, OrganizationIdentityMigration, TaskExecutionBinding,
@@ -2966,12 +2967,13 @@ impl PgStore {
               workflow_name, workflow_version, workflow_digest, \
               user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
               coding_agent_runtime, runtime_uid, runtime_namespace, runtime_name, runtime_ownership, phase, \
-              runtime_spec, agent_command, execution_binding, envelope_revision, orchestration_version, \
+              runtime_spec, agent_command, execution_binding, direct_task_evidence, \
+              envelope_revision, orchestration_version, \
               orchestration_operation_id, \
               candidate_digest, service_envelope_digest, original_admission_decision, \
               original_admission_deltas) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, $12, $13, $14, \
-                     $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, 2, $25, $26, $27, $28, $29) \
+                     $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, 2, $26, $27, $28, $29, $30) \
              ON CONFLICT DO NOTHING",
         )
         .bind(task_uid)
@@ -2997,6 +2999,7 @@ impl PgStore {
         .bind(Json(request.runtime_spec))
         .bind(Json(request.agent_command))
         .bind(request.execution_binding.map(Json))
+        .bind(request.direct_task_evidence.map(Json))
         .bind(request.envelope_revision)
         .bind(operation_id)
         .bind(request.candidate_digest)
@@ -6136,6 +6139,8 @@ pub struct TaskReservationRequest<'a> {
     pub runtime_spec: &'a AgentRuntimeSpec,
     pub agent_command: &'a [String],
     pub execution_binding: Option<&'a TaskExecutionBinding>,
+    /// Immutable direct-package source and authority evidence. Legacy and catalog Tasks omit it.
+    pub direct_task_evidence: Option<&'a DirectTaskBindingEvidence>,
     pub envelope_revision: i64,
     pub service_envelope: &'a Envelope,
     pub service_envelope_digest: &'a str,
@@ -6394,6 +6399,7 @@ fn task_reservation_matches(
         && record.runtime_spec == *request.runtime_spec
         && record.agent_command == request.agent_command
         && record.execution_binding.as_ref() == request.execution_binding
+        && record.direct_task_evidence.as_ref() == request.direct_task_evidence
         && record.envelope_revision == request.envelope_revision
         && record.orchestration_version == 2
         && record.orchestration_operation_id == Some(operation.operation_id)
@@ -6580,6 +6586,23 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
     let complete = |pins: [bool; 3]| {
         pins.iter().all(|present| *present) || pins.iter().all(|present| !*present)
     };
+    let direct_evidence_valid = match request.direct_task_evidence {
+        Some(evidence) => {
+            evidence.validate().is_ok()
+                && evidence.task_uid.as_str() == request.task_uid.to_string()
+                && workflow_pins.iter().all(|present| !*present)
+                && envelope_pins.iter().all(|present| *present)
+                && request.runtime_ownership == steward_types::RuntimeOwnership::Provisioned
+                && i64::try_from(evidence.envelope.revision).ok() == request.user_envelope_revision
+                && evidence.envelope.digest.as_str().strip_prefix("steward:")
+                    == request.user_envelope_digest
+        }
+        None => {
+            complete(workflow_pins)
+                && complete(envelope_pins)
+                && workflow_pins[0] == envelope_pins[0]
+        }
+    };
     if request
         .execution_binding
         .is_some_and(|binding| binding.validate().is_err())
@@ -6600,9 +6623,7 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
                         || request.runtime_uid != Some(resident.runtime_uid.0.as_str())
                 }
             })
-        || !complete(workflow_pins)
-        || !complete(envelope_pins)
-        || workflow_pins[0] != envelope_pins[0]
+        || !direct_evidence_valid
         || request.workflow_version.is_some_and(|version| version <= 0)
         || request
             .user_envelope_revision
@@ -6705,6 +6726,7 @@ mod task_execution_binding_tests {
             runtime_spec: &spec,
             agent_command: &command,
             execution_binding: Some(&binding),
+            direct_task_evidence: None,
             envelope_revision: 1,
             service_envelope: &envelope,
             service_envelope_digest: &digest,
@@ -7123,6 +7145,7 @@ pub struct TaskRecord {
     pub runtime_spec: AgentRuntimeSpec,
     pub agent_command: Vec<String>,
     pub execution_binding: Option<TaskExecutionBinding>,
+    pub direct_task_evidence: Option<DirectTaskBindingEvidence>,
     pub envelope_revision: i64,
     pub orchestration_version: i16,
     pub orchestration_operation_id: Option<Uuid>,
@@ -7859,6 +7882,10 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
             .try_get::<Option<Json<TaskExecutionBinding>>, _>("execution_binding")
             .map_err(database_error)?
             .map(|binding| binding.0),
+        direct_task_evidence: row
+            .try_get::<Option<Json<DirectTaskBindingEvidence>>, _>("direct_task_evidence")
+            .map_err(database_error)?
+            .map(|evidence| evidence.0),
         envelope_revision: row.try_get("envelope_revision").map_err(database_error)?,
         orchestration_version: row
             .try_get("orchestration_version")
