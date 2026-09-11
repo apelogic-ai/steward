@@ -2,8 +2,8 @@
 
 Priority: P0
 
-Status: CI maintenance pending in `apelogic-ai/github-oidc-exchange#32` at `13a89de`;
-provenance implementation remains `#31` at `4f7a685`
+Status: CI maintenance review pending in `apelogic-ai/github-oidc-exchange#32` at
+`13a89de`; provenance implementation remains `#31` at `4f7a685`
 
 ## Goal
 
@@ -65,4 +65,5 @@ GitOps-owned local-main cluster.
   green; and
 - isolated CI maintenance: `apelogic-ai/github-oidc-exchange#32` at `13a89de`
   replaces the timing-out emulated ARM smoke with the same check on the native
-  `ubuntu-24.04-arm` runner without changing release publication.
+  `ubuntu-24.04-arm` runner without changing release publication; its native ARM,
+  unchanged amd64 quality and Trivy, and Kubernetes replay jobs are green.
