@@ -2,7 +2,7 @@
 
 Priority: P0 blocker
 
-Status: review ready in `apelogic-ai/steward-run#32` at `e73f931`
+Status: merged by `apelogic-ai/steward-run#32` as `a7bc15c`
 
 ## Goal
 
@@ -64,12 +64,13 @@ coverage, bump the runner base, or include direct-package behavior changes.
 
 ## Parallel boundary
 
-May proceed independently of DP-C01, DP-I01, DP-G01, DP-S01, and DP-A01. It blocks a
-green DP-R01 CI result. No Kubernetes environment is required.
+Proceeded independently of DP-C01, DP-I01, DP-G01, DP-S01, and DP-A01. It had blocked
+a green DP-R01 CI result. No Kubernetes environment was required.
 
 ## Implementation evidence
 
 - implementation: `apelogic-ai/steward-run#32` at commit `e73f931`;
+- merged commit: `a7bc15c`;
 - final-image package absence, apt consistency, Runner.Listener/linkage, retained
   tools, passwordless runner sudo, and thin-shell absence assertions: green;
 - full repository and Action round-trip gates: green; and

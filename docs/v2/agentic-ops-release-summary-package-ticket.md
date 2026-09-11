@@ -2,7 +2,8 @@
 
 Priority: P0
 
-Status: review ready in `apelogic-ai/agentic-ops#4` at `5a2930e`
+Status: merged by `apelogic-ai/agentic-ops#4` as
+`cca19bc5671d46992037e928f55b1ae18f895730`
 
 ## Goal
 
@@ -68,6 +69,8 @@ running Steward environment until final integration.
   `042e8aa96a66d8927b50dc253509a5d437a5eeec`;
 - implementation: `apelogic-ai/agentic-ops#4` at commit
   `5a2930ee6ab40e8e0a6b1c0e0bbbe46e8b1bb367`;
+- immutable merged source commit:
+  `cca19bc5671d46992037e928f55b1ae18f895730`;
 - closure digest:
   `steward:sha256:79a68a6e3f7a21d37c4da0594555d409999562b3d1778641f743ec0e290118a8`;
   and

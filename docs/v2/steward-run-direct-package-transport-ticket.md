@@ -2,8 +2,8 @@
 
 Priority: P0
 
-Status: code complete in `apelogic-ai/steward-run#31` at `a2b8d77`; blocked by
-the pinned runner base image's unfixed CVE-2026-58016 security finding
+Status: CI pending in `apelogic-ai/steward-run#31` at `79b9f42`; merged DP-R02
+remediation is incorporated and the fresh round-trip is green
 
 ## Goal
 
@@ -52,14 +52,13 @@ for client tests; the real MCP proof belongs to the final P0 integration.
 ## Implementation evidence
 
 - contract checkpoint: Steward DP-C01 commit `042e8aa`;
-- implementation: `apelogic-ai/steward-run#31` at commit `a2b8d77`;
+- implementation: `apelogic-ai/steward-run#31` at commit `79b9f42`;
 - full `npm run check`: green, including 151 tests, typecheck, build, thin-shell
   validation, and checked-in bundle verification; and
 - bundled E2E: green for path-only v2 submission, authenticated transcript replay,
   workflow-command suppression, output handling, and unconditional finalization.
 
-The GitHub round-trip workflow is green. The separate CI vulnerability gate reports
-four affected GLib packages for CVE-2026-58016 in the unchanged, pinned Actions
-runner base image. The scanner reports no fixed package version. This ticket neither
-accepts the finding nor weakens the security policy; remediation remains a separate
-baseline decision tracked by DP-R02.
+The earlier CI vulnerability gate reported four affected GLib packages for
+CVE-2026-58016 in the pinned Actions runner base image. DP-R02 removed that build-only
+package chain without accepting the finding or weakening the policy and is now merged.
+The current DP-R01 head contains that remediation; its fresh image CI is running.
