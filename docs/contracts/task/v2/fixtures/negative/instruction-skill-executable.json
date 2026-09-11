@@ -1,0 +1,7 @@
+{
+  "schemaVersion": "steward.instruction-skill/v1",
+  "name": "repository-inspection",
+  "description": "Inspect repository metadata.",
+  "kind": "executable",
+  "instructions": "instructions.md"
+}

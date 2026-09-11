@@ -3,12 +3,14 @@
 use std::sync::Mutex;
 
 use steward_ports::{
-    DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, GitHostingPlane,
-    InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
-    InferenceRequest, Notification, NotificationSink, PolicySink, PortError, ProvisionedInference,
-    SessionEvent, SessionRelay, StreamGranularity, SvidAssertion, SvidValidationError,
-    ToolCapabilities, ToolPlane, ValidatedWorkload, WorkloadIdentity,
+    DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, GitFile,
+    GitFileRequest, GitHostingPlane, GitRepositoryIdentity, InferenceCapabilities,
+    InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest, Notification,
+    NotificationSink, PolicySink, PortError, ProvisionedInference, SessionEvent, SessionRelay,
+    StreamGranularity, SvidAssertion, SvidValidationError, ToolCapabilities, ToolPlane,
+    ValidatedWorkload, WorkloadIdentity,
 };
+use steward_types::direct_package::{RepositoryUrl, StableProviderId};
 use steward_types::{RuntimeId, SpendSummary};
 
 pub const IMPLEMENTED_PORTS: [&str; 8] = [
@@ -161,7 +163,30 @@ impl PolicySink for FakeAdapter {
 }
 
 impl GitHostingPlane for FakeAdapter {
-    fn create_snapshot(&mut self, runtime: &RuntimeId) -> Result<String, PortError> {
-        Ok(format!("snapshot-{}", runtime.0))
+    async fn resolve_repository(
+        &self,
+        repository: &RepositoryUrl,
+    ) -> Result<GitRepositoryIdentity, PortError> {
+        Ok(GitRepositoryIdentity {
+            repository: repository.clone(),
+            repository_id: StableProviderId::parse("1001")
+                .map_err(|reason| PortError::Failed { reason })?,
+            repository_owner_id: StableProviderId::parse("1000")
+                .map_err(|reason| PortError::Failed { reason })?,
+        })
+    }
+
+    async fn read_file(&self, request: &GitFileRequest) -> Result<GitFile, PortError> {
+        if request.max_bytes == 0 {
+            return Err(PortError::Rejected {
+                reason: "Git file byte bound must be positive".to_owned(),
+            });
+        }
+        Ok(GitFile {
+            repository: request.repository.clone(),
+            commit: request.commit.clone(),
+            path: request.path.clone(),
+            bytes: Vec::new(),
+        })
     }
 }

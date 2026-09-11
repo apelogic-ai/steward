@@ -18,7 +18,8 @@ Git source, Steward, runner, and package implementations proceed independently.
 - direct instruction-skill schema in which omitted kind means `instruction_only`;
 - deterministic package-closure digest rules;
 - verified source-provenance input shape;
-- immutable Task source/effective-authority evidence shape; and
+- immutable Task source/effective-authority evidence shape;
+- public v2 Task status carrying that immutable evidence; and
 - successful-run stdout/stderr transcript filenames and limits.
 
 The frozen `steward.m1/v1` schemas are inputs for compatibility tests only and are not
@@ -31,10 +32,11 @@ modified.
 - Envelope values are `steward:sha256:<64-hex>`;
 - omitted or empty skills means no skills;
 - instruction-only is the default and only initial skill kind;
-- omitted `requires` expands to the selected Envelope's full approved values;
+- omitted `requires` expands to the selected Envelope's full approved authority
+  values, including explicit null optional maxima;
 - present `requires` is a complete narrower authority request;
-- nullable approved maxima remain explicit `null` in expanded evidence rather than
-  being omitted or invented;
+- execution behavior comes only from the immutable deployment-owned `runtime.agentRef`
+  binding; packages cannot declare unverified execution capabilities;
 - omitted diagnostics means no caller-visible execution log; and
 - `diagnostics.executionLog: full` requests successful stdout/stderr replay.
 
@@ -65,22 +67,26 @@ This ticket lands first. The four independent implementation lanes may start fro
 reviewed contract commit. Wire-compatible corrections are coordinated here rather than
 made independently in consumers.
 
+## Implementation record
+
+- [x] additive Rust wire types and strict semantic validation;
+- [x] authoritative JSON Schema and positive, negative, and v1 compatibility fixtures;
+- [x] signed `source_provenance` exchange-JWT claim and authenticated v2 diagnostics
+  response projection;
+- [x] deterministic closure canonicalization and digest vector;
+- [x] effective authority evidence preserves nullable Envelope maxima and rejects
+  package-authored execution capabilities without a verifiable authority source;
+- [x] reserved successful-run transcript paths and bounds;
+- [x] repository gate and reviewed contract commit; and
+- [x] downstream lane synchronization against the exact commit.
+
 ## Implementation evidence
 
-- initial checkpoint: `042e8aa`;
-- authority-evidence correction: `d4d8dc4`;
-- v2 status evidence exposure: `0455bf3`;
-- rebased post-maintenance head: `320b79f`;
-- evidence-binding and repository-gated contract correction: `103919e`;
+- reviewed implementation head: `103919e`;
 - merged source: `ba4c062`;
-- focused contract tests, all Steward type tests, Clippy, formatting, all 27 JSON
-  Schema fixtures, status/evidence consistency regressions, and diff checks: green;
-  and
-- full `cargo xtask ci`, pinned conformance, and the pre-push full quality gate are
-  green after isolated neutrality maintenance PR `apelogic-ai/steward#82` merged as
-  `cc19487`.
+- all 27 JSON Schema fixtures, Rust/schema parity, frozen-v1 byte identity, closure
+  digest and source-binding integrity regressions: green; and
+- full `cargo xtask ci`, pinned conformance, and the pre-push full quality gate: green.
 
-The correction binds invocation identity to signed provenance, package metadata to the
-closure entry, and the claimed closure digest to recomputed canonical bytes. It also
-aligns Rust and JSON Schema validation, proves frozen-v1 byte identity, and makes the
-manifest-driven fixture matrix part of normal repository tests.
+The final correction binds invocation identity to signed provenance, package metadata
+to the closure entry, and the claimed closure digest to recomputed canonical bytes.

@@ -1560,15 +1560,14 @@ pub fn neutrality_violations(content: &str) -> Vec<String> {
     let mut violations = Vec::new();
 
     for region in text_regions(content) {
-        for token in region.split(|character: char| {
-            !character.is_ascii_alphanumeric() && !matches!(character, '@' | '.' | ':' | '-' | '_')
-        }) {
+        for (start, end, token) in identifier_tokens(&region) {
             if token.is_empty() {
                 continue;
             }
 
             if token.contains('@') {
-                if !is_reserved_email(token)
+                if !is_github_workflow_ref_component(&region, start, end, token)
+                    && !is_reserved_email(token)
                     && !is_technical_package_scope(token)
                     && !is_versioned_technical_identifier(token)
                 {
@@ -1593,6 +1592,7 @@ pub fn neutrality_violations(content: &str) -> Vec<String> {
 
             if looks_like_hostname(token)
                 && !is_allowed_filename(token)
+                && !is_repository_path_component(&region, start, end, token)
                 && !is_steward_schema_identifier(token)
                 && !is_reserved_hostname(token)
             {
@@ -1602,6 +1602,30 @@ pub fn neutrality_violations(content: &str) -> Vec<String> {
     }
 
     violations
+}
+
+fn identifier_tokens(region: &str) -> Vec<(usize, usize, &str)> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+
+    for (index, character) in region.char_indices() {
+        let is_token_character =
+            character.is_ascii_alphanumeric() || matches!(character, '@' | '.' | ':' | '-' | '_');
+        match (start, is_token_character) {
+            (None, true) => start = Some(index),
+            (Some(token_start), false) => {
+                tokens.push((token_start, index, &region[token_start..index]));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(token_start) = start {
+        tokens.push((token_start, region.len(), &region[token_start..]));
+    }
+
+    tokens
 }
 
 pub fn secret_violations(path: &Path, content: &[u8]) -> Vec<usize> {
@@ -2049,7 +2073,16 @@ fn is_versioned_technical_identifier(token: &str) -> bool {
 }
 
 fn is_steward_schema_identifier(token: &str) -> bool {
-    token == "steward.workflows"
+    matches!(
+        token,
+        "steward.contracts"
+            | "steward.instruction-skill"
+            | "steward.package-closure"
+            | "steward.source-provenance"
+            | "steward.task"
+            | "steward.task-definition"
+            | "steward.workflows"
+    )
 }
 
 fn is_globally_routable(address: IpAddr) -> bool {
@@ -2123,10 +2156,9 @@ fn looks_like_hostname(token: &str) -> bool {
         })
 }
 
-// Dotted tokens are ambiguous even when they appear inside paths because the
-// neutrality tokenizer deliberately discards path context. Keep this list exact
-// and security-biased; add a narrowly reviewed entry when a fixture must name
-// another file so unknown hostname-shaped tokens continue to fail closed.
+// Bare dotted tokens remain ambiguous, so keep this list exact and
+// security-biased. Repository paths are classified separately with their slash
+// context intact.
 fn is_allowed_filename(token: &str) -> bool {
     matches!(
         token.to_ascii_lowercase().as_str(),
@@ -2139,13 +2171,48 @@ fn is_allowed_filename(token: &str) -> bool {
             | "favicon.ico"
             | "fixture.txt"
             | "icon.svg"
+            | "instructions.md"
             | "jwks.json"
             | "lib.rs"
             | "license.md"
             | "main.rs"
             | "main.txt"
             | "mod.rs"
+            | "prompt.md"
+            | "report.md"
             | "readme.md"
+    )
+}
+
+fn is_github_workflow_ref_component(region: &str, start: usize, end: usize, token: &str) -> bool {
+    let Some((workflow, marker)) = token.rsplit_once('@') else {
+        return false;
+    };
+    marker == "refs"
+        && region[..start].ends_with("/.github/workflows/")
+        && (region[end..].starts_with("/heads/") || region[end..].starts_with("/tags/"))
+        && matches!(
+            workflow
+                .rsplit_once('.')
+                .map(|(_name, extension)| extension),
+            Some("yaml" | "yml")
+        )
+}
+
+fn is_repository_path_component(region: &str, start: usize, end: usize, token: &str) -> bool {
+    if region[..start].ends_with("//") {
+        return false;
+    }
+
+    let follows_separator = region[..start].ends_with('/');
+    let precedes_separator = region[end..].starts_with('/');
+    if !follows_separator && !precedes_separator {
+        return false;
+    }
+
+    matches!(
+        token.rsplit_once('.').map(|(_name, extension)| extension),
+        Some("git" | "json" | "log" | "md" | "toml" | "txt" | "yaml" | "yml")
     )
 }
 
@@ -2519,6 +2586,55 @@ mod tests {
         assert!(
             violations.is_empty(),
             "routine filename literals are not hostnames: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn neutrality_allows_direct_package_schema_and_path_literals() {
+        let violations = neutrality_violations(
+            r#""steward.task/v2"
+               "steward.task-definition/v2"
+               "steward.instruction-skill/v1"
+               "steward.source-provenance/v1"
+               "steward.package-closure/v1"
+               "https://github.com/example-org/agentic-ops.git"
+               "catalog/release-summary/v1/task-definition.json"
+               "prompt.md"
+               "instructions.md"
+               "report.md"
+               "example-org/caller/.github/workflows/review.yml@refs/heads/main"
+               "example-org/steward-run/.github/workflows/steward-task.yml@refs/tags/v1.0.0"
+               ".steward/diagnostics/stdout.log"
+               ".steward/diagnostics/stderr.log""#,
+        );
+
+        assert!(
+            violations.is_empty(),
+            "schema identifiers and repository path components are not hostnames: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn neutrality_still_rejects_hosts_in_bare_url_and_path_like_contexts() {
+        let bare_host = ["service", "md"].join(".");
+        let url_host = ["api", "json"].join(".");
+        let path_like_host = ["fixtures", "tenant.corp.invalid"].join("/");
+        let spoofed_workflow_email = ["review.yml", "corp.invalid"].join("@");
+        let spoofed_workflow_ref =
+            format!("example-org/caller/.github/workflows/{spoofed_workflow_email}/path");
+        let violations = neutrality_violations(&format!(
+            "\"{bare_host}\" \"https://{url_host}/v1\" \"{path_like_host}\" \"{spoofed_workflow_ref}\""
+        ));
+
+        assert_eq!(
+            violations,
+            vec![
+                format!("non-reserved hostname: {bare_host}"),
+                format!("non-reserved hostname: {url_host}"),
+                "non-reserved hostname: tenant.corp.invalid".to_owned(),
+                format!("non-reserved email: {spoofed_workflow_email}"),
+            ],
+            "path recognition must not weaken rejection of non-reserved hosts"
         );
     }
 

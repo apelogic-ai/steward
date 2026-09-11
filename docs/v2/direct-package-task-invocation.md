@@ -146,10 +146,17 @@ wire schemas are owned by the contract ticket, but these semantics are fixed:
 - a future executable-skill kind requires a new schema version plus explicit runtime
   capability and Envelope permission;
 - existing instruction-only packages must never become executable implicitly;
-- `requires` omitted means use the selected Envelope's complete approved values;
+- `requires` omitted means use the selected Envelope's complete approved authority
+  values;
 - `requires` present is a complete, explicit request that must be no broader than the
   selected Envelope; and
 - Steward records the fully expanded effective requirements in Task evidence.
+
+The v2 package cannot request `shell`, `python3`, or another execution capability.
+`runtime.agentRef` selects the immutable deployment-owned execution binding, while
+the current Envelope and binding contracts expose no independently verifiable
+execution-capability authority. Adding capability requests requires a new schema and
+authority source; package content cannot invent one.
 
 The initial missing-`requires` behavior favors authoring simplicity over least
 privilege. Operators should therefore select a deliberately bounded Envelope.
@@ -157,7 +164,9 @@ privilege. Operators should therefore select a deliberately bounded Envelope.
 Steward computes a deterministic digest over the resolved package closure and records
 the repository identity, exact commit, entry path, dependency identities and digest,
 Envelope digest, effective requirements, source provenance, and Task/runtime
-identities. The human-facing reference remains repository, commit, and path.
+identities. The v2 Task status returns that immutable source-authority evidence and
+fails validation if its Task UID or diagnostics disagree with the surrounding status.
+The human-facing reference remains repository, commit, and path.
 
 ## Admission and execution
 

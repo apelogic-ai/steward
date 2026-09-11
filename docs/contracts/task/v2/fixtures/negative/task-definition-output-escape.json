@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "steward.task-definition/v2",
+  "name": "release-summary",
+  "version": 1,
+  "runtime": {
+    "agentRef": "example-agent@1.2.3"
+  },
+  "prompt": "prompt.md",
+  "outputs": [
+    { "path": "report.md", "kind": "file", "required": true }
+  ]
+}

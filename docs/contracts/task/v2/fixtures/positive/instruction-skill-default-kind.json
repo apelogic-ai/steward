@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "steward.instruction-skill/v1",
+  "name": "repository-inspection",
+  "description": "Inspect repository metadata and report observed facts.",
+  "instructions": "instructions.md",
+  "assets": [
+    "references/checklist.md"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "contractVersion": "steward.source-provenance/v1",
+  "provider": "github",
+  "repository": {
+    "id": "123456",
+    "ownerId": "7890",
+    "name": "example-org/caller"
+  },
+  "triggeredSha": "git:sha1:cccccccccccccccccccccccccccccccccccccccc",
+  "run": { "id": "900001", "attempt": 1 },
+  "event": "workflow_dispatch",
+  "ref": "refs/heads/main",
+  "actorId": "24680",
+  "actor": "alice",
+  "callerWorkflow": {
+    "ref": "example-org/caller/.github/workflows/review.yml@refs/heads/main",
+    "sha": "git:sha1:dddddddddddddddddddddddddddddddddddddddd"
+  },
+  "reusableWorkflow": {
+    "ref": "example-org/steward-run/.github/workflows/steward-task.yml@refs/tags/v1.0.0",
+    "sha": "git:sha1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "oidcToken": "not-a-real-token"
+}

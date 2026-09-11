@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "steward.task-definition/v2",
+  "name": "release-summary",
+  "version": 1,
+  "runtime": {
+    "agentRef": "example-agent@1.2.3"
+  },
+  "prompt": "prompt.md",
+  "skills": ["skills/review.json", "skills/review.json"],
+  "outputs": [
+    { "path": "out", "kind": "directory", "required": true }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "contractVersion": "steward.package-closure/v1",
+  "entryPoint": "catalog/release-summary/v1/task-definition.json",
+  "entries": [
+    {
+      "kind": "prompt",
+      "path": "catalog/release-summary/v1/prompt.md",
+      "digest": "steward:sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "sizeBytes": 1200
+    },
+    {
+      "kind": "task_definition",
+      "path": "catalog/release-summary/v1/task-definition.json",
+      "digest": "steward:sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "sizeBytes": 301
+    }
+  ]
+}
