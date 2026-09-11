@@ -17,10 +17,10 @@ contracts remain authoritative; this record does not relax their exit criteria.
 | DP-I01 | `github-oidc-exchange` | merged | PR `#31` merged as `f2e33ae`; provenance, amd64 quality/Trivy, native ARM, and Kubernetes replay were green. |
 | DP-G01 | `apelogic-ai/steward` | red checkpoint | Approved port and dependency boundary compiles; first uninstalled-App negative executes and is red against the provisional stub. |
 | DP-S01 | `apelogic-ai/steward` | red checkpoint | Five pre-reservation escape tests are retained locally at `bf53e91`; implementation depends on DP-G01 and DP-I01. |
-| DP-R01 | `apelogic-ai/steward-run` | CI | Pin-correction PR `#33` at `2cbfe5f` targets merged transport `fd090be`; local repository and production-audit gates are green. |
+| DP-R01 | `apelogic-ai/steward-run` | review | Pin-correction PR `#33` at `2cbfe5f` is repository- and Action-round-trip-green. |
 | DP-R02 | `apelogic-ai/steward-run` | merged | PR `apelogic-ai/steward-run#32` merged as `a7bc15c`; live scan reported zero critical and zero accepted findings. |
 | DP-A01 | `apelogic-ai/agentic-ops` | merged | PR `apelogic-ai/agentic-ops#4` merged as `cca19bc`; package validation is green. |
-| DP-O01 | `apelogic-ai/gitops` | waiting | Preparation follows reviewed releases; GitOps alone operates local-main. |
+| DP-O01 | `apelogic-ai/gitops` | readiness audited | Repository/configuration seams are mapped; preparation may start without local-main while final names and reviewed commits land. |
 | DP-P01 | `apelogic-ai/steward` | post-P0 | Optional catalog publication and release provenance. |
 | DP-T01 | `apelogic-ai/steward` | post-P0 | Multiple-package/workflow and stable-lane conformance. |
 | DP-D01 | `apelogic-ai/steward` | post-P0 | Durable failed, cancelled, and rejected Task diagnostics. |
@@ -37,7 +37,7 @@ or mutable environment state.
 | DP-I01 | DP-S01, DP-O01 | merged source `f2e33ae`, implementation/integrated head `1f9fe99`, contract checkpoint `042e8aa`; native-ARM maintenance merged as `6d4c106` | ready for immutable deployment pin |
 | DP-G01 | DP-S01, DP-O01 | reviewed Git source adapter release/configuration contract | pending |
 | DP-R02 | DP-R01 | merged commit `a7bc15c`, implementation `e73f931`, green live scan | incorporated in `79b9f42` |
-| DP-R01 | DP-O01 | merged source `fd090be`, implementation `79b9f42`, pin-correction PR `#33` at `2cbfe5f`, contract checkpoint `042e8aa` | CI and review pending |
+| DP-R01 | DP-O01 | merged source `fd090be`, implementation `79b9f42`, fully green pin-correction PR `#33` at `2cbfe5f`, contract checkpoint `042e8aa` | review pending |
 | DP-A01 | DP-O01 | merged source commit `cca19bc`, closure `steward:sha256:79a68a6e3f7a21d37c4da0594555d409999562b3d1778641f743ec0e290118a8` | ready for caller pin after DP-C01 is published |
 | DP-S01 | DP-O01 | reviewed Steward release and E2E verifier | pending |
 | DP-O01 | DP-P00 | local-main preflight and final demo evidence | pending |

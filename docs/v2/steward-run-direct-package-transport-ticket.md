@@ -78,4 +78,5 @@ for DP-O01. No mutable ref is an acceptable substitute.
 
 The focused red proof rejected the legacy-only nested action pin. At correction commit
 `2cbfe5f`, all 152 repository tests, build, thin-shell, checked-in distribution, and
-production dependency audit are green; GitHub CI and Action round-trip remain pending.
+production dependency audit are green. GitHub CI and the complete seed, governed, and
+verification Action round-trip are also green; human review remains pending.
