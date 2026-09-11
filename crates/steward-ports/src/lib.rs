@@ -3,7 +3,7 @@
 use std::future::Future;
 
 use steward_types::direct_package::{
-    ExactGitCommit, RelativePath, RepositoryUrl, StableProviderId,
+    DiagnosticsRequest, ExactGitCommit, RelativePath, RepositoryUrl, StableProviderId,
 };
 use steward_types::{
     AgentType, Budget, DisposableExecutionBinding, ModelRef, RuntimeId, RuntimeRefs, SpendSummary,
@@ -213,6 +213,9 @@ pub struct SandboxTaskRequest {
     /// The controller reads this only from the persisted runtime spec; callers cannot choose it.
     pub agent_type: AgentType,
     pub command: Vec<String>,
+    /// Immutable caller-visible diagnostics selected by the admitted direct package.
+    /// Legacy tasks and provider-control operations always carry the default disabled value.
+    pub diagnostics: DiagnosticsRequest,
     /// The exact deployment binding persisted when the Task was reserved.
     pub execution_binding: Option<DisposableExecutionBinding>,
 }

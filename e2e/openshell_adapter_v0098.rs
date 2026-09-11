@@ -12,6 +12,10 @@ use steward_ports::{
     SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
     SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
 };
+use steward_types::direct_package::{
+    DiagnosticsRequest, EXECUTION_STDERR_ARCHIVE_PATH, EXECUTION_STDOUT_ARCHIVE_PATH,
+    ExecutionLogMode,
+};
 use steward_types::{AgentType, RuntimeId, RuntimeRefs};
 use tokio::time::sleep;
 
@@ -114,6 +118,13 @@ fn output_payload(run_dir: &Path, archive: &[u8]) -> Result<Vec<u8>, String> {
             .arg(&output_root),
         "output archive extraction",
     )?;
+    let stdout = fs::read(output_root.join(EXECUTION_STDOUT_ARCHIVE_PATH))
+        .map_err(|error| format!("bounded stdout diagnostic is missing: {error}"))?;
+    let stderr = fs::read(output_root.join(EXECUTION_STDERR_ARCHIVE_PATH))
+        .map_err(|error| format!("bounded stderr diagnostic is missing: {error}"))?;
+    if stdout != b"task-stdout" || stderr != b"task-stderr" {
+        return Err("successful execution diagnostics did not preserve both streams".to_owned());
+    }
     fs::read(output_root.join("out/payload.bin"))
         .map_err(|error| format!("declared output out/payload.bin is missing: {error}"))
 }
@@ -219,6 +230,7 @@ async fn verify_attempt_failure_semantics(
         execution_class: SandboxExecutionClass::Agent,
         agent_type: sandbox.agent_type.clone(),
         command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()],
+        diagnostics: Default::default(),
         execution_binding: None,
     };
     let attempt = TaskAttemptId("00000000-0000-4000-8000-000000000002".to_owned());
@@ -381,8 +393,11 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
                 command: vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "set -eu; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; cp in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"".to_owned(),
+                    "set -eu; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; cp in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"; printf task-stdout; printf task-stderr >&2".to_owned(),
                 ],
+                diagnostics: DiagnosticsRequest {
+                    execution_log: ExecutionLogMode::Full,
+                },
                 execution_binding: None,
             },
             &input_archive,
