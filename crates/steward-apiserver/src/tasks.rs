@@ -1288,7 +1288,7 @@ pub struct LegacyTaskStatusResponse {
 #[serde(untagged)]
 pub enum TaskStatusResponse {
     Existing(LegacyTaskStatusResponse),
-    Direct(DirectTaskStatusResponse),
+    Direct(Box<DirectTaskStatusResponse>),
 }
 
 /// Machine-readable shape of an admission delta returned in Task status.
@@ -3026,7 +3026,7 @@ async fn status_response<L: TaskSubmissionLedger>(
         response
             .validate()
             .map_err(ApiError::TaskRuntimeContractUnavailable)?;
-        Ok(TaskStatusResponse::Direct(response))
+        Ok(TaskStatusResponse::Direct(Box::new(response)))
     } else {
         Ok(TaskStatusResponse::Existing(LegacyTaskStatusResponse {
             task_uid: record.task_uid,

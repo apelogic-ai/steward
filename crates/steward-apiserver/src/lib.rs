@@ -3373,18 +3373,18 @@ mod tests {
         })
     }
 
-    fn direct_manifest() -> serde_json::Value {
+    fn direct_manifest() -> Result<serde_json::Value, String> {
         serde_json::from_str(include_str!(
             "../../../docs/contracts/task/v2/fixtures/positive/invocation-manifest.json"
         ))
-        .expect("checked-in direct manifest fixture must remain valid JSON")
+        .map_err(|error| format!("checked-in direct manifest fixture is invalid: {error}"))
     }
 
-    fn direct_definition_no_skills() -> serde_json::Value {
+    fn direct_definition_no_skills() -> Result<serde_json::Value, String> {
         serde_json::from_str(include_str!(
             "../../../docs/contracts/task/v2/fixtures/positive/task-definition-no-skills.json"
         ))
-        .expect("checked-in direct TaskDefinition fixture must remain valid JSON")
+        .map_err(|error| format!("checked-in direct TaskDefinition fixture is invalid: {error}"))
     }
 
     fn authorize_direct_source(ledger: &FakeLedger) -> Result<(), String> {
@@ -4898,6 +4898,8 @@ mod tests {
         requests: Arc<AtomicUsize>,
     }
 
+    type SourceRepositoryBindings = Arc<Mutex<Vec<(String, String, String, String)>>>;
+
     #[derive(Clone)]
     struct ApprovalDuringDecisionFiling {
         application_slot: Arc<Mutex<Option<GrantReversion>>>,
@@ -5487,7 +5489,7 @@ mod tests {
         agent_runs: Arc<Mutex<Vec<AgentRunRecord>>>,
         agent_run_events: AgentRunEvents,
         service_envelope_authors: Arc<Mutex<Vec<(String, String)>>>,
-        source_repository_bindings: Arc<Mutex<Vec<(String, String, String, String)>>>,
+        source_repository_bindings: SourceRepositoryBindings,
     }
 
     #[derive(Clone)]
@@ -9122,9 +9124,9 @@ mod tests {
     async fn configured_stable_repository_binding_authorizes_cross_repository_source()
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
-        let mut definition = direct_definition_no_skills();
+        let mut definition = direct_definition_no_skills()?;
         definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
-        let git = direct_git_fixture(direct_manifest(), definition, None)?;
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
         let config = task_api_config()?
             .with_git_hosting_plane(git)
             .with_source_repository_bindings_json(Some(&direct_source_bindings_json("654321")))?;
@@ -9169,7 +9171,7 @@ mod tests {
     async fn configured_repository_binding_rejects_a_different_stable_source_identity()
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
-        let git = direct_git_fixture(direct_manifest(), direct_definition_no_skills(), None)?;
+        let git = direct_git_fixture(direct_manifest()?, direct_definition_no_skills()?, None)?;
         let config = task_api_config()?
             .with_git_hosting_plane(git)
             .with_source_repository_bindings_json(Some(&direct_source_bindings_json("654322")))?;
@@ -9194,7 +9196,7 @@ mod tests {
     async fn direct_package_rejects_unauthorized_source_before_read_or_reservation()
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
-        let git = direct_git_fixture(direct_manifest(), direct_definition_no_skills(), None)?;
+        let git = direct_git_fixture(direct_manifest()?, direct_definition_no_skills()?, None)?;
         let reads = git.reads.clone();
         let app = direct_test_app(ledger.clone(), git)?;
 
@@ -9222,8 +9224,8 @@ mod tests {
     {
         let ledger = versioned_task_ledger()?;
         let git = direct_git_fixture(
-            direct_manifest(),
-            direct_definition_no_skills(),
+            direct_manifest()?,
+            direct_definition_no_skills()?,
             Some(".steward/tasks/release-summary.json"),
         )?;
         let app = direct_test_app(ledger.clone(), git)?;
@@ -9248,7 +9250,7 @@ mod tests {
             .lock()
             .map_err(|_| "fake User Envelope ledger lock was poisoned")?
             .clear();
-        let git = direct_git_fixture(direct_manifest(), direct_definition_no_skills(), None)?;
+        let git = direct_git_fixture(direct_manifest()?, direct_definition_no_skills()?, None)?;
         let app = direct_test_app(ledger.clone(), git)?;
 
         assert_direct_rejection_before_reservation(
@@ -9270,9 +9272,9 @@ mod tests {
             "../../../docs/contracts/task/v2/fixtures/positive/task-definition-with-requires.json"
         ))
         .map_err(|error| format!("checked-in direct TaskDefinition fixture is invalid: {error}"))?;
-        let mut definition = direct_definition_no_skills();
+        let mut definition = direct_definition_no_skills()?;
         definition["requires"] = requirements_fixture["requires"].clone();
-        let git = direct_git_fixture(direct_manifest(), definition, None)?;
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
         let app = direct_test_app(ledger.clone(), git)?;
 
         assert_direct_rejection_before_reservation(
@@ -9290,9 +9292,9 @@ mod tests {
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
         authorize_direct_source(&ledger)?;
-        let mut manifest = direct_manifest();
+        let mut manifest = direct_manifest()?;
         manifest["package"]["commit"] = serde_json::json!("git:trigger");
-        let git = direct_git_fixture(manifest, direct_definition_no_skills(), None)?;
+        let git = direct_git_fixture(manifest, direct_definition_no_skills()?, None)?;
         let app = direct_test_app(ledger.clone(), git)?;
 
         assert_direct_rejection_before_reservation(
@@ -9309,9 +9311,9 @@ mod tests {
     async fn direct_package_resolves_closure_and_reserves_exact_evidence() -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
         authorize_direct_source(&ledger)?;
-        let mut definition = direct_definition_no_skills();
+        let mut definition = direct_definition_no_skills()?;
         definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
-        let git = direct_git_fixture(direct_manifest(), definition, None)?;
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
         let app = direct_test_app(ledger.clone(), git)?;
 
         let response = app
