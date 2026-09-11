@@ -16,7 +16,7 @@ contracts remain authoritative; this record does not relax their exit criteria.
 | DP-C01 | `apelogic-ai/steward` | merged | PR `#83` merged as `ba4c062`; reviewed implementation head `103919e` was full-gate green. |
 | DP-I01 | `github-oidc-exchange` | merged | PR `#31` merged as `f2e33ae`; provenance, amd64 quality/Trivy, native ARM, and Kubernetes replay were green. |
 | DP-G01 | `apelogic-ai/steward` | merged | PR `#84` merged as `8c2ca03`; reviewed head `b93d611` was focused-, full-gate-, conformance-, and pre-push-green. |
-| DP-S01 | `apelogic-ai/steward` | ready to publish | Clean local head `99c5e0b` is full-gate-, Postgres-, and OpenShell-E2E-green; branch publication waits only for the permitted SSH hardware-key retry. Broader adversarial coverage is recorded as post-demo debt. |
+| DP-S01 | `apelogic-ai/steward` | review | Non-draft PR `#85` at exact head `99c5e0b` is full-gate-, Postgres-, and OpenShell-E2E-green. Broader adversarial coverage is recorded as post-demo debt. |
 | DP-R01 | `apelogic-ai/steward-run` | merged | Pin-correction PR `#33` merged as `139221e`; repository and complete Action round-trip were green. |
 | DP-R02 | `apelogic-ai/steward-run` | merged | PR `apelogic-ai/steward-run#32` merged as `a7bc15c`; live scan reported zero critical and zero accepted findings. |
 | DP-A01 | `apelogic-ai/agentic-ops` | merged | PR `apelogic-ai/agentic-ops#4` merged as `cca19bc`; package validation is green. |
@@ -39,7 +39,7 @@ or mutable environment state.
 | DP-R02 | DP-R01 | merged commit `a7bc15c`, implementation `e73f931`, green live scan | incorporated in `79b9f42` |
 | DP-R01 | DP-O01 | usable reusable-workflow pin `139221e`, nested action pin `fd090be`, implementation `79b9f42`, contract checkpoint `042e8aa` | ready for caller pin |
 | DP-A01 | DP-O01 | merged source commit `cca19bc`, closure `steward:sha256:79a68a6e3f7a21d37c4da0594555d409999562b3d1778641f743ec0e290118a8` | ready for caller pin |
-| DP-S01 | DP-O01 | local candidate `99c5e0b`; full gate, 5/5 real-Postgres regressions, and authenticated OpenShell transcript E2E green with cleanup verified | review pending |
+| DP-S01 | DP-O01 | PR `apelogic-ai/steward#85`, exact head `99c5e0b`; full gate, 5/5 real-Postgres regressions, and authenticated OpenShell transcript E2E green with cleanup verified | review pending |
 | DP-O01 fixture | DP-O01 activation | merged GitOps source `f8ec588`, reviewed implementation head `e48300b` | complete |
 | DP-O01 | DP-P00 | local-main preflight and final demo evidence | pending |
 

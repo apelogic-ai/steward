@@ -2,9 +2,8 @@
 
 Priority: P0
 
-Status: implementation complete locally at `99c5e0b` on merged G01 `8c2ca03`; all
-required gates are green and branch publication waits on the permitted SSH
-hardware-key retry
+Status: review pending in `apelogic-ai/steward#85` at exact head `99c5e0b` on merged
+G01 `8c2ca03`; all required gates are green
 
 ## Goal
 
@@ -77,8 +76,8 @@ Coordinate final integration with DP-I01 and DP-R01; serialize heavy integration
   cluster, containers, networks, state, kubeconfig, and processes were verified
   absent afterward; local-main and stable were untouched.
 
-This candidate is intentionally not pushed until the single rule-governed SSH
-hardware-key retry can complete the final fetch and ancestry check.
+The implementation is published as non-draft PR `apelogic-ai/steward#85`; it remains
+unmerged pending maintainer review.
 
 ## Implementation-readiness audit
 
