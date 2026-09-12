@@ -95,7 +95,9 @@ config:
       bindings: []
     # Exact OpenAI-compatible Responses API endpoint rendered by the Codex adapter.
     inferenceEndpoint: http://litellm-litellm.litellm.svc.cluster.local:4000/v1
-    # Exact streamable HTTP endpoint rendered only into tool-bearing Codex task plans.
+    # Exact Anthropic-compatible API base URL rendered by the Claude Code adapter.
+    anthropicInferenceEndpoint: http://litellm-litellm.litellm.svc.cluster.local:4000
+    # Exact streamable HTTP endpoint rendered only into tool-bearing Task plans.
     # Empty keeps tool-less tasks available and makes tool-bearing submission fail closed.
     mcpGatewayEndpoint: ""
   controller:

@@ -63,8 +63,9 @@ The architecture is implemented by these internal boundaries:
 - cleanup atomically retires pending approval delivery, pending approvals, and active
   grants before it records Task-owned projections absent; and
 - `TaskExecutionAdapter` keeps agent-specific command generation out of core. The
-  Codex implementation lives in `adapters/codex`, while deployment-selected images,
-  executables, versions, profiles, and network endpoints remain configuration.
+  Codex and Claude Code implementations live in their respective `adapters/` crates,
+  while deployment-selected images, executables, versions, profiles, and network
+  endpoints remain configuration.
 
 The focused Postgres and fake-Kubernetes fault suite covers concurrent reconcilers,
 ambiguous create and execution results, UID replacement, authority revision and
@@ -322,6 +323,11 @@ configuration rendering belong to that adapter. Core Task code must not contain 
 Codex command, `CODEX_HOME`, a LiteLLM cluster URL, npm package path, provider-profile
 name, or fallback agent/version. Supporting a new deployment instance is catalog data;
 supporting a new execution protocol is an explicit new adapter contract.
+
+The `claude-code-v1` contract additionally requires a non-root sandbox process. Its unattended
+permission mode rejects UID 0, so the adapter checks the effective UID before probing or launching
+Claude Code, and compatible image conformance must prove the configured entrypoint remains
+non-root under OpenShell.
 
 An empty or missing catalog advertises no logical agents and rejects new Task
 reservation before intent is written. Historical Tasks continue only from their

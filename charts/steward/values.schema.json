@@ -296,6 +296,7 @@
             "executionBindingsMode",
             "executionBindings",
             "inferenceEndpoint",
+            "anthropicInferenceEndpoint",
             "mcpGatewayEndpoint"
           ],
           "properties": {
@@ -310,6 +311,7 @@
             "taskWorkflowsJson": {"type": "string", "pattern": "^\\s*\\[", "minLength": 2},
             "executionBindingsMode": {"type": "string", "enum": ["staged", "active"]},
             "inferenceEndpoint": {"type": "string", "pattern": "^https?://", "minLength": 10},
+            "anthropicInferenceEndpoint": {"type": "string", "pattern": "^https?://", "minLength": 10},
             "executionBindings": {
               "type": "object",
               "additionalProperties": false,
@@ -343,7 +345,7 @@
                         "maxLength": 200,
                         "pattern": "^[^\\s\\x00-\\x1F\\x7F](?:[^\\x00-\\x1F\\x7F]*[^\\s\\x00-\\x1F\\x7F])?$"
                       },
-                      "adapter": {"const": "codex-v1"},
+                      "adapter": {"type": "string", "enum": ["codex-v1", "claude-code-v1"]},
                       "image": {
                         "type": "string",
                         "maxLength": 327,

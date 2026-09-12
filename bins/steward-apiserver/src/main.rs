@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::serve::Listener;
+use steward_adapter_claude_code::ClaudeCodeTaskExecutionAdapter;
 use steward_adapter_codex::CodexTaskExecutionAdapter;
 use steward_adapter_github_artifact::GitHubArtifactVerifier;
 use steward_adapter_github_source::{GitHubAppCredentials, GitHubSourceAdapter};
@@ -108,11 +109,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "Codex execution adapter configuration failed: {error:?}"
         ))
     })?;
-    let task_api_config = TaskApiConfig::new(task_mcp_gateway_endpoint)
+    let mut task_api_config = TaskApiConfig::new(task_mcp_gateway_endpoint)
         .and_then(|config| config.with_execution_adapter(Arc::new(task_execution_adapter)))
-        .and_then(|config| {
-            config.with_execution_bindings_json(task_execution_bindings_json.as_deref())
-        })
+        .map_err(io::Error::other)?;
+    task_api_config = with_claude_code_execution_adapter(
+        task_api_config,
+        optional_unicode_environment("STEWARD_TASK_ANTHROPIC_INFERENCE_ENDPOINT")?,
+    )?;
+    let task_api_config = task_api_config
+        .with_execution_bindings_json(task_execution_bindings_json.as_deref())
         .and_then(|config| {
             config.with_source_repository_bindings_json(source_repository_bindings_json.as_deref())
         })
@@ -189,6 +194,23 @@ fn configured_execution_bindings_json() -> Result<Option<String>, io::Error> {
         (None, Some(path)) => read_execution_binding_catalog(&path).map(Some),
         (None, None) => Ok(None),
     }
+}
+
+fn with_claude_code_execution_adapter(
+    config: TaskApiConfig,
+    inference_endpoint: Option<String>,
+) -> Result<TaskApiConfig, io::Error> {
+    let Some(inference_endpoint) = inference_endpoint else {
+        return Ok(config);
+    };
+    let adapter = ClaudeCodeTaskExecutionAdapter::new(inference_endpoint).map_err(|error| {
+        io::Error::other(format!(
+            "Claude Code execution adapter configuration failed: {error:?}"
+        ))
+    })?;
+    config
+        .with_execution_adapter(Arc::new(adapter))
+        .map_err(io::Error::other)
 }
 
 fn configured_source_repository_bindings_json() -> Result<Option<String>, io::Error> {
@@ -779,10 +801,11 @@ mod tests {
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
     use super::{
-        KubernetesTokenReviewAudience, TlsListener, bootstrap_rbac_arguments, decode_tls_material,
-        github_source_adapter_from_values, install_rustls_crypto_provider,
-        kubernetes_token_review_audience, parse_execution_bindings_mode,
-        stable_bridge_configuration_from_values, validate_execution_bindings,
+        CodexTaskExecutionAdapter, KubernetesTokenReviewAudience, TaskApiConfig, TlsListener,
+        bootstrap_rbac_arguments, decode_tls_material, github_source_adapter_from_values,
+        install_rustls_crypto_provider, kubernetes_token_review_audience,
+        parse_execution_bindings_mode, stable_bridge_configuration_from_values,
+        validate_execution_bindings, with_claude_code_execution_adapter,
     };
 
     #[test]
@@ -794,6 +817,44 @@ mod tests {
             example.to_string_lossy().into_owned(),
         ])
         .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn configured_claude_adapter_activates_both_supported_catalog_contracts() -> Result<(), String>
+    {
+        let catalog = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../charts/steward/testdata/execution-bindings/valid.json"),
+        )
+        .map_err(|error| format!("read execution binding fixture: {error}"))?;
+        let codex = CodexTaskExecutionAdapter::new("https://inference.example.test/v1".to_owned())
+            .map_err(|error| format!("configure Codex adapter: {error:?}"))?;
+        let config = TaskApiConfig::default()
+            .with_execution_adapter(Arc::new(codex))
+            .map_err(|error| format!("register Codex adapter: {error}"))?;
+        let config = with_claude_code_execution_adapter(
+            config,
+            Some("https://inference.example.test".to_owned()),
+        )
+        .map_err(|error| error.to_string())?
+        .with_execution_bindings_json(Some(&catalog))?
+        .with_execution_bindings_active(true)?;
+        assert_eq!(
+            config.execution_binding_refs(),
+            ["claude-code@2.1.222", "codex@1.2.3"]
+        );
+
+        let codex = CodexTaskExecutionAdapter::new("https://inference.example.test/v1".to_owned())
+            .map_err(|error| format!("configure Codex adapter: {error:?}"))?;
+        let unavailable = TaskApiConfig::default()
+            .with_execution_adapter(Arc::new(codex))?
+            .with_execution_bindings_json(Some(&catalog))?
+            .with_execution_bindings_active(true);
+        assert!(
+            unavailable.is_err_and(|reason| reason.contains("claude-code-v1")),
+            "an active Claude binding must fail startup when its endpoint-backed adapter is absent"
+        );
+        Ok(())
     }
 
     #[test]

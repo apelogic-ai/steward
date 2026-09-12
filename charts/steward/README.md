@@ -190,6 +190,9 @@ that allowlist remain inaccessible to both service accounts.
   The chart validates it, renders it into an immutable content-addressed ConfigMap,
   mounts it read-only in the apiserver, and rolls the apiserver when its checksum
   changes. See [Execution bindings](../../docs/installation/execution-bindings.md).
+- `config.apiserver.inferenceEndpoint` is the OpenAI-compatible Responses endpoint for
+  `codex-v1`; `config.apiserver.anthropicInferenceEndpoint` is the Anthropic-compatible API
+  base URL for `claude-code-v1`. Agent images, packages, and bindings cannot override them.
 - `config.apiserver.jiraBaseUrl`, `jiraProjectKey`, and `jiraAccountEmail` are
   mandatory startup inputs. The base URL is the public HTTPS Jira tenant root,
   the project must already exist, and the account email must correspond to the

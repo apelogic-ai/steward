@@ -25,7 +25,7 @@ The top-level object and every nested object reject unknown fields.
 | `bindings` | yes | Zero to 128 entries; duplicate `agentRef` or derived identities fail startup. |
 | `agentRef` | yes | Opaque exact deployment value, 3–255 bytes, one `@`, lowercase bounded name, version beginning with a digit; `latest` is invalid. |
 | `displayName` | no | Presentation only, 1–200 characters, trimmed, no control characters. The Workflow UI shows it beside the exact reference; it is excluded from execution identity and is never an ownership key. |
-| `adapter` | yes | Product-supported adapter. This release accepts only `codex-v1`. |
+| `adapter` | yes | Product-supported execution contract. This release accepts `codex-v1` and `claude-code-v1`. |
 | `image` | yes | Lowercase OCI repository plus exact `@sha256:` and 64 lowercase hexadecimal digits. Tags are rejected. |
 | `executable` | yes | Absolute normalized path, 2–1024 bytes; no empty, `.` or `..` components. |
 | `versionProbe.arguments` | yes | One to eight process arguments, each 1–128 characters with no control characters. No shell parsing occurs. |
@@ -52,7 +52,7 @@ Do not substitute a tag. The command invokes the released `/usr/local/bin/stewar
 the production parser with networking disabled, needs no credential, prints only public `agentRef`
 and derived digest metadata, and returns nonzero for an invalid document.
 
-## Agent image and adapter contract
+## Agent images and adapter contracts
 
 `codex-v1` defines behavior, not a product-pinned Codex release. A compatible image must be
 multi-architecture for every platform the deployment admits, contain the configured absolute
@@ -60,6 +60,24 @@ executable on each architecture, return the exact configured stdout for the conf
 arguments, and implement the Codex-compatible configuration, `exec`, model, MCP, output-file, and
 termination behavior used by the adapter. Obtain or build the image through the operator's normal
 source, scanning, signing, and promotion process, then configure its immutable manifest digest.
+
+`claude-code-v1` likewise identifies stable execution behavior rather than a Claude Code release.
+A compatible image must implement unattended `--print` execution, bare configuration isolation,
+the Anthropic-compatible model endpoint, exclusive server-provided MCP configuration, disabled
+session persistence and updates, and the common `result.txt` plus `out/` output contract. It must
+also supply `/bin/sh`, `id`, `mkdir`, `ln`, `tee`, and `cat`, declare a non-root sandbox user, and
+remain non-root when OpenShell starts the Task. Claude Code refuses `bypassPermissions` as root, so
+the adapter checks the effective UID and fails closed before its version probe or inference call.
+Image conformance must exercise that non-root entrypoint; a root-only image is not compatible with
+`claude-code-v1`. The adapter passes only the admitted Anthropic model name; it does not select or
+remap a model. The deployment configures the Anthropic-compatible API base URL independently from
+Codex's OpenAI-compatible Responses endpoint.
+
+Before launch, the adapter removes inherited Claude cloud-provider selectors and alternate
+authentication or custom-header variables, then supplies only the governed Anthropic-compatible
+base URL and OpenShell token-grant placeholder. The isolated, initially empty Claude configuration
+directory prevents a host or image-level login and API-key helper from becoming another authority
+path.
 
 Adding another compatible version is configuration-only: publish a distinct digest-pinned image,
 choose a new exact `agentRef`, set its executable and probe, install its profiles, validate the
@@ -74,6 +92,10 @@ their endpoint and token-grant policy must match the deployment. Install policie
 under the exact configured IDs. Compute the configured digest from the immutable policy artifact
 used by that installation and promote ID plus digest together; never mutate an installed ID in
 place.
+
+For an interpreted or launcher-based agent, conformance must identify the process that actually
+opens the governed connection. The provider profile must authorize that executable identity; do
+not assume a configured launcher symlink is sufficient.
 
 Pinned OpenShell v0.0.98 exposes profile selection by exact ID but does not expose an authenticated
 content digest for an installed profile. Steward therefore persists the configured profile IDs and
@@ -115,6 +137,14 @@ config:
               id: example-inference-profile-v7
               digest: sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 ```
+
+Configure `config.apiserver.inferenceEndpoint` with the exact OpenAI-compatible Responses endpoint
+used by `codex-v1`, and configure `config.apiserver.anthropicInferenceEndpoint` with the exact
+Anthropic-compatible API base URL used by `claude-code-v1`. Neither value belongs in a Task package
+or execution binding. Non-Helm installations set the corresponding
+`STEWARD_TASK_ANTHROPIC_INFERENCE_ENDPOINT` environment variable before activating any Claude Code
+binding. When it is absent, Codex remains available but an active Claude Code binding fails startup
+as unavailable.
 
 The chart validates the structure, writes it to an immutable content-addressed ConfigMap, mounts it
 read-only in the apiserver, sets `STEWARD_TASK_EXECUTION_BINDINGS_FILE`, and changes the pod-template
