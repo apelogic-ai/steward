@@ -4,11 +4,17 @@ Priority: P1 post-demo
 
 Status: proposed
 
+Implementation owner: agentic-ops team (`apelogic-ai/agentic-ops`), with the GitOps
+team owning fixed local-main execution
+
 ## Goal
 
-Prove that a repository-authored Task package can select an exact GitOps-advertised
-Claude Code release and execute through the existing Steward-governed GHA path with
-real inference, GitHub MCP, outputs, evidence, and diagnostics.
+Prove that a repository-authored Task package can select an exact release from the
+customer-owned GitOps agent catalog and execute through the existing Steward-governed
+GHA path with real Claude inference, GitHub MCP, outputs, evidence, and diagnostics.
+
+The selected `agentRef` is produced through the
+[GitOps coding-agent release lifecycle](coding-agent-release-lifecycle.md).
 
 ## Package scope
 
@@ -28,8 +34,9 @@ The TaskDefinition:
 - uses only neutral public fixtures and repository identities.
 
 The invoking GitOps manifest continues to contain only exact Git source coordinates
-and diagnostics. It does not select an Envelope or transport agent implementation
-details. A new exact package commit is the only invocation change required.
+and diagnostics. It does not select an Envelope, OCI registry, image, adapter,
+executable, or provider profile. A new exact package commit is the only invocation
+change required.
 
 ## Governed execution proof
 
@@ -67,6 +74,7 @@ stable-lane coverage, publication automation, or AgentSession support.
 ## Dependencies and parallel boundary
 
 Package authorship and fixture validation may begin once CA-P01 fixes the intended
-`agentRef` and model name. Live execution waits for CA-A01 to be released and CA-P01
-to activate the binding, profiles, model, and Envelope authority. The GitOps team
-owns fixed local-main operation.
+`agentRef` and the deployment exposes an admitted Claude model. Live execution waits
+for CA-A01 to be released and CA-P01 to merge the complete digest-pinned binding.
+Model/profile provisioning and Envelope authority are deployment prerequisites, not
+per-agent-version work. The GitOps team owns fixed local-main operation.

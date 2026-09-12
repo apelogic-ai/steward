@@ -4,21 +4,27 @@ Priority: P1 post-demo
 
 Status: proposed
 
+Implementation owner: Steward team (`apelogic-ai/steward`)
+
 ## Goal
 
-Make each supported coding-agent family a stable Steward execution adapter so that
-compatible agent releases can be enabled through deployment metadata without a new
-Steward build.
+Make each supported coding-agent execution protocol a stable Steward adapter so that
+compatible product releases can be enabled from the customer-owned GitOps agent catalog
+without a new Steward build.
 
 The first additional family is Claude Code under the adapter contract
 `claude-code-v1`. The existing `codex-v1` behavior remains unchanged.
 
+The shared release and activation boundary is defined in the
+[GitOps coding-agent release lifecycle](coding-agent-release-lifecycle.md).
+
 ## Contract boundary
 
 An adapter name identifies execution semantics, not a product release. Steward must
-not branch on `agentRef` versions or contain a list of individual Claude Code
-releases. Every binding using `claude-code-v1` must satisfy the same command,
-configuration, authentication, MCP, output, termination, and diagnostic contract.
+not branch on `agentRef` versions, contain a list of individual Claude Code releases,
+or build agent images. Every binding using `claude-code-v1` must satisfy the same
+command, configuration, authentication, MCP, output, termination, and diagnostic
+contract.
 
 If a future Claude Code release cannot satisfy that contract, operators must not
 promote it under `claude-code-v1`. A genuinely incompatible execution protocol uses
@@ -46,8 +52,8 @@ and Tasks retain their original semantics.
   registered by the running apiserver; and
 - update installation documentation without changing frozen M1/v1.
 
-No TaskDefinition, invocation, Task evidence, CRD, migration, `steward-run`, or
-catalog-publication schema change is required.
+No TaskDefinition, invocation, Task evidence, CRD, migration, `steward-run`, agent
+release catalog, or registry integration change belongs in this ticket.
 
 ## Negative proofs
 
@@ -73,8 +79,8 @@ catalog-publication schema change is required.
   names; and
 - `cargo xtask ci` passes.
 
-Pinned-binary compatibility belongs to CA-P01. Adapter unit tests must not claim that
-an arbitrary upstream release conforms.
+Pinned-binary compatibility and image production belong to CA-P01. Adapter unit tests
+must not claim that an arbitrary upstream release conforms.
 
 ## Exit criteria
 
@@ -85,7 +91,8 @@ an arbitrary upstream release conforms.
 
 ## Dependencies and parallel boundary
 
-This ticket is independent of package authorship. CA-P01 may prepare its artifact and
-conformance harness in parallel once this ticket freezes the initial command
-contract, but deployment activation waits for the Steward release containing the
-adapter.
+This ticket is independent of package authorship and GitOps automation. CA-P01 can
+implement and prove the generic catalog lifecycle against the existing `codex-v1`
+contract in parallel. It can prepare Claude Code image production once this ticket
+freezes the `claude-code-v1` command contract. Activating a Claude Code binding waits
+for a Steward release containing that adapter.

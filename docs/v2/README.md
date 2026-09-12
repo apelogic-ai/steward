@@ -54,15 +54,18 @@ Task packages select exact deployment-advertised `runtime.agentRef` values. A st
 adapter contract belongs to Steward, while compatible agent versions are built,
 proven, tested, and enabled through GitOps without a Steward source change:
 
+- [GitOps coding-agent release lifecycle](coding-agent-release-lifecycle.md);
 - [CA-A01: stable coding-agent adapter contracts](coding-agent-adapter-ticket.md);
-- [CA-P01: coding-agent version promotion and execution catalog](coding-agent-version-promotion-ticket.md);
+- [CA-P01: GitOps coding-agent release catalog and promotion](coding-agent-version-promotion-ticket.md);
   and
 - [CA-D01: Claude Code package adoption and governed execution](claude-code-package-enablement-ticket.md).
 
-CA-A01 adds `claude-code-v1` once. CA-P01 makes exact Claude Code releases coexist as
-immutable execution bindings. CA-D01 proves that a reviewed `agentic-ops` package can
+CA-A01 adds `claude-code-v1` once. CA-P01 gives the customer-owned GitOps repository a
+single release catalog and a pre-merge build, publication, conformance, and review
+process for exact OCI digests. CA-D01 proves that a reviewed `agentic-ops` package can
 select one of those bindings through the existing governed GHA Task path. No ticket
-adds an invocation-time agent override, mutable alias, or `steward-run` input.
+adds an invocation-time agent override, mutable alias, registry setting, or
+`steward-run` input.
 
 ## Canonical terminology
 
