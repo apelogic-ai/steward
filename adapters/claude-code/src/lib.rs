@@ -78,10 +78,10 @@ impl ClaudeCodeTaskExecutionAdapter {
                 "prompt=$1; model=$2; inference_endpoint=$3; mcp_config=$4; ",
                 "config_dir=$5; executable=$6; expected_version=$7; shift 7; ",
                 "command -v id >/dev/null 2>&1; test \"$(id -u)\" -ne 0; ",
-                "test \"$(\"$executable\" \"$@\")\" = \"$expected_version\"; ",
                 "export CLAUDE_CONFIG_DIR=\"$config_dir\"; ",
                 "unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX ",
-                "CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_ANTHROPIC_AWS ",
+                "CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_MANTLE ",
+                "CLAUDE_CODE_USE_ANTHROPIC_AWS ",
                 "ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ",
                 "CLAUDE_CODE_OAUTH_REFRESH_TOKEN CLAUDE_CODE_OAUTH_SCOPES ",
                 "ANTHROPIC_CUSTOM_HEADERS; ",
@@ -90,7 +90,9 @@ impl ClaudeCodeTaskExecutionAdapter {
                 "export DISABLE_UPDATES=1; ",
                 "export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1; ",
                 "export CLAUDE_CODE_SKIP_PROMPT_HISTORY=1; ",
-                "mkdir -p \"$CLAUDE_CONFIG_DIR\" \"$STEWARD_OUTPUT_DIR/out\"; ",
+                "mkdir -p \"$CLAUDE_CONFIG_DIR\"; ",
+                "test \"$(\"$executable\" \"$@\")\" = \"$expected_version\"; ",
+                "mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; ",
                 "test ! -e out; ln -s \"$STEWARD_OUTPUT_DIR/out\" out; ",
                 "{}",
                 "status_file=\"$CLAUDE_CONFIG_DIR/exit-status\"; ",
@@ -277,6 +279,7 @@ mod tests {
             "CLAUDE_CODE_USE_BEDROCK",
             "CLAUDE_CODE_USE_VERTEX",
             "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_MANTLE",
             "CLAUDE_CODE_USE_ANTHROPIC_AWS",
             "ANTHROPIC_AUTH_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN",
@@ -318,18 +321,23 @@ mod tests {
             &executable,
             concat!(
                 "#!/bin/sh\n",
+                "test -z \"${CLAUDE_CODE_USE_BEDROCK+x}\" || exit 91\n",
+                "test -z \"${CLAUDE_CODE_USE_VERTEX+x}\" || exit 91\n",
+                "test -z \"${CLAUDE_CODE_USE_FOUNDRY+x}\" || exit 91\n",
+                "test -z \"${CLAUDE_CODE_USE_MANTLE+x}\" || exit 91\n",
+                "test -z \"${CLAUDE_CODE_USE_ANTHROPIC_AWS+x}\" || exit 91\n",
+                "test -z \"${ANTHROPIC_AUTH_TOKEN+x}\" || exit 91\n",
+                "test -z \"${CLAUDE_CODE_OAUTH_TOKEN+x}\" || exit 91\n",
+                "test -z \"${CLAUDE_CODE_OAUTH_REFRESH_TOKEN+x}\" || exit 91\n",
+                "test -z \"${CLAUDE_CODE_OAUTH_SCOPES+x}\" || exit 91\n",
+                "test -z \"${ANTHROPIC_CUSTOM_HEADERS+x}\" || exit 91\n",
+                "test \"$CLAUDE_CONFIG_DIR\" = \"$EXPECTED_CLAUDE_CONFIG_DIR\" || exit 92\n",
+                "test \"$ANTHROPIC_BASE_URL\" = http://inference.example.test:4000 || exit 92\n",
+                "test \"$ANTHROPIC_API_KEY\" = openshell-token-grant-placeholder || exit 93\n",
                 "if [ \"$1\" = --version ]; then\n",
                 "  printf '%s\\n' '2.1.222 (Claude Code)'\n",
                 "  exit 0\n",
                 "fi\n",
-                "test -z \"${CLAUDE_CODE_USE_BEDROCK+x}\" || exit 91\n",
-                "test -z \"${CLAUDE_CODE_USE_VERTEX+x}\" || exit 91\n",
-                "test -z \"${CLAUDE_CODE_USE_FOUNDRY+x}\" || exit 91\n",
-                "test -z \"${CLAUDE_CODE_USE_ANTHROPIC_AWS+x}\" || exit 91\n",
-                "test -z \"${ANTHROPIC_AUTH_TOKEN+x}\" || exit 91\n",
-                "test -z \"${CLAUDE_CODE_OAUTH_TOKEN+x}\" || exit 91\n",
-                "test \"$ANTHROPIC_BASE_URL\" = http://inference.example.test:4000 || exit 92\n",
-                "test \"$ANTHROPIC_API_KEY\" = openshell-token-grant-placeholder || exit 93\n",
                 "for argument do prompt=$argument; done\n",
                 "printf 'stdout:%s\\n' \"$prompt\"\n",
                 "printf 'stderr:%s\\n' \"$prompt\" >&2\n",
@@ -376,9 +384,14 @@ mod tests {
             .env("CLAUDE_CODE_USE_BEDROCK", "1")
             .env("CLAUDE_CODE_USE_VERTEX", "1")
             .env("CLAUDE_CODE_USE_FOUNDRY", "1")
+            .env("CLAUDE_CODE_USE_MANTLE", "1")
             .env("CLAUDE_CODE_USE_ANTHROPIC_AWS", "1")
             .env("ANTHROPIC_AUTH_TOKEN", "untrusted")
             .env("CLAUDE_CODE_OAUTH_TOKEN", "untrusted")
+            .env("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "untrusted")
+            .env("CLAUDE_CODE_OAUTH_SCOPES", "untrusted")
+            .env("ANTHROPIC_CUSTOM_HEADERS", "Authorization: untrusted")
+            .env("EXPECTED_CLAUDE_CONFIG_DIR", &config_dir)
             .output()
             .map_err(|error| format!("execute rendered adapter plan: {error}"))?;
 
