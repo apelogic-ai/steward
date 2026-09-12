@@ -48,6 +48,25 @@ DP-I01, DP-G01, DP-R01, and DP-A01 may proceed in parallel after DP-C01. Heavy t
 lanes remain serialized. GitOps controls local-main; development workers do not operate
 it.
 
+## Coding-agent families and version promotion
+
+Task packages select exact deployment-advertised `runtime.agentRef` values. A stable
+adapter contract belongs to Steward, while compatible agent versions are built,
+proven, tested, and enabled through GitOps without a Steward source change:
+
+- [GitOps coding-agent release lifecycle](coding-agent-release-lifecycle.md);
+- [CA-A01: stable coding-agent adapter contracts](coding-agent-adapter-ticket.md);
+- [CA-P01: GitOps coding-agent release catalog and promotion](coding-agent-version-promotion-ticket.md);
+  and
+- [CA-D01: Claude Code package adoption and governed execution](claude-code-package-enablement-ticket.md).
+
+CA-A01 adds `claude-code-v1` once. CA-P01 gives the customer-owned GitOps repository a
+single release catalog and a pre-merge build, publication, conformance, and review
+process for exact OCI digests. CA-D01 proves that a reviewed `agentic-ops` package can
+select one of those bindings through the existing governed GHA Task path. No ticket
+adds an invocation-time agent override, mutable alias, registry setting, or
+`steward-run` input.
+
 ## Canonical terminology
 
 | Term | Accepted meaning |
