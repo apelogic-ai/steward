@@ -160,6 +160,17 @@ function modelValue(model: ModelRef): string {
   return `${model.provider}/${model.model}`;
 }
 
+function modelKey(model: ModelRef): string {
+  return JSON.stringify([model.provider, model.model]);
+}
+
+function modelLabel(model: ModelRef, choices: Array<ModelRef>): string {
+  const display = modelValue(model);
+  return choices.some((other) => modelKey(other) !== modelKey(model) && modelValue(other) === display)
+    ? `Provider: ${model.provider} · Model: ${model.model}`
+    : display;
+}
+
 function initialTemplateForService(serviceEnvelope: BrowserEnvelope): BrowserEnvelope {
   return {
     ...initialEnvelopeTemplate,
@@ -329,11 +340,11 @@ function AuthenticatedNewTemplate({ csrf }: Readonly<{ csrf: string }>) {
 function TemplateEditor({ create = false, csrf, memberRole, serviceEnvelope, template }: Readonly<{ create?: boolean; csrf: string; memberRole: string; serviceEnvelope: BrowserEnvelope; template: BrowserEnvelope }>) {
   const router = useRouter();
   const modelCatalog = serviceEnvelope.spec.llms;
-  const allowedModels = new Set(modelCatalog.map(modelValue));
+  const allowedModels = new Set(modelCatalog.map(modelKey));
   const [status, setStatus] = useState<TemplateMutationState>("idle");
   const [currentRevision, setCurrentRevision] = useState(template.revision);
   const [models, setModels] = useState<Array<ModelRef>>(template.spec.llms);
-  const [modelInput, setModelInput] = useState(modelCatalog[0] ? modelValue(modelCatalog[0]) : "");
+  const [modelInput, setModelInput] = useState(modelCatalog[0] ? modelKey(modelCatalog[0]) : "");
   const [tools, setTools] = useState<Array<ToolGrant>>(template.spec.tools);
   const [toolProviderInput, setToolProviderInput] = useState(supportedToolProvider);
   const [toolInput, setToolInput] = useState(supportedToolAction);
@@ -343,9 +354,13 @@ function TemplateEditor({ create = false, csrf, memberRole, serviceEnvelope, tem
   const limitAmount = limitType === "singleRun" ? singleRunLimit : monthlyLimit;
 
   function addModel() {
-    const selected = modelCatalog.find((model) => modelValue(model) === modelInput);
-    if (!selected || models.some((model) => modelValue(model) === modelInput)) return;
+    const selected = modelCatalog.find((model) => modelKey(model) === modelInput);
+    if (!selected || models.some((model) => modelKey(model) === modelInput)) return;
     setModels([...models, selected]);
+  }
+
+  function removeModel(index: number) {
+    setModels(models.filter((_, modelIndex) => modelIndex !== index));
   }
 
   function addTool() {
@@ -368,7 +383,7 @@ function TemplateEditor({ create = false, csrf, memberRole, serviceEnvelope, tem
       || !monthlyLimit.trim()
       || !singleRunLimit.trim()
       || models.length === 0
-      || models.some((model) => !allowedModels.has(modelValue(model)))
+      || models.some((model) => !allowedModels.has(modelKey(model)))
       || tools.some((tool) => toolValue(tool) !== supportedTool)) {
       setStatus("rejected");
       return;
@@ -459,18 +474,28 @@ function TemplateEditor({ create = false, csrf, memberRole, serviceEnvelope, tem
               {modelCatalog.length === 0
                 ? <option value="">No models available</option>
                 : modelCatalog.map((model) => {
-                  const value = modelValue(model);
-                  return <option key={value} value={value}>{value}</option>;
+                  const key = modelKey(model);
+                  return <option key={key} value={key}>{modelLabel(model, modelCatalog)}</option>;
                 })}
             </select>
           </label>
-          <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-50" disabled={!modelInput || models.some((model) => modelValue(model) === modelInput)} onClick={addModel} type="button">Add model</button>
+          <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-50" disabled={!modelInput || models.some((model) => modelKey(model) === modelInput)} onClick={addModel} type="button">Add model</button>
         </div>
         {modelCatalog.length === 0 ? <p className="text-sm text-muted-ink">The current Service Envelope does not allow any models.</p> : null}
         <ul className="flex flex-wrap gap-2" role="list">
-          {models.map((model) => {
-            const value = modelValue(model);
-            return <li className={allowedModels.has(value) ? "rounded-full border px-3 py-1.5 text-sm" : "rounded-full border px-3 py-1.5 text-sm text-muted-ink opacity-60"} key={value}>{value}</li>;
+          {models.map((model, index) => {
+            const allowed = allowedModels.has(modelKey(model));
+            return (
+              <li className={allowed ? "flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm" : "flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm text-muted-ink"} key={`${modelKey(model)}:${index}`}>
+                <span>{modelLabel(model, models)}</span>
+                {!allowed ? <span className="text-xs">No longer allowed by the current Service Envelope</span> : null}
+                <button aria-label={`Remove model ${model.model} from provider ${model.provider}`} className="rounded-full p-1 hover:bg-canvas" onClick={() => removeModel(index)} type="button">
+                  <svg aria-hidden="true" className="size-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 12 12">
+                    <path d="M2 2l8 8M10 2l-8 8" />
+                  </svg>
+                </button>
+              </li>
+            );
           })}
         </ul>
       </fieldset>

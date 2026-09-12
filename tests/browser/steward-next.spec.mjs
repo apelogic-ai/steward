@@ -413,6 +413,7 @@ async function stopWeb(instance) {
 }
 
 async function guardedPage(browser, {
+  adminTemplateModels = adminEnvelope.spec.llms,
   legacyAdminTemplate = false,
   malformedAdminTemplate = false,
   mockSignIn = true,
@@ -549,7 +550,10 @@ async function guardedPage(browser, {
       ? { apiVersion: "steward.browser-admin/v1", memberRole }
       : legacyAdminTemplate
         ? { apiVersion: "steward.admin/v1", template: { id: memberRole, revision: 4, envelope } }
-        : { apiVersion: "steward.browser-admin/v1", memberRole, envelope: adminEnvelope });
+        : { apiVersion: "steward.browser-admin/v1", memberRole, envelope: {
+          ...adminEnvelope,
+          spec: { ...adminEnvelope.spec, llms: adminTemplateModels },
+        } });
   });
   await context.route(`${origin}/admin/api/v1/envelope-templates`, (route) => json(route, {
     apiVersion: "steward.browser-admin/v1",
@@ -1165,7 +1169,7 @@ test("administrator templates and approvals use typed browser authority", async 
     await expect(administrator.page.getByRole("combobox", { name: "Currency" }).locator("option")).toHaveText(["USD"]);
     await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText(["provider-a/model-a"]);
     const model = administrator.page.getByRole("combobox", { name: "Model" });
-    await expect(model).toHaveValue("provider-a/model-a");
+    await expect(model).toHaveValue(JSON.stringify(["provider-a", "model-a"]));
     await expect(model.locator("option")).toHaveText([
       "provider-a/model-a",
       "provider-b/model-b",
@@ -1173,7 +1177,7 @@ test("administrator templates and approvals use typed browser authority", async 
     await expect(model.locator("option").nth(0)).toBeEnabled();
     await expect(model.locator("option").nth(1)).toBeEnabled();
     await expect(model.locator("option", { hasText: "openai/gpt-5.4" })).toHaveCount(0);
-    await model.selectOption("provider-b/model-b");
+    await model.selectOption(JSON.stringify(["provider-b", "model-b"]));
     await administrator.page.getByRole("button", { name: "Add model" }).click();
     await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText([
       "provider-a/model-a",
@@ -1291,6 +1295,82 @@ test("administrator template authoring rejects models outside the current Servic
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
   } finally {
     await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator can replace a template model removed from the current Service Envelope", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    adminTemplateModels: [{ provider: "openai", model: "gpt-5.4" }],
+    serviceEnvelopeModels: [{ provider: "anthropic", model: "claude-sonnet-4" }],
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
+    const models = administrator.page.getByRole("group", { name: "Models" });
+    await expect(models.getByRole("listitem")).toContainText("openai/gpt-5.4");
+    await expect(models.getByText("No longer allowed by the current Service Envelope")).toBeVisible();
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect(administrator.page.getByText("The template ID or envelope fields are invalid, so no authority was changed.", { exact: true })).toBeVisible();
+    expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
+
+    await models.getByRole("button", { name: "Remove model gpt-5.4 from provider openai" }).click();
+    await expect(models.getByRole("listitem")).toHaveCount(0);
+    await models.getByRole("combobox", { name: "Model" }).selectOption(JSON.stringify(["anthropic", "claude-sonnet-4"]));
+    await models.getByRole("button", { name: "Add model" }).click();
+    await expect(models.getByRole("listitem")).toHaveCount(1);
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
+    const mutation = administrator.mutations.find((entry) => entry.path === "/admin/api/v1/envelope-templates/analyst");
+    expect(mutation.body.spec.llms).toEqual([{ provider: "anthropic", model: "claude-sonnet-4" }]);
+    expect(mutation.body.revision).toBe(adminEnvelope.revision + 1);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator template model identity does not collide across provider and model slashes", async ({ browser }) => {
+  const first = { provider: "provider-a", model: "part/model-a" };
+  const second = { provider: "provider-a/part", model: "model-a" };
+  const administrator = await guardedPage(browser, {
+    adminTemplateModels: [first],
+    serviceEnvelopeModels: [first, second],
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
+    const models = administrator.page.getByRole("group", { name: "Models" });
+    await expect(models.getByRole("combobox", { name: "Model" }).locator("option")).toHaveText([
+      "Provider: provider-a · Model: part/model-a",
+      "Provider: provider-a/part · Model: model-a",
+    ]);
+    await models.getByRole("combobox", { name: "Model" }).selectOption(JSON.stringify([second.provider, second.model]));
+    await models.getByRole("button", { name: "Add model" }).click();
+    await expect(models.getByRole("listitem")).toHaveCount(2);
+    await models.getByRole("listitem").first().getByRole("button", { name: "Remove model part/model-a from provider provider-a" }).click();
+    await expect(models.getByRole("listitem")).toHaveCount(1);
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
+    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.spec.llms).toEqual([second]);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+
+  const stale = await guardedPage(browser, {
+    adminTemplateModels: [first, second],
+    serviceEnvelopeModels: [second],
+    session: administratorSession,
+  });
+  try {
+    await stale.page.goto(`${origin}/admin/envelopes/templates/analyst`);
+    const models = stale.page.getByRole("group", { name: "Models" });
+    await expect(models.getByText("No longer allowed by the current Service Envelope")).toHaveCount(1);
+    await models.getByRole("listitem").first().getByRole("button", { name: "Remove model part/model-a from provider provider-a" }).click();
+    await expect(models.getByRole("listitem")).toHaveCount(1);
+    await stale.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => stale.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
+    expect(stale.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.spec.llms).toEqual([second]);
+  } finally {
+    await closeGuardedPage(stale);
   }
 });
 

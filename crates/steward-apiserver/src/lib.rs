@@ -4403,6 +4403,10 @@ mod tests {
             .await
             .map_err(|error| format!("execute missing admin service-envelope request: {error}"))?;
         assert_eq!(missing_service_envelope.status(), StatusCode::NOT_FOUND);
+        *admin_ledger
+            .missing_service_envelope
+            .lock()
+            .map_err(|_| "fake service-envelope lock was poisoned")? = false;
 
         let template = admin_app
             .clone()
@@ -4671,6 +4675,202 @@ mod tests {
             "browser writes must audit the canonical Rust-resolved actor, never display identity or UI state"
         );
         assert_eq!(authors[0].2, next);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_admin_template_authoring_rechecks_current_service_models() -> Result<(), String>
+    {
+        let origin = "http://127.0.0.1:33002";
+        let ledger = ledger();
+        let (auth, cookie, csrf) = signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let app = browser_admin::protected_router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger.clone(),
+            FakeDecisionChannel::default(),
+            auth,
+        );
+        let initially_current = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/service-envelope")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build current service-envelope request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("read current service-envelope: {error}"))?;
+        assert_eq!(initially_current.status(), StatusCode::OK);
+
+        let mut rotated = ledger
+            .envelope
+            .lock()
+            .map_err(|_| "lock member template")?
+            .clone();
+        rotated.revision += 1;
+        rotated.spec.llms = vec![ModelRef {
+            provider: "provider-b".to_owned(),
+            model: "model-b".to_owned(),
+        }];
+        *ledger
+            .service_envelope_override
+            .lock()
+            .map_err(|_| "lock service envelope")? = Some(rotated);
+
+        let mut next = ledger
+            .envelope
+            .lock()
+            .map_err(|_| "lock member template")?
+            .clone();
+        next.revision += 1;
+        let old_model = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-templates/engineer")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&next).map_err(|error| error.to_string())?,
+                    ))
+                    .map_err(|error| format!("build stale-model template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit stale-model template: {error}"))?;
+        assert_eq!(old_model.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            ledger
+                .envelope_authors
+                .lock()
+                .map_err(|_| "lock template authors")?
+                .is_empty()
+        );
+
+        next.spec.llms = vec![ModelRef {
+            provider: "provider-b".to_owned(),
+            model: "model-b".to_owned(),
+        }];
+        let newly_allowed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-templates/engineer")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&next).map_err(|error| error.to_string())?,
+                    ))
+                    .map_err(|error| format!("build new-model template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit new-model template: {error}"))?;
+        assert_eq!(newly_allowed.status(), StatusCode::CREATED);
+
+        ledger
+            .service_envelope_override
+            .lock()
+            .map_err(|_| "lock service envelope")?
+            .as_mut()
+            .ok_or("missing service fixture")?
+            .spec
+            .llms
+            .clear();
+        next.revision += 1;
+        let no_models = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-templates/engineer")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&next).map_err(|error| error.to_string())?,
+                    ))
+                    .map_err(|error| format!("build no-model template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit no-model template: {error}"))?;
+        assert_eq!(no_models.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        next.spec.llms.clear();
+        let empty_candidate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-templates/engineer")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&next).map_err(|error| error.to_string())?,
+                    ))
+                    .map_err(|error| format!("build empty-candidate template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit empty-candidate template: {error}"))?;
+        assert_eq!(empty_candidate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            ledger
+                .envelope_authors
+                .lock()
+                .map_err(|_| "lock template authors")?
+                .len(),
+            1,
+            "an empty model selection cannot write a new template revision"
+        );
+        next.spec.llms = vec![ModelRef {
+            provider: "provider-b".to_owned(),
+            model: "model-b".to_owned(),
+        }];
+
+        *ledger
+            .missing_service_envelope
+            .lock()
+            .map_err(|_| "lock missing service flag")? = true;
+        let missing_service = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-templates/engineer")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&next).map_err(|error| error.to_string())?,
+                    ))
+                    .map_err(|error| format!("build missing-service template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit missing-service template: {error}"))?;
+        assert_eq!(missing_service.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            ledger
+                .envelope_authors
+                .lock()
+                .map_err(|_| "lock template authors")?
+                .len(),
+            1
+        );
         Ok(())
     }
 
@@ -5547,6 +5747,7 @@ mod tests {
     struct FakeLedger {
         envelope: Arc<Mutex<Envelope>>,
         missing_service_envelope: Arc<Mutex<bool>>,
+        service_envelope_override: Arc<Mutex<Option<Envelope>>>,
         envelope_authors: Arc<Mutex<Vec<(String, String, Envelope)>>>,
         grants: Vec<AdmissionDelta>,
         parked: ParkedRows,
@@ -5717,6 +5918,14 @@ mod tests {
                     .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))?
                 {
                     return Ok(None);
+                }
+                if let Some(envelope) = self
+                    .service_envelope_override
+                    .lock()
+                    .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))?
+                    .clone()
+                {
+                    return Ok(Some(envelope));
                 }
                 self.envelope
                     .lock()
@@ -6828,6 +7037,7 @@ mod tests {
         FakeLedger {
             envelope: Arc::new(Mutex::new(envelope)),
             missing_service_envelope: Arc::new(Mutex::new(false)),
+            service_envelope_override: Arc::new(Mutex::new(None)),
             envelope_authors: Arc::new(Mutex::new(Vec::new())),
             grants: Vec::new(),
             parked: Arc::new(Mutex::new(Vec::new())),
