@@ -12,7 +12,7 @@ Git source, Steward, runner, and package implementations proceed independently.
 ## Scope
 
 - `steward.task/v2` invocation manifest with package repository, typed commit, path,
-  Envelope digest, and optional diagnostics;
+  optional backward-compatible Envelope digest selector, and optional diagnostics;
 - direct TaskDefinition schema with prompt, runtime selection, outputs, optional
   skills, and optional complete `requires`;
 - direct instruction-skill schema in which omitted kind means `instruction_only`;
@@ -29,10 +29,10 @@ modified.
 
 - repository and commit remain separate fields;
 - commit values are `git:sha1:<40-hex>` or the same-repository-only `git:trigger`;
-- Envelope values are `steward:sha256:<64-hex>`;
+- when present for compatibility, Envelope values are `steward:sha256:<64-hex>`;
 - omitted or empty skills means no skills;
 - instruction-only is the default and only initial skill kind;
-- omitted `requires` expands to the selected Envelope's full approved authority
+- omitted `requires` expands to the server-resolved Envelope's full approved authority
   values, including explicit null optional maxima;
 - present `requires` is a complete narrower authority request;
 - execution behavior comes only from the immutable deployment-owned `runtime.agentRef`

@@ -2193,28 +2193,20 @@ where
         &canonical_json_bytes(&definition).map_err(ApiError::Admission)?,
     )?;
 
-    let envelopes = ledger
-        .active_provisioned_user_envelopes_by_digest(
-            &identity.canonical_user_id,
-            &manifest.envelope,
-        )
-        .await
-        .map_err(ApiError::Store)?;
-    let [envelope] = envelopes.as_slice() else {
-        return if envelopes.is_empty() {
-            Err(ApiError::Admission(
-                "the selected Envelope is not active".to_owned(),
-            ))
+    let explicit_envelope = manifest.envelope.is_some();
+    let envelope = resolve_direct_user_envelope(
+        ledger,
+        &identity.canonical_user_id,
+        manifest.envelope.as_ref(),
+    )
+    .await?;
+    let approved = envelope.approved_envelope.as_ref().ok_or_else(|| {
+        ApiError::Admission(if explicit_envelope {
+            "the selected Envelope is not active".to_owned()
         } else {
-            Err(ApiError::Conflict(
-                "multiple active Envelopes have the selected digest".to_owned(),
-            ))
-        };
-    };
-    let approved = envelope
-        .approved_envelope
-        .as_ref()
-        .ok_or_else(|| ApiError::Admission("the selected Envelope is not active".to_owned()))?;
+            "the resolved Envelope is not active".to_owned()
+        })
+    })?;
     let effective_requirements = match &definition.requires {
         Some(requirements) => requirements.clone(),
         None => direct_requirements_from_envelope(&approved.spec)?,
@@ -2225,9 +2217,11 @@ where
             .map_err(|error| ApiError::Admission(format!("{error:?}")))?,
         AdmissionDecision::Admit
     ) {
-        return Err(ApiError::Admission(
-            "direct package requirements exceed the selected Envelope".to_owned(),
-        ));
+        return Err(ApiError::Admission(if explicit_envelope {
+            "direct package requirements exceed the selected Envelope".to_owned()
+        } else {
+            "direct package requirements exceed the resolved Envelope".to_owned()
+        }));
     }
     let (command, execution_binding) =
         resolve_direct_execution_plan(config, &definition, &prompt, &spec)?;
@@ -2238,12 +2232,63 @@ where
         closure,
         closure_digest,
         diagnostics: manifest.effective_diagnostics(),
-        envelope: envelope.clone(),
+        envelope,
         effective_requirements,
         spec,
         command,
         execution_binding,
     })
+}
+
+async fn resolve_direct_user_envelope<L>(
+    ledger: &L,
+    owner_user_id: &CanonicalUserId,
+    selector: Option<&EnvelopeDigest>,
+) -> Result<EnvelopeRequestRecord, ApiError>
+where
+    L: TaskSubmissionLedger,
+{
+    let mut envelopes = match selector {
+        Some(digest) => ledger
+            .active_provisioned_user_envelopes_by_digest(owner_user_id, digest)
+            .await
+            .map_err(ApiError::Store)?,
+        None => ledger
+            .active_provisioned_user_envelopes(owner_user_id)
+            .await
+            .map_err(ApiError::Store)?,
+    };
+    if envelopes.len() != 1 {
+        return match (selector, envelopes.is_empty()) {
+            (Some(_), true) => Err(ApiError::Admission(
+                "the selected Envelope is not active".to_owned(),
+            )),
+            (Some(_), false) => Err(ApiError::Conflict(
+                "multiple active Envelopes have the selected digest".to_owned(),
+            )),
+            (None, true) => Err(ApiError::Admission(
+                "the authenticated user has no active provisioned User Envelope".to_owned(),
+            )),
+            (None, false) => Err(ApiError::Conflict(
+                "multiple active provisioned User Envelopes are ambiguous".to_owned(),
+            )),
+        };
+    }
+    let envelope = envelopes
+        .pop()
+        .ok_or_else(|| ApiError::Admission("User Envelope resolution failed closed".to_owned()))?;
+    if envelope.owner_user_id != *owner_user_id
+        || envelope.status != steward_store::EnvelopeRequestStatus::Provisioned
+        || envelope.envelope_instance_id.is_none()
+        || envelope.envelope_digest.is_none()
+    {
+        return Err(ApiError::Admission(if selector.is_some() {
+            "the selected Envelope is not active".to_owned()
+        } else {
+            "the resolved Envelope is not active".to_owned()
+        }));
+    }
+    Ok(envelope)
 }
 
 fn direct_task_evidence(

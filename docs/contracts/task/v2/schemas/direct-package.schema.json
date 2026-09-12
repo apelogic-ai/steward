@@ -89,7 +89,7 @@
     },
     "invocationManifest": {
       "type": "object",
-      "required": ["contractVersion", "package", "envelope"],
+      "required": ["contractVersion", "package"],
       "properties": {
         "contractVersion": { "$ref": "#/$defs/contractVersion" },
         "package": { "$ref": "#/$defs/packageReference" },

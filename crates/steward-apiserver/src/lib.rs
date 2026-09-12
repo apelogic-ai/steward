@@ -3400,6 +3400,13 @@ mod tests {
         .map_err(|error| format!("checked-in direct manifest fixture is invalid: {error}"))
     }
 
+    fn unpinned_direct_manifest() -> Result<serde_json::Value, String> {
+        serde_json::from_str(include_str!(
+            "../../../docs/contracts/task/v2/fixtures/positive/invocation-manifest-unpinned.json"
+        ))
+        .map_err(|error| format!("checked-in unpinned direct manifest fixture is invalid: {error}"))
+    }
+
     fn direct_definition_no_skills() -> Result<serde_json::Value, String> {
         serde_json::from_str(include_str!(
             "../../../docs/contracts/task/v2/fixtures/positive/task-definition-no-skills.json"
@@ -9293,6 +9300,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_package_without_selector_rejects_zero_or_multiple_active_envelopes()
+    -> Result<(), String> {
+        let no_envelope_ledger = versioned_task_ledger()?;
+        authorize_direct_source(&no_envelope_ledger)?;
+        no_envelope_ledger
+            .user_envelopes
+            .lock()
+            .map_err(|_| "fake User Envelope ledger lock was poisoned")?
+            .clear();
+        let no_envelope_git = direct_git_fixture(
+            unpinned_direct_manifest()?,
+            direct_definition_no_skills()?,
+            None,
+        )?;
+        assert_direct_rejection_before_reservation(
+            &no_envelope_ledger,
+            direct_test_app(no_envelope_ledger.clone(), no_envelope_git)?,
+            "direct-unpinned-no-envelope",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "no active provisioned User Envelope",
+        )
+        .await?;
+
+        let ambiguous_ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ambiguous_ledger)?;
+        {
+            let mut envelopes = ambiguous_ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+            let mut second = envelopes
+                .first()
+                .cloned()
+                .ok_or_else(|| "fixture requires one active User Envelope".to_owned())?;
+            second.id = Uuid::from_u128(42);
+            second.envelope_instance_id = Some("envelope-instance-2".to_owned());
+            second.envelope_digest = Some(format!("sha256:{}", "d".repeat(64)));
+            envelopes.push(second);
+        }
+        let ambiguous_git = direct_git_fixture(
+            unpinned_direct_manifest()?,
+            direct_definition_no_skills()?,
+            None,
+        )?;
+        assert_direct_rejection_before_reservation(
+            &ambiguous_ledger,
+            direct_test_app(ambiguous_ledger.clone(), ambiguous_git)?,
+            "direct-unpinned-ambiguous-envelope",
+            StatusCode::CONFLICT,
+            "multiple active provisioned User Envelopes are ambiguous",
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn direct_package_rejects_over_authority_requirements_before_reservation()
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
@@ -9303,7 +9365,7 @@ mod tests {
         .map_err(|error| format!("checked-in direct TaskDefinition fixture is invalid: {error}"))?;
         let mut definition = direct_definition_no_skills()?;
         definition["requires"] = requirements_fixture["requires"].clone();
-        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let git = direct_git_fixture(unpinned_direct_manifest()?, definition, None)?;
         let app = direct_test_app(ledger.clone(), git)?;
 
         assert_direct_rejection_before_reservation(
@@ -9311,7 +9373,7 @@ mod tests {
             app,
             "direct-over-authority",
             StatusCode::UNPROCESSABLE_ENTITY,
-            "exceed the selected Envelope",
+            "exceed the resolved Envelope",
         )
         .await
     }
@@ -9342,7 +9404,7 @@ mod tests {
         authorize_direct_source(&ledger)?;
         let mut definition = direct_definition_no_skills()?;
         definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
-        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let git = direct_git_fixture(unpinned_direct_manifest()?, definition, None)?;
         let app = direct_test_app(ledger.clone(), git)?;
 
         let response = app
@@ -9388,6 +9450,21 @@ mod tests {
             Some("654321")
         );
         assert_eq!(
+            body.pointer("/evidence/envelope/uid")
+                .and_then(|value| value.as_str()),
+            Some("00000000-0000-0000-0000-000000000029")
+        );
+        assert_eq!(
+            body.pointer("/evidence/envelope/revision")
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(
+            body.pointer("/evidence/envelope/digest")
+                .and_then(|value| value.as_str()),
+            Some(format!("steward:sha256:{}", "b".repeat(64)).as_str())
+        );
+        assert_eq!(
             body.pointer("/evidence/closure/entries/0/kind")
                 .and_then(|value| value.as_str()),
             Some("prompt"),
@@ -9402,6 +9479,80 @@ mod tests {
             body.pointer("/diagnostics/executionLog")
                 .and_then(|value| value.as_str()),
             Some("full")
+        );
+        assert_eq!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .len(),
+            1
+        );
+        assert_eq!(
+            ledger
+                .task_operations
+                .lock()
+                .map_err(|_| "fake task-operation ledger lock was poisoned")?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_package_retry_cannot_change_the_resolved_envelope_evidence()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        let git = direct_git_fixture(unpinned_direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "direct-unpinned-envelope-retry")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "contractVersion": "steward.task/v2",
+                        "invocationPath": ".steward/tasks/release-summary.json",
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build direct-package retry: {error}"))
+        };
+
+        let first = app
+            .clone()
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("submit initial direct package: {error}"))?;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+
+        {
+            let mut envelopes = ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+            let envelope = envelopes
+                .first_mut()
+                .ok_or_else(|| "fixture requires one active User Envelope".to_owned())?;
+            envelope.id = Uuid::from_u128(42);
+            envelope.envelope_instance_id = Some("envelope-instance-2".to_owned());
+            envelope.envelope_digest = Some(format!("sha256:{}", "d".repeat(64)));
+        }
+
+        let retry = app
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("retry direct package after Envelope rotation: {error}"))?;
+        assert_eq!(
+            retry.status(),
+            StatusCode::CONFLICT,
+            "an idempotent retry must not silently bind to newly resolved authority"
         );
         assert_eq!(
             ledger

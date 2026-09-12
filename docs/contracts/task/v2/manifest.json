@@ -15,6 +15,7 @@
   "fixtures": [
     { "path": "fixtures/positive/direct-task-submission.json", "definition": "directTaskSubmission", "valid": true },
     { "path": "fixtures/positive/invocation-manifest.json", "definition": "invocationManifest", "valid": true },
+    { "path": "fixtures/positive/invocation-manifest-unpinned.json", "definition": "invocationManifest", "valid": true },
     { "path": "fixtures/positive/invocation-manifest-trigger.json", "definition": "invocationManifest", "valid": true },
     { "path": "fixtures/positive/direct-task-status.json", "definition": "directTaskStatusResponse", "valid": true },
     { "path": "fixtures/positive/task-definition-no-skills.json", "definition": "taskDefinition", "valid": true },

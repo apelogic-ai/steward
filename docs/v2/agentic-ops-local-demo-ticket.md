@@ -32,7 +32,8 @@ source authorization, GitHub connection, and Envelope are prepared beforehand.
 - package path: `catalog/release-summary/v1/task-definition.json`;
 - package behavior: one prompt, no skills, omitted `requires`;
 - input: a workflow-dispatch run URL belonging to `apelogic-ai/gitops`;
-- Envelope: approved in Steward UI and referenced by `steward:sha256` digest;
+- Envelope: provisioned and approved for the demo user in Steward UI, with no product
+  configuration pin;
 - provider path: GitHub MCP through MCP-GW with real read-only calls;
 - result: `out/release-summary-<run-id>.md`; and
 - diagnostics: successful agent stdout and stderr replayed in GHA after a sensitive
@@ -41,8 +42,8 @@ source authorization, GitHub connection, and Envelope are prepared beforehand.
 ## Presentation flow
 
 1. Show the reviewed package and invocation manifest in Git.
-2. Show the approved Envelope in Steward UI and confirm the digest matches the
-   manifest.
+2. Show the approved User Envelope in Steward UI and the absence of an Envelope
+   selector in the invocation manifest.
 3. Dispatch the ordinary `apelogic-ai/gitops` workflow with a valid run URL.
 4. Show Identity-authenticated source resolution and Task creation.
 5. Show the exact package repository, commit, path, and closure digest in evidence.
@@ -57,7 +58,7 @@ source authorization, GitHub connection, and Envelope are prepared beforehand.
   Task reservation;
 - an unauthorized cross-repository source is rejected before package content is
   trusted;
-- an absent or non-active Envelope digest is rejected;
+- zero or multiple active provisioned User Envelopes are rejected;
 - a workflow token or caller-supplied Git credential cannot replace the GitHub App
   source boundary;
 - a run URL outside the allowed neutral fixture repository is rejected by the caller

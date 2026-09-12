@@ -39,7 +39,6 @@ The fetched invocation manifest has this exact shape:
     "commit": "git:sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "path": "catalog/release-summary/v1/task-definition.json"
   },
-  "envelope": "steward:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "diagnostics": {
     "executionLog": "full"
   }
@@ -52,8 +51,12 @@ when the package repository equals the invoking repository; Steward immediately
 resolves it to the verified `triggeredSha`. Branches, tags, abbreviated SHAs, and
 caller-provided credentials fail closed.
 
-`envelope` selects one active caller-authorized Envelope by approved content digest.
-It is not an Envelope UUID. Internal Envelope UID and revision appear only in evidence.
+When `envelope` is absent, Steward resolves exactly one active provisioned Envelope
+owned by the authenticated user. Zero matches fail closed and multiple matches are
+ambiguous. During the backward-compatible rollout, an optional `envelope` value may
+still select one active caller-authorized Envelope by approved content digest. It is
+not an Envelope UUID. Product configuration should omit it; internal Envelope UID,
+revision, and digest remain mandatory immutable evidence.
 
 Missing diagnostics, `{}`, or `executionLog: off` means no caller-visible execution
 transcript. A v2 create/status representation always returns the server-snapshotted
@@ -81,7 +84,7 @@ Its instruction and asset paths resolve relative to the descriptor directory. A
 future executable kind requires a new skill schema and explicit runtime and Envelope
 authority; this v1 schema can never acquire executable meaning.
 
-Omitted `requires` means the selected Envelope's entire approved authority values
+Omitted `requires` means the resolved Envelope's entire approved authority values
 become effective. A present `requires` object is a complete narrower candidate: its
 `authority` contains all of `llms`, `tools`, `budget`, `ttl`, and `runner`. Empty arrays
 express an explicit empty set. `budget.singleRunLimit` and the runner `memory`,

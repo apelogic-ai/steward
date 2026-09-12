@@ -314,7 +314,8 @@ impl DirectTaskSubmission {
 pub struct InvocationManifest {
     pub contract_version: String,
     pub package: PackageReference,
-    pub envelope: EnvelopeDigest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<EnvelopeDigest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<DiagnosticsRequest>,
 }
