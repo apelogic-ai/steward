@@ -276,6 +276,12 @@ export type BrowserRunView = {
     workflowVersion?: number | null;
 };
 
+export type BrowserServiceEnvelopeResponse = {
+    apiVersion: string;
+    envelope: BrowserEnvelope;
+    service: string;
+};
+
 export type Budget = {
     currency: string;
     monthlyLimit: string;
@@ -1479,6 +1485,38 @@ export type AgentRunTimelineContractResponses = {
 };
 
 export type AgentRunTimelineContractResponse = AgentRunTimelineContractResponses[keyof AgentRunTimelineContractResponses];
+
+export type GetAdminServiceEnvelopeData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/service-envelope';
+};
+
+export type GetAdminServiceEnvelopeErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * The managed Service Envelope is not provisioned
+     */
+    404: unknown;
+    /**
+     * The managed Service Envelope is unavailable
+     */
+    503: unknown;
+};
+
+export type GetAdminServiceEnvelopeResponses = {
+    200: BrowserServiceEnvelopeResponse;
+};
+
+export type GetAdminServiceEnvelopeResponse = GetAdminServiceEnvelopeResponses[keyof GetAdminServiceEnvelopeResponses];
 
 export type SessionData = {
     body?: never;

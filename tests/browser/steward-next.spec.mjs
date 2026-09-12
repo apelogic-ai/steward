@@ -70,7 +70,19 @@ const adminEnvelope = {
   spec: {
     ...envelope.spec,
     budget: { ...envelope.spec.budget, singleRunLimit: "2.50" },
-    llms: [{ provider: "openai", model: "gpt-5.4" }],
+    llms: [{ provider: "provider-a", model: "model-a" }],
+  },
+};
+
+const serviceEnvelope = {
+  ...envelope,
+  revision: 7,
+  spec: {
+    ...envelope.spec,
+    llms: [
+      { provider: "provider-a", model: "model-a" },
+      { provider: "provider-b", model: "model-b" },
+    ],
   },
 };
 
@@ -414,6 +426,8 @@ async function guardedPage(browser, {
   },
   mutationFailures = {},
   runPhase = "succeeded",
+  serviceEnvelopeModels = serviceEnvelope.spec.llms,
+  serviceEnvelopeStatus = 200,
   session = developerSession,
   viewport = { width: 1280, height: 800 },
 } = {}) {
@@ -544,6 +558,16 @@ async function guardedPage(browser, {
       { memberRole: "developer", envelope },
     ],
   }));
+  await context.route(`${origin}/admin/api/v1/service-envelope`, (route) => serviceEnvelopeStatus === 200
+    ? json(route, {
+      apiVersion: "steward.browser-admin/v1",
+      service: "steward-run",
+      envelope: {
+        ...serviceEnvelope,
+        spec: { ...serviceEnvelope.spec, llms: serviceEnvelopeModels },
+      },
+    })
+    : route.fulfill({ status: serviceEnvelopeStatus, body: "" }));
   await context.route(`${origin}/admin/api/v1/workflows`, async (route) => {
     if (route.request().method() === "POST") {
       await route.continue();
@@ -1139,18 +1163,22 @@ test("administrator templates and approvals use typed browser authority", async 
     await expect(administrator.page.getByRole("textbox", { name: "TTL" })).toHaveValue("4h");
     await expect(administrator.page.getByRole("combobox", { name: "Currency" })).toHaveValue("USD");
     await expect(administrator.page.getByRole("combobox", { name: "Currency" }).locator("option")).toHaveText(["USD"]);
-    await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText(["openai/gpt-5.4"]);
+    await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText(["provider-a/model-a"]);
     const model = administrator.page.getByRole("combobox", { name: "Model" });
-    await expect(model).toHaveValue("openai/gpt-5.4");
+    await expect(model).toHaveValue("provider-a/model-a");
     await expect(model.locator("option")).toHaveText([
-      "openai/gpt-5.4",
-      "openai/gpt-5.3",
-      "anthropic/claude-opus-4",
-      "google/gemini-2.5-pro",
+      "provider-a/model-a",
+      "provider-b/model-b",
     ]);
     await expect(model.locator("option").nth(0)).toBeEnabled();
-    for (const option of await model.locator("option").all().then((options) => options.slice(1))) await expect(option).toHaveAttribute("disabled", "");
-    await expect(administrator.page.getByText("Only GPT-5.4 is currently available. Other models are disabled.", { exact: true })).toHaveCount(0);
+    await expect(model.locator("option").nth(1)).toBeEnabled();
+    await expect(model.locator("option", { hasText: "openai/gpt-5.4" })).toHaveCount(0);
+    await model.selectOption("provider-b/model-b");
+    await administrator.page.getByRole("button", { name: "Add model" }).click();
+    await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText([
+      "provider-a/model-a",
+      "provider-b/model-b",
+    ]);
 
     const toolProvider = administrator.page.getByRole("combobox", { name: "Tool provider" });
     await expect(toolProvider).toHaveValue("github");
@@ -1182,12 +1210,20 @@ test("administrator templates and approvals use typed browser authority", async 
       monthlyLimit: "30.00",
       singleRunLimit: "3.00",
     });
+    expect(templateMutation.body.spec.llms).toEqual(serviceEnvelope.spec.llms);
     await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("reviewer");
     await administrator.page.getByRole("button", { name: "Save as new" }).click();
     await expect.poll(() => administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/reviewer")).toBe(true);
     const copiedTemplate = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/reviewer");
     expectMutationProof(copiedTemplate);
     expect(copiedTemplate.body.revision).toBe(1);
+
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/new`);
+    await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText(["provider-a/model-a"]);
+    await expect(administrator.page.getByRole("combobox", { name: "Model" }).locator("option")).toHaveText([
+      "provider-a/model-a",
+      "provider-b/model-b",
+    ]);
 
     await administrator.page.goto(`${origin}/admin/approvals`);
     await expect(administrator.page.getByRole("heading", { name: "Pending approvals" })).toBeVisible();
@@ -1220,6 +1256,55 @@ test("administrator templates and approvals use typed browser authority", async 
 
     await administrator.page.goto(`${origin}/admin/settings`);
     await expect(administrator.page.getByRole("heading", { name: "Administrator session" })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator template model controls fail closed when the Service Envelope has no models", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    serviceEnvelopeModels: [],
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
+    const model = administrator.page.getByRole("combobox", { name: "Model" });
+    await expect(model).toBeDisabled();
+    await expect(model.locator("option")).toHaveText(["No models available"]);
+    await expect(administrator.page.getByRole("button", { name: "Add model" })).toBeDisabled();
+    await expect(administrator.page.getByText("The current Service Envelope does not allow any models.", { exact: true })).toBeVisible();
+    await expect(model.locator("option", { hasText: "openai/gpt-5.4" })).toHaveCount(0);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator template authoring rejects models outside the current Service Envelope", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    serviceEnvelopeModels: [{ provider: "provider-b", model: "model-b" }],
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect(administrator.page.getByText("The template ID or envelope fields are invalid, so no authority was changed.", { exact: true })).toBeVisible();
+    expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator template authoring has no fallback when the Service Envelope is absent", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    expectedHttpStatuses: [404],
+    serviceEnvelopeStatus: 404,
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
+    await expect(administrator.page.getByRole("heading", { name: "Not found" })).toBeVisible();
+    await expect(administrator.page.getByRole("combobox", { name: "Model" })).toHaveCount(0);
+    await expect(administrator.page.getByText("openai/gpt-5.4", { exact: true })).toHaveCount(0);
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1267,7 +1352,7 @@ test("the deployed admin template contract is accepted during the rolling Next c
     await expect(administrator.page.getByText("Current revision 4")).toBeVisible();
     await administrator.page.getByRole("combobox", { name: "Limit type" }).selectOption("monthly");
     await expect(administrator.page.getByRole("textbox", { name: "Limit amount (USD)" })).toHaveValue("25.00");
-    await expect(administrator.page.getByText("provider-a/model-a", { exact: true })).toBeVisible();
+    await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText(["provider-a/model-a"]);
   } finally {
     await closeGuardedPage(administrator);
   }

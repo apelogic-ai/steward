@@ -25,6 +25,7 @@ use crate::{
 };
 
 const BROWSER_ADMIN_API_VERSION: &str = "steward.browser-admin/v1";
+const MANAGED_SERVICE: &str = "steward-run";
 
 #[derive(Clone)]
 pub(crate) struct BrowserAdminState<R, L, D> {
@@ -53,6 +54,14 @@ pub(crate) struct BrowserEnvelopeTemplateListItem {
 pub(crate) struct BrowserEnvelopeTemplateListResponse {
     api_version: &'static str,
     templates: Vec<BrowserEnvelopeTemplateListItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserServiceEnvelopeResponse {
+    api_version: &'static str,
+    service: &'static str,
+    envelope: BrowserEnvelope,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -202,6 +211,10 @@ where
             "/admin/api/v1/envelope-templates/{member_role}",
             get(get_envelope_template::<R, L, D>).post(author_envelope_template::<R, L, D>),
         )
+        .route(
+            "/admin/api/v1/service-envelope",
+            get(get_service_envelope::<R, L, D>),
+        )
         .route("/admin/api/v1/approvals", get(list_approvals::<R, L, D>))
         .route(
             "/admin/api/v1/envelope-requests/{request_id}/approve",
@@ -224,6 +237,40 @@ where
             ledger,
             decisions,
         })
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "getAdminServiceEnvelope",
+    path = "/admin/api/v1/service-envelope",
+    responses(
+        (status = 200, body = BrowserServiceEnvelopeResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role is required"),
+        (status = 404, description = "The managed Service Envelope is not provisioned"),
+        (status = 503, description = "The managed Service Envelope is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn get_service_envelope<R, L, D>(
+    Extension(_authority): Extension<BrowserAdminAuthority>,
+    State(state): State<BrowserAdminState<R, L, D>>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    match state.ledger.latest_service_envelope(MANAGED_SERVICE).await {
+        Ok(Some(envelope)) => Json(BrowserServiceEnvelopeResponse {
+            api_version: BROWSER_ADMIN_API_VERSION,
+            service: MANAGED_SERVICE,
+            envelope: envelope.into(),
+        })
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => ApiError::Store(error).into_response(),
+    }
 }
 
 #[utoipa::path(

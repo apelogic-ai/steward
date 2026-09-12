@@ -366,6 +366,7 @@ pub struct GrantRevocationRequest {
         connections::start_connection,
         connections::disconnect_connection,
         browser_admin::get_envelope_template,
+        browser_admin::get_service_envelope,
         browser_admin::list_envelope_templates,
         browser_admin::author_envelope_template,
         browser_admin::list_approvals,
@@ -4179,6 +4180,7 @@ mod tests {
                 "204",
             ),
             ("/paths/~1admin~1api~1v1~1envelope-templates/get", "200"),
+            ("/paths/~1admin~1api~1v1~1service-envelope/get", "200"),
             (
                 "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/get",
                 "200",
@@ -4353,6 +4355,54 @@ mod tests {
             templates.pointer("/templates/0/envelope/revision"),
             Some(&serde_json::json!(3))
         );
+
+        let service_envelope = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/service-envelope")
+                    .header(header::COOKIE, &admin_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build admin service-envelope request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute admin service-envelope request: {error}"))?;
+        assert_eq!(service_envelope.status(), StatusCode::OK);
+        let service_envelope_body = to_bytes(service_envelope.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read admin service-envelope response: {error}"))?;
+        let service_envelope: serde_json::Value = serde_json::from_slice(&service_envelope_body)
+            .map_err(|error| format!("decode admin service-envelope response: {error}"))?;
+        assert_eq!(
+            service_envelope.pointer("/service"),
+            Some(&serde_json::json!("steward-run"))
+        );
+        assert_eq!(
+            service_envelope.pointer("/envelope/spec/llms/0"),
+            Some(&serde_json::json!({
+                "provider": "provider-a",
+                "model": "model-a"
+            }))
+        );
+
+        *admin_ledger
+            .missing_service_envelope
+            .lock()
+            .map_err(|_| "fake service-envelope lock was poisoned")? = true;
+        let missing_service_envelope = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/service-envelope")
+                    .header(header::COOKIE, &admin_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| {
+                        format!("build missing admin service-envelope request: {error}")
+                    })?,
+            )
+            .await
+            .map_err(|error| format!("execute missing admin service-envelope request: {error}"))?;
+        assert_eq!(missing_service_envelope.status(), StatusCode::NOT_FOUND);
 
         let template = admin_app
             .clone()
@@ -5496,6 +5546,7 @@ mod tests {
     #[derive(Clone)]
     struct FakeLedger {
         envelope: Arc<Mutex<Envelope>>,
+        missing_service_envelope: Arc<Mutex<bool>>,
         envelope_authors: Arc<Mutex<Vec<(String, String, Envelope)>>>,
         grants: Vec<AdmissionDelta>,
         parked: ParkedRows,
@@ -5660,6 +5711,13 @@ mod tests {
             _service: &'a str,
         ) -> BoxFuture<'a, Result<Option<Envelope>, StoreError>> {
             Box::pin(async move {
+                if *self
+                    .missing_service_envelope
+                    .lock()
+                    .map_err(|_| StoreError::Database("fake ledger lock was poisoned".to_owned()))?
+                {
+                    return Ok(None);
+                }
                 self.envelope
                     .lock()
                     .map(|envelope| Some(envelope.clone()))
@@ -6750,24 +6808,26 @@ mod tests {
     }
 
     fn ledger() -> FakeLedger {
-        FakeLedger {
-            envelope: Arc::new(Mutex::new(Envelope {
-                revision: 3,
-                spec: EnvelopeSpec {
-                    llms: vec![ModelRef {
-                        provider: "provider-a".to_owned(),
-                        model: "model-a".to_owned(),
-                    }],
-                    tools: Vec::new(),
-                    budget: Budget {
-                        monthly_limit: "200.00".to_owned(),
-                        single_run_limit: None,
-                        currency: "USD".to_owned(),
-                    },
-                    ttl: Duration("24h".to_owned()),
-                    runner: steward_types::RunnerRequirements::default(),
+        let envelope = Envelope {
+            revision: 3,
+            spec: EnvelopeSpec {
+                llms: vec![ModelRef {
+                    provider: "provider-a".to_owned(),
+                    model: "model-a".to_owned(),
+                }],
+                tools: Vec::new(),
+                budget: Budget {
+                    monthly_limit: "200.00".to_owned(),
+                    single_run_limit: None,
+                    currency: "USD".to_owned(),
                 },
-            })),
+                ttl: Duration("24h".to_owned()),
+                runner: steward_types::RunnerRequirements::default(),
+            },
+        };
+        FakeLedger {
+            envelope: Arc::new(Mutex::new(envelope)),
+            missing_service_envelope: Arc::new(Mutex::new(false)),
             envelope_authors: Arc::new(Mutex::new(Vec::new())),
             grants: Vec::new(),
             parked: Arc::new(Mutex::new(Vec::new())),

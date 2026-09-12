@@ -7,8 +7,10 @@ import { useCallback, useState, type FormEvent } from "react";
 import {
   authorAdminEnvelopeTemplate,
   getAdminEnvelopeTemplate,
+  getAdminServiceEnvelope,
   type BrowserEnvelope,
   type BrowserEnvelopeTemplateResponse,
+  type BrowserServiceEnvelopeResponse,
   type ModelRef,
   type RunnerPlatform,
   type ToolGrant,
@@ -32,16 +34,9 @@ type AdminTemplateListResponse = {
 };
 
 const fieldClass = "min-h-11 min-w-0 w-full rounded-md border bg-panel px-3 font-normal";
-const supportedModel = "openai/gpt-5.4";
 const supportedTool = "github:repository:get_file_contents";
 const supportedToolProvider = "github";
 const supportedToolAction = "repository:get_file_contents";
-const modelCatalog = [
-  { value: supportedModel, enabled: true },
-  { value: "openai/gpt-5.3", enabled: false },
-  { value: "anthropic/claude-opus-4", enabled: false },
-  { value: "google/gemini-2.5-pro", enabled: false },
-] as const;
 const toolProviderCatalog = [
   { label: "GitHub", value: supportedToolProvider, enabled: true },
   { label: "GitLab", value: "gitlab", enabled: false },
@@ -62,7 +57,7 @@ export const initialEnvelopeTemplate: BrowserEnvelope = {
       monthlyLimit: "0.10",
       singleRunLimit: "0.10",
     },
-    llms: [{ provider: "openai", model: "gpt-5.4" }],
+    llms: [],
     tools: [],
     ttl: "15m",
     runner: { platforms: ["linux"] },
@@ -133,6 +128,14 @@ function normalizeTemplateList(value: unknown): AdminTemplateListResponse | null
   return { apiVersion: "steward.browser-admin/v1", templates };
 }
 
+function normalizeServiceEnvelopeResponse(value: unknown): BrowserServiceEnvelopeResponse | null {
+  if (!isRecord(value)
+    || value.apiVersion !== "steward.browser-admin/v1"
+    || value.service !== "steward-run"
+    || !isBrowserEnvelope(value.envelope)) return null;
+  return value as BrowserServiceEnvelopeResponse;
+}
+
 async function getAdminEnvelopeTemplates(): Promise<{ data?: unknown; response?: Response }> {
   try {
     const response = await fetch("/admin/api/v1/envelope-templates", {
@@ -155,6 +158,16 @@ function displayName(memberRole: string): string {
 
 function modelValue(model: ModelRef): string {
   return `${model.provider}/${model.model}`;
+}
+
+function initialTemplateForService(serviceEnvelope: BrowserEnvelope): BrowserEnvelope {
+  return {
+    ...initialEnvelopeTemplate,
+    spec: {
+      ...initialEnvelopeTemplate.spec,
+      llms: serviceEnvelope.spec.llms.slice(0, 1),
+    },
+  };
 }
 
 function toolValue(tool: ToolGrant): string {
@@ -232,6 +245,11 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
     path: { member_role: memberRole },
   }), [memberRole]);
   const state = useApiResource<BrowserEnvelopeTemplateResponse>(load);
+  const loadServiceEnvelope = useCallback(() => getAdminServiceEnvelope({
+    cache: "no-store",
+    credentials: "same-origin",
+  }), []);
+  const serviceEnvelopeState = useApiResource<BrowserServiceEnvelopeResponse>(loadServiceEnvelope);
   const normalizedTemplate = state.status === "ready"
     ? normalizeEnvelopeTemplateResponse(state.value, memberRole)
     : null;
@@ -240,6 +258,11 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
       ? { status: "ready" as const, value: normalizedTemplate }
       : { status: "error" as const }
     : state;
+  const acceptedServiceEnvelopeState = serviceEnvelopeState.status === "ready"
+    ? normalizeServiceEnvelopeResponse(serviceEnvelopeState.value)
+      ? { status: "ready" as const, value: normalizeServiceEnvelopeResponse(serviceEnvelopeState.value)! }
+      : { status: "error" as const }
+    : serviceEnvelopeState;
 
   return (
     <section aria-labelledby="page-title" className="space-y-6">
@@ -249,7 +272,15 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
         title="Envelope template"
       />
       <ResourceBoundary state={acceptedState}>{({ envelope }) => (
-        <TemplateEditor csrf={csrf} key={`${memberRole}:${envelope.revision}`} memberRole={memberRole} template={envelope} />
+        <ResourceBoundary state={acceptedServiceEnvelopeState}>{({ envelope: serviceEnvelope }) => (
+          <TemplateEditor
+            csrf={csrf}
+            key={`${memberRole}:${envelope.revision}:${serviceEnvelope.revision}`}
+            memberRole={memberRole}
+            serviceEnvelope={serviceEnvelope}
+            template={envelope}
+          />
+        )}</ResourceBoundary>
       )}</ResourceBoundary>
     </section>
   );
@@ -260,6 +291,20 @@ export function AdminNewEnvelopeTemplateView() {
   if (session.status !== "authenticated") {
     return <EmptyState title="Session unavailable"><p>The authoritative administrator session is not available.</p></EmptyState>;
   }
+  return <AuthenticatedNewTemplate csrf={session.value.csrf} />;
+}
+
+function AuthenticatedNewTemplate({ csrf }: Readonly<{ csrf: string }>) {
+  const load = useCallback(() => getAdminServiceEnvelope({
+    cache: "no-store",
+    credentials: "same-origin",
+  }), []);
+  const state = useApiResource<BrowserServiceEnvelopeResponse>(load);
+  const acceptedState = state.status === "ready"
+    ? normalizeServiceEnvelopeResponse(state.value)
+      ? { status: "ready" as const, value: normalizeServiceEnvelopeResponse(state.value)! }
+      : { status: "error" as const }
+    : state;
   return (
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader
@@ -267,17 +312,28 @@ export function AdminNewEnvelopeTemplateView() {
         description="Author the first immutable revision for a member role. All suggested values remain editable before saving."
         title="Create envelope template"
       />
-      <TemplateEditor create csrf={session.value.csrf} memberRole="" template={initialEnvelopeTemplate} />
+      <ResourceBoundary state={acceptedState}>{({ envelope: serviceEnvelope }) => (
+        <TemplateEditor
+          create
+          csrf={csrf}
+          key={`new:${serviceEnvelope.revision}`}
+          memberRole=""
+          serviceEnvelope={serviceEnvelope}
+          template={initialTemplateForService(serviceEnvelope)}
+        />
+      )}</ResourceBoundary>
     </section>
   );
 }
 
-function TemplateEditor({ create = false, csrf, memberRole, template }: Readonly<{ create?: boolean; csrf: string; memberRole: string; template: BrowserEnvelope }>) {
+function TemplateEditor({ create = false, csrf, memberRole, serviceEnvelope, template }: Readonly<{ create?: boolean; csrf: string; memberRole: string; serviceEnvelope: BrowserEnvelope; template: BrowserEnvelope }>) {
   const router = useRouter();
+  const modelCatalog = serviceEnvelope.spec.llms;
+  const allowedModels = new Set(modelCatalog.map(modelValue));
   const [status, setStatus] = useState<TemplateMutationState>("idle");
   const [currentRevision, setCurrentRevision] = useState(template.revision);
   const [models, setModels] = useState<Array<ModelRef>>(template.spec.llms);
-  const [modelInput, setModelInput] = useState(supportedModel);
+  const [modelInput, setModelInput] = useState(modelCatalog[0] ? modelValue(modelCatalog[0]) : "");
   const [tools, setTools] = useState<Array<ToolGrant>>(template.spec.tools);
   const [toolProviderInput, setToolProviderInput] = useState(supportedToolProvider);
   const [toolInput, setToolInput] = useState(supportedToolAction);
@@ -287,8 +343,9 @@ function TemplateEditor({ create = false, csrf, memberRole, template }: Readonly
   const limitAmount = limitType === "singleRun" ? singleRunLimit : monthlyLimit;
 
   function addModel() {
-    if (modelInput !== supportedModel || models.some((model) => modelValue(model) === supportedModel)) return;
-    setModels([...models, { provider: "openai", model: "gpt-5.4" }]);
+    const selected = modelCatalog.find((model) => modelValue(model) === modelInput);
+    if (!selected || models.some((model) => modelValue(model) === modelInput)) return;
+    setModels([...models, selected]);
   }
 
   function addTool() {
@@ -311,7 +368,7 @@ function TemplateEditor({ create = false, csrf, memberRole, template }: Readonly
       || !monthlyLimit.trim()
       || !singleRunLimit.trim()
       || models.length === 0
-      || models.some((model) => modelValue(model) !== supportedModel)
+      || models.some((model) => !allowedModels.has(modelValue(model)))
       || tools.some((tool) => toolValue(tool) !== supportedTool)) {
       setStatus("rejected");
       return;
@@ -398,16 +455,22 @@ function TemplateEditor({ create = false, csrf, memberRole, template }: Readonly
         <legend className="text-base font-semibold">Models</legend>
         <div className="flex flex-wrap items-end gap-3">
           <label className="grid min-w-64 flex-1 gap-2 text-sm font-semibold">Model
-            <select className={fieldClass} onChange={(event) => setModelInput(event.target.value)} value={modelInput}>
-              {modelCatalog.map((model) => <option disabled={!model.enabled} key={model.value} value={model.value}>{model.value}</option>)}
+            <select className={fieldClass} disabled={modelCatalog.length === 0} onChange={(event) => setModelInput(event.target.value)} value={modelInput}>
+              {modelCatalog.length === 0
+                ? <option value="">No models available</option>
+                : modelCatalog.map((model) => {
+                  const value = modelValue(model);
+                  return <option key={value} value={value}>{value}</option>;
+                })}
             </select>
           </label>
-          <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-50" disabled={models.some((model) => modelValue(model) === modelInput)} onClick={addModel} type="button">Add model</button>
+          <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-50" disabled={!modelInput || models.some((model) => modelValue(model) === modelInput)} onClick={addModel} type="button">Add model</button>
         </div>
+        {modelCatalog.length === 0 ? <p className="text-sm text-muted-ink">The current Service Envelope does not allow any models.</p> : null}
         <ul className="flex flex-wrap gap-2" role="list">
           {models.map((model) => {
             const value = modelValue(model);
-            return <li className={value === supportedModel ? "rounded-full border px-3 py-1.5 text-sm" : "rounded-full border px-3 py-1.5 text-sm text-muted-ink opacity-60"} key={value}>{value}</li>;
+            return <li className={allowedModels.has(value) ? "rounded-full border px-3 py-1.5 text-sm" : "rounded-full border px-3 py-1.5 text-sm text-muted-ink opacity-60"} key={value}>{value}</li>;
           })}
         </ul>
       </fieldset>
