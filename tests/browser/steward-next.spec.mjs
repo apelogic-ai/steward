@@ -551,6 +551,7 @@ async function guardedPage(browser, {
     }
     await json(route, {
       apiVersion: "steward.workflows/v1",
+      agents: [{ agentRef: workflowRevision.agent, displayName: "Codex" }],
       workflows: emptyCollections ? [] : [workflowRevision],
     });
   });
@@ -966,7 +967,7 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await developer.page.goto(`${origin}/connections`);
     await expect(developer.page.getByRole("heading", { name: "GitHub" })).toBeVisible();
     await expect(developer.page.getByText("alice@example.com").last()).toBeVisible();
-    await developer.page.getByRole("checkbox", { name: "I understand this revokes the Steward connection." }).check();
+    await developer.page.getByRole("checkbox", { name: "I understand this revokes the shared Steward connection." }).check();
     await developer.page.getByRole("button", { name: "Disconnect GitHub" }).click();
     await expect.poll(() => developer.mutations.some((mutation) => mutation.path.endsWith("/disconnect"))).toBe(true);
     expectMutationProof(developer.mutations.find((mutation) => mutation.path.endsWith("/disconnect")));
