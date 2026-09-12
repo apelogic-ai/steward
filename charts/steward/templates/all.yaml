@@ -284,6 +284,7 @@ spec:
             - { name: STEWARD_TASK_EXECUTION_BINDINGS_MODE, value: {{ .Values.config.apiserver.executionBindingsMode | quote }} }
             - { name: STEWARD_TASK_EXECUTION_BINDINGS_FILE, value: /run/execution-bindings/execution-bindings.json }
             - { name: STEWARD_TASK_INFERENCE_ENDPOINT, value: {{ .Values.config.apiserver.inferenceEndpoint | quote }} }
+            - { name: STEWARD_TASK_ANTHROPIC_INFERENCE_ENDPOINT, value: {{ .Values.config.apiserver.anthropicInferenceEndpoint | quote }} }
             - { name: STEWARD_TASK_MCP_GW_ENDPOINT, value: {{ .Values.config.apiserver.mcpGatewayEndpoint | quote }} }
 {{- if .Values.githubSource.enabled }}
             - { name: STEWARD_GITHUB_SOURCE_APP_ID, value: {{ .Values.githubSource.appId | quote }} }

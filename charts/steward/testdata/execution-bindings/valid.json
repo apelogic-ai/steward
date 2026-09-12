@@ -20,5 +20,25 @@
         "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
       }
     }
+  }, {
+    "agentRef": "claude-code@2.1.222",
+    "displayName": "Claude Code",
+    "adapter": "claude-code-v1",
+    "image": "registry.example.test/agents/claude-code\u0040sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "executable": "/usr/local/bin/claude",
+    "versionProbe": {
+      "arguments": ["--version"],
+      "expectedStdout": "2.1.222 (Claude Code)"
+    },
+    "providerProfiles": {
+      "tools": {
+        "id": "example-tools-profile-v7",
+        "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "inference": {
+        "id": "example-inference-profile-v7",
+        "digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      }
+    }
   }]
 }

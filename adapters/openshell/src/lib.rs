@@ -454,7 +454,7 @@ fn validate_disposable_execution_binding(
     binding
         .validate()
         .map_err(|reason| PortError::Rejected { reason })?;
-    if binding.adapter != "codex-v1" {
+    if !matches!(binding.adapter.as_str(), "codex-v1" | "claude-code-v1") {
         return Err(PortError::Rejected {
             reason: format!(
                 "persisted execution binding uses unsupported adapter {}",
@@ -4152,6 +4152,31 @@ mod tests {
                 Err(PortError::Rejected { ref reason }) if reason.contains("digest")
             ),
             "runtime projection must recompute the content-bound digest"
+        );
+
+        let mut claude = binding.clone();
+        claude.agent_ref = "claude-code@2.1.222".to_owned();
+        claude.adapter = "claude-code-v1".to_owned();
+        seal_binding(&mut claude)?;
+        assert!(
+            project_request(
+                &SandboxRequest {
+                    runtime: RuntimeId("runtime-uid-claude".to_owned()),
+                    workspace_key: "team-a".to_owned(),
+                    execution_class: SandboxExecutionClass::Agent,
+                    agent_type: AgentType {
+                        name: claude.agent_ref.clone(),
+                    },
+                    models: Vec::new(),
+                    tools: Vec::new(),
+                    refs: RuntimeRefs::default(),
+                    execution_binding: Some(claude),
+                },
+                None,
+                None,
+            )
+            .is_ok(),
+            "the runtime must preserve a registered Claude adapter binding without interpreting it as Codex"
         );
 
         let mut unsupported = binding.clone();

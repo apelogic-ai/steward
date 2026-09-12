@@ -9,6 +9,7 @@ version.workspace = true
 [dependencies]
 axum.workspace = true # Serves the authenticated REST admission and escalation API.
 kube = { workspace = true, features = ["client", "ring", "rustls-tls"] } # Authenticates bearer tokens through Kubernetes TokenReview and writes AgentRuntime desired state.
+steward-adapter-claude-code = { path = "../../adapters/claude-code", version = "=0.0.0" } # Renders Claude Code disposable Task commands behind its stable execution adapter contract.
 steward-adapter-codex = { path = "../../adapters/codex", version = "=0.0.0" } # Renders Codex-specific disposable Task commands behind the neutral execution adapter seam.
 steward-adapter-jira = { path = "../../adapters/jira", version = "=0.0.0" } # Delivers escalation decisions without leaking Jira types into core.
 steward-adapter-github-artifact = { path = "../../adapters/github-artifact", version = "=0.0.0" } # Verifies the same digest-pinned bridge artifact used by controller provisioning.
