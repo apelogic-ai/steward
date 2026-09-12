@@ -534,7 +534,11 @@ where
     D: DecisionChannel + Clone,
 {
     let envelope: Envelope = browser_envelope.into();
-    if member_role.is_empty() || envelope.revision <= 0 || validate_envelope(&envelope).is_err() {
+    if member_role.is_empty()
+        || envelope.revision <= 0
+        || envelope.spec.llms.is_empty()
+        || validate_envelope(&envelope).is_err()
+    {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
     match state.ledger.latest_envelope(&member_role).await {
@@ -549,11 +553,12 @@ where
         Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(error) => return ApiError::Store(error).into_response(),
     };
-    if envelope
-        .spec
-        .llms
-        .iter()
-        .any(|model| !service_envelope.spec.llms.contains(model))
+    if service_envelope.spec.llms.is_empty()
+        || envelope
+            .spec
+            .llms
+            .iter()
+            .any(|model| !service_envelope.spec.llms.contains(model))
     {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }

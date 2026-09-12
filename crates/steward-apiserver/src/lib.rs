@@ -4807,6 +4807,40 @@ mod tests {
             .map_err(|error| format!("submit no-model template: {error}"))?;
         assert_eq!(no_models.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
+        next.spec.llms.clear();
+        let empty_candidate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-templates/engineer")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&next).map_err(|error| error.to_string())?,
+                    ))
+                    .map_err(|error| format!("build empty-candidate template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit empty-candidate template: {error}"))?;
+        assert_eq!(empty_candidate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            ledger
+                .envelope_authors
+                .lock()
+                .map_err(|_| "lock template authors")?
+                .len(),
+            1,
+            "an empty model selection cannot write a new template revision"
+        );
+        next.spec.llms = vec![ModelRef {
+            provider: "provider-b".to_owned(),
+            model: "model-b".to_owned(),
+        }];
+
         *ledger
             .missing_service_envelope
             .lock()
