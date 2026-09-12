@@ -413,6 +413,7 @@ async function stopWeb(instance) {
 }
 
 async function guardedPage(browser, {
+  adminTemplateModels = adminEnvelope.spec.llms,
   legacyAdminTemplate = false,
   malformedAdminTemplate = false,
   mockSignIn = true,
@@ -549,7 +550,10 @@ async function guardedPage(browser, {
       ? { apiVersion: "steward.browser-admin/v1", memberRole }
       : legacyAdminTemplate
         ? { apiVersion: "steward.admin/v1", template: { id: memberRole, revision: 4, envelope } }
-        : { apiVersion: "steward.browser-admin/v1", memberRole, envelope: adminEnvelope });
+        : { apiVersion: "steward.browser-admin/v1", memberRole, envelope: {
+          ...adminEnvelope,
+          spec: { ...adminEnvelope.spec, llms: adminTemplateModels },
+        } });
   });
   await context.route(`${origin}/admin/api/v1/envelope-templates`, (route) => json(route, {
     apiVersion: "steward.browser-admin/v1",
@@ -1289,6 +1293,36 @@ test("administrator template authoring rejects models outside the current Servic
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(administrator.page.getByText("The template ID or envelope fields are invalid, so no authority was changed.", { exact: true })).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator can replace a template model removed from the current Service Envelope", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    adminTemplateModels: [{ provider: "openai", model: "gpt-5.4" }],
+    serviceEnvelopeModels: [{ provider: "anthropic", model: "claude-sonnet-4" }],
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
+    const models = administrator.page.getByRole("group", { name: "Models" });
+    await expect(models.getByRole("listitem")).toContainText("openai/gpt-5.4");
+    await expect(models.getByText("No longer allowed by the current Service Envelope")).toBeVisible();
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect(administrator.page.getByText("The template ID or envelope fields are invalid, so no authority was changed.", { exact: true })).toBeVisible();
+    expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
+
+    await models.getByRole("button", { name: "Remove openai/gpt-5.4" }).click();
+    await expect(models.getByRole("listitem")).toHaveCount(0);
+    await models.getByRole("combobox", { name: "Model" }).selectOption("anthropic/claude-sonnet-4");
+    await models.getByRole("button", { name: "Add model" }).click();
+    await expect(models.getByRole("listitem")).toHaveCount(1);
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
+    const mutation = administrator.mutations.find((entry) => entry.path === "/admin/api/v1/envelope-templates/analyst");
+    expect(mutation.body.spec.llms).toEqual([{ provider: "anthropic", model: "claude-sonnet-4" }]);
+    expect(mutation.body.revision).toBe(adminEnvelope.revision + 1);
   } finally {
     await closeGuardedPage(administrator);
   }

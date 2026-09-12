@@ -516,8 +516,8 @@ where
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
         (status = 409, description = "Envelope revision is not newer than the current revision"),
-        (status = 422, description = "Member role or envelope is invalid"),
-        (status = 503, description = "Envelope templates are unavailable")
+        (status = 422, description = "Member role, envelope, or current Service Envelope model subset is invalid"),
+        (status = 503, description = "Envelope templates or the managed Service Envelope are unavailable")
     ),
     security(("browserSession" = []))
 )]
@@ -543,6 +543,19 @@ where
         }
         Ok(_) => {}
         Err(error) => return ApiError::Store(error).into_response(),
+    }
+    let service_envelope = match state.ledger.latest_service_envelope(MANAGED_SERVICE).await {
+        Ok(Some(service_envelope)) => service_envelope,
+        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => return ApiError::Store(error).into_response(),
+    };
+    if envelope
+        .spec
+        .llms
+        .iter()
+        .any(|model| !service_envelope.spec.llms.contains(model))
+    {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
     match state
         .ledger

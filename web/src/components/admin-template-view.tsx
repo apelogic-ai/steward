@@ -348,6 +348,10 @@ function TemplateEditor({ create = false, csrf, memberRole, serviceEnvelope, tem
     setModels([...models, selected]);
   }
 
+  function removeModel(value: string) {
+    setModels(models.filter((model) => modelValue(model) !== value));
+  }
+
   function addTool() {
     if (`${toolProviderInput}:${toolInput}` !== supportedTool
       || tools.some((tool) => toolValue(tool) === supportedTool)) return;
@@ -470,7 +474,18 @@ function TemplateEditor({ create = false, csrf, memberRole, serviceEnvelope, tem
         <ul className="flex flex-wrap gap-2" role="list">
           {models.map((model) => {
             const value = modelValue(model);
-            return <li className={allowedModels.has(value) ? "rounded-full border px-3 py-1.5 text-sm" : "rounded-full border px-3 py-1.5 text-sm text-muted-ink opacity-60"} key={value}>{value}</li>;
+            const allowed = allowedModels.has(value);
+            return (
+              <li className={allowed ? "flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm" : "flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm text-muted-ink"} key={value}>
+                <span>{value}</span>
+                {!allowed ? <span className="text-xs">No longer allowed by the current Service Envelope</span> : null}
+                <button aria-label={`Remove ${value}`} className="rounded-full p-1 hover:bg-canvas" onClick={() => removeModel(value)} type="button">
+                  <svg aria-hidden="true" className="size-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 12 12">
+                    <path d="M2 2l8 8M10 2l-8 8" />
+                  </svg>
+                </button>
+              </li>
+            );
           })}
         </ul>
       </fieldset>
