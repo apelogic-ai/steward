@@ -345,7 +345,12 @@
                         "maxLength": 200,
                         "pattern": "^[^\\s\\x00-\\x1F\\x7F](?:[^\\x00-\\x1F\\x7F]*[^\\s\\x00-\\x1F\\x7F])?$"
                       },
-                      "adapter": {"type": "string", "enum": ["codex-v1", "claude-code-v1"]},
+                      "adapter": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[a-z](?:[a-z0-9-]{0,126}[a-z0-9])?$"
+                      },
                       "image": {
                         "type": "string",
                         "maxLength": 327,

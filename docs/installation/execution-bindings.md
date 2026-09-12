@@ -25,7 +25,7 @@ The top-level object and every nested object reject unknown fields.
 | `bindings` | yes | Zero to 128 entries; duplicate `agentRef` or derived identities fail startup. |
 | `agentRef` | yes | Opaque exact deployment value, 3–255 bytes, one `@`, lowercase bounded name, version beginning with a digit; `latest` is invalid. |
 | `displayName` | no | Presentation only, 1–200 characters, trimmed, no control characters. The Workflow UI shows it beside the exact reference; it is excluded from execution identity and is never an ownership key. |
-| `adapter` | yes | Product-supported execution contract. This release accepts `codex-v1` and `claude-code-v1`. |
+| `adapter` | yes | Opaque execution-contract slug: 1–128 characters, starting lowercase, containing only lowercase ASCII letters, digits, or hyphens, and ending alphanumeric. The apiserver adapter registry—not Helm or OpenShell—decides whether the named contract is available. This release registers `codex-v1` and optionally `claude-code-v1` when its endpoint is configured. |
 | `image` | yes | Lowercase OCI repository plus exact `@sha256:` and 64 lowercase hexadecimal digits. Tags are rejected. |
 | `executable` | yes | Absolute normalized path, 2–1024 bytes; no empty, `.` or `..` components. |
 | `versionProbe.arguments` | yes | One to eight process arguments, each 1–128 characters with no control characters. No shell parsing occurs. |
@@ -148,7 +148,9 @@ as unavailable.
 
 The chart validates the structure, writes it to an immutable content-addressed ConfigMap, mounts it
 read-only in the apiserver, sets `STEWARD_TASK_EXECUTION_BINDINGS_FILE`, and changes the pod-template
-checksum when content changes. The catalog is deliberately a ConfigMap, not a Secret. A first
+checksum when content changes. The catalog is deliberately a ConfigMap, not a Secret. Helm validates
+the adapter identifier shape but does not maintain a product-family allowlist; active catalog
+startup fails unless the apiserver has registered every referenced adapter. A first
 upgrade from a release without persisted bindings must keep `executionBindingsMode: staged`; follow
 [the enforced two-stage upgrade](upgrade-execution-bindings.md) before setting it to `active`.
 

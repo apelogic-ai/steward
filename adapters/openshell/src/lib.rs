@@ -454,14 +454,6 @@ fn validate_disposable_execution_binding(
     binding
         .validate()
         .map_err(|reason| PortError::Rejected { reason })?;
-    if !matches!(binding.adapter.as_str(), "codex-v1" | "claude-code-v1") {
-        return Err(PortError::Rejected {
-            reason: format!(
-                "persisted execution binding uses unsupported adapter {}",
-                binding.adapter
-            ),
-        });
-    }
     let mut digest = Sha256::new();
     digest.update(steward_types::TASK_EXECUTION_BINDING_DIGEST_DOMAIN);
     digest.update(
@@ -4154,55 +4146,28 @@ mod tests {
             "runtime projection must recompute the content-bound digest"
         );
 
-        let mut claude = binding.clone();
-        claude.agent_ref = "claude-code@2.1.222".to_owned();
-        claude.adapter = "claude-code-v1".to_owned();
-        seal_binding(&mut claude)?;
+        let mut future = binding.clone();
+        future.adapter = "future-v1".to_owned();
+        seal_binding(&mut future)?;
         assert!(
             project_request(
                 &SandboxRequest {
-                    runtime: RuntimeId("runtime-uid-claude".to_owned()),
+                    runtime: RuntimeId("runtime-uid-d".to_owned()),
                     workspace_key: "team-a".to_owned(),
                     execution_class: SandboxExecutionClass::Agent,
                     agent_type: AgentType {
-                        name: claude.agent_ref.clone(),
+                        name: future.agent_ref.clone(),
                     },
                     models: Vec::new(),
                     tools: Vec::new(),
                     refs: RuntimeRefs::default(),
-                    execution_binding: Some(claude),
+                    execution_binding: Some(future),
                 },
                 None,
                 None,
             )
             .is_ok(),
-            "the runtime must preserve a registered Claude adapter binding without interpreting it as Codex"
-        );
-
-        let mut unsupported = binding.clone();
-        unsupported.adapter = "future-v1".to_owned();
-        seal_binding(&mut unsupported)?;
-        assert!(
-            matches!(
-                project_request(
-                    &SandboxRequest {
-                        runtime: RuntimeId("runtime-uid-d".to_owned()),
-                        workspace_key: "team-a".to_owned(),
-                        execution_class: SandboxExecutionClass::Agent,
-                        agent_type: AgentType {
-                            name: unsupported.agent_ref.clone(),
-                        },
-                        models: Vec::new(),
-                        tools: Vec::new(),
-                        refs: RuntimeRefs::default(),
-                        execution_binding: Some(unsupported),
-                    },
-                    None,
-                    None,
-                ),
-                Err(PortError::Rejected { ref reason }) if reason.contains("unsupported adapter")
-            ),
-            "a rollback must not interpret a persisted newer adapter with Codex semantics"
+            "OpenShell projection must preserve a validated opaque adapter without interpreting it"
         );
         Ok(())
     }
