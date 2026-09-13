@@ -69,8 +69,9 @@ also supply `/bin/sh`, `id`, `mkdir`, `ln`, `tee`, and `cat`, declare a non-root
 remain non-root when OpenShell starts the Task. Claude Code refuses `bypassPermissions` as root, so
 the adapter checks the effective UID and fails closed before its version probe or inference call.
 Image conformance must exercise that non-root entrypoint; a root-only image is not compatible with
-`claude-code-v1`. The adapter passes only the admitted Anthropic model name; it does not select or
-remap a model. The deployment configures the Anthropic-compatible API base URL independently from
+`claude-code-v1`. The adapter passes the admitted provider-qualified Anthropic model group to
+match the runtime-scoped LiteLLM key; it does not select or remap a model. The deployment
+configures the Anthropic-compatible API base URL independently from
 Codex's OpenAI-compatible Responses endpoint.
 
 Before launch, the adapter removes inherited Claude cloud-provider selectors and alternate

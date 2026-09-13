@@ -112,7 +112,7 @@ impl ClaudeCodeTaskExecutionAdapter {
             shell_command,
             "steward-workflow".to_owned(),
             request.workflow_prompt.to_owned(),
-            request.model.model.clone(),
+            format!("{}/{}", request.model.provider, request.model.model),
             self.inference_endpoint.clone(),
             mcp_config,
             config_dir.to_owned(),
@@ -299,7 +299,9 @@ mod tests {
         assert!(shell.contains("exit \"$status\""));
         assert!(shell.contains("ln -s \"$STEWARD_OUTPUT_DIR/out\" out"));
         assert_eq!(plan.command[4], "Review the repository state.");
-        assert_eq!(plan.command[5], "claude-sonnet-example");
+        // LiteLLM grants the runtime key the provider-qualified model group.
+        // Claude must request that same exact group, not its bare model name.
+        assert_eq!(plan.command[5], "anthropic/claude-sonnet-example");
         assert_eq!(plan.command[6], "http://inference.example.test:4000");
         assert_eq!(plan.command[8], "/sandbox/steward-claude");
         assert_eq!(plan.command[9], binding.executable);
