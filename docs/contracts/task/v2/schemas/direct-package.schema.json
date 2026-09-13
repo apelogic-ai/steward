@@ -219,7 +219,8 @@
       "type": "object",
       "required": ["agentRef"],
       "properties": {
-        "agentRef": { "$ref": "#/$defs/agentRef" }
+        "agentRef": { "$ref": "#/$defs/agentRef" },
+        "model": { "$ref": "#/$defs/modelRequirement" }
       },
       "additionalProperties": false
     },

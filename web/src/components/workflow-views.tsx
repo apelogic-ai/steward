@@ -63,7 +63,7 @@ function WorkflowDetail({ workflow }: Readonly<{ workflow: WorkflowRevision }>) 
         <div><h2 className="text-xl font-semibold">{workflow.displayName}</h2><p className="mt-1 font-mono text-xs text-muted-ink">{workflowReference(workflow)}</p></div>
         <PrimaryLink href={`/admin/workflows/${workflow.name}/new-version`}>Create new version</PrimaryLink>
       </div>
-      <DefinitionList items={[["Agent", workflow.agent], ["Content digest", workflow.contentDigest], ["Published", workflow.publishedAt]]} />
+      <DefinitionList items={[["Agent", workflow.agent], ["Model", workflow.model ? `${workflow.model.provider}/${workflow.model.model}` : "Legacy Envelope selection"], ["Content digest", workflow.contentDigest], ["Published", workflow.publishedAt]]} />
       <div><h3 className="text-sm font-semibold">Prompt</h3><pre className="mt-2 whitespace-pre-wrap rounded-md border bg-canvas p-4 text-sm">{workflow.prompt}</pre></div>
     </article>
   );
@@ -88,6 +88,10 @@ function WorkflowForm({ agents, from }: Readonly<{ agents: WorkflowListResponse[
     const data = new FormData(event.currentTarget);
     const content = {
       agent: String(data.get("agent")),
+      model: {
+        provider: String(data.get("modelProvider")),
+        model: String(data.get("modelName")),
+      },
       displayName: String(data.get("displayName")),
       prompt: String(data.get("prompt")),
     };
@@ -107,6 +111,8 @@ function WorkflowForm({ agents, from }: Readonly<{ agents: WorkflowListResponse[
         <label className="grid gap-2 text-sm font-semibold">Name<input className="min-h-11 rounded-md border px-3 font-normal" defaultValue={from?.name ?? ""} disabled={Boolean(from)} name="name" pattern="[a-z](?:[a-z0-9]|-)*[a-z0-9]" required /></label>
         <label className="grid gap-2 text-sm font-semibold">Display name<input className="min-h-11 rounded-md border px-3 font-normal" defaultValue={from?.displayName ?? ""} name="displayName" required /></label>
         <label className="grid gap-2 text-sm font-semibold">Agent<select className="min-h-11 rounded-md border bg-panel px-3 font-normal" defaultValue={from?.agent ?? agents[0].agentRef} name="agent" required>{agents.map((agent) => <option key={agent.agentRef} value={agent.agentRef}>{agent.displayName ?? agent.agentRef} · {agent.agentRef}</option>)}</select></label>
+        <label className="grid gap-2 text-sm font-semibold">Model provider<input className="min-h-11 rounded-md border px-3 font-normal" defaultValue={from?.model?.provider ?? ""} name="modelProvider" required /></label>
+        <label className="grid gap-2 text-sm font-semibold">Model name<input className="min-h-11 rounded-md border px-3 font-normal" defaultValue={from?.model?.model ?? ""} name="modelName" required /></label>
         <label className="grid gap-2 text-sm font-semibold">Prompt<textarea className="min-h-52 rounded-md border p-3 font-normal" defaultValue={from?.prompt ?? ""} name="prompt" required /></label>
         {submission !== "idle" && submission !== "submitting" ? <p className="text-sm text-red-800" role="alert">{{ conflict: "This Workflow name or version was published concurrently.", rejected: "The Workflow content was rejected.", forbidden: "The authorization boundary rejected publication.", unavailable: "The Workflow service is unavailable.", error: "The Workflow could not be published." }[submission]}</p> : null}
         <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Publishing…" : from ? "Publish new version" : "Publish workflow"}</button>

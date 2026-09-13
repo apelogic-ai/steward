@@ -7212,6 +7212,7 @@ mod tests {
                 version: 1,
                 display_name: "Repository review".to_owned(),
                 agent: TEST_VERSIONED_AGENT.to_owned(),
+                model: None,
                 prompt: "Review the repository state that triggered this run.".to_owned(),
                 content_digest: format!("sha256:{}", "a".repeat(64)),
                 published_by: "admin@example.com".to_owned(),
@@ -9813,6 +9814,209 @@ mod tests {
                 .len(),
             1
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_package_selects_one_allowed_model_from_a_wider_envelope() -> Result<(), String>
+    {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        {
+            let mut envelopes = ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+            let envelope = envelopes
+                .first_mut()
+                .ok_or_else(|| "fixture requires a User Envelope".to_owned())?;
+            let additional_model = ModelRef {
+                provider: "anthropic".to_owned(),
+                model: "claude-sonnet-4-6".to_owned(),
+            };
+            envelope
+                .requested_envelope
+                .spec
+                .llms
+                .push(additional_model.clone());
+            envelope
+                .approved_envelope
+                .as_mut()
+                .ok_or_else(|| "fixture requires approved authority".to_owned())?
+                .spec
+                .llms
+                .push(additional_model);
+        }
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["runtime"]["model"] = serde_json::json!({
+            "provider": "openai",
+            "model": "gpt-5.4"
+        });
+        let git = direct_git_fixture(unpinned_direct_manifest()?, definition, None)?;
+        let response = direct_test_app(ledger.clone(), git)?
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "direct-multi-model-envelope")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json"
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build direct Task request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit direct Task: {error}"))?;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read direct Task response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("direct Task response was not JSON: {error}"))?;
+        assert_eq!(status, StatusCode::ACCEPTED, "unexpected response: {body}");
+        assert_eq!(
+            body.pointer("/evidence/effectiveRequirements/authority/llms"),
+            Some(&serde_json::json!([{"provider":"openai","model":"gpt-5.4"}])),
+            "unused Envelope models must not become Task runtime authority"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_package_rejects_a_selected_model_outside_the_user_envelope()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["runtime"]["model"] = serde_json::json!({
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6"
+        });
+        let git = direct_git_fixture(unpinned_direct_manifest()?, definition, None)?;
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            direct_test_app(ledger.clone(), git)?,
+            "direct-unapproved-selected-model",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "selected model is not allowed by the resolved Envelope",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_package_requires_an_unambiguous_model_selection() -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        {
+            let mut envelopes = ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+            let envelope = envelopes
+                .first_mut()
+                .ok_or_else(|| "fixture requires a User Envelope".to_owned())?;
+            let additional_model = ModelRef {
+                provider: "anthropic".to_owned(),
+                model: "claude-sonnet-4-6".to_owned(),
+            };
+            envelope
+                .requested_envelope
+                .spec
+                .llms
+                .push(additional_model.clone());
+            envelope
+                .approved_envelope
+                .as_mut()
+                .ok_or_else(|| "fixture requires approved authority".to_owned())?
+                .spec
+                .llms
+                .push(additional_model);
+        }
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        let git = direct_git_fixture(unpinned_direct_manifest()?, definition, None)?;
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            direct_test_app(ledger.clone(), git)?,
+            "direct-ambiguous-model",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "must select a runtime model",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_package_single_model_requirements_are_admitted_by_a_wider_envelope()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let authority = {
+            let mut envelopes = ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+            let envelope = envelopes
+                .first_mut()
+                .ok_or_else(|| "fixture requires a User Envelope".to_owned())?;
+            let additional_model = ModelRef {
+                provider: "anthropic".to_owned(),
+                model: "claude-sonnet-4-6".to_owned(),
+            };
+            envelope
+                .requested_envelope
+                .spec
+                .llms
+                .push(additional_model.clone());
+            let approved = envelope
+                .approved_envelope
+                .as_mut()
+                .ok_or_else(|| "fixture requires approved authority".to_owned())?;
+            approved.spec.llms.push(additional_model);
+            let mut authority = serde_json::to_value(&approved.spec)
+                .map_err(|error| format!("serialize approved authority: {error}"))?;
+            authority["llms"] = serde_json::json!([{
+                "provider": "openai",
+                "model": "gpt-5.4"
+            }]);
+            authority
+        };
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["requires"] = serde_json::json!({"authority": authority});
+        let git = direct_git_fixture(unpinned_direct_manifest()?, definition, None)?;
+        let response = direct_test_app(ledger, git)?
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "direct-narrow-model-requirements")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json"
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build direct Task request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit direct Task: {error}"))?;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read direct Task response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("direct Task response was not JSON: {error}"))?;
+        assert_eq!(status, StatusCode::ACCEPTED, "unexpected response: {body}");
         Ok(())
     }
 

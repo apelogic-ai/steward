@@ -149,10 +149,14 @@ wire schemas are owned by the contract ticket, but these semantics are fixed:
 - a future executable-skill kind requires a new schema version plus explicit runtime
   capability and Envelope permission;
 - existing instruction-only packages must never become executable implicitly;
-- `requires` omitted means use the resolved Envelope's complete approved authority
-  values;
+- `runtime.model` selects the execution model from the resolved Envelope. For
+  compatibility, it may be omitted when the effective requirements contain
+  exactly one model; a wider model set requires an explicit selection;
+- `requires` omitted means use the resolved Envelope's approved tools, budget,
+  TTL, and runner maxima, with model authority narrowed to `runtime.model`;
 - `requires` present is a complete, explicit request that must be no broader than the
-  resolved Envelope; and
+  resolved Envelope. Its model set must include `runtime.model` when selected,
+  and only the selected model is provisioned for this execution; and
 - Steward records the fully expanded effective requirements in Task evidence.
 
 The v2 package cannot request `shell`, `python3`, or another execution capability.

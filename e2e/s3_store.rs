@@ -127,11 +127,16 @@ async fn workflow_revisions_are_immutable_and_task_pins_are_atomic() -> Result<(
     let workflow_name = format!("repository-review-{suffix}");
     let first_digest = format!("sha256:{}", "a".repeat(64));
     let second_digest = format!("sha256:{}", "b".repeat(64));
+    let selected_model = ModelRef {
+        provider: "openai".to_owned(),
+        model: "gpt-5.4".to_owned(),
+    };
     let first = store
         .publish_initial_workflow(WorkflowPublication {
             name: &workflow_name,
             display_name: "Repository review",
             agent: "codex@0.140.0",
+            model: None,
             prompt: "Review the repository state that triggered this GitHub Actions run.",
             content_digest: &first_digest,
             published_by: "admin@example.com",
@@ -142,6 +147,7 @@ async fn workflow_revisions_are_immutable_and_task_pins_are_atomic() -> Result<(
             name: &workflow_name,
             display_name: "Repository review",
             agent: "codex@0.140.0",
+            model: Some(&selected_model),
             prompt: "Review the repository state and summarize actionable findings.",
             content_digest: &second_digest,
             published_by: "admin@example.com",
@@ -149,6 +155,11 @@ async fn workflow_revisions_are_immutable_and_task_pins_are_atomic() -> Result<(
         .await?;
     assert_eq!(first.version, 1);
     assert_eq!(second.version, 2);
+    assert_eq!(second.model, Some(selected_model));
+    assert_eq!(
+        store.workflow_revision(&workflow_name, 2).await?,
+        Some(second.clone())
+    );
 
     let mutation = sqlx::query(
         "UPDATE workflow_revisions SET prompt = 'mutated' WHERE name = $1 AND version = 1",

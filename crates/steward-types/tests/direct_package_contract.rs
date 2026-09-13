@@ -504,6 +504,22 @@ fn positive_wire_fixtures_parse_and_validate() -> Result<(), String> {
     let narrowed: DirectTaskDefinition =
         parse("fixtures/positive/task-definition-with-requires.json")?;
     narrowed.validate()?;
+    assert_eq!(
+        narrowed.runtime.model.as_ref(),
+        narrowed
+            .requires
+            .as_ref()
+            .and_then(|requirements| requirements.authority.llms.first())
+    );
+    let mut mismatched_model = narrowed.clone();
+    mismatched_model.runtime.model = Some(steward_types::direct_package::ModelRequirement {
+        provider: steward_types::direct_package::Slug::parse("other")?,
+        model: steward_types::direct_package::BoundedText::parse("unrequested-model")?,
+    });
+    assert!(
+        mismatched_model.validate().is_err(),
+        "selected model must be covered by explicit package requirements"
+    );
     let Some(requirements) = narrowed.requires.as_ref() else {
         return Err("narrowed fixture must contain requirements".to_owned());
     };

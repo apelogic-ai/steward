@@ -3,7 +3,8 @@
   "name": "repository-review",
   "version": 2,
   "runtime": {
-    "agentRef": "example-agent@1.2.3"
+    "agentRef": "example-agent@1.2.3",
+    "model": { "provider": "litellm", "model": "review-model" }
   },
   "prompt": "prompt.md",
   "skills": [

@@ -11,7 +11,7 @@ use steward_admission::{
 };
 use steward_types::direct_package::{DirectTaskBindingEvidence, MAX_EXECUTION_STREAM_BYTES};
 use steward_types::{
-    AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
+    AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, ModelRef, OrganizationId,
     OrganizationIdentity, OrganizationIdentityMigration, TaskExecutionBinding,
 };
 use uuid::Uuid;
@@ -48,6 +48,7 @@ pub struct WorkflowRevisionRecord {
     pub version: i64,
     pub display_name: String,
     pub agent: String,
+    pub model: Option<ModelRef>,
     pub prompt: String,
     pub content_digest: String,
     pub published_by: String,
@@ -59,6 +60,7 @@ pub struct WorkflowPublication<'a> {
     pub name: &'a str,
     pub display_name: &'a str,
     pub agent: &'a str,
+    pub model: Option<&'a ModelRef>,
     pub prompt: &'a str,
     pub content_digest: &'a str,
     pub published_by: &'a str,
@@ -184,7 +186,7 @@ impl PgStore {
 
     pub async fn list_latest_workflows(&self) -> Result<Vec<WorkflowRevisionRecord>, StoreError> {
         let rows = sqlx::query(
-            "SELECT DISTINCT ON (name) name, version, display_name, agent, prompt, \
+            "SELECT DISTINCT ON (name) name, version, display_name, agent, model_provider, model_name, prompt, \
                     content_digest, published_by, \
                     to_char(published_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS published_at \
@@ -206,7 +208,7 @@ impl PgStore {
             return Err(StoreError::InvalidWorkflow);
         }
         let row = sqlx::query(
-            "SELECT name, version, display_name, agent, prompt, content_digest, published_by, \
+            "SELECT name, version, display_name, agent, model_provider, model_name, prompt, content_digest, published_by, \
                     to_char(published_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS published_at \
              FROM workflow_revisions WHERE name = $1 AND version = $2",
@@ -262,9 +264,9 @@ impl PgStore {
         };
         let row = sqlx::query(
             "INSERT INTO workflow_revisions \
-             (name, version, display_name, agent, prompt, content_digest, published_by) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             RETURNING name, version, display_name, agent, prompt, content_digest, published_by, \
+             (name, version, display_name, agent, model_provider, model_name, prompt, content_digest, published_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             RETURNING name, version, display_name, agent, model_provider, model_name, prompt, content_digest, published_by, \
                        to_char(published_at AT TIME ZONE 'UTC', \
                                'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS published_at",
         )
@@ -272,6 +274,8 @@ impl PgStore {
         .bind(version)
         .bind(publication.display_name)
         .bind(publication.agent)
+        .bind(publication.model.map(|model| model.provider.as_str()))
+        .bind(publication.model.map(|model| model.model.as_str()))
         .bind(publication.prompt)
         .bind(publication.content_digest)
         .bind(publication.published_by)
@@ -8834,6 +8838,14 @@ fn valid_workflow_publication(publication: &WorkflowPublication<'_>) -> bool {
     !publication.name.is_empty()
         && !publication.display_name.trim().is_empty()
         && !publication.agent.is_empty()
+        && publication.model.is_none_or(|model| {
+            !model.provider.trim().is_empty()
+                && model.provider.trim() == model.provider
+                && !model.provider.chars().any(char::is_control)
+                && !model.model.trim().is_empty()
+                && model.model.trim() == model.model
+                && !model.model.chars().any(char::is_control)
+        })
         && !publication.prompt.trim().is_empty()
         && !publication.content_digest.is_empty()
         && !publication.published_by.trim().is_empty()
@@ -8842,11 +8854,19 @@ fn valid_workflow_publication(publication: &WorkflowPublication<'_>) -> bool {
 fn workflow_revision_record(
     row: sqlx::postgres::PgRow,
 ) -> Result<WorkflowRevisionRecord, StoreError> {
+    let model_provider: Option<String> = row.try_get("model_provider").map_err(database_error)?;
+    let model_name: Option<String> = row.try_get("model_name").map_err(database_error)?;
+    let model = match (model_provider, model_name) {
+        (Some(provider), Some(model)) => Some(ModelRef { provider, model }),
+        (None, None) => None,
+        _ => return Err(StoreError::InvalidWorkflow),
+    };
     Ok(WorkflowRevisionRecord {
         name: row.try_get("name").map_err(database_error)?,
         version: row.try_get("version").map_err(database_error)?,
         display_name: row.try_get("display_name").map_err(database_error)?,
         agent: row.try_get("agent").map_err(database_error)?,
+        model,
         prompt: row.try_get("prompt").map_err(database_error)?,
         content_digest: row.try_get("content_digest").map_err(database_error)?,
         published_by: row.try_get("published_by").map_err(database_error)?,
