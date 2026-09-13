@@ -3187,24 +3187,6 @@ mod workflow_request_tests {
     }
 
     #[test]
-    fn active_catalog_rejects_an_adapter_not_registered_by_the_apiserver() -> Result<(), String> {
-        let mut catalog = serde_json::from_str::<serde_json::Value>(&execution_catalog(
-            "example-agent@1.0.0",
-            'a',
-        )?)
-        .map_err(|error| error.to_string())?;
-        catalog["bindings"][0]["adapter"] = serde_json::json!("unavailable-v1");
-        let result = TaskApiConfig::default()
-            .with_execution_bindings_json(Some(&catalog.to_string()))?
-            .with_execution_bindings_active(true);
-        assert!(
-            result.is_err_and(|reason| reason.contains("uses unavailable adapter")),
-            "an active binding must not name an adapter absent from the running apiserver"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn source_repository_binding_catalog_rejects_invalid_or_duplicate_entries() {
         let unknown_field = serde_json::json!({
             "contractVersion": "steward.source-repository-bindings/v1",
@@ -3309,11 +3291,15 @@ mod workflow_request_tests {
     #[test]
     fn active_execution_catalog_rejects_an_unregistered_adapter() -> Result<(), String> {
         let workflow = workflow();
+        let mut catalog =
+            serde_json::from_str::<serde_json::Value>(&execution_catalog(&workflow.agent, 'a')?)
+                .map_err(|error| error.to_string())?;
+        catalog["bindings"][0]["adapter"] = serde_json::json!("future-v1");
         let result = TaskApiConfig::new(None)?
-            .with_execution_bindings_json(Some(&execution_catalog(&workflow.agent, 'a')?))?
+            .with_execution_bindings_json(Some(&catalog.to_string()))?
             .with_execution_bindings_active(true);
         assert!(
-            result.is_err(),
+            result.is_err_and(|reason| reason.contains("uses unavailable adapter future-v1")),
             "an active catalog must fail startup when no implementation owns its adapter contract"
         );
         Ok(())
