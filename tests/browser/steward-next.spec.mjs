@@ -86,6 +86,11 @@ const serviceEnvelope = {
   },
 };
 
+const githubReadTools = [
+  "actions_get", "actions_list", "get_job_logs", "get_file_contents", "list_commits",
+  "get_commit", "get_release", "list_releases", "get_workflow", "list_workflows",
+].map((resource) => ({ provider: "github", resource, action: "read" }));
+
 const envelopeRequest = {
   id: envelopeId,
   templateId: "developer",
@@ -414,6 +419,7 @@ async function stopWeb(instance) {
 
 async function guardedPage(browser, {
   adminTemplateModels = adminEnvelope.spec.llms,
+  adminTemplateTools = adminEnvelope.spec.tools,
   legacyAdminTemplate = false,
   malformedAdminTemplate = false,
   mockSignIn = true,
@@ -428,6 +434,7 @@ async function guardedPage(browser, {
   mutationFailures = {},
   runPhase = "succeeded",
   serviceEnvelopeModels = serviceEnvelope.spec.llms,
+  serviceEnvelopeTools = serviceEnvelope.spec.tools,
   serviceEnvelopeStatus = 200,
   session = developerSession,
   viewport = { width: 1280, height: 800 },
@@ -552,7 +559,7 @@ async function guardedPage(browser, {
         ? { apiVersion: "steward.admin/v1", template: { id: memberRole, revision: 4, envelope } }
         : { apiVersion: "steward.browser-admin/v1", memberRole, envelope: {
           ...adminEnvelope,
-          spec: { ...adminEnvelope.spec, llms: adminTemplateModels },
+          spec: { ...adminEnvelope.spec, llms: adminTemplateModels, tools: adminTemplateTools },
         } });
   });
   await context.route(`${origin}/admin/api/v1/envelope-templates`, (route) => json(route, {
@@ -568,7 +575,7 @@ async function guardedPage(browser, {
       service: "steward-run",
       envelope: {
         ...serviceEnvelope,
-        spec: { ...serviceEnvelope.spec, llms: serviceEnvelopeModels },
+        spec: { ...serviceEnvelope.spec, llms: serviceEnvelopeModels, tools: serviceEnvelopeTools },
       },
     })
     : route.fulfill({ status: serviceEnvelopeStatus, body: "" }));
@@ -1186,21 +1193,13 @@ test("administrator templates and approvals use typed browser authority", async 
 
     const toolProvider = administrator.page.getByRole("combobox", { name: "Tool provider" });
     await expect(toolProvider).toHaveValue("github");
-    await expect(toolProvider.locator("option")).toHaveText(["GitHub", "GitLab", "Jira"]);
-    await expect(toolProvider.locator("option").nth(0)).toBeEnabled();
-    await expect(toolProvider.locator("option").nth(1)).toHaveAttribute("disabled", "");
-    await expect(toolProvider.locator("option").nth(2)).toHaveAttribute("disabled", "");
+    await expect(toolProvider.locator("option")).toHaveText(["GitHub"]);
 
     const tool = administrator.page.getByRole("combobox", { exact: true, name: "Tool" });
-    await expect(tool).toHaveValue("repository:get_file_contents");
-    await expect(tool.locator("option")).toHaveText([
-      "repository:get_file_contents",
-      "repository:list_issues",
-      "repository:create_issue",
-      "pull_request:get",
-    ]);
+    await expect(tool).toHaveValue(JSON.stringify(["github", "repository", "get_file_contents"]));
+    await expect(tool.locator("option")).toHaveText(["repository:get_file_contents"]);
     await expect(tool.locator("option").nth(0)).toBeEnabled();
-    for (const option of await tool.locator("option").all().then((options) => options.slice(1))) await expect(option).toHaveAttribute("disabled", "");
+    await expect(administrator.page.getByRole("button", { name: "Add tool" })).toBeDisabled();
     const advanced = administrator.page.getByText("Advanced", { exact: true }).locator("..");
     await expect(advanced).not.toHaveAttribute("open", "");
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
@@ -1278,6 +1277,83 @@ test("administrator template model controls fail closed when the Service Envelop
     await expect(administrator.page.getByRole("button", { name: "Add model" })).toBeDisabled();
     await expect(administrator.page.getByText("The current Service Envelope does not allow any models.", { exact: true })).toBeVisible();
     await expect(model.locator("option", { hasText: "openai/gpt-5.4" })).toHaveCount(0);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator can revise and copy a ten-grant template under the current Service Envelope", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    adminTemplateTools: githubReadTools,
+    serviceEnvelopeTools: githubReadTools,
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/developer`);
+    const tools = administrator.page.getByRole("group", { name: "Tools" });
+    await expect(tools.getByRole("listitem")).toHaveCount(10);
+    await expect(tools.getByRole("combobox", { name: "Tool", exact: true }).locator("option")).toHaveCount(10);
+
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer")).toBeTruthy();
+    const revised = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer");
+    expectMutationProof(revised);
+    expect(revised.body.revision).toBe(adminEnvelope.revision + 1);
+    expect(revised.body.spec.tools).toEqual(githubReadTools);
+
+    await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("engineer");
+    await administrator.page.getByRole("button", { name: "Save as new" }).click();
+    await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/engineer")).toBeTruthy();
+    const copied = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/engineer");
+    expectMutationProof(copied);
+    expect(copied.body.revision).toBe(1);
+    expect(copied.body.spec.tools).toEqual(githubReadTools);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator can replace a template tool removed from the current Service Envelope", async ({ browser }) => {
+  const replacement = githubReadTools[0];
+  const administrator = await guardedPage(browser, {
+    serviceEnvelopeTools: [replacement],
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
+    const tools = administrator.page.getByRole("group", { name: "Tools" });
+    await expect(tools.getByText("No longer allowed by the current Service Envelope")).toBeVisible();
+    await expect(tools.getByRole("combobox", { name: "Tool", exact: true }).locator("option")).toHaveText(["actions_get:read"]);
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect(administrator.page.getByRole("alert").filter({ hasText: "no authority was changed" })).toBeVisible();
+    expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
+
+    await tools.getByRole("button", { name: "Remove tool github:repository:get_file_contents" }).click();
+    await tools.getByRole("button", { name: "Add tool" }).click();
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
+    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.spec.tools).toEqual([replacement]);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator template tool controls offer no fallback when the Service Envelope has no tools", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    adminTemplateTools: [],
+    serviceEnvelopeTools: [],
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
+    const tools = administrator.page.getByRole("group", { name: "Tools" });
+    await expect(tools.getByRole("combobox", { name: "Tool provider" })).toBeDisabled();
+    await expect(tools.getByRole("combobox", { name: "Tool", exact: true })).toBeDisabled();
+    await expect(tools.getByRole("button", { name: "Add tool" })).toBeDisabled();
+    await expect(tools.getByText("The current Service Envelope does not allow any tools.")).toBeVisible();
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
+    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.spec.tools).toEqual([]);
   } finally {
     await closeGuardedPage(administrator);
   }

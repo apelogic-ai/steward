@@ -4679,8 +4679,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_admin_template_authoring_rechecks_current_service_models() -> Result<(), String>
-    {
+    async fn browser_admin_template_authoring_rechecks_current_service_models_and_tools()
+    -> Result<(), String> {
         let origin = "http://127.0.0.1:33002";
         let ledger = ledger();
         let (auth, cookie, csrf) = signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
@@ -4715,6 +4715,12 @@ mod tests {
             provider: "provider-b".to_owned(),
             model: "model-b".to_owned(),
         }];
+        let tool = steward_types::ToolGrant {
+            provider: "github".to_owned(),
+            resource: "get_file_contents".to_owned(),
+            action: "read".to_owned(),
+        };
+        rotated.spec.tools = vec![tool.clone()];
         *ledger
             .service_envelope_override
             .lock()
@@ -4726,6 +4732,7 @@ mod tests {
             .map_err(|_| "lock member template")?
             .clone();
         next.revision += 1;
+        next.spec.tools = vec![tool];
         let old_model = app
             .clone()
             .oneshot(
@@ -4776,6 +4783,46 @@ mod tests {
             .await
             .map_err(|error| format!("submit new-model template: {error}"))?;
         assert_eq!(newly_allowed.status(), StatusCode::CREATED);
+
+        ledger
+            .service_envelope_override
+            .lock()
+            .map_err(|_| "lock service envelope")?
+            .as_mut()
+            .ok_or("missing service fixture")?
+            .spec
+            .tools
+            .clear();
+        next.revision += 1;
+        let removed_tool = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-templates/engineer")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&next).map_err(|error| error.to_string())?,
+                    ))
+                    .map_err(|error| format!("build removed-tool template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit removed-tool template: {error}"))?;
+        assert_eq!(removed_tool.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            ledger
+                .envelope_authors
+                .lock()
+                .map_err(|_| "lock template authors")?
+                .len(),
+            1,
+            "a tool removed from the Service Envelope cannot write another template revision"
+        );
+        next.spec.tools.clear();
 
         ledger
             .service_envelope_override

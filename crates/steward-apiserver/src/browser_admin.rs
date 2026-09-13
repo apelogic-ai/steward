@@ -516,7 +516,7 @@ where
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
         (status = 409, description = "Envelope revision is not newer than the current revision"),
-        (status = 422, description = "Member role, envelope, or current Service Envelope model subset is invalid"),
+        (status = 422, description = "Member role, envelope, or current Service Envelope model/tool subset is invalid"),
         (status = 503, description = "Envelope templates or the managed Service Envelope are unavailable")
     ),
     security(("browserSession" = []))
@@ -559,6 +559,11 @@ where
             .llms
             .iter()
             .any(|model| !service_envelope.spec.llms.contains(model))
+        || envelope
+            .spec
+            .tools
+            .iter()
+            .any(|tool| !service_envelope.spec.tools.contains(tool))
     {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
