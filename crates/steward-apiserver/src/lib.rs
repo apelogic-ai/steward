@@ -7212,7 +7212,6 @@ mod tests {
                 version: 1,
                 display_name: "Repository review".to_owned(),
                 agent: TEST_VERSIONED_AGENT.to_owned(),
-                model: None,
                 prompt: "Review the repository state that triggered this run.".to_owned(),
                 content_digest: format!("sha256:{}", "a".repeat(64)),
                 published_by: "admin@example.com".to_owned(),

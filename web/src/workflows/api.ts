@@ -37,7 +37,6 @@ export function getAdminWorkflow(name: string, version: number) {
 
 type WorkflowContent = {
   agent: string;
-  model: { provider: string; model: string };
   displayName: string;
   prompt: string;
 };

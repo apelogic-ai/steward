@@ -412,24 +412,10 @@ fn resolve_versioned_task_plan(
         .approved_envelope
         .as_ref()
         .ok_or(ApiError::MissingEnvelope)?;
-    let model = match workflow.model.as_ref() {
-        Some(model) => {
-            if !approved.spec.llms.contains(model) {
-                return Err(ApiError::Admission(
-                    "selected Workflow model is not allowed by the User Envelope".to_owned(),
-                ));
-            }
-            model
-        }
-        None => match approved.spec.llms.as_slice() {
-            [model] => model,
-            _ => {
-                return Err(ApiError::Admission(
-                    "versioned Workflow revision must select a model when the User Envelope allows multiple models"
-                        .to_owned(),
-                ));
-            }
-        },
+    let [model] = approved.spec.llms.as_slice() else {
+        return Err(ApiError::Admission(
+            "versioned Workflows require exactly one approved model".to_owned(),
+        ));
     };
     let execution_binding = config
         .execution_bindings_active
@@ -490,7 +476,7 @@ fn resolve_versioned_task_plan(
         agent_type: steward_types::AgentType {
             name: workflow.agent.clone(),
         },
-        llms: vec![model.clone()],
+        llms: approved.spec.llms.clone(),
         tools: approved.spec.tools.clone(),
         budget: approved.spec.budget.clone(),
         ttl: approved.spec.ttl.clone(),
@@ -3415,7 +3401,6 @@ mod workflow_request_tests {
             version: 1,
             display_name: "Repository review".to_owned(),
             agent: "example-agent@1.0.0".to_owned(),
-            model: None,
             prompt: "Review the repository state.".to_owned(),
             content_digest: "workflow-digest".to_owned(),
             published_by: "usr_abcdef0123456789abcdef0123456789".to_owned(),
@@ -3559,63 +3544,6 @@ mod workflow_request_tests {
                 .iter()
                 .all(|argument| !argument.contains("example-org")),
             "repository mechanics do not belong to the Workflow execution command"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn versioned_workflow_selects_one_model_from_a_wider_envelope() -> Result<(), String> {
-        let owner = "usr_0123456789abcdef0123456789abcdef";
-        let mut workflow = workflow();
-        workflow.model = Some(steward_types::ModelRef {
-            provider: "openai".to_owned(),
-            model: "gpt-5.4".to_owned(),
-        });
-        let mut envelope = provisioned_envelope(owner)?;
-        envelope
-            .approved_envelope
-            .as_mut()
-            .ok_or_else(|| "fixture requires approved authority".to_owned())?
-            .spec
-            .llms
-            .push(steward_types::ModelRef {
-                provider: "anthropic".to_owned(),
-                model: "claude-sonnet-4-6".to_owned(),
-            });
-        let plan = resolve_versioned_task_plan(
-            &identity(owner)?,
-            workflow,
-            vec![envelope],
-            &task_config(Some("https://mcp-gw.example.test/mcp"))?,
-        )
-        .map_err(|error| format!("selected model was rejected: {error:?}"))?;
-        assert_eq!(
-            plan.spec.llms,
-            vec![steward_types::ModelRef {
-                provider: "openai".to_owned(),
-                model: "gpt-5.4".to_owned(),
-            }],
-            "unused Envelope models must not be provisioned"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn versioned_workflow_rejects_a_model_outside_its_envelope() -> Result<(), String> {
-        let owner = "usr_0123456789abcdef0123456789abcdef";
-        let mut workflow = workflow();
-        workflow.model = Some(steward_types::ModelRef {
-            provider: "anthropic".to_owned(),
-            model: "claude-sonnet-4-6".to_owned(),
-        });
-        let result = resolve_versioned_task_plan(
-            &identity(owner)?,
-            workflow,
-            vec![provisioned_envelope(owner)?],
-            &task_config(Some("https://mcp-gw.example.test/mcp"))?,
-        );
-        assert!(
-            matches!(result, Err(ApiError::Admission(reason)) if reason.contains("not allowed by the User Envelope"))
         );
         Ok(())
     }

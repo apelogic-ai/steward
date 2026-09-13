@@ -552,7 +552,6 @@ export type ProviderConnectionStatus = {
 export type PublishWorkflowRequest = {
     agent: string;
     displayName: string;
-    model?: null | ModelRef;
     name: string;
     prompt: string;
 };
@@ -560,7 +559,6 @@ export type PublishWorkflowRequest = {
 export type PublishWorkflowVersionRequest = {
     agent: string;
     displayName: string;
-    model?: null | ModelRef;
     prompt: string;
 };
 
@@ -774,7 +772,6 @@ export type WorkflowRevisionView = {
     agent: string;
     contentDigest: string;
     displayName: string;
-    model?: null | ModelRef;
     name: string;
     prompt: string;
     publishedAt: string;

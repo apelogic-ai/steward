@@ -33,7 +33,7 @@ cleanup() {
     kill "${jira_forward_pid}" >/dev/null 2>&1
     wait "${jira_forward_pid}" >/dev/null 2>&1
   fi
-  kind delete cluster --name "${cluster}" >/dev/null 2>&1
+  kind delete cluster --name "${cluster}" --kubeconfig "${kubeconfig}" >/dev/null 2>&1
   docker image rm "${image}" >/dev/null 2>&1
   rm -rf -- "${run_dir}"
   exit "${status}"

@@ -13,10 +13,4 @@ describe("Workflow agent catalog", () => {
     expect(source).toContain("agent.displayName ?? agent.agentRef");
     expect(source).toContain('value={agent.agentRef}');
   });
-
-  test("authors an explicit model for an immutable Workflow revision", () => {
-    expect(source).toContain('name="modelProvider"');
-    expect(source).toContain('name="modelName"');
-    expect(source).toContain("model: {");
-  });
 });

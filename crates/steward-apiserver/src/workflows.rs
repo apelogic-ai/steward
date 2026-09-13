@@ -67,8 +67,6 @@ pub struct PublishWorkflowRequest {
     pub name: String,
     pub display_name: String,
     pub agent: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<steward_types::ModelRef>,
     pub prompt: String,
 }
 
@@ -80,14 +78,6 @@ impl PublishWorkflowRequest {
         if !valid_workflow_name(&self.name)
             || self.display_name.trim().is_empty()
             || !allowed_agents.contains(&self.agent)
-            || self.model.as_ref().is_some_and(|model| {
-                model.provider.trim().is_empty()
-                    || model.provider.trim() != model.provider
-                    || model.provider.chars().any(char::is_control)
-                    || model.model.trim().is_empty()
-                    || model.model.trim() != model.model
-                    || model.model.chars().any(char::is_control)
-            })
             || self.prompt.trim().is_empty()
         {
             return Err(PublishWorkflowError::Invalid);
@@ -106,8 +96,6 @@ pub(crate) enum PublishWorkflowError {
 pub struct PublishWorkflowVersionRequest {
     pub display_name: String,
     pub agent: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<steward_types::ModelRef>,
     pub prompt: String,
 }
 
@@ -117,7 +105,6 @@ impl PublishWorkflowVersionRequest {
             name,
             display_name: self.display_name.clone(),
             agent: self.agent.clone(),
-            model: self.model.clone(),
             prompt: self.prompt.clone(),
         }
     }
@@ -130,8 +117,6 @@ pub struct WorkflowRevisionView {
     pub version: i64,
     pub display_name: String,
     pub agent: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<steward_types::ModelRef>,
     pub prompt: String,
     pub content_digest: String,
     pub published_by: String,
@@ -145,7 +130,6 @@ impl From<WorkflowRevisionRecord> for WorkflowRevisionView {
             version: record.version,
             display_name: record.display_name,
             agent: record.agent,
-            model: record.model,
             prompt: record.prompt,
             content_digest: record.content_digest,
             published_by: record.published_by,
@@ -412,12 +396,11 @@ where
     if request.validate(&state.allowed_agents).is_err() {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    let digest = workflow_content_digest(&request.agent, request.model.as_ref(), &request.prompt);
+    let digest = workflow_content_digest(&request.agent, &request.prompt);
     let publication = WorkflowPublication {
         name: &request.name,
         display_name: &request.display_name,
         agent: &request.agent,
-        model: request.model.as_ref(),
         prompt: &request.prompt,
         content_digest: &digest,
         published_by: authority.principal().canonical_user_id.as_str(),
@@ -443,21 +426,11 @@ where
     }
 }
 
-fn workflow_content_digest(
-    agent: &str,
-    model: Option<&steward_types::ModelRef>,
-    prompt: &str,
-) -> String {
+fn workflow_content_digest(agent: &str, prompt: &str) -> String {
     let mut hasher = Sha256::new();
     for value in [agent, prompt] {
         hasher.update(value.len().to_be_bytes());
         hasher.update(value.as_bytes());
-    }
-    if let Some(model) = model {
-        for value in ["execution-model/v1", &model.provider, &model.model] {
-            hasher.update(value.len().to_be_bytes());
-            hasher.update(value.as_bytes());
-        }
     }
     let digest = hasher
         .finalize()
@@ -573,77 +546,30 @@ mod tests {
     }
 
     #[test]
-    fn workflow_publication_accepts_an_exact_execution_model() -> Result<(), String> {
-        let publication = serde_json::from_value::<PublishWorkflowRequest>(serde_json::json!({
-            "name": "repository-review",
-            "displayName": "Repository review",
-            "agent": TEST_AGENT,
-            "model": {"provider": "openai", "model": "gpt-5.4"},
-            "prompt": "Review the repository state."
-        }))
-        .map_err(|error| format!("a selected model was rejected: {error}"))?;
-        let encoded = serde_json::to_value(publication).map_err(|error| error.to_string())?;
-        assert_eq!(
-            encoded.get("model"),
-            Some(&serde_json::json!({"provider": "openai", "model": "gpt-5.4"}))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn workflow_digest_binds_the_selected_model_without_changing_legacy_digests() {
-        let model_a = steward_types::ModelRef {
-            provider: "openai".to_owned(),
-            model: "gpt-5.4".to_owned(),
-        };
-        let model_b = steward_types::ModelRef {
-            provider: "anthropic".to_owned(),
-            model: "claude-sonnet-4-6".to_owned(),
-        };
-        let legacy = super::workflow_content_digest(TEST_AGENT, None, "Review the repository.");
-        assert_eq!(
-            legacy,
-            super::workflow_content_digest(TEST_AGENT, None, "Review the repository.")
-        );
-        assert_ne!(
-            legacy,
-            super::workflow_content_digest(TEST_AGENT, Some(&model_a), "Review the repository.")
-        );
-        assert_ne!(
-            super::workflow_content_digest(TEST_AGENT, Some(&model_a), "Review the repository."),
-            super::workflow_content_digest(TEST_AGENT, Some(&model_b), "Review the repository.")
-        );
-    }
-
-    #[test]
     fn workflow_publication_accepts_only_deployment_advertised_exact_agents() {
         for request in [
             PublishWorkflowRequest {
                 name: "Repository-review".to_owned(),
                 display_name: "Repository review".to_owned(),
                 agent: TEST_AGENT.to_owned(),
-                model: None,
                 prompt: "Review the repository state.".to_owned(),
             },
             PublishWorkflowRequest {
                 name: "repository-review".to_owned(),
                 display_name: " ".to_owned(),
                 agent: TEST_AGENT.to_owned(),
-                model: None,
                 prompt: "Review the repository state.".to_owned(),
             },
             PublishWorkflowRequest {
                 name: "repository-review".to_owned(),
                 display_name: "Repository review".to_owned(),
                 agent: "codex@latest".to_owned(),
-                model: None,
                 prompt: "Review the repository state.".to_owned(),
             },
             PublishWorkflowRequest {
                 name: "repository-review".to_owned(),
                 display_name: "Repository review".to_owned(),
                 agent: TEST_AGENT.to_owned(),
-                model: None,
                 prompt: "".to_owned(),
             },
         ] {
@@ -659,7 +585,6 @@ mod tests {
                 name: "repository-review".to_owned(),
                 display_name: "Repository review".to_owned(),
                 agent: TEST_AGENT.to_owned(),
-                model: None,
                 prompt: "Review the repository state.".to_owned(),
             }
             .validate(&BTreeSet::from([TEST_AGENT.to_owned()])),
@@ -670,7 +595,6 @@ mod tests {
                 name: "repository-review".to_owned(),
                 display_name: "Repository review".to_owned(),
                 agent: TEST_AGENT_TWO.to_owned(),
-                model: None,
                 prompt: "Review the repository state.".to_owned(),
             }
             .validate(&BTreeSet::from([
@@ -769,7 +693,6 @@ mod tests {
                     version,
                     display_name: publication.display_name.to_owned(),
                     agent: publication.agent.to_owned(),
-                    model: publication.model.cloned(),
                     prompt: publication.prompt.to_owned(),
                     content_digest: publication.content_digest.to_owned(),
                     published_by: publication.published_by.to_owned(),
@@ -943,7 +866,6 @@ mod tests {
                 serde_json::json!({
                     "displayName": "Repository review",
                     "agent": TEST_AGENT_TWO,
-                    "model": {"provider": "openai", "model": "gpt-5.4"},
                     "prompt": "Review version two."
                 }),
             )?)
@@ -970,7 +892,6 @@ mod tests {
         )
         .map_err(|error| error.to_string())?;
         assert_eq!(v1.pointer("/workflow/version"), Some(&serde_json::json!(1)));
-        assert_eq!(v1.pointer("/workflow/model"), None);
         assert_eq!(
             v1.pointer("/workflow/prompt"),
             Some(&serde_json::json!("Review version one."))
@@ -979,24 +900,6 @@ mod tests {
             v1.pointer("/workflow/publishedBy"),
             Some(&serde_json::json!("usr_abcdef0123456789abcdef0123456789"))
         );
-        {
-            let revisions = repository
-                .records
-                .lock()
-                .map_err(|_| "fake Workflow ledger lock was poisoned")?;
-            let v2 = revisions
-                .iter()
-                .find(|revision| revision.version == 2)
-                .ok_or_else(|| "second Workflow revision was not persisted".to_owned())?;
-            assert_eq!(
-                v2.model.as_ref(),
-                Some(&steward_types::ModelRef {
-                    provider: "openai".to_owned(),
-                    model: "gpt-5.4".to_owned(),
-                })
-            );
-            assert_ne!(revisions[0].content_digest, v2.content_digest);
-        }
 
         let forbidden_update = app
             .oneshot(
