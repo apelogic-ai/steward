@@ -1339,11 +1339,11 @@ export type AuthorAdminEnvelopeTemplateErrors = {
      */
     409: unknown;
     /**
-     * Member role or envelope is invalid
+     * Member role, envelope, or current Service Envelope model/tool subset is invalid
      */
     422: unknown;
     /**
-     * Envelope templates are unavailable
+     * Envelope templates or the managed Service Envelope are unavailable
      */
     503: unknown;
 };

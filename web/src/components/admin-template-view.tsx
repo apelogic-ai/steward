@@ -34,20 +34,6 @@ type AdminTemplateListResponse = {
 };
 
 const fieldClass = "min-h-11 min-w-0 w-full rounded-md border bg-panel px-3 font-normal";
-const supportedTool = "github:repository:get_file_contents";
-const supportedToolProvider = "github";
-const supportedToolAction = "repository:get_file_contents";
-const toolProviderCatalog = [
-  { label: "GitHub", value: supportedToolProvider, enabled: true },
-  { label: "GitLab", value: "gitlab", enabled: false },
-  { label: "Jira", value: "jira", enabled: false },
-] as const;
-const githubToolCatalog = [
-  { value: supportedToolAction, enabled: true },
-  { value: "repository:list_issues", enabled: false },
-  { value: "repository:create_issue", enabled: false },
-  { value: "pull_request:get", enabled: false },
-] as const;
 
 export const initialEnvelopeTemplate: BrowserEnvelope = {
   revision: 1,
@@ -183,6 +169,17 @@ function initialTemplateForService(serviceEnvelope: BrowserEnvelope): BrowserEnv
 
 function toolValue(tool: ToolGrant): string {
   return `${tool.provider}:${tool.resource}:${tool.action}`;
+}
+
+function toolKey(tool: ToolGrant): string {
+  return JSON.stringify([tool.provider, tool.resource, tool.action]);
+}
+
+function toolLabel(tool: ToolGrant, choices: Array<ToolGrant>): string {
+  const display = `${tool.resource}:${tool.action}`;
+  return choices.some((other) => toolKey(other) !== toolKey(tool) && `${other.resource}:${other.action}` === display)
+    ? `Resource: ${tool.resource} · Action: ${tool.action}`
+    : display;
 }
 
 function mutationMessage(status: Exclude<TemplateMutationState, "idle" | "saving">): string {
@@ -341,13 +338,16 @@ function TemplateEditor({ create = false, csrf, memberRole, serviceEnvelope, tem
   const router = useRouter();
   const modelCatalog = serviceEnvelope.spec.llms;
   const allowedModels = new Set(modelCatalog.map(modelKey));
+  const toolCatalog = serviceEnvelope.spec.tools;
+  const allowedTools = new Set(toolCatalog.map(toolKey));
+  const toolProviders = [...new Set(toolCatalog.map((tool) => tool.provider))];
   const [status, setStatus] = useState<TemplateMutationState>("idle");
   const [currentRevision, setCurrentRevision] = useState(template.revision);
   const [models, setModels] = useState<Array<ModelRef>>(template.spec.llms);
   const [modelInput, setModelInput] = useState(modelCatalog[0] ? modelKey(modelCatalog[0]) : "");
   const [tools, setTools] = useState<Array<ToolGrant>>(template.spec.tools);
-  const [toolProviderInput, setToolProviderInput] = useState(supportedToolProvider);
-  const [toolInput, setToolInput] = useState(supportedToolAction);
+  const [toolProviderInput, setToolProviderInput] = useState(toolProviders[0] ?? "");
+  const [toolInput, setToolInput] = useState(toolCatalog[0] ? toolKey(toolCatalog[0]) : "");
   const [limitType, setLimitType] = useState<LimitType>("singleRun");
   const [monthlyLimit, setMonthlyLimit] = useState(template.spec.budget.monthlyLimit);
   const [singleRunLimit, setSingleRunLimit] = useState(template.spec.budget.singleRunLimit ?? "");
@@ -364,9 +364,13 @@ function TemplateEditor({ create = false, csrf, memberRole, serviceEnvelope, tem
   }
 
   function addTool() {
-    if (`${toolProviderInput}:${toolInput}` !== supportedTool
-      || tools.some((tool) => toolValue(tool) === supportedTool)) return;
-    setTools([...tools, { provider: "github", resource: "repository", action: "get_file_contents" }]);
+    const selected = toolCatalog.find((tool) => toolKey(tool) === toolInput && tool.provider === toolProviderInput);
+    if (!selected || tools.some((tool) => toolKey(tool) === toolInput)) return;
+    setTools([...tools, selected]);
+  }
+
+  function removeTool(index: number) {
+    setTools(tools.filter((_, toolIndex) => toolIndex !== index));
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -384,7 +388,7 @@ function TemplateEditor({ create = false, csrf, memberRole, serviceEnvelope, tem
       || !singleRunLimit.trim()
       || models.length === 0
       || models.some((model) => !allowedModels.has(modelKey(model)))
-      || tools.some((tool) => toolValue(tool) !== supportedTool)) {
+      || tools.some((tool) => !allowedTools.has(toolKey(tool)))) {
       setStatus("rejected");
       return;
     }
@@ -504,19 +508,42 @@ function TemplateEditor({ create = false, csrf, memberRole, serviceEnvelope, tem
         <legend className="text-base font-semibold">Tools</legend>
         <div className="grid gap-3 sm:grid-cols-[1fr_2fr_auto] sm:items-end">
           <label className="grid gap-2 text-sm font-semibold">Tool provider
-            <select className={fieldClass} onChange={(event) => setToolProviderInput(event.target.value)} value={toolProviderInput}>
-              {toolProviderCatalog.map((provider) => <option disabled={!provider.enabled} key={provider.value} value={provider.value}>{provider.label}</option>)}
+            <select className={fieldClass} disabled={toolProviders.length === 0} onChange={(event) => {
+              const provider = event.target.value;
+              setToolProviderInput(provider);
+              const first = toolCatalog.find((tool) => tool.provider === provider);
+              setToolInput(first ? toolKey(first) : "");
+            }} value={toolProviderInput}>
+              {toolProviders.length === 0
+                ? <option value="">No tool providers available</option>
+                : toolProviders.map((provider) => <option key={provider} value={provider}>{provider === "github" ? "GitHub" : provider}</option>)}
             </select>
           </label>
           <label className="grid gap-2 text-sm font-semibold">Tool
-            <select className={fieldClass} onChange={(event) => setToolInput(event.target.value)} value={toolInput}>
-              {githubToolCatalog.map((tool) => <option disabled={!tool.enabled} key={tool.value} value={tool.value}>{tool.value}</option>)}
+            <select className={fieldClass} disabled={toolCatalog.length === 0} onChange={(event) => setToolInput(event.target.value)} value={toolInput}>
+              {toolCatalog.length === 0
+                ? <option value="">No tools available</option>
+                : toolCatalog.filter((tool) => tool.provider === toolProviderInput).map((tool) => <option key={toolKey(tool)} value={toolKey(tool)}>{toolLabel(tool, toolCatalog)}</option>)}
             </select>
           </label>
-          <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-50" disabled={tools.some((tool) => toolValue(tool) === `${toolProviderInput}:${toolInput}`)} onClick={addTool} type="button">Add tool</button>
+          <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-50" disabled={!toolInput || tools.some((tool) => toolKey(tool) === toolInput)} onClick={addTool} type="button">Add tool</button>
         </div>
+        {toolCatalog.length === 0 ? <p className="text-sm text-muted-ink">The current Service Envelope does not allow any tools.</p> : null}
         <ul className="flex flex-wrap gap-2" role="list">
-          {tools.map((tool) => <li className="rounded-full border px-3 py-1.5 text-sm" key={toolValue(tool)}>{toolValue(tool)}</li>)}
+          {tools.map((tool, index) => {
+            const allowed = allowedTools.has(toolKey(tool));
+            return (
+              <li className={allowed ? "flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm" : "flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm text-muted-ink"} key={`${toolKey(tool)}:${index}`}>
+                <span>{toolValue(tool)}</span>
+                {!allowed ? <span className="text-xs">No longer allowed by the current Service Envelope</span> : null}
+                <button aria-label={`Remove tool ${toolValue(tool)}`} className="rounded-full p-1 hover:bg-canvas" onClick={() => removeTool(index)} type="button">
+                  <svg aria-hidden="true" className="size-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 12 12">
+                    <path d="M2 2l8 8M10 2l-8 8" />
+                  </svg>
+                </button>
+              </li>
+            );
+          })}
         </ul>
       </fieldset>
 
