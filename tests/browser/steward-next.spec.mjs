@@ -1526,6 +1526,19 @@ test("connection OAuth starts through a same-origin Rust mutation", async ({ bro
   }
 });
 
+test("connected GitHub can be reauthorized without disconnecting", async ({ browser }) => {
+  const developer = await guardedPage(browser, { connectionPhase: "connected" });
+  try {
+    await developer.page.goto(`${origin}/connections`);
+    await developer.page.getByRole("button", { name: "Re-authorize GitHub" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/connections?oauth=started`);
+    expectMutationProof(developer.mutations.find((mutation) => mutation.path.endsWith("/start")));
+    expect(developer.mutations.some((mutation) => mutation.path.endsWith("/disconnect"))).toBe(false);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("envelope request keeps a Rust authorization denial explicit", async ({ browser }) => {
   const developer = await guardedPage(browser, {
     expectedHttpStatuses: [403],

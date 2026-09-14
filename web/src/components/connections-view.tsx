@@ -74,6 +74,7 @@ function GithubConnection({ connection, refresh }: Readonly<{ connection: Connec
       ]} />
       {status.phase === "connected" ? (
         <div className="space-y-3 border-t pt-5">
+          <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">Re-authorize GitHub</button>
           <p className="text-sm text-muted-ink">Disconnecting GitHub affects all present and future agent runtimes using the same Steward identity.</p>
           <label className="flex min-h-11 items-center gap-3 text-sm"><input checked={confirmDisconnect} onChange={(event) => setConfirmDisconnect(event.target.checked)} type="checkbox" />I understand this revokes the shared Steward connection.</label>
           <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!confirmDisconnect || action === "working"} onClick={() => void disconnect()} type="button">Disconnect GitHub</button>
