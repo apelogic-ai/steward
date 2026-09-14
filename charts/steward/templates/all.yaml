@@ -6,8 +6,17 @@
 {{- $sourceRepositoryBindingsJson := toJson .Values.githubSource.bindings }}
 {{- $sourceRepositoryBindingsHash := $sourceRepositoryBindingsJson | sha256sum }}
 {{- $sourceRepositoryBindingsConfigMapName := printf "steward-source-repository-bindings-%s" ($sourceRepositoryBindingsHash | trunc 12) }}
-{{- if and .Values.web.enabled .Values.web.ingress.enabled (ne .Values.browserAuth.google.origin (printf "https://%s" .Values.web.host)) }}
+{{- if .Values.persistence.enabled }}
+{{- fail "persistence.enabled is unsupported: Steward uses the externally managed database Secret" }}
+{{- end }}
+{{- if and .Values.web.enabled (or .Values.web.ingress.enabled .Values.web.httpRoute.enabled) (ne .Values.browserAuth.google.origin (printf "https://%s" .Values.web.host)) }}
 {{- fail "web.host must exactly match the HTTPS browserAuth.google.origin" }}
+{{- end }}
+{{- if and .Values.web.httpRoute.enabled (ne .Values.web.httpRoute.hostname .Values.web.host) }}
+{{- fail "web.httpRoute.hostname must exactly match web.host" }}
+{{- end }}
+{{- if and .Values.web.ingress.enabled .Values.web.httpRoute.enabled }}
+{{- fail "choose exactly one edge route interface: web.ingress or web.httpRoute" }}
 {{- end }}
 {{- if and .Values.connectionsBridge.enabled (not (has .Values.connectionsBridge.runtimeNamespace .Values.runtimeNamespaces)) }}
 {{- fail "connectionsBridge.runtimeNamespace must be one of runtimeNamespaces" }}
@@ -18,7 +27,13 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: {{ include (printf "steward.%sName" $component) $ }}
-  labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: {{ $component }} }
+  labels:
+    app.kubernetes.io/name: steward
+    app.kubernetes.io/component: {{ $component }}
+{{- with (index $.Values.serviceAccounts $component).annotations }}
+  annotations:
+{{ toYaml . | nindent 4 }}
+{{- end }}
 automountServiceAccountToken: true
 {{- end }}
 {{- if .Values.web.enabled }}
@@ -27,7 +42,13 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: {{ include "steward.webName" . }}
-  labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: web }
+  labels:
+    app.kubernetes.io/name: steward
+    app.kubernetes.io/component: web
+{{- with .Values.serviceAccounts.web.annotations }}
+  annotations:
+{{ toYaml . | nindent 4 }}
+{{- end }}
 automountServiceAccountToken: false
 {{- end }}
 ---
@@ -202,7 +223,7 @@ kind: Service
 metadata: { name: steward-apiserver }
 spec:
   selector: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver }
-  ports: [{ name: https, port: {{ .Values.services.apiserverPort }}, targetPort: https }]
+  ports: [{ name: https, appProtocol: https, port: {{ .Values.services.apiserverPort }}, targetPort: https }]
 ---
 apiVersion: v1
 kind: Service
@@ -224,7 +245,7 @@ kind: Service
 metadata: { name: steward-web }
 spec:
   selector: { app.kubernetes.io/name: steward, app.kubernetes.io/component: web }
-  ports: [{ name: http, port: {{ .Values.services.webPort }}, targetPort: http }]
+  ports: [{ name: http, appProtocol: http, port: {{ .Values.services.webPort }}, targetPort: http }]
 {{- end }}
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -261,17 +282,28 @@ spec:
 {{- if .Values.githubSource.enabled }}
         checksum/source-repository-bindings: {{ $sourceRepositoryBindingsHash | quote }}
 {{- end }}
+{{- with .Values.podAnnotations.apiserver }}
+{{ toYaml . | nindent 8 }}
+{{- end }}
     spec:
       serviceAccountName: {{ include "steward.apiserverName" . }}
       securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+{{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+{{- end }}
       containers:
         - name: apiserver
           image: {{ include "steward.image" (dict "root" . "image" .Values.images.apiserver) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
           ports: [{ name: https, containerPort: 8443 }]
-          readinessProbe: { tcpSocket: { port: https }, initialDelaySeconds: 2, periodSeconds: 5 }
-          livenessProbe: { tcpSocket: { port: https }, initialDelaySeconds: 10, periodSeconds: 10 }
+          readinessProbe:
+            tcpSocket: { port: https }
+{{ toYaml .Values.probes.apiserver.readiness | nindent 12 }}
+          livenessProbe:
+            tcpSocket: { port: https }
+{{ toYaml .Values.probes.apiserver.liveness | nindent 12 }}
           env:
             - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.database.name }}, key: {{ .Values.secrets.database.key }} } } }
             - { name: STEWARD_TASK_ORCHESTRATION_MODE, value: {{ .Values.config.taskOrchestrationMode | quote }} }
@@ -372,18 +404,31 @@ spec:
   replicas: {{ .Values.replicaCount.controller }}
   selector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: controller } }
   template:
-    metadata: { labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: controller } }
+    metadata:
+      labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: controller }
+{{- with .Values.podAnnotations.controller }}
+      annotations:
+{{ toYaml . | nindent 8 }}
+{{- end }}
     spec:
       serviceAccountName: {{ include "steward.controllerName" . }}
       securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+{{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+{{- end }}
       containers:
         - name: controller
           image: {{ include "steward.image" (dict "root" . "image" .Values.images.controller) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
           ports: [{ name: webhook, containerPort: 8443 }]
-          readinessProbe: { tcpSocket: { port: webhook }, initialDelaySeconds: 2, periodSeconds: 5 }
-          livenessProbe: { tcpSocket: { port: webhook }, initialDelaySeconds: 10, periodSeconds: 10 }
+          readinessProbe:
+            tcpSocket: { port: webhook }
+{{ toYaml .Values.probes.controller.readiness | nindent 12 }}
+          livenessProbe:
+            tcpSocket: { port: webhook }
+{{ toYaml .Values.probes.controller.liveness | nindent 12 }}
           env:
             - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.database.name }}, key: {{ .Values.secrets.database.key }} } } }
             - { name: STEWARD_TASK_ORCHESTRATION_MODE, value: {{ .Values.config.taskOrchestrationMode | quote }} }
@@ -471,18 +516,31 @@ spec:
   replicas: {{ .Values.replicaCount.mint }}
   selector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: mint } }
   template:
-    metadata: { labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: mint } }
+    metadata:
+      labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: mint }
+{{- with .Values.podAnnotations.mint }}
+      annotations:
+{{ toYaml . | nindent 8 }}
+{{- end }}
     spec:
       serviceAccountName: {{ include "steward.mintName" . }}
       securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+{{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+{{- end }}
       containers:
         - name: mint
           image: {{ include "steward.image" (dict "root" . "image" .Values.images.mint) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
           ports: [{ name: http, containerPort: 8080 }]
-          readinessProbe: { tcpSocket: { port: http }, initialDelaySeconds: 2, periodSeconds: 5 }
-          livenessProbe: { tcpSocket: { port: http }, initialDelaySeconds: 10, periodSeconds: 10 }
+          readinessProbe:
+            tcpSocket: { port: http }
+{{ toYaml .Values.probes.mint.readiness | nindent 12 }}
+          livenessProbe:
+            tcpSocket: { port: http }
+{{ toYaml .Values.probes.mint.liveness | nindent 12 }}
           env:
             - { name: SPIFFE_ENDPOINT_SOCKET, value: {{ printf "unix://%s/spire-agent.sock" .Values.spire.socketPath | quote }} }
             - { name: STEWARD_MINT_SIGNING_KEY_FILE, value: /run/mint/signing-key }
@@ -516,19 +574,32 @@ spec:
   replicas: {{ .Values.replicaCount.web }}
   selector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: web } }
   template:
-    metadata: { labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: web } }
+    metadata:
+      labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: web }
+{{- with .Values.podAnnotations.web }}
+      annotations:
+{{ toYaml . | nindent 8 }}
+{{- end }}
     spec:
       serviceAccountName: {{ include "steward.webName" . }}
       automountServiceAccountToken: false
       securityContext: { runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: { type: RuntimeDefault } }
+{{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+{{- end }}
       containers:
         - name: web
           image: {{ include "steward.image" (dict "root" . "image" .Values.images.web) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
           ports: [{ name: http, containerPort: 3000 }]
-          readinessProbe: { httpGet: { path: /health/ready, port: http }, initialDelaySeconds: 2, periodSeconds: 5 }
-          livenessProbe: { httpGet: { path: /health/ready, port: http }, initialDelaySeconds: 10, periodSeconds: 10 }
+          readinessProbe:
+            httpGet: { path: /health/ready, port: http }
+{{ toYaml .Values.probes.web.readiness | nindent 12 }}
+          livenessProbe:
+            httpGet: { path: /health/ready, port: http }
+{{ toYaml .Values.probes.web.liveness | nindent 12 }}
           env:
             - { name: HOSTNAME, value: 0.0.0.0 }
             - { name: NODE_ENV, value: production }
@@ -545,9 +616,10 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: steward-api
+{{- with .Values.web.ingress.apiAnnotations }}
   annotations:
-    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+{{ toYaml . | nindent 4 }}
+{{- end }}
 spec:
   ingressClassName: {{ .Values.web.ingress.className }}
   tls:
@@ -567,8 +639,10 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: steward-web
+{{- with .Values.web.ingress.webAnnotations }}
   annotations:
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+{{ toYaml . | nindent 4 }}
+{{- end }}
 spec:
   ingressClassName: {{ .Values.web.ingress.className }}
   tls:
@@ -580,6 +654,50 @@ spec:
         paths:
           - { path: /, pathType: Prefix, backend: { service: { name: steward-web, port: { name: http } } } }
 {{- end }}
+{{- end }}
+{{- if .Values.web.httpRoute.enabled }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: steward-api
+spec:
+  parentRefs:
+{{- range .Values.web.httpRoute.parentRefs }}
+    - name: {{ .name | quote }}
+      namespace: {{ .namespace | quote }}
+      sectionName: {{ .sectionName | quote }}
+{{- end }}
+  hostnames: [{{ .Values.web.httpRoute.hostname | quote }}]
+  rules:
+    - matches:
+{{- range .Values.web.httpRoute.apiPaths }}
+        - path: { type: {{ .type }}, value: {{ .value | quote }} }
+{{- end }}
+      backendRefs:
+        - name: steward-apiserver
+          port: {{ .Values.services.apiserverPort }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: steward-web
+spec:
+  parentRefs:
+{{- range .Values.web.httpRoute.parentRefs }}
+    - name: {{ .name | quote }}
+      namespace: {{ .namespace | quote }}
+      sectionName: {{ .sectionName | quote }}
+{{- end }}
+  hostnames: [{{ .Values.web.httpRoute.hostname | quote }}]
+  rules:
+    - matches:
+{{- range .Values.web.httpRoute.webPaths }}
+        - path: { type: {{ .type }}, value: {{ .value | quote }} }
+{{- end }}
+      backendRefs:
+        - name: steward-web
+          port: {{ .Values.services.webPort }}
 {{- end }}
 {{- if .Values.networkPolicy.enabled }}
 ---
@@ -606,15 +724,32 @@ metadata: { name: steward-apiserver-ingress }
 spec:
   podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
   policyTypes: [Ingress]
+{{- if or .Values.networkPolicy.apiserverIngressNamespaces .Values.networkPolicy.burbleNamespace .Values.networkPolicy.arcNamespace (and .Values.web.enabled .Values.networkPolicy.ingressNamespace) }}
   ingress:
+{{- if .Values.networkPolicy.apiserverIngressNamespaces }}
+    - from:
+{{- range .Values.networkPolicy.apiserverIngressNamespaces }}
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ . }} } }
+{{- end }}
+      ports: [{ protocol: TCP, port: 8443 }]
+{{- end }}
+{{- if .Values.networkPolicy.burbleNamespace }}
     - from:
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.burbleNamespace }} } }
+      ports: [{ protocol: TCP, port: 8443 }]
+{{- end }}
+{{- if .Values.networkPolicy.arcNamespace }}
+    - from:
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.arcNamespace }} } }
       ports: [{ protocol: TCP, port: 8443 }]
-{{- if .Values.web.enabled }}
+{{- end }}
+{{- if and .Values.web.enabled .Values.networkPolicy.ingressNamespace }}
     - from:
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressNamespace }} } }
       ports: [{ protocol: TCP, port: 8443 }]
+{{- end }}
+{{- else }}
+  ingress: []
 {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
@@ -745,10 +880,14 @@ metadata: { name: steward-web-ingress }
 spec:
   podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: web } }
   policyTypes: [Ingress]
+{{- if .Values.networkPolicy.ingressNamespace }}
   ingress:
     - from:
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressNamespace }} } }
       ports: [{ protocol: TCP, port: 3000 }]
+{{- else }}
+  ingress: []
+{{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

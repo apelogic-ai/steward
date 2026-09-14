@@ -1,13 +1,15 @@
 # Steward Helm chart
 
 This chart installs the Steward apiserver, controller/webhook, mint, optional
-web presentation, and the `AgentRuntime` CRD. The web presentation defaults to
-disabled. When enabled, its Ingress is enabled by default for compatibility;
-set `web.ingress.enabled=false` when an environment-owned edge routes directly
-to the cluster-internal web and API services.
+web presentation, and the `AgentRuntime` CRD. The web presentation and every
+edge route default to disabled. The chart can render an explicitly configured
+Gateway API `HTTPRoute`, but never installs a Gateway, Gateway API CRDs, an
+Ingress controller, DNS, certificates, namespaces, or private edge topology.
 
-The default values are fail-closed. A release consumer must set a non-empty tag
-and immutable digest for every component before Helm will render the chart:
+The chart's default image coordinates are the public, digest-pinned `v0.1.17`
+release. They make `helm lint` and `helm template` useful before an operator has
+created any environment-specific values. A real install must replace all image
+tag/digest pairs together with the exact coordinates from its chosen release:
 
 ```yaml
 images:
@@ -22,9 +24,13 @@ images:
   mint:
     tag: <version>-mint
     digest: sha256:<digest>
+  web:
+    tag: <version>-web
+    digest: sha256:<digest>
 ```
 
-The release handoff attached to every GitHub release records these three image
+Never set a tag without the matching digest or use a mutable image reference.
+The release handoff attached to every GitHub release records these component
 digests and the OCI chart digest. If repository variable
 `ECR_PROMOTION_ENABLED` is `true`, the release workflow also copies those exact
 manifests to the configured ECR repositories, verifies that the digests did not
@@ -35,6 +41,106 @@ to any other digest fails closed. For BuildKit OCI indexes, the workflow scans
 exactly one runnable `linux/amd64` child manifest (excluding SBOM/provenance
 attestations) and records both the release index digest and scanned platform
 digest. A missing or ambiguous runnable child fails closed.
+
+## Installation contract
+
+Steward is a Kubernetes control plane, not a self-contained database or
+identity bundle. Before installing, the target cluster must provide:
+
+- Kubernetes 1.30 or later, cert-manager with the `tls.issuerRef` issuer, and
+  SPIRE's CSI driver and `ClusterSPIFFEID` API;
+- an external Postgres database, Jira tenant, LiteLLM endpoint, OpenShell
+  gateway, and workload identity exchange endpoint; and
+- the existing Secret and public trust references listed below.
+
+The chart creates no Secret values, PVCs, database, ingress controller,
+cert-manager issuer, or SPIRE control plane. Render first, then install with a
+reviewed values file containing only configuration and existing object names:
+
+```console
+helm pull oci://ghcr.io/apelogic-ai/charts/steward --version <chart-version> --untar
+helm lint ./steward
+helm template steward ./steward --namespace steward --values steward-values.yaml > steward-rendered.yaml
+helm upgrade --install steward oci://ghcr.io/apelogic-ai/charts/steward \\
+  --version <chart-version> --namespace steward --create-namespace \\
+  --values steward-values.yaml
+```
+
+`steward-values.yaml` must set the chosen immutable image coordinates,
+`tls.issuerRef`, environment endpoints, approved network CIDRs, and the
+names/keys of externally managed Secrets. The checked-in defaults deliberately
+remain non-production placeholders for Jira, OpenShell, identity, and network
+topology. A successful render proves chart structure only; readiness requires
+all listed dependencies and externally managed configuration.
+
+## Workload defaults and platform integration
+
+The chart creates fixed component service accounts because controller-to-API
+identity is part of the Steward authority contract. The apiserver, controller,
+and mint service accounts have Kubernetes API tokens; the web service account
+does not. `serviceAccounts.<component>.annotations` supports workload identity
+integration such as EKS IRSA without inserting credentials into values.
+`imagePullSecrets` names pre-existing registry credentials, and
+`podAnnotations.<component>` is available for platform-owned metadata.
+
+Every workload is non-root, uses the RuntimeDefault seccomp profile, drops all
+Linux capabilities, disallows privilege escalation, and uses a read-only root
+filesystem. Explicit resource requests/limits and readiness/liveness probe
+timings are under `resources` and `probes`, respectively. Review those values
+for the target capacity rather than relying on scheduler defaults.
+
+Steward owns no persistent volume: all durable state is external Postgres
+selected by `secrets.database`. `persistence.enabled` is intentionally fixed to
+`false`; setting it true is a Helm error rather than silently creating an
+unreviewed storage contract.
+
+No metrics or ServiceMonitor resource is rendered because the currently
+documented component interfaces do not expose a stable Prometheus contract.
+Use the Kubernetes deployment/probe state and the platform's approved log and
+event collection until a separately versioned observability interface exists.
+
+For a shared Envoy Gateway/Gateway API platform, set
+`web.httpRoute.enabled=true`. The chart then renders two `HTTPRoute` objects:
+`steward-api` targets `steward-apiserver` port `https` (443, targeting the
+apiserver's TLS listener on 8443), and `steward-web`
+targets `steward-web` port `http` (3000). Their `parentRefs`, hostname, and API
+and web paths have no defaults and must be supplied explicitly. The apiserver
+Service declares `appProtocol: https`; the platform remains responsible for any
+Gateway API `BackendTLSPolicy` required by its controller.
+
+Set `networkPolicy.ingressNamespace` to the explicit Envoy Gateway data-plane
+namespace from which the route reaches the apiserver. It defaults to empty, so
+no edge access is assumed. The chart intentionally does not declare a Gateway,
+Gateway API CRDs, DNS, or certificate policy. For example:
+
+```yaml
+web:
+  enabled: true
+  host: steward.example.com
+  httpRoute:
+    enabled: true
+    parentRefs:
+      - name: shared-gateway
+        namespace: envoy-gateway-system
+        sectionName: https
+    hostname: steward.example.com
+    apiPaths:
+      - { type: PathPrefix, value: /admin/api }
+      - { type: PathPrefix, value: /admin/auth }
+      - { type: Exact, value: /admin/connections/github/callback }
+      - { type: PathPrefix, value: /app/api }
+      - { type: PathPrefix, value: /v1 }
+    webPaths:
+      - { type: PathPrefix, value: / }
+networkPolicy:
+  ingressNamespace: envoy-gateway-system
+```
+
+`web.ingress.enabled=true` remains a legacy, portable Kubernetes `Ingress`
+interface for installations that explicitly choose it. Its annotation maps are
+empty by default and controller-specific. It is mutually exclusive with
+`web.httpRoute.enabled`. In either edge mode, `web.host` must exactly match the
+browser origin; the legacy Ingress additionally requires an existing TLS Secret.
 
 Execution bindings default to `config.apiserver.executionBindingsMode: staged`. An upgrade from a
 pre-binding release must roll out all new binaries in that mode before a second Helm operation sets
@@ -48,9 +154,9 @@ the Task lifecycle owner or approval dispatcher. Roll every apiserver and contro
 shared value to `active`. Existing Task reads and exact idempotent retries remain available during
 the staged deployment.
 
-## Required secrets
+## Required existing references
 
-The chart references five existing Secrets and never creates their values:
+The chart references existing objects and never creates secret values:
 
 | Secret | Key(s) | Mounted by |
 |---|---|---|
@@ -84,10 +190,12 @@ name/key for the Google client secret. The chart never creates the Secret or a
 public edge. A deployment adapter supplies the HTTPS route, certificate and
 network policy appropriate to its platform (for example, a local Kind adapter
 or a DEV gateway); those controls do not belong in this portable chart.
-When `web.ingress.enabled=true`, `web.host` must exactly match the browser
-origin host and the Ingress class and TLS Secret are required. With
-`web.ingress.enabled=false`, those Ingress-only inputs may be empty and no
-Ingress resources are rendered.
+When the legacy `web.ingress.enabled=true` interface is selected, `web.host`
+must exactly match the browser origin host and the Ingress class and TLS Secret
+are required. With it disabled, those Ingress-only inputs may be empty and no
+Ingress resources are rendered. A Gateway API deployment uses the chart's
+explicit `web.httpRoute` interface and retains ownership of Gateway and
+certificate policy outside this chart.
 
 When `networkPolicy.enabled=true`, browser authentication additionally requires
 at least one `networkPolicy.browserAuthEgressCidrs` entry. The chart allows
@@ -208,12 +316,8 @@ that allowlist remain inaccessible to both service accounts.
   workload fails startup on an unreadable or unverified bundle.
 - This chart wiring enables the session-protected stable bridge *resolver*.
   It does not invent sandbox artifact installation, a Kubernetes pod selector,
-  or a direct pod copy/exec path. OpenShell upstream delivery work is not an
-  activation gate. [LBE-318](https://linear.app/lbelyaev/issue/LBE-318)
-  owns the controller-reconciled execution contract; [LBE-326](https://linear.app/lbelyaev/issue/LBE-326)
-  owns publication of the compatible, immutable bridge image and provenance
-  coordinates. GitOps keeps the feature disabled until those internal inputs
-  are available and verified.
+  or a direct pod copy/exec path. Enable it only after the compatible,
+  immutable bridge image and provenance coordinates are available and verified.
 - `config.controller.litellmUrl` and
   `config.controller.openshellEndpoint` are internal service endpoints.
 - The OpenShell endpoint must use HTTPS. `openshellServerName` pins the TLS
@@ -289,7 +393,8 @@ runtime-class contract and propagation. It does not prove a VM isolation boundar
 `networkPolicy.enabled` defaults to `true`. The chart denies ingress and egress
 for all Steward pods, then opens only these paths:
 
-- Burble and ARC namespaces to the apiserver;
+- caller namespaces listed in `networkPolicy.apiserverIngressNamespaces` to the
+  apiserver (the default is empty and therefore denies all workload callers);
 - configured Kubernetes API/VPC CIDRs to the validating webhook;
 - OpenShell and MCP-GW namespaces to the mint;
 - controller to LiteLLM, OpenShell, Postgres, and the Kubernetes API;
@@ -302,6 +407,12 @@ for all Steward pods, then opens only these paths:
 means denied, not unrestricted, so production values must supply the applicable
 CIDRs. FQDN-aware egress policy, if used by the cluster, belongs in the GitOps
 layer rather than this portable Kubernetes `NetworkPolicy` chart.
+
+A governed distribution must explicitly list its workload namespaces, for
+example `networkPolicy.apiserverIngressNamespaces: ["my-runner"]`. The legacy
+`burbleNamespace` and `arcNamespace` values remain only to render older
+governed values files; both default to empty and new public installations should
+not use them.
 
 ## Release configuration
 
