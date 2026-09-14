@@ -2207,13 +2207,37 @@ where
             "the resolved Envelope is not active".to_owned()
         })
     })?;
-    let effective_requirements = match &definition.requires {
+    let mut effective_requirements = match &definition.requires {
         Some(requirements) => requirements.clone(),
         None => direct_requirements_from_envelope(&approved.spec)?,
     };
-    let spec = direct_runtime_spec(identity, &definition, &effective_requirements)?;
+    let selected_model = match definition.runtime.model.as_ref() {
+        Some(model) => model.clone(),
+        None => match effective_requirements.authority.llms.as_slice() {
+            [model] => model.clone(),
+            _ => {
+                return Err(ApiError::Admission(
+                    "direct TaskDefinition must select a runtime model when multiple models are available"
+                        .to_owned(),
+                ));
+            }
+        },
+    };
+    if definition.requires.is_none()
+        && !approved.spec.llms.iter().any(|model| {
+            model.provider == selected_model.provider.as_str()
+                && model.model == selected_model.model.as_str()
+        })
+    {
+        return Err(ApiError::Admission(if explicit_envelope {
+            "selected model is not allowed by the selected Envelope".to_owned()
+        } else {
+            "selected model is not allowed by the resolved Envelope".to_owned()
+        }));
+    }
+    let requested_spec = direct_runtime_spec(identity, &definition, &effective_requirements)?;
     if !matches!(
-        evaluate_with_grants(&spec, approved, &[])
+        evaluate_with_grants(&requested_spec, approved, &[])
             .map_err(|error| ApiError::Admission(format!("{error:?}")))?,
         AdmissionDecision::Admit
     ) {
@@ -2223,8 +2247,17 @@ where
             "direct package requirements exceed the resolved Envelope".to_owned()
         }));
     }
+    // A package can declare a wider required capability set, but a single
+    // execution receives only its selected model. The source closure still
+    // records the exact declaration that passed admission above.
+    effective_requirements.authority.llms = vec![selected_model.clone()];
+    let spec = direct_runtime_spec(identity, &definition, &effective_requirements)?;
+    let model = steward_types::ModelRef {
+        provider: selected_model.provider.as_str().to_owned(),
+        model: selected_model.model.as_str().to_owned(),
+    };
     let (command, execution_binding) =
-        resolve_direct_execution_plan(config, &definition, &prompt, &spec)?;
+        resolve_direct_execution_plan(config, &definition, &prompt, &spec, &model)?;
     Ok(DirectTaskPreAdmission {
         definition,
         invocation,
@@ -2554,13 +2587,9 @@ fn resolve_direct_execution_plan(
     definition: &DirectTaskDefinition,
     prompt: &str,
     spec: &AgentRuntimeSpec,
+    model: &steward_types::ModelRef,
 ) -> Result<(Vec<String>, TaskExecutionBinding), ApiError> {
     let agent_ref = definition.runtime.agent_ref.as_str();
-    let [model] = spec.llms.as_slice() else {
-        return Err(ApiError::Admission(
-            "direct Tasks require exactly one approved model".to_owned(),
-        ));
-    };
     let binding = config
         .execution_bindings_active
         .then(|| config.execution_bindings.resolve(agent_ref))

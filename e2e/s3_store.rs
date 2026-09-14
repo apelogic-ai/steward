@@ -178,39 +178,68 @@ async fn workflow_revisions_are_immutable_and_task_pins_are_atomic() -> Result<(
         "INSERT INTO task_submissions \
          (task_uid, idempotency_key, submitter_service, owner, workflow, workflow_name, \
           coding_agent_runtime, runtime_namespace, runtime_name, runtime_ownership, phase, \
-          runtime_spec, agent_command) \
+          runtime_spec, agent_command, execution_binding, orchestration_version, orchestration_operation_id, \
+          candidate_digest, service_envelope_digest, original_admission_decision, \
+          original_admission_deltas) \
          VALUES (gen_random_uuid(), $1, 'steward-run', \
                  'alice@example.com', $2, $3, 'codex@0.140.0', 'steward-test', 'task-a', \
-                 'provisioned', 'submitted', '{}'::jsonb, '[]'::jsonb)",
+                 'provisioned', 'submitted', '{}'::jsonb, '[]'::jsonb, '{}'::jsonb, 2, gen_random_uuid(), \
+                 'sha256:' || repeat('d', 64), 'sha256:' || repeat('e', 64), 'admit', '[]'::jsonb)",
     )
     .bind(format!("partial-{suffix}"))
     .bind(format!("{workflow_name}@1"))
     .bind(&workflow_name)
     .execute(store.pool())
     .await;
-    assert!(
-        partial_pins.is_err(),
-        "a Task must not persist a partial Workflow or User Envelope pin set"
+    let partial_error = partial_pins
+        .expect_err("a Task must not persist a partial Workflow or User Envelope pin set");
+    assert_eq!(
+        partial_error
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("task_submissions_versioned_pins_complete"),
+        "the partial-pin constraint, not an unrelated writer fence, must reject the Task"
     );
 
+    let complete_task_uid = sqlx::types::Uuid::new_v4();
+    let complete_operation_id = sqlx::types::Uuid::new_v4();
+    let mut transaction = store.pool().begin().await?;
     let complete_pins = sqlx::query(
         "INSERT INTO task_submissions \
          (task_uid, idempotency_key, submitter_service, owner, workflow, workflow_name, \
           workflow_version, workflow_digest, user_envelope_instance_id, \
           user_envelope_revision, user_envelope_digest, coding_agent_runtime, \
-          runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, agent_command) \
-         VALUES (gen_random_uuid(), $1, 'steward-run', \
+          runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, agent_command, execution_binding, \
+          orchestration_version, orchestration_operation_id, candidate_digest, \
+          service_envelope_digest, original_admission_decision, original_admission_deltas) \
+         VALUES ($6, $1, 'steward-run', \
                  'alice@example.com', $2, $3, 1, $4, 'env_test', 7, $5, 'codex@0.140.0', \
-                 'steward-test', 'task-b', 'provisioned', 'submitted', '{}'::jsonb, '[]'::jsonb)",
+                 'steward-test', 'task-b', 'provisioned', 'submitted', '{}'::jsonb, '[]'::jsonb, '{}'::jsonb, \
+                 2, $7, 'sha256:' || repeat('d', 64), \
+                 'sha256:' || repeat('e', 64), 'admit', '[]'::jsonb)",
     )
     .bind(format!("complete-{suffix}"))
     .bind(format!("{workflow_name}@1"))
     .bind(&workflow_name)
     .bind(&first_digest)
     .bind(format!("sha256:{}", "c".repeat(64)))
-    .execute(store.pool())
+    .bind(complete_task_uid)
+    .bind(complete_operation_id)
+    .execute(&mut *transaction)
     .await?;
     assert_eq!(complete_pins.rows_affected(), 1);
+    sqlx::query(
+        "INSERT INTO task_runtime_operations \
+         (task_uid, operation_id, state, runtime_ownership, runtime_namespace, runtime_name, \
+          inert_manifest_digest, active_manifest_digest) \
+         VALUES ($1, $2, 'intent_recorded', 'provisioned', 'steward-test', 'task-b', \
+                 'sha256:' || repeat('f', 64), 'sha256:' || repeat('f', 64))",
+    )
+    .bind(complete_task_uid)
+    .bind(complete_operation_id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
 
     Ok(())
 }
@@ -637,6 +666,29 @@ async fn envelope_requests_are_idempotent_audited_and_bound_to_the_exact_templat
     );
     assert!(
         [concurrent_a.record.id, concurrent_b.record.id].contains(&active_after_concurrent[0].id)
+    );
+
+    // A later transaction can have an earlier now() timestamp than the one it
+    // supersedes. Event identity, not transaction time, defines lifecycle order.
+    let active_request_id = active_after_concurrent[0].id;
+    sqlx::query(
+        "INSERT INTO envelope_request_events \
+         (request_id, status, reason, actor, template_revision, at) \
+         SELECT $1, 'stale', 'superseded', $2, $3, max(at) - interval '1 microsecond' \
+         FROM envelope_request_events WHERE request_id = $1",
+    )
+    .bind(active_request_id)
+    .bind(principal.user_id.as_str())
+    .bind(next_template.revision)
+    .execute(store.pool())
+    .await?;
+    assert_eq!(
+        store
+            .envelope_request(&principal.user_id, active_request_id)
+            .await?
+            .map(|request| request.status),
+        Some(EnvelopeRequestStatus::Stale),
+        "the latest appended event must win even if its transaction timestamp is older"
     );
 
     let stale_key = format!("stale-envelope-request-{suffix}");

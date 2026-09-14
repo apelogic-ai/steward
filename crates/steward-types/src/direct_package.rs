@@ -543,6 +543,11 @@ impl DirectTaskDefinition {
         }
         if let Some(requirements) = &self.requires {
             requirements.validate()?;
+            if let Some(model) = &self.runtime.model
+                && !requirements.authority.llms.contains(model)
+            {
+                return Err("selected runtime model is not included in requirements".to_owned());
+            }
         }
         require_unique_paths(self.skills.iter())?;
         require_unique_paths(self.outputs.iter().map(|output| &output.path))
@@ -553,6 +558,8 @@ impl DirectTaskDefinition {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeSelection {
     pub agent_ref: AgentRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelRequirement>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]

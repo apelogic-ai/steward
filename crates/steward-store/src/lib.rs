@@ -159,6 +159,21 @@ mod browser_rbac_tests {
     }
 }
 
+#[cfg(test)]
+mod migration_tests {
+    #[test]
+    fn applied_workflow_model_migration_remains_embedded() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations
+                .migrations
+                .iter()
+                .any(|migration| migration.version == 36),
+            "migration 36 was applied in existing databases and must remain embedded"
+        );
+    }
+}
+
 impl PgStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -1219,7 +1234,7 @@ impl PgStore {
                  SELECT events.status \
                  FROM envelope_request_events events \
                  WHERE events.request_id = requests.id \
-                 ORDER BY events.at DESC, events.id DESC \
+                 ORDER BY events.id DESC \
                  LIMIT 1 \
              ) status ON true \
              WHERE status.status = 'pending' \
@@ -1304,7 +1319,7 @@ impl PgStore {
 
         let latest = sqlx::query(
             "SELECT status FROM envelope_request_events \
-             WHERE request_id = $1 ORDER BY at DESC, id DESC LIMIT 1 FOR UPDATE",
+             WHERE request_id = $1 ORDER BY id DESC LIMIT 1 FOR UPDATE",
         )
         .bind(request_id)
         .fetch_optional(&mut *transaction)
@@ -1377,7 +1392,7 @@ impl PgStore {
                      SELECT events.status \
                      FROM envelope_request_events events \
                      WHERE events.request_id = requests.id \
-                     ORDER BY events.at DESC, events.id DESC \
+                     ORDER BY events.id DESC \
                      LIMIT 1 \
                  ) current_status ON true \
                  WHERE requests.owner_user_id = $1 \
@@ -6307,7 +6322,7 @@ async fn direct_user_envelope_evidence_active(
                     events.approved_envelope \
              FROM envelope_request_events events \
              WHERE events.request_id = requests.id \
-             ORDER BY events.at DESC, events.id DESC LIMIT 1 \
+             ORDER BY events.id DESC LIMIT 1 \
          ) status ON true \
          WHERE requests.id = $1",
     )
@@ -8714,6 +8729,8 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
          LIMIT 1 \
      ) spend ON true";
 
+// Event ids express append order. `at` uses transaction time and can move backwards
+// when concurrent provisioners wait on the same user-level lock.
 const ENVELOPE_REQUEST_COLUMNS: &str = "SELECT requests.id, requests.owner_user_id, requests.template_id, \
             requests.template_revision, requests.requested_envelope, \
             status.status, \
@@ -8735,7 +8752,7 @@ const ENVELOPE_REQUEST_COLUMNS: &str = "SELECT requests.id, requests.owner_user_
                 events.actor, events.template_revision, events.at \
          FROM envelope_request_events events \
          WHERE events.request_id = requests.id \
-         ORDER BY events.at DESC, events.id DESC \
+         ORDER BY events.id DESC \
          LIMIT 1 \
      ) status ON true \
      LEFT JOIN LATERAL ( \
@@ -8743,7 +8760,7 @@ const ENVELOPE_REQUEST_COLUMNS: &str = "SELECT requests.id, requests.owner_user_
                 events.envelope_digest, events.approved_envelope \
          FROM envelope_request_events events \
          WHERE events.request_id = requests.id AND events.status = 'provisioned' \
-         ORDER BY events.at DESC, events.id DESC \
+         ORDER BY events.id DESC \
          LIMIT 1 \
      ) provisioned ON status.status = 'stale' ";
 
