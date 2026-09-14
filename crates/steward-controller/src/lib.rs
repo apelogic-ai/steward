@@ -994,7 +994,21 @@ fn internal_task_authority_snapshot(
     {
         return Ok(None);
     }
-    let envelope = steward_connections_v1::envelope();
+    let (envelope, authority_digest) = match task.internal_authority_version {
+        Some(1) => (
+            steward_connections_v1::envelope(),
+            steward_connections_v1::AUTHORITY_DIGEST,
+        ),
+        Some(2) => (
+            steward_admission::internal_authorities::steward_connections_v2::envelope(),
+            steward_admission::internal_authorities::steward_connections_v2::AUTHORITY_DIGEST,
+        ),
+        _ => {
+            return Err(TaskControllerError::InvalidState(
+                "unknown internal authority version".to_owned(),
+            ));
+        }
+    };
     let digest = bytes_digest(&serde_json::to_vec(&envelope).map_err(|error| {
         TaskControllerError::InvalidState(format!(
             "internal Task Envelope cannot be digested: {error}"
@@ -1002,9 +1016,7 @@ fn internal_task_authority_snapshot(
     })?);
     if task.submitter_service != steward_connections_v1::SERVICE
         || task.internal_authority_id.as_deref() != Some(steward_connections_v1::SERVICE)
-        || task.internal_authority_version != Some(steward_connections_v1::AUTHORITY_VERSION)
-        || task.internal_authority_digest.as_deref()
-            != Some(steward_connections_v1::AUTHORITY_DIGEST)
+        || task.internal_authority_digest.as_deref() != Some(authority_digest)
         || task.envelope_revision != envelope.revision
         || task.service_envelope_digest.as_deref() != Some(digest.as_str())
     {
@@ -2142,8 +2154,7 @@ fn connection_operation_bindings_match(
         return false;
     };
     operation.authority_id == "steward-connections"
-        && operation.authority_version == 1
-        && operation.authority_digest == steward_connections_v1::AUTHORITY_DIGEST
+        && connection_authority_matches(operation)
         && task.internal_authority_id.as_deref() == Some(operation.authority_id.as_str())
         && task.internal_authority_version == Some(operation.authority_version)
         && task.internal_authority_digest.as_deref() == Some(operation.authority_digest.as_str())
@@ -2151,6 +2162,22 @@ fn connection_operation_bindings_match(
         && operation.command_snapshot == task.agent_command
         && provider_control_bindings_match(&operation.bindings, current)
         && task.runtime_namespace == operation.bindings.namespace
+}
+
+fn connection_authority_matches(operation: &ConnectionOperationRecord) -> bool {
+    matches!(
+        (
+            operation.authority_version,
+            operation.authority_digest.as_str(),
+            operation.bindings.mcp_gw_version.as_str()
+        ),
+        (1, steward_connections_v1::AUTHORITY_DIGEST, "0.3.2")
+            | (
+                2,
+                steward_admission::internal_authorities::steward_connections_v2::AUTHORITY_DIGEST,
+                "0.4.9"
+            )
+    )
 }
 
 fn provider_control_bindings_match(
@@ -2227,7 +2254,11 @@ fn connection_operation_runtime_matches(
             acting_user: Some(acting_user),
         } if name == steward_connections_v1::SERVICE && acting_user == &runtime.spec.owner
     );
-    let authority = steward_connections_v1::envelope();
+    let authority = match operation.authority_version {
+        1 => steward_connections_v1::envelope(),
+        2 => steward_admission::internal_authorities::steward_connections_v2::envelope(),
+        _ => return Ok(false),
+    };
     let fixed_limits_match = runtime.spec.budget == authority.spec.budget
         && runtime.spec.ttl == authority.spec.ttl
         && runtime.spec.runner == authority.spec.runner;
@@ -2239,8 +2270,7 @@ fn connection_operation_runtime_matches(
     Ok(operation.operation_id == operation.task_uid
         && operation.provider == "github"
         && operation.authority_id == steward_connections_v1::AUTHORITY_ID
-        && operation.authority_version == steward_connections_v1::AUTHORITY_VERSION
-        && operation.authority_digest == steward_connections_v1::AUTHORITY_DIGEST
+        && connection_authority_matches(operation)
         && operation.runtime_spec_snapshot == runtime.spec
         && operation
             .command_snapshot
@@ -2287,12 +2317,10 @@ fn expected_connection_admission_runtime(
     let connection = &admission.connection;
     let mut spec = connection.runtime_spec_snapshot.clone();
     if !active {
-        let authority = steward_connections_v1::envelope();
         spec.llms.clear();
         spec.tools.clear();
         spec.budget.monthly_limit = "0".to_owned();
         spec.budget.single_run_limit = Some("0".to_owned());
-        spec.budget.currency = authority.spec.budget.currency;
     }
     let mode = if active { "active" } else { "inert" };
     let manifest_digest = if active {

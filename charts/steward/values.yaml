@@ -138,7 +138,7 @@ connectionsBridge:
   sourceRepository: ""
   sourceCommit: ""
   mcpGatewayOrigin: ""
-  # Authority v1 is valid only for the exact MCP-GW OAuth contract in release 0.3.2.
+  # Authority v1 uses MCP-GW 0.3.2; authority v2 uses MCP-GW 0.4.9.
   mcpGatewayVersion: ""
   runtimeNamespace: ""
   attestationBundle: ""

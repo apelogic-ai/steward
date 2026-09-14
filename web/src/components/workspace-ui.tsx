@@ -26,6 +26,10 @@ export function PrimaryLink({ children, href }: Readonly<{ children: ReactNode; 
 export function StatusBadge({ value }: Readonly<{ value: string }>) {
   const badgeClass = {
     failed: "status-badge-error",
+    "credential expired": "status-badge-error",
+    reauth_required: "status-badge-error",
+    "expiring soon": "status-badge-warning",
+    connected: "status-badge-success",
     provisioned: "status-badge-success",
     succeeded: "status-badge-success",
   }[value.toLowerCase()] ?? "bg-canvas text-muted-ink";

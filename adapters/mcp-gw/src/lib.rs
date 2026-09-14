@@ -16,7 +16,8 @@ const OPEN_SHELL_BEARER_PLACEHOLDER: &str = "openshell-token-grant-placeholder";
 const MAX_RESPONSE_BYTES: usize = 32 * 1024;
 const PROVIDER_TRANSPORT_READY_TIMEOUT: Duration = Duration::from_secs(12);
 const PROVIDER_TRANSPORT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
-const STATUS_PATH: &str = "/oauth/github/status";
+const LEGACY_STATUS_PATH: &str = "/oauth/github/status";
+const LIFECYCLE_STATUS_PATH: &str = "/connections/github/status";
 const START_PATH: &str = "/oauth/github/start";
 const DISCONNECT_PATH: &str = "/oauth/github/disconnect";
 
@@ -25,6 +26,24 @@ pub enum GithubBridgeOperation {
     Status,
     Start,
     Disconnect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GatewayContract {
+    LegacyV032,
+    LifecycleV049,
+}
+
+impl GatewayContract {
+    fn parse(value: &str) -> Result<Self, PortError> {
+        match value {
+            "0.3.2" => Ok(Self::LegacyV032),
+            "0.4.9" => Ok(Self::LifecycleV049),
+            _ => Err(rejected(
+                "Connections bridge gateway version is not allowlisted",
+            )),
+        }
+    }
 }
 
 impl GithubBridgeOperation {
@@ -37,9 +56,15 @@ impl GithubBridgeOperation {
         }
     }
 
-    fn method_and_path(self) -> (Method, &'static str) {
+    fn method_and_path(self, contract: GatewayContract) -> (Method, &'static str) {
         match self {
-            Self::Status => (Method::GET, STATUS_PATH),
+            Self::Status => (
+                Method::GET,
+                match contract {
+                    GatewayContract::LegacyV032 => LEGACY_STATUS_PATH,
+                    GatewayContract::LifecycleV049 => LIFECYCLE_STATUS_PATH,
+                },
+            ),
             Self::Start => (Method::POST, START_PATH),
             Self::Disconnect => (Method::POST, DISCONNECT_PATH),
         }
@@ -88,18 +113,24 @@ impl GithubBridgeRequest {
 pub struct GithubMcpGateway {
     client: Client,
     origin: Url,
+    contract: GatewayContract,
 }
 
 impl GithubMcpGateway {
-    pub fn new(origin: &str) -> Result<Self, PortError> {
+    pub fn new(origin: &str, version: &str) -> Result<Self, PortError> {
         let origin = validate_origin(origin)?;
+        let contract = GatewayContract::parse(version)?;
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|_| unavailable("build MCP-GW client"))?;
-        Ok(Self { client, origin })
+        Ok(Self {
+            client,
+            origin,
+            contract,
+        })
     }
 
     pub async fn execute(
@@ -121,7 +152,7 @@ impl GithubMcpGateway {
                 "Connections bridge request does not match its allowlisted operation",
             ));
         }
-        let (method, path) = operation.method_and_path();
+        let (method, path) = operation.method_and_path(self.contract);
         let target = endpoint(&self.origin, path)?;
         let body = request.body();
         let started = Instant::now();
@@ -154,7 +185,7 @@ impl GithubMcpGateway {
             }
             break (status, body);
         };
-        parse_response(operation, status, &body)
+        parse_response(self.contract, operation, status, &body)
     }
 }
 
@@ -177,6 +208,7 @@ fn pre_dispatch_provider_failure(status: StatusCode, body: &[u8]) -> bool {
 }
 
 fn parse_response(
+    contract: GatewayContract,
     operation: GithubBridgeOperation,
     status: StatusCode,
     body: &[u8],
@@ -185,8 +217,13 @@ fn parse_response(
         GithubBridgeOperation::Status => {
             require_status(status, StatusCode::OK, "read GitHub connection status")?;
             let object = json_object(body, "GitHub status response")?;
-            validate_status_response(&object)?;
-            Ok(Value::Object(object))
+            match contract {
+                GatewayContract::LegacyV032 => {
+                    validate_status_response(&object)?;
+                    Ok(Value::Object(object))
+                }
+                GatewayContract::LifecycleV049 => normalized_status_response(&object),
+            }
         }
         GithubBridgeOperation::Start => {
             require_status(status, StatusCode::OK, "start GitHub connection")?;
@@ -259,6 +296,185 @@ fn validate_status_response(object: &Map<String, Value>) -> Result<(), PortError
         ));
     }
     Ok(())
+}
+
+fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, PortError> {
+    if !object.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "version"
+                | "provider"
+                | "phase"
+                | "connected"
+                | "account"
+                | "requiredScopes"
+                | "grantedScopes"
+                | "missingScopes"
+                | "activeCredentialExpiresAt"
+                | "renewalCredentialExpiresAt"
+                | "lastAuthorizedAt"
+                | "lastRenewedAt"
+                | "lastValidatedAt"
+                | "capabilities"
+                | "errorCategory"
+        )
+    }) || object.get("version").and_then(Value::as_str) != Some("1")
+        || object.get("provider").and_then(Value::as_str) != Some("github")
+    {
+        return Err(rejected(
+            "GitHub lifecycle status has an invalid identity or schema",
+        ));
+    }
+
+    let phase = object
+        .get("phase")
+        .and_then(Value::as_str)
+        .filter(|phase| {
+            matches!(
+                *phase,
+                "disconnected"
+                    | "authorizing"
+                    | "connected"
+                    | "renewing"
+                    | "reauthorization_required"
+                    | "revocation_pending"
+                    | "disconnected_with_provider_cleanup_pending"
+                    | "unavailable"
+            )
+        })
+        .ok_or_else(|| rejected("GitHub lifecycle phase is invalid"))?;
+    let connected = object
+        .get("connected")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| rejected("GitHub lifecycle connected state is invalid"))?;
+    let account = object
+        .get("account")
+        .map(|value| {
+            let account = value
+                .as_object()
+                .filter(|account| account.len() == 1)
+                .ok_or_else(|| rejected("GitHub lifecycle account is invalid"))?;
+            account
+                .get("displayName")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty() && name.len() <= 320)
+                .map(str::to_owned)
+                .ok_or_else(|| rejected("GitHub lifecycle account is invalid"))
+        })
+        .transpose()?;
+    let scopes_required = required_string_array(object, "requiredScopes")?;
+    let scopes_granted = required_string_array(object, "grantedScopes")?;
+    let scopes_missing = required_string_array(object, "missingScopes")?;
+    if connected != (phase == "connected")
+        || (connected
+            && (account.is_none()
+                || scopes_missing
+                    .as_array()
+                    .is_some_and(|values| !values.is_empty())))
+    {
+        return Err(rejected("GitHub lifecycle phase and account disagree"));
+    }
+    let active_expiry = nullable_utc_timestamp(object, "activeCredentialExpiresAt")?;
+    let renewal_expiry = nullable_utc_timestamp(object, "renewalCredentialExpiresAt")?;
+    for key in ["lastAuthorizedAt", "lastRenewedAt", "lastValidatedAt"] {
+        nullable_utc_timestamp(object, key)?;
+    }
+    let capabilities = object
+        .get("capabilities")
+        .and_then(Value::as_object)
+        .ok_or_else(|| rejected("GitHub lifecycle capabilities are invalid"))?;
+    if !capabilities.iter().all(|(key, value)| {
+        matches!(
+            key.as_str(),
+            "interactiveAuthorization"
+                | "activeCredentialExpiry"
+                | "automaticRenewal"
+                | "manualRenewal"
+                | "rotatingRenewalCredential"
+                | "providerValidation"
+                | "providerRevocation"
+                | "scopeReporting"
+                | "identityVerification"
+                | "authorizationRequiresRenewalCredential"
+        ) && value.is_boolean()
+    }) || object
+        .get("errorCategory")
+        .is_some_and(|value| value.as_str().is_none_or(|category| category.len() > 64))
+    {
+        return Err(rejected(
+            "GitHub lifecycle capabilities or error are invalid",
+        ));
+    }
+
+    let mut projection = Map::new();
+    projection.insert("phase".to_owned(), Value::String(phase.to_owned()));
+    projection.insert("connected".to_owned(), Value::Bool(connected));
+    if let Some(account) = account {
+        projection.insert("email".to_owned(), Value::String(account));
+    }
+    projection.insert("scopesRequired".to_owned(), scopes_required);
+    projection.insert("scopesGranted".to_owned(), scopes_granted);
+    projection.insert("missingScopes".to_owned(), scopes_missing);
+    projection.insert("activeCredentialExpiresAt".to_owned(), active_expiry);
+    projection.insert("renewalCredentialExpiresAt".to_owned(), renewal_expiry);
+    Ok(Value::Object(projection))
+}
+
+fn required_string_array(object: &Map<String, Value>, key: &str) -> Result<Value, PortError> {
+    object
+        .get(key)
+        .filter(|value| string_array(Some(value)))
+        .cloned()
+        .ok_or_else(|| rejected("GitHub lifecycle scope list is invalid"))
+}
+
+fn nullable_utc_timestamp(object: &Map<String, Value>, key: &str) -> Result<Value, PortError> {
+    let value = object
+        .get(key)
+        .ok_or_else(|| rejected("GitHub lifecycle timestamp is missing"))?;
+    if value.is_null() || value.as_str().is_some_and(valid_utc_timestamp) {
+        Ok(value.clone())
+    } else {
+        Err(rejected("GitHub lifecycle timestamp is invalid"))
+    }
+}
+
+fn valid_utc_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 24
+        || ![4, 7, 10, 13, 16, 19, 23]
+            .into_iter()
+            .zip([b'-', b'-', b'T', b':', b':', b'.', b'Z'])
+            .all(|(index, expected)| bytes[index] == expected)
+        || !bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19 | 23) || byte.is_ascii_digit()
+        })
+    {
+        return false;
+    }
+    let number = |start: usize, end: usize| -> Option<u32> { value[start..end].parse().ok() };
+    let Some((year, month, day, hour, minute, second)) = number(0, 4)
+        .zip(number(5, 7))
+        .zip(number(8, 10))
+        .zip(number(11, 13))
+        .zip(number(14, 16))
+        .zip(number(17, 19))
+        .map(|(((((year, month), day), hour), minute), second)| {
+            (year, month, day, hour, minute, second)
+        })
+    else {
+        return false;
+    };
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=max_day).contains(&day) && hour < 24 && minute < 60 && second < 60
 }
 
 fn string_array(value: Option<&Value>) -> bool {
@@ -381,8 +597,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        GithubBridgeOperation, GithubBridgeRequest, GithubMcpGateway, parse_response,
-        pre_dispatch_provider_failure,
+        GatewayContract, GithubBridgeOperation, GithubBridgeRequest, GithubMcpGateway,
+        parse_response, pre_dispatch_provider_failure,
     };
     use reqwest::StatusCode;
     use steward_ports::PortError;
@@ -436,6 +652,7 @@ mod tests {
     fn bridge_responses_accept_the_disconnected_mcp_gw_contract_and_reject_malformed_values() {
         assert!(
             parse_response(
+                GatewayContract::LegacyV032,
                 GithubBridgeOperation::Status,
                 StatusCode::OK,
                 br#"{"connected":false}"#,
@@ -445,6 +662,7 @@ mod tests {
         );
         assert!(
             parse_response(
+                GatewayContract::LegacyV032,
                 GithubBridgeOperation::Status,
                 StatusCode::OK,
                 br#"{"connected":"false"}"#,
@@ -454,6 +672,7 @@ mod tests {
         );
         assert!(
             parse_response(
+                GatewayContract::LegacyV032,
                 GithubBridgeOperation::Status,
                 StatusCode::OK,
                 br#"{"connected":true}"#,
@@ -463,6 +682,7 @@ mod tests {
         );
         assert!(
             parse_response(
+                GatewayContract::LegacyV032,
                 GithubBridgeOperation::Start,
                 StatusCode::OK,
                 br#"{"authorizationUrl":"http://github.example.test/authorize"}"#,
@@ -471,15 +691,61 @@ mod tests {
             "a non-HTTPS authorization URL must never reach the browser"
         );
         assert!(
-            parse_response(GithubBridgeOperation::Disconnect, StatusCode::OK, b"").is_err(),
+            parse_response(
+                GatewayContract::LegacyV032,
+                GithubBridgeOperation::Disconnect,
+                StatusCode::OK,
+                b"",
+            )
+            .is_err(),
             "disconnect is only complete on the exact MCP-GW no-content response"
         );
+    }
+
+    #[test]
+    fn normalized_status_preserves_expiry_without_forwarding_provider_secrets() -> Result<(), String>
+    {
+        let status = br#"{"version":"1","provider":"github","phase":"connected","connected":true,"account":{"displayName":"alice@example.com"},"requiredScopes":["repo"],"grantedScopes":["repo"],"missingScopes":[],"activeCredentialExpiresAt":"2026-09-15T12:00:00.000Z","renewalCredentialExpiresAt":"2026-09-16T12:00:00.000Z","lastAuthorizedAt":"2026-09-14T12:00:00.000Z","lastRenewedAt":null,"lastValidatedAt":null,"capabilities":{"interactiveAuthorization":true,"activeCredentialExpiry":true,"automaticRenewal":true,"manualRenewal":true,"rotatingRenewalCredential":true,"providerValidation":true,"providerRevocation":true,"scopeReporting":true,"identityVerification":true}}"#;
+        let mut escaped: serde_json::Value = serde_json::from_slice(status)
+            .map_err(|error| format!("fixed neutral status fixture is invalid: {error}"))?;
+        escaped["activeCredential"] = serde_json::json!("fake-secret");
+        assert!(
+            parse_response(
+                GatewayContract::LifecycleV049,
+                GithubBridgeOperation::Status,
+                StatusCode::OK,
+                escaped.to_string().as_bytes(),
+            )
+            .is_err(),
+            "unexpected credential material must not enter the governed Task archive"
+        );
+
+        assert_eq!(
+            parse_response(
+                GatewayContract::LifecycleV049,
+                GithubBridgeOperation::Status,
+                StatusCode::OK,
+                status,
+            ),
+            Ok(serde_json::json!({
+                "phase": "connected",
+                "connected": true,
+                "email": "alice@example.com",
+                "scopesRequired": ["repo"],
+                "scopesGranted": ["repo"],
+                "missingScopes": [],
+                "activeCredentialExpiresAt": "2026-09-15T12:00:00.000Z",
+                "renewalCredentialExpiresAt": "2026-09-16T12:00:00.000Z"
+            }))
+        );
+        Ok(())
     }
 
     #[test]
     fn provider_control_http_failures_are_reduced_to_non_secret_runtime_categories() {
         assert_eq!(
             parse_response(
+                GatewayContract::LegacyV032,
                 GithubBridgeOperation::Status,
                 StatusCode::UNAUTHORIZED,
                 b"ignored",
@@ -490,6 +756,7 @@ mod tests {
         );
         assert_eq!(
             parse_response(
+                GatewayContract::LegacyV032,
                 GithubBridgeOperation::Status,
                 StatusCode::FORBIDDEN,
                 b"ignored",
@@ -500,6 +767,7 @@ mod tests {
         );
         assert_eq!(
             parse_response(
+                GatewayContract::LegacyV032,
                 GithubBridgeOperation::Status,
                 StatusCode::BAD_GATEWAY,
                 b"ignored",
@@ -546,7 +814,7 @@ mod tests {
                 .map_err(|error| format!("write the delayed MCP-GW response: {error}"))?;
             Ok(())
         });
-        let gateway = GithubMcpGateway::new(&format!("http://{address}"))
+        let gateway = GithubMcpGateway::new(&format!("http://{address}"), "0.3.2")
             .map_err(|error| format!("build the MCP-GW fixture adapter: {error:?}"))?;
 
         let response = gateway
@@ -607,7 +875,7 @@ mod tests {
             }
             Ok(())
         });
-        let gateway = GithubMcpGateway::new(&format!("http://{address}"))
+        let gateway = GithubMcpGateway::new(&format!("http://{address}"), "0.3.2")
             .map_err(|error| format!("build the MCP-GW fixture adapter: {error:?}"))?;
 
         let result = gateway

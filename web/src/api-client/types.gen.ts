@@ -542,8 +542,10 @@ export type Principal = {
 
 export type ProviderConnectionStatus = {
     accountEmail?: string | null;
+    activeCredentialExpiresAt?: string | null;
     expiresAt?: string | null;
     phase: ConnectionPhase;
+    renewalCredentialExpiresAt?: string | null;
     scopesGranted: Array<string>;
     scopesMissing: Array<string>;
     scopesRequired: Array<string>;

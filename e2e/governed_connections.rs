@@ -133,7 +133,7 @@ impl Harness {
             bridge_image: Some(bridge_image.to_owned()),
             bridge_artifact_trust_mode: Some(artifact_trust_mode.to_owned()),
             bridge_gateway_origin: Some(MCP_GW_ORIGIN.to_owned()),
-            bridge_gateway_version: Some("0.3.2".to_owned()),
+            bridge_gateway_version: Some("0.4.9".to_owned()),
             bridge_runtime_namespace: Some(CONNECTIONS_NAMESPACE.to_owned()),
         })
         .await
@@ -238,7 +238,7 @@ impl Harness {
                 artifact_trust_mode: artifact_trust_mode.to_owned(),
                 bridge_image_digest: self.bridge_image.clone(),
                 mcp_gw_origin: MCP_GW_ORIGIN.to_owned(),
-                mcp_gw_version: "0.3.2".to_owned(),
+                mcp_gw_version: "0.4.9".to_owned(),
                 namespace: CONNECTIONS_NAMESPACE.to_owned(),
                 runtime_class: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
             },
@@ -830,7 +830,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     harness.wait_tool_contains(
         ALICE_NAMESPACE,
         ALICE_RUNTIME,
-        "not connected",
+        "\"error\":\"provider_oauth_required\"",
         Duration::from_secs(30),
     )?;
 
@@ -928,7 +928,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     let remaining: f64 = oauth_row.try_get("remaining")?;
     assert!(
         (585.0..=600.0).contains(&remaining),
-        "real MCP-GW 0.3.2 OAuth state must have its pinned 600-second lifetime"
+        "real MCP-GW 0.4.9 OAuth state must have its pinned 600-second lifetime"
     );
     let steward_lifetime: f64 = sqlx::query_scalar(
         "SELECT EXTRACT(EPOCH FROM (flow_expires_at - flow_created_at))::float8 \
@@ -987,7 +987,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     harness.wait_tool_contains(
         BOB_NAMESPACE,
         BOB_RUNTIME,
-        "not connected",
+        "\"error\":\"provider_oauth_required\"",
         Duration::from_secs(30),
     )?;
     harness.wait_runtime_phase(
@@ -1007,7 +1007,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     let enforcement = harness.wait_tool_contains(
         ALICE_NAMESPACE,
         ALICE_RUNTIME,
-        "not connected",
+        "\"error\":\"provider_oauth_required\"",
         Duration::from_secs(10),
     )?;
     assert!(enforcement <= Duration::from_secs(10));
@@ -1032,7 +1032,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     harness.wait_tool_contains(
         ALICE_NAMESPACE,
         ALICE_AFTER_DISCONNECT_RUNTIME,
-        "not connected",
+        "\"error\":\"provider_oauth_required\"",
         Duration::from_secs(30),
     )?;
 

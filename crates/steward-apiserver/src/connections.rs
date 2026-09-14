@@ -59,6 +59,8 @@ pub struct ProviderConnectionStatus {
     pub scopes_granted: Vec<String>,
     pub scopes_missing: Vec<String>,
     pub expires_at: Option<String>,
+    pub active_credential_expires_at: Option<String>,
+    pub renewal_credential_expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -462,6 +464,8 @@ mod tests {
                         .into_iter()
                         .collect(),
                     expires_at: None,
+                    active_credential_expires_at: None,
+                    renewal_credential_expires_at: None,
                 })
             })
         }

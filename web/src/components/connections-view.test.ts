@@ -13,4 +13,10 @@ describe("governed provider connection controls", () => {
     expect(source).toContain('oauth_flow_pending');
     expect(source).toContain("Finish or wait for the pending GitHub authorization");
   });
+
+  test("shows a reauthorization action when a reported credential deadline approaches", () => {
+    expect(source).toContain('connectionHealth(status)');
+    expect(source).toContain('Re-authorize GitHub');
+    expect(source).toContain('renewalCredentialExpiresAt');
+  });
 });

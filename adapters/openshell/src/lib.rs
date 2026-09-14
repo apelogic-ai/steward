@@ -1178,9 +1178,9 @@ impl OpenShellConnectionConfig {
                     });
                 }
                 validate_connections_bridge_gateway_origin(origin)?;
-                if version != "0.3.2" {
+                if !matches!(version, "0.3.2" | "0.4.9") {
                     return Err(PortError::Rejected {
-                        reason: "Connections bridge requires the pinned MCP-GW 0.3.2 contract"
+                        reason: "Connections bridge requires a supported, authority-pinned MCP-GW contract"
                             .to_owned(),
                     });
                 }
@@ -2339,6 +2339,13 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 reason: "Selected bridge gateway origin is not configured".to_owned(),
             })?;
             environment.insert("STEWARD_MCP_GW_ORIGIN".to_owned(), origin.to_owned());
+            let version =
+                self.bridge_gateway_version
+                    .as_deref()
+                    .ok_or_else(|| PortError::Rejected {
+                        reason: "Connections bridge gateway version is not configured".to_owned(),
+                    })?;
+            environment.insert("STEWARD_MCP_GW_VERSION".to_owned(), version.to_owned());
         }
         let output_archive_command =
             output_archive_command(&request.agent_type, request.execution_binding.as_ref());

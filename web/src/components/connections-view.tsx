@@ -3,6 +3,7 @@
 import { useCallback, useState } from "react";
 
 import { connectionStatus, disconnectConnection, startConnection, type ConnectionStatusResponse } from "@/api-client";
+import { connectionHealth } from "@/components/connection-health";
 import { DefinitionList, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -28,6 +29,9 @@ function GithubConnection({ connection, refresh }: Readonly<{ connection: Connec
   const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   const [action, setAction] = useState<"idle" | "working" | "oauth-pending" | MutationFailureState>("idle");
   const status = connection.status;
+  const health = connectionHealth(status);
+  const reauthorizationRecommended = health === "expiring_soon" || health === "expired";
+  const badge = health === "expiring_soon" ? "Expiring soon" : health === "expired" ? "Credential expired" : status.phase;
 
   async function connect() {
     if (session.status !== "authenticated") return;
@@ -64,22 +68,24 @@ function GithubConnection({ connection, refresh }: Readonly<{ connection: Connec
 
   return (
     <article className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
-      <div className="flex items-center justify-between gap-4"><div><h2 className="text-xl font-semibold">GitHub</h2><p className="mt-1 text-sm text-muted-ink">User-bound repository access</p></div><StatusBadge value={status.phase} /></div>
+      <div className="flex items-center justify-between gap-4"><div><h2 className="text-xl font-semibold">GitHub</h2><p className="mt-1 text-sm text-muted-ink">User-bound repository access</p></div><StatusBadge value={badge} /></div>
       <DefinitionList items={[
         ["Account", status.accountEmail ?? "Not connected"],
         ["Required scopes", status.scopesRequired.join(", ") || "None"],
         ["Granted scopes", status.scopesGranted.join(", ") || "None"],
         ["Missing scopes", status.scopesMissing.join(", ") || "None"],
-        ["Expires", status.expiresAt ?? "Not reported"],
+        ["Active credential expires", status.activeCredentialExpiresAt ?? "Not reported"],
+        ["Renewal credential expires", status.renewalCredentialExpiresAt ?? "Not reported"],
       ]} />
       {status.phase === "connected" ? (
         <div className="space-y-3 border-t pt-5">
+          {reauthorizationRecommended ? <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">Re-authorize GitHub</button> : null}
           <p className="text-sm text-muted-ink">Disconnecting GitHub affects all present and future agent runtimes using the same Steward identity.</p>
           <label className="flex min-h-11 items-center gap-3 text-sm"><input checked={confirmDisconnect} onChange={(event) => setConfirmDisconnect(event.target.checked)} type="checkbox" />I understand this revokes the shared Steward connection.</label>
           <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!confirmDisconnect || action === "working"} onClick={() => void disconnect()} type="button">Disconnect GitHub</button>
         </div>
       ) : (
-        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={action === "working" || status.phase === "unavailable"} onClick={() => void connect()} type="button">{status.phase === "reauth_required" ? "Reconnect GitHub" : "Connect GitHub"}</button>
+        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={action === "working" || status.phase === "unavailable"} onClick={() => void connect()} type="button">{status.phase === "reauth_required" ? "Re-authorize GitHub" : "Connect GitHub"}</button>
       )}
       {action !== "idle" && action !== "working" ? <p className="text-sm text-red-800" role="alert">{{ "oauth-pending": "Finish or wait for the pending GitHub authorization before disconnecting.", conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "Rust rejected the connection action.", forbidden: "The Rust authorization boundary rejected the connection action.", unavailable: "The authoritative connection service is unavailable.", error: "The server-owned connection action could not be completed." }[action]}</p> : null}
     </article>
