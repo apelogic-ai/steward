@@ -159,6 +159,21 @@ mod browser_rbac_tests {
     }
 }
 
+#[cfg(test)]
+mod migration_tests {
+    #[test]
+    fn applied_workflow_model_migration_remains_embedded() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations
+                .migrations
+                .iter()
+                .any(|migration| migration.version == 36),
+            "migration 36 was applied in existing databases and must remain embedded"
+        );
+    }
+}
+
 impl PgStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
