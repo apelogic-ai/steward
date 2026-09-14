@@ -2364,8 +2364,7 @@ mod tests {
         );
         for required in [
             "STEWARD_OPEN_SHELL_RELEASE=v0.0.98",
-            "sha256:f2ad2353a0445b8a89d7da2028a7a42f52bc538f9e63d66c07d242834553d96f",
-            "sha256:6e7da4111d3e46aeac82eaad7a022e18c8cfb007f6024194049f0fe24b54e341",
+            "sha256:80bef7bee93482c8091335ae27c3c3e968e5c78c2bb4a40b401e6af36f70f993",
             "e2e/Dockerfile.workflow-sandbox",
             "STEWARD_OPENSHELL_SANDBOX_IMAGE",
         ] {
@@ -2388,7 +2387,7 @@ mod tests {
             );
         }
         for required in [
-            "real MCP-GW 0.3.2 OAuth state must have its pinned 600-second lifetime",
+            "real MCP-GW 0.4.9 OAuth state must have its pinned 600-second lifetime",
             "connection operations must remain structurally absent from generic run history",
             "harness.wait_runtime_phase(",
             "ALICE_RUNTIME,\n        \"Running\"",

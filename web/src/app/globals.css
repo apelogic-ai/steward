@@ -27,6 +27,9 @@
   --steward-error-background: #fef2f2;
   --steward-error-border: #fca5a5;
   --steward-error-ink: #991b1b;
+  --steward-warning-background: #fff7e6;
+  --steward-warning-border: #f2bb58;
+  --steward-warning-ink: #854d0e;
   color-scheme: light;
   background: var(--color-canvas);
 }
@@ -45,6 +48,9 @@
     --steward-error-background: #3b1717;
     --steward-error-border: #9f3d3d;
     --steward-error-ink: #fca5a5;
+    --steward-warning-background: #423115;
+    --steward-warning-border: #a06e20;
+    --steward-warning-ink: #fcd58a;
     color-scheme: dark;
   }
 }
@@ -62,6 +68,9 @@
   --steward-error-background: #fef2f2;
   --steward-error-border: #fca5a5;
   --steward-error-ink: #991b1b;
+  --steward-warning-background: #fff7e6;
+  --steward-warning-border: #f2bb58;
+  --steward-warning-ink: #854d0e;
   color-scheme: light;
 }
 
@@ -78,6 +87,9 @@
   --steward-error-background: #3b1717;
   --steward-error-border: #9f3d3d;
   --steward-error-ink: #fca5a5;
+  --steward-warning-background: #423115;
+  --steward-warning-border: #a06e20;
+  --steward-warning-ink: #fcd58a;
   color-scheme: dark;
 }
 
@@ -146,6 +158,12 @@ body {
   border-color: var(--steward-error-border);
   background: var(--steward-error-background);
   color: var(--steward-error-ink);
+}
+
+.status-badge-warning {
+  border-color: var(--steward-warning-border);
+  background: var(--steward-warning-background);
+  color: var(--steward-warning-ink);
 }
 
 input,

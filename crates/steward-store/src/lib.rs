@@ -6707,9 +6707,22 @@ fn validate_connection_operation_request(
     );
     if request.task.submitter_service != "steward-connections"
         || request.authority_id != "steward-connections"
-        || request.authority_version != 1
-        || request.authority_digest
-            != steward_admission::internal_authorities::steward_connections_v1::AUTHORITY_DIGEST
+        || !matches!(
+            (
+                request.authority_version,
+                request.authority_digest,
+                request.bindings.mcp_gw_version.as_str()
+            ),
+            (
+                1,
+                steward_admission::internal_authorities::steward_connections_v1::AUTHORITY_DIGEST,
+                "0.3.2"
+            ) | (
+                2,
+                steward_admission::internal_authorities::steward_connections_v2::AUTHORITY_DIGEST,
+                "0.4.9"
+            )
+        )
         || request.response_deadline_seconds <= 0
         || request.response_deadline_seconds > 60
         || request.idempotency_identity.trim().is_empty()
@@ -6737,7 +6750,6 @@ fn validate_connection_operation_request(
             _ => false,
         }
         || request.bindings.mcp_gw_origin.trim().is_empty()
-        || request.bindings.mcp_gw_version != "0.3.2"
         || request.bindings.namespace.trim().is_empty()
         || request.bindings.runtime_class.trim().is_empty()
         || !principal_is_bound

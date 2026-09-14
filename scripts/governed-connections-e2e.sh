@@ -35,18 +35,7 @@ trap 'cleanup "$?"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-case "$(docker info --format '{{.Architecture}}')" in
-  aarch64 | arm64)
-    MCP_GW_RELEASE_IMAGE="ghcr.io/apelogic-ai/mcp-gw-github-wrapper@sha256:f2ad2353a0445b8a89d7da2028a7a42f52bc538f9e63d66c07d242834553d96f"
-    ;;
-  x86_64 | amd64)
-    MCP_GW_RELEASE_IMAGE="ghcr.io/apelogic-ai/mcp-gw-github-wrapper@sha256:6e7da4111d3e46aeac82eaad7a022e18c8cfb007f6024194049f0fe24b54e341"
-    ;;
-  *)
-    echo "unsupported Docker architecture" >&2
-    exit 2
-    ;;
-esac
+MCP_GW_RELEASE_IMAGE="ghcr.io/apelogic-ai/mcp-gw-github-wrapper@sha256:80bef7bee93482c8091335ae27c3c3e968e5c78c2bb4a40b401e6af36f70f993"
 
 docker pull "${MCP_GW_RELEASE_IMAGE}"
 docker tag "${MCP_GW_RELEASE_IMAGE}" "${MCP_GW_LOCAL_IMAGE}"

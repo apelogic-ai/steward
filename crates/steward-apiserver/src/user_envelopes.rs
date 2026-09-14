@@ -1454,6 +1454,8 @@ mod tests {
                     scopes_granted: Vec::new(),
                     scopes_missing: vec!["repo".to_owned()],
                     expires_at: None,
+                    active_credential_expires_at: None,
+                    renewal_credential_expires_at: None,
                 })
             })
         }

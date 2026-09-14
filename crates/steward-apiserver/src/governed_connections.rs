@@ -8,7 +8,7 @@ use std::time::Duration as StdDuration;
 use reqwest::Url;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use steward_admission::internal_authorities::steward_connections_v1;
+use steward_admission::internal_authorities::{steward_connections_v1, steward_connections_v2};
 use steward_admission::{AdmissionDecision, Envelope, evaluate};
 use steward_store::{
     ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase,
@@ -132,8 +132,22 @@ fn provider_control_grant(action: &str) -> Result<ToolGrant, GovernedConnectionP
         .ok_or(GovernedConnectionPlanError::Admission)
 }
 
-fn authority_envelope() -> Envelope {
-    steward_connections_v1::envelope()
+fn connection_authority(
+    version: &str,
+) -> Result<(Envelope, i64, &'static str), GovernedConnectionPlanError> {
+    match version {
+        steward_connections_v1::MCP_GW_VERSION => Ok((
+            steward_connections_v1::envelope(),
+            steward_connections_v1::AUTHORITY_VERSION,
+            steward_connections_v1::AUTHORITY_DIGEST,
+        )),
+        steward_connections_v2::MCP_GW_VERSION => Ok((
+            steward_connections_v2::envelope(),
+            steward_connections_v2::AUTHORITY_VERSION,
+            steward_connections_v2::AUTHORITY_DIGEST,
+        )),
+        _ => Err(GovernedConnectionPlanError::InvalidBindings),
+    }
 }
 
 impl ConnectionOperationKind {
@@ -182,7 +196,7 @@ impl ConnectionExecutionBindings {
             || !matches!(origin.path(), "" | "/")
             || origin.query().is_some()
             || origin.fragment().is_some()
-            || self.mcp_gw_version != MCP_GW_CONTRACT_VERSION
+            || connection_authority(&self.mcp_gw_version).is_err()
             || self.namespace.trim().is_empty()
             || self.runtime_class.trim().is_empty()
         {
@@ -288,7 +302,8 @@ impl<B> GovernedConnectionsBroker<B> {
             namespace: plan.bindings.namespace.clone(),
             runtime_class: plan.bindings.runtime_class.clone(),
         };
-        let service_envelope = steward_connections_v1::envelope();
+        let (service_envelope, _, _) = connection_authority(&plan.bindings.mcp_gw_version)
+            .map_err(|_| ConnectionBrokerError::Unavailable)?;
         let admission = evaluate(&plan.spec, &service_envelope)
             .map_err(|_| ConnectionBrokerError::Unavailable)?;
         // Connection reservations use one identity for the operation and its Task.
@@ -313,7 +328,11 @@ impl<B> GovernedConnectionsBroker<B> {
             acting_user_id: Some(acting_user_id),
             owner: email.as_str(),
             owner_user_id: canonical_user_id.as_str(),
-            workflow: "internal:steward-connections/v1",
+            workflow: if plan.authority_version == steward_connections_v2::AUTHORITY_VERSION {
+                "internal:steward-connections/v2"
+            } else {
+                "internal:steward-connections/v1"
+            },
             workflow_name: None,
             workflow_version: None,
             workflow_digest: None,
@@ -329,7 +348,7 @@ impl<B> GovernedConnectionsBroker<B> {
             agent_command: &plan.command,
             execution_binding: None,
             direct_task_evidence: None,
-            envelope_revision: CONNECTIONS_AUTHORITY_VERSION,
+            envelope_revision: plan.authority_version,
             service_envelope: &service_envelope,
             service_envelope_digest: &orchestration.service_envelope_digest,
             candidate_digest: &orchestration.candidate_digest,
@@ -768,7 +787,14 @@ fn provider_status(value: &Value) -> Result<ProviderConnectionStatus, Connection
     if !object.keys().all(|key| {
         matches!(
             key.as_str(),
-            "connected" | "email" | "scopesRequired" | "scopesGranted" | "missingScopes"
+            "phase"
+                | "connected"
+                | "email"
+                | "scopesRequired"
+                | "scopesGranted"
+                | "missingScopes"
+                | "activeCredentialExpiresAt"
+                | "renewalCredentialExpiresAt"
         )
     }) {
         return Err(ConnectionBrokerError::Unavailable);
@@ -784,13 +810,21 @@ fn provider_status(value: &Value) -> Result<ProviderConnectionStatus, Connection
     if connected && (email.is_none() || !scopes_missing.is_empty()) {
         return Err(ConnectionBrokerError::Unavailable);
     }
-    let phase = if connected {
-        ConnectionPhase::Connected
-    } else if email.is_some() && !scopes_missing.is_empty() {
-        ConnectionPhase::ReauthRequired
-    } else {
-        ConnectionPhase::Disconnected
+    let phase = match object.get("phase").and_then(Value::as_str) {
+        Some("connected") if connected => ConnectionPhase::Connected,
+        Some("reauthorization_required") if !connected => ConnectionPhase::ReauthRequired,
+        Some("authorizing" | "renewing") if !connected => ConnectionPhase::Connecting,
+        Some("unavailable") if !connected => ConnectionPhase::Unavailable,
+        Some(
+            "disconnected" | "revocation_pending" | "disconnected_with_provider_cleanup_pending",
+        ) if !connected => ConnectionPhase::Disconnected,
+        None if connected => ConnectionPhase::Connected,
+        None if email.is_some() && !scopes_missing.is_empty() => ConnectionPhase::ReauthRequired,
+        None => ConnectionPhase::Disconnected,
+        _ => return Err(ConnectionBrokerError::Unavailable),
     };
+    let active_credential_expires_at = optional_expiry(object, "activeCredentialExpiresAt")?;
+    let renewal_credential_expires_at = optional_expiry(object, "renewalCredentialExpiresAt")?;
     Ok(ProviderConnectionStatus {
         phase,
         account_email: email,
@@ -798,7 +832,22 @@ fn provider_status(value: &Value) -> Result<ProviderConnectionStatus, Connection
         scopes_granted,
         scopes_missing,
         expires_at: None,
+        active_credential_expires_at,
+        renewal_credential_expires_at,
     })
+}
+
+fn optional_expiry(
+    object: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, ConnectionBrokerError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() && value.len() <= 40 => {
+            Ok(Some(value.clone()))
+        }
+        _ => Err(ConnectionBrokerError::Unavailable),
+    }
 }
 
 fn optional_string(
@@ -944,7 +993,8 @@ pub fn plan_connection_operation(
     bindings: ConnectionExecutionBindings,
 ) -> Result<GovernedConnectionPlan, GovernedConnectionPlanError> {
     bindings.validate()?;
-    let authority = authority_envelope();
+    let (authority, authority_version, authority_digest) =
+        connection_authority(&bindings.mcp_gw_version)?;
     let spec = AgentRuntimeSpec {
         principal: Principal::Service {
             name: CONNECTIONS_SERVICE.to_owned(),
@@ -983,8 +1033,8 @@ pub fn plan_connection_operation(
             "request.json".to_owned(),
         ],
         authority_id: CONNECTIONS_SERVICE,
-        authority_version: CONNECTIONS_AUTHORITY_VERSION,
-        authority_digest: CONNECTIONS_AUTHORITY_DIGEST.to_owned(),
+        authority_version,
+        authority_digest: authority_digest.to_owned(),
         bindings,
     })
 }
@@ -1001,7 +1051,8 @@ mod tests {
         ConnectionExecutionBindings, ConnectionOperationKind, GITHUB_ATTESTATION_TRUST_MODE,
         GovernedConnectionPlanError, MCP_GW_CONTRACT_VERSION, MCP_GW_OAUTH_CLOCK_SKEW_SECONDS,
         MCP_GW_OAUTH_STATE_LIFETIME_SECONDS, OPERATOR_PINNED_TRUST_MODE, bridge_result,
-        plan_connection_operation, single_file_archive, valid_operator_pinned_image,
+        plan_connection_operation, provider_status, single_file_archive,
+        valid_operator_pinned_image,
     };
 
     fn bindings() -> ConnectionExecutionBindings {
@@ -1120,8 +1171,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            evaluate(&plan.spec, &super::authority_envelope())
-                .map_err(|error| format!("evaluate internal authority: {error:?}"))?,
+            evaluate(
+                &plan.spec,
+                &steward_admission::internal_authorities::steward_connections_v1::envelope()
+            )
+            .map_err(|error| format!("evaluate internal authority: {error:?}"))?,
             AdmissionDecision::Admit,
             "the fixed bridge plan must pass the same admission library as agent runtimes"
         );
@@ -1150,8 +1204,11 @@ mod tests {
             assert_eq!(plan.spec.tools[0].action, action);
             assert_eq!(plan.command[2], bridge_operation);
             assert_eq!(
-                evaluate(&plan.spec, &super::authority_envelope())
-                    .map_err(|error| format!("evaluate {action}: {error:?}"))?,
+                evaluate(
+                    &plan.spec,
+                    &steward_admission::internal_authorities::steward_connections_v1::envelope()
+                )
+                .map_err(|error| format!("evaluate {action}: {error:?}"))?,
                 AdmissionDecision::Admit
             );
 
@@ -1159,8 +1216,11 @@ mod tests {
             ordinary_tool.tools[0].resource = "repository".to_owned();
             ordinary_tool.tools[0].action = "get_file_contents".to_owned();
             assert_ne!(
-                evaluate(&ordinary_tool, &super::authority_envelope())
-                    .map_err(|error| format!("evaluate ordinary tool: {error:?}"))?,
+                evaluate(
+                    &ordinary_tool,
+                    &steward_admission::internal_authorities::steward_connections_v1::envelope()
+                )
+                .map_err(|error| format!("evaluate ordinary tool: {error:?}"))?,
                 AdmissionDecision::Admit,
                 "provider-control authority must never authorize an ordinary GitHub MCP tool"
             );
@@ -1225,6 +1285,35 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_gateway_selects_immutable_v2_authority() -> Result<(), String> {
+        let mut lifecycle_bindings = bindings();
+        lifecycle_bindings.mcp_gw_version = "0.4.9".to_owned();
+        let plan = plan_connection_operation(
+            &CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
+                .map_err(|error| format!("user: {error:?}"))?,
+            &Email::parse("alice@example.com").map_err(|error| format!("email: {error:?}"))?,
+            ConnectionOperationKind::Status,
+            lifecycle_bindings,
+        )
+        .map_err(|error| format!("plan: {error:?}"))?;
+        let document = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/internal-authorities/steward-connections/v2.json"
+        ));
+        assert_eq!(plan.authority_version, 2);
+        assert_eq!(
+            plan.authority_digest,
+            format!("sha256:{:x}", Sha256::digest(document.as_bytes()))
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(document)
+                .map_err(|error| error.to_string())?["oauthContract"]["mcpGwVersion"],
+            "0.4.9"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn incompatible_gateway_contract_version_fails_closed() {
         let mut incompatible = bindings();
         incompatible.mcp_gw_version = "0.3.1".to_owned();
@@ -1232,6 +1321,30 @@ mod tests {
             incompatible.validate(),
             Err(GovernedConnectionPlanError::InvalidBindings)
         );
+    }
+
+    #[test]
+    fn normalized_status_retains_precise_credential_expiries() -> Result<(), String> {
+        let status = provider_status(&serde_json::json!({
+            "phase": "connected",
+            "connected": true,
+            "email": "alice@example.com",
+            "scopesRequired": ["repo"],
+            "scopesGranted": ["repo"],
+            "missingScopes": [],
+            "activeCredentialExpiresAt": "2026-09-15T12:00:00.000Z",
+            "renewalCredentialExpiresAt": "2026-09-16T12:00:00.000Z"
+        }))
+        .map_err(|error| format!("normalized status was rejected: {error:?}"))?;
+        assert_eq!(
+            status.active_credential_expires_at.as_deref(),
+            Some("2026-09-15T12:00:00.000Z")
+        );
+        assert_eq!(
+            status.renewal_credential_expires_at.as_deref(),
+            Some("2026-09-16T12:00:00.000Z")
+        );
+        Ok(())
     }
 
     #[test]

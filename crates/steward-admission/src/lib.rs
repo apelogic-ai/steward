@@ -69,6 +69,37 @@ pub mod internal_authorities {
             }
         }
     }
+
+    pub mod steward_connections_v2 {
+        use super::{Envelope, steward_connections_v1};
+        use steward_types::ToolGrant;
+
+        pub const AUTHORITY_ID: &str = steward_connections_v1::AUTHORITY_ID;
+        pub const AUTHORITY_VERSION: i64 = 2;
+        pub const AUTHORITY_DIGEST: &str =
+            "sha256:9a572bcefa75b6f2b5b4931d8604c1ad3f3e7560e0e0c2843646ec4f7853ef02";
+        pub const SERVICE: &str = steward_connections_v1::SERVICE;
+        pub const AGENT_TYPE: &str = steward_connections_v1::AGENT_TYPE;
+        pub const BRIDGE_BINARY: &str = steward_connections_v1::BRIDGE_BINARY;
+        pub const INPUT_FILE: &str = steward_connections_v1::INPUT_FILE;
+        pub const OUTPUT_FILE: &str = steward_connections_v1::OUTPUT_FILE;
+        pub const RESPONSE_DEADLINE_SECONDS: i64 =
+            steward_connections_v1::RESPONSE_DEADLINE_SECONDS;
+        pub const MCP_GW_VERSION: &str = "0.4.9";
+        pub const OAUTH_STATE_LIFETIME_SECONDS: i64 =
+            steward_connections_v1::OAUTH_STATE_LIFETIME_SECONDS;
+        pub const OAUTH_CLOCK_SKEW_SECONDS: i64 = steward_connections_v1::OAUTH_CLOCK_SKEW_SECONDS;
+
+        pub fn provider_control_grant(action: &str) -> Option<ToolGrant> {
+            steward_connections_v1::provider_control_grant(action)
+        }
+
+        pub fn envelope() -> Envelope {
+            let mut envelope = steward_connections_v1::envelope();
+            envelope.revision = AUTHORITY_VERSION;
+            envelope
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

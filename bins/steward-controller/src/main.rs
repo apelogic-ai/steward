@@ -257,9 +257,11 @@ fn bridge_gateway_version_for_image(
 ) -> Result<Option<String>, io::Error> {
     match (bridge_image, configured_version) {
         (None, None) => Ok(None),
-        (Some(_), Some(version)) if version == "0.3.2" => Ok(Some(version)),
+        (Some(_), Some(version)) if matches!(version.as_str(), "0.3.2" | "0.4.9") => {
+            Ok(Some(version))
+        }
         (Some(_), Some(_)) => Err(io::Error::other(
-            "STEWARD_CONNECTIONS_MCP_GW_VERSION must be the authority-pinned 0.3.2 release",
+            "STEWARD_CONNECTIONS_MCP_GW_VERSION must be a supported authority-pinned release",
         )),
         (Some(_), None) => Err(io::Error::other(
             "bridge image provenance requires STEWARD_CONNECTIONS_MCP_GW_VERSION",

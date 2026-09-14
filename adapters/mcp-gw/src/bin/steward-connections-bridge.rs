@@ -91,10 +91,12 @@ fn gateway_failure(error: &PortError) -> &'static str {
 
 async fn execute(arguments: &[String]) -> Result<(), String> {
     let origin = required_environment("STEWARD_MCP_GW_ORIGIN")?;
+    let version = required_environment("STEWARD_MCP_GW_VERSION")?;
     execute_at(
         arguments,
         PathBuf::from(REQUEST_FILE),
         origin,
+        version,
         response_path()?,
     )
     .await
@@ -104,13 +106,14 @@ async fn execute_at(
     arguments: &[String],
     request_path: PathBuf,
     origin: String,
+    version: String,
     response_path: PathBuf,
 ) -> Result<(), String> {
     let invocation = parse_invocation(arguments)?;
     let request = GithubBridgeRequest::parse(invocation.operation, &request_bytes(&request_path)?)
         .map_err(|_| "bridge request.json violates the operation contract".to_owned())?;
-    let gateway = GithubMcpGateway::new(&origin)
-        .map_err(|_| "STEWARD_MCP_GW_ORIGIN is not an exact HTTP(S) origin".to_owned())?;
+    let gateway = GithubMcpGateway::new(&origin, &version)
+        .map_err(|_| "MCP-GW bridge origin or version is invalid".to_owned())?;
     let response = gateway
         .execute(invocation.operation, request)
         .await
@@ -243,7 +246,14 @@ mod tests {
             "request.json".to_owned(),
         ];
 
-        execute_at(&arguments, input, origin, output.clone()).await?;
+        execute_at(
+            &arguments,
+            input,
+            origin,
+            "0.3.2".to_owned(),
+            output.clone(),
+        )
+        .await?;
 
         let request = server
             .join()
@@ -327,7 +337,7 @@ mod tests {
             "request.json".to_owned(),
         ];
 
-        let error = match execute_at(&arguments, input, origin, output).await {
+        let error = match execute_at(&arguments, input, origin, "0.3.2".to_owned(), output).await {
             Err(error) => error,
             Ok(()) => {
                 return Err("the bridge must reject runtime authentication failure".to_owned());

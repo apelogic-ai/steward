@@ -120,7 +120,7 @@ GitHub API CIDRs; the portable chart opens HTTPS egress only to those entries.
 `connectionsBridge` is disabled by default. Enabling it requires browser
 authentication, an immutable bridge image, an explicit artifact-trust contract,
 the exact MCP-GW origin, and a dedicated runtime namespace. Authority v1 also
-requires the exact MCP-GW `0.3.2` contract; another configured version fails
+requires an exact authority-pinned MCP-GW contract (`0.3.2` for v1 or `0.4.9` for v2); another configured version fails
 closed. The apiserver records those values on each operation; the controller
 verifies the same snapshot before creating or executing the short-lived
 `steward-connections` runtime.
