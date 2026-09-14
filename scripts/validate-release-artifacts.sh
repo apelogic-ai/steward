@@ -3,6 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 rendered="$(mktemp)"
+default_rendered="$(mktemp)"
 stable_bridge_rendered="$(mktemp)"
 stable_bridge_bundle="$(mktemp)"
 stable_bridge_configmap="$(mktemp)"
@@ -25,6 +26,7 @@ github_source_rendered="$(mktemp)"
 web_rendered="$(mktemp)"
 web_deployment="$(mktemp)"
 external_edge_rendered="$(mktemp)"
+http_route_rendered="$(mktemp)"
 secret_trust_rendered="$(mktemp)"
 mint_synthetic_kubeconfig="$(mktemp)"
 mint_startup_output="$(mktemp)"
@@ -37,7 +39,7 @@ cleanup() {
   if [[ -n "${web_container_id}" ]]; then
     docker stop --time 5 "${web_container_id}" >/dev/null 2>&1
   fi
-  rm -f "${rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" \
+  rm -f "${rendered}" "${default_rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" \
     "${stable_bridge_configmap}" "${stable_bridge_deployment}" \
     "${stable_bridge_controller_deployment}" "${connections_bridge_rendered}" \
     "${connections_bridge_bundle}" "${connections_bridge_configmap}" \
@@ -49,7 +51,7 @@ cleanup() {
     "${browser_auth_deployment}" "${task_identity_rendered}" \
     "${task_identity_deployment}" "${task_execution_bindings_rendered}" \
     "${github_source_rendered}" \
-    "${web_rendered}" "${web_deployment}" "${external_edge_rendered}" \
+    "${web_rendered}" "${web_deployment}" "${external_edge_rendered}" "${http_route_rendered}" \
     "${secret_trust_rendered}" \
     "${mint_synthetic_kubeconfig}" "${mint_startup_output}"
   exit "${status}"
@@ -124,6 +126,41 @@ printf '%s\n%s' \
 connections_bridge_bundle_content="$(<"${connections_bridge_bundle}")"
 connections_bridge_bundle_hash="$(printf '%s' "${connections_bridge_bundle_content}" | shasum -a 256 | awk '{print $1}')"
 connections_bridge_configmap_name="steward-connections-bridge-attestation-${connections_bridge_bundle_hash:0:12}"
+
+helm lint "${root}/charts/steward"
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds > "${default_rendered}"
+for default_component_image in \
+  'ghcr.io/apelogic-ai/steward:0.1.17-apiserver@sha256:fcc1f8e4f375f4d2cb69372cc78dfe58ada603afe914987537160931b1bdeffa' \
+  'ghcr.io/apelogic-ai/steward:0.1.17-controller@sha256:04bc2664cb4ed7a720270911a328db8bf1dd0c0d5f8582b65234811741339f08' \
+  'ghcr.io/apelogic-ai/steward:0.1.17-mint@sha256:54215c5cb1945a80cd66ec149c86d5baf0ea467cc8c3b9dd87ab67a785d5aa36'
+do
+  if ! grep -Fq "image: ${default_component_image}" "${default_rendered}"; then
+    echo "default render lost its digest-pinned Steward image: ${default_component_image}" >&2
+    exit 1
+  fi
+done
+if grep -q '^kind: Ingress$' "${default_rendered}"; then
+  echo "the standalone chart must not expose an ingress until web ingress is explicitly enabled" >&2
+  exit 1
+fi
+default_apiserver_ingress_policy="$(awk '
+  /name: steward-apiserver-ingress/ { capture = 1 }
+  capture { print }
+  capture && /^---$/ { exit }
+' "${default_rendered}")"
+if ! grep -Fxq '  ingress: []' <<<"${default_apiserver_ingress_policy}"; then
+  echo "the standalone chart must deny apiserver callers until namespaces are explicitly configured" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --set persistence.enabled=true >/dev/null 2>&1
+then
+  echo "the chart must reject an unreviewed persistent-volume contract" >&2
+  exit 1
+fi
 
 helm lint "${root}/charts/steward" "${image_values[@]}"
 helm template steward "${root}/charts/steward" \
@@ -266,8 +303,9 @@ helm template steward "${root}/charts/steward" \
   --include-crds \
   "${image_values[@]}" \
   --set web.enabled=true \
+  --set web.ingress.enabled=true \
   --set-string web.host=steward.example.test \
-  --set-string web.ingress.className=nginx \
+  --set-string web.ingress.className=example-ingress \
   --set-string web.ingress.tlsSecretName=steward-public-tls \
   --set images.web.tag=validation-web \
   --set "images.web.digest=${digest3}" \
@@ -290,7 +328,9 @@ for required in \
   '      automountServiceAccountToken: false' \
   '      securityContext: { runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: { type: RuntimeDefault } }' \
   '          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }' \
-  '          readinessProbe: { httpGet: { path: /health/ready, port: http }, initialDelaySeconds: 2, periodSeconds: 5 }'
+  '          readinessProbe:' \
+  '            httpGet: { path: /health/ready, port: http }' \
+  '            failureThreshold: 3'
 do
   grep -Fxq "${required}" "${web_deployment}"
 done
@@ -344,6 +384,61 @@ helm template steward "${root}/charts/steward" \
 grep -Fq 'metadata: { name: steward-web }' "${external_edge_rendered}"
 if grep -Fq 'kind: Ingress' "${external_edge_rendered}"; then
   echo "environment-owned web edge must not render Steward Ingress resources" >&2
+  exit 1
+fi
+
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set web.enabled=true \
+  --set web.httpRoute.enabled=true \
+  --set-string web.host=steward.example.test \
+  --set-string web.httpRoute.hostname=steward.example.test \
+  --set-string 'web.httpRoute.parentRefs[0].name=shared-gateway' \
+  --set-string 'web.httpRoute.parentRefs[0].namespace=envoy-gateway-system' \
+  --set-string 'web.httpRoute.parentRefs[0].sectionName=https' \
+  --set-string 'web.httpRoute.apiPaths[0].type=PathPrefix' \
+  --set-string 'web.httpRoute.apiPaths[0].value=/admin/api' \
+  --set-string 'web.httpRoute.webPaths[0].type=PathPrefix' \
+  --set-string 'web.httpRoute.webPaths[0].value=/' \
+  --set images.web.tag=validation-web \
+  --set "images.web.digest=${digest3}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set networkPolicy.ingressNamespace=envoy-gateway-system \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' > "${http_route_rendered}"
+test "$(grep -c '^kind: HTTPRoute$' "${http_route_rendered}")" -eq 2
+for required in \
+  'name: steward-api' \
+  'name: steward-web' \
+  'namespace: "envoy-gateway-system"' \
+  'sectionName: "https"' \
+  'hostnames: ["steward.example.test"]' \
+  'path: { type: PathPrefix, value: "/admin/api" }' \
+  'path: { type: PathPrefix, value: "/" }' \
+  'name: steward-apiserver' \
+  'port: 443' \
+  'name: steward-web' \
+  'port: 3000'
+do
+  grep -Fq "${required}" "${http_route_rendered}"
+done
+if grep -Fq 'kind: Ingress' "${http_route_rendered}"; then
+  echo "Gateway API routing must not render a legacy Ingress" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  "${image_values[@]}" \
+  --set web.httpRoute.enabled=true >/dev/null 2>&1
+then
+  echo "an HTTPRoute without explicit edge inputs must fail chart validation" >&2
   exit 1
 fi
 

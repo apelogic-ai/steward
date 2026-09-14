@@ -1,25 +1,56 @@
 images:
   repository: ghcr.io/apelogic-ai/steward
   pullPolicy: IfNotPresent
+  # The public v0.1.17 release is the renderable, immutable baseline. Pin a
+  # later release's tag and digest together before installing or upgrading.
   apiserver:
-    tag: ""
-    digest: ""
+    tag: 0.1.17-apiserver
+    digest: sha256:fcc1f8e4f375f4d2cb69372cc78dfe58ada603afe914987537160931b1bdeffa
   controller:
-    tag: ""
-    digest: ""
+    tag: 0.1.17-controller
+    digest: sha256:04bc2664cb4ed7a720270911a328db8bf1dd0c0d5f8582b65234811741339f08
   mint:
-    tag: ""
-    digest: ""
+    tag: 0.1.17-mint
+    digest: sha256:54215c5cb1945a80cd66ec149c86d5baf0ea467cc8c3b9dd87ab67a785d5aa36
   web:
-    tag: ""
-    digest: ""
+    tag: 0.1.17-web
+    digest: sha256:133f83eff2b49f9d8501f894efbc55cde8891bf13294ad41dc41743c4695c925
+imagePullSecrets: []
+serviceAccounts:
+  # The chart creates these fixed service accounts. Annotations support
+  # platform workload identity (for example, EKS IRSA) without exposing any
+  # credentials in values.
+  apiserver:
+    annotations: {}
+  controller:
+    annotations: {}
+  mint:
+    annotations: {}
+  web:
+    annotations: {}
+podAnnotations:
+  apiserver: {}
+  controller: {}
+  mint: {}
+  web: {}
 web:
   enabled: false
   host: ""
   ingress:
-    enabled: true
+    # Legacy standard Ingress support is opt-in.
+    enabled: false
     className: ""
     tlsSecretName: ""
+    apiAnnotations: {}
+    webAnnotations: {}
+  httpRoute:
+    # Gateway API routing is opt-in and carries no parent, hostname, or paths
+    # until the platform explicitly supplies them.
+    enabled: false
+    parentRefs: []
+    hostname: ""
+    apiPaths: []
+    webPaths: []
 secrets:
   database:
     name: steward-database
@@ -151,9 +182,16 @@ networkPolicy:
   jiraCidrs: []
   browserAuthEgressCidrs: []
   githubApiCidrs: []
-  ingressNamespace: ingress-nginx
-  burbleNamespace: burble
-  arcNamespace: arc-runners
+  # The namespace of an explicitly configured edge implementation (for
+  # example, Envoy Gateway). Empty denies edge-to-apiserver traffic.
+  ingressNamespace: ""
+  # No workload namespace may call the apiserver by default. Add each caller
+  # namespace explicitly in the distribution's values file.
+  apiserverIngressNamespaces: []
+  # Deprecated compatibility inputs for pre-0.1.17 governed values. New
+  # installations must use apiserverIngressNamespaces instead.
+  burbleNamespace: ""
+  arcNamespace: ""
   mcpGatewayNamespace: mcp-gw
   openshellNamespace: openshell
   identityExchangeNamespace: identity-exchange
@@ -182,7 +220,32 @@ replicaCount:
   mint: 1
   web: 1
 resources:
-  apiserver: {}
-  controller: {}
-  mint: {}
-  web: {}
+  apiserver:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  controller:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  mint:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+  web:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+probes:
+  apiserver:
+    readiness: { initialDelaySeconds: 2, periodSeconds: 5, timeoutSeconds: 3, failureThreshold: 3 }
+    liveness: { initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3 }
+  controller:
+    readiness: { initialDelaySeconds: 2, periodSeconds: 5, timeoutSeconds: 3, failureThreshold: 3 }
+    liveness: { initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3 }
+  mint:
+    readiness: { initialDelaySeconds: 2, periodSeconds: 5, timeoutSeconds: 3, failureThreshold: 3 }
+    liveness: { initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3 }
+  web:
+    readiness: { initialDelaySeconds: 2, periodSeconds: 5, timeoutSeconds: 3, failureThreshold: 3 }
+    liveness: { initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3 }
+persistence:
+  # Steward persists authority and Task state in the external Postgres URL
+  # referenced by secrets.database. This chart intentionally owns no PVC.
+  enabled: false

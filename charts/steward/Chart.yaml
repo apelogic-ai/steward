@@ -1,7 +1,18 @@
 apiVersion: v2
 name: steward
-description: Steward governance control plane
+description: Governance control plane for policy-bound coding-agent workloads
 type: application
-version: 0.0.0
-appVersion: 0.0.0
+version: 0.1.17
+appVersion: 0.1.17
 kubeVersion: ">=1.30.0-0"
+home: https://github.com/apelogic-ai/steward
+sources:
+  - https://github.com/apelogic-ai/steward
+keywords:
+  - governance
+  - agents
+  - policy
+  - kubernetes
+maintainers:
+  - name: ApeLogic
+    url: https://github.com/apelogic-ai

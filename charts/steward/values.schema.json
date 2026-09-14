@@ -18,7 +18,12 @@
     "spire",
     "services",
     "replicaCount",
-    "resources"
+    "resources",
+    "imagePullSecrets",
+    "serviceAccounts",
+    "podAnnotations",
+    "probes",
+    "persistence"
   ],
   "properties": {
     "images": {
@@ -34,21 +39,71 @@
         "web": {"$ref": "#/definitions/optionalImage"}
       }
     },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {"name": {"$ref": "#/definitions/nonempty"}}
+      },
+      "uniqueItems": true
+    },
+    "serviceAccounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiserver", "controller", "mint", "web"],
+      "properties": {
+        "apiserver": {"$ref": "#/definitions/serviceAccount"},
+        "controller": {"$ref": "#/definitions/serviceAccount"},
+        "mint": {"$ref": "#/definitions/serviceAccount"},
+        "web": {"$ref": "#/definitions/serviceAccount"}
+      }
+    },
+    "podAnnotations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiserver", "controller", "mint", "web"],
+      "properties": {
+        "apiserver": {"$ref": "#/definitions/annotations"},
+        "controller": {"$ref": "#/definitions/annotations"},
+        "mint": {"$ref": "#/definitions/annotations"},
+        "web": {"$ref": "#/definitions/annotations"}
+      }
+    },
     "web": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "host", "ingress"],
+      "required": ["enabled", "host", "ingress", "httpRoute"],
       "properties": {
         "enabled": {"type": "boolean"},
         "host": {"type": "string"},
         "ingress": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["enabled", "className", "tlsSecretName"],
+          "required": ["enabled", "className", "tlsSecretName", "apiAnnotations", "webAnnotations"],
           "properties": {
             "enabled": {"type": "boolean"},
             "className": {"type": "string"},
-            "tlsSecretName": {"type": "string"}
+            "tlsSecretName": {"type": "string"},
+            "apiAnnotations": {"$ref": "#/definitions/annotations"},
+            "webAnnotations": {"$ref": "#/definitions/annotations"}
+          }
+        },
+        "httpRoute": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "parentRefs", "hostname", "apiPaths", "webPaths"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "parentRefs": {
+              "type": "array",
+              "items": {"$ref": "#/definitions/httpRouteParentRef"},
+              "uniqueItems": true
+            },
+            "hostname": {"type": "string"},
+            "apiPaths": {"$ref": "#/definitions/httpRoutePaths"},
+            "webPaths": {"$ref": "#/definitions/httpRoutePaths"}
           }
         }
       }
@@ -619,6 +674,7 @@
         "browserAuthEgressCidrs",
         "githubApiCidrs",
         "ingressNamespace",
+        "apiserverIngressNamespaces",
         "burbleNamespace",
         "arcNamespace",
         "mcpGatewayNamespace",
@@ -635,9 +691,14 @@
         "jiraCidrs": {"$ref": "#/definitions/cidrs"},
         "browserAuthEgressCidrs": {"$ref": "#/definitions/cidrs"},
         "githubApiCidrs": {"$ref": "#/definitions/cidrs"},
-        "ingressNamespace": {"$ref": "#/definitions/nonempty"},
-        "burbleNamespace": {"$ref": "#/definitions/nonempty"},
-        "arcNamespace": {"$ref": "#/definitions/nonempty"},
+        "ingressNamespace": {"type": "string"},
+        "apiserverIngressNamespaces": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "burbleNamespace": {"type": "string"},
+        "arcNamespace": {"type": "string"},
         "mcpGatewayNamespace": {"$ref": "#/definitions/nonempty"},
         "openshellNamespace": {"$ref": "#/definitions/nonempty"},
         "identityExchangeNamespace": {"$ref": "#/definitions/nonempty"},
@@ -701,6 +762,23 @@
         "mint": {"type": "object"},
         "web": {"type": "object"}
       }
+    },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiserver", "controller", "mint", "web"],
+      "properties": {
+        "apiserver": {"$ref": "#/definitions/componentProbes"},
+        "controller": {"$ref": "#/definitions/componentProbes"},
+        "mint": {"$ref": "#/definitions/componentProbes"},
+        "web": {"$ref": "#/definitions/componentProbes"}
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {"enabled": {"const": false}}
     }
   },
   "allOf": [
@@ -715,6 +793,39 @@
         "properties": {
           "networkPolicy": {
             "properties": {"githubApiCidrs": {"minItems": 1}}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "web": {
+            "properties": {
+              "httpRoute": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}
+            },
+            "required": ["httpRoute"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "networkPolicy": {
+            "properties": {"ingressNamespace": {"$ref": "#/definitions/nonempty"}}
+          },
+          "web": {
+            "properties": {
+              "enabled": {"const": true},
+              "host": {"$ref": "#/definitions/nonempty"},
+              "httpRoute": {
+                "properties": {
+                  "parentRefs": {"minItems": 1},
+                  "hostname": {"$ref": "#/definitions/nonempty"},
+                  "apiPaths": {"minItems": 1},
+                  "webPaths": {"minItems": 1}
+                }
+              }
+            }
           }
         }
       }
@@ -804,6 +915,56 @@
   ],
   "definitions": {
     "nonempty": {"type": "string", "minLength": 1},
+    "annotations": {"type": "object", "additionalProperties": {"type": "string"}},
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["annotations"],
+      "properties": {"annotations": {"$ref": "#/definitions/annotations"}}
+    },
+    "probeTiming": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initialDelaySeconds", "periodSeconds", "timeoutSeconds", "failureThreshold"],
+      "properties": {
+        "initialDelaySeconds": {"type": "integer", "minimum": 0},
+        "periodSeconds": {"type": "integer", "minimum": 1},
+        "timeoutSeconds": {"type": "integer", "minimum": 1},
+        "failureThreshold": {"type": "integer", "minimum": 1}
+      }
+    },
+    "componentProbes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["readiness", "liveness"],
+      "properties": {
+        "readiness": {"$ref": "#/definitions/probeTiming"},
+        "liveness": {"$ref": "#/definitions/probeTiming"}
+      }
+    },
+    "httpRouteParentRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "namespace", "sectionName"],
+      "properties": {
+        "name": {"$ref": "#/definitions/nonempty"},
+        "namespace": {"$ref": "#/definitions/nonempty"},
+        "sectionName": {"$ref": "#/definitions/nonempty"}
+      }
+    },
+    "httpRoutePaths": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "value"],
+        "properties": {
+          "type": {"enum": ["Exact", "PathPrefix", "RegularExpression"]},
+          "value": {"type": "string", "minLength": 1}
+        }
+      },
+      "uniqueItems": true
+    },
     "port": {"type": "integer", "minimum": 1, "maximum": 65535},
     "cidrs": {
       "type": "array",
