@@ -1227,7 +1227,7 @@ mod tests {
             );
         }
         for required in [
-            "\"next\": \"16.3.2\"",
+            "\"next\": \"16.3.3\"",
             "\"react\": \"19.2.8\"",
             "\"tailwindcss\": \"4.3.3\"",
             "\"@hey-api/openapi-ts\": \"0.99.0\"",
@@ -3120,7 +3120,7 @@ mod tests {
             "production images must run as a numeric non-root user"
         );
         for required in [
-            "FROM debian:bookworm-slim@sha256:",
+            "FROM ubuntu:24.04@sha256:",
             "apt-get install --yes --no-install-recommends iproute2",
             "rm -rf /var/lib/apt/lists/*",
             "test -x /bin/cat",
