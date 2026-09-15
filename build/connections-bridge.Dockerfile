@@ -3,7 +3,7 @@ WORKDIR /workspace
 COPY . .
 RUN cargo build --locked --release --bin steward-connections-bridge
 
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+FROM ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254
 
 RUN apt-get update \
   && apt-get install --yes --no-install-recommends iproute2 \
