@@ -418,7 +418,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           image_repository="$ECR_REGISTRY/$STEWARD_ECR_IMAGE_REPOSITORY"
           chart_repository="$ECR_REGISTRY/$STEWARD_ECR_CHART_REPOSITORY"
-          for component in apiserver controller mint bridge; do
+          for component in apiserver controller mint bridge web; do
             source_digest="$(cat "dist/$component.digest")"
             source="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward@$source_digest"
             scripts/promote-ecr-artifact.sh \
@@ -444,6 +444,7 @@ jobs:
             printf 'controller-digest=%s\n' "$(cat dist/ecr-controller.digest)"
             printf 'mint-digest=%s\n' "$(cat dist/ecr-mint.digest)"
             printf 'bridge-digest=%s\n' "$(cat dist/ecr-bridge.digest)"
+            printf 'web-digest=%s\n' "$(cat dist/ecr-web.digest)"
             printf 'chart-digest=%s\n' "$source_chart_digest"
           } >> "$GITHUB_OUTPUT"
 
@@ -451,7 +452,7 @@ jobs:
         run: |
           set -euo pipefail
           scan_failed=0
-          for component in apiserver controller mint bridge; do
+          for component in apiserver controller mint bridge web; do
             index_digest="$(cat "dist/ecr-$component.digest")"
             index_ref="$ECR_REGISTRY/$STEWARD_ECR_IMAGE_REPOSITORY@$index_digest"
             if ! platform_digest="$(scripts/resolve-ecr-platform-digest.sh \
@@ -505,7 +506,7 @@ jobs:
           CHART_REPOSITORY: ${{ steps.promote.outputs['chart-repository'] }}
         run: |
           set -euo pipefail
-          for component in apiserver controller mint bridge; do
+          for component in apiserver controller mint bridge web; do
             digest="$(cat "dist/ecr-$component.digest")"
             cosign sign --yes \
               --output-signature "dist/ecr-$component.sig" \
@@ -545,6 +546,13 @@ jobs:
           subject-digest: ${{ steps.promote.outputs['bridge-digest'] }}
           push-to-registry: true
 
+      - name: Attest promoted web provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-name: ${{ steps.promote.outputs['image-repository'] }}
+          subject-digest: ${{ steps.promote.outputs['web-digest'] }}
+          push-to-registry: true
+
       - name: Download ECR bridge provenance bundle
         env:
           GH_TOKEN: ${{ github.token }}
@@ -581,7 +589,7 @@ jobs:
             printf '# Steward private registry handoff %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '| Artifact | Immutable reference | Scanned linux/amd64 digest |\n|---|---|---|\n'
-            for component in apiserver controller mint bridge; do
+            for component in apiserver controller mint bridge web; do
               printf '| %s | %s:%s-%s@%s | %s |\n' \
                 "$component" "$IMAGE_REPOSITORY" "$version" "$component" \
                 "$(cat "dist/ecr-$component.digest")" \
@@ -676,7 +684,7 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
-            for component in apiserver controller mint bridge; do
+            for component in apiserver controller mint bridge web; do
               printf '| %s | %s:%s-%s | %s |\n' \
                 "$component" "$repository" "$version" "$component" "$(cat "dist/$component.digest")"
             done
@@ -702,7 +710,7 @@ jobs:
       - name: Verify public artifact access
         run: |
           set -euo pipefail
-          for component in apiserver controller mint bridge; do
+          for component in apiserver controller mint bridge web; do
             docker buildx imagetools inspect \
               "ghcr.io/$GITHUB_REPOSITORY_OWNER/steward@$(cat "dist/$component.digest")"
           done
