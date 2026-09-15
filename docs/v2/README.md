@@ -12,6 +12,16 @@ See the [documentation index](../README.md) for authority order and the
 [deferred-contract register](deferred-implementation-contracts.md) for decisions that
 still require separate design and acceptance.
 
+## Provider connection status
+
+[PC-S01](runtime-free-provider-connection-status-ticket.md) removes passive provider
+connection status reads from the Task and OpenShell runtime path. It uses MCP-GW
+0.4.9's existing metadata-only status endpoint through a narrowly scoped Steward Mint
+control-plane exchange, renders an immediate unknown-state recovery action when
+metadata is unavailable, and requires an E2E proof that loading the Connections page
+cannot create a Task or AgentRuntime. Explicit provider mutations remain outside that
+P0 boundary.
+
 ## Direct-package GHA demonstration
 
 The accepted [direct Git package architecture](direct-package-task-invocation.md) lets
