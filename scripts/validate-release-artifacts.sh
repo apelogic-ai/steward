@@ -1043,3 +1043,11 @@ fi
 
 "${root}/scripts/test-promote-ecr-artifact.sh"
 "${root}/scripts/test-resolve-ecr-platform-digest.sh"
+
+release_workflow="${root}/.github/workflows/release.yml"
+if [[ "$(grep -Fc 'for component in apiserver controller mint bridge web; do' "${release_workflow}")" -ne 6 ]]; then
+  echo "every release publication gate must include the Steward web image" >&2
+  exit 1
+fi
+grep -Fq "printf 'web-digest=%s\\n'" "${release_workflow}"
+grep -Fq "subject-digest: \${{ steps.promote.outputs['web-digest'] }}" "${release_workflow}"
