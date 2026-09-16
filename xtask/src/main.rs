@@ -19,6 +19,8 @@ use xtask::{
     validate_register_content,
 };
 
+mod storage;
+
 type TaskResult = Result<(), String>;
 
 const PROVIDER_PROFILE_BUNDLE_CATALOG: [(&str, &str); 3] = [
@@ -46,6 +48,8 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
     match command {
         "ci" if rest.is_empty() => ci(),
         "quality" if rest.is_empty() => quality(),
+        "storage" if rest == ["check"] => storage::check(&root()),
+        "storage" if rest == ["audit"] => storage::audit(&root()),
         "e2e-s0" if rest.is_empty() => e2e_s0(),
         "e2e-s1" if rest.is_empty() => e2e_s1(),
         "e2e-s2" if rest.is_empty() => e2e_s2(),
@@ -86,6 +90,7 @@ fn usage() -> String {
         "commands:",
         "  ci",
         "  quality",
+        "  storage check|audit",
         "  e2e-s0",
         "  e2e-s1",
         "  e2e-s2",
@@ -132,6 +137,7 @@ fn ci() -> TaskResult {
 }
 
 fn quality() -> TaskResult {
+    storage::check(&root())?;
     run("cargo", &["fmt", "--all", "--", "--check"])?;
     run(
         "cargo",
