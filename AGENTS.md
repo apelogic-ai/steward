@@ -88,8 +88,14 @@ or loading another key, or disabling signing.
   unsafe branch switch or another rule.
 - Never copy `.env`, kubeconfig, `.steward-run/`, credentials, or other
   untracked local configuration between worktrees.
-- Do not share `target/` across worktrees on differing revisions and do not run
-  multiple heavy local test lanes concurrently.
+- Each worktree has exactly one Steward Cargo artifact root at
+  `<worktree>/target`; root, E2E, and conformance builds use it. Never set a
+  machine-global Cargo target directory for Steward or share `target/` across
+  worktrees on differing revisions.
+- Before handoff, run `cargo xtask storage audit` and address its storage-policy
+  warnings. Build artifacts inactive for seven days are cleanup candidates; do
+  not retain a worktree solely for its build artifacts.
+- Do not run multiple heavy local test lanes concurrently.
 - Remove temporary worktrees before handoff. Explicitly declared persistent
   lane worktrees may remain; record their purpose and state.
 
