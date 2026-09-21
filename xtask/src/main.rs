@@ -2502,6 +2502,15 @@ mod tests {
         ] {
             assert!(ci.contains(required), "pinned CI is missing {required}");
         }
+        let governed_connections_job = ci
+            .split_once("  governed-connections:\n")
+            .and_then(|(_, remainder)| remainder.split_once("\n  postgres-tls:"))
+            .map(|(job, _)| job)
+            .ok_or_else(|| "governed Connections CI job boundary is missing".to_owned())?;
+        assert!(
+            governed_connections_job.contains("supervisor-tools: \"true\""),
+            "governed Connections CI must install the pinned supervisor build tools"
+        );
         assert!(
             xtask_source.contains("\"e2e-governed-connections\" if rest.is_empty()")
                 && xtask_source.contains("scripts/governed-connections-e2e.sh"),
