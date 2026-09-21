@@ -9,6 +9,9 @@
 {{- if .Values.persistence.enabled }}
 {{- fail "persistence.enabled is unsupported: Steward uses the externally managed database Secret" }}
 {{- end }}
+{{- if and .Values.jira.enabled (or (not .Values.config.apiserver.jiraBaseUrl) (not .Values.config.apiserver.jiraProjectKey) (not .Values.config.apiserver.jiraAccountEmail)) }}
+{{- fail "jira.enabled requires URL, project key, and account email" }}
+{{- end }}
 {{- if and .Values.web.enabled (or .Values.web.ingress.enabled .Values.web.httpRoute.enabled) (ne .Values.browserAuth.google.origin (printf "https://%s" .Values.web.host)) }}
 {{- fail "web.host must exactly match the HTTPS browserAuth.google.origin" }}
 {{- end }}
@@ -22,6 +25,7 @@
 {{- fail "connectionsBridge.runtimeNamespace must be one of runtimeNamespaces" }}
 {{- end }}
 {{- range $component := list "apiserver" "controller" "mint" }}
+{{- if or (ne $component "mint") $.Values.execution.enabled }}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -35,6 +39,7 @@ metadata:
 {{ toYaml . | nindent 4 }}
 {{- end }}
 automountServiceAccountToken: true
+{{- end }}
 {{- end }}
 {{- if .Values.web.enabled }}
 ---
@@ -76,6 +81,7 @@ rules:
   - apiGroups: [""]
     resources: ["users", "groups"]
     verbs: ["impersonate"]
+{{- if .Values.execution.enabled }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -87,7 +93,9 @@ rules:
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
     verbs: ["get", "list"]
+{{- end }}
 {{- range $component := list "apiserver" "controller" "mint" }}
+{{- if or (ne $component "mint") $.Values.execution.enabled }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -99,6 +107,8 @@ subjects:
     name: {{ include (printf "steward.%sName" $component) $ }}
     namespace: {{ $.Release.Namespace }}
 {{- end }}
+{{- end }}
+{{- if .Values.execution.enabled }}
 {{- range $namespace := .Values.runtimeNamespaces }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -143,6 +153,8 @@ subjects:
     name: {{ include "steward.mintName" $ }}
     namespace: {{ $.Release.Namespace }}
 {{- end }}
+{{- end }}
+{{- if .Values.execution.enabled }}
 ---
 apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterSPIFFEID
@@ -157,18 +169,29 @@ spec:
     matchLabels:
       app.kubernetes.io/name: steward
       app.kubernetes.io/component: mint
+{{- end }}
+{{- if eq .Values.tls.mode "certManager" }}
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata: { name: steward-apiserver-tls }
 spec:
-  secretName: steward-apiserver-tls
+  secretName: {{ .Values.tls.api.secretName }}
   dnsNames:
     - steward-apiserver
     - steward-apiserver.{{ .Release.Namespace }}.svc
     - steward-apiserver.{{ .Release.Namespace }}.svc.{{ .Values.services.clusterDomain }}
   issuerRef:
 {{ toYaml .Values.tls.issuerRef | nindent 4 }}
+{{- end }}
+{{- if and (eq .Values.tls.mode "customerSecret") .Values.tls.webhook.caBundlePem }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: steward-webhook-ca }
+data:
+  ca.crt: {{ .Values.tls.webhook.caBundlePem | quote }}
+{{- end }}
 {{- if .Values.stableBridge.enabled }}
 ---
 apiVersion: v1
@@ -205,18 +228,20 @@ immutable: true
 data:
   source-repository-bindings.json: {{ $sourceRepositoryBindingsJson | quote }}
 {{- end }}
+{{- if eq .Values.tls.mode "certManager" }}
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata: { name: steward-webhook-tls }
 spec:
-  secretName: steward-webhook-tls
+  secretName: {{ .Values.tls.webhook.secretName }}
   dnsNames:
     - steward-webhook
     - steward-webhook.{{ .Release.Namespace }}.svc
     - steward-webhook.{{ .Release.Namespace }}.svc.{{ .Values.services.clusterDomain }}
   issuerRef:
 {{ toYaml .Values.tls.issuerRef | nindent 4 }}
+{{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -231,6 +256,7 @@ metadata: { name: steward-webhook }
 spec:
   selector: { app.kubernetes.io/name: steward, app.kubernetes.io/component: controller }
   ports: [{ name: https, port: {{ .Values.services.webhookPort }}, targetPort: webhook }]
+{{- if .Values.execution.enabled }}
 ---
 apiVersion: v1
 kind: Service
@@ -238,6 +264,7 @@ metadata: { name: steward-mint }
 spec:
   selector: { app.kubernetes.io/name: steward, app.kubernetes.io/component: mint }
   ports: [{ name: http, port: {{ .Values.services.mintPort }}, targetPort: http }]
+{{- end }}
 {{- if .Values.web.enabled }}
 ---
 apiVersion: v1
@@ -252,7 +279,9 @@ apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
 metadata:
   name: steward-agentruntime
+{{- if eq .Values.tls.mode "certManager" }}
   annotations: { cert-manager.io/inject-ca-from: {{ printf "%s/steward-webhook-tls" .Release.Namespace | quote }} }
+{{- end }}
 webhooks:
   - name: agentruntime.steward.agents.apelogic.ai
     admissionReviewVersions: ["v1"]
@@ -261,6 +290,9 @@ webhooks:
     matchPolicy: Equivalent
     clientConfig:
       service: { name: steward-webhook, namespace: {{ .Release.Namespace }}, path: /validate-agent-runtime, port: {{ .Values.services.webhookPort }} }
+{{- if eq .Values.tls.mode "customerSecret" }}
+      caBundle: {{ .Values.tls.webhook.caBundlePem | b64enc | quote }}
+{{- end }}
     rules:
       - apiGroups: ["agents.apelogic.ai"]
         apiVersions: ["v1alpha1"]
@@ -307,16 +339,21 @@ spec:
           env:
             - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.database.name }}, key: {{ .Values.secrets.database.key }} } } }
             - { name: STEWARD_TASK_ORCHESTRATION_MODE, value: {{ .Values.config.taskOrchestrationMode | quote }} }
+{{- if .Values.jira.enabled }}
             - { name: STEWARD_JIRA_TOKEN, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.jira.name }}, key: {{ .Values.secrets.jira.key }} } } }
             - { name: STEWARD_JIRA_BASE_URL, value: {{ .Values.config.apiserver.jiraBaseUrl | quote }} }
             - { name: STEWARD_JIRA_PROJECT_KEY, value: {{ .Values.config.apiserver.jiraProjectKey | quote }} }
             - { name: STEWARD_JIRA_ACCOUNT_EMAIL, value: {{ .Values.config.apiserver.jiraAccountEmail | quote }} }
+{{- end }}
             - { name: STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE, value: {{ .Values.config.apiserver.kubernetesTokenReviewAudience | quote }} }
             - { name: STEWARD_TASK_WORKFLOWS_JSON, value: {{ .Values.config.apiserver.taskWorkflowsJson | quote }} }
             - { name: STEWARD_TASK_EXECUTION_BINDINGS_MODE, value: {{ .Values.config.apiserver.executionBindingsMode | quote }} }
             - { name: STEWARD_TASK_EXECUTION_BINDINGS_FILE, value: /run/execution-bindings/execution-bindings.json }
+            - { name: STEWARD_EXECUTION_ENABLED, value: {{ .Values.execution.enabled | quote }} }
+{{- if .Values.execution.enabled }}
             - { name: STEWARD_TASK_INFERENCE_ENDPOINT, value: {{ .Values.config.apiserver.inferenceEndpoint | quote }} }
             - { name: STEWARD_TASK_ANTHROPIC_INFERENCE_ENDPOINT, value: {{ .Values.config.apiserver.anthropicInferenceEndpoint | quote }} }
+{{- end }}
             - { name: STEWARD_TASK_MCP_GW_ENDPOINT, value: {{ .Values.config.apiserver.mcpGatewayEndpoint | quote }} }
 {{- if .Values.githubSource.enabled }}
             - { name: STEWARD_GITHUB_SOURCE_APP_ID, value: {{ .Values.githubSource.appId | quote }} }
@@ -369,7 +406,7 @@ spec:
           resources:
 {{ toYaml .Values.resources.apiserver | nindent 12 }}
       volumes:
-        - { name: tls, secret: { secretName: steward-apiserver-tls } }
+        - { name: tls, secret: { secretName: {{ .Values.tls.api.secretName }} } }
         - name: execution-bindings
           configMap:
             name: {{ $executionBindingsConfigMapName }}
@@ -432,10 +469,14 @@ spec:
           env:
             - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.database.name }}, key: {{ .Values.secrets.database.key }} } } }
             - { name: STEWARD_TASK_ORCHESTRATION_MODE, value: {{ .Values.config.taskOrchestrationMode | quote }} }
+            - { name: STEWARD_EXECUTION_ENABLED, value: {{ .Values.execution.enabled | quote }} }
+{{- if .Values.jira.enabled }}
             - { name: STEWARD_JIRA_TOKEN, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.jira.name }}, key: {{ .Values.secrets.jira.key }} } } }
             - { name: STEWARD_JIRA_BASE_URL, value: {{ .Values.config.apiserver.jiraBaseUrl | quote }} }
             - { name: STEWARD_JIRA_PROJECT_KEY, value: {{ .Values.config.apiserver.jiraProjectKey | quote }} }
             - { name: STEWARD_JIRA_ACCOUNT_EMAIL, value: {{ .Values.config.apiserver.jiraAccountEmail | quote }} }
+{{- end }}
+{{- if .Values.execution.enabled }}
             - { name: STEWARD_LITELLM_MASTER_KEY, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.litellm.name }}, key: {{ .Values.secrets.litellm.key }} } } }
             - { name: STEWARD_LITELLM_URL, value: {{ .Values.config.controller.litellmUrl | quote }} }
             - { name: STEWARD_OPENSHELL_ENDPOINT, value: {{ .Values.config.controller.openshellEndpoint | quote }} }
@@ -449,6 +490,7 @@ spec:
             - { name: STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME, value: {{ .Values.config.controller.workloadExchangeServerName | quote }} }
             - { name: STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE, value: /run/workload-exchange/ca.crt }
             - { name: STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE, value: /var/run/secrets/steward/workload/source-token }
+{{- end }}
             - { name: STEWARD_CONTROLLER_USERNAME, value: {{ printf "system:serviceaccount:%s:steward-controller" .Release.Namespace | quote }} }
             - { name: STEWARD_APISERVER_USERNAME, value: {{ printf "system:serviceaccount:%s:steward-apiserver" .Release.Namespace | quote }} }
 {{- if .Values.connectionsBridge.enabled }}
@@ -468,16 +510,19 @@ spec:
             - { name: STEWARD_TLS_KEY_DER, value: /run/tls/tls.key }
           volumeMounts:
             - { name: tls, mountPath: /run/tls, readOnly: true }
+{{- if .Values.execution.enabled }}
             - { name: openshell-client, mountPath: /run/openshell, readOnly: true }
             - { name: workload-exchange-ca, mountPath: /run/workload-exchange, readOnly: true }
             - { name: workload-source-credential, mountPath: /var/run/secrets/steward/workload, readOnly: true }
+{{- end }}
 {{- if and .Values.connectionsBridge.enabled (eq .Values.connectionsBridge.artifactTrust.mode "github-attestation") }}
             - { name: connections-bridge-attestation, mountPath: /run/connections-bridge-attestation, readOnly: true }
 {{- end }}
           resources:
 {{ toYaml .Values.resources.controller | nindent 12 }}
       volumes:
-        - { name: tls, secret: { secretName: steward-webhook-tls } }
+        - { name: tls, secret: { secretName: {{ .Values.tls.webhook.secretName }} } }
+{{- if .Values.execution.enabled }}
         - name: openshell-client
           secret:
             secretName: {{ .Values.secrets.openshellClient.name }}
@@ -502,12 +547,14 @@ spec:
                   audience: apelogic-workload-exchange
                   expirationSeconds: 600
                   path: source-token
+{{- end }}
 {{- if and .Values.connectionsBridge.enabled (eq .Values.connectionsBridge.artifactTrust.mode "github-attestation") }}
         - name: connections-bridge-attestation
           configMap:
             name: {{ $connectionsBridgeBundleName }}
             items: [{ key: bundle.jsonl, path: bundle.jsonl }]
 {{- end }}
+{{- if .Values.execution.enabled }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -565,6 +612,7 @@ spec:
               - { key: {{ .Values.secrets.mint.introspectionCredential }}, path: introspection-credential }
         - name: spiffe-workload-api
           csi: { driver: {{ .Values.spire.csiDriver }}, readOnly: true }
+{{- end }}
 {{- if .Values.web.enabled }}
 ---
 apiVersion: apps/v1
@@ -768,6 +816,7 @@ spec:
 {{- else }}
   ingress: []
 {{- end }}
+{{- if .Values.execution.enabled }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -780,6 +829,7 @@ spec:
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.openshellNamespace }} } }
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.mcpGatewayNamespace }} } }
       ports: [{ protocol: TCP, port: 8080 }]
+{{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -787,19 +837,29 @@ metadata: { name: steward-controller-egress }
 spec:
   podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: controller } }
   policyTypes: [Egress]
+{{- if or .Values.execution.enabled .Values.networkPolicy.postgresCidrs (and .Values.jira.enabled .Values.networkPolicy.jiraCidrs) .Values.networkPolicy.kubeApiCidrs }}
   egress:
+{{- if .Values.execution.enabled }}
     - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.litellmNamespace }} } } }]
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.litellm }} }]
     - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.openshellNamespace }} } } }]
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.openshell }} }]
     - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.identityExchangeNamespace }} } } }]
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.identityExchange }} }]
+{{- end }}
 {{- if .Values.networkPolicy.postgresCidrs }}
     - to:
 {{- range .Values.networkPolicy.postgresCidrs }}
         - ipBlock: { cidr: {{ . }} }
 {{- end }}
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.postgres }} }]
+{{- end }}
+{{- if and .Values.jira.enabled .Values.networkPolicy.jiraCidrs }}
+    - to:
+{{- range .Values.networkPolicy.jiraCidrs }}
+        - ipBlock: { cidr: {{ . }} }
+{{- end }}
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.jira }} }]
 {{- end }}
 {{- if .Values.networkPolicy.kubeApiCidrs }}
     - to:
@@ -808,6 +868,9 @@ spec:
 {{- end }}
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.kubernetesApi }} }]
 {{- end }}
+{{- else }}
+  egress: []
+{{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -815,7 +878,7 @@ metadata: { name: steward-apiserver-egress }
 spec:
   podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
   policyTypes: [Egress]
-{{- if or .Values.networkPolicy.postgresCidrs .Values.networkPolicy.jiraCidrs .Values.networkPolicy.kubeApiCidrs (and .Values.browserAuth.enabled .Values.networkPolicy.browserAuthEgressCidrs) (and .Values.githubSource.enabled .Values.networkPolicy.githubApiCidrs) }}
+{{- if or .Values.networkPolicy.postgresCidrs (and .Values.jira.enabled .Values.networkPolicy.jiraCidrs) .Values.networkPolicy.kubeApiCidrs (and .Values.browserAuth.enabled .Values.networkPolicy.browserAuthEgressCidrs) (and .Values.githubSource.enabled .Values.networkPolicy.githubApiCidrs) }}
   egress:
 {{- if .Values.networkPolicy.postgresCidrs }}
     - to:
@@ -824,7 +887,7 @@ spec:
 {{- end }}
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.postgres }} }]
 {{- end }}
-{{- if .Values.networkPolicy.jiraCidrs }}
+{{- if and .Values.jira.enabled .Values.networkPolicy.jiraCidrs }}
     - to:
 {{- range .Values.networkPolicy.jiraCidrs }}
         - ipBlock: { cidr: {{ . }} }
@@ -855,6 +918,7 @@ spec:
 {{- else }}
   egress: []
 {{- end }}
+{{- if .Values.execution.enabled }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -871,6 +935,7 @@ spec:
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.kubernetesApi }} }]
 {{- else }}
   egress: []
+{{- end }}
 {{- end }}
 {{- if .Values.web.enabled }}
 ---

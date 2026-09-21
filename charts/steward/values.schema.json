@@ -4,8 +4,10 @@
   "additionalProperties": false,
   "required": [
     "images",
+    "execution",
     "web",
     "secrets",
+    "jira",
     "browserAuth",
     "workloadExchangeTrust",
     "taskIdentity",
@@ -26,6 +28,12 @@
     "persistence"
   ],
   "properties": {
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {"enabled": {"type": "boolean"}}
+    },
     "images": {
       "type": "object",
       "additionalProperties": false,
@@ -35,7 +43,7 @@
         "pullPolicy": {"enum": ["IfNotPresent", "Always", "Never"]},
         "apiserver": {"$ref": "#/definitions/image"},
         "controller": {"$ref": "#/definitions/image"},
-        "mint": {"$ref": "#/definitions/image"},
+        "mint": {"$ref": "#/definitions/optionalImage"},
         "web": {"$ref": "#/definitions/optionalImage"}
       }
     },
@@ -143,6 +151,12 @@
           }
         }
       }
+    },
+    "jira": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {"enabled": {"type": "boolean"}}
     },
     "browserAuth": {
       "type": "object",
@@ -319,19 +333,49 @@
     "tls": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["issuerRef"],
+      "required": ["mode", "api", "issuerRef", "webhook"],
       "properties": {
+        "mode": {"enum": ["certManager", "customerSecret"]},
+        "api": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["secretName"],
+          "properties": {"secretName": {"$ref": "#/definitions/nonempty"}}
+        },
         "issuerRef": {
           "type": "object",
           "additionalProperties": false,
           "required": ["name", "kind"],
           "properties": {
-            "name": {"$ref": "#/definitions/nonempty"},
+            "name": {"type": "string"},
             "kind": {"enum": ["Issuer", "ClusterIssuer"]},
             "group": {"type": "string", "default": "cert-manager.io"}
           }
+        },
+        "webhook": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["secretName", "caBundlePem"],
+          "properties": {
+            "secretName": {"$ref": "#/definitions/nonempty"},
+            "caBundlePem": {"type": "string"}
+          }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"mode": {"const": "customerSecret"}}},
+          "then": {
+            "properties": {
+              "webhook": {
+                "properties": {
+                  "caBundlePem": {"$ref": "#/definitions/nonempty"}
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "config": {
       "type": "object",
@@ -355,9 +399,9 @@
             "mcpGatewayEndpoint"
           ],
           "properties": {
-            "jiraBaseUrl": {"type": "string", "pattern": "^https://", "minLength": 9},
-            "jiraProjectKey": {"$ref": "#/definitions/nonempty"},
-            "jiraAccountEmail": {"type": "string", "minLength": 3},
+            "jiraBaseUrl": {"type": "string", "pattern": "^$|^https://"},
+            "jiraProjectKey": {"type": "string"},
+            "jiraAccountEmail": {"type": "string"},
             "kubernetesTokenReviewAudience": {
               "type": "string",
               "minLength": 1,
@@ -365,8 +409,8 @@
             },
             "taskWorkflowsJson": {"type": "string", "pattern": "^\\s*\\[", "minLength": 2},
             "executionBindingsMode": {"type": "string", "enum": ["staged", "active"]},
-            "inferenceEndpoint": {"type": "string", "pattern": "^https?://", "minLength": 10},
-            "anthropicInferenceEndpoint": {"type": "string", "pattern": "^https?://", "minLength": 10},
+            "inferenceEndpoint": {"type": "string", "pattern": "^$|^https?://"},
+            "anthropicInferenceEndpoint": {"type": "string", "pattern": "^$|^https?://"},
             "executionBindings": {
               "type": "object",
               "additionalProperties": false,
@@ -473,22 +517,20 @@
             "litellmUrl"
           ],
           "properties": {
-            "openshellEndpoint": {"type": "string", "pattern": "^https://", "minLength": 9},
-            "openshellServerName": {"$ref": "#/definitions/nonempty"},
+            "openshellEndpoint": {"type": "string", "pattern": "^$|^https://"},
+            "openshellServerName": {"type": "string"},
             "openshellRuntimeClassName": {
               "type": "string",
-              "minLength": 1,
               "maxLength": 253,
-              "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$"
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$"
             },
             "openshellTaskLogMode": {"type": "string", "enum": ["off", "full"]},
             "workloadExchangeEndpoint": {
               "type": "string",
-              "pattern": "^https://[^/?#]+(?::[0-9]+)?/v1/workload/exchange$",
-              "minLength": 38
+              "pattern": "^$|^https://[^/?#]+(?::[0-9]+)?/v1/workload/exchange$"
             },
-            "workloadExchangeServerName": {"$ref": "#/definitions/nonempty"},
-            "litellmUrl": {"type": "string", "pattern": "^https?://", "minLength": 9}
+            "workloadExchangeServerName": {"type": "string"},
+            "litellmUrl": {"type": "string", "pattern": "^$|^https?://"}
           }
         },
         "mint": {
@@ -503,12 +545,12 @@
             "openshellNamespace"
           ],
           "properties": {
-            "issuer": {"type": "string", "pattern": "^https?://", "minLength": 9},
+            "issuer": {"type": "string", "pattern": "^$|^https?://"},
             "audience": {"$ref": "#/definitions/nonempty"},
             "allowedScopes": {"$ref": "#/definitions/nonempty"},
             "svidAudience": {"$ref": "#/definitions/nonempty"},
-            "spiffeTrustDomain": {"$ref": "#/definitions/nonempty"},
-            "openshellNamespace": {"$ref": "#/definitions/nonempty"}
+            "spiffeTrustDomain": {"type": "string"},
+            "openshellNamespace": {"type": "string"}
           }
         }
       }
@@ -782,6 +824,94 @@
     }
   },
   "allOf": [
+    {
+      "if": {"properties": {"execution": {"properties": {"enabled": {"const": true}}}}},
+      "then": {
+        "properties": {
+          "images": {"properties": {"mint": {"$ref": "#/definitions/image"}}},
+          "config": {
+            "properties": {
+              "mint": {
+                "properties": {
+                  "issuer": {"type": "string", "pattern": "^https?://", "minLength": 9},
+                  "spiffeTrustDomain": {"$ref": "#/definitions/nonempty"},
+                  "openshellNamespace": {"$ref": "#/definitions/nonempty"}
+                }
+              },
+              "apiserver": {
+                "properties": {
+                  "inferenceEndpoint": {"type": "string", "pattern": "^https?://", "minLength": 10}
+                }
+              },
+              "controller": {
+                "properties": {
+                  "openshellEndpoint": {"type": "string", "pattern": "^https://", "minLength": 9},
+                  "openshellServerName": {"$ref": "#/definitions/nonempty"},
+                  "openshellRuntimeClassName": {"$ref": "#/definitions/nonempty"},
+                  "workloadExchangeEndpoint": {"type": "string", "pattern": "^https://[^/?#]+(?::[0-9]+)?/v1/workload/exchange$", "minLength": 38},
+                  "workloadExchangeServerName": {"$ref": "#/definitions/nonempty"},
+                  "litellmUrl": {"type": "string", "pattern": "^https?://", "minLength": 9}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"execution": {"properties": {"enabled": {"const": false}}}}},
+      "then": {
+        "properties": {
+          "config": {
+            "properties": {
+              "taskOrchestrationMode": {"const": "staged"},
+              "apiserver": {
+                "properties": {
+                  "executionBindingsMode": {"const": "staged"},
+                  "executionBindings": {"properties": {"bindings": {"maxItems": 0}}}
+                }
+              }
+            }
+          },
+          "connectionsBridge": {"properties": {"enabled": {"const": false}}},
+          "stableBridge": {"properties": {"enabled": {"const": false}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"jira": {"properties": {"enabled": {"const": true}}}}},
+      "then": {
+        "properties": {
+          "config": {
+            "properties": {
+              "apiserver": {
+                "properties": {
+                  "jiraBaseUrl": {"type": "string", "pattern": "^https://", "minLength": 9},
+                  "jiraProjectKey": {"$ref": "#/definitions/nonempty"},
+                  "jiraAccountEmail": {"$ref": "#/definitions/nonempty"}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"tls": {"properties": {"mode": {"const": "certManager"}}}}},
+      "then": {
+        "properties": {
+          "tls": {"properties": {"issuerRef": {"properties": {"name": {"$ref": "#/definitions/nonempty"}}}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"config": {"properties": {"taskOrchestrationMode": {"const": "active"}}}}},
+      "then": {
+        "properties": {
+          "config": {"properties": {"controller": {"properties": {"openshellRuntimeClassName": {"$ref": "#/definitions/nonempty"}}}}}
+        }
+      }
+    },
     {
       "if": {
         "properties": {

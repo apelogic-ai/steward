@@ -1,21 +1,25 @@
 images:
-  repository: ghcr.io/apelogic-ai/steward
+  # No distribution is assumed. Supply a fork-owned repository and exact
+  # immutable component coordinates from one verified release handoff.
+  repository: ""
   pullPolicy: IfNotPresent
-  # The public v0.1.17 release is the renderable, immutable baseline. Pin a
-  # later release's tag and digest together before installing or upgrading.
   apiserver:
-    tag: 0.1.17-apiserver
-    digest: sha256:fcc1f8e4f375f4d2cb69372cc78dfe58ada603afe914987537160931b1bdeffa
+    tag: ""
+    digest: ""
   controller:
-    tag: 0.1.17-controller
-    digest: sha256:04bc2664cb4ed7a720270911a328db8bf1dd0c0d5f8582b65234811741339f08
+    tag: ""
+    digest: ""
   mint:
-    tag: 0.1.17-mint
-    digest: sha256:54215c5cb1945a80cd66ec149c86d5baf0ea467cc8c3b9dd87ab67a785d5aa36
+    tag: ""
+    digest: ""
   web:
-    tag: 0.1.17-web
-    digest: sha256:133f83eff2b49f9d8501f894efbc55cde8891bf13294ad41dc41743c4695c925
+    tag: ""
+    digest: ""
 imagePullSecrets: []
+execution:
+  # Core API/webhook mode. Governed execution requires an explicit switch
+  # after OpenShell, identity, inference, and RuntimeClass preflight.
+  enabled: false
 serviceAccounts:
   # The chart creates these fixed service accounts. Annotations support
   # platform workload identity (for example, EKS IRSA) without exposing any
@@ -70,6 +74,8 @@ secrets:
     name: steward-mint
     signingKey: signing-key
     introspectionCredential: introspection-credential
+jira:
+  enabled: false
 browserAuth:
   enabled: false
   google:
@@ -105,17 +111,25 @@ githubSource:
     contractVersion: steward.source-repository-bindings/v1
     bindings: []
 tls:
+  # customerSecret consumes operator-issued TLS Secrets and a public webhook CA.
+  # certManager creates both Certificates with the explicitly selected issuer.
+  mode: customerSecret
+  api:
+    secretName: steward-apiserver-tls
   issuerRef:
-    name: cluster-issuer
-    kind: ClusterIssuer
+    name: ""
+    kind: Issuer
+  webhook:
+    secretName: steward-webhook-tls
+    caBundlePem: ""
 config:
   # First deploy the new binaries with staged ownership. Switch to active only after every
   # legacy controller replica is gone; the same value gates Task intent writers and owner loops.
   taskOrchestrationMode: staged
   apiserver:
-    jiraBaseUrl: https://jira.example.com
-    jiraProjectKey: PROJ
-    jiraAccountEmail: alice@example.com
+    jiraBaseUrl: ""
+    jiraProjectKey: ""
+    jiraAccountEmail: ""
     kubernetesTokenReviewAudience: https://kubernetes.default.svc
     taskWorkflowsJson: "[]"
     # Keep staged for the first binary rollout; activate only after every controller is upgraded.
@@ -125,27 +139,27 @@ config:
       apiVersion: steward.execution-bindings/v1
       bindings: []
     # Exact OpenAI-compatible Responses API endpoint rendered by the Codex adapter.
-    inferenceEndpoint: http://litellm-litellm.litellm.svc.cluster.local:4000/v1
+    inferenceEndpoint: ""
     # Exact Anthropic-compatible API base URL rendered by the Claude Code adapter.
-    anthropicInferenceEndpoint: http://litellm-litellm.litellm.svc.cluster.local:4000
+    anthropicInferenceEndpoint: ""
     # Exact streamable HTTP endpoint rendered only into tool-bearing Task plans.
     # Empty keeps tool-less tasks available and makes tool-bearing submission fail closed.
     mcpGatewayEndpoint: ""
   controller:
-    openshellEndpoint: https://gateway.example.test:8080
-    openshellServerName: gateway.example.test
-    openshellRuntimeClassName: kata-qemu
+    openshellEndpoint: ""
+    openshellServerName: ""
+    openshellRuntimeClassName: ""
     openshellTaskLogMode: "off"
-    workloadExchangeEndpoint: https://identity.example.test/v1/workload/exchange
-    workloadExchangeServerName: identity.example.test
-    litellmUrl: http://litellm-litellm.litellm.svc.cluster.local:4000
+    workloadExchangeEndpoint: ""
+    workloadExchangeServerName: ""
+    litellmUrl: ""
   mint:
-    issuer: http://steward-mint.steward.svc.cluster.local:8080
+    issuer: ""
     audience: steward-mcp
     allowedScopes: mcp inference
     svidAudience: steward-mint
-    spiffeTrustDomain: example.test
-    openshellNamespace: openshell
+    spiffeTrustDomain: ""
+    openshellNamespace: ""
 stableBridge:
   # Disabled until GitOps supplies an immutable, provenance-verified bridge image and bundle.
   enabled: false
