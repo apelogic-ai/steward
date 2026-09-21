@@ -86,7 +86,8 @@ docker network create "${network}" >/dev/null
 network_created=1
 registry_created=1
 docker run -d --name "${registry}" --network "${network}" \
-  -p 127.0.0.1::5000 registry:2 >/dev/null
+  -p 127.0.0.1::5000 \
+  registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373 >/dev/null
 registry_port="$(docker port "${registry}" 5000/tcp | awk -F: 'NR == 1 { print $NF }')"
 if [[ ! "${registry_port}" =~ ^[0-9]+$ ]]; then
   echo 'registry did not publish a unique host port' >&2
@@ -116,8 +117,7 @@ printf 'api_digest=%s\ncontroller_digest=%s\n' "${api_digest}" "${controller_dig
 echo "published local immutable images ${api_digest} and ${controller_digest}"
 
 stage=cluster
-printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\ncontainerdConfigPatches:\n- |-\n  [plugins."io.containerd.grpc.v1.cri".registry.mirrors."%s:5000"]\n    endpoint = ["http://%s:5000"]\n' \
-  "${registry}" "${registry}" > "${run_dir}/kind.yaml"
+printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\n' > "${run_dir}/kind.yaml"
 cluster_created=1
 KIND_EXPERIMENTAL_DOCKER_NETWORK="${network}" kind create cluster \
   --name "${cluster}" --kubeconfig "${kubeconfig}" \
@@ -128,6 +128,17 @@ if [[ "${actual_context}" != "${context}" ]]; then
   echo "unexpected disposable context ${actual_context}" >&2
   exit 1
 fi
+stage=registry-binding
+node="${cluster}-control-plane"
+# New Kind/containerd nodes already set registry.config_path. Adding a legacy
+# registry.mirrors patch disables CRI, so use the supported per-host file.
+docker exec "${node}" crictl info >/dev/null
+printf 'server = "http://%s:5000"\n[host."http://%s:5000"]\n  capabilities = ["pull", "resolve"]\n' \
+  "${registry}" "${registry}" |
+  docker exec -i "${node}" sh -c 'mkdir -p "$1" && cat > "$1/hosts.toml"' \
+    _ "/etc/containerd/certs.d/${registry}:5000"
+docker exec "${node}" crictl pull "${registry}:5000/steward:${tag}-apiserver@${api_digest}" >/dev/null
+docker exec "${node}" crictl pull "${registry}:5000/steward:${tag}-controller@${controller_digest}" >/dev/null
 kubectl --kubeconfig "${kubeconfig}" --context "${context}" \
   create namespace steward >/dev/null
 kubectl --kubeconfig "${kubeconfig}" --context "${context}" \
