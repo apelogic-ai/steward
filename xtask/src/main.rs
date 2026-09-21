@@ -2307,6 +2307,8 @@ mod tests {
         );
         for required in [
             "OPEN_SHELL_RELEASE=\"v0.0.98\"",
+            "KIND_NODE_IMAGE=\"kindest/node:v1.32.1@sha256:6afef2b7f69d627ea7bf27ee6696b6868d18e03bf98167c420df486da4662db6\"",
+            "--image \"${KIND_NODE_IMAGE}\"",
             "server.defaultRuntimeClassName=openshell-runc",
             "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME=openshell-runc",
             "handler: runc",
@@ -2334,6 +2336,143 @@ mod tests {
             !adapter_source.contains("driver_config"),
             "the adapter must not expose per-create OpenShell driver or scheduler overrides"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn customer_install_guide_verifies_and_installs_the_oci_chart_by_digest() -> Result<(), String>
+    {
+        let guide = fs::read_to_string(root().join("docs/installation/installation-guide.md"))
+            .map_err(|error| format!("customer installation guide is required: {error}"))?;
+
+        for required in [
+            "Helm 3.17.0 or newer",
+            "OCI chart digest pull commands were exercised with Helm v3.17.1",
+            "STEWARD_CHART_REF=\"oci://${STEWARD_CHART_REPOSITORY}@${STEWARD_CHART_DIGEST}\"",
+            "helm pull \"${STEWARD_CHART_REF}\" --destination \"${STEWARD_CHART_DIRECTORY}\"",
+            "awk '$1 == \"Digest:\" { print $2 }'",
+            "test \"${resolved_chart_digest}\" = \"${STEWARD_CHART_DIGEST}\"",
+            "STEWARD_CHART_PACKAGE=\"${STEWARD_CHART_DIRECTORY}/steward@sha256-${STEWARD_CHART_DIGEST#sha256:}.tgz\"",
+            "upgrade --install steward \"${STEWARD_CHART_PACKAGE}\"",
+        ] {
+            assert!(
+                guide.contains(required),
+                "customer installation guide is missing the copyable OCI chart command: {required}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn customer_install_guide_separates_ordered_administration_from_helm() -> Result<(), String> {
+        let guide = fs::read_to_string(root().join("docs/installation/installation-guide.md"))
+            .map_err(|error| format!("customer installation guide is required: {error}"))?;
+
+        let administration_start = guide
+            .find("## Post-install administration (not Helm installation)")
+            .ok_or_else(|| {
+                "customer installation guide is missing the administration boundary".to_owned()
+            })?;
+        let administration_tail = &guide[administration_start..];
+        let delivery_start = administration_tail
+            .find("## Post-install and delivery tests")
+            .ok_or_else(|| {
+                "customer installation guide is missing post-install delivery tests".to_owned()
+            })?;
+        let administration = &administration_tail[..delivery_start];
+
+        for required in [
+            "None of these administration records is a Helm installation outcome",
+            "Google/browser authentication is conditional",
+        ] {
+            assert!(
+                administration.contains(required),
+                "customer installation guide is missing the administration boundary: {required}"
+            );
+        }
+
+        let service_heading = "### Operator/service post-install administration";
+        let browser_heading = "### Conditional human browser administration";
+        let service_start = administration
+            .find(service_heading)
+            .ok_or_else(|| format!("customer installation guide is missing {service_heading}"))?;
+        let browser_start = administration
+            .find(browser_heading)
+            .ok_or_else(|| format!("customer installation guide is missing {browser_heading}"))?;
+        assert!(
+            service_start < browser_start,
+            "service-only administration must precede conditional human browser administration"
+        );
+
+        let service_path = &administration[service_start..browser_start];
+        for required in [
+            "POST /admin/service-envelopes/{service}",
+            "separately authenticated operator/service identity",
+            "scripts/bootstrap-task-copy-smoke.sh",
+            "short-lived route-scoped identity",
+        ] {
+            assert!(
+                service_path.contains(required),
+                "service-only administration is missing {required}"
+            );
+        }
+
+        let browser_path = &administration[browser_start..];
+        for required in [
+            "When `browserAuth.enabled=false`, skip this entire subsection",
+            "There is no documented non-browser substitute",
+            "steward-apiserver-bin bootstrap-rbac",
+            "reads and verifies the existing Service Envelope",
+            "does not provision or modify it",
+        ] {
+            assert!(
+                browser_path.contains(required),
+                "conditional browser administration is missing {required}"
+            );
+        }
+
+        let ordered_steps = [
+            "1. **Enable optional human browser administration.**",
+            "2. **First login and canonical ID.**",
+            "3. **Authorized local RBAC grant.**",
+            "4. **Verify service authority and publish the browser catalog.**",
+            "5. **User Envelope operation.**",
+        ];
+        let positions = ordered_steps
+            .map(|step| {
+                browser_path
+                    .find(step)
+                    .ok_or_else(|| format!("customer installation guide is missing {step}"))
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "conditional browser administration steps must remain in operator order"
+        );
+
+        for browser_only in [
+            "First login and canonical ID",
+            "Verify service authority and publish the browser catalog",
+            "User Envelope operation",
+        ] {
+            assert!(
+                !service_path.contains(browser_only),
+                "browser-only operation escaped its conditional group: {browser_only}"
+            );
+        }
+
+        for forbidden in [
+            "provision the required Service Envelope",
+            "POST /admin/service-envelopes",
+        ] {
+            assert!(
+                !browser_path.contains(forbidden),
+                "browser administration must not claim Service Envelope authoring: {forbidden}"
+            );
+        }
 
         Ok(())
     }

@@ -21,9 +21,9 @@ turn execution off on an installation with live AgentRuntimes or Tasks.
 
 ## Prerequisites
 
-1. Kubernetes 1.30 or newer, Helm 3, `kubectl`, and cluster-admin authority for
-   the Steward CRD, cluster roles, and validating webhook. Select an explicit
-   kubeconfig and context; do not use an ambient or unrelated cluster.
+1. Kubernetes 1.30 or newer, Helm 3.17.0 or newer, `kubectl`, and cluster-admin
+   authority for the Steward CRD, cluster roles, and validating webhook. Select
+   an explicit kubeconfig and context; do not use an ambient or unrelated cluster.
 2. A reachable, separately operated PostgreSQL database and an existing
    `steward-database` Secret with key `url` in the installation namespace.
    PostgreSQL 16 is the tested line. Give a dedicated database role `CONNECT`
@@ -77,6 +77,7 @@ again in the customer's cluster before enabling governed execution.
 | Component | Repository evidence | Installation implication |
 |---|---|---|
 | Kubernetes | The chart declares `kubeVersion: >=1.30.0-0`; the S3 envelope E2E pins Kind node `v1.32.1`. | Verify the target API version and admission/RBAC/NetworkPolicy behavior. A version declaration is not a tested cluster matrix. |
+| Helm | OCI chart digest pull commands were exercised with Helm v3.17.1. | Use Helm 3.17.0 or newer; earlier Helm 3 releases do not support the documented `oci://...@sha256:...` pull reference. |
 | PostgreSQL | `scripts/postgres-tls-e2e.sh` and pinned conformance use `postgres:16-alpine` at a fixed digest. | PostgreSQL 16 is the tested database line. Provision it, TLS, backups, and availability outside Steward. |
 | OpenShell and agent-sandbox | `scripts/openshell-adapter-e2e.sh` pins OpenShell `v0.0.98` and agent-sandbox `v0.5.0`. G-1 conformance separately pins an older OpenShell revision. | The adapter test proves RuntimeClass propagation with a Kind `runc` handler, not VM isolation. Review the actual gateway, driver, policy, and sandbox image on the target. |
 | MCP-GW | The governed Connections bridge accepts authority v1 contract `0.3.2` or v2 contract `0.4.9`, selected by the binding. | Do not infer compatibility for an arbitrary MCP-GW release or enable a Connections bridge without the matching authority and image provenance. |
@@ -262,6 +263,36 @@ different commits. If the operator uses another registry, copy the exact OCI
 manifests by digest, verify the destination digests are unchanged, and update
 only the fork-owned repository coordinates in the values file.
 
+Pull the chart through its immutable OCI manifest digest, verify Helm resolved
+that same digest, and retain the resulting local archive for lint, render, and
+install. Replace the repository and digest with the exact release handoff; do
+not substitute a tag-only reference:
+
+```sh
+STEWARD_CHART_REPOSITORY=ghcr.io/<fork-owner>/charts/steward
+STEWARD_CHART_DIGEST=sha256:<64-hex-digest>
+STEWARD_CHART_DIRECTORY="$(mktemp -d)"
+STEWARD_CHART_REF="oci://${STEWARD_CHART_REPOSITORY}@${STEWARD_CHART_DIGEST}"
+
+pull_output="$(
+  helm pull "${STEWARD_CHART_REF}" --destination "${STEWARD_CHART_DIRECTORY}" 2>&1
+)"
+printf '%s\n' "${pull_output}"
+resolved_chart_digest="$(
+  printf '%s\n' "${pull_output}" |
+    awk '$1 == "Digest:" { print $2 }'
+)"
+test "${resolved_chart_digest}" = "${STEWARD_CHART_DIGEST}"
+
+STEWARD_CHART_PACKAGE="${STEWARD_CHART_DIRECTORY}/steward@sha256-${STEWARD_CHART_DIGEST#sha256:}.tgz"
+test -s "${STEWARD_CHART_PACKAGE}"
+```
+
+Keep `STEWARD_CHART_PACKAGE` in the same shell for the remaining commands.
+For a source-tree install instead, set
+`STEWARD_CHART_PACKAGE=./charts/steward` and record the exact commit and chart
+archive checksum; do not mix that tree with images from another revision.
+
 1. Select a chart directory from the exact release or fork revision and record
    its OCI digest (or, for a source-tree install, the exact commit and chart
    archive checksum) and each image digest in the delivery record. Set a
@@ -340,9 +371,9 @@ only the fork-owned repository coordinates in the values file.
    applying anything:
 
    ```sh
-   helm lint ./charts/steward -f customer-values.yaml \
+   helm lint "${STEWARD_CHART_PACKAGE}" -f customer-values.yaml \
      --set-file tls.webhook.caBundlePem=webhook-public-ca.pem
-   helm template steward ./charts/steward --namespace steward \
+   helm template steward "${STEWARD_CHART_PACKAGE}" --namespace steward \
      -f customer-values.yaml \
      --set-file tls.webhook.caBundlePem=webhook-public-ca.pem > steward-rendered.yaml
    ```
@@ -357,7 +388,7 @@ only the fork-owned repository coordinates in the values file.
 
    ```sh
    helm --kubeconfig "$CLUSTER_KUBECONFIG" --kube-context "$CLUSTER_CONTEXT" \
-     upgrade --install steward ./charts/steward --namespace steward \
+     upgrade --install steward "${STEWARD_CHART_PACKAGE}" --namespace steward \
      --create-namespace --atomic --wait --timeout 10m \
      -f customer-values.yaml \
      --set-file tls.webhook.caBundlePem=webhook-public-ca.pem
@@ -367,6 +398,91 @@ only the fork-owned repository coordinates in the values file.
    placed from `crds/`. Review CRD compatibility before upgrades. For
    cert-manager, wait until both Certificate resources are Ready before
    treating deployment readiness as meaningful.
+
+## Post-install administration (not Helm installation)
+
+A successful Helm install creates and readies only the selected Kubernetes
+release objects. It does not create a Steward user, role grant, Workflow,
+envelope template, Service Envelope, User Envelope, approval, or provider
+grant. None of these administration records is a Helm installation outcome,
+and their absence must not be treated as a failed core installation.
+Google/browser authentication is conditional on `browserAuth.enabled=true`
+and is not a core prerequisite.
+
+Perform only the administration needed for the enabled customer path, after
+the installation and mode-specific readiness checks succeed:
+
+### Operator/service post-install administration
+
+Before browser catalog work, an authorized operator provisions each required
+Service Envelope through the separately authenticated operator/service identity
+accepted by the authoring route:
+
+```text
+POST /admin/service-envelopes/{service}
+```
+
+This authoring route is separate from the GET-only browser administrator
+surface. For the bounded `steward-run` copy-smoke path, use
+[`scripts/bootstrap-task-copy-smoke.sh`](../../scripts/bootstrap-task-copy-smoke.sh)
+with its documented short-lived route-scoped identity. This explicit service
+bootstrap does not create a human user or grant, publish a browser Workflow or
+envelope template, create a User Envelope, or make Task execution an
+installation outcome.
+
+### Conditional human browser administration
+
+The following numbered steps are one conditional human-administration group.
+When `browserAuth.enabled=false`, skip this entire subsection. First-login
+canonical-ID discovery, browser Workflow/template publication, and User
+Envelope operations are protected by the browser session and administrator
+boundaries. There is no documented non-browser substitute for those operations;
+enable and verify the human browser path before performing them.
+
+1. **Enable optional human browser administration.** Enable the web and
+   `browserAuth`, then configure the operator-owned Google OIDC client, HTTPS
+   edge, exact callback, workspace, and organization described in the
+   [browser session contract](../browser-session-contract-v1.md). Do not enable
+   this human-browser path merely to declare Helm installation successful.
+2. **First login and canonical ID.** An organization user signs in once and
+   reads the opaque canonical user ID from `/settings`. The login resolves
+   identity but grants no administrator or member authority. Email and Google
+   subject values are not authorization keys.
+3. **Authorized local RBAC grant.** The user gives that opaque ID to an
+   authorized Steward operator. In the protected runtime where
+   `STEWARD_DATABASE_URL` is already projected, the operator records the
+   audited initial grant explicitly:
+
+   ```text
+   steward-apiserver-bin bootstrap-rbac \
+     --user-id usr_<opaque-id> \
+     --grant administrator \
+     --actor <audited-operator>
+   ```
+
+   There is no first-login administrator shortcut or automatic bootstrap.
+   Follow the grant, revocation, session, and CSRF boundaries in the
+   [browser session contract](../browser-session-contract-v1.md) and
+   [administrator browser contract](../admin-ui-contract-v1.md).
+4. **Verify service authority and publish the browser catalog.** The authorized
+   browser administrator reads and verifies the existing Service Envelope
+   through the GET-only browser surface; it does not provision or modify it.
+   Only after verifying that authority ceiling may the administrator publish
+   immutable Workflow revisions and author versioned envelope templates bounded
+   by it. These are database administration
+   operations, not chart resources or Helm values. The route-scoped
+   `steward-run` Service Envelope bootstrap above does not grant browser
+   authority.
+5. **User Envelope operation.** An authenticated user requests authority from
+   the applicable published template, and an authorized administrator reviews,
+   approves, or rejects that exact request. Before Task submission, prove the
+   user has exactly one active provisioned User Envelope with the intended
+   revision and authority. Never pre-create or select a User Envelope through
+   Helm values.
+
+Record the canonical IDs, immutable revisions, decision evidence, and operator
+actors through the product's supported administration surfaces without placing
+credentials, tokens, or personal data in the installation delivery record.
 
 ## Post-install and delivery tests
 
