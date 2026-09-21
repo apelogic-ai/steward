@@ -121,6 +121,11 @@ kind create cluster \
   --wait 120s
 CLUSTER_CREATED=1
 
+if [[ -n "${STEWARD_G1_BASE_IMAGE:-}" ]]; then
+  "${ROOT}/scripts/g1-preload-kind-base-image.sh" \
+    "${CLUSTER_NAME}" "${STEWARD_G1_BASE_IMAGE}"
+fi
+
 supervisor_image_args=()
 if [[ -n "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
   if [[ "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE}" != *:* || "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE}" == *@* ]]; then

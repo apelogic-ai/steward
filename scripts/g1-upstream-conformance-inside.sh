@@ -80,7 +80,7 @@ YAML
 if ! "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
   --workspace "${WORKSPACE}" sandbox create \
   --name "${SANDBOX}" \
-  --from "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e" \
+  --from "${STEWARD_G1_BASE_IMAGE:?G-1 pinned base image is required}" \
   --policy "${policy}" \
   --no-tty \
   -- true

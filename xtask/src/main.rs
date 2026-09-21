@@ -4138,6 +4138,50 @@ esac
     }
 
     #[test]
+    fn g1_pinned_base_image_is_preloaded_before_the_sandbox_probe() -> Result<(), String> {
+        let wrapper = fs::read_to_string(root().join("scripts/g1-upstream-conformance"))
+            .map_err(|error| format!("failed to read G-1 wrapper: {error}"))?;
+        let setup = fs::read_to_string(root().join("scripts/s0-0-openshell-spike.sh"))
+            .map_err(|error| format!("failed to read OpenShell setup: {error}"))?;
+        let probe = fs::read_to_string(root().join("scripts/g1-upstream-conformance-inside.sh"))
+            .map_err(|error| format!("failed to read G-1 probe: {error}"))?;
+
+        assert!(
+            wrapper.contains("STEWARD_G1_BASE_IMAGE=\"${G1_BASE_IMAGE}\""),
+            "G-1 must pass its pinned base-image digest to the run-owned setup"
+        );
+        let cluster_created = setup
+            .find("CLUSTER_CREATED=1")
+            .ok_or("OpenShell setup must track the created Kind cluster")?;
+        let preload = setup
+            .find("g1-preload-kind-base-image.sh")
+            .ok_or("G-1 must preload the pinned base image in the owned Kind node")?;
+        let helm_install = setup
+            .find("helm \"${openshell_helm_args[@]}\"")
+            .ok_or("OpenShell setup must install the upstream chart")?;
+        assert!(
+            cluster_created < preload && preload < helm_install,
+            "G-1 image preload must finish after Kind creation and before sandbox setup"
+        );
+        assert!(
+            probe
+                .contains("--from \"${STEWARD_G1_BASE_IMAGE:?G-1 pinned base image is required}\""),
+            "G-1 must create its sandbox from the same pinned image that was preloaded"
+        );
+        let regression = Command::new("bash")
+            .arg(root().join("scripts/test-g1-kind-base-image-preload.sh"))
+            .output()
+            .map_err(|error| format!("failed to run G-1 preload regressions: {error}"))?;
+        if !regression.status.success() {
+            return Err(format!(
+                "G-1 preload regressions failed: {}",
+                String::from_utf8_lossy(&regression.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn migration_diff_accepts_a_divergent_base() -> Result<(), String> {
         let repository = TestRepository::create()?;
         git(&repository.path, &["init", "--initial-branch=main"])?;
