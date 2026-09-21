@@ -2369,28 +2369,76 @@ mod tests {
     fn customer_install_guide_separates_ordered_administration_from_helm() -> Result<(), String> {
         let guide = fs::read_to_string(root().join("docs/installation/installation-guide.md"))
             .map_err(|error| format!("customer installation guide is required: {error}"))?;
+
+        let administration_start = guide
+            .find("## Post-install administration (not Helm installation)")
+            .ok_or_else(|| {
+                "customer installation guide is missing the administration boundary".to_owned()
+            })?;
+        let administration_tail = &guide[administration_start..];
+        let delivery_start = administration_tail
+            .find("## Post-install and delivery tests")
+            .ok_or_else(|| {
+                "customer installation guide is missing post-install delivery tests".to_owned()
+            })?;
+        let administration = &administration_tail[..delivery_start];
+
         for required in [
-            "## Post-install administration (not Helm installation)",
             "None of these administration records is a Helm installation outcome",
             "Google/browser authentication is conditional",
-            "steward-apiserver-bin bootstrap-rbac",
         ] {
             assert!(
-                guide.contains(required),
+                administration.contains(required),
                 "customer installation guide is missing the administration boundary: {required}"
             );
         }
 
+        let service_heading = "### Optional service-only administration";
+        let browser_heading = "### Conditional human browser administration";
+        let service_start = administration
+            .find(service_heading)
+            .ok_or_else(|| format!("customer installation guide is missing {service_heading}"))?;
+        let browser_start = administration
+            .find(browser_heading)
+            .ok_or_else(|| format!("customer installation guide is missing {browser_heading}"))?;
+        assert!(
+            service_start < browser_start,
+            "service-only administration must precede conditional human browser administration"
+        );
+
+        let service_path = &administration[service_start..browser_start];
+        for required in [
+            "scripts/bootstrap-task-copy-smoke.sh",
+            "short-lived route-scoped identity",
+        ] {
+            assert!(
+                service_path.contains(required),
+                "service-only administration is missing {required}"
+            );
+        }
+
+        let browser_path = &administration[browser_start..];
+        for required in [
+            "When `browserAuth.enabled=false`, skip this entire subsection",
+            "There is no documented non-browser substitute",
+            "steward-apiserver-bin bootstrap-rbac",
+        ] {
+            assert!(
+                browser_path.contains(required),
+                "conditional browser administration is missing {required}"
+            );
+        }
+
         let ordered_steps = [
-            "1. **Optional browser onboarding.**",
+            "1. **Enable optional human browser administration.**",
             "2. **First login and canonical ID.**",
             "3. **Authorized local RBAC grant.**",
-            "4. **Service authority and catalog publication.**",
+            "4. **Browser service authority and catalog publication.**",
             "5. **User Envelope operation.**",
         ];
         let positions = ordered_steps
             .map(|step| {
-                guide
+                browser_path
                     .find(step)
                     .ok_or_else(|| format!("customer installation guide is missing {step}"))
             })
@@ -2398,8 +2446,19 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?;
         assert!(
             positions.windows(2).all(|pair| pair[0] < pair[1]),
-            "post-install administration steps must remain in operator order"
+            "conditional browser administration steps must remain in operator order"
         );
+
+        for browser_only in [
+            "First login and canonical ID",
+            "Browser service authority and catalog publication",
+            "User Envelope operation",
+        ] {
+            assert!(
+                !service_path.contains(browser_only),
+                "browser-only operation escaped its conditional group: {browser_only}"
+            );
+        }
 
         Ok(())
     }

@@ -412,12 +412,30 @@ and is not a core prerequisite.
 Perform only the administration needed for the enabled customer path, after
 the installation and mode-specific readiness checks succeed:
 
-1. **Optional browser onboarding.** If the customer enables the web and
-   `browserAuth`, configure the operator-owned Google OIDC client, HTTPS edge,
-   exact callback, workspace, and organization described in the
-   [browser session contract](../browser-session-contract-v1.md). Skip this
-   human-browser path when browser authentication is disabled; do not enable it
-   merely to declare Helm installation successful.
+### Optional service-only administration
+
+After governed readiness, a customer that enables the bounded `steward-run`
+copy-smoke path may provision only its exact Service Envelope with
+[`scripts/bootstrap-task-copy-smoke.sh`](../../scripts/bootstrap-task-copy-smoke.sh)
+and the documented short-lived route-scoped identity. This is a separate,
+explicit service bootstrap; it does not create a human user or grant, publish a
+browser Workflow or envelope template, create a User Envelope, or make Task
+execution an installation outcome.
+
+### Conditional human browser administration
+
+The following numbered steps are one conditional human-administration group.
+When `browserAuth.enabled=false`, skip this entire subsection. First-login
+canonical-ID discovery, browser Workflow/template publication, and User
+Envelope operations are protected by the browser session and administrator
+boundaries. There is no documented non-browser substitute for those operations;
+enable and verify the human browser path before performing them.
+
+1. **Enable optional human browser administration.** Enable the web and
+   `browserAuth`, then configure the operator-owned Google OIDC client, HTTPS
+   edge, exact callback, workspace, and organization described in the
+   [browser session contract](../browser-session-contract-v1.md). Do not enable
+   this human-browser path merely to declare Helm installation successful.
 2. **First login and canonical ID.** An organization user signs in once and
    reads the opaque canonical user ID from `/settings`. The login resolves
    identity but grants no administrator or member authority. Email and Google
@@ -438,15 +456,14 @@ the installation and mode-specific readiness checks succeed:
    Follow the grant, revocation, session, and CSRF boundaries in the
    [browser session contract](../browser-session-contract-v1.md) and
    [administrator browser contract](../admin-ui-contract-v1.md).
-4. **Service authority and catalog publication.** Through an authenticated,
-   authorized post-install administration path, provision the required Service
-   Envelope before relying on it as an authority ceiling. For the bounded
-   `steward-run` copy-smoke path, use
-   [`scripts/bootstrap-task-copy-smoke.sh`](../../scripts/bootstrap-task-copy-smoke.sh)
-   with its short-lived route-scoped identity. An administrator may then
-   publish immutable Workflow revisions and author versioned envelope templates
-   bounded by the current Service Envelope. These are database administration
-   operations, not chart resources or Helm values.
+4. **Browser service authority and catalog publication.** Through the
+   authenticated, authorized browser administration surface, provision the
+   required Service Envelope before relying on it as an authority ceiling,
+   publish immutable Workflow revisions, and author versioned envelope
+   templates bounded by the current Service Envelope. These are database
+   administration operations, not chart resources or Helm values. The
+   route-scoped `steward-run` Service Envelope bootstrap above does not grant
+   this browser authority.
 5. **User Envelope operation.** An authenticated user requests authority from
    the applicable published template, and an authorized administrator reviews,
    approves, or rejects that exact request. Before Task submission, prove the
