@@ -2393,7 +2393,7 @@ mod tests {
             );
         }
 
-        let service_heading = "### Optional service-only administration";
+        let service_heading = "### Operator/service post-install administration";
         let browser_heading = "### Conditional human browser administration";
         let service_start = administration
             .find(service_heading)
@@ -2408,6 +2408,8 @@ mod tests {
 
         let service_path = &administration[service_start..browser_start];
         for required in [
+            "POST /admin/service-envelopes/{service}",
+            "separately authenticated operator/service identity",
             "scripts/bootstrap-task-copy-smoke.sh",
             "short-lived route-scoped identity",
         ] {
@@ -2422,6 +2424,8 @@ mod tests {
             "When `browserAuth.enabled=false`, skip this entire subsection",
             "There is no documented non-browser substitute",
             "steward-apiserver-bin bootstrap-rbac",
+            "reads and verifies the existing Service Envelope",
+            "does not provision or modify it",
         ] {
             assert!(
                 browser_path.contains(required),
@@ -2433,7 +2437,7 @@ mod tests {
             "1. **Enable optional human browser administration.**",
             "2. **First login and canonical ID.**",
             "3. **Authorized local RBAC grant.**",
-            "4. **Browser service authority and catalog publication.**",
+            "4. **Verify service authority and publish the browser catalog.**",
             "5. **User Envelope operation.**",
         ];
         let positions = ordered_steps
@@ -2451,12 +2455,22 @@ mod tests {
 
         for browser_only in [
             "First login and canonical ID",
-            "Browser service authority and catalog publication",
+            "Verify service authority and publish the browser catalog",
             "User Envelope operation",
         ] {
             assert!(
                 !service_path.contains(browser_only),
                 "browser-only operation escaped its conditional group: {browser_only}"
+            );
+        }
+
+        for forbidden in [
+            "provision the required Service Envelope",
+            "POST /admin/service-envelopes",
+        ] {
+            assert!(
+                !browser_path.contains(forbidden),
+                "browser administration must not claim Service Envelope authoring: {forbidden}"
             );
         }
 

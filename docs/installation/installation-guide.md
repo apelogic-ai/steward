@@ -412,15 +412,23 @@ and is not a core prerequisite.
 Perform only the administration needed for the enabled customer path, after
 the installation and mode-specific readiness checks succeed:
 
-### Optional service-only administration
+### Operator/service post-install administration
 
-After governed readiness, a customer that enables the bounded `steward-run`
-copy-smoke path may provision only its exact Service Envelope with
+Before browser catalog work, an authorized operator provisions each required
+Service Envelope through the separately authenticated operator/service identity
+accepted by the authoring route:
+
+```text
+POST /admin/service-envelopes/{service}
+```
+
+This authoring route is separate from the GET-only browser administrator
+surface. For the bounded `steward-run` copy-smoke path, use
 [`scripts/bootstrap-task-copy-smoke.sh`](../../scripts/bootstrap-task-copy-smoke.sh)
-and the documented short-lived route-scoped identity. This is a separate,
-explicit service bootstrap; it does not create a human user or grant, publish a
-browser Workflow or envelope template, create a User Envelope, or make Task
-execution an installation outcome.
+with its documented short-lived route-scoped identity. This explicit service
+bootstrap does not create a human user or grant, publish a browser Workflow or
+envelope template, create a User Envelope, or make Task execution an
+installation outcome.
 
 ### Conditional human browser administration
 
@@ -456,14 +464,15 @@ enable and verify the human browser path before performing them.
    Follow the grant, revocation, session, and CSRF boundaries in the
    [browser session contract](../browser-session-contract-v1.md) and
    [administrator browser contract](../admin-ui-contract-v1.md).
-4. **Browser service authority and catalog publication.** Through the
-   authenticated, authorized browser administration surface, provision the
-   required Service Envelope before relying on it as an authority ceiling,
-   publish immutable Workflow revisions, and author versioned envelope
-   templates bounded by the current Service Envelope. These are database
-   administration operations, not chart resources or Helm values. The
-   route-scoped `steward-run` Service Envelope bootstrap above does not grant
-   this browser authority.
+4. **Verify service authority and publish the browser catalog.** The authorized
+   browser administrator reads and verifies the existing Service Envelope
+   through the GET-only browser surface; it does not provision or modify it.
+   Only after verifying that authority ceiling may the administrator publish
+   immutable Workflow revisions and author versioned envelope templates bounded
+   by it. These are database administration
+   operations, not chart resources or Helm values. The route-scoped
+   `steward-run` Service Envelope bootstrap above does not grant browser
+   authority.
 5. **User Envelope operation.** An authenticated user requests authority from
    the applicable published template, and an authorized administrator reviews,
    approves, or rejects that exact request. Before Task submission, prove the
