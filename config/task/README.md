@@ -144,8 +144,9 @@ authentication.
 
 Bootstrap requires a Steward release containing both the route-scoped authorization contract and
 the delegated Kubernetes TokenReview audience setting, plus a customer-operated identity provider
-and short-lived exchange profile that can issue the exact verified identity above. DEV uses an
-EKS OIDC association for this purpose; a customer cluster must supply and test its own equivalent.
+and short-lived exchange profile that can issue the exact verified identity above. DEV uses
+Infra's short-lived token exchange through the `DEV EKS OIDC identity-provider` association for
+this purpose; a customer cluster must supply and test its own equivalent.
 Steward does not issue that token. It must not be stored in a Kubernetes Secret or replaced with
 any other long-lived credential; the chart intentionally has no bootstrap-token Secret input.
 
