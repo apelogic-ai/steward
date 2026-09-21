@@ -2347,6 +2347,8 @@ mod tests {
             .map_err(|error| format!("customer installation guide is required: {error}"))?;
 
         for required in [
+            "Helm 3.17.0 or newer",
+            "OCI chart digest pull commands were exercised with Helm v3.17.1",
             "STEWARD_CHART_REF=\"oci://${STEWARD_CHART_REPOSITORY}@${STEWARD_CHART_DIGEST}\"",
             "helm pull \"${STEWARD_CHART_REF}\" --destination \"${STEWARD_CHART_DIRECTORY}\"",
             "awk '$1 == \"Digest:\" { print $2 }'",

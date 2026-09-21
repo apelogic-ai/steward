@@ -21,9 +21,9 @@ turn execution off on an installation with live AgentRuntimes or Tasks.
 
 ## Prerequisites
 
-1. Kubernetes 1.30 or newer, Helm 3, `kubectl`, and cluster-admin authority for
-   the Steward CRD, cluster roles, and validating webhook. Select an explicit
-   kubeconfig and context; do not use an ambient or unrelated cluster.
+1. Kubernetes 1.30 or newer, Helm 3.17.0 or newer, `kubectl`, and cluster-admin
+   authority for the Steward CRD, cluster roles, and validating webhook. Select
+   an explicit kubeconfig and context; do not use an ambient or unrelated cluster.
 2. A reachable, separately operated PostgreSQL database and an existing
    `steward-database` Secret with key `url` in the installation namespace.
    PostgreSQL 16 is the tested line. Give a dedicated database role `CONNECT`
@@ -77,6 +77,7 @@ again in the customer's cluster before enabling governed execution.
 | Component | Repository evidence | Installation implication |
 |---|---|---|
 | Kubernetes | The chart declares `kubeVersion: >=1.30.0-0`; the S3 envelope E2E pins Kind node `v1.32.1`. | Verify the target API version and admission/RBAC/NetworkPolicy behavior. A version declaration is not a tested cluster matrix. |
+| Helm | OCI chart digest pull commands were exercised with Helm v3.17.1. | Use Helm 3.17.0 or newer; earlier Helm 3 releases do not support the documented `oci://...@sha256:...` pull reference. |
 | PostgreSQL | `scripts/postgres-tls-e2e.sh` and pinned conformance use `postgres:16-alpine` at a fixed digest. | PostgreSQL 16 is the tested database line. Provision it, TLS, backups, and availability outside Steward. |
 | OpenShell and agent-sandbox | `scripts/openshell-adapter-e2e.sh` pins OpenShell `v0.0.98` and agent-sandbox `v0.5.0`. G-1 conformance separately pins an older OpenShell revision. | The adapter test proves RuntimeClass propagation with a Kind `runc` handler, not VM isolation. Review the actual gateway, driver, policy, and sandbox image on the target. |
 | MCP-GW | The governed Connections bridge accepts authority v1 contract `0.3.2` or v2 contract `0.4.9`, selected by the binding. | Do not infer compatibility for an arbitrary MCP-GW release or enable a Connections bridge without the matching authority and image provenance. |
