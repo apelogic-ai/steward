@@ -398,6 +398,65 @@ archive checksum; do not mix that tree with images from another revision.
    cert-manager, wait until both Certificate resources are Ready before
    treating deployment readiness as meaningful.
 
+## Post-install administration (not Helm installation)
+
+A successful Helm install creates and readies only the selected Kubernetes
+release objects. It does not create a Steward user, role grant, Workflow,
+envelope template, Service Envelope, User Envelope, approval, or provider
+grant. None of these administration records is a Helm installation outcome,
+and their absence must not be treated as a failed core installation.
+Google/browser authentication is conditional on `browserAuth.enabled=true`
+and is not a core prerequisite.
+
+Perform only the administration needed for the enabled customer path, after
+the installation and mode-specific readiness checks succeed:
+
+1. **Optional browser onboarding.** If the customer enables the web and
+   `browserAuth`, configure the operator-owned Google OIDC client, HTTPS edge,
+   exact callback, workspace, and organization described in the
+   [browser session contract](../browser-session-contract-v1.md). Skip this
+   human-browser path when browser authentication is disabled; do not enable it
+   merely to declare Helm installation successful.
+2. **First login and canonical ID.** An organization user signs in once and
+   reads the opaque canonical user ID from `/settings`. The login resolves
+   identity but grants no administrator or member authority. Email and Google
+   subject values are not authorization keys.
+3. **Authorized local RBAC grant.** The user gives that opaque ID to an
+   authorized Steward operator. In the protected runtime where
+   `STEWARD_DATABASE_URL` is already projected, the operator records the
+   audited initial grant explicitly:
+
+   ```text
+   steward-apiserver-bin bootstrap-rbac \
+     --user-id usr_<opaque-id> \
+     --grant administrator \
+     --actor <audited-operator>
+   ```
+
+   There is no first-login administrator shortcut or automatic bootstrap.
+   Follow the grant, revocation, session, and CSRF boundaries in the
+   [browser session contract](../browser-session-contract-v1.md) and
+   [administrator browser contract](../admin-ui-contract-v1.md).
+4. **Service authority and catalog publication.** Through an authenticated,
+   authorized post-install administration path, provision the required Service
+   Envelope before relying on it as an authority ceiling. For the bounded
+   `steward-run` copy-smoke path, use
+   [`scripts/bootstrap-task-copy-smoke.sh`](../../scripts/bootstrap-task-copy-smoke.sh)
+   with its short-lived route-scoped identity. An administrator may then
+   publish immutable Workflow revisions and author versioned envelope templates
+   bounded by the current Service Envelope. These are database administration
+   operations, not chart resources or Helm values.
+5. **User Envelope operation.** An authenticated user requests authority from
+   the applicable published template, and an authorized administrator reviews,
+   approves, or rejects that exact request. Before Task submission, prove the
+   user has exactly one active provisioned User Envelope with the intended
+   revision and authority. Never pre-create or select a User Envelope through
+   Helm values.
+
+Record the canonical IDs, immutable revisions, decision evidence, and operator
+actors through the product's supported administration surfaces without placing
+credentials, tokens, or personal data in the installation delivery record.
+
 ## Post-install and delivery tests
 
 Run these against the same explicit context and record the revision, values

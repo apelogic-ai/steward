@@ -2364,6 +2364,45 @@ mod tests {
     }
 
     #[test]
+    fn customer_install_guide_separates_ordered_administration_from_helm() -> Result<(), String> {
+        let guide = fs::read_to_string(root().join("docs/installation/installation-guide.md"))
+            .map_err(|error| format!("customer installation guide is required: {error}"))?;
+        for required in [
+            "## Post-install administration (not Helm installation)",
+            "None of these administration records is a Helm installation outcome",
+            "Google/browser authentication is conditional",
+            "steward-apiserver-bin bootstrap-rbac",
+        ] {
+            assert!(
+                guide.contains(required),
+                "customer installation guide is missing the administration boundary: {required}"
+            );
+        }
+
+        let ordered_steps = [
+            "1. **Optional browser onboarding.**",
+            "2. **First login and canonical ID.**",
+            "3. **Authorized local RBAC grant.**",
+            "4. **Service authority and catalog publication.**",
+            "5. **User Envelope operation.**",
+        ];
+        let positions = ordered_steps
+            .map(|step| {
+                guide
+                    .find(step)
+                    .ok_or_else(|| format!("customer installation guide is missing {step}"))
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "post-install administration steps must remain in operator order"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn governed_connections_real_stack_is_a_required_pinned_ci_lane() -> Result<(), String> {
         let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
