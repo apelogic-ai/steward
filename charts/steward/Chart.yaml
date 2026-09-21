@@ -2,8 +2,8 @@ apiVersion: v2
 name: steward
 description: Governance control plane for policy-bound coding-agent workloads
 type: application
-version: 0.1.17
-appVersion: 0.1.17
+version: 0.1.18
+appVersion: 0.1.18
 kubeVersion: ">=1.30.0-0"
 home: https://github.com/apelogic-ai/steward
 sources:
@@ -18,3 +18,4 @@ maintainers:
     url: https://github.com/apelogic-ai
 annotations:
   artifacthub.io/license: MIT
+  steward.apelogic.ai/customer-install-contract: steward.customer-install/v1

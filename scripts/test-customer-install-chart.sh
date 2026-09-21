@@ -5,6 +5,12 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 run_dir="$(mktemp -d)"
 trap 'rm -f "${run_dir}/default.yaml" "${run_dir}/cert-manager.yaml" "${run_dir}/jira.yaml" "${run_dir}/customer.yaml"; rmdir "${run_dir}"' EXIT
 
+# The release validator selects its strict customer contract only for a
+# deliberately versioned chart; a missing or stale marker must fail the handoff.
+grep -Fxq 'version: 0.1.18' "${root}/charts/steward/Chart.yaml"
+grep -Fxq '  steward.apelogic.ai/customer-install-contract: steward.customer-install/v1' \
+  "${root}/charts/steward/Chart.yaml"
+
 customer_images=(
   --set-string images.repository=registry.example.test/customer/steward
   --set-string images.apiserver.tag=test-apiserver
