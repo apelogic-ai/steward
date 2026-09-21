@@ -4286,6 +4286,32 @@ esac
     }
 
     #[test]
+    fn g1_requires_the_explicit_default_deny_response() -> Result<(), String> {
+        let script_path = root().join("scripts/g1-upstream-conformance-inside.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        assert!(
+            script.contains(
+                "curl -sS --max-time 20 -H 'User-Agent: steward-conformance/1.0' https://api.github.com/zen"
+            ),
+            "the allowed probe must treat an upstream HTTP response as reachable without curl --fail"
+        );
+        assert!(
+            script.contains(
+                "curl -sS --max-time 10 --output /dev/null --write-out '%{http_connect}' https://docs.rs"
+            ),
+            "the forbidden HTTPS probe must retain the proxy CONNECT status for an explicit denial assertion"
+        );
+        assert!(
+            script.contains(
+                "if [[ \"${denied_exit}\" -ne 56 || \"${denied_connect_status}\" != \"403\" ]]; then"
+            ),
+            "G-1 must pass only on curl's failed CONNECT exit paired with OpenShell's explicit 403 denial"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn g1_pinned_base_image_is_preloaded_before_the_sandbox_probe() -> Result<(), String> {
         let wrapper = fs::read_to_string(root().join("scripts/g1-upstream-conformance"))
             .map_err(|error| format!("failed to read G-1 wrapper: {error}"))?;

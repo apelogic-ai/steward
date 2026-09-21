@@ -106,12 +106,17 @@ done
 
 "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
   --workspace "${WORKSPACE}" sandbox exec --name "${SANDBOX}" --no-tty -- \
-  curl -fsS --max-time 20 -H 'User-Agent: steward-conformance/1.0' https://api.github.com/zen >/dev/null
+  curl -sS --max-time 20 -H 'User-Agent: steward-conformance/1.0' https://api.github.com/zen >/dev/null
 
-if "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
-  --workspace "${WORKSPACE}" sandbox exec --name "${SANDBOX}" --no-tty -- \
-  curl -fsS --max-time 10 https://docs.rs >/dev/null 2>&1
-then
-  echo "OpenShell allowed an egress destination absent from the sandbox policy" >&2
+set +e
+denied_connect_status="$(
+  "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
+    --workspace "${WORKSPACE}" sandbox exec --name "${SANDBOX}" --no-tty -- \
+    curl -sS --max-time 10 --output /dev/null --write-out '%{http_connect}' https://docs.rs 2>/dev/null
+)"
+denied_exit="$?"
+set -e
+if [[ "${denied_exit}" -ne 56 || "${denied_connect_status}" != "403" ]]; then
+  echo "OpenShell unlisted HTTPS probe returned CONNECT ${denied_connect_status:-none} with curl exit ${denied_exit}; expected CONNECT 403 with exit 56" >&2
   exit 1
 fi
