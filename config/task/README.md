@@ -12,17 +12,19 @@ worker is part of the normal `steward-controller` process.
 | `STEWARD_TASK_WORKFLOWS_JSON` | Required JSON array matching `workflows.example.json`. Commands are server-selected; clients cannot supply them. |
 | `STEWARD_TASK_EXECUTION_BINDINGS_FILE` | Preferred read-only file containing `steward.execution-bindings/v1`. Missing or empty catalog means no coding agents are available. |
 | `STEWARD_TASK_EXECUTION_BINDINGS_JSON` | Optional inline form of the same document for non-Helm integration environments. Configuring both forms fails startup. |
-| `STEWARD_TASK_INFERENCE_ENDPOINT` | Exact OpenAI-compatible Responses API endpoint rendered by the configured Codex adapter. Production routes this through the governed inference provider. |
+| `STEWARD_EXECUTION_ENABLED` | Set to `false` for core-only installation: Task orchestration and execution bindings must also remain `staged`. Set to `true` only after the governed prerequisites and staged rollout are ready. The chart's `execution.enabled` sets this for both binaries. |
+| `STEWARD_TASK_INFERENCE_ENDPOINT` | Required only with governed execution. Exact OpenAI-compatible Responses API endpoint rendered by the configured Codex adapter; route it through the governed inference provider. |
 | `STEWARD_TASK_MCP_GW_ENDPOINT` | Exact HTTP(S) streamable MCP endpoint. Required only when a versioned task resolves non-empty tool authority; otherwise the task fails before reservation or execution. |
 | `STEWARD_APISERVER_BIND` | HTTPS listener, default `0.0.0.0:8443`. Expose the existing apiserver Service port to this target port. |
-| Task API enablement | Enabled whenever the production apiserver starts. There is no bypass flag; invalid or absent Task configuration fails startup. |
+| Task API enablement | The Task routes exist when the apiserver starts, but core-only installation is staged and rejects new Task execution. Invalid required Task configuration still fails startup. |
 | `STEWARD_DATABASE_URL` | Existing Postgres connection reference. Keep the value in a Secret, never this repository. |
 
 The caller supplies `Authorization: Bearer <exchanged-token>`. GitHub requests the production
 exchange service's audience; Steward never receives the raw GitHub OIDC token. Steward sends the
 exchanged token to TokenReview with the configured Kubernetes API server audience. The exchanged
-JWT still has `aud=steward-task-api`, matching the EKS external OIDC client ID; Steward does not
-parse or reinterpret that JWT. See `docs/task-submission-api.md` for the required verified
+JWT has `aud=steward-task-api`, which the customer's cluster identity provider must be configured
+to validate; Steward does not parse or reinterpret that JWT. DEV uses an EKS external OIDC client
+ID with the same value. See `docs/task-submission-api.md` for the required verified
 username/groups and the external mapper boundary.
 
 For a tool-bearing versioned Workflow using the `codex-v1` adapter, Steward writes the configured
@@ -41,14 +43,16 @@ The concrete agent and profile values in this directory are local E2E fixtures o
 
 ## Controller inputs
 
-Task execution is enabled in the normal controller composition root when
-`STEWARD_DATABASE_URL`, `STEWARD_OPENSHELL_ENDPOINT`, and the existing inference-plane inputs
-are present. The same process drains the Task approval outbox through the Jira
-`DecisionChannel`, so it also requires `STEWARD_JIRA_BASE_URL`,
-`STEWARD_JIRA_PROJECT_KEY`, `STEWARD_JIRA_ACCOUNT_EMAIL`, and the
-`STEWARD_JIRA_TOKEN` secret reference. `STEWARD_S0_BOOTSTRAP=1` is the bootstrap-only mode and
-does not run the durable Task worker or approval dispatcher; do not use it for a Task deployment.
-No second Task controller flag or service port exists.
+With `STEWARD_EXECUTION_ENABLED=false`, the controller starts its database-backed admission
+webhook without OpenShell, LiteLLM, Mint, or Jira. This is the fail-closed core-only mode: Task
+orchestration must remain `staged`, and no Task worker or approval dispatcher runs. With governed
+execution enabled, `STEWARD_OPENSHELL_ENDPOINT`, the LiteLLM URL and master key, workload identity,
+and the other [installation prerequisites](../../docs/installation/installation-guide.md) are
+required even for the model-free copy-smoke Workflow below. When orchestration becomes `active`,
+the approval dispatcher uses Jira if configured; with Jira disabled, decisions requiring that
+channel are rejected, not silently approved. `STEWARD_S0_BOOTSTRAP=1` is a bootstrap-only mode
+and does not run the durable Task worker or approval dispatcher; do not use it for a Task
+deployment. No second Task controller service port exists.
 
 The chart's `config.taskOrchestrationMode` supplies the same required mode to both binaries and
 defaults to `staged`. A migration rollout first deploys all new binaries with that default, verifies
@@ -79,8 +83,9 @@ mkdir -p "$STEWARD_OUTPUT_DIR/out"
 cp in/payload.bin "$STEWARD_OUTPUT_DIR/out/payload.bin"
 ```
 
-The input and output names are workspace-relative tar paths. This smoke requires no LiteLLM or
-MCP call. Inject the JSON through a ConfigMap or equivalent configuration source as
+The input and output names are workspace-relative tar paths. This smoke makes no LiteLLM or MCP
+call, but governed controller startup still requires its configured LiteLLM and OpenShell planes.
+Inject the JSON through a ConfigMap or equivalent configuration source as
 `STEWARD_TASK_WORKFLOWS_JSON`; do not let submitters override its command, namespace, models,
 tools, budget, or TTL.
 
@@ -124,7 +129,7 @@ bearer token out of command arguments, and fails closed on every other response.
 
 The production identity contract for this credential is exact:
 
-- exchanged JWT audience and EKS external OIDC client ID: `steward-task-api`
+- exchanged JWT audience and the cluster identity provider's client ID: `steward-task-api`
 - delegated Kubernetes TokenReview audience: the required
   `STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE`; DEV uses
   `https://kubernetes.default.svc`
@@ -138,15 +143,17 @@ the bootstrap group with the broad administrator group or a member-role group fa
 authentication.
 
 Bootstrap requires a Steward release containing both the route-scoped authorization contract and
-the delegated Kubernetes TokenReview audience setting, plus Infra's short-lived token exchange
-profile through the DEV EKS OIDC identity-provider association. Steward does not issue that token.
-It must not be stored in a Kubernetes Secret or replaced with any other long-lived credential; the
-chart intentionally has no bootstrap-token Secret input.
+the delegated Kubernetes TokenReview audience setting, plus a customer-operated identity provider
+and short-lived exchange profile that can issue the exact verified identity above. DEV uses an
+EKS OIDC association for this purpose; a customer cluster must supply and test its own equivalent.
+Steward does not issue that token. It must not be stored in a Kubernetes Secret or replaced with
+any other long-lived credential; the chart intentionally has no bootstrap-token Secret input.
 
-## Jira startup values
+## Optional Jira decision channel
 
-Jira is currently required whenever the production apiserver starts. DEV must supply these exact
-inputs; no dummy value is valid:
+The chart defaults to `jira.enabled=false`; neither binary mounts a Jira token or needs Jira
+values in that mode. If a decision workflow uses Jira, enable it explicitly and supply all four
+real inputs below. A partially configured Jira adapter fails startup; no dummy value is valid:
 
 | Environment input | Helm value/source | Required value shape |
 |---|---|---|
@@ -155,12 +162,12 @@ inputs; no dummy value is valid:
 | `STEWARD_JIRA_ACCOUNT_EMAIL` | `config.apiserver.jiraAccountEmail` | Account email corresponding to the API token |
 | `STEWARD_JIRA_TOKEN` | Secret named by `secrets.jira.name`, key `secrets.jira.key` | Raw Jira API token |
 
-The actual DEV tenant URL, project key, and account email are deployment inputs owned by GitOps;
-the token is secret-store material. None belongs in this public repository. If Jira should become
-optional, that requires a separate product/chart change rather than a placeholder credential.
+The tenant URL, project key, and account email are deployment inputs; the token is secret-store
+material. None belongs in this public repository. Decisions needing Jira fail closed when the
+channel is disabled.
 
-## Release impact
+## Release compatibility
 
-This contract changes the delegated TokenReview audience used by both Task and administrator
-authentication. A new signed patch release is therefore required after this change merges; reuse
-of the Steward v0.1.5 image/chart handoff is not sufficient.
+Use apiserver, controller, and chart artifacts from the same exact Steward revision. Older
+image/chart handoffs may not support the core-only execution flag, optional Jira projections, or
+the current delegated TokenReview audience; do not mix them with this configuration.
