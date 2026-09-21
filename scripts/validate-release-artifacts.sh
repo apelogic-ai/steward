@@ -2,6 +2,8 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+bash "${root}/scripts/test-release-chart-contract.sh"
+chart_contract_mode="$(bash "${root}/scripts/release-chart-contract.sh" "${root}/charts/steward/Chart.yaml")"
 rendered="$(mktemp)"
 default_rendered="$(mktemp)"
 stable_bridge_rendered="$(mktemp)"
@@ -63,12 +65,37 @@ digest1="sha256:1111111111111111111111111111111111111111111111111111111111111111
 digest2="sha256:2222222222222222222222222222222222222222222222222222222222222222"
 digest3="sha256:3333333333333333333333333333333333333333333333333333333333333333"
 image_values=(
+  --set-string images.repository=registry.example.test/customer/steward
   --set images.apiserver.tag=validation-apiserver
   --set "images.apiserver.digest=${digest0}"
   --set images.controller.tag=validation-controller
   --set "images.controller.digest=${digest1}"
   --set images.mint.tag=validation-mint
   --set "images.mint.digest=${digest2}"
+)
+core_image_values=(
+  --set-string images.repository=registry.example.test/customer/steward
+  --set images.apiserver.tag=validation-apiserver
+  --set "images.apiserver.digest=${digest0}"
+  --set images.controller.tag=validation-controller
+  --set "images.controller.digest=${digest1}"
+)
+if [[ "${chart_contract_mode}" == customer-v1 ]]; then
+  image_values+=(
+    --set execution.enabled=true
+    --set-string tls.webhook.caBundlePem=public-validation-ca
+    --set-string config.apiserver.inferenceEndpoint=https://inference.example.test/v1
+    --set-string config.controller.openshellEndpoint=https://gateway.example.test:8080
+    --set-string config.controller.openshellServerName=gateway.example.test
+    --set-string config.controller.workloadExchangeEndpoint=https://identity.example.test/v1/workload/exchange
+    --set-string config.controller.workloadExchangeServerName=identity.example.test
+    --set-string config.controller.litellmUrl=https://litellm.example.test
+    --set-string config.mint.issuer=https://mint.example.test
+    --set-string config.mint.spiffeTrustDomain=customer.example.test
+    --set-string config.mint.openshellNamespace=customer-openshell
+  )
+fi
+image_values+=(
   --set 'runtimeNamespaces[0]=team-a'
   --set-string config.controller.openshellRuntimeClassName=openshell-runc
   --set-string config.apiserver.mcpGatewayEndpoint=https://mcp-gw.example.test/mcp
@@ -127,20 +154,73 @@ connections_bridge_bundle_content="$(<"${connections_bridge_bundle}")"
 connections_bridge_bundle_hash="$(printf '%s' "${connections_bridge_bundle_content}" | shasum -a 256 | awk '{print $1}')"
 connections_bridge_configmap_name="steward-connections-bridge-attestation-${connections_bridge_bundle_hash:0:12}"
 
-helm lint "${root}/charts/steward"
-helm template steward "${root}/charts/steward" \
-  --namespace steward \
-  --include-crds > "${default_rendered}"
-for default_component_image in \
-  'ghcr.io/apelogic-ai/steward:0.1.17-apiserver@sha256:fcc1f8e4f375f4d2cb69372cc78dfe58ada603afe914987537160931b1bdeffa' \
-  'ghcr.io/apelogic-ai/steward:0.1.17-controller@sha256:04bc2664cb4ed7a720270911a328db8bf1dd0c0d5f8582b65234811741339f08' \
-  'ghcr.io/apelogic-ai/steward:0.1.17-mint@sha256:54215c5cb1945a80cd66ec149c86d5baf0ea467cc8c3b9dd87ab67a785d5aa36'
-do
-  if ! grep -Fq "image: ${default_component_image}" "${default_rendered}"; then
-    echo "default render lost its digest-pinned Steward image: ${default_component_image}" >&2
+if [[ "${chart_contract_mode}" == legacy ]]; then
+  # Preserve the published v0.1.17 default-image guarantee exactly.
+  helm lint "${root}/charts/steward"
+  helm template steward "${root}/charts/steward" \
+    --namespace steward \
+    --include-crds > "${default_rendered}"
+  for default_component_image in \
+    'ghcr.io/apelogic-ai/steward:0.1.17-apiserver@sha256:fcc1f8e4f375f4d2cb69372cc78dfe58ada603afe914987537160931b1bdeffa' \
+    'ghcr.io/apelogic-ai/steward:0.1.17-controller@sha256:04bc2664cb4ed7a720270911a328db8bf1dd0c0d5f8582b65234811741339f08' \
+    'ghcr.io/apelogic-ai/steward:0.1.17-mint@sha256:54215c5cb1945a80cd66ec149c86d5baf0ea467cc8c3b9dd87ab67a785d5aa36'
+  do
+    if ! grep -Fq "image: ${default_component_image}" "${default_rendered}"; then
+      echo "legacy default render lost its digest-pinned Steward image: ${default_component_image}" >&2
+      exit 1
+    fi
+  done
+else
+  core_values=("${core_image_values[@]}" --set-string tls.webhook.caBundlePem=public-validation-ca)
+  helm lint "${root}/charts/steward" "${core_values[@]}"
+  helm template steward "${root}/charts/steward" \
+    --namespace steward \
+    --include-crds \
+    "${core_values[@]}" > "${default_rendered}"
+  for default_component_image in \
+    "registry.example.test/customer/steward:validation-apiserver@${digest0}" \
+    "registry.example.test/customer/steward:validation-controller@${digest1}"
+  do
+    if ! grep -Fq "image: ${default_component_image}" "${default_rendered}"; then
+      echo "customer core render lost its fixture-owned digest-pinned image: ${default_component_image}" >&2
+      exit 1
+    fi
+  done
+  if grep -Eq 'kind: ClusterSPIFFEID|name: steward-mint|STEWARD_OPENSHELL_|STEWARD_LITELLM_|secretName: steward-jira' "${default_rendered}"; then
+    echo 'core render must not project governed execution or Jira prerequisites' >&2
     exit 1
   fi
-done
+  if helm template steward "${root}/charts/steward" --namespace steward \
+    "${core_image_values[@]}" >/dev/null 2>&1; then
+    echo 'customer TLS mode accepted an empty webhook CA' >&2
+    exit 1
+  fi
+  if helm template steward "${root}/charts/steward" --namespace steward \
+    "${core_values[@]}" --set-string images.repository= >/dev/null 2>&1; then
+    echo 'customer chart accepted a missing image repository' >&2
+    exit 1
+  fi
+  if helm template steward "${root}/charts/steward" --namespace steward \
+    "${core_values[@]}" --set-string images.apiserver.digest= >/dev/null 2>&1; then
+    echo 'customer chart accepted an absent apiserver digest' >&2
+    exit 1
+  fi
+  if helm template steward "${root}/charts/steward" --namespace steward \
+    "${core_values[@]}" --set-string images.apiserver.digest=latest >/dev/null 2>&1; then
+    echo 'customer chart accepted a mutable apiserver image reference' >&2
+    exit 1
+  fi
+  if helm template steward "${root}/charts/steward" --namespace steward \
+    "${core_values[@]}" --set config.taskOrchestrationMode=active >/dev/null 2>&1; then
+    echo 'core-only chart accepted active Task orchestration' >&2
+    exit 1
+  fi
+  if helm template steward "${root}/charts/steward" --namespace steward \
+    "${core_values[@]}" --set config.apiserver.executionBindingsMode=active >/dev/null 2>&1; then
+    echo 'core-only chart accepted active execution bindings' >&2
+    exit 1
+  fi
+fi
 if grep -q '^kind: Ingress$' "${default_rendered}"; then
   echo "the standalone chart must not expose an ingress until web ingress is explicitly enabled" >&2
   exit 1
@@ -167,6 +247,28 @@ helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
   "${image_values[@]}" > "${rendered}"
+if [[ "${chart_contract_mode}" == customer-v1 ]]; then
+  for missing_governed_value in \
+    tls.webhook.caBundlePem \
+    images.mint.digest \
+    config.controller.openshellEndpoint \
+    config.controller.openshellRuntimeClassName \
+    config.controller.workloadExchangeEndpoint \
+    config.controller.litellmUrl \
+    config.mint.issuer \
+    config.mint.spiffeTrustDomain
+  do
+    if helm template steward "${root}/charts/steward" --namespace steward \
+      "${image_values[@]}" --set-string "${missing_governed_value}=" >/dev/null 2>&1; then
+      echo "governed execution accepted missing ${missing_governed_value}" >&2
+      exit 1
+    fi
+  done
+  if grep -Eq 'STEWARD_JIRA_|secretName: steward-jira' "${rendered}"; then
+    echo 'governed execution must not implicitly enable Jira' >&2
+    exit 1
+  fi
+fi
 if [[ "$(grep -c 'name: STEWARD_TASK_EXECUTION_BINDINGS_FILE' "${rendered}")" != "1" ]] ||
   ! grep -Fq 'name: STEWARD_TASK_EXECUTION_BINDINGS_MODE, value: "staged"' "${rendered}" ||
   ! grep -Fq '\"apiVersion\":\"steward.execution-bindings/v1\"' "${rendered}" ||
