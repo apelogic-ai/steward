@@ -262,6 +262,36 @@ different commits. If the operator uses another registry, copy the exact OCI
 manifests by digest, verify the destination digests are unchanged, and update
 only the fork-owned repository coordinates in the values file.
 
+Pull the chart through its immutable OCI manifest digest, verify Helm resolved
+that same digest, and retain the resulting local archive for lint, render, and
+install. Replace the repository and digest with the exact release handoff; do
+not substitute a tag-only reference:
+
+```sh
+STEWARD_CHART_REPOSITORY=ghcr.io/<fork-owner>/charts/steward
+STEWARD_CHART_DIGEST=sha256:<64-hex-digest>
+STEWARD_CHART_DIRECTORY="$(mktemp -d)"
+STEWARD_CHART_REF="oci://${STEWARD_CHART_REPOSITORY}@${STEWARD_CHART_DIGEST}"
+
+pull_output="$(
+  helm pull "${STEWARD_CHART_REF}" --destination "${STEWARD_CHART_DIRECTORY}" 2>&1
+)"
+printf '%s\n' "${pull_output}"
+resolved_chart_digest="$(
+  printf '%s\n' "${pull_output}" |
+    awk '$1 == "Digest:" { print $2 }'
+)"
+test "${resolved_chart_digest}" = "${STEWARD_CHART_DIGEST}"
+
+STEWARD_CHART_PACKAGE="${STEWARD_CHART_DIRECTORY}/steward@sha256-${STEWARD_CHART_DIGEST#sha256:}.tgz"
+test -s "${STEWARD_CHART_PACKAGE}"
+```
+
+Keep `STEWARD_CHART_PACKAGE` in the same shell for the remaining commands.
+For a source-tree install instead, set
+`STEWARD_CHART_PACKAGE=./charts/steward` and record the exact commit and chart
+archive checksum; do not mix that tree with images from another revision.
+
 1. Select a chart directory from the exact release or fork revision and record
    its OCI digest (or, for a source-tree install, the exact commit and chart
    archive checksum) and each image digest in the delivery record. Set a
@@ -340,9 +370,9 @@ only the fork-owned repository coordinates in the values file.
    applying anything:
 
    ```sh
-   helm lint ./charts/steward -f customer-values.yaml \
+   helm lint "${STEWARD_CHART_PACKAGE}" -f customer-values.yaml \
      --set-file tls.webhook.caBundlePem=webhook-public-ca.pem
-   helm template steward ./charts/steward --namespace steward \
+   helm template steward "${STEWARD_CHART_PACKAGE}" --namespace steward \
      -f customer-values.yaml \
      --set-file tls.webhook.caBundlePem=webhook-public-ca.pem > steward-rendered.yaml
    ```
@@ -357,7 +387,7 @@ only the fork-owned repository coordinates in the values file.
 
    ```sh
    helm --kubeconfig "$CLUSTER_KUBECONFIG" --kube-context "$CLUSTER_CONTEXT" \
-     upgrade --install steward ./charts/steward --namespace steward \
+     upgrade --install steward "${STEWARD_CHART_PACKAGE}" --namespace steward \
      --create-namespace --atomic --wait --timeout 10m \
      -f customer-values.yaml \
      --set-file tls.webhook.caBundlePem=webhook-public-ca.pem

@@ -2339,6 +2339,29 @@ mod tests {
     }
 
     #[test]
+    fn customer_install_guide_verifies_and_installs_the_oci_chart_by_digest() -> Result<(), String>
+    {
+        let guide = fs::read_to_string(root().join("docs/installation/installation-guide.md"))
+            .map_err(|error| format!("customer installation guide is required: {error}"))?;
+
+        for required in [
+            "STEWARD_CHART_REF=\"oci://${STEWARD_CHART_REPOSITORY}@${STEWARD_CHART_DIGEST}\"",
+            "helm pull \"${STEWARD_CHART_REF}\" --destination \"${STEWARD_CHART_DIRECTORY}\"",
+            "awk '$1 == \"Digest:\" { print $2 }'",
+            "test \"${resolved_chart_digest}\" = \"${STEWARD_CHART_DIGEST}\"",
+            "STEWARD_CHART_PACKAGE=\"${STEWARD_CHART_DIRECTORY}/steward@sha256-${STEWARD_CHART_DIGEST#sha256:}.tgz\"",
+            "upgrade --install steward \"${STEWARD_CHART_PACKAGE}\"",
+        ] {
+            assert!(
+                guide.contains(required),
+                "customer installation guide is missing the copyable OCI chart command: {required}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn governed_connections_real_stack_is_a_required_pinned_ci_lane() -> Result<(), String> {
         let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
