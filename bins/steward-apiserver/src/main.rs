@@ -48,6 +48,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some("validate-execution-bindings") => {
             return validate_execution_bindings(arguments.collect());
         }
+        Some("validate-jira-config") => {
+            jira_adapter()?;
+            return Ok(());
+        }
         Some(command) => {
             return Err(io::Error::other(format!("unknown command {command}")).into());
         }
@@ -61,15 +65,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         steward_apiserver::governed_connections::ConnectionOperationReconciler::new(store.clone())
             .run(),
     );
-    let decisions = JiraAdapter::new(
-        JiraConfig {
-            base_url: required("STEWARD_JIRA_BASE_URL")?,
-            project_key: required("STEWARD_JIRA_PROJECT_KEY")?,
-            account_email: required("STEWARD_JIRA_ACCOUNT_EMAIL")?,
-        },
-        required("STEWARD_JIRA_TOKEN")?,
-    )
-    .map_err(|error| io::Error::other(format!("Jira configuration failed: {error:?}")))?;
+    let decisions = jira_adapter()?;
     let token_review_audience = kubernetes_token_review_audience(
         env::var("STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE").ok(),
     )?;
@@ -162,6 +158,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn jira_adapter() -> Result<JiraAdapter, io::Error> {
+    let optional = |name| match env::var(name) {
+        Ok(value) => Ok(value),
+        Err(env::VarError::NotPresent) => Ok(String::new()),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(io::Error::other(format!("{name} must be Unicode")))
+        }
+    };
+    JiraAdapter::new(
+        JiraConfig {
+            base_url: optional("STEWARD_JIRA_BASE_URL")?,
+            project_key: optional("STEWARD_JIRA_PROJECT_KEY")?,
+            account_email: optional("STEWARD_JIRA_ACCOUNT_EMAIL")?,
+        },
+        optional("STEWARD_JIRA_TOKEN")?,
+    )
+    .map_err(|error| io::Error::other(format!("Jira configuration failed: {error:?}")))
 }
 
 fn configured_execution_bindings_json() -> Result<Option<String>, io::Error> {

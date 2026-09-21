@@ -21,17 +21,24 @@ pub struct JiraAdapter {
     client: reqwest::Client,
     config: JiraConfig,
     api_token: String,
+    enabled: bool,
 }
 
 impl JiraAdapter {
     pub fn new(config: JiraConfig, api_token: String) -> Result<Self, PortError> {
-        if config.base_url.is_empty()
-            || config.project_key.is_empty()
-            || config.account_email.is_empty()
-            || api_token.is_empty()
+        let enabled = !config.base_url.is_empty()
+            || !config.project_key.is_empty()
+            || !config.account_email.is_empty()
+            || !api_token.is_empty();
+        if enabled
+            && (config.base_url.is_empty()
+                || config.project_key.is_empty()
+                || config.account_email.is_empty()
+                || api_token.is_empty())
         {
             return Err(PortError::Rejected {
-                reason: "Jira endpoint, project, account, and API token are required".to_owned(),
+                reason: "enabled Jira requires endpoint, project, account, and API token"
+                    .to_owned(),
             });
         }
         let mut config = config;
@@ -46,7 +53,18 @@ impl JiraAdapter {
             client,
             config,
             api_token,
+            enabled,
         })
+    }
+
+    fn require_enabled(&self) -> Result<(), PortError> {
+        if self.enabled {
+            Ok(())
+        } else {
+            Err(PortError::Rejected {
+                reason: "Jira decision channel is disabled".to_owned(),
+            })
+        }
     }
 }
 
@@ -55,6 +73,7 @@ impl DecisionChannel for JiraAdapter {
         &self,
         request_id: &str,
     ) -> Result<Option<DecisionReference>, PortError> {
+        self.require_enabled()?;
         let marker = approval_marker(request_id);
         let jql = format!(
             "project = {} AND labels = \"{}\"",
@@ -93,6 +112,7 @@ impl DecisionChannel for JiraAdapter {
     }
 
     async fn request(&self, request: &DecisionRequest) -> Result<DecisionReference, PortError> {
+        self.require_enabled()?;
         if let Some(reference) = self.observe_request(&request.request_id).await? {
             return Ok(reference);
         }
@@ -141,6 +161,7 @@ impl DecisionChannel for JiraAdapter {
     }
 
     async fn record_resolution(&self, resolution: &DecisionResolution) -> Result<(), PortError> {
+        self.require_enabled()?;
         validate_issue_key(&resolution.key)?;
         let comment = format!(
             "Steward resolved approval request {}.\nDecided by: {}\nRationale: {}\nEvidence: {}",
@@ -364,6 +385,35 @@ mod tests {
                 .map_err(|_| "mock Jira request lock was poisoned".to_owned())
                 .map(|requests| requests.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn absent_jira_configuration_disables_decisions_without_egress() -> Result<(), String> {
+        let adapter = JiraAdapter::new(
+            JiraConfig {
+                base_url: String::new(),
+                project_key: String::new(),
+                account_email: String::new(),
+            },
+            String::new(),
+        )
+        .map_err(|error| format!("optional Jira must not block startup: {error:?}"))?;
+        let request = DecisionRequest {
+            request_id: "approval-a".to_owned(),
+            runtime_uid: "runtime-a".to_owned(),
+            actor: "bob@example.org".to_owned(),
+            member_role: "engineer".to_owned(),
+            counterexample: "outside approved envelope".to_owned(),
+        };
+        assert!(matches!(
+            adapter.request(&request).await,
+            Err(steward_ports::PortError::Rejected { .. })
+        ));
+        assert!(matches!(
+            adapter.observe_request("approval-a").await,
+            Err(steward_ports::PortError::Rejected { .. })
+        ));
+        Ok(())
     }
 
     #[tokio::test]

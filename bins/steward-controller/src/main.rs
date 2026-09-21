@@ -43,6 +43,10 @@ struct VerifiedConnectionsBridgeArtifact {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider()?;
+    if env::args().nth(1).as_deref() == Some("validate-jira-config") {
+        jira_adapter()?;
+        return Ok(());
+    }
     let openshell_config = openshell_connection_config()?;
     let client = Client::try_default().await?;
     let sandbox_runtime = OpenShellRuntime::connect(openshell_config)
@@ -80,17 +84,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ),
     );
     if task_orchestration_mode.is_active() {
-        let decisions = JiraAdapter::new(
-            JiraConfig {
-                base_url: required("STEWARD_JIRA_BASE_URL")?,
-                project_key: required("STEWARD_JIRA_PROJECT_KEY")?,
-                account_email: required("STEWARD_JIRA_ACCOUNT_EMAIL")?,
-            },
-            required("STEWARD_JIRA_TOKEN")?,
-        )
-        .map_err(|error| {
-            io::Error::other(format!("decision channel configuration failed: {error:?}"))
-        })?;
+        let decisions = jira_adapter()?;
         let approval_dispatcher =
             steward_controller::run_task_approval_dispatcher(store.clone(), decisions);
         let controller = steward_controller::run_controller_with_planes(
@@ -119,6 +113,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+fn jira_adapter() -> Result<JiraAdapter, io::Error> {
+    let optional = |name| match env::var(name) {
+        Ok(value) => Ok(value),
+        Err(env::VarError::NotPresent) => Ok(String::new()),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(io::Error::other(format!("{name} must be Unicode")))
+        }
+    };
+    JiraAdapter::new(
+        JiraConfig {
+            base_url: optional("STEWARD_JIRA_BASE_URL")?,
+            project_key: optional("STEWARD_JIRA_PROJECT_KEY")?,
+            account_email: optional("STEWARD_JIRA_ACCOUNT_EMAIL")?,
+        },
+        optional("STEWARD_JIRA_TOKEN")?,
+    )
+    .map_err(|error| io::Error::other(format!("decision channel configuration failed: {error:?}")))
 }
 
 fn task_orchestration_mode() -> Result<TaskOrchestrationMode, io::Error> {
