@@ -281,10 +281,15 @@ if [[ ! "${forward_port}" =~ ^[0-9]+$ ]]; then
   echo 'API port-forward did not become ready' >&2
   exit 1
 fi
-curl --silent --show-error --fail --noproxy '*' \
+api_status="$(curl --silent --show-error --noproxy '*' \
   --cacert "${run_dir}/ca.crt" \
   --connect-to "steward-apiserver.steward.svc.cluster.local:443:127.0.0.1:${forward_port}" \
-  https://steward-apiserver.steward.svc.cluster.local/health/ready >/dev/null
+  --output /dev/null --write-out '%{http_code}' \
+  https://steward-apiserver.steward.svc.cluster.local/admin/api/v1/runs)"
+if [[ "${api_status}" != 401 ]]; then
+  echo "protected API returned ${api_status}, expected unauthenticated 401 over verified TLS" >&2
+  exit 1
+fi
 kill "${port_forward_pid}" >/dev/null 2>&1 || true
 wait "${port_forward_pid}" >/dev/null 2>&1 || true
 port_forward_pid=""
