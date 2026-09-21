@@ -147,10 +147,11 @@ kubectl --kubeconfig "${kubeconfig}" --context "${context}" \
 stage=credentials
 umask 077
 openssl rand -hex 24 > "${run_dir}/postgres-password"
-postgres_password="$(<"${run_dir}/postgres-password")"
-printf 'postgres://steward:%s@core-test-postgres.steward.svc.cluster.local:5432/steward?sslmode=disable' \
-  "${postgres_password}" > "${run_dir}/database-url"
-unset postgres_password
+{
+  printf 'postgres://steward:'
+  tr -d '\n' < "${run_dir}/postgres-password"
+  printf '@core-test-postgres.steward.svc.cluster.local:5432/steward?sslmode=disable'
+} > "${run_dir}/database-url"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -keyout "${run_dir}/ca.key" -out "${run_dir}/ca.crt" \
   -subj '/CN=Steward disposable core install CA' >/dev/null 2>&1
