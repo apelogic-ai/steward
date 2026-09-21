@@ -2307,6 +2307,8 @@ mod tests {
         );
         for required in [
             "OPEN_SHELL_RELEASE=\"v0.0.98\"",
+            "KIND_NODE_IMAGE=\"kindest/node:v1.32.1@sha256:6afef2b7f69d627ea7bf27ee6696b6868d18e03bf98167c420df486da4662db6\"",
+            "--image \"${KIND_NODE_IMAGE}\"",
             "server.defaultRuntimeClassName=openshell-runc",
             "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME=openshell-runc",
             "handler: runc",

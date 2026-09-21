@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OPEN_SHELL_RELEASE="v0.0.98"
 OPEN_SHELL_HELM_VERSION="${OPEN_SHELL_RELEASE#v}"
+KIND_NODE_IMAGE="kindest/node:v1.32.1@sha256:6afef2b7f69d627ea7bf27ee6696b6868d18e03bf98167c420df486da4662db6"
 RUN_ID="${STEWARD_RUN_ID:-openshell-adapter-$(date -u +%Y%m%d%H%M%S)-$$}"
 if [[ ! "${RUN_ID}" =~ ^[a-z0-9-]+$ ]]; then
   echo "STEWARD_RUN_ID must contain only lowercase ASCII letters, digits, and hyphens" >&2
@@ -61,6 +62,7 @@ mkdir -p "${RUN_DIR}"
 kind create cluster \
   --name "${CLUSTER_NAME}" \
   --kubeconfig "${KUBECONFIG_PATH}" \
+  --image "${KIND_NODE_IMAGE}" \
   --wait 120s
 CLUSTER_CREATED=1
 
