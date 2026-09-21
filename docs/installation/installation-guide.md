@@ -26,8 +26,12 @@ turn execution off on an installation with live AgentRuntimes or Tasks.
    kubeconfig and context; do not use an ambient or unrelated cluster.
 2. A reachable, separately operated PostgreSQL database and an existing
    `steward-database` Secret with key `url` in the installation namespace.
-   Supply a database URL appropriate to the platform's TLS policy. Steward
-   creates no database, PVC, backup, or database credential.
+   PostgreSQL 16 is the tested line. Give a dedicated database role `CONNECT`
+   plus the schema DDL/DML authority needed to run Steward's embedded,
+   append-only migrations; both binaries migrate on startup, so a read-only
+   application role is insufficient. Use a URI with the customer's required
+   TLS verification mode and CA location, stored only in the Secret file.
+   Steward creates no database, PVC, backup, or database credential.
 3. Immutable apiserver and controller images from the same source revision as
    the chart. Supply their exact repository, tags, and `sha256` digests from a
    verified release handoff. If using a fork, build and publish to a registry
@@ -78,6 +82,31 @@ again in the customer's cluster before enabling governed execution.
 | MCP-GW | The governed Connections bridge accepts authority v1 contract `0.3.2` or v2 contract `0.4.9`, selected by the binding. | Do not infer compatibility for an arbitrary MCP-GW release or enable a Connections bridge without the matching authority and image provenance. |
 | SPIRE, LiteLLM, cert-manager, browser identity, GitHub, and edge gateway | The chart declares interfaces but no general supported-version matrix for these services. | Supply exact tested versions and acceptance evidence in the customer delivery record; do not describe an untested combination as supported. |
 
+Runtime support is deliberately narrower than the chart's DNS-label validation:
+
+| Kubernetes / node / CRI | OpenShell / agent-sandbox | RuntimeClass handler | Evidence and isolation claim |
+|---|---|---|---|
+| Kind v1.32.1, host architecture, containerd | OpenShell v0.0.98 / agent-sandbox v0.5.0 | Test-only `openshell-runc` → `runc` | Product E2E proves mTLS, workload exchange, copy-task execution, RuntimeClass propagation, and cleanup. It is **not** VM isolation. |
+| Customer production cluster | Pin and record the selected versions | Explicit customer-installed handler | Unsupported until the delivery record proves the handler on the target node pool, an actual OpenShell Sandbox Pod, and its advertised isolation mechanism. Steward does not install or support an arbitrary handler merely because its name renders. |
+
+The cluster operator owns handler installation on compatible nodes, node
+labels/taints, RuntimeClass `scheduling` selectors/tolerations, `overhead`, CRI
+configuration, and preservation across node upgrades. Before enabling execution,
+check that the selected class exists, its handler is registered on every eligible
+node, and OpenShell's `server.defaultRuntimeClassName` exactly equals
+`config.controller.openshellRuntimeClassName`:
+
+```sh
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  get runtimeclass "$STEWARD_RUNTIME_CLASS" -o jsonpath='{.handler}{"\n"}'
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  get nodes -l "$RUNTIME_NODE_SELECTOR" -o name
+```
+
+The delivery test must additionally prove absent class, unavailable handler,
+wrong-node scheduling, and OpenShell/Steward name mismatch fail before a task is
+accepted. A successful `runc` propagation check cannot satisfy that evidence.
+
 Integration ownership is explicit: core requires only PostgreSQL, Kubernetes
 TokenReview/API access, and service TLS; Jira adds a decision channel; browser
 OIDC adds an external identity provider and edge; GitHub source adds a read-only
@@ -88,6 +117,26 @@ independent opt-ins with immutable images and provenance contracts. See the
 [chart configuration](../../charts/steward/README.md) for exact flags and
 ingress/egress requirements.
 
+### External identity and integration ownership
+
+Do not reuse one credential for these unrelated boundaries:
+
+| Integration | Required when | Owner, minimum authority, and verification |
+|---|---|---|
+| GitHub Actions OIDC → identity exchange → `steward-run` | Governed submission from Actions | Runner operator grants `id-token: write`; the exchange trusts `https://token.actions.githubusercontent.com`, repository/ref policy, and audience `steward-task-api`. The exchanged short-lived identity must carry the exact Steward service-envelope or submission groups and pass TokenReview. This is not a GitHub OAuth App. Install the independent runner and exchange from [steward-run#41](https://github.com/apelogic-ai/steward-run/issues/41) and [github-oidc-exchange#38](https://github.com/apelogic-ai/github-oidc-exchange/issues/38); they are not subcharts. Verify issuer, audience, HTTPS CA, and one denied wrong-repository/ref request before submission. |
+| ARC GitHub App | Only an ARC-based runner installation | Runner-platform owner supplies the App ID, installation ID, and key with the minimum ARC repository/organization permissions. Steward neither reads nor creates this credential. Verify runner registration and job pickup in that product's handoff. |
+| Read-only GitHub source App | `githubSource.enabled=true` direct packages | Steward source operator supplies the configured App ID and PEM Secret; install it only on approved repositories with read-only Contents. Verify resolution of one exact allowed commit and denial of an unbound repository. |
+| Google OAuth/OIDC client | `browserAuth.enabled=true` | Browser-identity owner supplies the client ID/Secret, allowed workspace/organization, and the exact HTTPS callback derived from `browserAuth.google.origin`. Verify login, callback, wrong-domain denial, and logout. |
+| MCP-GW downstream OAuth clients | Only selected MCP tools | MCP-GW operator owns Google/GitHub/provider consent clients, callbacks, and stored grants. They never go in the Steward chart. Verify consent and subject isolation through MCP-GW. |
+| Jira Cloud API token | `jira.enabled=true` only | Jira project owner supplies a dedicated account/token permitted to search/browse, create Task issues, and comment in the configured project. Verify create/search/comment and revocation. With Jira disabled, verify no Secret projection or Jira egress. |
+
+Service and User Envelopes, approval decisions, and execution bindings are
+post-install governance data. Do not bake a User Envelope revision or a bearer
+credential into Helm values. Provision the authority-minimal `steward-run`
+Service Envelope with [`scripts/bootstrap-task-copy-smoke.sh`](../../scripts/bootstrap-task-copy-smoke.sh)
+over authenticated HTTPS and a short-lived route-scoped identity, then review
+and approve any wider envelope through the selected decision channel.
+
 ## Secret and integration inventory
 
 The chart references existing names and keys; it never puts secret bytes in
@@ -95,20 +144,21 @@ values. Manage creation and rotation with the customer's approved secret
 system. The default names can be overridden under `secrets`, `tls`,
 `browserAuth`, and `githubSource`.
 
-| Reference and namespace | Required keys | Producer and consumer | Rotation / condition |
+| Reference and namespace | Kubernetes type and keys | Producer and consumer | Rotation / condition |
 |---|---|---|---|
-| `secrets.database.name` (`steward-database`) in release namespace | `secrets.database.key` (`url`) | Database operator creates; API and controller read. | Always. Rotate the database credential and restart both Deployments after the new Secret is present; verify connectivity and migrations. |
-| `tls.api.secretName` and `tls.webhook.secretName` in release namespace | Both `tls.crt`, `tls.key`, type `kubernetes.io/tls` | Customer PKI or cert-manager creates; API and controller mount separately. | Always. Renew before expiry, verify service DNS SANs, CA chain, and webhook `caBundle`; roll the affected Deployment. |
-| `secrets.jira.name` (`steward-jira`) in release namespace | `secrets.jira.key` (`token`) | Jira operator creates; API and controller read only if `jira.enabled=true`. | Optional. Rotate with the Jira service account, then restart consumers and prove a decision; absent when disabled. |
-| `secrets.litellm.name` (`steward-litellm`) in release namespace | `secrets.litellm.key` (`master-key`) | LiteLLM operator creates; controller reads. | Governed mode only. Coordinate credential overlap/restart with LiteLLM. |
-| `secrets.openshellClient.name` (`steward-openshell-client`) in release namespace | Configured CA, client certificate, and private-key keys (`ca.crt`, `tls.crt`, `tls.key`) | OpenShell/customer PKI creates; controller mounts. | Governed mode only. Rotate as an mTLS bundle and reprove server-name/CA validation. |
-| `secrets.mint.name` (`steward-mint`) in release namespace | Configured `signing-key`, `introspection-credential` | Customer key authority creates; Mint mounts. | Governed mode only. Coordinate JWKS/key rollover and introspection credential overlap with consumers. |
-| `workloadExchangeTrust.name` in release namespace | `workloadExchangeTrust.caCertificate` (`ca.crt`) | Workload-exchange PKI creates public CA ConfigMap or Secret; controller mounts. | Governed mode only; rotate with exchange TLS and reprove trust. |
-| `browserAuth.google.clientSecret.name` in release namespace | Configured `clientSecret.key` | Identity-provider operator creates; API reads. | Only `browserAuth.enabled=true`; rotate with provider, restart API, and retest login/callback. |
-| `githubSource.privateKeySecret.name` in release namespace | Configured private-key key, normally PEM | GitHub App owner creates; API mounts read-only. | Only `githubSource.enabled=true`; rotate the App key and retest exact Git-object resolution. |
-| `web.ingress.tlsSecretName` in release namespace | `tls.crt`, `tls.key` | Customer edge PKI creates; Ingress controller reads. | Only legacy `web.ingress.enabled=true`; gateway-owned TLS stays outside this chart. |
-| Each `imagePullSecrets` reference in release namespace | Registry-specific credential data | Registry operator creates; kubelet reads. | Only private registries; rotate before expiry and verify pulls without printing the Secret. |
-| Runtime-UID-named Secret in each allowed runtime namespace | `access-token` | Controller creates from a runtime-scoped LiteLLM credential; sandbox consumes. | Governed runtime only. It is UID-bound and owner-referenced; controller deletes it on suspend/termination. Do not pre-create, back up as a reusable credential, or share across runtimes. |
+| `secrets.database.name` (`steward-database`) in release namespace | `Opaque`; `secrets.database.key` (`url`) | Database operator creates; API and controller read. | Always. Rotate the database credential and restart both Deployments after the new Secret is present; verify connectivity and migrations. |
+| `tls.api.secretName` and `tls.webhook.secretName` in release namespace | `kubernetes.io/tls`; both `tls.crt`, `tls.key` | Customer PKI or cert-manager creates; API and controller mount separately. | Always. Renew before expiry, verify service DNS SANs, CA chain, and webhook `caBundle`; roll the affected Deployment. |
+| `secrets.jira.name` (`steward-jira`) in release namespace | `Opaque`; `secrets.jira.key` (`token`) | Jira operator creates; API and controller read only if `jira.enabled=true`. | Optional. Use a Jira Cloud API token with a dedicated account allowed to browse/search, create Task issues, and add comments in the configured project. Rotate the token, restart consumers, and prove a decision; absent when disabled. |
+| `secrets.litellm.name` (`steward-litellm`) in release namespace | `Opaque`; `secrets.litellm.key` (`master-key`) | LiteLLM operator creates; controller reads. | Governed mode only, including model-free copy-smoke startup. Coordinate credential overlap/restart with LiteLLM. |
+| `secrets.openshellClient.name` (`steward-openshell-client`) in release namespace | `Opaque`; configured CA, client certificate, and private-key keys (`ca.crt`, `tls.crt`, `tls.key`) | OpenShell/customer PKI creates; controller mounts. | Governed mode only. Rotate as an mTLS bundle and reprove server-name/CA validation. |
+| `secrets.mint.name` (`steward-mint`) in release namespace | `Opaque`; configured `signing-key`, `introspection-credential` | Customer key authority creates; Mint mounts. The signing key is exactly 32 raw bytes; newline-terminated or hex text is invalid. | Governed mode only. Coordinate JWKS/key rollover and introspection credential overlap with consumers. |
+| `workloadExchangeTrust.name` (`steward-workload-exchange-ca`) in release namespace | Public `ConfigMap` by default (or explicitly selected `Secret`); `workloadExchangeTrust.caCertificate` (`ca.crt`) | Workload-exchange PKI creates; controller mounts. | Governed mode only; rotate with exchange TLS and reprove trust. |
+| `taskIdentity.publicJwksConfigMap.name` in release namespace | Public `ConfigMap`; configured JWKS key | External Identity operator creates; API reads. | Only `taskIdentity.enabled=true`; rotate with issuer overlap and reprove issuer/audience/signature. |
+| `browserAuth.google.clientSecret.name` in release namespace | `Opaque`; configured `clientSecret.key` | Identity-provider operator creates; API reads. | Only `browserAuth.enabled=true`; rotate with provider, restart API, and retest the exact HTTPS callback/origin. |
+| `githubSource.privateKeySecret.name` in release namespace | `Opaque`; configured private-key key containing the GitHub App PEM | GitHub App owner creates; API mounts read-only. | Only `githubSource.enabled=true`; App needs read-only Contents and installation only on approved repositories. Rotate the App key and retest exact Git-object resolution. |
+| `web.ingress.tlsSecretName` in release namespace | `kubernetes.io/tls`; `tls.crt`, `tls.key` | Customer edge PKI creates; Ingress controller reads. | Only legacy `web.ingress.enabled=true`; gateway-owned TLS stays outside this chart. |
+| Each `imagePullSecrets` reference in release namespace | Normally `kubernetes.io/dockerconfigjson`; `.dockerconfigjson` | Registry operator creates; kubelet reads. | Only private registries; rotate before expiry and verify pulls without printing the Secret. |
+| Runtime-UID-named Secret in each allowed runtime namespace | `Opaque`; `access-token` | Controller creates from a runtime-scoped LiteLLM credential; sandbox consumes. | Governed runtime only. It is UID-bound and owner-referenced; controller deletes it on suspend/termination. Do not pre-create, back up as a reusable credential, or share across runtimes. |
 
 The optional task identity JWKS is a **public ConfigMap**, not a Secret.
 Bridge attestation bundles and the customer webhook CA are public material.
@@ -120,6 +170,59 @@ For example, with `jq` installed, a customer-supplied TLS Secret can be checked
 as follows; repeat for every enabled row above, using its configured name/key.
 For `certManager` mode, check the issuer first and check generated TLS Secrets
 after the Certificates become Ready.
+
+Create/import enabled Secrets only from protected files. These commands do not
+print values; keep shell tracing disabled, never put values directly on a command
+line, and securely remove local copies according to the customer's media policy
+after the cluster secret manager has taken ownership:
+
+```sh
+set +x
+umask 077
+install -d -m 0700 ./private
+openssl rand 32 > ./private/mint-ed25519.seed
+openssl rand -hex 24 | tr -d '\n' > ./private/mint-introspection.txt
+
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  -n steward create secret generic steward-database \
+  --from-file=url=./private/postgres-url.txt --dry-run=client -o yaml | \
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" apply -f -
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  -n steward create secret generic steward-mint \
+  --from-file=signing-key=./private/mint-ed25519.seed \
+  --from-file=introspection-credential=./private/mint-introspection.txt \
+  --dry-run=client -o yaml | \
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" apply -f -
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  -n steward create secret generic steward-openshell-client \
+  --from-file=ca.crt=./private/openshell-ca.crt \
+  --from-file=tls.crt=./private/openshell-client.crt \
+  --from-file=tls.key=./private/openshell-client.key \
+  --dry-run=client -o yaml | \
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" apply -f -
+```
+
+The same file-only pattern applies to the optional Jira token, LiteLLM master
+key, Google client secret, GitHub App PEM, and registry config. Customer-PKI TLS
+uses `kubectl create secret tls` for each endpoint. Install public trust
+separately as a ConfigMap. For example:
+
+```sh
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  -n steward create secret tls steward-apiserver-tls \
+  --cert=./private/apiserver.crt --key=./private/apiserver.key \
+  --dry-run=client -o yaml | \
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" apply -f -
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  -n steward create configmap steward-workload-exchange-ca \
+  --from-file=ca.crt=./public/workload-exchange-ca.crt \
+  --dry-run=client -o yaml | \
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" apply -f -
+```
+
+Repeat the TLS command for `steward-webhook-tls`. cert-manager mode creates
+those two endpoint TLS Secrets from the selected issuer; it does not create
+database, Mint, OpenShell, or integration Secrets.
 
 ```sh
 set +x
@@ -139,6 +242,25 @@ credential-bearing URLs in the delivery record. A missing or empty required
 key blocks installation; disabling that feature is a separate, reviewed choice.
 
 ## Install core mode
+
+### Build and publish from a fork
+
+The fork release workflow is the tested publisher. Review the exact commit,
+update chart/app versions coherently, run `cargo xtask ci` and
+`scripts/validate-release-artifacts.sh`, and create a signed `vX.Y.Z` tag on a
+commit already contained in the fork's `main`. The workflow builds every
+component, produces SBOM/provenance attestations, publishes images to
+`ghcr.io/<fork-owner>/steward`, and publishes the chart to
+`oci://ghcr.io/<fork-owner>/charts/steward`. AWS/ECR promotion is optional and
+disabled unless the fork explicitly configures it.
+
+Before installation, verify the workflow succeeded, copy the image manifest
+digests and OCI chart digest from its handoff, verify attestations against the
+fork repository/tag workflow identity, and pull the chart by digest into a
+clean directory. Never reconstruct a digest from a tag or mix components from
+different commits. If the operator uses another registry, copy the exact OCI
+manifests by digest, verify the destination digests are unchanged, and update
+only the fork-owned repository coordinates in the values file.
 
 1. Select a chart directory from the exact release or fork revision and record
    its OCI digest (or, for a source-tree install, the exact commit and chart
@@ -164,6 +286,54 @@ key blocks installation; disabling that feature is a separate, reviewed choice.
    illustrative; replace the apiserver and controller coordinates with the
    immutable handoff. Governed mode also requires Mint coordinates. Keep
    Secret bytes out of the values file.
+
+   For governed execution, start with both ownership switches staged and add
+   all external coordinates explicitly. A minimal profile has this shape;
+   replace every example with the customer handoff and do not activate Tasks
+   until the prerequisites and execution binding have been verified:
+
+   ```yaml
+   execution: {enabled: true}
+   jira: {enabled: false}
+   images:
+     repository: registry.example.test/customer/steward
+     apiserver: {tag: release-apiserver, digest: sha256:<64-hex-digest>}
+     controller: {tag: release-controller, digest: sha256:<64-hex-digest>}
+     mint: {tag: release-mint, digest: sha256:<64-hex-digest>}
+     web: {tag: "", digest: ""}
+   config:
+     taskOrchestrationMode: staged
+     apiserver:
+       executionBindingsMode: staged
+       inferenceEndpoint: https://inference.example.test/v1
+     controller:
+       openshellEndpoint: https://gateway.example.test:8080
+       openshellServerName: gateway.example.test
+       openshellRuntimeClassName: customer-sandbox-vm
+       workloadExchangeEndpoint: https://identity.example.test/v1/workload/exchange
+       workloadExchangeServerName: identity.example.test
+       litellmUrl: https://litellm.example.test
+     mint:
+       issuer: https://mint.example.test
+       spiffeTrustDomain: customer.example.test
+       openshellNamespace: customer-openshell
+   runtimeNamespaces: [steward-tasks]
+   ```
+
+   The chart references the existing `steward-litellm`,
+   `steward-openshell-client`, `steward-mint`, and
+   `steward-workload-exchange-ca` objects named above. Install the matching
+   OpenShell provider profiles outside this chart. For the product-owned
+   versioned bundle, create a deployment-neutral inputs file, then run
+   `cargo xtask provider-profile-bundle install --inputs <inputs.json>
+   --output <rendered-directory>` followed by the matching `reconcile` command
+   from the [bundle guide](../../config/provider-profile-bundle/v1.2.0/README.md).
+   Record each installed profile ID and immutable policy digest in the
+   [execution binding](execution-bindings.md); a model-free copy task attaches
+   neither tool nor inference profile, while an approved model/tool requires
+   the corresponding category. Pinned OpenShell v0.0.98 cannot attest profile
+   content itself, so the deployment system must keep each installed ID
+   immutable and verify the rendered bytes against the recorded digest.
 
 2. Verify the named Secret objects and certificate SANs without displaying
    their data. With an explicit kubeconfig/context, lint and render before
@@ -208,6 +378,9 @@ Do not hand off merely because `helm template` or `helm lint` passed.
    reports a deployed release. `kubectl --kubeconfig "$CLUSTER_KUBECONFIG"
    --context "$CLUSTER_CONTEXT" -n steward rollout status deployment/steward-apiserver`
    and the same command for `deployment/steward-controller` complete.
+   The database operator confirms the embedded migration table is at the
+   migration packaged in the exact release (currently `0037`) using an
+   approved database session that does not expose the URI or row contents.
 2. The `agentruntimes.agents.apelogic.ai` CRD is Established, and the
    `steward-agentruntime` validating webhook has `failurePolicy: Fail`, the
    expected service reference, and a nonempty CA bundle. The webhook TLS
@@ -228,6 +401,9 @@ Do not hand off merely because `helm template` or `helm lint` passed.
    orchestration only in their documented staged rollout sequence. Run one
    approved bounded Task, then verify execution, audit, and cleanup. Do not
    infer isolation from a successful unconfined Kind/runc run.
+   Inspect the actual Sandbox Pod/CR and record its `runtimeClassName`, node,
+   selected RuntimeClass handler, and the platform's non-secret handler/isolation
+   evidence. Confirm no undeclared provider profile was attached.
 6. Exercise a fresh install, same-revision upgrade, a supported prior-version
    upgrade, and rollback on a disposable or otherwise explicitly authorized
    target. Verify no user data, credentials, CRDs, or external integrations

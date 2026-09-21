@@ -11,6 +11,16 @@ do not silently activate when an integration is absent.
 Steward is available under the [MIT License](LICENSE). Checked-in upstream
 patches retain their [third-party notices](THIRD_PARTY_NOTICES.md).
 
+Current installation contract: chart `0.1.18`, Kubernetes `>=1.30`, Helm 3,
+and PostgreSQL 16 as the tested database line. Governed adapter evidence pins
+OpenShell `v0.0.98` with agent-sandbox `v0.5.0`; the pinned G-1 upstream gate
+uses OpenShell `v0.0.90`. No registry is a default: release images and the OCI
+chart are published under the fork owner's GHCR namespace, and every customer
+installation supplies the exact image/chart digests from one handoff. The
+[installation guide](docs/installation/installation-guide.md#tested-versions-and-integration-boundaries)
+records the limits of this tested matrix; a rendered RuntimeClass name is not
+evidence of VM isolation.
+
 ## Start here
 
 | If you want to know | Read |
