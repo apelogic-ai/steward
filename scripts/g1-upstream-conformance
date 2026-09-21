@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${STEWARD_CONFORMANCE_TARGET:-}"
+G1_BASE_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e"
 
 case "${TARGET}" in
   pinned)
@@ -25,6 +26,7 @@ esac
 STEWARD_OPEN_SHELL_RELEASE="${release}" \
 STEWARD_RUN_ID="g1-$(date -u +%Y%m%d%H%M%S)-$$" \
 STEWARD_USE_CHART_SUPERVISOR="${use_chart_supervisor}" \
+STEWARD_G1_BASE_IMAGE="${G1_BASE_IMAGE}" \
   bash "${ROOT}/scripts/s0-0-openshell-spike.sh" \
   bash "${ROOT}/scripts/g1-upstream-conformance-inside.sh"
 
