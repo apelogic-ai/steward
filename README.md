@@ -8,6 +8,9 @@ endpoint, OpenShell, LiteLLM, SPIRE, or a sandbox RuntimeClass. Governed
 execution and Jira are explicit opt-ins with additional prerequisites; they
 do not silently activate when an integration is absent.
 
+Steward is available under the [MIT License](LICENSE). Checked-in upstream
+patches retain their [third-party notices](THIRD_PARTY_NOTICES.md).
+
 ## Start here
 
 | If you want to know | Read |

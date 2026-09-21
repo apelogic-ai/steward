@@ -17,5 +17,7 @@ WORKDIR /app
 COPY --chown=65532:65532 --from=build /workspace/web/.next/standalone ./
 COPY --chown=65532:65532 --from=build /workspace/web/.next/static ./web/.next/static
 COPY --chown=65532:65532 --from=build /workspace/web/public ./web/public
+COPY LICENSE /usr/share/licenses/steward/LICENSE
+COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/steward/THIRD_PARTY_NOTICES.md
 USER 65532:65532
 CMD ["web/server.js"]

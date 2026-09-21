@@ -16,3 +16,5 @@ keywords:
 maintainers:
   - name: ApeLogic
     url: https://github.com/apelogic-ai
+annotations:
+  artifacthub.io/license: MIT
