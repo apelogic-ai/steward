@@ -318,7 +318,7 @@ struct ControllerContext<R, I> {
 }
 
 #[derive(Clone, Copy)]
-struct NoInferencePlane;
+pub struct NoInferencePlane;
 
 impl InferencePlane for NoInferencePlane {
     fn capabilities(&self) -> InferenceCapabilities {
@@ -361,6 +361,25 @@ impl InferencePlane for NoInferencePlane {
 
     async fn revoke(&self, _request: &InferenceRequest) -> Result<(), PortError> {
         Ok(())
+    }
+}
+
+/// Core-only reconciliation cannot create or delete a sandbox. This is not a
+/// fallback runtime for an unavailable OpenShell gateway.
+#[derive(Clone, Copy)]
+pub struct DisabledSandboxRuntime;
+
+impl SandboxRuntime for DisabledSandboxRuntime {
+    async fn ensure(&self, _request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+        Err(PortError::Unsupported {
+            operation: "sandbox execution is disabled",
+        })
+    }
+
+    async fn delete(&self, _request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+        Err(PortError::Unsupported {
+            operation: "sandbox execution is disabled",
+        })
     }
 }
 
@@ -4556,6 +4575,28 @@ mod tests {
         status_merge_patch, suspend_runtime, suspend_runtime_with_inference_cleanup,
         task_output_archive_failure, task_runtime, task_runtime_action, ttl_action,
     };
+
+    #[tokio::test]
+    async fn core_only_runtime_rejects_sandbox_creation_and_deletion() {
+        let request = SandboxRequest {
+            runtime: RuntimeId("core-only-test".to_owned()),
+            workspace_key: "core-only-test".to_owned(),
+            execution_class: SandboxExecutionClass::Agent,
+            agent_type: AgentType {
+                name: "test".to_owned(),
+            },
+            models: Vec::new(),
+            tools: Vec::new(),
+            refs: RuntimeRefs::default(),
+            execution_binding: None,
+        };
+        let runtime = super::DisabledSandboxRuntime;
+        let disabled = Err(PortError::Unsupported {
+            operation: "sandbox execution is disabled",
+        });
+        assert_eq!(runtime.ensure(&request).await, disabled);
+        assert_eq!(runtime.delete(&request).await, disabled);
+    }
 
     struct RejectingTaskRuntimeBindingStore;
 

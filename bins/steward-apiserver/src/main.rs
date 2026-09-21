@@ -52,6 +52,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             jira_adapter()?;
             return Ok(());
         }
+        Some("validate-core-config") => {
+            core_only_configuration()?;
+            return Ok(());
+        }
         Some(command) => {
             return Err(io::Error::other(format!("unknown command {command}")).into());
         }
@@ -97,21 +101,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let source_repository_bindings_json = configured_source_repository_bindings_json()?;
     let github_source = configured_github_source_adapter()?;
     let task_execution_bindings_active = execution_bindings_active().map_err(io::Error::other)?;
-    let task_execution_adapter = CodexTaskExecutionAdapter::new(required(
-        "STEWARD_TASK_INFERENCE_ENDPOINT",
-    )?)
-    .map_err(|error| {
-        io::Error::other(format!(
-            "Codex execution adapter configuration failed: {error:?}"
-        ))
-    })?;
-    let mut task_api_config = TaskApiConfig::new(task_mcp_gateway_endpoint)
-        .and_then(|config| config.with_execution_adapter(Arc::new(task_execution_adapter)))
-        .map_err(io::Error::other)?;
-    task_api_config = with_claude_code_execution_adapter(
-        task_api_config,
-        optional_unicode_environment("STEWARD_TASK_ANTHROPIC_INFERENCE_ENDPOINT")?,
-    )?;
+    let mut task_api_config =
+        TaskApiConfig::new(task_mcp_gateway_endpoint).map_err(io::Error::other)?;
+    if execution_enabled()? {
+        let task_execution_adapter = CodexTaskExecutionAdapter::new(required(
+            "STEWARD_TASK_INFERENCE_ENDPOINT",
+        )?)
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Codex execution adapter configuration failed: {error:?}"
+            ))
+        })?;
+        task_api_config = task_api_config
+            .with_execution_adapter(Arc::new(task_execution_adapter))
+            .map_err(io::Error::other)?;
+        task_api_config = with_claude_code_execution_adapter(
+            task_api_config,
+            optional_unicode_environment("STEWARD_TASK_ANTHROPIC_INFERENCE_ENDPOINT")?,
+        )?;
+    } else {
+        core_only_configuration()?;
+    }
     let task_api_config = task_api_config
         .with_execution_bindings_json(task_execution_bindings_json.as_deref())
         .and_then(|config| {
@@ -157,6 +167,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .await?;
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn execution_enabled() -> Result<bool, io::Error> {
+    match env::var("STEWARD_EXECUTION_ENABLED") {
+        Ok(value) if value == "true" => Ok(true),
+        Ok(value) if value == "false" => Ok(false),
+        Err(env::VarError::NotPresent) => Ok(true),
+        _ => Err(io::Error::other(
+            "STEWARD_EXECUTION_ENABLED must be true or false",
+        )),
+    }
+}
+
+fn core_only_configuration() -> Result<(), io::Error> {
+    if execution_enabled()? {
+        return Err(io::Error::other(
+            "core-only mode requires STEWARD_EXECUTION_ENABLED=false",
+        ));
+    }
+    if task_orchestration_mode()?.is_active() {
+        return Err(io::Error::other(
+            "core-only mode requires staged Task orchestration",
+        ));
+    }
+    if execution_bindings_active().map_err(io::Error::other)? {
+        return Err(io::Error::other(
+            "core-only mode requires staged execution bindings",
+        ));
+    }
     Ok(())
 }
 
