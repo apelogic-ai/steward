@@ -43,6 +43,17 @@ struct VerifiedConnectionsBridgeArtifact {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider()?;
+    if env::args().nth(1).as_deref() == Some("validate-jira-config") {
+        jira_adapter()?;
+        return Ok(());
+    }
+    if env::args().nth(1).as_deref() == Some("validate-core-config") {
+        core_only_configuration()?;
+        return Ok(());
+    }
+    if !execution_enabled()? {
+        return run_core_only().await;
+    }
     let openshell_config = openshell_connection_config()?;
     let client = Client::try_default().await?;
     let sandbox_runtime = OpenShellRuntime::connect(openshell_config)
@@ -80,17 +91,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ),
     );
     if task_orchestration_mode.is_active() {
-        let decisions = JiraAdapter::new(
-            JiraConfig {
-                base_url: required("STEWARD_JIRA_BASE_URL")?,
-                project_key: required("STEWARD_JIRA_PROJECT_KEY")?,
-                account_email: required("STEWARD_JIRA_ACCOUNT_EMAIL")?,
-            },
-            required("STEWARD_JIRA_TOKEN")?,
-        )
-        .map_err(|error| {
-            io::Error::other(format!("decision channel configuration failed: {error:?}"))
-        })?;
+        let decisions = jira_adapter()?;
         let approval_dispatcher =
             steward_controller::run_task_approval_dispatcher(store.clone(), decisions);
         let controller = steward_controller::run_controller_with_planes(
@@ -119,6 +120,82 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+fn execution_enabled() -> Result<bool, io::Error> {
+    match env::var("STEWARD_EXECUTION_ENABLED") {
+        Ok(value) if value == "true" => Ok(true),
+        Ok(value) if value == "false" => Ok(false),
+        Err(env::VarError::NotPresent) => Ok(true),
+        _ => Err(io::Error::other(
+            "STEWARD_EXECUTION_ENABLED must be true or false",
+        )),
+    }
+}
+
+fn core_only_configuration() -> Result<(), io::Error> {
+    if execution_enabled()? {
+        return Err(io::Error::other(
+            "core-only mode requires STEWARD_EXECUTION_ENABLED=false",
+        ));
+    }
+    if task_orchestration_mode()?.is_active() {
+        return Err(io::Error::other(
+            "core-only mode requires staged Task orchestration",
+        ));
+    }
+    Ok(())
+}
+
+async fn run_core_only() -> Result<(), Box<dyn Error>> {
+    core_only_configuration()?;
+    let client = Client::try_default().await?;
+    let store = PgStore::connect(&required("STEWARD_DATABASE_URL")?).await?;
+    store.migrate().await?;
+    let listener = tls_listener(
+        &env::var("STEWARD_WEBHOOK_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_owned()),
+        &required("STEWARD_TLS_CERT_DER")?,
+        &required("STEWARD_TLS_KEY_DER")?,
+    )
+    .await?;
+    let webhook = axum::serve(
+        listener,
+        steward_controller::webhook_router_for_controller_with_catalog(
+            store.clone(),
+            steward_controller::NoInferencePlane,
+            required("STEWARD_CONTROLLER_USERNAME")?,
+            required("STEWARD_APISERVER_USERNAME")?,
+        ),
+    );
+    let controller = steward_controller::run_controller_with_store(
+        client,
+        steward_controller::DisabledSandboxRuntime,
+        store,
+    );
+    tokio::select! {
+        result = webhook => result?,
+        () = controller => return Err(io::Error::other("core-only controller exited").into()),
+    }
+    Ok(())
+}
+
+fn jira_adapter() -> Result<JiraAdapter, io::Error> {
+    let optional = |name| match env::var(name) {
+        Ok(value) => Ok(value),
+        Err(env::VarError::NotPresent) => Ok(String::new()),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(io::Error::other(format!("{name} must be Unicode")))
+        }
+    };
+    JiraAdapter::new(
+        JiraConfig {
+            base_url: optional("STEWARD_JIRA_BASE_URL")?,
+            project_key: optional("STEWARD_JIRA_PROJECT_KEY")?,
+            account_email: optional("STEWARD_JIRA_ACCOUNT_EMAIL")?,
+        },
+        optional("STEWARD_JIRA_TOKEN")?,
+    )
+    .map_err(|error| io::Error::other(format!("decision channel configuration failed: {error:?}")))
 }
 
 fn task_orchestration_mode() -> Result<TaskOrchestrationMode, io::Error> {

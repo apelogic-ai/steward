@@ -48,6 +48,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some("validate-execution-bindings") => {
             return validate_execution_bindings(arguments.collect());
         }
+        Some("validate-jira-config") => {
+            jira_adapter()?;
+            return Ok(());
+        }
+        Some("validate-core-config") => {
+            core_only_configuration()?;
+            return Ok(());
+        }
         Some(command) => {
             return Err(io::Error::other(format!("unknown command {command}")).into());
         }
@@ -61,15 +69,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         steward_apiserver::governed_connections::ConnectionOperationReconciler::new(store.clone())
             .run(),
     );
-    let decisions = JiraAdapter::new(
-        JiraConfig {
-            base_url: required("STEWARD_JIRA_BASE_URL")?,
-            project_key: required("STEWARD_JIRA_PROJECT_KEY")?,
-            account_email: required("STEWARD_JIRA_ACCOUNT_EMAIL")?,
-        },
-        required("STEWARD_JIRA_TOKEN")?,
-    )
-    .map_err(|error| io::Error::other(format!("Jira configuration failed: {error:?}")))?;
+    let decisions = jira_adapter()?;
     let token_review_audience = kubernetes_token_review_audience(
         env::var("STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE").ok(),
     )?;
@@ -101,21 +101,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let source_repository_bindings_json = configured_source_repository_bindings_json()?;
     let github_source = configured_github_source_adapter()?;
     let task_execution_bindings_active = execution_bindings_active().map_err(io::Error::other)?;
-    let task_execution_adapter = CodexTaskExecutionAdapter::new(required(
-        "STEWARD_TASK_INFERENCE_ENDPOINT",
-    )?)
-    .map_err(|error| {
-        io::Error::other(format!(
-            "Codex execution adapter configuration failed: {error:?}"
-        ))
-    })?;
-    let mut task_api_config = TaskApiConfig::new(task_mcp_gateway_endpoint)
-        .and_then(|config| config.with_execution_adapter(Arc::new(task_execution_adapter)))
-        .map_err(io::Error::other)?;
-    task_api_config = with_claude_code_execution_adapter(
-        task_api_config,
-        optional_unicode_environment("STEWARD_TASK_ANTHROPIC_INFERENCE_ENDPOINT")?,
-    )?;
+    let mut task_api_config =
+        TaskApiConfig::new(task_mcp_gateway_endpoint).map_err(io::Error::other)?;
+    if execution_enabled()? {
+        let task_execution_adapter = CodexTaskExecutionAdapter::new(required(
+            "STEWARD_TASK_INFERENCE_ENDPOINT",
+        )?)
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Codex execution adapter configuration failed: {error:?}"
+            ))
+        })?;
+        task_api_config = task_api_config
+            .with_execution_adapter(Arc::new(task_execution_adapter))
+            .map_err(io::Error::other)?;
+        task_api_config = with_claude_code_execution_adapter(
+            task_api_config,
+            optional_unicode_environment("STEWARD_TASK_ANTHROPIC_INFERENCE_ENDPOINT")?,
+        )?;
+    } else {
+        core_only_configuration()?;
+    }
     let task_api_config = task_api_config
         .with_execution_bindings_json(task_execution_bindings_json.as_deref())
         .and_then(|config| {
@@ -162,6 +168,55 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn execution_enabled() -> Result<bool, io::Error> {
+    match env::var("STEWARD_EXECUTION_ENABLED") {
+        Ok(value) if value == "true" => Ok(true),
+        Ok(value) if value == "false" => Ok(false),
+        Err(env::VarError::NotPresent) => Ok(true),
+        _ => Err(io::Error::other(
+            "STEWARD_EXECUTION_ENABLED must be true or false",
+        )),
+    }
+}
+
+fn core_only_configuration() -> Result<(), io::Error> {
+    if execution_enabled()? {
+        return Err(io::Error::other(
+            "core-only mode requires STEWARD_EXECUTION_ENABLED=false",
+        ));
+    }
+    if task_orchestration_mode()?.is_active() {
+        return Err(io::Error::other(
+            "core-only mode requires staged Task orchestration",
+        ));
+    }
+    if execution_bindings_active().map_err(io::Error::other)? {
+        return Err(io::Error::other(
+            "core-only mode requires staged execution bindings",
+        ));
+    }
+    Ok(())
+}
+
+fn jira_adapter() -> Result<JiraAdapter, io::Error> {
+    let optional = |name| match env::var(name) {
+        Ok(value) => Ok(value),
+        Err(env::VarError::NotPresent) => Ok(String::new()),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(io::Error::other(format!("{name} must be Unicode")))
+        }
+    };
+    JiraAdapter::new(
+        JiraConfig {
+            base_url: optional("STEWARD_JIRA_BASE_URL")?,
+            project_key: optional("STEWARD_JIRA_PROJECT_KEY")?,
+            account_email: optional("STEWARD_JIRA_ACCOUNT_EMAIL")?,
+        },
+        optional("STEWARD_JIRA_TOKEN")?,
+    )
+    .map_err(|error| io::Error::other(format!("Jira configuration failed: {error:?}")))
 }
 
 fn configured_execution_bindings_json() -> Result<Option<String>, io::Error> {
