@@ -23,6 +23,8 @@ RUN apt-get update \
   && chown 65532:65532 /sandbox
 
 COPY --from=build /workspace/target/release/steward-connections-bridge /usr/local/bin/steward-connections-bridge
+COPY LICENSE /usr/share/licenses/steward/LICENSE
+COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/steward/THIRD_PARTY_NOTICES.md
 
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/steward-connections-bridge"]

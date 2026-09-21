@@ -1,15 +1,16 @@
 # Steward Helm chart
 
-This chart installs the Steward apiserver, controller/webhook, mint, optional
-web presentation, and the `AgentRuntime` CRD. The web presentation and every
-edge route default to disabled. The chart can render an explicitly configured
-Gateway API `HTTPRoute`, but never installs a Gateway, Gateway API CRDs, an
-Ingress controller, DNS, certificates, namespaces, or private edge topology.
+This chart installs the Steward apiserver, controller/webhook, and
+`AgentRuntime` CRD. Mint and governed execution are opt-in; the web
+presentation and every edge route also default to disabled. The chart can
+render an explicitly configured Gateway API `HTTPRoute`, but never installs a
+Gateway, Gateway API CRDs, an Ingress controller, DNS, a certificate issuer,
+or private edge topology.
 
-The chart's default image coordinates are the public, digest-pinned `v0.1.17`
-release. They make `helm lint` and `helm template` useful before an operator has
-created any environment-specific values. A real install must replace all image
-tag/digest pairs together with the exact coordinates from its chosen release:
+The checked-in image repository, tags, and digests are empty by design: there
+is no assumed vendor registry or preselected release. Supply every enabled
+component's immutable coordinates from the same chosen source revision. Fork
+operators set a fork-owned repository and publish their own images and chart:
 
 ```yaml
 images:
@@ -22,14 +23,17 @@ images:
     tag: <version>-controller
     digest: sha256:<digest>
   mint:
-    tag: <version>-mint
-    digest: sha256:<digest>
+    tag: "" # set tag and digest when execution.enabled=true
+    digest: ""
   web:
-    tag: <version>-web
-    digest: sha256:<digest>
+    tag: "" # set tag and digest when web.enabled=true
+    digest: ""
 ```
 
 Never set a tag without the matching digest or use a mutable image reference.
+Set `images.web.tag` and `images.web.digest` to empty strings if web is disabled
+and no web image is published. Only enabled workloads are rendered.
+
 The release handoff attached to every GitHub release records these component
 digests and the OCI chart digest. If repository variable
 `ECR_PROMOTION_ENABLED` is `true`, the release workflow also copies those exact
@@ -45,40 +49,42 @@ digest. A missing or ambiguous runnable child fails closed.
 ## Installation contract
 
 Steward is a Kubernetes control plane, not a self-contained database or
-identity bundle. Before installing, the target cluster must provide:
-
-- Kubernetes 1.30 or later, cert-manager with the `tls.issuerRef` issuer, and
-  SPIRE's CSI driver and `ClusterSPIFFEID` API;
-- an external Postgres database, Jira tenant, LiteLLM endpoint, OpenShell
-  gateway, and workload identity exchange endpoint; and
-- the existing Secret and public trust references listed below.
+identity bundle. A core-only installation needs Kubernetes 1.30 or later,
+an external PostgreSQL database, immutable images, and TLS for the API and
+webhook. It does **not** need Jira, a model endpoint, LiteLLM, OpenShell,
+SPIRE, a sandbox RuntimeClass, or a Mint Secret. Set `execution.enabled=true`
+only after supplying and verifying those governed-execution dependencies;
+`jira.enabled=true` separately opts in to Jira. See the
+[installation guide](../../docs/installation/installation-guide.md) for the
+complete prerequisite, Secret, procedure, and delivery-test matrix.
 
 The chart creates no Secret values, PVCs, database, ingress controller,
-cert-manager issuer, or SPIRE control plane. Render first, then install with a
-reviewed values file containing only configuration and existing object names:
+cert-manager issuer, or SPIRE control plane. Choose TLS mode before rendering:
+`customerSecret` requires two pre-existing TLS Secrets and a public webhook
+CA bundle; `certManager` requires cert-manager and an explicit issuer. Render
+first, then install with a reviewed values file containing only configuration
+and existing object names:
 
 ```console
-helm pull oci://ghcr.io/apelogic-ai/charts/steward --version <chart-version> --untar
-helm lint ./steward
-helm template steward ./steward --namespace steward --values steward-values.yaml > steward-rendered.yaml
-helm upgrade --install steward oci://ghcr.io/apelogic-ai/charts/steward \\
-  --version <chart-version> --namespace steward --create-namespace \\
-  --values steward-values.yaml
+helm lint ./charts/steward --values steward-values.yaml --set-file tls.webhook.caBundlePem=webhook-public-ca.pem
+helm template steward ./charts/steward --namespace steward --values steward-values.yaml --set-file tls.webhook.caBundlePem=webhook-public-ca.pem > steward-rendered.yaml
+helm --kubeconfig "$CLUSTER_KUBECONFIG" --kube-context "$CLUSTER_CONTEXT" upgrade --install steward ./charts/steward --namespace steward --create-namespace --atomic --wait --values steward-values.yaml --set-file tls.webhook.caBundlePem=webhook-public-ca.pem
 ```
 
-`steward-values.yaml` must set the chosen immutable image coordinates,
-`tls.issuerRef`, environment endpoints, approved network CIDRs, and the
-names/keys of externally managed Secrets. The checked-in defaults deliberately
-remain non-production placeholders for Jira, OpenShell, identity, and network
-topology. A successful render proves chart structure only; readiness requires
-all listed dependencies and externally managed configuration.
+The commands above show `customerSecret`; omit `--set-file` and set
+`tls.mode=certManager` plus `tls.issuerRef` for the other mode. Supply exact
+image coordinates, approved network CIDRs, and names/keys of externally
+managed Secrets. The checked-in defaults are not a usable installation
+values file. A successful render proves chart structure only; follow the
+installation guide's live delivery tests before hand-off.
 
 ## Workload defaults and platform integration
 
-The chart creates fixed component service accounts because controller-to-API
-identity is part of the Steward authority contract. The apiserver, controller,
-and mint service accounts have Kubernetes API tokens; the web service account
-does not. `serviceAccounts.<component>.annotations` supports workload identity
+The chart creates fixed service accounts for enabled components because
+controller-to-API identity is part of the Steward authority contract. Core
+mode creates apiserver and controller accounts; governed mode also creates
+Mint's account. These accounts have Kubernetes API tokens; the optional web
+service account does not. `serviceAccounts.<component>.annotations` supports workload identity
 integration such as EKS IRSA without inserting credentials into values.
 `imagePullSecrets` names pre-existing registry credentials, and
 `podAnnotations.<component>` is available for platform-owned metadata.
@@ -158,26 +164,28 @@ the staged deployment.
 
 The chart references existing objects and never creates secret values:
 
-| Secret | Key(s) | Mounted by |
+| Existing reference | Key(s) | Required when |
 |---|---|---|
-| `steward-database` | `url` | apiserver, controller |
-| `steward-jira` | `token` | apiserver |
-| `steward-litellm` | `master-key` | controller |
-| `steward-openshell-client` | `ca.crt`, `tls.crt`, `tls.key` | controller |
-| `steward-mint` | `signing-key`, `introspection-credential` | mint |
-| browser-auth Secret (selected only when `browserAuth.enabled=true`) | configured client-secret key | apiserver |
-| GitHub source App Secret (selected only when `githubSource.enabled=true`) | configured PEM private-key key | apiserver |
+| `steward-database` Secret | `url` | Always; apiserver and controller |
+| API and webhook TLS Secrets | `tls.crt`, `tls.key` | Always; supplied by customer or cert-manager |
+| `steward-jira` Secret | `token` | `jira.enabled=true`; apiserver |
+| `steward-litellm` Secret | `master-key` | `execution.enabled=true`; controller |
+| `steward-openshell-client` Secret | `ca.crt`, `tls.crt`, `tls.key` | `execution.enabled=true`; controller |
+| `steward-mint` Secret | `signing-key`, `introspection-credential` | `execution.enabled=true`; mint |
+| browser-auth Secret | configured client-secret key | `browserAuth.enabled=true`; apiserver |
+| GitHub source App Secret | configured PEM private-key key | `githubSource.enabled=true`; apiserver |
 
-The controller also requires the public workload-exchange CA bundle selected
+In governed mode the controller also requires the public workload-exchange CA bundle selected
 by `workloadExchangeTrust.kind`, `workloadExchangeTrust.name`, and
 `workloadExchangeTrust.caCertificate`. `ConfigMap` is the default; `Secret`
 supports cert-manager-managed local trust bundles while projecting only the
 named CA key into the workload.
 
 The mint Secret is not referenced by either the apiserver or controller
-Deployment. `steward-apiserver-tls` and `steward-webhook-tls` are issued by
-cert-manager from `tls.issuerRef`; the binaries accept cert-manager's PEM
-certificate chains and private keys.
+Deployment. TLS mode `customerSecret` consumes existing TLS Secrets and a
+nonempty public webhook CA; `certManager` renders two Certificate resources
+using `tls.issuerRef`. The binaries accept PEM certificate chains and private
+keys in either mode.
 
 ## Browser authentication
 
@@ -281,11 +289,11 @@ that allowlist remain inaccessible to both service accounts.
 
 - `config.apiserver.kubernetesTokenReviewAudience` is the required, non-empty
   Kubernetes API server audience used in every delegated TokenReview, including
-  the Task API and route-scoped service-envelope bootstrap. DEV uses
-  `https://kubernetes.default.svc`. This is distinct from the exchanged JWT's
-  `steward-task-api` audience and the EKS external OIDC client ID. The Task API
-  is enabled on the apiserver service; its internal port is
-  `services.apiserverPort`.
+  the Task API and route-scoped service-envelope bootstrap. Its chart default
+  is `https://kubernetes.default.svc`; replace it if the target cluster's
+  delegated TokenReview audience differs. This is distinct from the exchanged
+  JWT's `steward-task-api` audience. The Task API is enabled on the apiserver
+  service; its internal port is `services.apiserverPort`.
 - The bootstrap identity has the exact group
   `agents.apelogic.ai/service-envelope-bootstrap:steward-run` and can call only
   `POST /admin/service-envelopes/steward-run`. Sharing the delegated TokenReview
@@ -301,11 +309,11 @@ that allowlist remain inaccessible to both service accounts.
 - `config.apiserver.inferenceEndpoint` is the OpenAI-compatible Responses endpoint for
   `codex-v1`; `config.apiserver.anthropicInferenceEndpoint` is the Anthropic-compatible API
   base URL for `claude-code-v1`. Agent images, packages, and bindings cannot override them.
-- `config.apiserver.jiraBaseUrl`, `jiraProjectKey`, and `jiraAccountEmail` are
-  mandatory startup inputs. The base URL is the public HTTPS Jira tenant root,
-  the project must already exist, and the account email must correspond to the
-  raw API token in the configured Jira Secret. The chart does not support a
-  dummy credential or an implicit Jira-disabled mode.
+- `jira.enabled` defaults to `false`. When enabled, `jiraBaseUrl`,
+  `jiraProjectKey`, and `jiraAccountEmail` are required; the base URL must be
+  HTTPS and the account email must correspond to the token in the existing
+  Jira Secret. When disabled, the Secret projection and Jira egress are absent,
+  and Jira-dependent decision operations reject without making a network call.
 - `stableBridge` defaults to disabled. Enabling it requires all of a
   digest-pinned bridge image, GitHub signer identity, HTTPS GitHub source repository and
   exact source commit, controller service identity, and the public GitHub
@@ -318,8 +326,12 @@ that allowlist remain inaccessible to both service accounts.
   It does not invent sandbox artifact installation, a Kubernetes pod selector,
   or a direct pod copy/exec path. Enable it only after the compatible,
   immutable bridge image and provenance coordinates are available and verified.
-- `config.controller.litellmUrl` and
-  `config.controller.openshellEndpoint` are internal service endpoints.
+- With `execution.enabled=false`, the controller starts with disabled sandbox
+  and inference ports and does not read governed endpoint or credential
+  configuration. The API does not construct a coding-agent adapter. Active
+  Task orchestration and active execution bindings are rejected. With
+  `execution.enabled=true`, `config.controller.litellmUrl` and
+  `config.controller.openshellEndpoint` are required internal service endpoints.
 - The OpenShell endpoint must use HTTPS. `openshellServerName` pins the TLS
   identity, while `secrets.openshellClient` supplies the trusted CA, client
   certificate, and private key.
@@ -352,7 +364,9 @@ that allowlist remain inaccessible to both service accounts.
   the task process. **Warning:** `full` logging copies task-controlled output
   without redaction and may expose prompts, responses, credentials, or other
   sensitive information to anyone who can read or retain controller logs.
-- `config.mint.issuer` is the issuer that must also be configured in MCP-GW.
+- In governed mode, `config.mint.issuer`, `spiffeTrustDomain`, and
+  `openshellNamespace` must be supplied for the target environment; none has
+  a usable default. The issuer must also be configured in MCP-GW.
   Steward publishes JWKS at `<issuer>/.well-known/jwks.json` and uses EdDSA.
 - `config.mint.audience` defaults to `steward-mcp` and
   `config.mint.allowedScopes` defaults to `mcp inference`. These include the
@@ -364,8 +378,11 @@ that allowlist remain inaccessible to both service accounts.
   `config.mint.spiffeTrustDomain` and stable path `spire.identityPath`
   (`/steward/mint` by default).
 
-Both the apiserver and controller apply the embedded Postgres migration set on
-startup, including migration `0011`. They must receive the same database URL.
+Both the apiserver and controller apply the embedded append-only Postgres
+migration set on startup (currently through migration `0037`). They must
+receive the same database URL. Review the
+[installation upgrade and backup procedure](../../docs/installation/installation-guide.md#upgrade-rollback-backup-and-removal)
+before upgrading; a Helm rollback does not reverse database migrations.
 
 The Task workflow's `AgentRuntime` spec must fit an envelope authorized for the
 `steward-run` service principal. That envelope is governance data, not a Helm
@@ -375,10 +392,7 @@ authority-minimal copy-smoke contract: no LLMs, tools, LiteLLM calls, or MCP
 calls. `scripts/bootstrap-task-copy-smoke.sh` installs that envelope
 idempotently over authenticated HTTPS. It requires an externally issued,
 short-lived route-scoped token; the chart deliberately has no bootstrap-token
-Secret input. DEV bootstrap is blocked first on a release containing this
-authorization contract and the delegated Kubernetes TokenReview audience
-setting, then on Infra supplying the credential through its EKS OIDC
-identity-provider association.
+Secret input. The deployment adapter supplies the route-scoped credential.
 
 Run `cargo xtask e2e-openshell-adapter` to exercise the adapter against the
 exact OpenShell `v0.0.98` chart in an ephemeral kind cluster. The test verifies
@@ -396,17 +410,19 @@ for all Steward pods, then opens only these paths:
 - caller namespaces listed in `networkPolicy.apiserverIngressNamespaces` to the
   apiserver (the default is empty and therefore denies all workload callers);
 - configured Kubernetes API/VPC CIDRs to the validating webhook;
-- OpenShell and MCP-GW namespaces to the mint;
-- controller to LiteLLM, OpenShell, Postgres, and the Kubernetes API;
-- controller to the internal workload identity exchange;
-- apiserver to Jira, Postgres, and the Kubernetes API;
-- mint to the Kubernetes API; and
+- OpenShell and MCP-GW namespaces to the mint only in governed mode;
+- controller to Postgres and the Kubernetes API, plus LiteLLM, OpenShell, and
+  workload exchange only in governed mode;
+- apiserver to Postgres and the Kubernetes API, plus Jira only when enabled;
+- mint to the Kubernetes API only in governed mode; and
 - all Steward components to cluster DNS.
 
 `kubeApiCidrs`, `postgresCidrs`, and `jiraCidrs` default to empty arrays. Empty
-means denied, not unrestricted, so production values must supply the applicable
-CIDRs. FQDN-aware egress policy, if used by the cluster, belongs in the GitOps
-layer rather than this portable Kubernetes `NetworkPolicy` chart.
+means denied, not unrestricted, so installation values must supply the
+applicable approved CIDRs. A nonempty `jiraCidrs` array does not open an egress
+rule unless `jira.enabled=true`. FQDN-aware egress policy, if used by the
+cluster, belongs in the deployment adapter rather than this portable
+Kubernetes `NetworkPolicy` chart.
 
 A governed distribution must explicitly list its workload namespaces, for
 example `networkPolicy.apiserverIngressNamespaces: ["my-runner"]`. The legacy

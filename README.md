@@ -1,23 +1,39 @@
 # Steward — governance control plane
 
-Steward is a Rust workspace for a self-service agent governance control plane.
-The repository implements Slice S0's walking skeleton, Slice S3's envelope
-admission path, and Slice S4's escalation path: immutable member-role envelopes,
-one shared admission evaluator, the Kubernetes webhook and REST front doors, a
-durable approval queue, Jira as an outbound decision channel, and append-only
-instance-bound grants.
+Steward is a Rust/Kubernetes control plane for policy-bound agent workloads.
+It provides the `AgentRuntime` CRD and admission webhook, an authenticated API,
+a durable approval and audit store, and optional governed Task execution.
+The Helm chart supports a staged core installation without Jira, a model
+endpoint, OpenShell, LiteLLM, SPIRE, or a sandbox RuntimeClass. Governed
+execution and Jira are explicit opt-ins with additional prerequisites; they
+do not silently activate when an integration is absent.
+
+Steward is available under the [MIT License](LICENSE). Checked-in upstream
+patches retain their [third-party notices](THIRD_PARTY_NOTICES.md).
+
+Current installation contract: chart `0.1.18`, Kubernetes `>=1.30`, Helm 3,
+and PostgreSQL 16 as the tested database line. Governed adapter evidence pins
+OpenShell `v0.0.98` with agent-sandbox `v0.5.0`; the pinned G-1 upstream gate
+uses OpenShell `v0.0.90`. No registry is a default: release images and the OCI
+chart are published under the fork owner's GHCR namespace, and every customer
+installation supplies the exact image/chart digests from one handoff. The
+[installation guide](docs/installation/installation-guide.md#tested-versions-and-integration-boundaries)
+records the limits of this tested matrix; a rendered RuntimeClass name is not
+evidence of VM isolation.
 
 ## Start here
 
 | If you want to know | Read |
 |---|---|
+| Prerequisites, installation, secrets, post-install checks, and delivery tests | [Installation guide](docs/installation/installation-guide.md) |
+| All chart values and optional integrations | [Helm chart reference](charts/steward/README.md) |
 | Documentation authority, status, and navigation | [Documentation index](docs/README.md) |
 | Normative M1 fields, ownership, and compatibility | [Frozen `steward.m1/v1` contract](docs/contracts/m1/v1/README.md) |
 | Accepted post-M1 Agent, Task, session, and runtime semantics | [Post-M1 architecture baseline](docs/v2/README.md) |
 | Post-M1 contracts that remain unresolved | [Deferred-contract register](docs/v2/deferred-implementation-contracts.md) |
 | Implemented v0.1.x Task lifecycle and identity contract | [Task submission API](docs/task-submission-api.md) |
 | Canonical browser / Task person identity | [Canonical user identity](docs/canonical-user-identity-v1.md) |
-| Deploy the Task API and worker | [Task deployment](config/task/README.md) |
+| Understand the Task API and worker contract | [Task deployment](config/task/README.md) |
 | Configure coding-agent versions | [Execution bindings](docs/installation/execution-bindings.md) |
 | The rules for changing this repository | [Agent rules](AGENTS.md) |
 | Run the complete local gate | `cargo xtask ci` |
@@ -32,7 +48,9 @@ Cargo.toml                    Rust workspace
 deny.toml                     the §8 layering rule, mechanically
 
 bins/
-  steward-controller/         Kubernetes controller composition root
+  steward-apiserver/          API composition root
+  steward-controller/         Kubernetes controller and webhook composition root
+  steward-mint/               workload credential mint composition root
 
 crates/
   steward-types/              vendor-neutral shared types
@@ -41,13 +59,15 @@ crates/
   steward-store/              operational history boundary
   steward-controller/         reconciliation and webhook boundary
   steward-apiserver/          REST API boundary
-  steward-mint/               protected path; code lands in its own reviewed PR
+  steward-mint/               protected workload-identity path
 
 adapters/
   fake/                       in-memory implementation of every port
   openshell/                  strategic runtime seam
   litellm/ mcp-gw/ jira/
-  spire/ opa/                 vendor-plane stubs
+  spire/ opa/                 identity and policy adapters
+
+charts/steward/               Helm deployment, schema, CRD, and chart reference
 
 xtask/                        local and CI gate implementation
 policy/                       OPA policy and tests
@@ -73,6 +93,8 @@ docs/
   task-submission-api.md      lifecycle REST, tar paths, limits, identity boundary
   canonical-user-identity-v1.md
                               immutable user ID, Google OIDC mapping, reconnect contract
+  installation/installation-guide.md
+                              prerequisites, procedure, and delivery checks
   installation/execution-bindings.md
                               deployment-neutral agent catalog and validation
   m1-delivery-plan.md         historical M1 delivery dependency index
@@ -110,27 +132,17 @@ analysis, and Workflow proposal are historical context. They are not current con
 implementation status, or committed post-M1 object models. In particular, Steward has
 no accepted domain object named `Workflow`.
 
-## What is deliberately not here yet
+## Installation boundary
 
-- **Mint code.** `crates/steward-mint/AGENTS.md` requires changes under that path
-  to land in a separate, human-reviewed PR.
-- **The identity and budget planes.** S1 and S2 use the recorded OpenShell
-  supervisor-identity patch until its upstream exit condition lands. The
-  ephemeral identity spike builds that patched supervisor from its immutable
-  source revision; S3 and S4 run independently of it.
-- **Post-M1 wire contracts.** The accepted semantic boundaries are documented, but
-  their unresolved schemas and protocols remain in the
-  [deferred-contract register](docs/v2/deferred-implementation-contracts.md).
-- **Connector-specific plans.** Burble is the worked example of a frontend connector.
-  The accepted boundary is documented in the
-  [post-M1 architecture baseline](docs/v2/README.md); its own roadmap and migration
-  plan live with the connector, not here.
-- **A filled-in push escalation** (`AGENTS.md` §1.3) — left blank on purpose.
-  Guessing it produces exactly the retry loop the section prevents. Record it
-  the first time someone resolves it.
+The chart installs Steward resources but does not create a database,
+credentials, an issuer, a Gateway, DNS, or an isolation RuntimeClass. An
+operator supplies immutable image coordinates and chooses customer-owned TLS
+Secrets plus a public webhook CA, or cert-manager with an explicit issuer.
+Core mode keeps execution disabled and Task orchestration staged. To enable
+governed execution, first validate all dependency and sandbox-isolation
+requirements in the [installation guide](docs/installation/installation-guide.md)
+and [execution-binding guide](docs/installation/execution-bindings.md).
 
-## Decisions already carried into bootstrap
-
-- **API group:** `agents.apelogic.ai` (§2.3), keeping the working product name
-  out of stored objects.
-- **Default branch:** `main` (D10).
+Historical design documents remain available through the documentation index;
+they are not an installation contract. The API group is
+`agents.apelogic.ai`, and the default branch is `main`.

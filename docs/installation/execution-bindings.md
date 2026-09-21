@@ -42,13 +42,16 @@ apiserver image digest from the release handoff to calculate and print them offl
 
 ```sh
 catalog="$PWD/execution-bindings.json"
+approved_image="registry.example.test/customer/steward@sha256:<approved-apiserver-manifest-digest>"
 docker run --rm --network none --read-only --user 65532:65532 \
   --mount "type=bind,src=${catalog},dst=/catalog.json,readonly" \
-  ghcr.io/apelogic-ai/steward@sha256:<approved-apiserver-manifest-digest> \
+  "${approved_image}" \
   validate-execution-bindings --file /catalog.json
 ```
 
-Do not substitute a tag. The command invokes the released `/usr/local/bin/steward` entrypoint, uses
+Replace `approved_image` with the exact fork-owned apiserver image from the customer release
+handoff; do not substitute a tag or an upstream-owner registry path. The command invokes the
+released `/usr/local/bin/steward` entrypoint, uses
 the production parser with networking disabled, needs no credential, prints only public `agentRef`
 and derived digest metadata, and returns nonzero for an invalid document.
 

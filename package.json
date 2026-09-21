@@ -1,5 +1,6 @@
 {
   "name": "steward-ui-assembly",
+  "license": "MIT",
   "private": true,
   "packageManager": "bun@1.2.21",
   "workspaces": [
