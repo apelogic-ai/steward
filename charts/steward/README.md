@@ -378,8 +378,11 @@ that allowlist remain inaccessible to both service accounts.
   `config.mint.spiffeTrustDomain` and stable path `spire.identityPath`
   (`/steward/mint` by default).
 
-Both the apiserver and controller apply the embedded Postgres migration set on
-startup, including migration `0011`. They must receive the same database URL.
+Both the apiserver and controller apply the embedded append-only Postgres
+migration set on startup (currently through migration `0037`). They must
+receive the same database URL. Review the
+[installation upgrade and backup procedure](../../docs/installation/installation-guide.md#upgrade-rollback-backup-and-removal)
+before upgrading; a Helm rollback does not reverse database migrations.
 
 The Task workflow's `AgentRuntime` spec must fit an envelope authorized for the
 `steward-run` service principal. That envelope is governance data, not a Helm
