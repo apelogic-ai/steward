@@ -19,6 +19,12 @@ worker is part of the normal `steward-controller` process.
 | Task API enablement | The Task routes exist when the apiserver starts, but core-only installation is staged and rejects new Task execution. Invalid required Task configuration still fails startup. |
 | `STEWARD_DATABASE_URL` | Existing Postgres connection reference. Keep the value in a Secret, never this repository. |
 
+For an unversioned legacy Workflow, the caller sends the Workflow name and
+normally omits `codingAgentRuntime`. Steward selects that value from its own
+Workflow catalog. A compatibility client may still send the field, but Steward
+rejects it unless it exactly matches the catalog. Versioned and direct
+Workflows remain fully server-selected and reject the field.
+
 The caller supplies `Authorization: Bearer <exchanged-token>`. GitHub requests the production
 exchange service's audience; Steward never receives the raw GitHub OIDC token. Steward sends the
 exchanged token to TokenReview with the configured Kubernetes API server audience. The exchanged

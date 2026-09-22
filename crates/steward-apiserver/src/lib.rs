@@ -10350,6 +10350,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_task_uses_server_selected_runtime_when_client_omits_it() -> Result<(), String> {
+        let ledger = ledger();
+        let task_rows = ledger.tasks.clone();
+        let app = task_router(
+            ledger.clone(),
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([task_workflow("100.00")]),
+            task_api_config()?,
+        );
+        let mismatched = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "caller-selected-wrong-runtime")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"workflow":"code-review","codingAgentRuntime":"other"}"#,
+                    ))
+                    .map_err(|error| format!("build mismatched legacy Task request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit mismatched legacy Task runtime: {error}"))?;
+        assert_eq!(mismatched.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            task_rows
+                .lock()
+                .map_err(|_| "task fixture lock was poisoned")?
+                .is_empty(),
+            "a caller must not override the server-selected runtime"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "server-selected-legacy-runtime")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"workflow":"code-review"}"#))
+                    .map_err(|error| format!("build legacy Task request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit legacy Task without a runtime: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        {
+            let rows = task_rows
+                .lock()
+                .map_err(|_| "task fixture lock was poisoned")?;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].coding_agent_runtime, "agent-v1");
+            assert_eq!(rows[0].runtime_spec.agent_type.name, "agent-v1");
+        }
+
+        let retry = task_router(
+            ledger,
+            FakeTaskIdentityResolver,
+            StaticTaskWorkflowCatalog::new([]),
+            TaskApiConfig::default(),
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "server-selected-legacy-runtime")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"workflow":"code-review"}"#))
+                .map_err(|error| format!("build legacy Task retry: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("retry legacy Task without a runtime: {error}"))?;
+        assert_eq!(retry.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            task_rows
+                .lock()
+                .map_err(|_| "task fixture lock was poisoned")?
+                .len(),
+            1,
+            "an omitted runtime retry must resolve to the persisted server-selected plan"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn legacy_task_retry_uses_persisted_plan_across_workflow_catalog_changes()
     -> Result<(), String> {
         let ledger = ledger();
