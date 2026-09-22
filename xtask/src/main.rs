@@ -2368,7 +2368,7 @@ mod tests {
         }
         assert!(
             guide.contains("OCI chart digest pull commands were exercised with Helm v3.17.1")
-                || guide.contains("| Helm | 3.17+; release acceptance uses 3.17.1. |"),
+                || guide.contains("| Helm | 3.17+; tested with 3.17.1 |"),
             "customer installation guide must record the tested Helm version"
         );
         assert!(
