@@ -22,6 +22,7 @@ for required in \
   'helm pull "${chart_repository}@${chart_digest}"' \
   'kind create cluster' \
   'upgrade --install steward "${chart_archive}"' \
+  '_sqlx_migrations' \
   'complete-rendered.yaml'
 do
   grep -Fq "${required}" "${harness}" || {

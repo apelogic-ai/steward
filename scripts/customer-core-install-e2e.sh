@@ -254,6 +254,15 @@ helm --kubeconfig "${kubeconfig}" --kube-context "${context}" \
   --atomic --wait --timeout 10m "${values[@]}" >/dev/null
 "${K[@]}" rollout status deployment/steward-apiserver --timeout=180s
 "${K[@]}" rollout status deployment/steward-controller --timeout=180s
+migration_counts="$("${K[@]}" exec deployment/core-test-postgres -- \
+  psql -U steward -d steward -Atc \
+  "SELECT count(*)::text || ':' || (count(*) FILTER (WHERE success))::text FROM _sqlx_migrations")"
+if [[ ! "${migration_counts}" =~ ^([0-9]+):([0-9]+)$ ]] \
+  || [[ "${BASH_REMATCH[1]}" == 0 ]] \
+  || [[ "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ]]; then
+  echo "database migrations are incomplete: ${migration_counts}" >&2
+  exit 1
+fi
 
 stage=delivery
 kubectl --kubeconfig "${kubeconfig}" --context "${context}" \
