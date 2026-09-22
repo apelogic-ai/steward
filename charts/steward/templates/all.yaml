@@ -378,7 +378,9 @@ spec:
             - { name: STEWARD_CONNECTIONS_MCP_GW_ORIGIN, value: {{ .Values.connectionsBridge.mcpGatewayOrigin | quote }} }
             - { name: STEWARD_CONNECTIONS_MCP_GW_VERSION, value: {{ .Values.connectionsBridge.mcpGatewayVersion | quote }} }
             - { name: STEWARD_CONNECTIONS_RUNTIME_NAMESPACE, value: {{ .Values.connectionsBridge.runtimeNamespace | quote }} }
+{{- if .Values.config.controller.openshellRuntimeClassName }}
             - { name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME, value: {{ .Values.config.controller.openshellRuntimeClassName | quote }} }
+{{- end }}
 {{- end }}
 {{- if .Values.stableBridge.enabled }}
             - { name: STEWARD_STABLE_BRIDGE_IMAGE, value: {{ .Values.stableBridge.image | quote }} }
@@ -481,7 +483,9 @@ spec:
             - { name: STEWARD_LITELLM_URL, value: {{ .Values.config.controller.litellmUrl | quote }} }
             - { name: STEWARD_OPENSHELL_ENDPOINT, value: {{ .Values.config.controller.openshellEndpoint | quote }} }
             - { name: STEWARD_OPENSHELL_SERVER_NAME, value: {{ .Values.config.controller.openshellServerName | quote }} }
+{{- if .Values.config.controller.openshellRuntimeClassName }}
             - { name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME, value: {{ .Values.config.controller.openshellRuntimeClassName | quote }} }
+{{- end }}
             - { name: STEWARD_OPENSHELL_TASK_LOG_MODE, value: {{ .Values.config.controller.openshellTaskLogMode | quote }} }
             - { name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE, value: /run/openshell/ca.crt }
             - { name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE, value: /run/openshell/tls.crt }

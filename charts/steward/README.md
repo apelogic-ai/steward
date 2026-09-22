@@ -352,7 +352,8 @@ that allowlist remain inaccessible to both service accounts.
   service-account authentication are unsupported. This file-source boundary is
   deployment-neutral: non-Kubernetes deployments may mount another
   platform-approved source credential without changing sandbox/runtime code.
-- `config.controller.openshellRuntimeClassName` must be a non-empty valid
+- `config.controller.openshellRuntimeClassName` is optional. When omitted,
+  OpenShell uses the cluster default runtime. When set, it must be a valid
   Kubernetes RuntimeClass name matching OpenShell's gateway-level
   `defaultRuntimeClassName`. Steward does not send a sandbox image or expose
   per-create driver/runtime overrides, so the gateway's configured image and
@@ -397,10 +398,9 @@ Secret input. The deployment adapter supplies the route-scoped credential.
 Run `cargo xtask e2e-openshell-adapter` to exercise the adapter against the
 exact OpenShell `v0.0.98` chart in an ephemeral kind cluster. The test verifies
 authenticated TLS failures, CA and server-name validation, the
-`openshell-runc` runtime-class selection propagates into the Sandbox pod
-template, input/output SHA-256 equality, and sandbox-last cleanup. Kind maps
-the test RuntimeClass to the `runc` handler, so this lane proves the generic
-runtime-class contract and propagation. It does not prove a VM isolation boundary.
+cluster-default runtime is retained in the Sandbox pod template, input/output
+SHA-256 equality, and sandbox-last cleanup. This lane proves functional
+execution. It does not prove a VM isolation boundary.
 
 ## Network policy
 

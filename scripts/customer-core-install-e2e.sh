@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
-# Disposable customer-style core install: no Jira, inference, Mint, or OpenShell.
+# Disposable customer-style core install from released OCI artifacts only.
 set -euo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+kind_node_image="kindest/node:v1.32.1@sha256:6afef2b7f69d627ea7bf27ee6696b6868d18e03bf98167c420df486da4662db6"
+release_version="${STEWARD_RELEASE_VERSION:?STEWARD_RELEASE_VERSION is required}"
+image_repository="${STEWARD_RELEASE_IMAGE_REPOSITORY:?STEWARD_RELEASE_IMAGE_REPOSITORY is required}"
+chart_repository="${STEWARD_RELEASE_CHART_REPOSITORY:?STEWARD_RELEASE_CHART_REPOSITORY is required}"
+chart_digest="${STEWARD_RELEASE_CHART_DIGEST:?STEWARD_RELEASE_CHART_DIGEST is required}"
+api_digest="${STEWARD_RELEASE_APISERVER_DIGEST:?STEWARD_RELEASE_APISERVER_DIGEST is required}"
+controller_digest="${STEWARD_RELEASE_CONTROLLER_DIGEST:?STEWARD_RELEASE_CONTROLLER_DIGEST is required}"
+mint_digest="${STEWARD_RELEASE_MINT_DIGEST:?STEWARD_RELEASE_MINT_DIGEST is required}"
+bridge_digest="${STEWARD_RELEASE_BRIDGE_DIGEST:?STEWARD_RELEASE_BRIDGE_DIGEST is required}"
+web_digest="${STEWARD_RELEASE_WEB_DIGEST:?STEWARD_RELEASE_WEB_DIGEST is required}"
 run_id="core-$(date -u +%Y%m%d%H%M%S)-$$"
 cluster="steward-${run_id}"
 context="kind-${cluster}"
-network="steward-${run_id}-net"
-registry="steward-${run_id}-registry"
 run_dir="$(mktemp -d "/private/tmp/steward-${run_id}.XXXXXX")"
 chmod 700 "${run_dir}"
 kubeconfig="${run_dir}/kubeconfig"
-network_created=0
-registry_created=0
 cluster_created=0
 port_forward_pid=""
-api_image=""
-controller_image=""
 stage=preflight
 
 cleanup() {
@@ -39,27 +42,13 @@ cleanup() {
   if [[ "${cluster_created}" == 1 ]]; then
     kind delete cluster --name "${cluster}" >/dev/null 2>&1 || status=1
   fi
-  if [[ "${registry_created}" == 1 ]]; then
-    docker rm -f "${registry}" >/dev/null 2>&1 || status=1
-  fi
-  if [[ "${network_created}" == 1 ]]; then
-    docker network rm "${network}" >/dev/null 2>&1 || status=1
-  fi
-  if [[ -n "${api_image}" ]]; then
-    docker image rm "${api_image}" >/dev/null 2>&1 || status=1
-  fi
-  if [[ -n "${controller_image}" ]]; then
-    docker image rm "${controller_image}" >/dev/null 2>&1 || status=1
-  fi
   find "${run_dir}" -depth -delete 2>/dev/null || status=1
   if kind get clusters 2>/dev/null | grep -Fxq "${cluster}" \
-    || docker container inspect "${registry}" >/dev/null 2>&1 \
-    || docker network inspect "${network}" >/dev/null 2>&1 \
     || [[ -e "${run_dir}" ]]; then
-    echo "owned disposable resources remain; check ${cluster}, ${registry}, ${network}, ${run_dir}" >&2
+    echo "owned disposable resources remain; check ${cluster} and ${run_dir}" >&2
     status=1
   else
-    echo "disposable cleanup verified: ${cluster}, ${registry}, ${network}, ${run_dir}" >&2
+    echo "disposable cleanup verified: ${cluster}, ${run_dir}" >&2
   fi
   exit "${status}"
 }
@@ -67,78 +56,44 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for tool in docker git helm kind kubectl openssl jq curl; do
+for tool in docker helm kind kubectl openssl jq curl tar; do
   command -v "${tool}" >/dev/null || { echo "missing ${tool}" >&2; exit 2; }
 done
 docker info >/dev/null
-if [[ -n "$(git -C "${root}" status --porcelain)" ]]; then
-  echo 'customer install E2E requires a clean exact-revision checkout' >&2
-  exit 2
-fi
-revision="$(git -C "${root}" rev-parse HEAD)"
-printf 'revision=%s\ncluster=%s\ncontext=%s\nkubeconfig=%s\nregistry=%s\nnetwork=%s\nrun_dir=%s\n' \
-  "${revision}" "${cluster}" "${context}" "${kubeconfig}" "${registry}" "${network}" "${run_dir}" \
+for digest in "${chart_digest}" "${api_digest}" "${controller_digest}" "${mint_digest}" "${bridge_digest}" "${web_digest}"; do
+  if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "release artifact has invalid digest: ${digest}" >&2
+    exit 2
+  fi
+done
+printf 'release_version=%s\ncluster=%s\ncontext=%s\nkubeconfig=%s\nrun_dir=%s\n' \
+  "${release_version}" "${cluster}" "${context}" "${kubeconfig}" "${run_dir}" \
   > "${run_dir}/ownership.txt"
-echo "core install revision ${revision}; owned cluster ${cluster}"
+echo "core install release ${release_version}; owned cluster ${cluster}"
 
-stage=registry
-docker network create "${network}" >/dev/null
-network_created=1
-registry_created=1
-docker run -d --name "${registry}" --network "${network}" \
-  -p 127.0.0.1::5000 \
-  registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373 >/dev/null
-registry_port="$(docker port "${registry}" 5000/tcp | awk -F: 'NR == 1 { print $NF }')"
-if [[ ! "${registry_port}" =~ ^[0-9]+$ ]]; then
-  echo 'registry did not publish a unique host port' >&2
-  exit 1
-fi
-printf 'registry_host_port=%s\n' "${registry_port}" >> "${run_dir}/ownership.txt"
-tag="${run_id}"
-api_image="localhost:${registry_port}/steward:${tag}-apiserver"
-controller_image="localhost:${registry_port}/steward:${tag}-controller"
-
-stage=images
-docker build --quiet -f "${root}/build/package.Dockerfile" \
-  --build-arg BINARY=steward-apiserver-bin -t "${api_image}" "${root}" >/dev/null
-docker build --quiet -f "${root}/build/package.Dockerfile" \
-  --build-arg BINARY=steward-controller-bin -t "${controller_image}" "${root}" >/dev/null
-docker push "${api_image}" >/dev/null
-docker push "${controller_image}" >/dev/null
-api_digest="$(docker image inspect "${api_image}" --format '{{index .RepoDigests 0}}')"
-controller_digest="$(docker image inspect "${controller_image}" --format '{{index .RepoDigests 0}}')"
-api_digest="${api_digest##*@}"
-controller_digest="${controller_digest##*@}"
-if [[ ! "${api_digest}" =~ ^sha256:[0-9a-f]{64}$ || ! "${controller_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-  echo 'local release images lack immutable OCI manifest digests' >&2
-  exit 1
-fi
-printf 'api_digest=%s\ncontroller_digest=%s\n' "${api_digest}" "${controller_digest}" >> "${run_dir}/ownership.txt"
-echo "published local immutable images ${api_digest} and ${controller_digest}"
+stage=release-artifacts
+for digest in "${api_digest}" "${controller_digest}" "${mint_digest}" "${bridge_digest}" "${web_digest}"; do
+  docker pull "${image_repository}@${digest}" >/dev/null
+done
+helm pull "${chart_repository}@${chart_digest}" --destination "${run_dir}"
+chart_archive="$(find "${run_dir}" -maxdepth 1 -type f -name 'steward*.tgz' -print -quit)"
+test -s "${chart_archive}"
+tar -xOf "${chart_archive}" steward/Chart.yaml > "${run_dir}/Chart.yaml"
+grep -Fxq "version: ${release_version}" "${run_dir}/Chart.yaml"
+grep -Fxq "appVersion: ${release_version}" "${run_dir}/Chart.yaml"
 
 stage=cluster
 printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\n' > "${run_dir}/kind.yaml"
 cluster_created=1
-KIND_EXPERIMENTAL_DOCKER_NETWORK="${network}" kind create cluster \
+kind create cluster \
   --name "${cluster}" --kubeconfig "${kubeconfig}" \
-  --config "${run_dir}/kind.yaml" --wait 120s
+  --config "${run_dir}/kind.yaml" --image "${kind_node_image}" --wait 120s
 chmod 600 "${kubeconfig}"
 actual_context="$(kubectl --kubeconfig "${kubeconfig}" config current-context)"
 if [[ "${actual_context}" != "${context}" ]]; then
   echo "unexpected disposable context ${actual_context}" >&2
   exit 1
 fi
-stage=registry-binding
-node="${cluster}-control-plane"
-# New Kind/containerd nodes already set registry.config_path. Adding a legacy
-# registry.mirrors patch disables CRI, so use the supported per-host file.
-docker exec "${node}" crictl info >/dev/null
-printf 'server = "http://%s:5000"\n[host."http://%s:5000"]\n  capabilities = ["pull", "resolve"]\n' \
-  "${registry}" "${registry}" |
-  docker exec -i "${node}" sh -c 'mkdir -p "$1" && cat > "$1/hosts.toml"' \
-    _ "/etc/containerd/certs.d/${registry}:5000"
-docker exec "${node}" crictl pull "${registry}:5000/steward:${tag}-apiserver@${api_digest}" >/dev/null
-docker exec "${node}" crictl pull "${registry}:5000/steward:${tag}-controller@${controller_digest}" >/dev/null
 kubectl --kubeconfig "${kubeconfig}" --context "${context}" \
   create namespace steward >/dev/null
 kubectl --kubeconfig "${kubeconfig}" --context "${context}" \
@@ -227,17 +182,66 @@ api_ip="$(kubectl --kubeconfig "${kubeconfig}" --context "${context}" \
 
 stage=install
 values=(
-  --set-string "images.repository=${registry}:5000/steward"
-  --set-string "images.apiserver.tag=${tag}-apiserver"
+  --set-string "images.repository=${image_repository}"
+  --set-string "images.apiserver.tag=${release_version}-apiserver"
   --set-string "images.apiserver.digest=${api_digest}"
-  --set-string "images.controller.tag=${tag}-controller"
+  --set-string "images.controller.tag=${release_version}-controller"
   --set-string "images.controller.digest=${controller_digest}"
   --set-string "networkPolicy.kubeApiCidrs[0]=${api_ip}/32"
   --set-string "networkPolicy.postgresCidrs[0]=${postgres_ip}/32"
   --set-file "tls.webhook.caBundlePem=${run_dir}/ca.crt"
 )
-helm lint "${root}/charts/steward" "${values[@]}" >/dev/null
-helm template steward "${root}/charts/steward" --namespace steward \
+complete_values=(
+  "${values[@]}"
+  --set execution.enabled=true
+  --set web.enabled=true
+  --set browserAuth.enabled=true
+  --set-string images.mint.tag="${release_version}-mint"
+  --set-string images.mint.digest="${mint_digest}"
+  --set-string images.web.tag="${release_version}-web"
+  --set-string images.web.digest="${web_digest}"
+  --set-string config.apiserver.inferenceEndpoint=https://inference.example.test/v1
+  --set-string config.controller.openshellEndpoint=https://openshell.example.test
+  --set-string config.controller.openshellServerName=openshell.example.test
+  --set-string config.controller.workloadExchangeEndpoint=https://identity.example.test/v1/workload/exchange
+  --set-string config.controller.workloadExchangeServerName=identity.example.test
+  --set-string config.controller.litellmUrl=https://litellm.example.test
+  --set-string config.mint.issuer=https://mint.example.test
+  --set-string config.mint.spiffeTrustDomain=example.test
+  --set-string config.mint.openshellNamespace=openshell
+  --set-string browserAuth.google.clientId=obviously-fake-client-id
+  --set-string browserAuth.google.origin=https://steward.example.test
+  --set-string browserAuth.google.workspaceDomain=example.test
+  --set-string browserAuth.google.organizationId=example-org
+  --set-string browserAuth.google.clientSecret.name=steward-browser-auth
+  --set-string browserAuth.google.clientSecret.key=client-secret
+  --set-string 'networkPolicy.browserAuthEgressCidrs[0]=192.0.2.0/24'
+  --set connectionsBridge.enabled=true
+  --set-string connectionsBridge.artifactTrust.mode=operator-pinned
+  --set-string connectionsBridge.image="${image_repository}@${bridge_digest}"
+  --set-string connectionsBridge.mcpGatewayOrigin=https://mcp-gw.example.test
+  --set-string connectionsBridge.mcpGatewayVersion=0.4.9
+  --set-string connectionsBridge.runtimeNamespace=steward-runtimes
+  --set-string 'runtimeNamespaces[0]=steward-runtimes'
+)
+helm lint "${chart_archive}" "${complete_values[@]}" >/dev/null
+helm template steward "${chart_archive}" --namespace steward \
+  "${complete_values[@]}" > "${run_dir}/complete-rendered.yaml"
+for image in \
+  "${image_repository}:${release_version}-apiserver@${api_digest}" \
+  "${image_repository}:${release_version}-controller@${controller_digest}" \
+  "${image_repository}:${release_version}-mint@${mint_digest}" \
+  "${image_repository}:${release_version}-web@${web_digest}" \
+  "${image_repository}@${bridge_digest}"
+do
+  grep -Fq "${image}" "${run_dir}/complete-rendered.yaml" || {
+    echo "complete chart render omitted released artifact ${image}" >&2
+    exit 1
+  }
+done
+
+helm lint "${chart_archive}" "${values[@]}" >/dev/null
+helm template steward "${chart_archive}" --namespace steward \
   "${values[@]}" > "${run_dir}/rendered.yaml"
 if grep -Eq 'STEWARD_JIRA_|STEWARD_LITELLM_|STEWARD_OPENSHELL_|kind: ClusterSPIFFEID|name: steward-mint' \
   "${run_dir}/rendered.yaml"; then
@@ -245,7 +249,7 @@ if grep -Eq 'STEWARD_JIRA_|STEWARD_LITELLM_|STEWARD_OPENSHELL_|kind: ClusterSPIF
   exit 1
 fi
 helm --kubeconfig "${kubeconfig}" --kube-context "${context}" \
-  upgrade --install steward "${root}/charts/steward" --namespace steward \
+  upgrade --install steward "${chart_archive}" --namespace steward \
   --atomic --wait --timeout 10m "${values[@]}" >/dev/null
 "${K[@]}" rollout status deployment/steward-apiserver --timeout=180s
 "${K[@]}" rollout status deployment/steward-controller --timeout=180s
@@ -320,4 +324,4 @@ if ! grep -Fq 'admission webhook "agentruntime.steward.agents.apelogic.ai" denie
   echo 'invalid AgentRuntime was not demonstrably rejected by Steward admission' >&2
   exit 1
 fi
-echo "core install delivery passed: ${revision}, ${api_digest}, ${controller_digest}"
+echo "released core install passed: ${release_version}, ${chart_digest}, ${api_digest}, ${controller_digest}"

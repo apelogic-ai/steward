@@ -72,21 +72,6 @@ if [[ "${actual_context}" != "${KUBE_CONTEXT}" ]]; then
   exit 1
 fi
 
-kubectl \
-  --kubeconfig "${KUBECONFIG_PATH}" \
-  --context "${KUBE_CONTEXT}" \
-  apply -f - <<YAML
-apiVersion: node.k8s.io/v1
-kind: RuntimeClass
-metadata:
-  name: openshell-runc
-  labels:
-    steward.test/run-id: ${RUN_ID}
-# Kind cannot provide Kata isolation. This lane verifies only that the
-# The generic RuntimeClass contract propagates into the Sandbox pod template.
-handler: runc
-YAML
-
 agent_sandbox_base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.5.0"
 kubectl \
   --kubeconfig "${KUBECONFIG_PATH}" \
@@ -284,7 +269,6 @@ env \
   --version "${OPEN_SHELL_HELM_VERSION}" \
   --namespace openshell \
   --create-namespace \
-  --set-string server.defaultRuntimeClassName=openshell-runc \
   --set server.auth.allowUnauthenticatedUsers=false \
   --set-string "server.oidc.issuer=${oidc_issuer}" \
   --set-string "server.oidc.audience=${OIDC_AUDIENCE}" \
@@ -378,7 +362,6 @@ STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE="${client_certificate}" \
 STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE="${client_private_key}" \
 STEWARD_OPENSHELL_UNTRUSTED_CA_FILE="${invalid_ca}" \
 STEWARD_OPENSHELL_SERVER_NAME=localhost \
-STEWARD_OPENSHELL_RUNTIME_CLASS_NAME=openshell-runc \
 STEWARD_WORKLOAD_EXCHANGE_ENDPOINT="${workload_exchange_endpoint}" \
 STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME=127.0.0.1 \
 STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE="${workload_exchange_ca_certificate}" \
@@ -390,6 +373,6 @@ STEWARD_RUN_DIR="${RUN_DIR}" \
 cargo test \
   --manifest-path "${ROOT}/e2e/Cargo.toml" \
   --test openshell_adapter_v0098 \
-  adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_cleanup \
+  adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup \
   -- \
   --exact

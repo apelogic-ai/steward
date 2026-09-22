@@ -2,6 +2,9 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+bash "${root}/scripts/test-validate-release-version.sh"
+bash "${root}/scripts/validate-release-version.sh" >/dev/null
+bash "${root}/scripts/test-released-artifact-acceptance.sh"
 bash "${root}/scripts/test-release-chart-contract.sh"
 chart_contract_mode="$(bash "${root}/scripts/release-chart-contract.sh" "${root}/charts/steward/Chart.yaml")"
 rendered="$(mktemp)"
@@ -97,7 +100,6 @@ if [[ "${chart_contract_mode}" == customer-v1 ]]; then
 fi
 image_values+=(
   --set 'runtimeNamespaces[0]=team-a'
-  --set-string config.controller.openshellRuntimeClassName=openshell-runc
   --set-string config.apiserver.mcpGatewayEndpoint=https://mcp-gw.example.test/mcp
 )
 task_execution_binding_values=(
@@ -252,7 +254,6 @@ if [[ "${chart_contract_mode}" == customer-v1 ]]; then
     tls.webhook.caBundlePem \
     images.mint.digest \
     config.controller.openshellEndpoint \
-    config.controller.openshellRuntimeClassName \
     config.controller.workloadExchangeEndpoint \
     config.controller.litellmUrl \
     config.mint.issuer \
@@ -954,10 +955,12 @@ grep -q '^kind: CustomResourceDefinition$' "${rendered}"
 grep -q 'failurePolicy: Fail' "${rendered}"
 grep -q 'driver: csi.spiffe.io' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_SERVER_NAME' "${rendered}"
-grep -q 'name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME' "${rendered}"
+if grep -q 'name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME' "${rendered}"; then
+  echo "the default governed render must leave RuntimeClass selection to OpenShell" >&2
+  exit 1
+fi
 grep -Fq '            - { name: STEWARD_TASK_MCP_GW_ENDPOINT, value: "https://mcp-gw.example.test/mcp" }' "${rendered}"
 grep -Eq 'name: STEWARD_OPENSHELL_TASK_LOG_MODE, value: "?off"?' "${rendered}"
-grep -Eq 'value: "?openshell-runc"?' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE' "${rendered}"
@@ -977,10 +980,9 @@ then
   echo "an empty Kubernetes TokenReview audience must fail chart validation" >&2
   exit 1
 fi
-legacy_runtime_values=("${image_values[@]:0:${#image_values[@]}-2}")
-helm lint "${root}/charts/steward" "${legacy_runtime_values[@]}" \
+helm lint "${root}/charts/steward" "${image_values[@]}" \
   --set-string config.controller.openshellRuntimeClassName=kata-qemu >/dev/null
-if helm lint "${root}/charts/steward" "${legacy_runtime_values[@]}" \
+if helm lint "${root}/charts/steward" "${image_values[@]}" \
   --set-string config.controller.openshellRuntimeClassName=invalid/runtime >/dev/null 2>&1
 then
   echo "an invalid Kubernetes RuntimeClass name must fail chart validation" >&2

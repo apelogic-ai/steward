@@ -44,7 +44,11 @@ jobs:
             scripts/resolve-ecr-platform-digest.sh \
             scripts/test-package-provider-profile-bundle.sh \
             scripts/test-promote-ecr-artifact.sh \
+            scripts/test-released-artifact-acceptance.sh \
             scripts/test-resolve-ecr-platform-digest.sh \
+            scripts/test-validate-release-version.sh \
+            scripts/validate-release-version.sh \
+            scripts/customer-core-install-e2e.sh \
             scripts/validate-release-artifacts.sh
 
       - name: Run Steward quality gates
@@ -56,7 +60,11 @@ jobs:
         run: cargo xtask e2e-postgres-tls
 
       - name: Validate Helm chart contract
-        run: scripts/validate-release-artifacts.sh
+        env:
+          STEWARD_RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          STEWARD_RELEASE_VERSION="${STEWARD_RELEASE_VERSION#v}" \
+            scripts/validate-release-artifacts.sh
 
   publish-images:
     needs: validate
@@ -612,8 +620,55 @@ jobs:
           path: dist/ecr-*
           if-no-files-found: error
 
+  released-artifact-acceptance:
+    needs: [publish-images, publish-chart]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Kubernetes tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download published artifact digests
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Install released core profile in a clean cluster
+        env:
+          STEWARD_RELEASE_IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/steward
+          STEWARD_RELEASE_CHART_REPOSITORY: oci://ghcr.io/${{ github.repository_owner }}/charts/steward
+        run: |
+          set -euo pipefail
+          export STEWARD_RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          export STEWARD_RELEASE_CHART_DIGEST="$(cat dist/helm-chart.digest)"
+          export STEWARD_RELEASE_APISERVER_DIGEST="$(cat dist/apiserver.digest)"
+          export STEWARD_RELEASE_CONTROLLER_DIGEST="$(cat dist/controller.digest)"
+          export STEWARD_RELEASE_MINT_DIGEST="$(cat dist/mint.digest)"
+          export STEWARD_RELEASE_BRIDGE_DIGEST="$(cat dist/bridge.digest)"
+          export STEWARD_RELEASE_WEB_DIGEST="$(cat dist/web.digest)"
+          bash scripts/customer-core-install-e2e.sh
+
   release:
-    needs: [publish-images, publish-provider-profile-bundle, openshell-x86-conformance, publish-chart, promote-ecr]
+    needs: [publish-images, publish-provider-profile-bundle, openshell-x86-conformance, publish-chart, promote-ecr, released-artifact-acceptance]
     if: >-
       ${{
         always() &&
@@ -621,6 +676,7 @@ jobs:
         needs.publish-provider-profile-bundle.result == 'success' &&
         needs.openshell-x86-conformance.result == 'success' &&
         needs.publish-chart.result == 'success' &&
+        needs.released-artifact-acceptance.result == 'success' &&
         (needs.promote-ecr.result == 'success' || needs.promote-ecr.result == 'skipped')
       }}
     runs-on: ubuntu-latest
