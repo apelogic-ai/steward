@@ -510,7 +510,6 @@
           "required": [
             "openshellEndpoint",
             "openshellServerName",
-            "openshellRuntimeClassName",
             "openshellTaskLogMode",
             "workloadExchangeEndpoint",
             "workloadExchangeServerName",
@@ -847,7 +846,6 @@
                 "properties": {
                   "openshellEndpoint": {"type": "string", "pattern": "^https://", "minLength": 9},
                   "openshellServerName": {"$ref": "#/definitions/nonempty"},
-                  "openshellRuntimeClassName": {"$ref": "#/definitions/nonempty"},
                   "workloadExchangeEndpoint": {"type": "string", "pattern": "^https://[^/?#]+(?::[0-9]+)?/v1/workload/exchange$", "minLength": 38},
                   "workloadExchangeServerName": {"$ref": "#/definitions/nonempty"},
                   "litellmUrl": {"type": "string", "pattern": "^https?://", "minLength": 9}
@@ -901,14 +899,6 @@
       "then": {
         "properties": {
           "tls": {"properties": {"issuerRef": {"properties": {"name": {"$ref": "#/definitions/nonempty"}}}}}
-        }
-      }
-    },
-    {
-      "if": {"properties": {"config": {"properties": {"taskOrchestrationMode": {"const": "active"}}}}},
-      "then": {
-        "properties": {
-          "config": {"properties": {"controller": {"properties": {"openshellRuntimeClassName": {"$ref": "#/definitions/nonempty"}}}}}
         }
       }
     },

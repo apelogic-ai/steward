@@ -64,24 +64,26 @@ governed_inputs=(
   --set-string config.controller.workloadExchangeServerName=identity.example.test
   --set-string config.controller.litellmUrl=https://litellm.example.test
 )
-if helm_template \
-  --set-string tls.webhook.caBundlePem=public-test-ca \
-  --set execution.enabled=true \
-  --set-string images.mint.tag=test-mint \
-  --set-string images.mint.digest=sha256:2222222222222222222222222222222222222222222222222222222222222222 \
-  --set-string config.apiserver.inferenceEndpoint=https://inference.example.test/v1 \
-  --set-string config.controller.openshellEndpoint=https://gateway.example.test:8080 \
-  --set-string config.controller.openshellServerName=gateway.example.test \
-  --set-string config.controller.workloadExchangeEndpoint=https://identity.example.test/v1/workload/exchange \
-  --set-string config.controller.workloadExchangeServerName=identity.example.test \
-  --set-string config.controller.litellmUrl=https://litellm.example.test \
-  --set-string config.mint.issuer=https://mint.example.test \
-  --set-string config.mint.spiffeTrustDomain=customer.example.test \
-  --set-string config.mint.openshellNamespace=customer-openshell > /dev/null 2> "${rendered}"; then
-  echo 'governed execution requires an explicit RuntimeClass' >&2
+default_runtime_inputs=(
+  --set-string tls.webhook.caBundlePem=public-test-ca
+  --set execution.enabled=true
+  --set-string images.mint.tag=test-mint
+  --set-string images.mint.digest=sha256:2222222222222222222222222222222222222222222222222222222222222222
+  --set-string config.apiserver.inferenceEndpoint=https://inference.example.test/v1
+  --set-string config.controller.openshellEndpoint=https://gateway.example.test:8080
+  --set-string config.controller.openshellServerName=gateway.example.test
+  --set-string config.controller.workloadExchangeEndpoint=https://identity.example.test/v1/workload/exchange
+  --set-string config.controller.workloadExchangeServerName=identity.example.test
+  --set-string config.controller.litellmUrl=https://litellm.example.test
+  --set-string config.mint.issuer=https://mint.example.test
+  --set-string config.mint.spiffeTrustDomain=customer.example.test
+  --set-string config.mint.openshellNamespace=customer-openshell
+)
+helm_template "${default_runtime_inputs[@]}" > "${rendered}"
+if rg -q 'STEWARD_OPENSHELL_RUNTIME_CLASS_NAME' "${rendered}"; then
+  echo 'default runtime render must not request a RuntimeClass' >&2
   exit 1
 fi
-rg -q 'openshellRuntimeClassName' "${rendered}"
 if helm_template "${governed_inputs[@]}" > /dev/null 2> "${rendered}"; then
   echo 'governed mode must not use an assumed Mint issuer or SPIFFE trust domain' >&2
   exit 1

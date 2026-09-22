@@ -47,7 +47,7 @@ fn valid_config() -> Result<OpenShellConnectionConfig, String> {
         )?,
         workload_source_credential_file: required_path("STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE")?,
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
-        runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
+        runtime_class_name: env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME").unwrap_or_default(),
         task_log_mode: OpenShellTaskLogMode::Off,
         stable_bridge_image: None,
         stable_bridge_gateway_origin: None,
@@ -129,11 +129,7 @@ fn output_payload(run_dir: &Path, archive: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("declared output out/payload.bin is missing: {error}"))
 }
 
-fn assert_runtime_class_propagation(
-    workspace: &str,
-    sandbox: &str,
-    expected_runtime_class: &str,
-) -> Result<(), String> {
+fn assert_default_runtime_class(workspace: &str, sandbox: &str) -> Result<(), String> {
     let kubeconfig = required("STEWARD_TEST_KUBECONFIG")?;
     let context = required("STEWARD_TEST_KUBE_CONTEXT")?;
     let selector =
@@ -163,9 +159,9 @@ fn assert_runtime_class_propagation(
     }
     let runtime_class = String::from_utf8(output.stdout)
         .map_err(|_| "sandbox runtime class was not UTF-8".to_owned())?;
-    if runtime_class.trim() != expected_runtime_class {
+    if !runtime_class.trim().is_empty() {
         return Err(format!(
-            "OpenShell created runtime class {:?}, expected {expected_runtime_class}",
+            "OpenShell created explicit runtime class {:?}, expected the cluster default",
             runtime_class.trim(),
         ));
     }
@@ -310,8 +306,8 @@ async fn verify_attempt_failure_semantics(
 }
 
 #[tokio::test]
-async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_cleanup()
--> Result<(), String> {
+async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() -> Result<(), String>
+{
     if required("STEWARD_OPEN_SHELL_RELEASE")? != EXPECTED_RELEASE {
         return Err(format!(
             "adapter integration requires OpenShell {EXPECTED_RELEASE}"
@@ -350,7 +346,6 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
         "an invalid Kubernetes RuntimeClass contract must fail closed"
     );
 
-    let expected_runtime_class = config.runtime_class_name.clone();
     let runtime = OpenShellRuntime::connect(config)
         .await
         .map_err(|error| format!("authenticated OpenShell connection failed: {error:?}"))?;
@@ -376,7 +371,7 @@ async fn adapter_round_trip_is_authenticated_with_runtime_class_propagation_and_
         .sandbox
         .as_deref()
         .ok_or_else(|| "running sandbox has no sandbox reference".to_owned())?;
-    assert_runtime_class_propagation(workspace, sandbox, &expected_runtime_class)?;
+    assert_default_runtime_class(workspace, sandbox)?;
     request.refs = refs.clone();
 
     let run_dir = PathBuf::from(required("STEWARD_RUN_DIR")?);

@@ -4,22 +4,23 @@ Steward is a Rust/Kubernetes control plane for policy-bound agent workloads.
 It provides the `AgentRuntime` CRD and admission webhook, an authenticated API,
 a durable approval and audit store, and optional governed Task execution.
 The Helm chart supports a staged core installation without Jira, a model
-endpoint, OpenShell, LiteLLM, SPIRE, or a sandbox RuntimeClass. Governed
+endpoint, OpenShell, LiteLLM, or SPIRE. Governed
 execution and Jira are explicit opt-ins with additional prerequisites; they
 do not silently activate when an integration is absent.
 
 Steward is available under the [MIT License](LICENSE). Checked-in upstream
 patches retain their [third-party notices](THIRD_PARTY_NOTICES.md).
 
-Current installation contract: chart `0.1.18`, Kubernetes `>=1.30`, Helm 3,
+Current installation contract: chart `0.1.22`, Kubernetes `>=1.30`, Helm 3.17+,
 and PostgreSQL 16 as the tested database line. Governed adapter evidence pins
-OpenShell `v0.0.98` with agent-sandbox `v0.5.0`; the pinned G-1 upstream gate
-uses OpenShell `v0.0.90`. No registry is a default: release images and the OCI
+OpenShell `v0.0.98` with agent-sandbox `v0.5.0`. No registry is a default:
+release images and the OCI
 chart are published under the fork owner's GHCR namespace, and every customer
-installation supplies the exact image/chart digests from one handoff. The
+installation supplies the exact image/chart digests from one handoff. OpenShell
+uses the cluster default runtime unless an operator explicitly configures an
+optional RuntimeClass; Steward makes no VM-isolation claim. The
 [installation guide](docs/installation/installation-guide.md#tested-versions-and-integration-boundaries)
-records the limits of this tested matrix; a rendered RuntimeClass name is not
-evidence of VM isolation.
+records the limits of this tested matrix.
 
 ## Start here
 
@@ -139,7 +140,7 @@ credentials, an issuer, a Gateway, DNS, or an isolation RuntimeClass. An
 operator supplies immutable image coordinates and chooses customer-owned TLS
 Secrets plus a public webhook CA, or cert-manager with an explicit issuer.
 Core mode keeps execution disabled and Task orchestration staged. To enable
-governed execution, first validate all dependency and sandbox-isolation
+governed execution, first validate all dependency and functional sandbox
 requirements in the [installation guide](docs/installation/installation-guide.md)
 and [execution-binding guide](docs/installation/execution-bindings.md).
 

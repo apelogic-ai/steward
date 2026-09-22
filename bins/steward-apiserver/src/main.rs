@@ -555,7 +555,6 @@ fn governed_connections_configuration(
         env::var("STEWARD_CONNECTIONS_MCP_GW_ORIGIN").ok(),
         env::var("STEWARD_CONNECTIONS_MCP_GW_VERSION").ok(),
         env::var("STEWARD_CONNECTIONS_RUNTIME_NAMESPACE").ok(),
-        env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME").ok(),
     ];
     if artifact_trust_mode.is_none() && values.iter().all(Option::is_none) {
         return Ok(None);
@@ -565,7 +564,6 @@ fn governed_connections_configuration(
         mcp_gw_origin,
         mcp_gw_version,
         namespace,
-        runtime_class,
     ] = values;
     let required = |value: Option<String>| {
         value
@@ -580,7 +578,10 @@ fn governed_connections_configuration(
             mcp_gw_origin: required(mcp_gw_origin)?,
             mcp_gw_version: required(mcp_gw_version)?,
             namespace: required(namespace)?,
-            runtime_class: required(runtime_class)?,
+            runtime_class: env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_default(),
         },
         browser_origin,
     )
@@ -960,7 +961,7 @@ mod tests {
                 mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
                 mcp_gw_version: "0.3.2".to_owned(),
                 namespace: "steward-test".to_owned(),
-                runtime_class: "kata-qemu".to_owned(),
+                runtime_class: String::new(),
             },
             "https://steward.example.test/",
         );

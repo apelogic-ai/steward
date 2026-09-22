@@ -1,17 +1,16 @@
 # Steward installation guide
 
-Status: candidate installation procedure for the Helm chart in this repository;
-live clean-room delivery evidence is still required. Use a chart and images
-built from the same exact Steward revision. A rendered manifest is not an
-installation acceptance result; complete the delivery tests below on the
-target cluster before handing it to an operator.
+Release contract: chart `0.1.22`. The release workflow pulls the published OCI
+chart and every published component image by digest, renders the complete chart,
+and installs the core profile into a clean disposable cluster before creating
+the GitHub release. Use chart and image digests from the same release handoff.
 
 ## Choose the installation mode
 
 | Mode | What starts | Additional prerequisites |
 |---|---|---|
-| Core (default, `execution.enabled=false`) | API, admission webhook, and AgentRuntime controller with Task orchestration staged | None of Jira, an inference endpoint, LiteLLM, OpenShell, SPIRE, a Mint Secret, or a sandbox RuntimeClass |
-| Governed execution (`execution.enabled=true`) | Core plus Mint, OpenShell reconciliation, LiteLLM inference, and workload identity | OpenShell gateway/client mTLS, LiteLLM, workload exchange, SPIRE CSI and ClusterSPIFFEID, a reviewed sandbox RuntimeClass, Mint signing material and trust |
+| Core (default, `execution.enabled=false`) | API, admission webhook, and AgentRuntime controller with Task orchestration staged | None of Jira, an inference endpoint, LiteLLM, OpenShell, SPIRE, a Mint Secret, or a RuntimeClass |
+| Governed execution (`execution.enabled=true`) | Core plus Mint, OpenShell reconciliation, LiteLLM inference, and workload identity | OpenShell gateway/client mTLS, LiteLLM, workload exchange, SPIRE CSI and ClusterSPIFFEID, Mint signing material and trust |
 
 Jira is a separate opt-in decision-channel integration (`jira.enabled=true`) in
 either mode. With Jira disabled, decisions that need it fail closed; the chart
@@ -61,11 +60,12 @@ turn execution off on an installation with live AgentRuntimes or Tasks.
    authentication, and their certificates are operator-owned opt-ins.
 
 For governed execution, add the OpenShell gateway URL/server name/client
-certificate Secret, approved `RuntimeClass`, LiteLLM URL/master-key Secret,
+certificate Secret, LiteLLM URL/master-key Secret,
 workload exchange URL/server name/public CA projection, SPIRE CSI driver and
-`ClusterSPIFFEID` API, and the Mint Secret. Verify the sandbox RuntimeClass
-actually provides the expected isolation on this cluster; a configured name
-or a Kind/runc smoke is not such evidence. See [chart configuration](../../charts/steward/README.md)
+`ClusterSPIFFEID` API, and the Mint Secret. OpenShell uses the cluster default
+runtime unless the operator supplies the optional RuntimeClass override.
+This release proves functional sandbox separation and makes no VM-isolation
+claim. See [chart configuration](../../charts/steward/README.md)
 and [execution bindings](execution-bindings.md) before activating Tasks.
 
 ### Tested versions and integration boundaries
@@ -74,45 +74,27 @@ These are the versions exercised or declared by this repository, not a promise
 that every other version works. Pin each external product and prove its contract
 again in the customer's cluster before enabling governed execution.
 
-| Component | Repository evidence | Installation implication |
-|---|---|---|
-| Kubernetes | The chart declares `kubeVersion: >=1.30.0-0`; the S3 envelope E2E pins Kind node `v1.32.1`. | Verify the target API version and admission/RBAC/NetworkPolicy behavior. A version declaration is not a tested cluster matrix. |
-| Helm | OCI chart digest pull commands were exercised with Helm v3.17.1. | Use Helm 3.17.0 or newer; earlier Helm 3 releases do not support the documented `oci://...@sha256:...` pull reference. |
-| PostgreSQL | `scripts/postgres-tls-e2e.sh` and pinned conformance use `postgres:16-alpine` at a fixed digest. | PostgreSQL 16 is the tested database line. Provision it, TLS, backups, and availability outside Steward. |
-| OpenShell and agent-sandbox | `scripts/openshell-adapter-e2e.sh` pins OpenShell `v0.0.98` and agent-sandbox `v0.5.0`. G-1 conformance separately pins an older OpenShell revision. | The adapter test proves RuntimeClass propagation with a Kind `runc` handler, not VM isolation. Review the actual gateway, driver, policy, and sandbox image on the target. |
-| MCP-GW | The governed Connections bridge accepts authority v1 contract `0.3.2` or v2 contract `0.4.9`, selected by the binding. | Do not infer compatibility for an arbitrary MCP-GW release or enable a Connections bridge without the matching authority and image provenance. |
-| SPIRE, LiteLLM, cert-manager, browser identity, GitHub, and edge gateway | The chart declares interfaces but no general supported-version matrix for these services. | Supply exact tested versions and acceptance evidence in the customer delivery record; do not describe an untested combination as supported. |
+| Component | Supported / tested now |
+|---|---|
+| Kubernetes | Chart accepts 1.30+; test lane uses Kind 1.32.1 |
+| Helm | 3.17+; tested with 3.17.1 |
+| PostgreSQL | 16 |
+| OpenShell | 0.0.98 |
+| agent-sandbox | 0.5.0 |
+| Runtime | Cluster/OpenShell default; no VM-isolation claim |
+| MCP-GW | 0.3.2 authority v1; 0.4.9 authority v2 |
+| Other integrations | Operator-supplied and tested as part of the selected deployment |
 
-Runtime support is deliberately narrower than the chart's DNS-label validation:
-
-| Kubernetes / node / CRI | OpenShell / agent-sandbox | RuntimeClass handler | Evidence and isolation claim |
-|---|---|---|---|
-| Kind v1.32.1, host architecture, containerd | OpenShell v0.0.98 / agent-sandbox v0.5.0 | Test-only `openshell-runc` → `runc` | Product E2E proves mTLS, workload exchange, copy-task execution, RuntimeClass propagation, and cleanup. It is **not** VM isolation. |
-| Customer production cluster | Pin and record the selected versions | Explicit customer-installed handler | Unsupported until the delivery record proves the handler on the target node pool, an actual OpenShell Sandbox Pod, and its advertised isolation mechanism. Steward does not install or support an arbitrary handler merely because its name renders. |
-
-The cluster operator owns handler installation on compatible nodes, node
-labels/taints, RuntimeClass `scheduling` selectors/tolerations, `overhead`, CRI
-configuration, and preservation across node upgrades. Before enabling execution,
-check that the selected class exists, its handler is registered on every eligible
-node, and OpenShell's `server.defaultRuntimeClassName` exactly equals
-`config.controller.openshellRuntimeClassName`:
-
-```sh
-kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
-  get runtimeclass "$STEWARD_RUNTIME_CLASS" -o jsonpath='{.handler}{"\n"}'
-kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
-  get nodes -l "$RUNTIME_NODE_SELECTOR" -o name
-```
-
-The delivery test must additionally prove absent class, unavailable handler,
-wrong-node scheduling, and OpenShell/Steward name mismatch fail before a task is
-accepted. A successful `runc` propagation check cannot satisfy that evidence.
+Runtime support is the Kubernetes/OpenShell default. Operators may set
+`config.controller.openshellRuntimeClassName` only when their platform requires
+an explicit class. That optional override is deployment configuration, not a
+separate Steward-supported runtime or an isolation certification.
 
 Integration ownership is explicit: core requires only PostgreSQL, Kubernetes
 TokenReview/API access, and service TLS; Jira adds a decision channel; browser
 OIDC adds an external identity provider and edge; GitHub source adds a read-only
 GitHub App; task identity adds an external issuer/public JWKS; governed execution
-adds OpenShell, SPIRE, workload exchange, LiteLLM, Mint, a sandbox RuntimeClass,
+adds OpenShell, SPIRE, workload exchange, LiteLLM, Mint,
 and optionally MCP-GW/provider profiles. The stable and Connections bridges are
 independent opt-ins with immutable images and provenance contracts. See the
 [chart configuration](../../charts/steward/README.md) for exact flags and
@@ -284,18 +266,16 @@ resolved_chart_digest="$(
 )"
 test "${resolved_chart_digest}" = "${STEWARD_CHART_DIGEST}"
 
-STEWARD_CHART_PACKAGE="${STEWARD_CHART_DIRECTORY}/steward@sha256-${STEWARD_CHART_DIGEST#sha256:}.tgz"
+STEWARD_CHART_PACKAGE="$(find "${STEWARD_CHART_DIRECTORY}" -maxdepth 1 -type f -name 'steward*.tgz' -print -quit)"
 test -s "${STEWARD_CHART_PACKAGE}"
 ```
 
 Keep `STEWARD_CHART_PACKAGE` in the same shell for the remaining commands.
-For a source-tree install instead, set
-`STEWARD_CHART_PACKAGE=./charts/steward` and record the exact commit and chart
-archive checksum; do not mix that tree with images from another revision.
+The supported release procedure installs this pulled archive; a source checkout
+or locally built image is not release evidence.
 
-1. Select a chart directory from the exact release or fork revision and record
-   its OCI digest (or, for a source-tree install, the exact commit and chart
-   archive checksum) and each image digest in the delivery record. Set a
+1. Record the chart OCI digest and every component image digest from the same
+   release handoff. Set a
    target-specific values file, for example:
 
    ```yaml
@@ -340,7 +320,6 @@ archive checksum; do not mix that tree with images from another revision.
      controller:
        openshellEndpoint: https://gateway.example.test:8080
        openshellServerName: gateway.example.test
-       openshellRuntimeClassName: customer-sandbox-vm
        workloadExchangeEndpoint: https://identity.example.test/v1/workload/exchange
        workloadExchangeServerName: identity.example.test
        litellmUrl: https://litellm.example.test
@@ -512,14 +491,11 @@ Do not hand off merely because `helm template` or `helm lint` passed.
    Kubernetes API, and TLS supplied. A Task execution attempt must fail
    closed, not start a sandbox or call a model.
 5. For governed mode, first confirm OpenShell mTLS, workload exchange,
-   SPIRE identity, LiteLLM, Mint readiness, the reviewed RuntimeClass, and
-   policy-bound sandbox isolation. Activate execution bindings and Task
+   SPIRE identity, LiteLLM, and Mint readiness. Activate execution bindings and Task
    orchestration only in their documented staged rollout sequence. Run one
-   approved bounded Task, then verify execution, audit, and cleanup. Do not
-   infer isolation from a successful unconfined Kind/runc run.
-   Inspect the actual Sandbox Pod/CR and record its `runtimeClassName`, node,
-   selected RuntimeClass handler, and the platform's non-secret handler/isolation
-   evidence. Confirm no undeclared provider profile was attached.
+   approved bounded Task, then verify execution, audit, and cleanup. Confirm no
+   undeclared provider profile was attached. This is functional sandbox
+   acceptance and does not establish VM isolation.
 6. Exercise a fresh install, same-revision upgrade, a supported prior-version
    upgrade, and rollback on a disposable or otherwise explicitly authorized
    target. Verify no user data, credentials, CRDs, or external integrations

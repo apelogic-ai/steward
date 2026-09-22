@@ -255,7 +255,10 @@ fn openshell_connection_config() -> Result<OpenShellConnectionConfig, io::Error>
             "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
         )?),
         server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
-        runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
+        runtime_class_name: env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_default(),
         task_log_mode,
         stable_bridge_gateway_origin: bridge_gateway_origin_for_image(
             &stable_bridge_image,

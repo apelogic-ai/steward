@@ -1130,7 +1130,9 @@ impl OpenShellConnectionConfig {
                 reason: "workload exchange CA certificate is required".to_owned(),
             });
         }
-        if !valid_kubernetes_runtime_class_name(&self.runtime_class_name) {
+        if !self.runtime_class_name.is_empty()
+            && !valid_kubernetes_runtime_class_name(&self.runtime_class_name)
+        {
             return Err(PortError::Rejected {
                 reason: "OpenShell gateway runtime class must be a valid Kubernetes DNS subdomain"
                     .to_owned(),
@@ -3752,7 +3754,6 @@ mod tests {
         let label_too_long = "a".repeat(64);
         let name_too_long = vec!["a".repeat(63); 4].join(".");
         for runtime_class_name in [
-            "".to_owned(),
             "invalid/runtime".to_owned(),
             "Invalid".to_owned(),
             "invalid_name".to_owned(),
@@ -3770,6 +3771,15 @@ mod tests {
                 "the OpenShell adapter must reject invalid Kubernetes RuntimeClass name {runtime_class_name:?}"
             );
         }
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn gateway_runtime_class_may_use_the_openshell_default() {
+        let mut config = valid_connection_config();
+        config.runtime_class_name.clear();
+
+        assert_eq!(config.validate(), Ok(()));
     }
 
     #[cfg(feature = "runtime")]

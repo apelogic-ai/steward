@@ -198,7 +198,7 @@ impl ConnectionExecutionBindings {
             || origin.fragment().is_some()
             || connection_authority(&self.mcp_gw_version).is_err()
             || self.namespace.trim().is_empty()
-            || self.runtime_class.trim().is_empty()
+            || (!self.runtime_class.is_empty() && self.runtime_class.trim().is_empty())
         {
             return Err(GovernedConnectionPlanError::InvalidBindings);
         }
@@ -1126,6 +1126,14 @@ mod tests {
             candidate.validate(),
             Err(GovernedConnectionPlanError::InvalidBindings)
         );
+    }
+
+    #[test]
+    fn governed_connection_operations_may_use_the_openshell_default_runtime() {
+        let mut candidate = bindings();
+        candidate.runtime_class.clear();
+
+        assert_eq!(candidate.validate(), Ok(()));
     }
 
     #[test]
