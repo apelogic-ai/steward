@@ -2502,6 +2502,15 @@ mod tests {
         ] {
             assert!(ci.contains(required), "pinned CI is missing {required}");
         }
+        let governed_connections_job = ci
+            .split_once("  governed-connections:\n")
+            .and_then(|(_, remainder)| remainder.split_once("\n  postgres-tls:"))
+            .map(|(job, _)| job)
+            .ok_or_else(|| "governed Connections CI job boundary is missing".to_owned())?;
+        assert!(
+            governed_connections_job.contains("supervisor-tools: \"true\""),
+            "governed Connections CI must install the pinned supervisor build tools"
+        );
         assert!(
             xtask_source.contains("\"e2e-governed-connections\" if rest.is_empty()")
                 && xtask_source.contains("scripts/governed-connections-e2e.sh"),
@@ -4272,6 +4281,32 @@ esac
         assert!(
             script.contains("-H 'User-Agent: steward-conformance/1.0' https://api.github.com/zen"),
             "the public G-1 GitHub API probe must identify itself without adding a credential"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn g1_requires_the_explicit_default_deny_response() -> Result<(), String> {
+        let script_path = root().join("scripts/g1-upstream-conformance-inside.sh");
+        let script = fs::read_to_string(&script_path)
+            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
+        assert!(
+            script.contains(
+                "curl -sS --max-time 20 -H 'User-Agent: steward-conformance/1.0' https://api.github.com/zen"
+            ),
+            "the allowed probe must treat an upstream HTTP response as reachable without curl --fail"
+        );
+        assert!(
+            script.contains(
+                "curl -sS --max-time 10 --output /dev/null --write-out '%{http_connect}' https://docs.rs"
+            ),
+            "the forbidden HTTPS probe must retain the proxy CONNECT status for an explicit denial assertion"
+        );
+        assert!(
+            script.contains(
+                "if [[ \"${denied_exit}\" -ne 56 || \"${denied_connect_status}\" != \"403\" ]]; then"
+            ),
+            "G-1 must pass only on curl's failed CONNECT exit paired with OpenShell's explicit 403 denial"
         );
         Ok(())
     }
