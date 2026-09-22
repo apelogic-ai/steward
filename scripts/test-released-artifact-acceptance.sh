@@ -35,4 +35,9 @@ if grep -Eq 'docker build[[:space:]]|docker push|registry:2|charts/steward.*upgr
   exit 1
 fi
 
+if grep -Fq '/private/tmp' "${harness}"; then
+  echo 'released-artifact acceptance must use the portable runner temporary directory' >&2
+  exit 1
+fi
+
 echo 'released-artifact acceptance contract passed'

@@ -15,7 +15,8 @@ web_digest="${STEWARD_RELEASE_WEB_DIGEST:?STEWARD_RELEASE_WEB_DIGEST is required
 run_id="core-$(date -u +%Y%m%d%H%M%S)-$$"
 cluster="steward-${run_id}"
 context="kind-${cluster}"
-run_dir="$(mktemp -d "/private/tmp/steward-${run_id}.XXXXXX")"
+temp_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+run_dir="$(mktemp -d "${temp_root%/}/steward-${run_id}.XXXXXX")"
 chmod 700 "${run_dir}"
 kubeconfig="${run_dir}/kubeconfig"
 cluster_created=0
