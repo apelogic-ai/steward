@@ -1254,6 +1254,10 @@ impl TaskSubmissionLedger for PgStore {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskSubmissionRequest {
     pub workflow: String,
+    /// Optional compatibility assertion for an unversioned legacy Workflow.
+    /// Steward selects the runtime from its own Workflow catalog when this is
+    /// omitted and rejects any supplied value that does not match the catalog.
+    /// Versioned Workflows always reject this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coding_agent_runtime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1777,11 +1781,6 @@ where
             &request.workflow,
             request.coding_agent_runtime.as_deref(),
         )?;
-        if reference.is_none() && request.coding_agent_runtime.is_none() {
-            return Err(ApiError::Admission(
-                "legacy workflows require codingAgentRuntime".to_owned(),
-            ));
-        }
         if let Some(record) = self
             .ledger
             .task_by_idempotency(
@@ -1809,10 +1808,11 @@ where
             .workflows
             .workflow(&request.workflow)
             .ok_or(ApiError::TaskWorkflowNotFound)?;
-        let coding_agent_runtime = request.coding_agent_runtime.as_deref().ok_or_else(|| {
-            ApiError::Admission("legacy workflows require codingAgentRuntime".to_owned())
-        })?;
-        if coding_agent_runtime != workflow.coding_agent_runtime {
+        if request
+            .coding_agent_runtime
+            .as_deref()
+            .is_some_and(|runtime| runtime != workflow.coding_agent_runtime)
+        {
             return Err(ApiError::Admission(
                 "codingAgentRuntime is not selected by the workflow".to_owned(),
             ));
@@ -2895,9 +2895,6 @@ fn validate_task_retry(
             }
         }
         None => {
-            let requested_runtime = request.coding_agent_runtime.as_deref().ok_or_else(|| {
-                ApiError::Admission("legacy workflows require codingAgentRuntime".to_owned())
-            })?;
             let runtime_binding_matches = match request.agent_runtime_uid.as_deref() {
                 Some(runtime_uid) => {
                     record.runtime_ownership == RuntimeOwnership::Adopted
@@ -2915,7 +2912,10 @@ fn validate_task_retry(
             if record.workflow != request.workflow
                 || record.workflow_name.is_some()
                 || record.workflow_version.is_some()
-                || record.coding_agent_runtime != requested_runtime
+                || request
+                    .coding_agent_runtime
+                    .as_deref()
+                    .is_some_and(|runtime| record.coding_agent_runtime != runtime)
                 || !runtime_binding_matches
             {
                 return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
