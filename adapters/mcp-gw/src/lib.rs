@@ -299,26 +299,10 @@ fn validate_status_response(object: &Map<String, Value>) -> Result<(), PortError
 }
 
 fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, PortError> {
-    if !object.keys().all(|key| {
-        matches!(
-            key.as_str(),
-            "version"
-                | "provider"
-                | "phase"
-                | "connected"
-                | "account"
-                | "requiredScopes"
-                | "grantedScopes"
-                | "missingScopes"
-                | "activeCredentialExpiresAt"
-                | "renewalCredentialExpiresAt"
-                | "lastAuthorizedAt"
-                | "lastRenewedAt"
-                | "lastValidatedAt"
-                | "capabilities"
-                | "errorCategory"
-        )
-    }) || object.get("version").and_then(Value::as_str) != Some("1")
+    // Validate only the fields Steward consumes. MCP-GW may add lifecycle metadata without
+    // changing this contract, and the projection below prevents unconsumed values from entering
+    // Steward's governed archive or browser response.
+    if object.get("version").and_then(Value::as_str) != Some("1")
         || object.get("provider").and_then(Value::as_str) != Some("github")
     {
         return Err(rejected(
@@ -383,7 +367,7 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
         .get("capabilities")
         .and_then(Value::as_object)
         .ok_or_else(|| rejected("GitHub lifecycle capabilities are invalid"))?;
-    if !capabilities.iter().all(|(key, value)| {
+    if capabilities.iter().any(|(key, value)| {
         matches!(
             key.as_str(),
             "interactiveAuthorization"
@@ -396,7 +380,7 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
                 | "scopeReporting"
                 | "identityVerification"
                 | "authorizationRequiresRenewalCredential"
-        ) && value.is_boolean()
+        ) && !value.is_boolean()
     }) || object
         .get("errorCategory")
         .is_some_and(|value| value.as_str().is_none_or(|category| category.len() > 64))
@@ -703,21 +687,33 @@ mod tests {
     }
 
     #[test]
-    fn normalized_status_preserves_expiry_without_forwarding_provider_secrets() -> Result<(), String>
-    {
+    fn normalized_status_accepts_additive_fields_without_forwarding_them() -> Result<(), String> {
         let status = br#"{"version":"1","provider":"github","phase":"connected","connected":true,"account":{"displayName":"alice@example.com"},"requiredScopes":["repo"],"grantedScopes":["repo"],"missingScopes":[],"activeCredentialExpiresAt":"2026-09-15T12:00:00.000Z","renewalCredentialExpiresAt":"2026-09-16T12:00:00.000Z","lastAuthorizedAt":"2026-09-14T12:00:00.000Z","lastRenewedAt":null,"lastValidatedAt":null,"capabilities":{"interactiveAuthorization":true,"activeCredentialExpiry":true,"automaticRenewal":true,"manualRenewal":true,"rotatingRenewalCredential":true,"providerValidation":true,"providerRevocation":true,"scopeReporting":true,"identityVerification":true}}"#;
         let mut escaped: serde_json::Value = serde_json::from_slice(status)
             .map_err(|error| format!("fixed neutral status fixture is invalid: {error}"))?;
+        escaped["activeCredentialPresent"] = serde_json::json!(true);
+        escaped["renewalCredentialPresent"] = serde_json::json!(true);
+        escaped["statusUpdatedAt"] = serde_json::json!("2026-09-14T12:30:00.000Z");
         escaped["activeCredential"] = serde_json::json!("fake-secret");
-        assert!(
+        escaped["capabilities"]["statusMetadata"] = serde_json::json!(true);
+        assert_eq!(
             parse_response(
                 GatewayContract::LifecycleV049,
                 GithubBridgeOperation::Status,
                 StatusCode::OK,
                 escaped.to_string().as_bytes(),
-            )
-            .is_err(),
-            "unexpected credential material must not enter the governed Task archive"
+            ),
+            Ok(serde_json::json!({
+                "phase": "connected",
+                "connected": true,
+                "email": "alice@example.com",
+                "scopesRequired": ["repo"],
+                "scopesGranted": ["repo"],
+                "missingScopes": [],
+                "activeCredentialExpiresAt": "2026-09-15T12:00:00.000Z",
+                "renewalCredentialExpiresAt": "2026-09-16T12:00:00.000Z"
+            })),
+            "additive fields must not break status, and unconsumed values must not enter the governed Task archive"
         );
 
         assert_eq!(
