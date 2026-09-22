@@ -710,6 +710,12 @@ export type TaskStatusResponse = LegacyTaskStatusResponse | DirectTaskStatusResp
 
 export type TaskSubmissionRequest = {
     agentRuntimeUid?: string | null;
+    /**
+     * Optional compatibility assertion for an unversioned legacy Workflow.
+     * Steward selects the runtime from its own Workflow catalog when this is
+     * omitted and rejects any supplied value that does not match the catalog.
+     * Versioned Workflows always reject this field.
+     */
     codingAgentRuntime?: string | null;
     workflow: string;
 };
