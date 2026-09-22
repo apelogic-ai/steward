@@ -76,14 +76,14 @@ again in the customer's cluster before enabling governed execution.
 
 | Component | Supported / tested now |
 |---|---|
-| Kubernetes | Chart requires 1.30+; release acceptance uses Kind 1.32.1. |
-| Helm | 3.17+; release acceptance uses 3.17.1. |
-| PostgreSQL | 16. |
-| OpenShell | 0.0.98. |
-| agent-sandbox | 0.5.0. |
-| Runtime | Cluster/OpenShell default; functional isolation only, no VM claim. |
-| MCP-GW | Authority v1: 0.3.2; authority v2: 0.4.9. |
-| SPIRE, LiteLLM, cert-manager, browser identity, GitHub, edge gateway | Operator-supplied; record the exact version tested for the selected deployment. |
+| Kubernetes | Chart accepts 1.30+; test lane uses Kind 1.32.1 |
+| Helm | 3.17+; tested with 3.17.1 |
+| PostgreSQL | 16 |
+| OpenShell | 0.0.98 |
+| agent-sandbox | 0.5.0 |
+| Runtime | Cluster/OpenShell default; no VM-isolation claim |
+| MCP-GW | 0.3.2 authority v1; 0.4.9 authority v2 |
+| Other integrations | Operator-supplied and tested as part of the selected deployment |
 
 Runtime support is the Kubernetes/OpenShell default. Operators may set
 `config.controller.openshellRuntimeClassName` only when their platform requires
