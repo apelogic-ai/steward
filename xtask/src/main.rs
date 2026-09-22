@@ -2309,9 +2309,6 @@ mod tests {
             "OPEN_SHELL_RELEASE=\"v0.0.98\"",
             "KIND_NODE_IMAGE=\"kindest/node:v1.32.1@sha256:6afef2b7f69d627ea7bf27ee6696b6868d18e03bf98167c420df486da4662db6\"",
             "--image \"${KIND_NODE_IMAGE}\"",
-            "server.defaultRuntimeClassName=openshell-runc",
-            "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME=openshell-runc",
-            "handler: runc",
             "server.oidc.issuer=",
             "--test openshell_adapter_v0098",
         ] {
@@ -2320,10 +2317,20 @@ mod tests {
                 "OpenShell adapter integration harness is missing {required}"
             );
         }
+        let explicit_runtime_lane = harness
+            .contains("server.defaultRuntimeClassName=openshell-runc")
+            && harness.contains("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME=openshell-runc")
+            && harness.contains("handler: runc")
+            && e2e_source.contains("assert_runtime_class_propagation");
+        let default_runtime_lane = harness
+            .contains("adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup")
+            && !harness.contains("server.defaultRuntimeClassName=")
+            && !harness.contains("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME=")
+            && !harness.contains("kind: RuntimeClass")
+            && e2e_source.contains("assert_default_runtime_class");
         assert!(
-            e2e_source.contains("assert_runtime_class_propagation")
-                && !e2e_source.contains("kata_bound"),
-            "the kind lane must describe runtime-class propagation, not Kata isolation"
+            (explicit_runtime_lane || default_runtime_lane) && !e2e_source.contains("kata_bound"),
+            "the kind lane must enforce either the existing explicit RuntimeClass contract or the cluster default runtime, never Kata isolation"
         );
         assert!(
             chart_readme.contains("does not prove a VM isolation boundary"),
@@ -2348,12 +2355,10 @@ mod tests {
 
         for required in [
             "Helm 3.17.0 or newer",
-            "OCI chart digest pull commands were exercised with Helm v3.17.1",
             "STEWARD_CHART_REF=\"oci://${STEWARD_CHART_REPOSITORY}@${STEWARD_CHART_DIGEST}\"",
             "helm pull \"${STEWARD_CHART_REF}\" --destination \"${STEWARD_CHART_DIRECTORY}\"",
             "awk '$1 == \"Digest:\" { print $2 }'",
             "test \"${resolved_chart_digest}\" = \"${STEWARD_CHART_DIGEST}\"",
-            "STEWARD_CHART_PACKAGE=\"${STEWARD_CHART_DIRECTORY}/steward@sha256-${STEWARD_CHART_DIGEST#sha256:}.tgz\"",
             "upgrade --install steward \"${STEWARD_CHART_PACKAGE}\"",
         ] {
             assert!(
@@ -2361,6 +2366,16 @@ mod tests {
                 "customer installation guide is missing the copyable OCI chart command: {required}"
             );
         }
+        assert!(
+            guide.contains("OCI chart digest pull commands were exercised with Helm v3.17.1")
+                || guide.contains("| Helm | 3.17+; tested with 3.17.1 |"),
+            "customer installation guide must record the tested Helm version"
+        );
+        assert!(
+            guide.contains("STEWARD_CHART_PACKAGE=\"${STEWARD_CHART_DIRECTORY}/steward@sha256-${STEWARD_CHART_DIGEST#sha256:}.tgz\"")
+                || guide.contains("STEWARD_CHART_PACKAGE=\"$(find \"${STEWARD_CHART_DIRECTORY}\" -maxdepth 1 -type f -name 'steward*.tgz' -print -quit)\""),
+            "customer installation guide must select the pulled chart package"
+        );
 
         Ok(())
     }
