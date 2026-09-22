@@ -18,10 +18,10 @@ do
 done
 
 for required in \
-  'docker pull "${image_repository}@${digest}"' \
-  'helm pull "${chart_repository}@${chart_digest}"' \
+  "docker pull \"\${image_repository}@\${digest}\"" \
+  "helm pull \"\${chart_repository}@\${chart_digest}\"" \
   'kind create cluster' \
-  'upgrade --install steward "${chart_archive}"' \
+  "upgrade --install steward \"\${chart_archive}\"" \
   '_sqlx_migrations' \
   'complete-rendered.yaml'
 do

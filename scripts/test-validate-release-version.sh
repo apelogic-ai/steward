@@ -5,6 +5,8 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fixture="$(mktemp -d)"
 trap 'rm -rf "${fixture}"' EXIT
 mkdir -p "${fixture}/charts/steward" "${fixture}/docs/installation"
+current_version=0.1.23
+previous_version=0.1.22
 
 write_fixture() {
   local chart="$1"
@@ -12,22 +14,22 @@ write_fixture() {
   local readme="$3"
   local guide="$4"
   printf 'apiVersion: v2\nname: steward\nversion: %s\nappVersion: %s\n' "${chart}" "${app}" > "${fixture}/charts/steward/Chart.yaml"
-  printf 'Current installation contract: chart `%s`.\n' "${readme}" > "${fixture}/README.md"
-  printf 'Release contract: chart `%s`.\n' "${guide}" > "${fixture}/docs/installation/installation-guide.md"
+  printf 'Current installation contract: chart \x60%s\x60.\n' "${readme}" > "${fixture}/README.md"
+  printf 'Release contract: chart \x60%s\x60.\n' "${guide}" > "${fixture}/docs/installation/installation-guide.md"
 }
 
-write_fixture 0.1.22 0.1.22 0.1.22 0.1.22
-test "$(bash "${root}/scripts/validate-release-version.sh" "${fixture}")" = 0.1.22
-STEWARD_RELEASE_VERSION=0.1.22 bash "${root}/scripts/validate-release-version.sh" "${fixture}" >/dev/null
+write_fixture "${current_version}" "${current_version}" "${current_version}" "${current_version}"
+test "$(bash "${root}/scripts/validate-release-version.sh" "${fixture}")" = "${current_version}"
+STEWARD_RELEASE_VERSION="${current_version}" bash "${root}/scripts/validate-release-version.sh" "${fixture}" >/dev/null
 
 for mismatch in app readme guide tag; do
-  write_fixture 0.1.22 0.1.22 0.1.22 0.1.22
+  write_fixture "${current_version}" "${current_version}" "${current_version}" "${current_version}"
   case "${mismatch}" in
-    app) sed -i.bak 's/appVersion: 0.1.22/appVersion: 0.1.21/' "${fixture}/charts/steward/Chart.yaml" ;;
-    readme) sed -i.bak 's/chart `0.1.22`/chart `0.1.21`/' "${fixture}/README.md" ;;
-    guide) sed -i.bak 's/chart `0.1.22`/chart `0.1.21`/' "${fixture}/docs/installation/installation-guide.md" ;;
+    app) sed -i.bak "s/appVersion: ${current_version}/appVersion: ${previous_version}/" "${fixture}/charts/steward/Chart.yaml" ;;
+    readme) sed -i.bak "s/chart \`${current_version}\`/chart \`${previous_version}\`/" "${fixture}/README.md" ;;
+    guide) sed -i.bak "s/chart \`${current_version}\`/chart \`${previous_version}\`/" "${fixture}/docs/installation/installation-guide.md" ;;
     tag)
-      if STEWARD_RELEASE_VERSION=0.1.21 bash "${root}/scripts/validate-release-version.sh" "${fixture}" >/dev/null 2>&1; then
+      if STEWARD_RELEASE_VERSION="${previous_version}" bash "${root}/scripts/validate-release-version.sh" "${fixture}" >/dev/null 2>&1; then
         echo 'mismatched release tag unexpectedly passed' >&2
         exit 1
       fi
