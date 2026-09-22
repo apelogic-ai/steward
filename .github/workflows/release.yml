@@ -658,13 +658,17 @@ jobs:
           STEWARD_RELEASE_CHART_REPOSITORY: oci://ghcr.io/${{ github.repository_owner }}/charts/steward
         run: |
           set -euo pipefail
-          export STEWARD_RELEASE_VERSION="${GITHUB_REF_NAME#v}"
-          export STEWARD_RELEASE_CHART_DIGEST="$(cat dist/helm-chart.digest)"
-          export STEWARD_RELEASE_APISERVER_DIGEST="$(cat dist/apiserver.digest)"
-          export STEWARD_RELEASE_CONTROLLER_DIGEST="$(cat dist/controller.digest)"
-          export STEWARD_RELEASE_MINT_DIGEST="$(cat dist/mint.digest)"
-          export STEWARD_RELEASE_BRIDGE_DIGEST="$(cat dist/bridge.digest)"
-          export STEWARD_RELEASE_WEB_DIGEST="$(cat dist/web.digest)"
+          STEWARD_RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          STEWARD_RELEASE_CHART_DIGEST="$(cat dist/helm-chart.digest)"
+          STEWARD_RELEASE_APISERVER_DIGEST="$(cat dist/apiserver.digest)"
+          STEWARD_RELEASE_CONTROLLER_DIGEST="$(cat dist/controller.digest)"
+          STEWARD_RELEASE_MINT_DIGEST="$(cat dist/mint.digest)"
+          STEWARD_RELEASE_BRIDGE_DIGEST="$(cat dist/bridge.digest)"
+          STEWARD_RELEASE_WEB_DIGEST="$(cat dist/web.digest)"
+          export STEWARD_RELEASE_VERSION STEWARD_RELEASE_CHART_DIGEST
+          export STEWARD_RELEASE_APISERVER_DIGEST STEWARD_RELEASE_CONTROLLER_DIGEST
+          export STEWARD_RELEASE_MINT_DIGEST STEWARD_RELEASE_BRIDGE_DIGEST
+          export STEWARD_RELEASE_WEB_DIGEST
           bash scripts/customer-core-install-e2e.sh
 
   release:
