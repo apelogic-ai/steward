@@ -9,9 +9,11 @@ use ed25519_dalek::SigningKey;
 use rand_core::OsRng;
 use serde_json::Value;
 use steward_mint::{
-    AuthorityBinding, AuthorityResolver, AuthorityState, DEFAULT_AUTHORITY_TTL,
-    IntrospectionClientCredential, Mint, MintConfig, MintError, MintSigningKey, SvidAssertion,
-    SvidValidationError, SvidValidator, ValidatedWorkload, router,
+    AuthenticatedControlPlaneWorkload, AuthorityBinding, AuthorityResolver, AuthorityState,
+    ControlPlaneClientCredential, ControlPlaneMintConfig, ControlPlaneWorkloadAuthenticator,
+    DEFAULT_AUTHORITY_TTL, IntrospectionClientCredential, Mint, MintConfig, MintError,
+    MintSigningKey, SvidAssertion, SvidValidationError, SvidValidator, ValidatedWorkload,
+    control_plane_router, router,
 };
 use steward_types::{CanonicalAuthorityBinding, CanonicalUserId, Email, Principal, RuntimeId};
 use tower::ServiceExt;
@@ -64,6 +66,29 @@ impl SvidValidator for FixedValidator {
 
 struct FixedResolver {
     calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct FixedControlPlaneAuthenticator {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ControlPlaneWorkloadAuthenticator for FixedControlPlaneAuthenticator {
+    fn authenticate(
+        &self,
+        credential: ControlPlaneClientCredential,
+    ) -> impl Future<Output = Result<AuthenticatedControlPlaneWorkload, MintError>> + Send {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        ready(
+            if credential.secret() == "projected-service-account-token" {
+                Ok(AuthenticatedControlPlaneWorkload::new(
+                    "system:serviceaccount:steward-test:steward-apiserver".to_owned(),
+                ))
+            } else {
+                Err(MintError::ControlPlaneClientRejected)
+            },
+        )
+    }
 }
 
 impl AuthorityResolver for FixedResolver {
@@ -120,6 +145,51 @@ fn app(
     Ok((router(Arc::new(mint)), validator_calls, resolver_calls))
 }
 
+fn control_plane_app() -> Result<(axum::Router, Arc<AtomicUsize>), String> {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let mint = Mint::new(
+        MintConfig {
+            issuer: "https://mint.example.test".to_owned(),
+            audience: "mcp-gw.example.test".to_owned(),
+            allowed_scopes: vec!["tools".to_owned()],
+            svid_audience: "https://mint.example.test".to_owned(),
+            authority_ttl: DEFAULT_AUTHORITY_TTL,
+            introspection_client_credential: IntrospectionClientCredential::new(
+                "gateway-credential".to_owned(),
+            ),
+        },
+        MintSigningKey::from_bytes(&signing_key.to_bytes()),
+        FixedValidator {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Ok(ValidatedWorkload {
+                spiffe_id: WORKLOAD.to_owned(),
+            }),
+        },
+        FixedResolver {
+            calls: Arc::new(AtomicUsize::new(0)),
+        },
+    )
+    .map_err(|error| format!("test mint config must be valid: {error:?}"))?
+    .with_control_plane(
+        ControlPlaneMintConfig::new(
+            "system:serviceaccount:steward-test:steward-apiserver".to_owned(),
+            std::time::Duration::from_secs(15),
+        )
+        .map_err(|error| format!("control-plane config must be valid: {error:?}"))?,
+    )
+    .map_err(|error| format!("control-plane mint config must be valid: {error:?}"))?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Ok((
+        control_plane_router(
+            Arc::new(mint),
+            FixedControlPlaneAuthenticator {
+                calls: calls.clone(),
+            },
+        ),
+        calls,
+    ))
+}
+
 async fn call(
     app: axum::Router,
     method: &str,
@@ -167,6 +237,114 @@ async fn call_with_authorization(
     let json = serde_json::from_slice(&body)
         .map_err(|error| format!("OAuth responses must be JSON: {error}"))?;
     Ok((status, headers, json))
+}
+
+async fn call_json_with_authorization(
+    app: axum::Router,
+    uri: &str,
+    body: &str,
+    authorization: Option<&str>,
+) -> Result<(StatusCode, HeaderMap, Value), String> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(authorization) = authorization {
+        request = request.header("authorization", authorization);
+    }
+    let request = request
+        .body(Body::from(body.to_owned()))
+        .map_err(|error| format!("build request: {error}"))?;
+    let response = app
+        .oneshot(request)
+        .await
+        .map_err(|error| format!("route request: {error}"))?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .map_err(|error| format!("read response: {error}"))?;
+    let json = serde_json::from_slice(&body)
+        .map_err(|error| format!("OAuth responses must be JSON: {error}"))?;
+    Ok((status, headers, json))
+}
+
+const CONTROL_PLANE_BODY: &str = r#"{
+  "principal":{"kind":"user","actingUser":"alice@example.com"},
+  "canonicalAuthority":{
+    "schemaVersion":"steward/canonical-authority-binding/v1",
+    "ownerUserId":"usr_0123456789abcdef0123456789abcdef",
+    "actingUserId":"usr_0123456789abcdef0123456789abcdef"
+  }
+}"#;
+
+#[tokio::test]
+async fn control_plane_exchange_authenticates_before_parsing_and_returns_no_store()
+-> Result<(), String> {
+    let (app, authenticator_calls) = control_plane_app()?;
+    let (status, _, body) = call_json_with_authorization(
+        app.clone(),
+        "/control-plane/token",
+        CONTROL_PLANE_BODY,
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "invalid_client");
+    assert_eq!(authenticator_calls.load(Ordering::SeqCst), 0);
+
+    let (status, _, body) = call_json_with_authorization(
+        app.clone(),
+        "/control-plane/token",
+        "not-json",
+        Some("Bearer wrong-token"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "invalid_client");
+    assert_eq!(authenticator_calls.load(Ordering::SeqCst), 1);
+
+    let (status, headers, body) = call_json_with_authorization(
+        app,
+        "/control-plane/token",
+        CONTROL_PLANE_BODY,
+        Some("Bearer projected-service-account-token"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(headers["pragma"], "no-cache");
+    assert_eq!(body["token_type"], "Bearer");
+    assert_eq!(body["expires_in"], 15);
+    assert_eq!(body["scope"], "connections_status");
+    assert!(
+        body["access_token"]
+            .as_str()
+            .is_some_and(|token| token.split('.').count() == 3),
+        "successful control-plane exchange must return one compact JWT"
+    );
+    assert_eq!(authenticator_calls.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn control_plane_exchange_rejects_additive_caller_authority_fields() -> Result<(), String> {
+    let (app, authenticator_calls) = control_plane_app()?;
+    let body = CONTROL_PLANE_BODY.replace(
+        "\n}",
+        ",\n  \"scope\":\"admin\",\n  \"service\":\"other\"\n}",
+    );
+    let (status, _, response) = call_json_with_authorization(
+        app,
+        "/control-plane/token",
+        &body,
+        Some("Bearer projected-service-account-token"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(response["error"], "invalid_request");
+    assert_eq!(authenticator_calls.load(Ordering::SeqCst), 1);
+    Ok(())
 }
 
 #[tokio::test]

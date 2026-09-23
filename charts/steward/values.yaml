@@ -157,6 +157,7 @@ config:
     issuer: ""
     audience: steward-mcp
     allowedScopes: mcp inference
+    controlPlaneAudience: steward-mint-control-plane
     svidAudience: steward-mint
     spiffeTrustDomain: ""
     openshellNamespace: ""

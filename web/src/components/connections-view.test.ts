@@ -19,4 +19,10 @@ describe("governed provider connection controls", () => {
     expect(source).toContain('Re-authorize GitHub');
     expect(source).toContain('renewalCredentialExpiresAt');
   });
+
+  test("keeps the provider card and recovery action available without status metadata", () => {
+    expect(source).toContain('state.status === "ready" ? state.value : undefined');
+    expect(source).toContain('Authorize / re-authorize GitHub');
+    expect(source).toContain('Status unavailable');
+  });
 });
