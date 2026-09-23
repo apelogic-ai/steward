@@ -1,8 +1,8 @@
-# Upgrade to Steward v0.2.0
+# Upgrade to Steward v0.2.1
 
 Status: current release contract for upgrades from v0.1.23.
 
-Steward v0.2.0 removes the Service Envelope as live Task authority. External Tasks use only an
+Steward v0.2 removes the Service Envelope as live Task authority. External Tasks use only an
 exact provisioned User Envelope; internal product operations use exact code-owned authority pins.
 Migration `0039_user_envelope_only_task_authority.sql` establishes orchestration version 3.
 
@@ -26,7 +26,7 @@ It also fails if an exact approved User Envelope snapshot cannot be recovered.
 
 ## Upgrade
 
-1. Install the exact v0.2.0 chart and image digests from the release handoff with orchestration
+1. Install the exact v0.2.1 chart and image digests from the release handoff with orchestration
    still `staged`.
 2. Allow the apiserver or controller to apply the append-only migration set through `0039`.
 3. Verify that unfinished user Tasks are version 3 with `authority_kind=user-envelope`, their

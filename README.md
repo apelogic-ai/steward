@@ -17,7 +17,7 @@ available models and tools without granting authority.
 Steward is available under the [MIT License](LICENSE). Checked-in upstream
 patches retain their [third-party notices](THIRD_PARTY_NOTICES.md).
 
-Current installation contract: chart `0.2.0`, Kubernetes `>=1.30`, Helm 3.17+,
+Current installation contract: chart `0.2.1`, Kubernetes `>=1.30`, Helm 3.17+,
 and PostgreSQL 16 as the tested database line. Governed adapter evidence pins
 OpenShell `v0.0.98` with agent-sandbox `v0.5.0`. No registry is a default:
 release images and the OCI

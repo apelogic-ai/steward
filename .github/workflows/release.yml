@@ -460,7 +460,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.2.0"
+          test "$version" = "0.2.1"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
           bridge_digest="$(cat dist/bridge.digest)"
@@ -508,10 +508,10 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.2.0 removes Service Envelope as a live authority, API, UI, and bootstrap concept. Exact provisioned User Envelope evidence is now the sole authority for externally submitted Tasks; product-owned operations retain fixed internal authorities. A deployment capability catalog replaces only the model/tool listing function and grants no authority.\n\n'
+            printf 'Steward v0.2 removes Service Envelope as a live authority, API, UI, and bootstrap concept. Exact provisioned User Envelope evidence is now the sole authority for externally submitted Tasks; product-owned operations retain fixed internal authorities. A deployment capability catalog replaces only the model/tool listing function and grants no authority.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
             printf 'Before migration 0039, terminalize and finalize every unfinished legacy Task that lacks a complete User Envelope or internal-authority pin. Use Identity v0.5.0 with policy contract github-oidc-exchange.apelogic.io/v5, remove Service Envelope bootstrap configuration, and configure the non-authoritative capability catalog.\n\n'
-            printf 'Rollback to v0.1.23 is safe before migration. After migration it is safe only before any v0.2.0-only Task is admitted and requires restoring a compatible database state. After such a Task exists, image-only rollback is unsafe. See docs/installation/upgrade-v0.2.0.md.\n\n'
+            printf 'Rollback to v0.1.23 is safe before migration. After migration it is safe only before any v0.2-or-later Task is admitted and requires restoring a compatible database state. After such a Task exists, image-only rollback is unsafe. See docs/installation/upgrade-v0.2.0.md.\n\n'
             printf '## Acceptance\n\n'
             printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
