@@ -3,6 +3,9 @@
 {{- $executionBindingsJson := toJson .Values.config.apiserver.executionBindings }}
 {{- $executionBindingsHash := $executionBindingsJson | sha256sum }}
 {{- $executionBindingsConfigMapName := printf "steward-execution-bindings-%s" ($executionBindingsHash | trunc 12) }}
+{{- $capabilityCatalogJson := toJson .Values.config.apiserver.capabilityCatalog }}
+{{- $capabilityCatalogHash := $capabilityCatalogJson | sha256sum }}
+{{- $capabilityCatalogConfigMapName := printf "steward-capability-catalog-%s" ($capabilityCatalogHash | trunc 12) }}
 {{- $sourceRepositoryBindingsJson := toJson .Values.githubSource.bindings }}
 {{- $sourceRepositoryBindingsHash := $sourceRepositoryBindingsJson | sha256sum }}
 {{- $sourceRepositoryBindingsConfigMapName := printf "steward-source-repository-bindings-%s" ($sourceRepositoryBindingsHash | trunc 12) }}
@@ -227,6 +230,13 @@ metadata: { name: {{ $executionBindingsConfigMapName }} }
 immutable: true
 data:
   execution-bindings.json: {{ $executionBindingsJson | quote }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: {{ $capabilityCatalogConfigMapName }} }
+immutable: true
+data:
+  capability-catalog.json: {{ $capabilityCatalogJson | quote }}
 {{- if .Values.githubSource.enabled }}
 ---
 apiVersion: v1
@@ -319,6 +329,7 @@ spec:
       labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver }
       annotations:
         checksum/execution-bindings: {{ $executionBindingsHash | quote }}
+        checksum/capability-catalog: {{ $capabilityCatalogHash | quote }}
 {{- if .Values.githubSource.enabled }}
         checksum/source-repository-bindings: {{ $sourceRepositoryBindingsHash | quote }}
 {{- end }}
@@ -354,7 +365,7 @@ spec:
             - { name: STEWARD_JIRA_ACCOUNT_EMAIL, value: {{ .Values.config.apiserver.jiraAccountEmail | quote }} }
 {{- end }}
             - { name: STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE, value: {{ .Values.config.apiserver.kubernetesTokenReviewAudience | quote }} }
-            - { name: STEWARD_TASK_WORKFLOWS_JSON, value: {{ .Values.config.apiserver.taskWorkflowsJson | quote }} }
+            - { name: STEWARD_CAPABILITY_CATALOG_FILE, value: /run/capability-catalog/capability-catalog.json }
             - { name: STEWARD_TASK_EXECUTION_BINDINGS_MODE, value: {{ .Values.config.apiserver.executionBindingsMode | quote }} }
             - { name: STEWARD_TASK_EXECUTION_BINDINGS_FILE, value: /run/execution-bindings/execution-bindings.json }
             - { name: STEWARD_EXECUTION_ENABLED, value: {{ .Values.execution.enabled | quote }} }
@@ -405,6 +416,7 @@ spec:
           volumeMounts:
             - { name: tls, mountPath: /run/tls, readOnly: true }
             - { name: execution-bindings, mountPath: /run/execution-bindings, readOnly: true }
+            - { name: capability-catalog, mountPath: /run/capability-catalog, readOnly: true }
 {{- if .Values.connectionsBridge.enabled }}
             - { name: connections-control-plane-credential, mountPath: /var/run/secrets/steward/connections, readOnly: true }
 {{- end }}
@@ -435,6 +447,10 @@ spec:
           configMap:
             name: {{ $executionBindingsConfigMapName }}
             items: [{ key: execution-bindings.json, path: execution-bindings.json }]
+        - name: capability-catalog
+          configMap:
+            name: {{ $capabilityCatalogConfigMapName }}
+            items: [{ key: capability-catalog.json, path: capability-catalog.json }]
 {{- if .Values.githubSource.enabled }}
         - name: github-source
           configMap:

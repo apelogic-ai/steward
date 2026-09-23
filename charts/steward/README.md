@@ -1,5 +1,7 @@
 # Steward Helm chart
 
+Current release contract: chart `0.2.0` and application `0.2.0`.
+
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
 presentation and every edge route also default to disabled. The chart can
@@ -279,19 +281,32 @@ that allowlist remain inaccessible to both service accounts.
 ## Runtime configuration
 
 - `config.apiserver.kubernetesTokenReviewAudience` is the required, non-empty
-  Kubernetes API server audience used in every delegated TokenReview, including
-  the Task API and route-scoped service-envelope bootstrap. Its chart default
+  Kubernetes API server audience used by delegated TokenReview, including the
+  Task API. Its chart default
   is `https://kubernetes.default.svc`; replace it if the target cluster's
   delegated TokenReview audience differs. This is distinct from the exchanged
   JWT's `steward-task-api` audience. The Task API is enabled on the apiserver
   service; its internal port is `services.apiserverPort`.
-- The bootstrap identity has the exact group
-  `agents.apelogic.ai/service-envelope-bootstrap:steward-run` and can call only
-  `POST /admin/service-envelopes/steward-run`. Sharing the delegated TokenReview
-  audience does not grant it access to any other administrator route.
-- `config.apiserver.taskWorkflowsJson` is the complete Task workflow catalog as
-  a JSON array. Invalid JSON or a missing, empty, or whitespace-only Kubernetes
-  TokenReview audience stops the apiserver.
+- `config.apiserver.capabilityCatalog` is the bounded, deployment-owned model/tool
+  catalog used by the template editor. The chart validates it, renders it into an
+  immutable content-addressed ConfigMap, mounts it read-only, and rolls the apiserver
+  when its checksum changes. It is descriptive availability data and never Task authority.
+
+  ```yaml
+  config:
+    apiserver:
+      capabilityCatalog:
+        schemaVersion: steward.capability-catalog/v1
+        models:
+          - provider: openai
+            model: gpt-5.4
+        tools:
+          - provider: github
+            resource: actions_get
+            action: read
+  ```
+
+  Authority, budget, TTL, template, and user fields are intentionally not part of this catalog.
 - `config.apiserver.executionBindings` is the structured, deployment-owned coding-agent
   catalog. The default `bindings: []` advertises no agents and creates no fallback.
   The chart validates it, renders it into an immutable content-addressed ConfigMap,
@@ -371,20 +386,15 @@ that allowlist remain inaccessible to both service accounts.
   (`/steward/mint` by default).
 
 Both the apiserver and controller apply the embedded append-only Postgres
-migration set on startup (currently through migration `0037`). They must
+migration set on startup (currently through migration `0039`). They must
 receive the same database URL. Review the
 [installation upgrade and backup procedure](../../docs/installation/installation-guide.md#upgrade-rollback-backup-and-removal)
 before upgrading; a Helm rollback does not reverse database migrations.
 
-The Task workflow's `AgentRuntime` spec must fit an envelope authorized for the
-`steward-run` service principal. That envelope is governance data, not a Helm
-value, and must exist before Task execution is enabled for callers.
-`config/task/workflows.example.json` and its matching service envelope are the
-authority-minimal copy-smoke contract: no LLMs, tools, LiteLLM calls, or MCP
-calls. `scripts/bootstrap-task-copy-smoke.sh` installs that envelope
-idempotently over authenticated HTTPS. It requires an externally issued,
-short-lived route-scoped token; the chart deliberately has no bootstrap-token
-Secret input. The deployment adapter supplies the route-scoped credential.
+Every external Task must fit the authenticated canonical user's exact active,
+provisioned User Envelope. The Envelope is product governance data, not a Helm
+value. Direct Git packages and immutable versioned Workflows are the supported
+Task paths; the removed unversioned workflow catalog has no chart setting.
 
 Run `cargo xtask e2e-openshell-adapter` to exercise the adapter against the
 exact OpenShell `v0.0.98` chart in an ephemeral kind cluster. The test verifies
