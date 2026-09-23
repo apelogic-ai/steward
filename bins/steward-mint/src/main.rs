@@ -5,21 +5,26 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use k8s_openapi::api::core::v1::Secret;
 use kube::Client;
-use kube::api::{Api, ListParams};
+use kube::api::{Api, ListParams, PostParams};
 use steward_adapter_openshell::{IdentityResolutionError, OpenShellIdentityResolver};
 use steward_adapter_spire::SpireSvidValidator;
 use steward_mint::{
-    AuthorityBinding, AuthorityResolver, CredentialGrant, CredentialGrantResolver,
-    DEFAULT_AUTHORITY_TTL, IntrospectionClientCredential, Mint, MintConfig, MintError,
-    MintSigningKey, OpaqueAccessToken, ValidatedWorkload, authority_from_runtime_refs, router,
+    AuthenticatedControlPlaneWorkload, AuthorityBinding, AuthorityResolver,
+    ControlPlaneClientCredential, ControlPlaneMintConfig, ControlPlaneWorkloadAuthenticator,
+    CredentialGrant, CredentialGrantResolver, DEFAULT_AUTHORITY_TTL, IntrospectionClientCredential,
+    MAX_CONTROL_PLANE_AUTHORITY_TTL, Mint, MintConfig, MintError, MintSigningKey,
+    OpaqueAccessToken, ValidatedWorkload, authority_from_runtime_refs, control_plane_router,
+    router,
 };
 use steward_types::{AgentRuntime, RuntimeId};
 use tokio::net::TcpListener;
 
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
 const INFERENCE_CREDENTIAL_DATA_KEY: &str = "access-token";
+const CONTROL_PLANE_TOKEN_REVIEW_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn credential_secret_name(runtime: &RuntimeId) -> Result<&str, MintError> {
     let bytes = runtime.0.as_bytes();
@@ -135,6 +140,48 @@ impl AuthorityResolver for KubernetesAuthorityResolver {
     }
 }
 
+#[derive(Clone)]
+struct KubernetesControlPlaneWorkloadAuthenticator {
+    audience: String,
+    expected_username: String,
+    token_reviews: Api<TokenReview>,
+}
+
+impl ControlPlaneWorkloadAuthenticator for KubernetesControlPlaneWorkloadAuthenticator {
+    async fn authenticate(
+        &self,
+        credential: ControlPlaneClientCredential,
+    ) -> Result<AuthenticatedControlPlaneWorkload, MintError> {
+        let review = TokenReview {
+            spec: TokenReviewSpec {
+                audiences: Some(vec![self.audience.clone()]),
+                token: Some(credential.secret().to_owned()),
+            },
+            ..TokenReview::default()
+        };
+        let reviewed = tokio::time::timeout(
+            CONTROL_PLANE_TOKEN_REVIEW_TIMEOUT,
+            self.token_reviews.create(&PostParams::default(), &review),
+        )
+        .await
+        .map_err(|_| MintError::ControlPlaneClientUnavailable)?
+        .map_err(|_| MintError::ControlPlaneClientUnavailable)?;
+        let status = reviewed
+            .status
+            .filter(|status| status.authenticated == Some(true))
+            .ok_or(MintError::ControlPlaneClientRejected)?;
+        if status.audiences.as_deref() != Some(std::slice::from_ref(&self.audience))
+            || status.user.as_ref().and_then(|user| user.username.as_ref())
+                != Some(&self.expected_username)
+        {
+            return Err(MintError::ControlPlaneClientRejected);
+        }
+        Ok(AuthenticatedControlPlaneWorkload::new(
+            self.expected_username.clone(),
+        ))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider()?;
@@ -150,7 +197,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         identity,
         runtimes: Api::all(client.clone()),
     };
-    let credential_resolver = KubernetesCredentialGrantResolver { client };
+    let credential_resolver = KubernetesCredentialGrantResolver {
+        client: client.clone(),
+    };
     let validator = SpireSvidValidator::connect_env()
         .await
         .map_err(|_| io::Error::other("SPIRE Workload API connection failed"))?;
@@ -180,7 +229,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             introspection_credential,
         ),
     };
-    let mint = Mint::new_with_credential_resolver(
+    let mut mint = Mint::new_with_credential_resolver(
         config,
         signing_key,
         validator,
@@ -188,11 +237,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
         credential_resolver,
     )
     .map_err(|error| io::Error::other(format!("mint configuration is invalid: {error:?}")))?;
+    let control_plane = match (
+        env::var("STEWARD_MINT_CONTROL_PLANE_AUDIENCE").ok(),
+        env::var("STEWARD_MINT_CONTROL_PLANE_WORKLOAD_ID").ok(),
+    ) {
+        (None, None) => None,
+        (Some(audience), Some(expected_username))
+            if !audience.trim().is_empty() && !expected_username.trim().is_empty() =>
+        {
+            mint = mint
+                .with_control_plane(
+                    ControlPlaneMintConfig::new(
+                        expected_username.clone(),
+                        MAX_CONTROL_PLANE_AUTHORITY_TTL,
+                    )
+                    .map_err(|error| {
+                        io::Error::other(format!(
+                            "control-plane mint configuration is invalid: {error:?}"
+                        ))
+                    })?,
+                )
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "control-plane mint configuration is invalid: {error:?}"
+                    ))
+                })?;
+            Some(KubernetesControlPlaneWorkloadAuthenticator {
+                audience,
+                expected_username,
+                token_reviews: Api::all(client),
+            })
+        }
+        _ => {
+            return Err(io::Error::other(
+                "control-plane mint audience and workload identity must be configured together",
+            )
+            .into());
+        }
+    };
+    let mint = Arc::new(mint);
     let listener = TcpListener::bind(
         env::var("STEWARD_MINT_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_owned()),
     )
     .await?;
-    axum::serve(listener, router(Arc::new(mint))).await?;
+    let app = match control_plane {
+        Some(authenticator) => {
+            router(mint.clone()).merge(control_plane_router(mint, authenticator))
+        }
+        None => router(mint),
+    };
+    axum::serve(listener, app).await?;
     Ok(())
 }
 

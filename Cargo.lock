@@ -4015,6 +4015,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "steward-adapter-github-artifact",
+ "steward-adapter-mcp-gw",
  "steward-admission",
  "steward-ports",
  "steward-store",

@@ -24,6 +24,9 @@
 {{- if and .Values.connectionsBridge.enabled (not (has .Values.connectionsBridge.runtimeNamespace .Values.runtimeNamespaces)) }}
 {{- fail "connectionsBridge.runtimeNamespace must be one of runtimeNamespaces" }}
 {{- end }}
+{{- if and .Values.connectionsBridge.enabled (not .Values.execution.enabled) }}
+{{- fail "connectionsBridge.enabled requires execution.enabled so the Mint trust boundary is available" }}
+{{- end }}
 {{- range $component := list "apiserver" "controller" "mint" }}
 {{- if or (ne $component "mint") $.Values.execution.enabled }}
 ---
@@ -87,6 +90,11 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata: { name: steward-mint }
 rules:
+{{- if .Values.connectionsBridge.enabled }}
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+{{- end }}
   - apiGroups: ["agents.apelogic.ai"]
     resources: ["agentruntimes"]
     verbs: ["get", "list"]
@@ -378,6 +386,8 @@ spec:
             - { name: STEWARD_CONNECTIONS_MCP_GW_ORIGIN, value: {{ .Values.connectionsBridge.mcpGatewayOrigin | quote }} }
             - { name: STEWARD_CONNECTIONS_MCP_GW_VERSION, value: {{ .Values.connectionsBridge.mcpGatewayVersion | quote }} }
             - { name: STEWARD_CONNECTIONS_RUNTIME_NAMESPACE, value: {{ .Values.connectionsBridge.runtimeNamespace | quote }} }
+            - { name: STEWARD_CONNECTIONS_MINT_ORIGIN, value: {{ printf "http://%s:%v" (include "steward.mintName" .) .Values.services.mintPort | quote }} }
+            - { name: STEWARD_CONNECTIONS_CONTROL_PLANE_CREDENTIAL_FILE, value: /var/run/secrets/steward/connections/status-token }
 {{- if .Values.config.controller.openshellRuntimeClassName }}
             - { name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME, value: {{ .Values.config.controller.openshellRuntimeClassName | quote }} }
 {{- end }}
@@ -395,6 +405,9 @@ spec:
           volumeMounts:
             - { name: tls, mountPath: /run/tls, readOnly: true }
             - { name: execution-bindings, mountPath: /run/execution-bindings, readOnly: true }
+{{- if .Values.connectionsBridge.enabled }}
+            - { name: connections-control-plane-credential, mountPath: /var/run/secrets/steward/connections, readOnly: true }
+{{- end }}
 {{- if .Values.githubSource.enabled }}
             - { name: github-source, mountPath: /run/github-source, readOnly: true }
             - { name: github-source-private-key, mountPath: /run/github-source-private-key, readOnly: true }
@@ -409,6 +422,15 @@ spec:
 {{ toYaml .Values.resources.apiserver | nindent 12 }}
       volumes:
         - { name: tls, secret: { secretName: {{ .Values.tls.api.secretName }} } }
+{{- if .Values.connectionsBridge.enabled }}
+        - name: connections-control-plane-credential
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: {{ .Values.config.mint.controlPlaneAudience | quote }}
+                  expirationSeconds: 600
+                  path: status-token
+{{- end }}
         - name: execution-bindings
           configMap:
             name: {{ $executionBindingsConfigMapName }}
@@ -599,6 +621,10 @@ spec:
             - { name: STEWARD_MINT_ISSUER, value: {{ .Values.config.mint.issuer | quote }} }
             - { name: STEWARD_MINT_AUDIENCE, value: {{ .Values.config.mint.audience | quote }} }
             - { name: STEWARD_MINT_ALLOWED_SCOPES, value: {{ .Values.config.mint.allowedScopes | quote }} }
+{{- if .Values.connectionsBridge.enabled }}
+            - { name: STEWARD_MINT_CONTROL_PLANE_AUDIENCE, value: {{ .Values.config.mint.controlPlaneAudience | quote }} }
+            - { name: STEWARD_MINT_CONTROL_PLANE_WORKLOAD_ID, value: {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "steward.apiserverName" .) | quote }} }
+{{- end }}
             - { name: STEWARD_MINT_SVID_AUDIENCE, value: {{ .Values.config.mint.svidAudience | quote }} }
             - { name: STEWARD_SPIFFE_TRUST_DOMAIN, value: {{ .Values.config.mint.spiffeTrustDomain | quote }} }
             - { name: STEWARD_OPENSHELL_NAMESPACE, value: {{ .Values.config.mint.openshellNamespace | quote }} }
@@ -830,6 +856,7 @@ spec:
   policyTypes: [Ingress]
   ingress:
     - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.openshellNamespace }} } }
         - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.mcpGatewayNamespace }} } }
       ports: [{ protocol: TCP, port: 8080 }]
@@ -882,8 +909,14 @@ metadata: { name: steward-apiserver-egress }
 spec:
   podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
   policyTypes: [Egress]
-{{- if or .Values.networkPolicy.postgresCidrs (and .Values.jira.enabled .Values.networkPolicy.jiraCidrs) .Values.networkPolicy.kubeApiCidrs (and .Values.browserAuth.enabled .Values.networkPolicy.browserAuthEgressCidrs) (and .Values.githubSource.enabled .Values.networkPolicy.githubApiCidrs) }}
+{{- if or .Values.connectionsBridge.enabled .Values.networkPolicy.postgresCidrs (and .Values.jira.enabled .Values.networkPolicy.jiraCidrs) .Values.networkPolicy.kubeApiCidrs (and .Values.browserAuth.enabled .Values.networkPolicy.browserAuthEgressCidrs) (and .Values.githubSource.enabled .Values.networkPolicy.githubApiCidrs) }}
   egress:
+{{- if .Values.connectionsBridge.enabled }}
+    - to: [{ podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: mint } } }]
+      ports: [{ protocol: TCP, port: {{ .Values.services.mintPort }} }]
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.mcpGatewayNamespace }} } } }]
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.mcpGateway }} }]
+{{- end }}
 {{- if .Values.networkPolicy.postgresCidrs }}
     - to:
 {{- range .Values.networkPolicy.postgresCidrs }}
