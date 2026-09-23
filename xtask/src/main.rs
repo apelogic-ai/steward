@@ -2261,7 +2261,7 @@ mod tests {
             );
             for required in [
                 "deployment capability catalog",
-                "availability data, not an authority ceiling",
+                "catalog is availability data",
                 "exactly one active provisioned User Envelope",
             ] {
                 assert!(
