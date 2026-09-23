@@ -234,8 +234,7 @@ update chart/app versions coherently, run `cargo xtask ci` and
 commit already contained in the fork's `main`. The workflow builds every
 component, produces SBOM/provenance attestations, publishes images to
 `ghcr.io/<fork-owner>/steward`, and publishes the chart to
-`oci://ghcr.io/<fork-owner>/charts/steward`. AWS/ECR promotion is optional and
-disabled unless the fork explicitly configures it.
+`oci://ghcr.io/<fork-owner>/charts/steward`.
 
 Before installation, verify the workflow succeeded, copy the image manifest
 digests and OCI chart digest from its handoff, verify attestations against the

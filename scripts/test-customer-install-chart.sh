@@ -37,7 +37,7 @@ if rg -q 'STEWARD_JIRA_|secretName: steward-jira|kind: Certificate|cert-manager.
   echo 'default install must not require Jira or cert-manager' >&2
   exit 1
 fi
-if rg -q 'jira.example.com|kata-qemu|cluster-issuer' "${run_dir}/default.yaml"; then
+if rg -q 'jira.example.com|sandbox-vm|cluster-issuer' "${run_dir}/default.yaml"; then
   echo 'default install contains environment-specific placeholders' >&2
   exit 1
 fi

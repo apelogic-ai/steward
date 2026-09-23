@@ -23,24 +23,6 @@ PORT_FORWARD_PID=""
 WORKLOAD_EXCHANGE_PID=""
 CLUSTER_CREATED=0
 OIDC_AUDIENCE="openshell-api"
-S0_E2E=0
-if [[ "$#" -eq 1 && "$1" == "--s0-e2e" ]]; then
-  S0_E2E=1
-fi
-DEFAULT_IDENTITY_SUPERVISOR_IMAGE="openshell/supervisor:steward-spiffe-v0090"
-SPIRE_ISSUER_CA_CONFIGMAP="openshell-spire-oidc-ca"
-if [[ "$#" -eq 1 && "$1" == "--print-identity-supervisor-image" ]]; then
-  echo "${DEFAULT_IDENTITY_SUPERVISOR_IMAGE}"
-  exit 0
-fi
-if [[ "$#" -eq 1 && "$1" == "--print-spire-issuer-ca-configmap" ]]; then
-  echo "${SPIRE_ISSUER_CA_CONFIGMAP}"
-  exit 0
-fi
-if [[ "$#" -eq 0 ]] && ! command -v jq >/dev/null 2>&1; then
-  echo "required command is missing: jq" >&2
-  exit 2
-fi
 
 cleanup() {
   status="$1"
@@ -88,7 +70,7 @@ if [[ "$#" -eq 1 && "$1" == "--print-openshell-cli-asset" ]]; then
   exit 0
 fi
 
-for command in kind kubectl helm cargo curl openssl python3 sed tar xxd; do
+for command in kind kubectl helm cargo curl jq openssl python3 sed tar xxd; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "required command is missing: ${command}" >&2
     exit 2
@@ -104,27 +86,12 @@ else
   exit 2
 fi
 
-if [[ "${S0_E2E}" == "0" \
-  && "${STEWARD_USE_CHART_SUPERVISOR:-0}" != "1" \
-  && -z "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]
-then
-  STEWARD_OPENSHELL_SUPERVISOR_IMAGE="${DEFAULT_IDENTITY_SUPERVISOR_IMAGE}"
-  if ! "${ROOT}/scripts/build-patched-openshell-supervisor.sh" --image-is-current; then
-    "${ROOT}/scripts/build-patched-openshell-supervisor.sh"
-  fi
-fi
-
 mkdir -p "${RUN_DIR}"
 kind create cluster \
   --name "${CLUSTER_NAME}" \
   --kubeconfig "${KUBECONFIG_PATH}" \
   --wait 120s
 CLUSTER_CREATED=1
-
-if [[ -n "${STEWARD_G1_BASE_IMAGE:-}" ]]; then
-  "${ROOT}/scripts/g1-preload-kind-base-image.sh" \
-    "${CLUSTER_NAME}" "${STEWARD_G1_BASE_IMAGE}"
-fi
 
 supervisor_image_args=()
 if [[ -n "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
@@ -166,19 +133,6 @@ if [[ "${actual_context}" != "${KUBE_CONTEXT}" ]]; then
   echo "created context ${actual_context}, expected ${KUBE_CONTEXT}" >&2
   exit 1
 fi
-
-kubectl \
-  --kubeconfig "${KUBECONFIG_PATH}" \
-  --context "${KUBE_CONTEXT}" \
-  apply -f - <<YAML
-apiVersion: node.k8s.io/v1
-kind: RuntimeClass
-metadata:
-  name: kata-qemu
-  labels:
-    steward.test/run-id: ${RUN_ID}
-handler: runc
-YAML
 
 oidc_issuer="http://oidc.openshell.svc.cluster.local:8000"
 oidc_private_key="${RUN_DIR}/oidc-private.pem"
@@ -318,41 +272,39 @@ openshell_helm_args=(
   --namespace openshell
   --create-namespace
 )
-if [[ "${S0_E2E}" == "0" ]]; then
-  env \
-    HELM_CACHE_HOME="${RUN_DIR}/helm/cache" \
-    HELM_CONFIG_HOME="${RUN_DIR}/helm/config" \
-    HELM_DATA_HOME="${RUN_DIR}/helm/data" \
-    helm \
-    --kubeconfig "${KUBECONFIG_PATH}" \
-    --kube-context "${KUBE_CONTEXT}" \
-    install spire-crds spire-crds \
-    --repo https://spiffe.github.io/helm-charts-hardened/ \
-    --version 0.5.0 \
-    --namespace spire \
-    --create-namespace \
-    --wait \
-    --timeout 5m
+env \
+  HELM_CACHE_HOME="${RUN_DIR}/helm/cache" \
+  HELM_CONFIG_HOME="${RUN_DIR}/helm/config" \
+  HELM_DATA_HOME="${RUN_DIR}/helm/data" \
+  helm \
+  --kubeconfig "${KUBECONFIG_PATH}" \
+  --kube-context "${KUBE_CONTEXT}" \
+  install spire-crds spire-crds \
+  --repo https://spiffe.github.io/helm-charts-hardened/ \
+  --version 0.5.0 \
+  --namespace spire \
+  --create-namespace \
+  --wait \
+  --timeout 5m
 
-  env \
-    HELM_CACHE_HOME="${RUN_DIR}/helm/cache" \
-    HELM_CONFIG_HOME="${RUN_DIR}/helm/config" \
-    HELM_DATA_HOME="${RUN_DIR}/helm/data" \
-    helm \
-    --kubeconfig "${KUBECONFIG_PATH}" \
-    --kube-context "${KUBE_CONTEXT}" \
-    install spire spire \
-    --repo https://spiffe.github.io/helm-charts-hardened/ \
-    --version 0.29.0 \
-    --namespace spire \
-    --create-namespace \
-    --values "${ROOT}/config/openshell/spire-values.yaml" \
-    --wait \
-    --timeout 10m
-  openshell_helm_args+=(--values "${ROOT}/config/openshell/provider-token-grants.yaml")
-fi
+env \
+  HELM_CACHE_HOME="${RUN_DIR}/helm/cache" \
+  HELM_CONFIG_HOME="${RUN_DIR}/helm/config" \
+  HELM_DATA_HOME="${RUN_DIR}/helm/data" \
+  helm \
+  --kubeconfig "${KUBECONFIG_PATH}" \
+  --kube-context "${KUBE_CONTEXT}" \
+  install spire spire \
+  --repo https://spiffe.github.io/helm-charts-hardened/ \
+  --version 0.29.0 \
+  --namespace spire \
+  --create-namespace \
+  --values "${ROOT}/config/openshell/spire-values.yaml" \
+  --wait \
+  --timeout 10m
+openshell_helm_args+=(--values "${ROOT}/config/openshell/provider-token-grants.yaml")
 openshell_helm_args+=(
-  --set-string server.defaultRuntimeClassName=kata-qemu
+  --set-string server.defaultRuntimeClassName=
   --set server.auth.allowUnauthenticatedUsers=false
   --set-string "server.oidc.issuer=${oidc_issuer}"
   --set-string "server.oidc.audience=${OIDC_AUDIENCE}"
@@ -540,127 +492,15 @@ export STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE="${workload_exchange_ca_cer
 export STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE="${workload_source_file}"
 export STEWARD_TEST_OPENSHELL_ACCESS_TOKEN_FILE="${bearer_token}"
 export STEWARD_OPENSHELL_SERVER_NAME="localhost"
-export STEWARD_OPENSHELL_RUNTIME_CLASS_NAME="kata-qemu"
+export STEWARD_OPENSHELL_RUNTIME_CLASS_NAME=""
 export STEWARD_TEST_KUBE_CONTEXT="${KUBE_CONTEXT}"
 export STEWARD_TEST_KUBECONFIG="${KUBECONFIG_PATH}"
 export STEWARD_RUN_DIR="${RUN_DIR}"
 export KUBECONFIG="${KUBECONFIG_PATH}"
 
-if [[ "${S0_E2E}" == "1" ]]; then
-  kubectl \
-    --kubeconfig "${KUBECONFIG_PATH}" \
-    --context "${KUBE_CONTEXT}" \
-    apply -f "${ROOT}/manifests/agents.apelogic.ai_agentruntimes.yaml"
-  kubectl \
-    --kubeconfig "${KUBECONFIG_PATH}" \
-    --context "${KUBE_CONTEXT}" \
-    wait \
-    --for=condition=Established \
-    crd/agentruntimes.agents.apelogic.ai \
-    --timeout=120s
-  cargo build -p steward-controller-bin
-  export STEWARD_CONTROLLER_BIN="${ROOT}/target/debug/steward-controller-bin"
-  export STEWARD_S0_BOOTSTRAP=1
-  export STEWARD_AGENTRUNTIME_API_VERSION="agents.apelogic.ai/v1alpha1"
-  cargo test \
-    --manifest-path "${ROOT}/e2e/Cargo.toml" \
-    --test s0 \
-    e2e_s0_provision_and_teardown \
-    -- \
-    --exact
-elif [[ "$#" -eq 0 ]]; then
-  cargo run \
-    -p steward-adapter-openshell \
-    --features s0-spike \
-    --example workspace_contract
-  cli_archive="${RUN_DIR}/${openshell_cli_archive}"
-  cli_checksums="${RUN_DIR}/openshell-checksums-sha256.txt"
-  curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
-    "https://github.com/NVIDIA/OpenShell/releases/download/${OPEN_SHELL_RELEASE}/${openshell_cli_archive}" \
-    -o "${cli_archive}"
-  curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
-    "https://github.com/NVIDIA/OpenShell/releases/download/${OPEN_SHELL_RELEASE}/openshell-checksums-sha256.txt" \
-    -o "${cli_checksums}"
-  (
-    cd "${RUN_DIR}"
-    grep " ${openshell_cli_archive}$" "${cli_checksums}" | "${checksum_command[@]}"
-    tar -xzf "${cli_archive}"
-  )
-  source_archive="${RUN_DIR}/openshell-${OPEN_SHELL_RELEASE}.tar.gz"
-  source_directory="${RUN_DIR}/openshell-source"
-  curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
-    "https://github.com/NVIDIA/OpenShell/archive/refs/tags/${OPEN_SHELL_RELEASE}.tar.gz" \
-    -o "${source_archive}"
-  mkdir -p "${source_directory}"
-  tar -xzf "${source_archive}" -C "${source_directory}" --strip-components=1
-  spire_bundle="${RUN_DIR}/spire-bundle.json"
-  kubectl \
-    --kubeconfig "${KUBECONFIG_PATH}" \
-    --context "${KUBE_CONTEXT}" \
-    -n spire \
-    get configmap spire-bundle \
-    -o jsonpath='{.data.bundle\.spiffe}' >"${spire_bundle}"
-  if ! jq -e \
-    '[.keys[] | select(.use == "x509-svid") | .x5c[]] | length > 0' \
-    "${spire_bundle}" >/dev/null
-  then
-    echo "SPIRE published no X.509 authorities for its OIDC certificate" >&2
-    exit 1
-  fi
-  spire_issuer_ca="${RUN_DIR}/spire-oidc-ca.pem"
-  while IFS= read -r authority; do
-    printf '%s' "${authority}" |
-      openssl base64 -d -A |
-      openssl x509 -inform DER
-  done < <(
-    jq -r '.keys[] | select(.use == "x509-svid") | .x5c[]' "${spire_bundle}"
-  ) >"${spire_issuer_ca}"
-  openssl x509 -in "${spire_issuer_ca}" -noout -subject >/dev/null
-  kubectl \
-    --kubeconfig "${KUBECONFIG_PATH}" \
-    --context "${KUBE_CONTEXT}" \
-    -n default \
-    create configmap "${SPIRE_ISSUER_CA_CONFIGMAP}" \
-    --from-file="ca.pem=${spire_issuer_ca}" \
-    --dry-run=client \
-    -o yaml |
-    kubectl \
-      --kubeconfig "${KUBECONFIG_PATH}" \
-      --context "${KUBE_CONTEXT}" \
-      apply -f -
-  demo_k8s_directory="${source_directory}/examples/spiffe-token-grant-demo/k8s"
-  if grep -q '^patches:' "${demo_k8s_directory}/kustomization.yaml"; then
-    echo "OpenShell demo now declares kustomize patches; rebase the Steward CA overlay" >&2
-    exit 1
-  fi
-  cp \
-    "${ROOT}/config/openshell/spiffe-token-issuer-ca-patch.yaml" \
-    "${demo_k8s_directory}/steward-token-issuer-ca-patch.yaml"
-  printf '\npatches:\n  - path: steward-token-issuer-ca-patch.yaml\n' \
-    >>"${demo_k8s_directory}/kustomization.yaml"
-  service_subnet="$(
-    kubectl \
-      --kubeconfig "${KUBECONFIG_PATH}" \
-      --context "${KUBE_CONTEXT}" \
-      -n kube-system \
-      get configmap kubeadm-config \
-      -o jsonpath='{.data.ClusterConfiguration}' |
-      sed -nE 's/^[[:space:]]*serviceSubnet:[[:space:]]*([^[:space:]]+).*$/\1/p'
-  )"
-  if [[ -z "${service_subnet}" ]]; then
-    echo "could not derive the kind service subnet for the OpenShell demo" >&2
-    exit 1
-  fi
-  demo_profile="${source_directory}/examples/spiffe-token-grant-demo/provider-profile.yaml"
-  if ! grep -q "10\\.43\\.0\\.0/16" "${demo_profile}"; then
-    echo "OpenShell demo no longer carries its expected k3s service subnet" >&2
-    exit 1
-  fi
-  sed -i.bak "s#10\\.43\\.0\\.0/16#${service_subnet}#g" "${demo_profile}"
-  PATH="${RUN_DIR}:${PATH}" \
-    XDG_CONFIG_HOME="${RUN_DIR}/openshell-config" \
-    GATEWAY_ENDPOINT="${endpoint}" \
-    bash "${source_directory}/examples/spiffe-token-grant-demo/demo.sh"
-else
-  "$@"
+if [[ "$#" -eq 0 ]]; then
+  echo "an in-cluster test command is required" >&2
+  exit 2
 fi
+
+"$@"

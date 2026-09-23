@@ -78,13 +78,14 @@ source tree unconditionally.
 `STEWARD_DEV_KEEP=1` retains that source for debugging and prints its exact
 cleanup command.
 
-The identity spike reuses this image only when its complete declared build
-contract (including the pinned cross-toolchain), patch content digest, and
-architecture match; otherwise it rebuilds it automatically. It then loads the
-image only into its ephemeral kind cluster. An explicit image override remains
-available for upstream-fix verification:
+The governed-connections harness reuses this image only when its complete
+declared build contract (including the pinned cross-toolchain), patch content
+digest, and architecture match; otherwise it rebuilds it automatically. It
+then loads the image only into its ephemeral kind cluster. The generic
+OpenShell testbed also accepts an explicit image override for upstream-fix
+verification:
 
 ```bash
 STEWARD_OPENSHELL_SUPERVISOR_IMAGE=openshell/supervisor:steward-spiffe-v0090 \
-  scripts/s0-0-openshell-spike.sh
+  scripts/openshell-testbed.sh <in-cluster-test-command>
 ```

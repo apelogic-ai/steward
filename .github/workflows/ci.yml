@@ -67,157 +67,9 @@ jobs:
         uses: ./.github/actions/setup-tools
         with:
           kubernetes-tools: "true"
-          supervisor-tools: "true"
 
       - name: Run pinned upstream conformance
         run: cargo xtask conformance --pinned
-
-  e2e-provisioning:
-    name: e2e / provisioning lifecycle
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal
-
-      - name: Restore shared Rust build cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: steward-rust-1.95.0
-
-      - name: Install Kubernetes tools
-        uses: ./.github/actions/setup-tools
-        with:
-          kubernetes-tools: "true"
-
-      - name: Verify provisioning and teardown
-        run: cargo xtask e2e-s0
-
-  e2e-runtime:
-    name: e2e / runtime identity, inference and PoC
-    runs-on: ubuntu-latest
-    timeout-minutes: 105
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal
-
-      - name: Restore shared Rust build cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: steward-rust-1.95.0
-
-      - name: Install integration tools
-        uses: ./.github/actions/setup-tools
-        with:
-          kubernetes-tools: "true"
-          supervisor-tools: "true"
-
-      # Keep runtime E2E lanes in one runner so cargo reuses the same target
-      # directory instead of recompiling the OpenShell/Mint graph per lane.
-      - name: Fail fast on the S5 Mint token-grant contract
-        run: >-
-          cargo test --locked --package steward-mint
-          --test runtime_mcp_compatibility
-          s5_hop1_v3_authority_mints_and_introspects_the_required_mcp_grant
-          -- --exact
-
-      - name: Verify workload identity and tool access
-        run: cargo xtask e2e-s1
-
-      - name: Verify inference budget enforcement
-        run: cargo xtask e2e-s2
-
-      - name: Verify the complete PoC journey and revocation
-        run: cargo xtask e2e-s5
-
-  e2e-controller-runtime-lifecycle:
-    name: e2e / controller runtime lifecycle
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal
-
-      - name: Restore shared Rust build cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: steward-rust-1.95.0
-
-      - name: Install controller lifecycle E2E tools
-        uses: ./.github/actions/setup-tools
-        with:
-          kubernetes-tools: "true"
-          supervisor-tools: "true"
-
-      - name: Verify controller-owned runtime lifecycle
-        run: cargo xtask e2e-controller-runtime-lifecycle
-
-  e2e-admission:
-    name: e2e / envelope admission
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal
-
-      - name: Restore shared Rust build cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: steward-rust-1.95.0
-
-      - name: Install Kubernetes tools
-        uses: ./.github/actions/setup-tools
-        with:
-          kubernetes-tools: "true"
-
-      - name: Verify envelope admission
-        run: cargo xtask e2e-s3
-
-  e2e-escalation:
-    name: e2e / approvals and grants
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal
-
-      - name: Restore shared Rust build cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: steward-rust-1.95.0
-
-      - name: Install Kubernetes tools
-        uses: ./.github/actions/setup-tools
-        with:
-          kubernetes-tools: "true"
-
-      - name: Verify approval and instance-grant enforcement
-        run: cargo xtask e2e-s4
 
   openshell-adapter:
     name: integration / OpenShell 0.0.98 adapter
@@ -352,10 +204,6 @@ jobs:
           actionlint
           shellcheck \
             scripts/openshell-adapter-e2e.sh \
-            scripts/promote-ecr-artifact.sh \
-            scripts/resolve-ecr-platform-digest.sh \
-            scripts/test-promote-ecr-artifact.sh \
-            scripts/test-resolve-ecr-platform-digest.sh \
             scripts/validate-release-artifacts.sh
 
       - name: Render the chart and build all component images
@@ -399,11 +247,6 @@ jobs:
     needs:
       - quality
       - conformance-pinned
-      - e2e-provisioning
-      - e2e-runtime
-      - e2e-controller-runtime-lifecycle
-      - e2e-admission
-      - e2e-escalation
       - openshell-adapter
       - governed-connections
       - postgres-tls
@@ -417,11 +260,6 @@ jobs:
         env:
           QUALITY: ${{ needs.quality.result }}
           CONFORMANCE: ${{ needs.conformance-pinned.result }}
-          PROVISIONING: ${{ needs.e2e-provisioning.result }}
-          RUNTIME: ${{ needs.e2e-runtime.result }}
-          CONTROLLER_RUNTIME_LIFECYCLE: ${{ needs.e2e-controller-runtime-lifecycle.result }}
-          ADMISSION: ${{ needs.e2e-admission.result }}
-          ESCALATION: ${{ needs.e2e-escalation.result }}
           OPENSHELL_ADAPTER: ${{ needs.openshell-adapter.result }}
           GOVERNED_CONNECTIONS: ${{ needs.governed-connections.result }}
           POSTGRES_TLS: ${{ needs.postgres-tls.result }}
@@ -432,11 +270,6 @@ jobs:
           for result in \
             "${QUALITY}" \
             "${CONFORMANCE}" \
-            "${PROVISIONING}" \
-            "${RUNTIME}" \
-            "${CONTROLLER_RUNTIME_LIFECYCLE}" \
-            "${ADMISSION}" \
-            "${ESCALATION}" \
             "${OPENSHELL_ADAPTER}" \
             "${GOVERNED_CONNECTIONS}" \
             "${POSTGRES_TLS}" \

@@ -126,7 +126,8 @@ impl Harness {
                 "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
             )?),
             server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
-            runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
+            runtime_class_name: env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")
+                .unwrap_or_default(),
             task_log_mode: OpenShellTaskLogMode::Full,
             stable_bridge_image: None,
             stable_bridge_gateway_origin: None,
@@ -240,7 +241,7 @@ impl Harness {
                 mcp_gw_origin: MCP_GW_ORIGIN.to_owned(),
                 mcp_gw_version: "0.4.9".to_owned(),
                 namespace: CONNECTIONS_NAMESPACE.to_owned(),
-                runtime_class: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
+                runtime_class: env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME").unwrap_or_default(),
             },
             "https://steward.example.test",
         )
@@ -547,6 +548,41 @@ impl Harness {
             .await?;
             if i64::try_from(rows.len())? > after_count {
                 return Ok(rows[0].try_get("operation_id")?);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(format!(
+                    "no new {kind} connection operation was durably reserved"
+                ))
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn latest_operation_or_broker_error<T>(
+        &self,
+        user_id: &CanonicalUserId,
+        kind: &str,
+        after_count: i64,
+        broker_task: &mut JoinHandle<Result<T, ConnectionBrokerError>>,
+    ) -> Result<(Uuid, Option<T>), Box<dyn Error>> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut completed = None;
+        loop {
+            let rows = sqlx::query(
+                "SELECT operation_id FROM connection_operations \
+                 WHERE canonical_user_id = $1 AND operation_kind = $2 \
+                 ORDER BY created_at DESC",
+            )
+            .bind(user_id.as_str())
+            .bind(kind)
+            .fetch_all(&self.database)
+            .await?;
+            if i64::try_from(rows.len())? > after_count {
+                return Ok((rows[0].try_get("operation_id")?, completed));
+            }
+            if completed.is_none() && broker_task.is_finished() {
+                completed = Some(connection_result((&mut *broker_task).await?)?);
             }
             if Instant::now() >= deadline {
                 return Err(io::Error::other(format!(
@@ -881,13 +917,16 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     let start_count = harness.operation_count(&alice_id, "start").await?;
     let start_broker = broker.clone();
     let start_session = alice.clone();
-    let start_task = tokio::spawn(async move { start_broker.start(&start_session).await });
-    let start_operation = harness
-        .latest_operation(&alice_id, "start", start_count)
+    let mut start_task = tokio::spawn(async move { start_broker.start(&start_session).await });
+    let (start_operation, early_start) = harness
+        .latest_operation_or_broker_error(&alice_id, "start", start_count, &mut start_task)
         .await?;
     let (bridge_workspace, bridge_sandbox, bridge_uid) =
         harness.capture_bridge_refs(start_operation).await?;
-    let started = connection_result(start_task.await?)?;
+    let started = match early_start {
+        Some(started) => started,
+        None => connection_result(start_task.await?)?,
+    };
     harness
         .wait_operation_finalized(start_operation, Duration::from_secs(90))
         .await?;

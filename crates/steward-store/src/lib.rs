@@ -6751,12 +6751,28 @@ fn validate_connection_operation_request(
         }
         || request.bindings.mcp_gw_origin.trim().is_empty()
         || request.bindings.namespace.trim().is_empty()
-        || request.bindings.runtime_class.trim().is_empty()
+        || !connection_runtime_class_is_valid(&request.bindings.runtime_class)
         || !principal_is_bound
     {
         return Err(StoreError::InvalidConnectionOperation);
     }
     Ok(())
+}
+
+fn connection_runtime_class_is_valid(runtime_class: &str) -> bool {
+    runtime_class.is_empty() || !runtime_class.trim().is_empty()
+}
+
+#[cfg(test)]
+mod connection_binding_validation_tests {
+    use super::connection_runtime_class_is_valid;
+
+    #[test]
+    fn cluster_default_runtime_class_is_valid() {
+        assert!(connection_runtime_class_is_valid(""));
+        assert!(connection_runtime_class_is_valid("openshell-runc"));
+        assert!(!connection_runtime_class_is_valid("   "));
+    }
 }
 
 fn valid_sha256_reference(value: &str) -> bool {

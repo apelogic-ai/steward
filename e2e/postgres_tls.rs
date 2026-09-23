@@ -51,5 +51,47 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         "the TLS database must contain applied Steward migrations"
     );
 
+    let mut transaction = store.pool().begin().await?;
+    sqlx::query(
+        "CREATE TEMP TABLE connection_runtime_class_probe \
+         (LIKE connection_operations INCLUDING CONSTRAINTS) ON COMMIT DROP",
+    )
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "DO $probe$ \
+         DECLARE column_name text; \
+         BEGIN \
+           FOR column_name IN \
+             SELECT attribute.attname \
+             FROM pg_attribute attribute \
+             WHERE attribute.attrelid = 'pg_temp.connection_runtime_class_probe'::regclass \
+               AND attribute.attnum > 0 \
+               AND NOT attribute.attisdropped \
+               AND attribute.attname <> 'runtime_class' \
+           LOOP \
+             EXECUTE format( \
+               'ALTER TABLE pg_temp.connection_runtime_class_probe DROP COLUMN %I CASCADE', \
+               column_name \
+             ); \
+           END LOOP; \
+         END \
+         $probe$",
+    )
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query("INSERT INTO connection_runtime_class_probe (runtime_class) VALUES ('')")
+        .execute(&mut *transaction)
+        .await?;
+    let whitespace_runtime_class =
+        sqlx::query("INSERT INTO connection_runtime_class_probe (runtime_class) VALUES ('   ')")
+            .execute(&mut *transaction)
+            .await;
+    assert!(
+        whitespace_runtime_class.is_err(),
+        "the connection runtime class must be empty for the cluster default or non-blank"
+    );
+    transaction.rollback().await?;
+
     Ok(())
 }

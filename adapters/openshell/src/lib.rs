@@ -3052,7 +3052,7 @@ mod tests {
             workload_exchange_ca_certificate_pem: b"test-exchange-ca-certificate".to_vec(),
             workload_source_credential_file: PathBuf::from("/run/workload/source-credential"),
             server_name: "gateway.example.test".to_owned(),
-            runtime_class_name: "kata-qemu".to_owned(),
+            runtime_class_name: "sandbox-vm".to_owned(),
             task_log_mode: super::OpenShellTaskLogMode::Off,
             stable_bridge_image: None,
             stable_bridge_gateway_origin: None,
@@ -3785,7 +3785,7 @@ mod tests {
     #[cfg(feature = "runtime")]
     #[test]
     fn gateway_runtime_class_accepts_reviewed_and_legacy_kubernetes_names() {
-        for runtime_class_name in ["openshell-runc", "kata-qemu"] {
+        for runtime_class_name in ["openshell-runc", "sandbox-vm"] {
             let mut config = valid_connection_config();
             config.runtime_class_name = runtime_class_name.to_owned();
 
