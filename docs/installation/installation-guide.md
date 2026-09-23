@@ -5,6 +5,10 @@ chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
 
+Installing alongside `steward-run` and `github-oidc-exchange` additionally
+requires an order those products do not own; see
+[platform deployment order](platform-deployment-order.md).
+
 ## Choose the installation mode
 
 | Mode | What starts | Additional prerequisites |
