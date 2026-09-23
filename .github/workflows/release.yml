@@ -536,9 +536,9 @@ jobs:
             printf 'Provider profile bundle source commit: %s\n\n' "$GITHUB_SHA"
             printf 'Provider profile bundle verification: pin the SHA-256 above; verify GitHub artifact provenance with this signer identity, repository, tag, and source commit; then verify the downloaded archive SHA-256 before render/install.\n\n'
             printf '\n## Verification\n\n'
-            printf 'Verify the release manifest with: `gh attestation verify release-handoff.json --repo %s --cert-identity %s`.\n\n' "$GITHUB_REPOSITORY" "$bridge_signer_identity"
-            printf 'Inspect every image by the exact digest above with `docker buildx imagetools inspect`, and pull the chart by its exact digest with `helm pull`.\n\n'
-            printf 'Each image and the chart includes an SPDX SBOM, a vulnerability report, and GitHub artifact provenance. The machine-readable contract is `release-handoff.json`; its verification material is `release-handoff-attestation.jsonl`.\n'
+            printf "Verify the release manifest with: \`gh attestation verify release-handoff.json --repo %s --cert-identity %s\`.\n\n" "$GITHUB_REPOSITORY" "$bridge_signer_identity"
+            printf "Inspect every image by the exact digest above with \`docker buildx imagetools inspect\`, and pull the chart by its exact digest with \`helm pull\`.\n\n"
+            printf "Each image and the chart includes an SPDX SBOM, a vulnerability report, and GitHub artifact provenance. The machine-readable contract is \`release-handoff.json\`; its verification material is \`release-handoff-attestation.jsonl\`.\n"
           } > dist/release-handoff.md
 
       - name: Attest machine-readable release handoff
