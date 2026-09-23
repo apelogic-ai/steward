@@ -176,8 +176,11 @@ size validation, and a sensitive-output warning.
 
 The streams may reproduce prompts, model output, repository data, and tool results.
 Injected credentials, bearer tokens, private keys, provider-control material, and
-hidden model reasoning must never enter them. Durable logs for failed, cancelled, or
-rejected Tasks remain outside this contract.
+hidden model reasoning must never enter them. Durable stdout and stderr for started execution
+attempts, including failed attempts, are stored outside the output archive and exposed to the
+authenticated owner at `/app/api/v1/runs/{taskUid}/logs/stdout` and
+`/app/api/v1/runs/{taskUid}/logs/stderr`. Rejected Tasks have no process attempt and therefore no
+process logs.
 
 ## Compatibility and validation
 
