@@ -91,6 +91,7 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 
 | Location | Status | Purpose |
 |---|---|---|
+| [`installation/platform-deployment-order.md`](installation/platform-deployment-order.md) | **Reference** | Installation order across Steward, `steward-run`, and `github-oidc-exchange`, and the Steward-side task-identity wiring that joins them. |
 | [`upstream/openshell-upstream-strategy.md`](upstream/openshell-upstream-strategy.md) | **Reference** | Versioned upstream findings and engagement record. |
 | [`upstream/pr-1970-review-comment.md`](upstream/pr-1970-review-comment.md) | **Historical, superseded** | Withdrawn upstream review draft. |
 | [`upstream/rfc-0011-review-comment.md`](upstream/rfc-0011-review-comment.md) | **Historical reference** | Retained upstream review text. |
