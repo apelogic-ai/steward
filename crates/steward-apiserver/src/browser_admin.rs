@@ -11,7 +11,7 @@ use steward_store::{
     EnvelopeRequestRecord, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, PendingApproval,
     PendingEnvelopeRequest, StoreError,
 };
-use steward_types::AgentRuntimeSpec;
+use steward_types::{AgentRuntimeSpec, ModelRef, ToolGrant};
 use uuid::Uuid;
 
 use crate::browser_auth::{
@@ -25,13 +25,155 @@ use crate::{
 };
 
 const BROWSER_ADMIN_API_VERSION: &str = "steward.browser-admin/v1";
-const MANAGED_SERVICE: &str = "steward-run";
+pub const MAX_CAPABILITY_CATALOG_BYTES: usize = 256 * 1024;
+const MAX_CAPABILITY_MODELS: usize = 256;
+const MAX_CAPABILITY_TOOLS: usize = 1024;
 
 #[derive(Clone)]
 pub(crate) struct BrowserAdminState<R, L, D> {
     runtimes: R,
     ledger: L,
     decisions: D,
+    capabilities: CapabilityCatalog,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityCatalog {
+    pub schema_version: String,
+    pub models: Vec<ModelRef>,
+    pub tools: Vec<ToolGrant>,
+}
+
+impl CapabilityCatalog {
+    pub fn from_json(value: &str) -> Result<Self, String> {
+        if value.len() > MAX_CAPABILITY_CATALOG_BYTES {
+            return Err("capability catalog exceeds 262144 bytes".to_owned());
+        }
+        let catalog: Self = serde_json::from_str(value)
+            .map_err(|error| format!("invalid capability catalog JSON: {error}"))?;
+        catalog.validate()?;
+        Ok(catalog)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != "steward.capability-catalog/v1" {
+            return Err(
+                "capability catalog schemaVersion must be steward.capability-catalog/v1".to_owned(),
+            );
+        }
+        if self.models.len() > MAX_CAPABILITY_MODELS || self.tools.len() > MAX_CAPABILITY_TOOLS {
+            return Err("capability catalog exceeds its bounded model or tool count".to_owned());
+        }
+        let valid = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 255
+                && value.trim() == value
+                && !value.chars().any(char::is_control)
+        };
+        if self
+            .models
+            .iter()
+            .any(|model| !valid(&model.provider) || !valid(&model.model))
+            || self.tools.iter().any(|tool| {
+                !valid(&tool.provider) || !valid(&tool.resource) || !valid(&tool.action)
+            })
+        {
+            return Err(
+                "capability catalog entries must contain bounded exact identifiers".to_owned(),
+            );
+        }
+        let mut model_keys = std::collections::BTreeSet::new();
+        let mut tool_keys = std::collections::BTreeSet::new();
+        if self
+            .models
+            .iter()
+            .any(|model| !model_keys.insert((&model.provider, &model.model)))
+            || self
+                .tools
+                .iter()
+                .any(|tool| !tool_keys.insert((&tool.provider, &tool.resource, &tool.action)))
+        {
+            return Err("capability catalog entries must be unique".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod capability_catalog_tests {
+    use super::{
+        CapabilityCatalog, MAX_CAPABILITY_CATALOG_BYTES, MAX_CAPABILITY_MODELS,
+        MAX_CAPABILITY_TOOLS,
+    };
+    use steward_types::{ModelRef, ToolGrant};
+
+    fn catalog() -> CapabilityCatalog {
+        CapabilityCatalog {
+            schema_version: "steward.capability-catalog/v1".to_owned(),
+            models: vec![ModelRef {
+                provider: "provider-a".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: vec![ToolGrant {
+                provider: "github".to_owned(),
+                resource: "actions_get".to_owned(),
+                action: "read".to_owned(),
+            }],
+        }
+    }
+
+    #[test]
+    fn accepts_exact_descriptive_capabilities() -> Result<(), String> {
+        let catalog = catalog();
+        catalog.validate()?;
+        assert_eq!(
+            CapabilityCatalog::from_json(
+                &serde_json::to_string(&catalog).map_err(|error| error.to_string())?
+            )?,
+            catalog
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unknown_fields_duplicates_and_malformed_identifiers() {
+        let unknown = r#"{"schemaVersion":"steward.capability-catalog/v1","models":[],"tools":[],"budget":{}}"#;
+        assert!(CapabilityCatalog::from_json(unknown).is_err());
+
+        let mut duplicate = catalog();
+        duplicate.models.push(duplicate.models[0].clone());
+        assert!(duplicate.validate().is_err());
+
+        let mut malformed = catalog();
+        malformed.tools[0].resource = " actions_get".to_owned();
+        assert!(malformed.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_documents_and_entry_sets() {
+        let oversized = " ".repeat(MAX_CAPABILITY_CATALOG_BYTES + 1);
+        assert!(CapabilityCatalog::from_json(&oversized).is_err());
+
+        let mut too_many_models = catalog();
+        too_many_models.models = (0..=MAX_CAPABILITY_MODELS)
+            .map(|index| ModelRef {
+                provider: "provider-a".to_owned(),
+                model: format!("model-{index}"),
+            })
+            .collect();
+        assert!(too_many_models.validate().is_err());
+
+        let mut too_many_tools = catalog();
+        too_many_tools.tools = (0..=MAX_CAPABILITY_TOOLS)
+            .map(|index| ToolGrant {
+                provider: "github".to_owned(),
+                resource: format!("resource-{index}"),
+                action: "read".to_owned(),
+            })
+            .collect();
+        assert!(too_many_tools.validate().is_err());
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -54,14 +196,6 @@ pub(crate) struct BrowserEnvelopeTemplateListItem {
 pub(crate) struct BrowserEnvelopeTemplateListResponse {
     api_version: &'static str,
     templates: Vec<BrowserEnvelopeTemplateListItem>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct BrowserServiceEnvelopeResponse {
-    api_version: &'static str,
-    service: &'static str,
-    envelope: BrowserEnvelope,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -196,7 +330,12 @@ pub(crate) struct BrowserDecisionReferenceResponse {
     evidence_url: String,
 }
 
-fn inner_router<R, L, D>(runtimes: R, ledger: L, decisions: D) -> Router
+fn inner_router<R, L, D>(
+    runtimes: R,
+    ledger: L,
+    decisions: D,
+    capabilities: CapabilityCatalog,
+) -> Router
 where
     R: RuntimeRepository,
     L: AdmissionLedger,
@@ -212,8 +351,8 @@ where
             get(get_envelope_template::<R, L, D>).post(author_envelope_template::<R, L, D>),
         )
         .route(
-            "/admin/api/v1/service-envelope",
-            get(get_service_envelope::<R, L, D>),
+            "/admin/api/v1/capabilities",
+            get(get_capabilities::<R, L, D>),
         )
         .route("/admin/api/v1/approvals", get(list_approvals::<R, L, D>))
         .route(
@@ -236,23 +375,22 @@ where
             runtimes,
             ledger,
             decisions,
+            capabilities,
         })
 }
 
 #[utoipa::path(
     get,
-    operation_id = "getAdminServiceEnvelope",
-    path = "/admin/api/v1/service-envelope",
+    operation_id = "getAdminCapabilities",
+    path = "/admin/api/v1/capabilities",
     responses(
-        (status = 200, body = BrowserServiceEnvelopeResponse),
+        (status = 200, body = CapabilityCatalog),
         (status = 401, description = "Browser session is absent or invalid"),
-        (status = 403, description = "Administrator role is required"),
-        (status = 404, description = "The managed Service Envelope is not provisioned"),
-        (status = 503, description = "The managed Service Envelope is unavailable")
+        (status = 403, description = "Administrator role is required")
     ),
     security(("browserSession" = []))
 )]
-pub(crate) async fn get_service_envelope<R, L, D>(
+pub(crate) async fn get_capabilities<R, L, D>(
     Extension(_authority): Extension<BrowserAdminAuthority>,
     State(state): State<BrowserAdminState<R, L, D>>,
 ) -> Response
@@ -261,16 +399,7 @@ where
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
-    match state.ledger.latest_service_envelope(MANAGED_SERVICE).await {
-        Ok(Some(envelope)) => Json(BrowserServiceEnvelopeResponse {
-            api_version: BROWSER_ADMIN_API_VERSION,
-            service: MANAGED_SERVICE,
-            envelope: envelope.into(),
-        })
-        .into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => ApiError::Store(error).into_response(),
-    }
+    Json(state.capabilities).into_response()
 }
 
 #[utoipa::path(
@@ -419,6 +548,7 @@ pub fn protected_router<R, L, D>(
     runtimes: R,
     ledger: L,
     decisions: D,
+    capabilities: CapabilityCatalog,
     browser_auth: BrowserAuthService,
 ) -> Router
 where
@@ -426,7 +556,10 @@ where
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
-    protect_browser_admin_routes(inner_router(runtimes, ledger, decisions), browser_auth)
+    protect_browser_admin_routes(
+        inner_router(runtimes, ledger, decisions, capabilities),
+        browser_auth,
+    )
 }
 
 #[utoipa::path(
@@ -516,8 +649,8 @@ where
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
         (status = 409, description = "Envelope revision is not newer than the current revision"),
-        (status = 422, description = "Member role, envelope, or current Service Envelope model/tool subset is invalid"),
-        (status = 503, description = "Envelope templates or the managed Service Envelope are unavailable")
+        (status = 422, description = "Member role, envelope, or deployed capability selection is invalid"),
+        (status = 503, description = "Envelope templates are unavailable")
     ),
     security(("browserSession" = []))
 )]
@@ -548,22 +681,17 @@ where
         Ok(_) => {}
         Err(error) => return ApiError::Store(error).into_response(),
     }
-    let service_envelope = match state.ledger.latest_service_envelope(MANAGED_SERVICE).await {
-        Ok(Some(service_envelope)) => service_envelope,
-        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(error) => return ApiError::Store(error).into_response(),
-    };
-    if service_envelope.spec.llms.is_empty()
+    if state.capabilities.models.is_empty()
         || envelope
             .spec
             .llms
             .iter()
-            .any(|model| !service_envelope.spec.llms.contains(model))
+            .any(|model| !state.capabilities.models.contains(model))
         || envelope
             .spec
             .tools
             .iter()
-            .any(|tool| !service_envelope.spec.tools.contains(tool))
+            .any(|tool| !state.capabilities.tools.contains(tool))
     {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }

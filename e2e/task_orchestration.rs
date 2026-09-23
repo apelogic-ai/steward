@@ -28,7 +28,8 @@ use steward_ports::{
     PortError, SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
 };
 use steward_store::{
-    PgStore, StoreError, TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest,
+    EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, PgStore,
+    StoreError, TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
@@ -123,13 +124,6 @@ async fn internal_authority_provisions_and_recovers_cleanup_without_a_service_en
         .await?;
     let store = PgStore::new(pool);
     store.migrate().await?;
-    assert!(
-        store
-            .latest_service_envelope(steward_connections_v1::SERVICE)
-            .await?
-            .is_none()
-    );
-
     for finalize_before_observation in [false, true] {
         let suffix = Uuid::new_v4().simple().to_string();
         let email = Email(format!("alice-{suffix}@example.com"));
@@ -242,7 +236,7 @@ async fn internal_authority_provisions_and_recovers_cleanup_without_a_service_en
                     work.task.internal_authority_digest = Some(format!("sha256:{}", "0".repeat(64)))
                 }
                 3 => work.task.service_envelope_digest = Some(format!("sha256:{}", "0".repeat(64))),
-                4 => work.task.envelope_revision = 999,
+                4 => work.task.envelope_revision = Some(999),
                 5 => work.task.submitter_service = "other-service".to_owned(),
                 6 => work.task.internal_authority_version = None,
                 _ => {
@@ -329,6 +323,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         .as_nanos()
         .to_string();
     let service = format!("orchestrator-fault-{suffix}");
+    let member_role = format!("engineer-{suffix}");
     let identity = store
         .register_canonical_identity(
             &OrganizationIdentityPolicy::new(
@@ -368,12 +363,58 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         },
     };
     store
-        .insert_service_envelope(&service, &envelope, "admin@example.com")
+        .insert_envelope(&member_role, &envelope, "admin@example.com")
+        .await?;
+    let envelope_request = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &identity.user_id,
+            template_id: &member_role,
+            template_revision: envelope.revision,
+            requested_envelope: &envelope,
+            idempotency_key: &format!("envelope-{suffix}"),
+            actor: "admin@example.com",
+        })
+        .await?
+        .record;
+    let approval_id = Uuid::new_v4();
+    store
+        .append_envelope_request_status(
+            envelope_request.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Approved,
+                approval_id: Some(approval_id),
+                envelope_instance_id: None,
+                envelope_digest: None,
+                reason: None,
+                approved_envelope: Some(&envelope),
+                actor: "admin@example.com",
+            },
+        )
+        .await?;
+    let envelope_instance_id = format!("env_{}", envelope_request.id.simple());
+    let envelope_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&envelope)?)
+    );
+    store
+        .append_envelope_request_status(
+            envelope_request.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Approved,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: Some(approval_id),
+                envelope_instance_id: Some(&envelope_instance_id),
+                envelope_digest: Some(&envelope_digest),
+                reason: None,
+                approved_envelope: Some(&envelope),
+                actor: "steward-test",
+            },
+        )
         .await?;
     let spec = AgentRuntimeSpec {
-        principal: Principal::Service {
-            name: service.clone(),
-            acting_user: Some(Email("alice@example.com".to_owned())),
+        principal: Principal::User {
+            acting_user: Email("alice@example.com".to_owned()),
         },
         owner: Email("alice@example.com".to_owned()),
         canonical_authority: Some(CanonicalAuthorityBinding::new(
@@ -394,7 +435,6 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     let operation_id = Uuid::new_v4();
     let runtime_name = format!("task-{}", operation_id.simple());
     let candidate_digest = digest(serde_json::to_value(&spec))?;
-    let envelope_digest = digest(serde_json::to_value(&envelope))?;
     let inert_digest = manifest_digest(
         task_uid,
         operation_id,
@@ -420,9 +460,9 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             workflow_name: None,
             workflow_version: None,
             workflow_digest: None,
-            user_envelope_instance_id: None,
-            user_envelope_revision: None,
-            user_envelope_digest: None,
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
             coding_agent_runtime: "example-agent",
             runtime_uid: None,
             runtime_namespace: "steward-test",
@@ -432,9 +472,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             agent_command: &agent_command,
             execution_binding: None,
             direct_task_evidence: None,
-            envelope_revision: envelope.revision,
-            service_envelope: &envelope,
-            service_envelope_digest: &envelope_digest,
+            user_envelope_snapshot: Some(&envelope),
             candidate_digest: &candidate_digest,
             admission_decision: &admission_decision,
             inert_manifest_digest: &inert_digest,
@@ -717,9 +755,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             agent_command: &agent_command,
             execution_binding: None,
             direct_task_evidence: None,
-            envelope_revision: envelope.revision,
-            service_envelope: &envelope,
-            service_envelope_digest: &envelope_digest,
+            user_envelope_snapshot: Some(&envelope),
             candidate_digest: &cleanup_candidate_digest,
             admission_decision: &admission_decision,
             inert_manifest_digest: &cleanup_inert_digest,
@@ -829,9 +865,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             agent_command: &agent_command,
             execution_binding: None,
             direct_task_evidence: None,
-            envelope_revision: envelope.revision,
-            service_envelope: &envelope,
-            service_envelope_digest: &envelope_digest,
+            user_envelope_snapshot: Some(&envelope),
             candidate_digest: &candidate_digest,
             admission_decision: &admission_decision,
             inert_manifest_digest: &inert_digest,
