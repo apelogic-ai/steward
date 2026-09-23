@@ -2464,6 +2464,8 @@ mod tests {
             "sslmode=disable",
             "sslmode=require",
             "--test postgres_tls",
+            "--test task_orchestration",
+            "STEWARD_TEST_DATABASE_URL",
             "steward.test/run-id",
             "docker volume create",
             "docker volume rm",
