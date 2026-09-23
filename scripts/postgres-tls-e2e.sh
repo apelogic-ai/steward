@@ -90,10 +90,18 @@ if [[ -z "${port}" ]]; then
   exit 1
 fi
 
+docker exec "${CONTAINER}" createdb -U steward steward_orchestration
 export STEWARD_TEST_PLAINTEXT_DATABASE_URL="postgres://steward@127.0.0.1:${port}/steward?sslmode=disable"
 export STEWARD_TEST_TLS_DATABASE_URL="postgres://steward@127.0.0.1:${port}/steward?sslmode=require"
+export STEWARD_TEST_DATABASE_URL="postgres://steward@127.0.0.1:${port}/steward_orchestration?sslmode=require"
 cargo test \
   --manifest-path "${ROOT}/e2e/Cargo.toml" \
   --test postgres_tls \
   -- \
   --nocapture
+RUST_MIN_STACK=8388608 cargo test \
+  --manifest-path "${ROOT}/e2e/Cargo.toml" \
+  --test task_orchestration \
+  -- \
+  --nocapture \
+  --test-threads=1

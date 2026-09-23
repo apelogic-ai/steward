@@ -23,7 +23,7 @@ use steward_apiserver::connections::{
 use steward_apiserver::governed_connections::{
     ConnectionExecutionBindings, GovernedConnectionsBroker, GovernedConnectionsConfig,
 };
-use steward_controller::reconcile_task_orchestration_work_item;
+use steward_controller::{TaskControllerError, reconcile_task_orchestration_work_item};
 use steward_ports::{
     PortError, SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
 };
@@ -467,12 +467,41 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     );
 
     let create_work = current_work(&store, task_uid).await?;
-    let (left, right) = tokio::join!(
-        reconcile_task_orchestration_work_item(&client, &task_runtime, &store, &create_work),
-        reconcile_task_orchestration_work_item(&client, &task_runtime, &store, &create_work),
+    let left = {
+        let client = client.clone();
+        let task_runtime = task_runtime.clone();
+        let store = store.clone();
+        let create_work = create_work.clone();
+        tokio::spawn(async move {
+            reconcile_task_orchestration_work_item(&client, &task_runtime, &store, &create_work)
+                .await
+        })
+    };
+    let right = {
+        let client = client.clone();
+        let task_runtime = task_runtime.clone();
+        let store = store.clone();
+        tokio::spawn(async move {
+            reconcile_task_orchestration_work_item(&client, &task_runtime, &store, &create_work)
+                .await
+        })
+    };
+    let (left, right) = tokio::join!(left, right);
+    let outcomes = [left?, right?];
+    assert!(
+        outcomes.iter().any(Result::is_ok),
+        "one competing reconciler must complete the durable lifecycle step"
     );
-    left?;
-    right?;
+    for outcome in outcomes.into_iter().filter_map(Result::err) {
+        assert!(
+            matches!(
+                outcome,
+                TaskControllerError::Store(StoreError::Database(ref reason))
+                    if reason.contains("deadlock detected")
+            ),
+            "only PostgreSQL's retryable deadlock arbitration may reject a competing reconcile: {outcome}"
+        );
+    }
     let observed = operation(&store, task_uid).await?;
     assert_eq!(observed.state, TaskOrchestrationState::RuntimeObserved);
     assert_eq!(observed.runtime_uid.as_deref(), Some("runtime-uid-a"));

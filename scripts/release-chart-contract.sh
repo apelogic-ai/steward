@@ -19,9 +19,12 @@ if [[ -z "${marker_lines}" && "${version_lines}" == 0.1.17 ]]; then
   exit 0
 fi
 
-if [[ "${marker_lines}" == steward.customer-install/v1 && "${version_lines}" =~ ^0\.1\.([0-9]+)$ && ${BASH_REMATCH[1]} -ge 18 ]]; then
-  printf '%s\n' customer-v1
-  exit 0
+if [[ "${marker_lines}" == steward.customer-install/v1 ]]; then
+  if [[ "${version_lines}" == 0.2.0 ]] \
+    || [[ "${version_lines}" =~ ^0\.1\.([0-9]+)$ && ${BASH_REMATCH[1]} -ge 18 ]]; then
+    printf '%s\n' customer-v1
+    exit 0
+  fi
 fi
 
 echo "unsupported chart version/customer-install contract: ${version_lines} / ${marker_lines:-<none>}" >&2
