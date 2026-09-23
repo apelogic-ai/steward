@@ -2186,6 +2186,7 @@ mod tests {
             "cargo xtask e2e-governed-connections",
             "- governed-connections",
             "GOVERNED_CONNECTIONS: ${{ needs.governed-connections.result }}",
+            "supervisor-tools: \"true\"",
         ] {
             assert!(ci.contains(required), "pinned CI is missing {required}");
         }
@@ -2198,6 +2199,8 @@ mod tests {
             "STEWARD_OPEN_SHELL_RELEASE=v0.0.98",
             "sha256:80bef7bee93482c8091335ae27c3c3e968e5c78c2bb4a40b401e6af36f70f993",
             "e2e/Dockerfile.workflow-sandbox",
+            "scripts/build-patched-openshell-supervisor.sh",
+            "STEWARD_OPENSHELL_SUPERVISOR_IMAGE",
             "STEWARD_OPENSHELL_SANDBOX_IMAGE",
             "scripts/openshell-testbed.sh",
         ] {

@@ -119,6 +119,7 @@ jobs:
         uses: ./.github/actions/setup-tools
         with:
           kubernetes-tools: "true"
+          supervisor-tools: "true"
 
       - name: Verify governed provider connections against the pinned real stack
         run: cargo xtask e2e-governed-connections

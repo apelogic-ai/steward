@@ -10,6 +10,10 @@ inputs:
     description: Install kind, kubectl, and Helm
     required: false
     default: "false"
+  supervisor-tools:
+    description: Install Zig and cargo-zigbuild
+    required: false
+    default: "false"
   workflow-tools:
     description: Install actionlint and ShellCheck
     required: false
@@ -34,6 +38,14 @@ inputs:
     description: Helm version
     required: false
     default: "3.17.1"
+  zig-version:
+    description: Zig version
+    required: false
+    default: "0.14.1"
+  cargo-zigbuild-version:
+    description: cargo-zigbuild version
+    required: false
+    default: "0.22.3"
   actionlint-version:
     description: actionlint version
     required: false
@@ -127,6 +139,35 @@ runs:
         chmod +x "${tools_dir}/helm"
 
         echo "${tools_dir}" >> "${GITHUB_PATH}"
+
+    - name: Install supervisor build tools
+      if: inputs.supervisor-tools == 'true'
+      shell: bash
+      env:
+        CARGO_ZIGBUILD_VERSION: ${{ inputs.cargo-zigbuild-version }}
+        ZIG_VERSION: ${{ inputs.zig-version }}
+      run: |
+        set -euo pipefail
+        tools_dir="${RUNNER_TEMP}/steward-tools"
+        mkdir -p "${tools_dir}"
+
+        zig_asset="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+        zig_url="https://ziglang.org/download/${ZIG_VERSION}/${zig_asset}"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/${zig_asset}" "${zig_url}"
+        echo "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c  ${tools_dir}/${zig_asset}" \
+          | sha256sum --check -
+        tar --extract --xz \
+          --file "${tools_dir}/${zig_asset}" --directory "${tools_dir}"
+        zig_dir="${tools_dir}/zig-x86_64-linux-${ZIG_VERSION}"
+        chmod +x "${zig_dir}/zig"
+        echo "${zig_dir}" >> "${GITHUB_PATH}"
+
+        cargo install cargo-zigbuild \
+          --locked \
+          --version "${CARGO_ZIGBUILD_VERSION}" \
+          --root "${tools_dir}/cargo-zigbuild"
+        echo "${tools_dir}/cargo-zigbuild/bin" >> "${GITHUB_PATH}"
 
     - name: Install workflow lint tools
       if: inputs.workflow-tools == 'true'

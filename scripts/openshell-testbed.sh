@@ -93,6 +93,24 @@ kind create cluster \
   --wait 120s
 CLUSTER_CREATED=1
 
+supervisor_image_args=()
+if [[ -n "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
+  if [[ "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE}" != *:* || "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE}" == *@* ]]; then
+    echo "STEWARD_OPENSHELL_SUPERVISOR_IMAGE must be an explicit repository:tag reference" >&2
+    exit 2
+  fi
+  supervisor_repository="${STEWARD_OPENSHELL_SUPERVISOR_IMAGE%:*}"
+  supervisor_tag="${STEWARD_OPENSHELL_SUPERVISOR_IMAGE##*:}"
+  kind load docker-image \
+    "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE}" \
+    --name "${CLUSTER_NAME}"
+  supervisor_image_args=(
+    --set-string "supervisor.image.repository=${supervisor_repository}"
+    --set-string "supervisor.image.tag=${supervisor_tag}"
+    --set-string "supervisor.image.pullPolicy=IfNotPresent"
+  )
+fi
+
 sandbox_image_args=()
 if [[ -n "${STEWARD_OPENSHELL_SANDBOX_IMAGE:-}" ]]; then
   if [[ "${STEWARD_OPENSHELL_SANDBOX_IMAGE}" != *:* || "${STEWARD_OPENSHELL_SANDBOX_IMAGE}" == *@* ]]; then
@@ -296,6 +314,9 @@ openshell_helm_args+=(
 )
 if [[ -n "${STEWARD_OPENSHELL_SANDBOX_IMAGE:-}" ]]; then
   openshell_helm_args+=("${sandbox_image_args[@]}")
+fi
+if [[ -n "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
+  openshell_helm_args+=("${supervisor_image_args[@]}")
 fi
 openshell_helm_args+=(--wait --timeout 5m)
 
