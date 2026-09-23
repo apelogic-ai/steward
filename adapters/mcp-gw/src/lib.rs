@@ -16,6 +16,7 @@ const OPEN_SHELL_BEARER_PLACEHOLDER: &str = "openshell-token-grant-placeholder";
 const MAX_RESPONSE_BYTES: usize = 32 * 1024;
 const PROVIDER_TRANSPORT_READY_TIMEOUT: Duration = Duration::from_secs(12);
 const PROVIDER_TRANSPORT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const DIRECT_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
 const LEGACY_STATUS_PATH: &str = "/oauth/github/status";
 const LIFECYCLE_STATUS_PATH: &str = "/connections/github/status";
 const START_PATH: &str = "/oauth/github/start";
@@ -114,6 +115,78 @@ pub struct GithubMcpGateway {
     client: Client,
     origin: Url,
     contract: GatewayContract,
+}
+
+/// A one-request HOP-1 credential used only by the fixed connection-status reader.
+/// Deliberately implements neither `Debug` nor `Display`.
+pub struct GithubStatusCredential(String);
+
+impl GithubStatusCredential {
+    pub fn new(value: String) -> Result<Self, PortError> {
+        let segments = value.split('.').collect::<Vec<_>>();
+        let compact_jwt = value.len() <= 8 * 1024
+            && segments.len() == 3
+            && segments.iter().all(|segment| {
+                !segment.is_empty()
+                    && segment
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            });
+        if compact_jwt {
+            Ok(Self(value))
+        } else {
+            Err(rejected("direct status credential must be one compact JWT"))
+        }
+    }
+
+    fn secret(&self) -> &str {
+        &self.0
+    }
+}
+
+/// MCP-GW metadata-only status reader. It has no mutation or generic request surface.
+#[derive(Clone)]
+pub struct GithubStatusReader {
+    client: Client,
+    origin: Url,
+    contract: GatewayContract,
+}
+
+impl GithubStatusReader {
+    pub fn new(origin: &str, version: &str) -> Result<Self, PortError> {
+        let origin = validate_origin(origin)?;
+        let contract = GatewayContract::parse(version)?;
+        if contract != GatewayContract::LifecycleV049 {
+            return Err(rejected(
+                "direct status requires the MCP-GW lifecycle metadata contract",
+            ));
+        }
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(DIRECT_STATUS_TIMEOUT)
+            .timeout(DIRECT_STATUS_TIMEOUT)
+            .build()
+            .map_err(|_| unavailable("build direct MCP-GW status client"))?;
+        Ok(Self {
+            client,
+            origin,
+            contract,
+        })
+    }
+
+    pub async fn read(&self, credential: &GithubStatusCredential) -> Result<Value, PortError> {
+        let target = endpoint(&self.origin, LIFECYCLE_STATUS_PATH)?;
+        let response = self
+            .client
+            .get(target)
+            .header(AUTHORIZATION, format!("Bearer {}", credential.secret()))
+            .send()
+            .await
+            .map_err(|_| unavailable("read direct GitHub connection status"))?;
+        let status = response.status();
+        let body = read_bounded(response).await?;
+        parse_response(self.contract, GithubBridgeOperation::Status, status, &body)
+    }
 }
 
 impl GithubMcpGateway {
@@ -582,7 +655,7 @@ mod tests {
 
     use super::{
         GatewayContract, GithubBridgeOperation, GithubBridgeRequest, GithubMcpGateway,
-        parse_response, pre_dispatch_provider_failure,
+        GithubStatusCredential, GithubStatusReader, parse_response, pre_dispatch_provider_failure,
     };
     use reqwest::StatusCode;
     use steward_ports::PortError;
@@ -773,6 +846,84 @@ mod tests {
                     .to_owned(),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn direct_status_uses_one_exact_authenticated_get_without_a_runtime_retry()
+    -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind direct status fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read direct status fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("accept direct status request: {error}"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|error| format!("bound direct status fixture read: {error}"))?;
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .map_err(|error| format!("read direct status request: {error}"))?;
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                request.starts_with("GET /connections/github/status HTTP/1.1\r\n"),
+                "the direct reader must expose only the lifecycle metadata route"
+            );
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("\r\nauthorization: bearer aaa.bbb.ccc\r\n"),
+                "the direct reader must present the one-request HOP-1 credential"
+            );
+            let body = r#"{"version":"1","provider":"github","phase":"disconnected","connected":false,"requiredScopes":["repo"],"grantedScopes":[],"missingScopes":["repo"],"activeCredentialExpiresAt":null,"renewalCredentialExpiresAt":null,"lastAuthorizedAt":null,"lastRenewedAt":null,"lastValidatedAt":null,"capabilities":{"interactiveAuthorization":true}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .map_err(|error| format!("write direct status response: {error}"))?;
+            Ok(())
+        });
+
+        let reader = GithubStatusReader::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build direct status reader: {error:?}"))?;
+        let credential = GithubStatusCredential::new("aaa.bbb.ccc".to_owned())
+            .map_err(|error| format!("build direct status credential: {error:?}"))?;
+        let status = reader
+            .read(&credential)
+            .await
+            .map_err(|error| format!("read direct status: {error:?}"))?;
+
+        server
+            .join()
+            .map_err(|_| "direct status fixture panicked".to_owned())??;
+        assert_eq!(
+            status,
+            serde_json::json!({
+                "phase": "disconnected",
+                "connected": false,
+                "scopesRequired": ["repo"],
+                "scopesGranted": [],
+                "missingScopes": ["repo"],
+                "activeCredentialExpiresAt": null,
+                "renewalCredentialExpiresAt": null
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_status_credential_requires_exactly_three_compact_jwt_segments() {
+        for invalid in ["aaa.bbb", "aaa.bbb.ccc.ddd", "aaa..ccc", "aaa.bbb.ccc="] {
+            assert!(
+                GithubStatusCredential::new(invalid.to_owned()).is_err(),
+                "direct status credential must reject {invalid}"
+            );
+        }
+        assert!(GithubStatusCredential::new("aaa.bbb.ccc".to_owned()).is_ok());
     }
 
     #[tokio::test]

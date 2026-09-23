@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::rejection::FormRejection;
-use axum::extract::{Form, FromRequest, Request, State};
+use axum::extract::{DefaultBodyLimit, Form, FromRequest, Request, State};
 use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, PRAGMA};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::routing::{get, post};
@@ -31,8 +31,20 @@ use uuid::Uuid;
 /// verified email as a separate compatibility claim for downstream provider boundaries.
 pub const HOP1_CLAIMS_VERSION: u8 = 3;
 pub const DEFAULT_AUTHORITY_TTL: Duration = Duration::from_secs(60);
+pub const MAX_CONTROL_PLANE_AUTHORITY_TTL: Duration = Duration::from_secs(15);
 pub const SPIFFE_CLIENT_ASSERTION_TYPE: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe";
+const CONTROL_PLANE_SERVICE: &str = "steward-apiserver";
+const CONTROL_PLANE_STATUS_PURPOSE: &str = "provider_connection_status";
+const CONTROL_PLANE_STATUS_SCOPE: &str = "connections_status";
+
+fn control_plane_status_grant() -> ToolGrant {
+    ToolGrant {
+        provider: "github".to_owned(),
+        resource: "provider-control".to_owned(),
+        action: "status".to_owned(),
+    }
+}
 
 /// A signed HOP-1 presented for online authority verification.
 /// Deliberately implements neither `Debug` nor `Display`.
@@ -276,6 +288,8 @@ pub enum MintConfigError {
     EmptySvidAudience,
     InvalidAllowedScopes,
     InvalidAuthorityTtl,
+    InvalidControlPlaneAuthorityTtl,
+    InvalidControlPlaneWorkloadIdentity,
     InvalidIntrospectionClientCredential,
 }
 
@@ -285,6 +299,62 @@ pub struct TokenGrantRequest {
     pub client_assertion: SvidAssertion,
     pub audience: String,
     pub scope: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedControlPlaneWorkload(String);
+
+impl AuthenticatedControlPlaneWorkload {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
+pub struct ControlPlaneTokenRequest {
+    pub workload: AuthenticatedControlPlaneWorkload,
+    pub principal: Principal,
+    pub canonical_authority: CanonicalAuthorityBinding,
+}
+
+/// A Kubernetes service-account bearer accepted only by the control-plane exchange.
+/// Deliberately implements neither `Debug` nor `Display`.
+pub struct ControlPlaneClientCredential(String);
+
+impl ControlPlaneClientCredential {
+    pub fn secret(&self) -> &str {
+        &self.0
+    }
+}
+
+pub trait ControlPlaneWorkloadAuthenticator: Clone + Send + Sync + 'static {
+    fn authenticate(
+        &self,
+        credential: ControlPlaneClientCredential,
+    ) -> impl Future<Output = Result<AuthenticatedControlPlaneWorkload, MintError>> + Send;
+}
+
+#[derive(Clone)]
+pub struct ControlPlaneMintConfig {
+    expected_workload_identity: String,
+    authority_ttl: Duration,
+}
+
+impl ControlPlaneMintConfig {
+    pub fn new(
+        expected_workload_identity: String,
+        authority_ttl: Duration,
+    ) -> Result<Self, MintConfigError> {
+        if expected_workload_identity.trim().is_empty() {
+            return Err(MintConfigError::InvalidControlPlaneWorkloadIdentity);
+        }
+        if authority_ttl.is_zero() || authority_ttl > MAX_CONTROL_PLANE_AUTHORITY_TTL {
+            return Err(MintConfigError::InvalidControlPlaneAuthorityTtl);
+        }
+        Ok(Self {
+            expected_workload_identity,
+            authority_ttl,
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -332,6 +402,8 @@ impl TokenGrantResponse {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum MintError {
+    ControlPlaneClientRejected,
+    ControlPlaneClientUnavailable,
     InvalidSvid,
     SvidValidatorUnavailable,
     AuthorityUnavailable,
@@ -358,9 +430,12 @@ struct Hop1Claims {
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 struct StewardClaims {
     acting_as: String,
-    runtime_uid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_uid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     service: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    purpose: Option<String>,
     tools: Vec<ToolGrant>,
     version: u8,
 }
@@ -447,6 +522,7 @@ struct MintRuntimeConfig {
     allowed_scopes: Vec<String>,
     svid_audience: String,
     authority_ttl: Duration,
+    control_plane: Option<ControlPlaneMintConfig>,
 }
 
 impl<V, R> Mint<V, R, NoCredentialGrantResolver>
@@ -476,6 +552,14 @@ where
     R: AuthorityResolver,
     C: CredentialGrantResolver,
 {
+    pub fn with_control_plane(
+        mut self,
+        config: ControlPlaneMintConfig,
+    ) -> Result<Self, MintConfigError> {
+        self.config.control_plane = Some(config);
+        Ok(self)
+    }
+
     pub fn new_with_credential_resolver(
         config: MintConfig,
         key: MintSigningKey,
@@ -501,6 +585,7 @@ where
                 allowed_scopes,
                 svid_audience,
                 authority_ttl,
+                control_plane: None,
             },
             credential_resolver,
             introspection_client_credential_hash,
@@ -583,8 +668,9 @@ where
             jti: Uuid::new_v4().to_string(),
             steward: StewardClaims {
                 acting_as: identity.acting_as.to_owned(),
-                runtime_uid: authority.runtime.0,
+                runtime_uid: Some(authority.runtime.0),
                 service: identity.service,
+                purpose: None,
                 tools: authority.tools,
                 version: HOP1_CLAIMS_VERSION,
             },
@@ -602,6 +688,63 @@ where
             access_token,
             expires_in: self.config.authority_ttl.as_secs(),
             scope: request.scope.join(" "),
+            token_type: "Bearer".to_owned(),
+        })
+    }
+
+    pub fn issue_control_plane_token(
+        &self,
+        request: ControlPlaneTokenRequest,
+    ) -> Result<TokenGrantResponse, MintError> {
+        let config = self
+            .config
+            .control_plane
+            .as_ref()
+            .ok_or(MintError::InvalidRequest)?;
+        if request.workload.0 != config.expected_workload_identity {
+            return Err(MintError::WorkloadMismatch);
+        }
+        let Principal::User { acting_user } = request.principal else {
+            return Err(MintError::InvalidRequest);
+        };
+        let acting_user_id = request
+            .canonical_authority
+            .acting_user_id
+            .as_ref()
+            .filter(|acting_user_id| *acting_user_id == &request.canonical_authority.owner_user_id)
+            .ok_or(MintError::WorkloadMismatch)?;
+        let authority_ttl = ChronoDuration::from_std(config.authority_ttl)
+            .map_err(|_| MintError::InvalidRequest)?;
+        let claims = Claims::new(Hop1Claims {
+            aud: vec![self.config.audience.clone()],
+            azp: request.workload.0,
+            email: Some(acting_user.0),
+            iss: self.config.issuer.clone(),
+            jti: Uuid::new_v4().to_string(),
+            steward: StewardClaims {
+                acting_as: "service_for_user".to_owned(),
+                runtime_uid: None,
+                service: Some(CONTROL_PLANE_SERVICE.to_owned()),
+                purpose: Some(CONTROL_PLANE_STATUS_PURPOSE.to_owned()),
+                tools: vec![control_plane_status_grant()],
+                version: HOP1_CLAIMS_VERSION,
+            },
+            sub: acting_user_id.as_str().to_owned(),
+        })
+        .set_duration_and_issuance(
+            &TimeOptions::from_leeway(ChronoDuration::zero()),
+            authority_ttl,
+        );
+        let header = Header::empty()
+            .with_key_id(self._key.key_id.clone())
+            .with_token_type("JWT");
+        let access_token = Ed25519
+            .token(&header, &claims, &self._key.signing)
+            .map_err(|_| MintError::SigningFailed)?;
+        Ok(TokenGrantResponse {
+            access_token,
+            expires_in: config.authority_ttl.as_secs(),
+            scope: CONTROL_PLANE_STATUS_SCOPE.to_owned(),
             token_type: "Bearer".to_owned(),
         })
     }
@@ -648,6 +791,20 @@ where
             return Ok(TokenIntrospectionResponse::inactive());
         }
 
+        if claims.custom.steward.purpose.as_deref() == Some(CONTROL_PLANE_STATUS_PURPOSE) {
+            let active = self.config.control_plane.as_ref().is_some_and(|config| {
+                claims.custom.azp == config.expected_workload_identity
+                    && claims.custom.steward.acting_as == "service_for_user"
+                    && claims.custom.steward.service.as_deref() == Some(CONTROL_PLANE_SERVICE)
+                    && claims.custom.steward.runtime_uid.is_none()
+                    && claims.custom.steward.tools == [control_plane_status_grant()]
+                    && claims.custom.steward.version == HOP1_CLAIMS_VERSION
+                    && claims.custom.email.is_some()
+                    && !claims.custom.sub.is_empty()
+            });
+            return Ok(TokenIntrospectionResponse { active });
+        }
+
         let workload = ValidatedWorkload {
             spiffe_id: claims.custom.azp.clone(),
         };
@@ -692,7 +849,8 @@ where
         };
         let active = authority.state == AuthorityState::Active
             && authority.workload_id == claims.custom.azp
-            && authority.runtime.0 == claims.custom.steward.runtime_uid
+            && claims.custom.steward.purpose.is_none()
+            && claims.custom.steward.runtime_uid.as_deref() == Some(authority.runtime.0.as_str())
             && authority.tools == claims.custom.steward.tools
             && claims.custom.steward.version == HOP1_CLAIMS_VERSION
             && principal_matches;
@@ -729,6 +887,13 @@ struct TokenGrantForm {
 #[derive(Deserialize)]
 struct TokenIntrospectionForm {
     token: Hop1Token,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ControlPlaneTokenGrantBody {
+    principal: Principal,
+    canonical_authority: CanonicalAuthorityBinding,
 }
 
 #[derive(Serialize)]
@@ -787,6 +952,37 @@ where
         .map_err(map_mint_error)
 }
 
+async fn control_plane_token_handler<V, R, C, A>(
+    State(state): State<ControlPlaneRouterState<V, R, C, A>>,
+    request: Request,
+) -> TokenResult<TokenGrantResponse>
+where
+    V: SvidValidator,
+    R: AuthorityResolver,
+    C: CredentialGrantResolver,
+    A: ControlPlaneWorkloadAuthenticator,
+{
+    let credential = control_plane_credential(request.headers().get(AUTHORIZATION))
+        .ok_or_else(|| oauth_error(StatusCode::UNAUTHORIZED, "invalid_client"))?;
+    let workload = state
+        .authenticator
+        .authenticate(credential)
+        .await
+        .map_err(map_mint_error)?;
+    let Json(body) = Json::<ControlPlaneTokenGrantBody>::from_request(request, &())
+        .await
+        .map_err(|_| oauth_error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    state
+        .mint
+        .issue_control_plane_token(ControlPlaneTokenRequest {
+            workload,
+            principal: body.principal,
+            canonical_authority: body.canonical_authority,
+        })
+        .map(|response| (no_store_headers(), Json(response)))
+        .map_err(map_mint_error)
+}
+
 async fn introspection_handler<V, R, C>(
     State(mint): State<Arc<Mint<V, R, C>>>,
     request: Request,
@@ -821,6 +1017,12 @@ where
 
 fn map_mint_error(error: MintError) -> (StatusCode, Json<OAuthError>) {
     match error {
+        MintError::ControlPlaneClientRejected => {
+            oauth_error(StatusCode::UNAUTHORIZED, "invalid_client")
+        }
+        MintError::ControlPlaneClientUnavailable => {
+            oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
+        }
         MintError::InvalidSvid => oauth_error(StatusCode::UNAUTHORIZED, "invalid_client"),
         MintError::SvidValidatorUnavailable | MintError::AuthorityUnavailable => {
             oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
@@ -872,6 +1074,55 @@ fn is_bearer_token(value: &str) -> bool {
                 saw_payload = true;
             }
             !saw_padding && allowed
+        })
+}
+
+fn control_plane_credential(
+    authorization: Option<&HeaderValue>,
+) -> Option<ControlPlaneClientCredential> {
+    authorization
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .map(|(scheme, credential)| (scheme, credential.trim_start_matches(' ')))
+        .filter(|(scheme, credential)| {
+            scheme.eq_ignore_ascii_case("Bearer") && is_bearer_token(credential)
+        })
+        .map(|(_, credential)| ControlPlaneClientCredential(credential.to_owned()))
+}
+
+struct ControlPlaneRouterState<V, R, C, A> {
+    mint: Arc<Mint<V, R, C>>,
+    authenticator: A,
+}
+
+impl<V, R, C, A> Clone for ControlPlaneRouterState<V, R, C, A>
+where
+    A: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            mint: Arc::clone(&self.mint),
+            authenticator: self.authenticator.clone(),
+        }
+    }
+}
+
+pub fn control_plane_router<V, R, C, A>(mint: Arc<Mint<V, R, C>>, authenticator: A) -> Router
+where
+    V: SvidValidator,
+    R: AuthorityResolver,
+    C: CredentialGrantResolver,
+    A: ControlPlaneWorkloadAuthenticator,
+{
+    Router::new()
+        .route(
+            "/control-plane/token",
+            post(control_plane_token_handler::<V, R, C, A>),
+        )
+        .layer(DefaultBodyLimit::max(16 * 1024))
+        .with_state(ControlPlaneRouterState {
+            mint,
+            authenticator,
         })
 }
 

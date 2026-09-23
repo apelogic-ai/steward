@@ -10,10 +10,11 @@ use jwt_compact::{AlgorithmExt, Token};
 use rand_core::OsRng;
 use serde::Deserialize;
 use steward_mint::{
-    AuthorityBinding, AuthorityResolver, AuthorityState, CredentialGrant, CredentialGrantResolver,
-    DEFAULT_AUTHORITY_TTL, IntrospectionClientCredential, Mint, MintConfig, MintConfigError,
-    MintError, MintSigningKey, OpaqueAccessToken, SPIFFE_CLIENT_ASSERTION_TYPE, SvidAssertion,
-    SvidValidationError, SvidValidator, TokenGrantRequest, ValidatedWorkload,
+    AuthenticatedControlPlaneWorkload, AuthorityBinding, AuthorityResolver, AuthorityState,
+    ControlPlaneMintConfig, ControlPlaneTokenRequest, CredentialGrant, CredentialGrantResolver,
+    DEFAULT_AUTHORITY_TTL, Hop1Token, IntrospectionClientCredential, Mint, MintConfig,
+    MintConfigError, MintError, MintSigningKey, OpaqueAccessToken, SPIFFE_CLIENT_ASSERTION_TYPE,
+    SvidAssertion, SvidValidationError, SvidValidator, TokenGrantRequest, ValidatedWorkload,
 };
 use steward_types::{
     CanonicalAuthorityBinding, CanonicalUserId, Email, Principal, RuntimeId, ToolGrant,
@@ -154,6 +155,117 @@ fn mint(
     )
     .map_err(|error| format!("test mint config must be valid: {error:?}"))?;
     Ok((mint, calls, verifying_key))
+}
+
+#[tokio::test]
+async fn control_plane_status_token_is_short_lived_status_only_and_runtime_free()
+-> Result<(), String> {
+    let (mint, resolver_calls, verifying_key) =
+        mint(Ok(validated_workload()), Ok(active_binding()?))?;
+    let mint = mint
+        .with_control_plane(
+            ControlPlaneMintConfig::new(
+                "system:serviceaccount:steward-test:steward-apiserver".to_owned(),
+                std::time::Duration::from_secs(15),
+            )
+            .map_err(|error| format!("build control-plane mint config: {error:?}"))?,
+        )
+        .map_err(|error| format!("control-plane mint config must be valid: {error:?}"))?;
+    let canonical_authority = person_authority()?;
+    let request = |workload: &str, principal: Principal| ControlPlaneTokenRequest {
+        workload: AuthenticatedControlPlaneWorkload::new(workload.to_owned()),
+        principal,
+        canonical_authority: canonical_authority.clone(),
+    };
+
+    assert!(
+        matches!(
+            mint.issue_control_plane_token(request(
+                "system:serviceaccount:steward-test:other",
+                Principal::User {
+                    acting_user: Email("alice@example.com".to_owned()),
+                },
+            )),
+            Err(MintError::WorkloadMismatch)
+        ),
+        "a different Kubernetes workload must not mint a browser-user status token"
+    );
+    assert!(
+        matches!(
+            mint.issue_control_plane_token(request(
+                "system:serviceaccount:steward-test:steward-apiserver",
+                Principal::Service {
+                    name: "other".to_owned(),
+                    acting_user: None,
+                },
+            )),
+            Err(MintError::InvalidRequest)
+        ),
+        "the control-plane exchange must take the authenticated browser user's typed principal"
+    );
+
+    let response = mint
+        .issue_control_plane_token(request(
+            "system:serviceaccount:steward-test:steward-apiserver",
+            Principal::User {
+                acting_user: Email("alice@example.com".to_owned()),
+            },
+        ))
+        .map_err(|error| format!("mint control-plane status token: {error:?}"))?;
+    assert_eq!(response.expires_in(), 15);
+    assert_eq!(response.scope(), "connections_status");
+    assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+
+    let untrusted = UntrustedToken::new(response.access_token())
+        .map_err(|error| format!("parse status token: {error}"))?;
+    let token: Token<serde_json::Value> = Ed25519
+        .validator(&verifying_key)
+        .validate(&untrusted)
+        .map_err(|error| format!("validate status token: {error}"))?;
+    let claims = &token.claims().custom;
+    assert_eq!(
+        claims["azp"],
+        "system:serviceaccount:steward-test:steward-apiserver"
+    );
+    assert_eq!(claims["sub"], CANONICAL_USER);
+    assert_eq!(claims["email"], "alice@example.com");
+    assert_eq!(claims["steward"]["acting_as"], "service_for_user");
+    assert_eq!(claims["steward"]["service"], "steward-apiserver");
+    assert_eq!(claims["steward"]["purpose"], "provider_connection_status");
+    assert!(
+        claims["steward"].get("runtime_uid").is_none(),
+        "a control-plane status read must not invent an AgentRuntime identity"
+    );
+    assert_eq!(
+        claims["steward"]["tools"],
+        serde_json::json!([{
+            "provider": "github",
+            "resource": "provider-control",
+            "action": "status"
+        }])
+    );
+
+    let hop1: Hop1Token = serde_json::from_value(serde_json::Value::String(
+        response.access_token().to_owned(),
+    ))
+    .map_err(|error| format!("wrap status token for introspection: {error}"))?;
+    let introspection = mint
+        .introspect(&hop1)
+        .await
+        .map_err(|error| format!("introspect status token: {error:?}"))?;
+    assert!(
+        serde_json::to_value(introspection)
+            .map_err(|error| format!("serialize status introspection: {error}"))?["active"]
+            .as_bool()
+            .unwrap_or(false),
+        "MCP-GW must be able to introspect the short-lived status token"
+    );
+    assert_eq!(
+        resolver_calls.load(Ordering::SeqCst),
+        0,
+        "runtime authority resolution must not be involved in control-plane status"
+    );
+    Ok(())
 }
 
 fn mint_for_inference_without_credential_resolver() -> Result<TestMint, String> {

@@ -2,6 +2,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -541,8 +542,12 @@ fn browser_application_router(
     Ok(Some(app))
 }
 
-type GovernedConnectionsBroker =
+type GovernedConnectionMutations =
     governed_connections::GovernedConnectionsBroker<browser_auth::BrowserSessionBinding>;
+type GovernedConnectionsBroker = governed_connections::SplitConnectionsBroker<
+    GovernedConnectionMutations,
+    governed_connections::DirectConnectionStatusReader,
+>;
 
 fn governed_connections_configuration(
     browser_origin: &str,
@@ -565,31 +570,45 @@ fn governed_connections_configuration(
         mcp_gw_version,
         namespace,
     ] = values;
-    let required = |value: Option<String>| {
+    let required_connection = |value: Option<String>| {
         value
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| io::Error::other("governed Connections configuration must be complete"))
     };
-    let config = governed_connections::GovernedConnectionsConfig::new(
-        governed_connections::ConnectionExecutionBindings {
-            artifact_trust_mode: artifact_trust_mode
-                .unwrap_or_else(|| governed_connections::GITHUB_ATTESTATION_TRUST_MODE.to_owned()),
-            bridge_image_digest: required(bridge_image_digest)?,
-            mcp_gw_origin: required(mcp_gw_origin)?,
-            mcp_gw_version: required(mcp_gw_version)?,
-            namespace: required(namespace)?,
-            runtime_class: env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_default(),
+    let bindings = governed_connections::ConnectionExecutionBindings {
+        artifact_trust_mode: artifact_trust_mode
+            .unwrap_or_else(|| governed_connections::GITHUB_ATTESTATION_TRUST_MODE.to_owned()),
+        bridge_image_digest: required_connection(bridge_image_digest)?,
+        mcp_gw_origin: required_connection(mcp_gw_origin)?,
+        mcp_gw_version: required_connection(mcp_gw_version)?,
+        namespace: required_connection(namespace)?,
+        runtime_class: env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_default(),
+    };
+    let config =
+        governed_connections::GovernedConnectionsConfig::new(bindings.clone(), browser_origin)
+            .map_err(|_| io::Error::other("governed Connections configuration is invalid"))?;
+    let status = governed_connections::DirectConnectionStatusReader::new(
+        store.clone(),
+        governed_connections::DirectConnectionStatusConfig {
+            control_plane_credential_file: PathBuf::from(required(
+                "STEWARD_CONNECTIONS_CONTROL_PLANE_CREDENTIAL_FILE",
+            )?),
+            mint_origin: required("STEWARD_CONNECTIONS_MINT_ORIGIN")?,
         },
-        browser_origin,
+        &bindings.mcp_gw_origin,
+        &bindings.mcp_gw_version,
     )
-    .map_err(|_| io::Error::other("governed Connections configuration is invalid"))?;
-    Ok(Some(governed_connections::GovernedConnectionsBroker::new(
+    .map_err(|_| io::Error::other("direct Connections status configuration is invalid"))?;
+    let mutations = governed_connections::GovernedConnectionsBroker::new(
         store,
         config,
         task_orchestration_mode,
+    );
+    Ok(Some(governed_connections::SplitConnectionsBroker::new(
+        mutations, status,
     )))
 }
 
