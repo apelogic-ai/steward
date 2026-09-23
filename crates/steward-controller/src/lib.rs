@@ -999,9 +999,21 @@ fn internal_task_authority_snapshot(
         }
     };
     if task.authority_kind.as_deref() != Some("internal")
+        || task.orchestration_version != 3
         || task.submitter_service != steward_connections_v1::SERVICE
         || task.internal_authority_id.as_deref() != Some(steward_connections_v1::SERVICE)
         || task.internal_authority_digest.as_deref() != Some(authority_digest)
+        || task.user_envelope_instance_id.is_some()
+        || task.user_envelope_revision.is_some()
+        || task.user_envelope_digest.is_some()
+        || task.user_envelope_snapshot.is_some()
+        || task.envelope_revision.is_some()
+        || task.service_envelope_digest.is_some()
+        || task.workflow_name.is_some()
+        || task.workflow_version.is_some()
+        || task.workflow_digest.is_some()
+        || task.execution_binding.is_some()
+        || task.direct_task_evidence.is_some()
     {
         return Err(TaskControllerError::InvalidState(
             "Task's immutable internal authority does not match the installed catalog".to_owned(),
@@ -1014,16 +1026,42 @@ fn task_immutable_envelope(task: &TaskRecord) -> Result<Envelope, TaskController
     if let Some(envelope) = internal_task_authority_snapshot(task)? {
         return Ok(envelope);
     }
-    if task.authority_kind.as_deref() != Some("user-envelope") {
+    if task.authority_kind.as_deref() != Some("user-envelope")
+        || task.orchestration_version != 3
+        || task.user_envelope_instance_id.is_none()
+        || task.user_envelope_revision.is_none()
+        || task.user_envelope_digest.is_none()
+        || task.internal_authority_id.is_some()
+        || task.internal_authority_version.is_some()
+        || task.internal_authority_digest.is_some()
+        || task.envelope_revision.is_some()
+        || task.service_envelope_digest.is_some()
+    {
         return Err(TaskControllerError::InvalidState(
             "Task has no supported immutable authority".to_owned(),
         ));
     }
-    task.user_envelope_snapshot.clone().ok_or_else(|| {
+    let envelope = task.user_envelope_snapshot.clone().ok_or_else(|| {
         TaskControllerError::InvalidState(
             "Task's immutable User Envelope snapshot is unavailable".to_owned(),
         )
-    })
+    })?;
+    if task.user_envelope_revision != Some(envelope.revision) {
+        return Err(TaskControllerError::InvalidState(
+            "Task's immutable User Envelope revision does not match its snapshot".to_owned(),
+        ));
+    }
+    let serialized_envelope = serde_json::to_vec(&envelope).map_err(|error| {
+        TaskControllerError::InvalidState(format!(
+            "Task's immutable User Envelope snapshot cannot be encoded: {error}"
+        ))
+    })?;
+    if task.user_envelope_digest.as_deref() != Some(bytes_digest(&serialized_envelope).as_str()) {
+        return Err(TaskControllerError::InvalidState(
+            "Task's immutable User Envelope digest does not match its snapshot".to_owned(),
+        ));
+    }
+    Ok(envelope)
 }
 
 async fn reconcile_task_execution<R: SandboxTaskRuntime>(
@@ -4567,6 +4605,10 @@ mod tests {
         let mut user_envelope_snapshot = envelope("1.00");
         user_envelope_snapshot.revision = 3;
         user_envelope_snapshot.spec.ttl = Duration("24h".to_owned());
+        let user_envelope_digest = super::bytes_digest(
+            &serde_json::to_vec(&user_envelope_snapshot)
+                .map_err(|error| format!("encode User Envelope fixture: {error}"))?,
+        );
         let task = TaskRecord {
             task_uid: serde_json::from_value(serde_json::json!(
                 "00000000-0000-0000-0000-000000000000"
@@ -4585,7 +4627,7 @@ mod tests {
             workflow_digest: None,
             user_envelope_instance_id: Some("user-envelope-a".to_owned()),
             user_envelope_revision: Some(3),
-            user_envelope_digest: Some(format!("sha256:{}", "b".repeat(64))),
+            user_envelope_digest: Some(user_envelope_digest),
             authority_kind: Some("user-envelope".to_owned()),
             user_envelope_snapshot: Some(user_envelope_snapshot),
             internal_authority_id: None,
