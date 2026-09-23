@@ -56,3 +56,7 @@ requests cleanup. The database records an immutable retirement timestamp and
 rejects replacement or restoration. Ordinary Task output, finalized history,
 runtime/attempt identity and result digests remain immutable. This is a narrowly
 approved retention correction, not permission to rewrite an execution result.
+
+Migration 0038 permits governed connection operations to select the Kubernetes
+cluster-default runtime by storing an empty `runtime_class`. Whitespace-only
+values remain invalid, and explicit nonblank RuntimeClass bindings are unchanged.
