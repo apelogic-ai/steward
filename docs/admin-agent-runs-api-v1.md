@@ -9,9 +9,8 @@ persist. The browser must never fill an unavailable field from a heuristic.
 
 All operations are below `/admin/api/v1/runs` and use the existing exact
 Steward administrator `RequestAuthenticator` and Kubernetes `TokenReview`
-boundary. A member-role identity, Task identity, runtime identity, provider
-credential, or the route-scoped service-envelope bootstrap identity has no
-read authority.
+boundary. A member-role identity, Task identity, runtime identity, or provider
+credential has no read authority.
 
 Responses contain no input or output archives, command arguments, provider
 payloads, raw logs, prompts, model output, tokens, credentials, assertions,
@@ -28,7 +27,7 @@ stored free-form failure reason is not returned.
 | Runtime UID and ownership | `task_submissions` | Durable binding | Available after binding; otherwise explicitly unavailable. |
 | Current Task phase and finalization | `task_submissions` | Current durable state | Available with `updatedAt`. |
 | Lifecycle timeline | append-only `task_lifecycle_events` | Recorded transactionally after migration | Complete for newly recorded Tasks. Migrated Tasks are explicitly `partial` because intermediate historical transitions cannot be reconstructed. |
-| Envelope revision | nullable submission snapshot | Submission snapshot | Available for Tasks submitted after this contract; migrated Tasks report unavailable. |
+| User Envelope revision | immutable Task authority snapshot | Submission snapshot | Available for v0.2 user Tasks; historical legacy-authority Tasks report unavailable. |
 | Configured models and tool grants | immutable `task_submissions.runtime_spec` snapshot | Submission snapshot | Available as configured authority only, never described as calls. |
 | Budget allocation | `task_submissions.runtime_spec.budget` | Submission snapshot | Available. |
 | Observed spend | latest append-only `spend_observations` row joined by `runtime_uid` | Observation timestamp | Available when observed; otherwise unavailable. Spend is observed, never custodied. |

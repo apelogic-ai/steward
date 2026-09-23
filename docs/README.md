@@ -58,13 +58,14 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | [`installation/installation-guide.md`](installation/installation-guide.md) | **Current release contract** | Prerequisites, installation modes, Secret and integration inventory, post-install checks, and delivery tests. |
 | [`installation/execution-bindings.md`](installation/execution-bindings.md) | **Current implementation** | Deployment-neutral coding-agent catalog, validation, Helm installation, and lifecycle behavior. |
 | [`installation/upgrade-execution-bindings.md`](installation/upgrade-execution-bindings.md) | **Current implementation** | Upgrade from implicit coding-agent behavior to explicit deployment bindings. |
-| [`task-submission-api.md`](task-submission-api.md) | **Current pre-M1 compatibility behavior** | Implemented v0.1 Task API; subordinate to the frozen contract for M1. |
+| [`installation/upgrade-v0.2.0.md`](installation/upgrade-v0.2.0.md) | **Current release contract** | v0.1.23 preconditions, migration result, and rollback boundary. |
+| [`task-submission-api.md`](task-submission-api.md) | **Current implementation** | Implemented v0.2 Task API and User-Envelope-only authority. |
 
 ### Accepted implementation architecture
 
 | Document | Status | Purpose |
 |---|---|---|
-| [`task-runtime-orchestration.md`](task-runtime-orchestration.md) | **Accepted implementation architecture** | Durable single-owner Task application across Postgres, Kubernetes, approval, execution, and cleanup boundaries. |
+| [`task-runtime-orchestration.md`](task-runtime-orchestration.md) | **Current implementation** | Durable v3 Task authority, reconciliation, recovery, and cleanup boundaries. |
 | [`v2/direct-package-task-invocation.md`](v2/direct-package-task-invocation.md) | **Accepted implementation architecture** | Direct invocation of exact Git packages through GHA, administrator-approved Envelope authority, and the common Task service. |
 
 ### Accepted post-M1 direction

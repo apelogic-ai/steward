@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.1.23`. The release workflow pulls the published OCI
+Release contract: chart `0.2.0`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -110,19 +110,18 @@ Do not reuse one credential for these unrelated boundaries:
 
 | Integration | Required when | Owner, minimum authority, and verification |
 |---|---|---|
-| GitHub Actions OIDC → identity exchange → `steward-run` | Governed submission from Actions | Runner operator grants `id-token: write`; the exchange trusts `https://token.actions.githubusercontent.com`, repository/ref policy, and audience `steward-task-api`. The exchanged short-lived identity must carry the exact Steward service-envelope or submission groups and pass TokenReview. This is not a GitHub OAuth App. Install the independent runner and exchange from [steward-run#41](https://github.com/apelogic-ai/steward-run/issues/41) and [github-oidc-exchange#38](https://github.com/apelogic-ai/github-oidc-exchange/issues/38); they are not subcharts. Verify issuer, audience, HTTPS CA, and one denied wrong-repository/ref request before submission. |
+| GitHub Actions OIDC → identity exchange → `steward-run` | Governed submission from Actions | Runner operator grants `id-token: write`; the exchange trusts `https://token.actions.githubusercontent.com`, repository/ref policy, and audience `steward-task-api`. The exchanged short-lived identity must carry the exact Task identity groups and pass TokenReview. This is not a GitHub OAuth App. Install the independent runner and exchange from [steward-run#41](https://github.com/apelogic-ai/steward-run/issues/41) and [github-oidc-exchange#38](https://github.com/apelogic-ai/github-oidc-exchange/issues/38); they are not subcharts. Verify issuer, audience, HTTPS CA, and one denied wrong-repository/ref request before submission. |
 | ARC GitHub App | Only an ARC-based runner installation | Runner-platform owner supplies the App ID, installation ID, and key with the minimum ARC repository/organization permissions. Steward neither reads nor creates this credential. Verify runner registration and job pickup in that product's handoff. |
 | Read-only GitHub source App | `githubSource.enabled=true` direct packages | Steward source operator supplies the configured App ID and PEM Secret; install it only on approved repositories with read-only Contents. Verify resolution of one exact allowed commit and denial of an unbound repository. |
 | Google OAuth/OIDC client | `browserAuth.enabled=true` | Browser-identity owner supplies the client ID/Secret, allowed workspace/organization, and the exact HTTPS callback derived from `browserAuth.google.origin`. Verify login, callback, wrong-domain denial, and logout. |
 | MCP-GW downstream OAuth clients | Only selected MCP tools | MCP-GW operator owns Google/GitHub/provider consent clients, callbacks, and stored grants. They never go in the Steward chart. Verify consent and subject isolation through MCP-GW. |
 | Jira Cloud API token | `jira.enabled=true` only | Jira project owner supplies a dedicated account/token permitted to search/browse, create Task issues, and comment in the configured project. Verify create/search/comment and revocation. With Jira disabled, verify no Secret projection or Jira egress. |
 
-Service and User Envelopes, approval decisions, and execution bindings are
-post-install governance data. Do not bake a User Envelope revision or a bearer
-credential into Helm values. Provision the authority-minimal `steward-run`
-Service Envelope with [`scripts/bootstrap-task-copy-smoke.sh`](../../scripts/bootstrap-task-copy-smoke.sh)
-over authenticated HTTPS and a short-lived route-scoped identity, then review
-and approve any wider envelope through the selected decision channel.
+Envelope templates, User Envelopes, approval decisions, and execution bindings are
+post-install governance data. Do not bake a User Envelope revision or bearer credential
+into Helm values. The deployment capability catalog advertises model and tool choices but
+grants no authority. Before external Task submission, provision the authenticated user's
+exact User Envelope through Steward's ordinary request and approval lifecycle.
 
 ## Secret and integration inventory
 
@@ -136,7 +135,7 @@ system. The default names can be overridden under `secrets`, `tls`,
 | `secrets.database.name` (`steward-database`) in release namespace | `Opaque`; `secrets.database.key` (`url`) | Database operator creates; API and controller read. | Always. Rotate the database credential and restart both Deployments after the new Secret is present; verify connectivity and migrations. |
 | `tls.api.secretName` and `tls.webhook.secretName` in release namespace | `kubernetes.io/tls`; both `tls.crt`, `tls.key` | Customer PKI or cert-manager creates; API and controller mount separately. | Always. Renew before expiry, verify service DNS SANs, CA chain, and webhook `caBundle`; roll the affected Deployment. |
 | `secrets.jira.name` (`steward-jira`) in release namespace | `Opaque`; `secrets.jira.key` (`token`) | Jira operator creates; API and controller read only if `jira.enabled=true`. | Optional. Use a Jira Cloud API token with a dedicated account allowed to browse/search, create Task issues, and add comments in the configured project. Rotate the token, restart consumers, and prove a decision; absent when disabled. |
-| `secrets.litellm.name` (`steward-litellm`) in release namespace | `Opaque`; `secrets.litellm.key` (`master-key`) | LiteLLM operator creates; controller reads. | Governed mode only, including model-free copy-smoke startup. Coordinate credential overlap/restart with LiteLLM. |
+| `secrets.litellm.name` (`steward-litellm`) in release namespace | `Opaque`; `secrets.litellm.key` (`master-key`) | LiteLLM operator creates; controller reads. | Governed execution only. Coordinate credential overlap/restart with LiteLLM. |
 | `secrets.openshellClient.name` (`steward-openshell-client`) in release namespace | `Opaque`; configured CA, client certificate, and private-key keys (`ca.crt`, `tls.crt`, `tls.key`) | OpenShell/customer PKI creates; controller mounts. | Governed mode only. Rotate as an mTLS bundle and reprove server-name/CA validation. |
 | `secrets.mint.name` (`steward-mint`) in release namespace | `Opaque`; configured `signing-key`, `introspection-credential` | Customer key authority creates; Mint mounts. The signing key is exactly 32 raw bytes; newline-terminated or hex text is invalid. | Governed mode only. Coordinate JWKS/key rollover and introspection credential overlap with consumers. |
 | `workloadExchangeTrust.name` (`steward-workload-exchange-ca`) in release namespace | Public `ConfigMap` by default (or explicitly selected `Secret`); `workloadExchangeTrust.caCertificate` (`ca.crt`) | Workload-exchange PKI creates; controller mounts. | Governed mode only; rotate with exchange TLS and reprove trust. |
@@ -385,7 +384,7 @@ or locally built image is not release evidence.
 
 A successful Helm install creates and readies only the selected Kubernetes
 release objects. It does not create a Steward user, role grant, Workflow,
-envelope template, Service Envelope, User Envelope, approval, or provider
+envelope template, User Envelope, approval, or provider
 grant. None of these administration records is a Helm installation outcome,
 and their absence must not be treated as a failed core installation.
 Google/browser authentication is conditional on `browserAuth.enabled=true`
@@ -393,24 +392,6 @@ and is not a core prerequisite.
 
 Perform only the administration needed for the enabled customer path, after
 the installation and mode-specific readiness checks succeed:
-
-### Operator/service post-install administration
-
-Before browser catalog work, an authorized operator provisions each required
-Service Envelope through the separately authenticated operator/service identity
-accepted by the authoring route:
-
-```text
-POST /admin/service-envelopes/{service}
-```
-
-This authoring route is separate from the GET-only browser administrator
-surface. For the bounded `steward-run` copy-smoke path, use
-[`scripts/bootstrap-task-copy-smoke.sh`](../../scripts/bootstrap-task-copy-smoke.sh)
-with its documented short-lived route-scoped identity. This explicit service
-bootstrap does not create a human user or grant, publish a browser Workflow or
-envelope template, create a User Envelope, or make Task execution an
-installation outcome.
 
 ### Conditional human browser administration
 
@@ -446,15 +427,12 @@ enable and verify the human browser path before performing them.
    Follow the grant, revocation, session, and CSRF boundaries in the
    [browser session contract](../browser-session-contract-v1.md) and
    [administrator browser contract](../admin-ui-contract-v1.md).
-4. **Verify service authority and publish the browser catalog.** The authorized
-   browser administrator reads and verifies the existing Service Envelope
-   through the GET-only browser surface; it does not provision or modify it.
-   Only after verifying that authority ceiling may the administrator publish
-   immutable Workflow revisions and author versioned envelope templates bounded
-   by it. These are database administration
-   operations, not chart resources or Helm values. The route-scoped
-   `steward-run` Service Envelope bootstrap above does not grant browser
-   authority.
+4. **Verify capabilities and publish browser governance data.** The authorized
+   browser administrator verifies the deployment capability catalog, publishes
+   immutable Workflow revisions, and authors versioned Envelope templates using
+   listed models and tools. The catalog is availability data, not an authority
+   ceiling. These are database administration operations, not chart resources or
+   Helm values.
 5. **User Envelope operation.** An authenticated user requests authority from
    the applicable published template, and an authorized administrator reviews,
    approves, or rejects that exact request. Before Task submission, prove the

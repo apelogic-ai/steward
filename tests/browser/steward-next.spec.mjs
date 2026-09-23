@@ -74,16 +74,13 @@ const adminEnvelope = {
   },
 };
 
-const serviceEnvelope = {
-  ...envelope,
-  revision: 7,
-  spec: {
-    ...envelope.spec,
-    llms: [
-      { provider: "provider-a", model: "model-a" },
-      { provider: "provider-b", model: "model-b" },
-    ],
-  },
+const capabilityCatalog = {
+  schemaVersion: "steward.capability-catalog/v1",
+  models: [
+    { provider: "provider-a", model: "model-a" },
+    { provider: "provider-b", model: "model-b" },
+  ],
+  tools: envelope.spec.tools,
 };
 
 const githubReadTools = [
@@ -130,7 +127,6 @@ const run = {
   runtimeUid: "runtime-example-1",
   runtimeOwnership: "provisioned",
   phase: "succeeded",
-  envelopeRevision: 4,
   finalizationRequested: true,
   finalized: true,
   createdAt: "2026-08-24T17:02:00Z",
@@ -433,9 +429,9 @@ async function guardedPage(browser, {
   },
   mutationFailures = {},
   runPhase = "succeeded",
-  serviceEnvelopeModels = serviceEnvelope.spec.llms,
-  serviceEnvelopeTools = serviceEnvelope.spec.tools,
-  serviceEnvelopeStatus = 200,
+  capabilityCatalogModels = capabilityCatalog.models,
+  capabilityCatalogTools = capabilityCatalog.tools,
+  capabilityCatalogStatus = 200,
   session = developerSession,
   viewport = { width: 1280, height: 800 },
 } = {}) {
@@ -569,16 +565,13 @@ async function guardedPage(browser, {
       { memberRole: "developer", envelope },
     ],
   }));
-  await context.route(`${origin}/admin/api/v1/service-envelope`, (route) => serviceEnvelopeStatus === 200
+  await context.route(`${origin}/admin/api/v1/capabilities`, (route) => capabilityCatalogStatus === 200
     ? json(route, {
-      apiVersion: "steward.browser-admin/v1",
-      service: "steward-run",
-      envelope: {
-        ...serviceEnvelope,
-        spec: { ...serviceEnvelope.spec, llms: serviceEnvelopeModels, tools: serviceEnvelopeTools },
-      },
+      schemaVersion: "steward.capability-catalog/v1",
+      models: capabilityCatalogModels,
+      tools: capabilityCatalogTools,
     })
-    : route.fulfill({ status: serviceEnvelopeStatus, body: "" }));
+    : route.fulfill({ status: capabilityCatalogStatus, body: "" }));
   await context.route(`${origin}/admin/api/v1/workflows`, async (route) => {
     if (route.request().method() === "POST") {
       await route.continue();
@@ -1213,7 +1206,7 @@ test("administrator templates and approvals use typed browser authority", async 
       monthlyLimit: "30.00",
       singleRunLimit: "3.00",
     });
-    expect(templateMutation.body.spec.llms).toEqual(serviceEnvelope.spec.llms);
+    expect(templateMutation.body.spec.llms).toEqual(capabilityCatalog.models);
     await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("reviewer");
     await administrator.page.getByRole("button", { name: "Save as new" }).click();
     await expect.poll(() => administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/reviewer")).toBe(true);
@@ -1264,9 +1257,9 @@ test("administrator templates and approvals use typed browser authority", async 
   }
 });
 
-test("administrator template model controls fail closed when the Service Envelope has no models", async ({ browser }) => {
+test("administrator template model controls fail closed when the capability catalog has no models", async ({ browser }) => {
   const administrator = await guardedPage(browser, {
-    serviceEnvelopeModels: [],
+    capabilityCatalogModels: [],
     session: administratorSession,
   });
   try {
@@ -1275,17 +1268,17 @@ test("administrator template model controls fail closed when the Service Envelop
     await expect(model).toBeDisabled();
     await expect(model.locator("option")).toHaveText(["No models available"]);
     await expect(administrator.page.getByRole("button", { name: "Add model" })).toBeDisabled();
-    await expect(administrator.page.getByText("The current Service Envelope does not allow any models.", { exact: true })).toBeVisible();
+    await expect(administrator.page.getByText("No models are listed in the deployment capability catalog.", { exact: true })).toBeVisible();
     await expect(model.locator("option", { hasText: "openai/gpt-5.4" })).toHaveCount(0);
   } finally {
     await closeGuardedPage(administrator);
   }
 });
 
-test("administrator can revise and copy a ten-grant template under the current Service Envelope", async ({ browser }) => {
+test("administrator can revise and copy a ten-grant template listed in the capability catalog", async ({ browser }) => {
   const administrator = await guardedPage(browser, {
     adminTemplateTools: githubReadTools,
-    serviceEnvelopeTools: githubReadTools,
+    capabilityCatalogTools: githubReadTools,
     session: administratorSession,
   });
   try {
@@ -1313,16 +1306,16 @@ test("administrator can revise and copy a ten-grant template under the current S
   }
 });
 
-test("administrator can replace a template tool removed from the current Service Envelope", async ({ browser }) => {
+test("administrator can replace a template tool absent from the capability catalog", async ({ browser }) => {
   const replacement = githubReadTools[0];
   const administrator = await guardedPage(browser, {
-    serviceEnvelopeTools: [replacement],
+    capabilityCatalogTools: [replacement],
     session: administratorSession,
   });
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const tools = administrator.page.getByRole("group", { name: "Tools" });
-    await expect(tools.getByText("No longer allowed by the current Service Envelope")).toBeVisible();
+    await expect(tools.getByText("Not listed in the deployment capability catalog")).toBeVisible();
     await expect(tools.getByRole("combobox", { name: "Tool", exact: true }).locator("option")).toHaveText(["actions_get:read"]);
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(administrator.page.getByRole("alert").filter({ hasText: "no authority was changed" })).toBeVisible();
@@ -1338,10 +1331,10 @@ test("administrator can replace a template tool removed from the current Service
   }
 });
 
-test("administrator template tool controls offer no fallback when the Service Envelope has no tools", async ({ browser }) => {
+test("administrator template tool controls offer no fallback when the capability catalog has no tools", async ({ browser }) => {
   const administrator = await guardedPage(browser, {
     adminTemplateTools: [],
-    serviceEnvelopeTools: [],
+    capabilityCatalogTools: [],
     session: administratorSession,
   });
   try {
@@ -1350,7 +1343,7 @@ test("administrator template tool controls offer no fallback when the Service En
     await expect(tools.getByRole("combobox", { name: "Tool provider" })).toBeDisabled();
     await expect(tools.getByRole("combobox", { name: "Tool", exact: true })).toBeDisabled();
     await expect(tools.getByRole("button", { name: "Add tool" })).toBeDisabled();
-    await expect(tools.getByText("The current Service Envelope does not allow any tools.")).toBeVisible();
+    await expect(tools.getByText("No tools are listed in the deployment capability catalog.")).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.spec.tools).toEqual([]);
@@ -1359,9 +1352,9 @@ test("administrator template tool controls offer no fallback when the Service En
   }
 });
 
-test("administrator template authoring rejects models outside the current Service Envelope", async ({ browser }) => {
+test("administrator template authoring rejects models absent from the capability catalog", async ({ browser }) => {
   const administrator = await guardedPage(browser, {
-    serviceEnvelopeModels: [{ provider: "provider-b", model: "model-b" }],
+    capabilityCatalogModels: [{ provider: "provider-b", model: "model-b" }],
     session: administratorSession,
   });
   try {
@@ -1374,17 +1367,17 @@ test("administrator template authoring rejects models outside the current Servic
   }
 });
 
-test("administrator can replace a template model removed from the current Service Envelope", async ({ browser }) => {
+test("administrator can replace a template model absent from the capability catalog", async ({ browser }) => {
   const administrator = await guardedPage(browser, {
     adminTemplateModels: [{ provider: "openai", model: "gpt-5.4" }],
-    serviceEnvelopeModels: [{ provider: "anthropic", model: "claude-sonnet-4" }],
+    capabilityCatalogModels: [{ provider: "anthropic", model: "claude-sonnet-4" }],
     session: administratorSession,
   });
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const models = administrator.page.getByRole("group", { name: "Models" });
     await expect(models.getByRole("listitem")).toContainText("openai/gpt-5.4");
-    await expect(models.getByText("No longer allowed by the current Service Envelope")).toBeVisible();
+    await expect(models.getByText("Not listed in the deployment capability catalog")).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(administrator.page.getByText("The template ID or envelope fields are invalid, so no authority was changed.", { exact: true })).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
@@ -1409,7 +1402,7 @@ test("administrator template model identity does not collide across provider and
   const second = { provider: "provider-a/part", model: "model-a" };
   const administrator = await guardedPage(browser, {
     adminTemplateModels: [first],
-    serviceEnvelopeModels: [first, second],
+    capabilityCatalogModels: [first, second],
     session: administratorSession,
   });
   try {
@@ -1433,13 +1426,13 @@ test("administrator template model identity does not collide across provider and
 
   const stale = await guardedPage(browser, {
     adminTemplateModels: [first, second],
-    serviceEnvelopeModels: [second],
+    capabilityCatalogModels: [second],
     session: administratorSession,
   });
   try {
     await stale.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const models = stale.page.getByRole("group", { name: "Models" });
-    await expect(models.getByText("No longer allowed by the current Service Envelope")).toHaveCount(1);
+    await expect(models.getByText("Not listed in the deployment capability catalog")).toHaveCount(1);
     await models.getByRole("listitem").first().getByRole("button", { name: "Remove model part/model-a from provider provider-a" }).click();
     await expect(models.getByRole("listitem")).toHaveCount(1);
     await stale.page.getByRole("button", { name: "Save new version" }).click();
@@ -1450,10 +1443,10 @@ test("administrator template model identity does not collide across provider and
   }
 });
 
-test("administrator template authoring has no fallback when the Service Envelope is absent", async ({ browser }) => {
+test("administrator template authoring has no fallback when the capability catalog is unavailable", async ({ browser }) => {
   const administrator = await guardedPage(browser, {
     expectedHttpStatuses: [404],
-    serviceEnvelopeStatus: 404,
+    capabilityCatalogStatus: 404,
     session: administratorSession,
   });
   try {

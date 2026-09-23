@@ -1019,6 +1019,64 @@ mod tests {
 
     static NEXT_REPOSITORY_ID: AtomicU64 = AtomicU64::new(0);
 
+    fn uses_user_envelope_only_contract() -> Result<bool, String> {
+        let chart = fs::read_to_string(root().join("charts/steward/Chart.yaml"))
+            .map_err(|error| format!("Steward chart metadata is required: {error}"))?;
+        let version = chart
+            .lines()
+            .find_map(|line| line.strip_prefix("version: "))
+            .ok_or_else(|| "Steward chart version is required".to_owned())?;
+        match version {
+            "0.1.23" => Ok(false),
+            "0.2.0" => Ok(true),
+            other => Err(format!(
+                "release enforcement has not reviewed Steward chart version {other}"
+            )),
+        }
+    }
+
+    fn text_files_below(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+        for entry in fs::read_dir(path)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?
+        {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "failed to inspect an entry below {}: {error}",
+                    path.display()
+                )
+            })?;
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                text_files_below(&entry_path, files)?;
+                continue;
+            }
+            let is_text = entry_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension,
+                        "rs" | "ts"
+                            | "tsx"
+                            | "js"
+                            | "mjs"
+                            | "json"
+                            | "yaml"
+                            | "yml"
+                            | "toml"
+                            | "sh"
+                            | "md"
+                            | "html"
+                            | "css"
+                    )
+                });
+            if is_text {
+                files.push(entry_path);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn browser_e2e_ci_uses_the_pinned_nextjs_gate() -> Result<(), String> {
         let repository = root();
@@ -1756,6 +1814,32 @@ mod tests {
     #[test]
     fn task_copy_smoke_contract_is_authority_bounded_and_idempotently_bootstrapped()
     -> Result<(), String> {
+        if uses_user_envelope_only_contract()? {
+            for removed in [
+                "config/task/workflows.example.json",
+                "config/task/steward-run-service-envelope.example.json",
+                "scripts/bootstrap-task-copy-smoke.sh",
+            ] {
+                assert!(
+                    !root().join(removed).exists(),
+                    "v0.2 must remove legacy Task bootstrap artifact {removed}"
+                );
+            }
+            let contract = fs::read_to_string(root().join("config/task/README.md"))
+                .map_err(|error| format!("Task production configuration is required: {error}"))?;
+            for required in [
+                "exactly one active, provisioned User Envelope",
+                "steward.capability-catalog/v1",
+                "grants no Task authority",
+            ] {
+                assert!(
+                    contract.contains(required),
+                    "v0.2 Task contract must state `{required}`"
+                );
+            }
+            return Ok(());
+        }
+
         let workflows_path = root().join("config/task/workflows.example.json");
         let workflows = serde_json::from_str::<serde_json::Value>(
             &fs::read_to_string(&workflows_path)
@@ -1862,6 +1946,19 @@ mod tests {
     fn task_bootstrap_publishes_its_route_scoped_identity_contract() -> Result<(), String> {
         let contract = fs::read_to_string(root().join("config/task/README.md"))
             .map_err(|error| format!("Task production configuration is required: {error}"))?;
+        if uses_user_envelope_only_contract()? {
+            for removed in [
+                "agents.apelogic.ai/service-envelope-bootstrap:steward-run",
+                "STEWARD_RUN_SERVICE_ENVELOPE_BOOTSTRAP_GROUP",
+                "/admin/service-envelopes",
+            ] {
+                assert!(
+                    !contract.contains(removed),
+                    "v0.2 Task contract must not retain `{removed}`"
+                );
+            }
+            return Ok(());
+        }
         for required in [
             "agents.apelogic.ai/service-envelope-bootstrap:steward-run",
             "steward-task-api",
@@ -1881,7 +1978,51 @@ mod tests {
     }
 
     #[test]
-    fn task_and_bootstrap_share_one_kubernetes_token_review_audience() -> Result<(), String> {
+    fn v020_live_surfaces_reject_service_envelope_drift() -> Result<(), String> {
+        if !uses_user_envelope_only_contract()? {
+            return Ok(());
+        }
+
+        let repository = root();
+        let mut files = vec![repository.join("README.md")];
+        for relative in ["bins", "crates", "web", "charts", "config", "scripts"] {
+            text_files_below(&repository.join(relative), &mut files)?;
+        }
+        for relative in [
+            "docs/README.md",
+            "docs/admin-agent-runs-api-v1.md",
+            "docs/contracts/task/v2/README.md",
+            "docs/github-actions-generator.md",
+            "docs/installation/installation-guide.md",
+            "docs/task-runtime-orchestration.md",
+            "docs/task-submission-api.md",
+        ] {
+            files.push(repository.join(relative));
+        }
+
+        let forbidden = [
+            "/admin/service-envelopes",
+            "service-envelope-bootstrap",
+            "latest_service_envelope",
+            "insert_service_envelope",
+        ];
+        for file in files {
+            let contents = fs::read_to_string(&file)
+                .map_err(|error| format!("failed to read {}: {error}", file.display()))?;
+            for value in forbidden {
+                assert!(
+                    !contents.contains(value),
+                    "live v0.2 surface {} contains forbidden Service Envelope reference `{value}`",
+                    file.strip_prefix(&repository).unwrap_or(&file).display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn delegated_task_authentication_uses_one_kubernetes_token_review_audience()
+    -> Result<(), String> {
         let chart = root().join("charts/steward");
         let values = fs::read_to_string(chart.join("values.yaml"))
             .map_err(|error| format!("published Steward chart values are required: {error}"))?;
@@ -2080,6 +2221,57 @@ mod tests {
             );
         }
 
+        if uses_user_envelope_only_contract()? {
+            for forbidden in [
+                "### Operator/service post-install administration",
+                "POST /admin/service-envelopes",
+                "scripts/bootstrap-task-copy-smoke.sh",
+                "service-envelope-bootstrap",
+            ] {
+                assert!(
+                    !administration.contains(forbidden),
+                    "v0.2 administration instructions must not retain `{forbidden}`"
+                );
+            }
+            let browser_heading = "### Conditional human browser administration";
+            let browser_path = administration
+                .split_once(browser_heading)
+                .map(|(_, path)| path)
+                .ok_or_else(|| {
+                    format!("customer installation guide is missing {browser_heading}")
+                })?;
+            let ordered_steps = [
+                "1. **Enable optional human browser administration.**",
+                "2. **First login and canonical ID.**",
+                "3. **Authorized local RBAC grant.**",
+                "4. **Verify capabilities and publish browser governance data.**",
+                "5. **User Envelope operation.**",
+            ];
+            let positions = ordered_steps
+                .map(|step| {
+                    browser_path
+                        .find(step)
+                        .ok_or_else(|| format!("customer installation guide is missing {step}"))
+                })
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+            assert!(
+                positions.windows(2).all(|pair| pair[0] < pair[1]),
+                "v0.2 browser administration steps must remain in operator order"
+            );
+            for required in [
+                "deployment capability catalog",
+                "catalog is availability data",
+                "exactly one active provisioned User Envelope",
+            ] {
+                assert!(
+                    browser_path.contains(required),
+                    "v0.2 browser administration is missing `{required}`"
+                );
+            }
+            return Ok(());
+        }
+
         let service_heading = "### Operator/service post-install administration";
         let browser_heading = "### Conditional human browser administration";
         let service_start = administration
@@ -2272,6 +2464,9 @@ mod tests {
             "sslmode=disable",
             "sslmode=require",
             "--test postgres_tls",
+            "--test task_orchestration",
+            "STEWARD_TEST_DATABASE_URL",
+            "steward_orchestration",
             "steward.test/run-id",
             "docker volume create",
             "docker volume rm",
@@ -2417,6 +2612,60 @@ mod tests {
                 "provider-profile bundle consumer verification instructions must include {required}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn v020_release_handoff_is_machine_readable_attested_and_verified() -> Result<(), String> {
+        let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("published Steward release workflow is required: {error}"))?;
+        let release = workflow
+            .split("  release:")
+            .nth(1)
+            .ok_or_else(|| "GitHub Release job is required".to_owned())?;
+        for required in [
+            "id-token: write",
+            "attestations: write",
+            "steward.release-handoff/v1",
+            "authorityContract: \"user-envelope-only\"",
+            "identityPolicyContract: \"github-oidc-exchange.apelogic.io/v5\"",
+            "0039_user_envelope_only_task_authority.sql",
+            "serviceEnvelopeSupported: false",
+            "subject-path: dist/release-handoff.json",
+            "release-handoff-attestation.jsonl",
+            "gh attestation verify dist/release-handoff.json",
+            "Verify published release handoff",
+            "cmp dist/release-handoff.json",
+        ] {
+            assert!(
+                release.contains(required),
+                "v0.2 release handoff is missing `{required}`"
+            );
+        }
+        for component in ["apiserver", "controller", "mint", "bridge", "web"] {
+            assert!(
+                release.contains(&format!("{component}: {{reference:")),
+                "machine-readable handoff must include {component}"
+            );
+        }
+        let manifest = release
+            .find("> dist/release-handoff.json")
+            .ok_or_else(|| "machine-readable handoff generation is required".to_owned())?;
+        let attestation = release
+            .find("subject-path: dist/release-handoff.json")
+            .ok_or_else(|| "machine-readable handoff attestation is required".to_owned())?;
+        let publication = release
+            .find("gh release create \"$GITHUB_REF_NAME\"")
+            .ok_or_else(|| "GitHub release creation must remain explicit".to_owned())?;
+        let public_verification = release
+            .find("Verify published release handoff")
+            .ok_or_else(|| "published handoff verification is required".to_owned())?;
+        assert!(
+            manifest < attestation
+                && attestation < publication
+                && publication < public_verification,
+            "release handoff must be generated, attested, published, and then publicly verified"
+        );
         Ok(())
     }
 

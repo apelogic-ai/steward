@@ -16,9 +16,9 @@ use steward_apiserver::{
     ConfiguredTaskIdentityResolver, ExecutionBindingCatalog,
     IdentityOrKubernetesTokenAuthenticator, KubeRuntimeRepository, KubernetesTokenAuthenticator,
     KubernetesTokenReviewAudience, MAX_EXECUTION_BINDING_CATALOG_BYTES,
-    MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, StaticTaskWorkflowCatalog, TaskApiConfig, agent_runs_ui,
-    browser_admin, browser_auth, connections, google_oidc, governed_connections, router,
-    stable_runtime_bridge, task_router, user_envelopes, workflows,
+    MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, TaskApiConfig, agent_runs_ui, browser_admin,
+    browser_auth, connections, google_oidc, governed_connections, router, stable_runtime_bridge,
+    task_router, user_envelopes, workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
@@ -88,9 +88,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         task_identities.clone(),
         admin_group,
     );
-    let task_workflows =
-        StaticTaskWorkflowCatalog::from_json(&required("STEWARD_TASK_WORKFLOWS_JSON")?)
-            .map_err(io::Error::other)?;
     let task_mcp_gateway_endpoint = match env::var("STEWARD_TASK_MCP_GW_ENDPOINT") {
         Ok(value) => Some(value),
         Err(env::VarError::NotPresent) => None,
@@ -152,10 +149,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .merge(task_router(
         store.clone(),
         task_identities,
-        task_workflows,
-        task_api_config
-            .with_task_orchestration_mode(task_orchestration_mode)
-            .with_legacy_runtime_resolver(runtimes.clone()),
+        task_api_config.with_task_orchestration_mode(task_orchestration_mode),
     ));
     let app = match browser {
         Some(browser) => app.merge(browser),
@@ -490,6 +484,15 @@ fn browser_application_router(
     let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
         return Ok(None);
     };
+    let capability_catalog_json = configured_bounded_json(
+        "STEWARD_CAPABILITY_CATALOG_JSON",
+        "STEWARD_CAPABILITY_CATALOG_FILE",
+        browser_admin::MAX_CAPABILITY_CATALOG_BYTES,
+        "capability catalog",
+    )?
+    .ok_or_else(|| io::Error::other("browser administration requires a capability catalog"))?;
+    let capability_catalog = browser_admin::CapabilityCatalog::from_json(&capability_catalog_json)
+        .map_err(io::Error::other)?;
     let origin = required("STEWARD_BROWSER_ORIGIN")?;
     let config = browser_auth::GoogleOidcConfig::new(
         client_id,
@@ -522,6 +525,7 @@ fn browser_application_router(
             runtimes.clone(),
             store.clone(),
             decisions,
+            capability_catalog,
             auth.clone(),
         ))
         .merge(workflows::protected_admin_router_with_agents(

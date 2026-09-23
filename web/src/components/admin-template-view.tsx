@@ -6,11 +6,11 @@ import { useCallback, useState, type FormEvent } from "react";
 
 import {
   authorAdminEnvelopeTemplate,
+  getAdminCapabilities,
   getAdminEnvelopeTemplate,
-  getAdminServiceEnvelope,
   type BrowserEnvelope,
   type BrowserEnvelopeTemplateResponse,
-  type BrowserServiceEnvelopeResponse,
+  type CapabilityCatalog,
   type ModelRef,
   type RunnerPlatform,
   type ToolGrant,
@@ -114,12 +114,19 @@ function normalizeTemplateList(value: unknown): AdminTemplateListResponse | null
   return { apiVersion: "steward.browser-admin/v1", templates };
 }
 
-function normalizeServiceEnvelopeResponse(value: unknown): BrowserServiceEnvelopeResponse | null {
+function normalizeCapabilityCatalog(value: unknown): CapabilityCatalog | null {
   if (!isRecord(value)
-    || value.apiVersion !== "steward.browser-admin/v1"
-    || value.service !== "steward-run"
-    || !isBrowserEnvelope(value.envelope)) return null;
-  return value as BrowserServiceEnvelopeResponse;
+    || value.schemaVersion !== "steward.capability-catalog/v1"
+    || !Array.isArray(value.models)
+    || !Array.isArray(value.tools)) return null;
+  const modelsValid = value.models.every((model) => isRecord(model)
+    && typeof model.provider === "string"
+    && typeof model.model === "string");
+  const toolsValid = value.tools.every((tool) => isRecord(tool)
+    && typeof tool.provider === "string"
+    && typeof tool.resource === "string"
+    && typeof tool.action === "string");
+  return modelsValid && toolsValid ? value as CapabilityCatalog : null;
 }
 
 async function getAdminEnvelopeTemplates(): Promise<{ data?: unknown; response?: Response }> {
@@ -157,12 +164,12 @@ function modelLabel(model: ModelRef, choices: Array<ModelRef>): string {
     : display;
 }
 
-function initialTemplateForService(serviceEnvelope: BrowserEnvelope): BrowserEnvelope {
+function initialTemplateForCatalog(capabilities: CapabilityCatalog): BrowserEnvelope {
   return {
     ...initialEnvelopeTemplate,
     spec: {
       ...initialEnvelopeTemplate.spec,
-      llms: serviceEnvelope.spec.llms.slice(0, 1),
+      llms: capabilities.models.slice(0, 1),
     },
   };
 }
@@ -253,11 +260,11 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
     path: { member_role: memberRole },
   }), [memberRole]);
   const state = useApiResource<BrowserEnvelopeTemplateResponse>(load);
-  const loadServiceEnvelope = useCallback(() => getAdminServiceEnvelope({
+  const loadCapabilities = useCallback(() => getAdminCapabilities({
     cache: "no-store",
     credentials: "same-origin",
   }), []);
-  const serviceEnvelopeState = useApiResource<BrowserServiceEnvelopeResponse>(loadServiceEnvelope);
+  const capabilitiesState = useApiResource<CapabilityCatalog>(loadCapabilities);
   const normalizedTemplate = state.status === "ready"
     ? normalizeEnvelopeTemplateResponse(state.value, memberRole)
     : null;
@@ -266,11 +273,11 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
       ? { status: "ready" as const, value: normalizedTemplate }
       : { status: "error" as const }
     : state;
-  const acceptedServiceEnvelopeState = serviceEnvelopeState.status === "ready"
-    ? normalizeServiceEnvelopeResponse(serviceEnvelopeState.value)
-      ? { status: "ready" as const, value: normalizeServiceEnvelopeResponse(serviceEnvelopeState.value)! }
+  const acceptedCapabilitiesState = capabilitiesState.status === "ready"
+    ? normalizeCapabilityCatalog(capabilitiesState.value)
+      ? { status: "ready" as const, value: normalizeCapabilityCatalog(capabilitiesState.value)! }
       : { status: "error" as const }
-    : serviceEnvelopeState;
+    : capabilitiesState;
 
   return (
     <section aria-labelledby="page-title" className="space-y-6">
@@ -280,12 +287,12 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
         title="Envelope template"
       />
       <ResourceBoundary state={acceptedState}>{({ envelope }) => (
-        <ResourceBoundary state={acceptedServiceEnvelopeState}>{({ envelope: serviceEnvelope }) => (
+        <ResourceBoundary state={acceptedCapabilitiesState}>{(capabilities) => (
           <TemplateEditor
+            capabilities={capabilities}
             csrf={csrf}
-            key={`${memberRole}:${envelope.revision}:${serviceEnvelope.revision}`}
+            key={`${memberRole}:${envelope.revision}:${capabilities.models.length}:${capabilities.tools.length}`}
             memberRole={memberRole}
-            serviceEnvelope={serviceEnvelope}
             template={envelope}
           />
         )}</ResourceBoundary>
@@ -303,14 +310,14 @@ export function AdminNewEnvelopeTemplateView() {
 }
 
 function AuthenticatedNewTemplate({ csrf }: Readonly<{ csrf: string }>) {
-  const load = useCallback(() => getAdminServiceEnvelope({
+  const load = useCallback(() => getAdminCapabilities({
     cache: "no-store",
     credentials: "same-origin",
   }), []);
-  const state = useApiResource<BrowserServiceEnvelopeResponse>(load);
+  const state = useApiResource<CapabilityCatalog>(load);
   const acceptedState = state.status === "ready"
-    ? normalizeServiceEnvelopeResponse(state.value)
-      ? { status: "ready" as const, value: normalizeServiceEnvelopeResponse(state.value)! }
+    ? normalizeCapabilityCatalog(state.value)
+      ? { status: "ready" as const, value: normalizeCapabilityCatalog(state.value)! }
       : { status: "error" as const }
     : state;
   return (
@@ -320,25 +327,25 @@ function AuthenticatedNewTemplate({ csrf }: Readonly<{ csrf: string }>) {
         description="Author the first immutable revision for a member role. All suggested values remain editable before saving."
         title="Create envelope template"
       />
-      <ResourceBoundary state={acceptedState}>{({ envelope: serviceEnvelope }) => (
+      <ResourceBoundary state={acceptedState}>{(capabilities) => (
         <TemplateEditor
+          capabilities={capabilities}
           create
           csrf={csrf}
-          key={`new:${serviceEnvelope.revision}`}
+          key={`new:${capabilities.models.length}:${capabilities.tools.length}`}
           memberRole=""
-          serviceEnvelope={serviceEnvelope}
-          template={initialTemplateForService(serviceEnvelope)}
+          template={initialTemplateForCatalog(capabilities)}
         />
       )}</ResourceBoundary>
     </section>
   );
 }
 
-function TemplateEditor({ create = false, csrf, memberRole, serviceEnvelope, template }: Readonly<{ create?: boolean; csrf: string; memberRole: string; serviceEnvelope: BrowserEnvelope; template: BrowserEnvelope }>) {
+function TemplateEditor({ capabilities, create = false, csrf, memberRole, template }: Readonly<{ capabilities: CapabilityCatalog; create?: boolean; csrf: string; memberRole: string; template: BrowserEnvelope }>) {
   const router = useRouter();
-  const modelCatalog = serviceEnvelope.spec.llms;
+  const modelCatalog = capabilities.models;
   const allowedModels = new Set(modelCatalog.map(modelKey));
-  const toolCatalog = serviceEnvelope.spec.tools;
+  const toolCatalog = capabilities.tools;
   const allowedTools = new Set(toolCatalog.map(toolKey));
   const toolProviders = [...new Set(toolCatalog.map((tool) => tool.provider))];
   const [status, setStatus] = useState<TemplateMutationState>("idle");
@@ -485,14 +492,14 @@ function TemplateEditor({ create = false, csrf, memberRole, serviceEnvelope, tem
           </label>
           <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-50" disabled={!modelInput || models.some((model) => modelKey(model) === modelInput)} onClick={addModel} type="button">Add model</button>
         </div>
-        {modelCatalog.length === 0 ? <p className="text-sm text-muted-ink">The current Service Envelope does not allow any models.</p> : null}
+        {modelCatalog.length === 0 ? <p className="text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}
         <ul className="flex flex-wrap gap-2" role="list">
           {models.map((model, index) => {
             const allowed = allowedModels.has(modelKey(model));
             return (
               <li className={allowed ? "flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm" : "flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm text-muted-ink"} key={`${modelKey(model)}:${index}`}>
                 <span>{modelLabel(model, models)}</span>
-                {!allowed ? <span className="text-xs">No longer allowed by the current Service Envelope</span> : null}
+                {!allowed ? <span className="text-xs">Not listed in the deployment capability catalog</span> : null}
                 <button aria-label={`Remove model ${model.model} from provider ${model.provider}`} className="rounded-full p-1 hover:bg-canvas" onClick={() => removeModel(index)} type="button">
                   <svg aria-hidden="true" className="size-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 12 12">
                     <path d="M2 2l8 8M10 2l-8 8" />
@@ -528,14 +535,14 @@ function TemplateEditor({ create = false, csrf, memberRole, serviceEnvelope, tem
           </label>
           <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-50" disabled={!toolInput || tools.some((tool) => toolKey(tool) === toolInput)} onClick={addTool} type="button">Add tool</button>
         </div>
-        {toolCatalog.length === 0 ? <p className="text-sm text-muted-ink">The current Service Envelope does not allow any tools.</p> : null}
+        {toolCatalog.length === 0 ? <p className="text-sm text-muted-ink">No tools are listed in the deployment capability catalog.</p> : null}
         <ul className="flex flex-wrap gap-2" role="list">
           {tools.map((tool, index) => {
             const allowed = allowedTools.has(toolKey(tool));
             return (
               <li className={allowed ? "flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm" : "flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm text-muted-ink"} key={`${toolKey(tool)}:${index}`}>
                 <span>{toolValue(tool)}</span>
-                {!allowed ? <span className="text-xs">No longer allowed by the current Service Envelope</span> : null}
+                {!allowed ? <span className="text-xs">Not listed in the deployment capability catalog</span> : null}
                 <button aria-label={`Remove tool ${toolValue(tool)}`} className="rounded-full p-1 hover:bg-canvas" onClick={() => removeTool(index)} type="button">
                   <svg aria-hidden="true" className="size-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 12 12">
                     <path d="M2 2l8 8M10 2l-8 8" />

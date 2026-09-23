@@ -1437,40 +1437,24 @@ impl PgStore {
         envelope: &Envelope,
         authored_by: &str,
     ) -> Result<(), StoreError> {
-        self.insert_scoped_envelope(
-            EnvelopeScopeKind::MemberRole,
-            member_role,
-            envelope,
-            authored_by,
-        )
-        .await
-    }
-
-    pub async fn insert_service_envelope(
-        &self,
-        service: &str,
-        envelope: &Envelope,
-        authored_by: &str,
-    ) -> Result<(), StoreError> {
-        self.insert_scoped_envelope(EnvelopeScopeKind::Service, service, envelope, authored_by)
+        self.insert_user_envelope(member_role, envelope, authored_by)
             .await
     }
 
-    async fn insert_scoped_envelope(
+    async fn insert_user_envelope(
         &self,
-        scope_kind: EnvelopeScopeKind,
         scope_ref: &str,
         envelope: &Envelope,
         authored_by: &str,
     ) -> Result<(), StoreError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        lock_envelope_scope(&mut transaction, scope_kind, scope_ref).await?;
+        lock_envelope_scope(&mut transaction, EnvelopeScopeKind::MemberRole, scope_ref).await?;
         let latest_revision = sqlx::query_scalar::<_, Option<i64>>(
             "SELECT max(revision) \
              FROM envelopes \
              WHERE scope_kind = $1 AND scope_ref = $2",
         )
-        .bind(scope_kind.as_str())
+        .bind(EnvelopeScopeKind::MemberRole.as_str())
         .bind(scope_ref)
         .fetch_one(&mut *transaction)
         .await
@@ -1483,7 +1467,7 @@ impl PgStore {
              (scope_kind, scope_ref, revision, spec, authored_by) \
              VALUES ($1, $2, $3, $4, $5)",
         )
-        .bind(scope_kind.as_str())
+        .bind(EnvelopeScopeKind::MemberRole.as_str())
         .bind(scope_ref)
         .bind(envelope.revision)
         .bind(Json(&envelope.spec))
@@ -1506,10 +1490,7 @@ impl PgStore {
              ON CONFLICT (grant_id) DO NOTHING",
         )
         .bind(scope_ref)
-        .bind(match scope_kind {
-            EnvelopeScopeKind::MemberRole => "user",
-            EnvelopeScopeKind::Service => "service",
-        })
+        .bind("user")
         .bind(authored_by)
         .bind(envelope.revision)
         .execute(&mut *transaction)
@@ -1520,8 +1501,25 @@ impl PgStore {
     }
 
     pub async fn latest_envelope(&self, member_role: &str) -> Result<Option<Envelope>, StoreError> {
-        self.latest_scoped_envelope(EnvelopeScopeKind::MemberRole, member_role)
-            .await
+        let row = sqlx::query(
+            "SELECT revision, spec \
+             FROM envelopes \
+             WHERE scope_kind = 'member_role' AND scope_ref = $1 \
+             ORDER BY revision DESC \
+             LIMIT 1",
+        )
+        .bind(member_role)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        row.map(|row| {
+            let revision = row.try_get("revision").map_err(database_error)?;
+            let Json(spec) = row
+                .try_get::<Json<EnvelopeSpec>, _>("spec")
+                .map_err(database_error)?;
+            Ok(Envelope { revision, spec })
+        })
+        .transpose()
     }
 
     pub async fn latest_envelopes(&self) -> Result<Vec<(String, Envelope)>, StoreError> {
@@ -1544,77 +1542,6 @@ impl PgStore {
                 Ok((member_role, Envelope { revision, spec }))
             })
             .collect()
-    }
-
-    pub async fn latest_service_envelope(
-        &self,
-        service: &str,
-    ) -> Result<Option<Envelope>, StoreError> {
-        self.latest_scoped_envelope(EnvelopeScopeKind::Service, service)
-            .await
-    }
-
-    pub async fn service_envelope_revision(
-        &self,
-        service: &str,
-        revision: i64,
-    ) -> Result<Option<Envelope>, StoreError> {
-        self.scoped_envelope_revision(EnvelopeScopeKind::Service, service, revision)
-            .await
-    }
-
-    async fn scoped_envelope_revision(
-        &self,
-        scope_kind: EnvelopeScopeKind,
-        scope_ref: &str,
-        revision: i64,
-    ) -> Result<Option<Envelope>, StoreError> {
-        let row = sqlx::query(
-            "SELECT revision, spec \
-             FROM envelopes \
-             WHERE scope_kind = $1 AND scope_ref = $2 AND revision = $3",
-        )
-        .bind(scope_kind.as_str())
-        .bind(scope_ref)
-        .bind(revision)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(database_error)?;
-        row.map(|row| {
-            let revision = row.try_get("revision").map_err(database_error)?;
-            let Json(spec) = row
-                .try_get::<Json<EnvelopeSpec>, _>("spec")
-                .map_err(database_error)?;
-            Ok(Envelope { revision, spec })
-        })
-        .transpose()
-    }
-
-    pub async fn latest_scoped_envelope(
-        &self,
-        scope_kind: EnvelopeScopeKind,
-        scope_ref: &str,
-    ) -> Result<Option<Envelope>, StoreError> {
-        let row = sqlx::query(
-            "SELECT revision, spec \
-             FROM envelopes \
-             WHERE scope_kind = $1 AND scope_ref = $2 \
-             ORDER BY revision DESC \
-             LIMIT 1",
-        )
-        .bind(scope_kind.as_str())
-        .bind(scope_ref)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(database_error)?;
-        row.map(|row| {
-            let revision = row.try_get("revision").map_err(database_error)?;
-            let Json(spec) = row
-                .try_get::<Json<EnvelopeSpec>, _>("spec")
-                .map_err(database_error)?;
-            Ok(Envelope { revision, spec })
-        })
-        .transpose()
     }
 
     pub async fn park_rejection(
@@ -1817,31 +1744,11 @@ impl PgStore {
         rows.pop().map(task_admission_record).transpose()
     }
 
-    /// Returns a grant only when it is the exact, currently effective authority for this Task.
-    /// Historical approval state alone never authorizes restoration or execution.
-    pub async fn task_grant_application(
-        &self,
-        task_uid: Uuid,
-        runtime_uid: &str,
-    ) -> Result<Option<GrantApplication>, StoreError> {
-        let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        let (_, authority) = self
-            .effective_task_authority(&mut transaction, task_uid, Some(runtime_uid))
-            .await?;
-        transaction.commit().await.map_err(database_error)?;
-        Ok(match authority {
-            EffectiveTaskAuthority::Active(application) => Some(*application),
-            EffectiveTaskAuthority::Baseline { .. }
-            | EffectiveTaskAuthority::Pending
-            | EffectiveTaskAuthority::Inactive => None,
-        })
-    }
-
     async fn effective_task_authority(
         &self,
         transaction: &mut sqlx::Transaction<'_, Postgres>,
         task_uid: Uuid,
-        expected_runtime_uid: Option<&str>,
+        _expected_runtime_uid: Option<&str>,
     ) -> Result<(TaskRecord, EffectiveTaskAuthority), StoreError> {
         let task = sqlx::query("SELECT * FROM task_submissions WHERE task_uid = $1 FOR UPDATE")
             .bind(task_uid)
@@ -1851,203 +1758,35 @@ impl PgStore {
             .map(task_record)
             .transpose()?
             .ok_or(StoreError::TaskNotFound)?;
-        if task.direct_task_evidence.is_some()
-            && !direct_user_envelope_authority_active(transaction, &task).await?
-        {
-            return Ok((task, EffectiveTaskAuthority::Inactive));
-        }
-        lock_envelope_scope(
-            transaction,
-            EnvelopeScopeKind::Service,
-            &task.submitter_service,
-        )
-        .await?;
-        let latest_envelope = sqlx::query(
-            "SELECT revision, spec FROM envelopes \
-             WHERE scope_kind = 'service' AND scope_ref = $1 \
-             ORDER BY revision DESC LIMIT 1",
-        )
-        .bind(&task.submitter_service)
-        .fetch_optional(&mut **transaction)
-        .await
-        .map_err(database_error)?;
-        let latest_envelope = latest_envelope
-            .map(|row| {
-                let revision = row.try_get("revision").map_err(database_error)?;
-                let Json(spec) = row
-                    .try_get::<Json<EnvelopeSpec>, _>("spec")
-                    .map_err(database_error)?;
-                Ok::<_, StoreError>(Envelope { revision, spec })
-            })
-            .transpose()?;
-        let internal_authority_pinned = task.internal_authority_id.is_some()
-            && task.internal_authority_version.is_some()
-            && task.internal_authority_digest.is_some();
-        let current_envelope = latest_envelope
-            .as_ref()
-            .is_some_and(|envelope| envelope.revision == task.envelope_revision);
-        let current_baseline_authority = internal_authority_pinned
-            || latest_envelope.as_ref().is_some_and(|envelope| {
-                matches!(
-                    evaluate(&task.runtime_spec, envelope),
-                    Ok(AdmissionDecision::Admit)
-                )
-            });
-
-        let mut rows = sqlx::query(
-            "SELECT admission_decisions.id AS decision_id, approvals.id AS approval_id, \
-                    admission_decisions.runtime_uid, approvals.runtime_uid AS approval_runtime_uid, \
-                    approvals.state, approvals.decision_key, approvals.evidence_url, \
-                    admission_decisions.deltas, admission_decisions.proposed_spec, \
-                    admission_decisions.base_spec, admission_decisions.spec_digest, \
-                    admission_decisions.base_pending_approval_digest, \
-                    admission_decisions.runtime_namespace, admission_decisions.runtime_name, \
-                    admission_decisions.orchestration_operation_id, \
-                    admission_decisions.envelope_rev, admission_decisions.actor, \
-                    admission_decisions.member_role \
-             FROM admission_decisions \
-             JOIN approvals ON approvals.admission_decision_id = admission_decisions.id \
-             WHERE admission_decisions.task_uid = $1 \
-             ORDER BY approvals.id \
-             LIMIT 2",
-        )
-        .bind(task_uid)
-        .fetch_all(&mut **transaction)
-        .await
-        .map_err(database_error)?;
-        if rows.is_empty() {
-            let authority = if current_baseline_authority {
-                EffectiveTaskAuthority::Baseline {
-                    envelope_revision: if internal_authority_pinned {
-                        task.envelope_revision
-                    } else {
-                        latest_envelope
-                            .as_ref()
-                            .map(|envelope| envelope.revision)
-                            .ok_or(StoreError::StaleEnvelope)?
-                    },
+        if task.orchestration_version == 3 {
+            let authority = match task.authority_kind.as_deref() {
+                Some("internal")
+                    if task.internal_authority_id.is_some()
+                        && task.internal_authority_version.is_some()
+                        && task.internal_authority_digest.is_some() =>
+                {
+                    EffectiveTaskAuthority::Baseline {
+                        envelope_revision: task
+                            .internal_authority_version
+                            .ok_or(StoreError::InvalidTaskTransition)?,
+                    }
                 }
-            } else {
-                EffectiveTaskAuthority::Inactive
+                Some("user-envelope")
+                    if task_user_envelope_authority_active(transaction, &task).await? =>
+                {
+                    EffectiveTaskAuthority::Baseline {
+                        envelope_revision: task
+                            .user_envelope_revision
+                            .ok_or(StoreError::InvalidTaskTransition)?,
+                    }
+                }
+                _ => EffectiveTaskAuthority::Inactive,
             };
             return Ok((task, authority));
         }
-        if rows.len() != 1 {
-            return Ok((task, EffectiveTaskAuthority::Inactive));
-        }
-        let row = rows
-            .pop()
-            .ok_or_else(|| StoreError::Database("Task admission row disappeared".to_owned()))?;
-        let approval_runtime_uid = row
-            .try_get::<String, _>("approval_runtime_uid")
-            .map_err(database_error)?;
-        let runtime_namespace = row
-            .try_get::<String, _>("runtime_namespace")
-            .map_err(database_error)?;
-        let runtime_name = row
-            .try_get::<String, _>("runtime_name")
-            .map_err(database_error)?;
-        let envelope_revision = row
-            .try_get::<i64, _>("envelope_rev")
-            .map_err(database_error)?;
-        let admission_operation_id = row
-            .try_get::<Option<Uuid>, _>("orchestration_operation_id")
-            .map_err(database_error)?;
-        let actor = row.try_get::<String, _>("actor").map_err(database_error)?;
-        let member_role = row
-            .try_get::<String, _>("member_role")
-            .map_err(database_error)?;
-        let spec_digest = row
-            .try_get::<String, _>("spec_digest")
-            .map_err(database_error)?;
-        let base_pending_approval_digest = row
-            .try_get::<Option<String>, _>("base_pending_approval_digest")
-            .map_err(database_error)?;
-        let Json(base_spec) = row
-            .try_get::<Json<AgentRuntimeSpec>, _>("base_spec")
-            .map_err(database_error)?;
-        let admission = task_admission_record(row)?;
-        let exact_runtime = expected_runtime_uid
-            .map(|runtime_uid| runtime_uid == admission.runtime_uid)
-            .unwrap_or(true)
-            && task
-                .runtime_uid
-                .as_deref()
-                .map(|runtime_uid| runtime_uid == admission.runtime_uid)
-                .unwrap_or(true)
-            && approval_runtime_uid == admission.runtime_uid;
-        let exact_admission = current_envelope
-            && exact_runtime
-            && task.runtime_ownership == steward_types::RuntimeOwnership::Provisioned
-            && runtime_namespace == task.runtime_namespace
-            && runtime_name == task.runtime_name
-            && admission_operation_id == task.orchestration_operation_id
-            && envelope_revision == task.envelope_revision
-            && actor == task.submitter_service
-            && member_role == task.submitter_service
-            && admission.proposed_spec == task.runtime_spec
-            && !admission.deltas.is_empty()
-            && base_pending_approval_digest.as_deref() == Some(spec_digest.as_str());
-        if !exact_admission {
-            return Ok((task, EffectiveTaskAuthority::Inactive));
-        }
-        if admission.state == AdmissionApprovalState::Pending {
-            return Ok((task, EffectiveTaskAuthority::Pending));
-        }
-        if admission.state != AdmissionApprovalState::Approved {
-            return Ok((task, EffectiveTaskAuthority::Inactive));
-        }
-
-        let grants =
-            sqlx::query("SELECT id FROM grants WHERE approval_id = $1 ORDER BY id FOR UPDATE")
-                .bind(admission.approval_id)
-                .fetch_all(&mut **transaction)
-                .await
-                .map_err(database_error)?;
-        if grants.len() != admission.deltas.len() {
-            return Ok((task, EffectiveTaskAuthority::Inactive));
-        }
-        let grant_status = sqlx::query(
-            "SELECT count(grants.id)::bigint AS grant_count, \
-                    COALESCE(bool_and( \
-                        grants.runtime_uid = $2 \
-                        AND grants.envelope_revision = $3 \
-                        AND grants.expires_at > clock_timestamp() \
-                        AND grant_revocations.grant_id IS NULL \
-                    ), false) AS grants_active \
-             FROM grants \
-             LEFT JOIN grant_revocations ON grant_revocations.grant_id = grants.id \
-             WHERE grants.approval_id = $1",
-        )
-        .bind(admission.approval_id)
-        .bind(&admission.runtime_uid)
-        .bind(envelope_revision)
-        .fetch_one(&mut **transaction)
-        .await
-        .map_err(database_error)?;
-        let grant_count = grant_status
-            .try_get::<i64, _>("grant_count")
-            .map_err(database_error)?;
-        let grants_active = grant_status
-            .try_get::<bool, _>("grants_active")
-            .map_err(database_error)?;
-        if !grants_active || grant_count != admission.deltas.len() as i64 {
-            return Ok((task, EffectiveTaskAuthority::Inactive));
-        }
-        let application = GrantApplication {
-            approval_id: admission.approval_id,
-            application: GrantReversion {
-                runtime_uid: admission.runtime_uid.clone(),
-                runtime_namespace,
-                runtime_name,
-                actor,
-                member_role,
-                base_spec,
-                proposed_spec: admission.proposed_spec.clone(),
-                base_pending_approval_digest,
-            },
-        };
-        Ok((task, EffectiveTaskAuthority::Active(Box::new(application))))
+        // Migration 0039 rejects unfinished legacy orchestration. Historical
+        // records remain readable, but they can never regain live authority.
+        Ok((task, EffectiveTaskAuthority::Inactive))
     }
 
     pub async fn pending_approvals(&self) -> Result<Vec<PendingApproval>, StoreError> {
@@ -2201,7 +1940,7 @@ impl PgStore {
         let losing_state = losing
             .try_get::<String, _>("state")
             .map_err(database_error)?;
-        let scope_kind = envelope_scope_kind(&proposed_spec);
+        let scope_kind = envelope_scope_kind(&proposed_spec)?;
         lock_envelope_scope(&mut transaction, scope_kind, &member_role).await?;
         let grants = sqlx::query(
             "SELECT id \
@@ -2338,22 +2077,6 @@ impl PgStore {
         member_role: &str,
         envelope_revision: i64,
     ) -> Result<Vec<AdmissionDelta>, StoreError> {
-        self.grants_for_runtime_scoped(
-            runtime_uid,
-            EnvelopeScopeKind::MemberRole,
-            member_role,
-            envelope_revision,
-        )
-        .await
-    }
-
-    pub async fn grants_for_runtime_scoped(
-        &self,
-        runtime_uid: &str,
-        scope_kind: EnvelopeScopeKind,
-        scope_ref: &str,
-        envelope_revision: i64,
-    ) -> Result<Vec<AdmissionDelta>, StoreError> {
         let rows = sqlx::query(
             "SELECT grants.granted_value \
              FROM grants \
@@ -2377,11 +2100,8 @@ impl PgStore {
              END, grants.at, grants.id",
         )
         .bind(runtime_uid)
-        .bind(scope_ref)
-        .bind(match scope_kind {
-            EnvelopeScopeKind::MemberRole => "user",
-            EnvelopeScopeKind::Service => "service",
-        })
+        .bind(member_role)
+        .bind("user")
         .bind(envelope_revision)
         .fetch_all(&self.pool)
         .await
@@ -2833,7 +2553,7 @@ impl PgStore {
         if state != "pending" {
             return Err(StoreError::ApprovalNotPending);
         }
-        let scope_kind = envelope_scope_kind(&proposed_spec);
+        let scope_kind = envelope_scope_kind(&proposed_spec)?;
         lock_envelope_scope(&mut transaction, scope_kind, &member_role).await?;
         let latest_revision = sqlx::query_scalar::<_, i64>(
             "SELECT revision \
@@ -2948,17 +2668,19 @@ impl PgStore {
             AdmissionDecision::Reject { deltas } => ("parked", "reject", deltas.clone()),
         };
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        if let Some(evidence) = request.direct_task_evidence
-            && !direct_user_envelope_evidence_active(
-                &mut transaction,
-                evidence,
-                request.owner_user_id,
-                request.user_envelope_instance_id,
-                request.user_envelope_revision,
-                request.user_envelope_digest,
-                request.runtime_spec,
-            )
-            .await?
+        let user_envelope = request
+            .user_envelope_snapshot
+            .ok_or(StoreError::InvalidTaskTransition)?;
+        if !user_envelope_authority_active(
+            &mut transaction,
+            request.owner_user_id,
+            request.user_envelope_instance_id,
+            request.user_envelope_revision,
+            request.user_envelope_digest,
+            user_envelope,
+            request.runtime_spec,
+        )
+        .await?
         {
             return Err(StoreError::StaleEnvelope);
         }
@@ -2995,40 +2717,6 @@ impl PgStore {
                 operation,
             });
         }
-        lock_envelope_scope(
-            &mut transaction,
-            EnvelopeScopeKind::Service,
-            request.submitter_service,
-        )
-        .await?;
-        let current_envelope = sqlx::query(
-            "SELECT revision, spec FROM envelopes \
-             WHERE scope_kind = 'service' AND scope_ref = $1 \
-             ORDER BY revision DESC LIMIT 1",
-        )
-        .bind(request.submitter_service)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(database_error)?
-        .map(|row| {
-            Ok::<_, StoreError>(Envelope {
-                revision: row.try_get("revision").map_err(database_error)?,
-                spec: row
-                    .try_get::<Json<EnvelopeSpec>, _>("spec")
-                    .map_err(database_error)?
-                    .0,
-            })
-        })
-        .transpose()?
-        .ok_or(StoreError::StaleEnvelope)?;
-        if current_envelope != *request.service_envelope
-            || current_envelope.revision != request.envelope_revision
-            || evaluate(request.runtime_spec, &current_envelope)
-                .map_err(|_| StoreError::InvalidTaskTransition)?
-                != *request.admission_decision
-        {
-            return Err(StoreError::StaleEnvelope);
-        }
         let task_uid = request.task_uid;
         let operation_id = request.operation_id;
         let inserted = sqlx::query(
@@ -3037,6 +2725,7 @@ impl PgStore {
               owner, owner_user_id, identity_binding_state, workflow, \
               workflow_name, workflow_version, workflow_digest, \
               user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
+              authority_kind, user_envelope_snapshot, \
               coding_agent_runtime, runtime_uid, runtime_namespace, runtime_name, runtime_ownership, phase, \
               runtime_spec, agent_command, execution_binding, direct_task_evidence, \
               envelope_revision, orchestration_version, \
@@ -3044,7 +2733,8 @@ impl PgStore {
               candidate_digest, service_envelope_digest, original_admission_decision, \
               original_admission_deltas) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, $12, $13, $14, \
-                     $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, 2, $26, $27, $28, $29, $30) \
+                     'user-envelope', $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, \
+                     NULL, 3, $26, $27, NULL, $28, $29) \
              ON CONFLICT DO NOTHING",
         )
         .bind(task_uid)
@@ -3061,6 +2751,7 @@ impl PgStore {
         .bind(request.user_envelope_instance_id)
         .bind(request.user_envelope_revision)
         .bind(request.user_envelope_digest)
+        .bind(Json(user_envelope))
         .bind(request.coding_agent_runtime)
         .bind(Option::<&str>::None)
         .bind(request.runtime_namespace)
@@ -3071,10 +2762,8 @@ impl PgStore {
         .bind(Json(request.agent_command))
         .bind(request.execution_binding.map(Json))
         .bind(request.direct_task_evidence.map(Json))
-        .bind(request.envelope_revision)
         .bind(operation_id)
         .bind(request.candidate_digest)
-        .bind(request.service_envelope_digest)
         .bind(admission_text)
         .bind(Json(&deltas))
         .execute(&mut *transaction)
@@ -3480,8 +3169,8 @@ impl PgStore {
             transaction.commit().await.map_err(database_error)?;
             return Ok(TaskOperationTransition::Superseded(current));
         }
-        if task.direct_task_evidence.is_some()
-            && !direct_user_envelope_authority_active(&mut transaction, &task).await?
+        if task.authority_kind.as_deref() == Some("user-envelope")
+            && !task_user_envelope_authority_active(&mut transaction, &task).await?
         {
             sqlx::query(
                 "UPDATE task_runtime_operations \
@@ -3628,25 +3317,22 @@ impl PgStore {
         })
     }
 
-    pub async fn decide_task_runtime_authority(
+    /// Select and revalidate immutable v3 Task authority without consulting a Service Envelope.
+    pub async fn decide_task_runtime_authority_v3(
         &self,
         task_uid: Uuid,
         expected_generation: i64,
-        latest_envelope: &Envelope,
-        latest_envelope_digest: &str,
         actor: &str,
     ) -> Result<TaskOperationTransition, StoreError> {
-        if expected_generation <= 0
-            || actor.is_empty()
-            || !valid_sha256_reference(latest_envelope_digest)
-        {
+        if expected_generation <= 0 || actor.is_empty() {
             return Err(StoreError::InvalidTaskTransition);
         }
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let task = task_in_transaction_for_update(&mut transaction, task_uid).await?;
         let current =
             task_runtime_operation_in_transaction_for_update(&mut transaction, task_uid).await?;
-        if current.generation != expected_generation
+        if task.orchestration_version != 3
+            || current.generation != expected_generation
             || !matches!(
                 current.state,
                 TaskOrchestrationState::RuntimeObserved | TaskOrchestrationState::ActivationPending
@@ -3655,138 +3341,72 @@ impl PgStore {
             transaction.commit().await.map_err(database_error)?;
             return Ok(TaskOperationTransition::Superseded(current));
         }
-        let direct_user_envelope_active =
-            direct_user_envelope_authority_active(&mut transaction, &task).await?;
-        let termination_requested = task.finalize_requested || task.cancel_requested;
-        let internal_authority = task.internal_authority_id.is_some()
-            && task.internal_authority_version.is_some()
-            && task.internal_authority_digest.is_some();
-        if internal_authority {
-            if latest_envelope.revision != task.envelope_revision
-                || task.service_envelope_digest.as_deref() != Some(latest_envelope_digest)
-            {
-                return Err(StoreError::StaleEnvelope);
-            }
-        } else {
-            lock_envelope_scope(
-                &mut transaction,
-                EnvelopeScopeKind::Service,
-                &task.submitter_service,
-            )
-            .await?;
-            let persisted_latest = sqlx::query(
-                "SELECT revision, spec FROM envelopes \
-                 WHERE scope_kind = 'service' AND scope_ref = $1 \
-                 ORDER BY revision DESC LIMIT 1",
-            )
-            .bind(&task.submitter_service)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(database_error)?
-            .map(|row| {
-                Ok::<_, StoreError>(Envelope {
-                    revision: row.try_get("revision").map_err(database_error)?,
-                    spec: row
-                        .try_get::<Json<EnvelopeSpec>, _>("spec")
-                        .map_err(database_error)?
-                        .0,
-                })
-            })
-            .transpose()?
-            .ok_or(StoreError::StaleEnvelope)?;
-            if persisted_latest != *latest_envelope {
-                return Err(StoreError::StaleEnvelope);
-            }
-        }
-        let decision = evaluate(&task.runtime_spec, latest_envelope)
-            .map_err(|_| StoreError::InvalidTaskTransition)?;
-        if current.state == TaskOrchestrationState::ActivationPending && !termination_requested {
-            let authority_is_current = match current.activation_authority_kind.as_deref() {
-                Some("internal") => internal_authority,
-                Some("baseline") => {
-                    !internal_authority
-                        && direct_user_envelope_active
-                        && decision == AdmissionDecision::Admit
-                }
-                Some("grant") => {
-                    let runtime_uid = current
-                        .runtime_uid
-                        .as_deref()
-                        .ok_or(StoreError::InvalidTaskTransition)?;
-                    let (_, effective) = self
-                        .effective_task_authority(&mut transaction, task_uid, Some(runtime_uid))
-                        .await?;
-                    matches!(
-                        effective,
-                        EffectiveTaskAuthority::Active(application)
-                            if current.approval_id == Some(application.approval_id)
-                    )
-                }
-                _ => false,
+
+        let (authority_kind, authority_revision, authority_digest, authority_active) =
+            match task.authority_kind.as_deref() {
+                Some("internal") => (
+                    "internal",
+                    task.internal_authority_version,
+                    task.internal_authority_digest.as_deref(),
+                    task.internal_authority_id.is_some()
+                        && task.internal_authority_version.is_some()
+                        && task.internal_authority_digest.is_some(),
+                ),
+                Some("user-envelope") => (
+                    "user-envelope",
+                    task.user_envelope_revision,
+                    task.user_envelope_digest.as_deref(),
+                    task_user_envelope_authority_active(&mut transaction, &task).await?,
+                ),
+                _ => ("invalid", None, None, false),
             };
-            if authority_is_current {
-                let authority_kind = current
-                    .activation_authority_kind
-                    .as_deref()
-                    .ok_or(StoreError::InvalidTaskTransition)?;
-                let exact_authority_already_authorized =
-                    current.activation_effect_authorized_at.is_some()
-                        && current.activation_envelope_revision == Some(latest_envelope.revision)
-                        && current.activation_envelope_digest.as_deref()
-                            == Some(latest_envelope_digest);
-                if exact_authority_already_authorized {
-                    transaction.commit().await.map_err(database_error)?;
-                    return Ok(TaskOperationTransition::AlreadyApplied(current));
-                }
+        let exact_authority = authority_active
+            && authority_revision.is_some()
+            && authority_digest.is_some()
+            && !task.finalize_requested
+            && !task.cancel_requested;
+
+        if exact_authority && current.state == TaskOrchestrationState::ActivationPending {
+            let selected = current.activation_authority_kind.as_deref() == Some(authority_kind)
+                && current.activation_envelope_revision == authority_revision
+                && current.activation_envelope_digest.as_deref() == authority_digest;
+            if selected && current.activation_effect_authorized_at.is_some() {
+                transaction.commit().await.map_err(database_error)?;
+                return Ok(TaskOperationTransition::AlreadyApplied(current));
+            }
+            if selected {
                 let updated = sqlx::query(
                     "UPDATE task_runtime_operations \
-                     SET generation = generation + 1, activation_authority_kind = $3, \
-                         activation_envelope_revision = $4, activation_envelope_digest = $5, \
-                         activation_effect_authorized_at = now(), retry_at = NULL, \
-                         last_error_code = NULL, lease_owner = NULL, lease_expires_at = NULL, \
-                         updated_at = now() \
+                     SET generation = generation + 1, activation_effect_authorized_at = now(), \
+                         retry_at = NULL, last_error_code = NULL, lease_owner = NULL, \
+                         lease_expires_at = NULL, updated_at = now() \
                      WHERE task_uid = $1 AND generation = $2 AND state = 'activation_pending'",
                 )
                 .bind(task_uid)
                 .bind(expected_generation)
-                .bind(authority_kind)
-                .bind(latest_envelope.revision)
-                .bind(latest_envelope_digest)
                 .execute(&mut *transaction)
                 .await
                 .map_err(database_error)?
                 .rows_affected();
-                if updated != 1 {
+                if updated == 1 {
+                    append_task_orchestration_journal(
+                        &mut transaction,
+                        task_uid,
+                        expected_generation + 1,
+                        TaskOrchestrationState::ActivationPending,
+                        "activation_effect_authorized",
+                        actor,
+                    )
+                    .await?;
                     let current =
                         task_runtime_operation_in_transaction(&mut transaction, task_uid).await?;
                     transaction.commit().await.map_err(database_error)?;
-                    return Ok(TaskOperationTransition::Superseded(current));
+                    return Ok(TaskOperationTransition::Applied(current));
                 }
-                append_task_orchestration_journal(
-                    &mut transaction,
-                    task_uid,
-                    expected_generation + 1,
-                    TaskOrchestrationState::ActivationPending,
-                    "activation_effect_authorized",
-                    actor,
-                )
-                .await?;
-                let current =
-                    task_runtime_operation_in_transaction(&mut transaction, task_uid).await?;
-                transaction.commit().await.map_err(database_error)?;
-                return Ok(TaskOperationTransition::Applied(current));
             }
         }
-        if current.state == TaskOrchestrationState::RuntimeObserved
-            && !termination_requested
-            && (internal_authority
-                || (direct_user_envelope_active && decision == AdmissionDecision::Admit))
-        {
-            let authority_kind = if internal_authority {
-                "internal"
-            } else {
-                "baseline"
-            };
+
+        if exact_authority && current.state == TaskOrchestrationState::RuntimeObserved {
             let updated = sqlx::query(
                 "UPDATE task_runtime_operations \
                  SET state = 'activation_pending', generation = generation + 1, \
@@ -3798,132 +3418,27 @@ impl PgStore {
             .bind(task_uid)
             .bind(expected_generation)
             .bind(authority_kind)
-            .bind(latest_envelope.revision)
-            .bind(latest_envelope_digest)
+            .bind(authority_revision)
+            .bind(authority_digest)
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?
             .rows_affected();
-            if updated != 1 {
+            if updated == 1 {
+                append_task_orchestration_journal(
+                    &mut transaction,
+                    task_uid,
+                    expected_generation + 1,
+                    TaskOrchestrationState::ActivationPending,
+                    "activation_authority_selected",
+                    actor,
+                )
+                .await?;
                 let current =
                     task_runtime_operation_in_transaction(&mut transaction, task_uid).await?;
                 transaction.commit().await.map_err(database_error)?;
-                return Ok(TaskOperationTransition::Superseded(current));
+                return Ok(TaskOperationTransition::Applied(current));
             }
-            append_task_orchestration_journal(
-                &mut transaction,
-                task_uid,
-                expected_generation + 1,
-                TaskOrchestrationState::ActivationPending,
-                "activation_authority_selected",
-                actor,
-            )
-            .await?;
-            let current = task_runtime_operation_in_transaction(&mut transaction, task_uid).await?;
-            transaction.commit().await.map_err(database_error)?;
-            return Ok(TaskOperationTransition::Applied(current));
-        }
-
-        let approval_can_be_materialized = current.state == TaskOrchestrationState::RuntimeObserved
-            && !termination_requested
-            && direct_user_envelope_active
-            && task.original_admission_decision.as_deref() == Some("reject")
-            && !task
-                .original_admission_deltas
-                .as_ref()
-                .is_none_or(Vec::is_empty)
-            && task.envelope_revision == latest_envelope.revision
-            && task.service_envelope_digest.as_deref() == Some(latest_envelope_digest);
-        if approval_can_be_materialized {
-            let runtime_uid = current
-                .runtime_uid
-                .as_deref()
-                .ok_or(StoreError::InvalidTaskTransition)?;
-            let candidate_digest = task
-                .candidate_digest
-                .as_deref()
-                .ok_or(StoreError::InvalidTaskTransition)?;
-            let deltas = task
-                .original_admission_deltas
-                .as_ref()
-                .ok_or(StoreError::InvalidTaskTransition)?;
-            let approval_id = Uuid::new_v4();
-            let decision_id = Uuid::new_v4();
-            let outbox_id = Uuid::new_v4();
-            let inert_spec = inert_task_runtime_spec(&task.runtime_spec, latest_envelope);
-            sqlx::query(
-                "INSERT INTO admission_decisions \
-                 (id, runtime_uid, spec_digest, envelope_rev, verdict, deltas, proposed_spec, \
-                  actor, member_role, base_spec_digest, base_spec, runtime_namespace, \
-                  runtime_name, base_pending_approval_digest, task_uid, \
-                  orchestration_operation_id) \
-                 VALUES ($1, $2, $3, $4, 'reject', $5, $6, $7, $7, $8, $9, $10, $11, $3, $12, $13)",
-            )
-            .bind(decision_id)
-            .bind(runtime_uid)
-            .bind(candidate_digest)
-            .bind(latest_envelope.revision)
-            .bind(Json(deltas))
-            .bind(Json(&task.runtime_spec))
-            .bind(&task.submitter_service)
-            .bind(&current.inert_manifest_digest)
-            .bind(Json(&inert_spec))
-            .bind(&current.runtime_namespace)
-            .bind(&current.runtime_name)
-            .bind(task_uid)
-            .bind(current.operation_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-            sqlx::query(
-                "INSERT INTO approvals \
-                 (id, runtime_uid, admission_decision_id, state) \
-                 VALUES ($1, $2, $3, 'pending')",
-            )
-            .bind(approval_id)
-            .bind(runtime_uid)
-            .bind(decision_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-            sqlx::query(
-                "INSERT INTO external_effect_outbox \
-                 (id, task_uid, operation_id, approval_id, effect_kind, idempotency_key, state) \
-                 VALUES ($1, $2, $3, $4, 'approval_delivery', $5, 'pending')",
-            )
-            .bind(outbox_id)
-            .bind(task_uid)
-            .bind(current.operation_id)
-            .bind(approval_id)
-            .bind(format!("approval:{approval_id}"))
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-            sqlx::query(
-                "UPDATE task_runtime_operations \
-                 SET state = 'approval_pending', generation = generation + 1, \
-                     approval_id = $3, retry_at = NULL, last_error_code = NULL, \
-                     lease_owner = NULL, lease_expires_at = NULL, updated_at = now() \
-                 WHERE task_uid = $1 AND generation = $2 AND state = 'runtime_observed'",
-            )
-            .bind(task_uid)
-            .bind(expected_generation)
-            .bind(approval_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-            append_task_orchestration_journal(
-                &mut transaction,
-                task_uid,
-                expected_generation + 1,
-                TaskOrchestrationState::ApprovalPending,
-                "runtime_bound_approval_materialized",
-                actor,
-            )
-            .await?;
-            let current = task_runtime_operation_in_transaction(&mut transaction, task_uid).await?;
-            transaction.commit().await.map_err(database_error)?;
-            return Ok(TaskOperationTransition::Applied(current));
         }
 
         sqlx::query(
@@ -3947,8 +3462,7 @@ impl PgStore {
                  failure_reason = CASE WHEN cancel_requested OR finalize_requested \
                      THEN failure_reason \
                      ELSE COALESCE(failure_reason, 'admission_authority_inactive') END, \
-                 updated_at = now() \
-             WHERE task_uid = $1 AND NOT finalized",
+                 updated_at = now() WHERE task_uid = $1 AND NOT finalized",
         )
         .bind(task_uid)
         .execute(&mut *transaction)
@@ -3959,7 +3473,7 @@ impl PgStore {
             task_uid,
             expected_generation + 1,
             TaskOrchestrationState::CleanupPending,
-            if termination_requested {
+            if task.finalize_requested || task.cancel_requested {
                 "termination_cleanup_requested"
             } else {
                 "authority_inactive_cleanup_requested"
@@ -3971,7 +3485,7 @@ impl PgStore {
         transaction.commit().await.map_err(database_error)?;
         Ok(TaskOperationTransition::AuthorityInactive {
             current,
-            reason: if termination_requested {
+            reason: if task.finalize_requested || task.cancel_requested {
                 "task_termination_requested"
             } else {
                 "admission_authority_inactive"
@@ -4035,7 +3549,7 @@ impl PgStore {
                  END, \
                  failure_reason = COALESCE(failure_reason, $3), \
                  finalize_requested = true, updated_at = now() \
-             WHERE task_uid = $1 AND orchestration_version = 2 AND NOT finalized",
+             WHERE task_uid = $1 AND orchestration_version IN (2, 3) AND NOT finalized",
         )
         .bind(task_uid)
         .bind(phase)
@@ -4286,7 +3800,6 @@ impl PgStore {
             return Err(StoreError::InvalidTaskTransition);
         }
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        let task = task_in_transaction_for_update(&mut transaction, task_uid).await?;
         let current =
             task_runtime_operation_in_transaction_for_update(&mut transaction, task_uid).await?;
         if current.generation != expected_generation
@@ -4299,64 +3812,12 @@ impl PgStore {
             .runtime_uid
             .as_deref()
             .ok_or(StoreError::InvalidTaskTransition)?;
-        let (_, authority) = self
+        match self
             .effective_task_authority(&mut transaction, task_uid, Some(runtime_uid))
-            .await?;
-        match authority {
-            EffectiveTaskAuthority::Pending => {
-                transaction.commit().await.map_err(database_error)?;
-                Ok(TaskOperationTransition::AlreadyApplied(current))
-            }
-            EffectiveTaskAuthority::Active(application)
-                if current.approval_id == Some(application.approval_id)
-                    && !task.finalize_requested
-                    && !task.cancel_requested =>
-            {
-                let envelope_digest = task
-                    .service_envelope_digest
-                    .as_deref()
-                    .ok_or(StoreError::InvalidTaskTransition)?;
-                let updated = sqlx::query(
-                    "UPDATE task_runtime_operations \
-                     SET state = 'activation_pending', generation = generation + 1, \
-                         activation_authority_kind = 'grant', \
-                         activation_envelope_revision = $3, \
-                         activation_envelope_digest = $4, retry_at = NULL, \
-                         last_error_code = NULL, lease_owner = NULL, lease_expires_at = NULL, \
-                         updated_at = now() \
-                     WHERE task_uid = $1 AND generation = $2 AND state = 'approval_pending'",
-                )
-                .bind(task_uid)
-                .bind(expected_generation)
-                .bind(task.envelope_revision)
-                .bind(envelope_digest)
-                .execute(&mut *transaction)
-                .await
-                .map_err(database_error)?
-                .rows_affected();
-                if updated != 1 {
-                    let current =
-                        task_runtime_operation_in_transaction(&mut transaction, task_uid).await?;
-                    transaction.commit().await.map_err(database_error)?;
-                    return Ok(TaskOperationTransition::Superseded(current));
-                }
-                append_task_orchestration_journal(
-                    &mut transaction,
-                    task_uid,
-                    expected_generation + 1,
-                    TaskOrchestrationState::ActivationPending,
-                    "approved_authority_revalidated",
-                    actor,
-                )
-                .await?;
-                let current =
-                    task_runtime_operation_in_transaction(&mut transaction, task_uid).await?;
-                transaction.commit().await.map_err(database_error)?;
-                Ok(TaskOperationTransition::Applied(current))
-            }
-            EffectiveTaskAuthority::Baseline { .. }
-            | EffectiveTaskAuthority::Active(_)
-            | EffectiveTaskAuthority::Inactive => {
+            .await?
+            .1
+        {
+            EffectiveTaskAuthority::Baseline { .. } | EffectiveTaskAuthority::Inactive => {
                 sqlx::query(
                     "UPDATE task_runtime_operations \
                      SET state = 'cleanup_pending', generation = generation + 1, \
@@ -5465,13 +4926,13 @@ impl PgStore {
              (task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, \
               owner, owner_user_id, identity_binding_state, workflow, coding_agent_runtime, \
               runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
-              agent_command, input_archive, execute_requested, envelope_revision, \
+              agent_command, input_archive, execute_requested, authority_kind, \
               internal_authority_id, internal_authority_version, internal_authority_digest, \
               orchestration_version, orchestration_operation_id, candidate_digest, service_envelope_digest, \
               original_admission_decision, original_admission_deltas) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, \
-                     'provisioned', 'queued', $12, $13, $14, true, $15, $16, $17, $18, \
-                     2, $1, $19, $20, 'admit', '[]'::jsonb)",
+                     'provisioned', 'queued', $12, $13, $14, true, 'internal', $15, $16, $17, \
+                     3, $1, $18, NULL, 'admit', '[]'::jsonb)",
         )
         .bind(request.operation_id)
         .bind(task.idempotency_key)
@@ -5487,12 +4948,10 @@ impl PgStore {
         .bind(Json(task.runtime_spec))
         .bind(Json(task.agent_command))
         .bind(request.input_archive)
-        .bind(task.envelope_revision)
         .bind(request.authority_id)
         .bind(request.authority_version)
         .bind(request.authority_digest)
         .bind(task.candidate_digest)
-        .bind(task.service_envelope_digest)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -5845,7 +5304,7 @@ impl PgStore {
              SET execute_requested = true, \
                  phase = CASE \
                      WHEN orchestration_version = 1 AND phase = 'submitted' THEN 'queued' \
-                     WHEN orchestration_version = 2 AND phase = 'submitted' \
+                     WHEN orchestration_version IN (2, 3) AND phase = 'submitted' \
                           AND EXISTS (SELECT 1 FROM task_runtime_operations operation \
                               WHERE operation.task_uid = task_submissions.task_uid \
                                 AND operation.state = 'active') THEN 'queued' \
@@ -5914,7 +5373,7 @@ impl PgStore {
             transaction.commit().await.map_err(database_error)?;
             return self.task(task_uid).await?.ok_or(StoreError::TaskNotFound);
         }
-        if current.orchestration_version == 2 {
+        if matches!(current.orchestration_version, 2 | 3) {
             task_runtime_operation_in_transaction_for_update(&mut transaction, task_uid).await?;
             fence_task_execution_for_cleanup(&mut transaction, task_uid).await?;
         }
@@ -6262,49 +5721,45 @@ impl PgStore {
     }
 }
 
-async fn direct_user_envelope_authority_active(
+async fn task_user_envelope_authority_active(
     transaction: &mut sqlx::Transaction<'_, Postgres>,
     task: &TaskRecord,
 ) -> Result<bool, StoreError> {
-    let Some(evidence) = task.direct_task_evidence.as_ref() else {
-        return Ok(true);
-    };
     let Some(owner_user_id) = task.owner_user_id.as_deref() else {
         return Ok(false);
     };
-    direct_user_envelope_evidence_active(
+    let Some(snapshot) = task.user_envelope_snapshot.as_ref() else {
+        return Ok(false);
+    };
+    user_envelope_authority_active(
         transaction,
-        evidence,
         owner_user_id,
         task.user_envelope_instance_id.as_deref(),
         task.user_envelope_revision,
         task.user_envelope_digest.as_deref(),
+        snapshot,
         &task.runtime_spec,
     )
     .await
 }
 
-async fn direct_user_envelope_evidence_active(
+async fn user_envelope_authority_active(
     transaction: &mut sqlx::Transaction<'_, Postgres>,
-    evidence: &DirectTaskBindingEvidence,
     owner_user_id: &str,
     user_envelope_instance_id: Option<&str>,
     user_envelope_revision: Option<i64>,
     user_envelope_digest: Option<&str>,
+    user_envelope_snapshot: &Envelope,
     runtime_spec: &AgentRuntimeSpec,
 ) -> Result<bool, StoreError> {
-    let Ok(envelope_request_id) = Uuid::parse_str(evidence.envelope.uid.as_str()) else {
+    let (Some(envelope_instance_id), Some(envelope_revision), Some(envelope_digest)) = (
+        user_envelope_instance_id,
+        user_envelope_revision,
+        user_envelope_digest,
+    ) else {
         return Ok(false);
     };
-    let Ok(envelope_revision) = i64::try_from(evidence.envelope.revision) else {
-        return Ok(false);
-    };
-    let Some(evidence_digest) = evidence.envelope.digest.as_str().strip_prefix("steward:") else {
-        return Ok(false);
-    };
-    if user_envelope_revision != Some(envelope_revision)
-        || user_envelope_digest != Some(evidence_digest)
-    {
+    if user_envelope_snapshot.revision != envelope_revision {
         return Ok(false);
     }
 
@@ -6324,15 +5779,20 @@ async fn direct_user_envelope_evidence_active(
              WHERE events.request_id = requests.id \
              ORDER BY events.id DESC LIMIT 1 \
          ) status ON true \
-         WHERE requests.id = $1",
+         WHERE requests.owner_user_id = $1 \
+           AND status.envelope_instance_id = $2 \
+         ORDER BY requests.created_at DESC, requests.id DESC \
+         LIMIT 2",
     )
-    .bind(envelope_request_id)
-    .fetch_optional(&mut **transaction)
+    .bind(owner_user_id)
+    .bind(envelope_instance_id)
+    .fetch_all(&mut **transaction)
     .await
     .map_err(database_error)?;
-    let Some(row) = row else {
+    if row.len() != 1 {
         return Ok(false);
-    };
+    }
+    let row = row.into_iter().next().ok_or(StoreError::StaleEnvelope)?;
     let approved_envelope = row
         .try_get::<Option<Json<Envelope>>, _>("approved_envelope")
         .map_err(database_error)?
@@ -6346,14 +5806,14 @@ async fn direct_user_envelope_evidence_active(
             .try_get::<Option<String>, _>("envelope_instance_id")
             .map_err(database_error)?
             .as_deref()
-            == user_envelope_instance_id
+            == Some(envelope_instance_id)
         && row
             .try_get::<Option<String>, _>("envelope_digest")
             .map_err(database_error)?
             .as_deref()
-            == Some(evidence_digest)
+            == Some(envelope_digest)
         && approved_envelope.as_ref().is_some_and(|envelope| {
-            envelope.revision == envelope_revision
+            envelope == user_envelope_snapshot
                 && matches!(
                     evaluate(runtime_spec, envelope),
                     Ok(AdmissionDecision::Admit)
@@ -6389,9 +5849,9 @@ pub struct TaskReservationRequest<'a> {
     pub execution_binding: Option<&'a TaskExecutionBinding>,
     /// Immutable direct-package source and authority evidence. Legacy and catalog Tasks omit it.
     pub direct_task_evidence: Option<&'a DirectTaskBindingEvidence>,
-    pub envelope_revision: i64,
-    pub service_envelope: &'a Envelope,
-    pub service_envelope_digest: &'a str,
+    /// Exact approved User Envelope used for admission. Internal operations omit it and carry
+    /// their code-owned authority on `ConnectionOperationReservationRequest` instead.
+    pub user_envelope_snapshot: Option<&'a Envelope>,
     pub candidate_digest: &'a str,
     pub admission_decision: &'a AdmissionDecision,
     pub inert_manifest_digest: &'a str,
@@ -6605,9 +6065,9 @@ fn validate_task_runtime_binding(request: &TaskReservationRequest<'_>) -> Result
 fn validate_task_orchestration_reservation(
     request: &TaskReservationRequest<'_>,
 ) -> Result<(), StoreError> {
-    if request.service_envelope.revision != request.envelope_revision
+    if request.user_envelope_snapshot.is_none()
+        || !matches!(request.admission_decision, AdmissionDecision::Admit)
         || !valid_sha256_reference(request.candidate_digest)
-        || !valid_sha256_reference(request.service_envelope_digest)
         || !valid_sha256_reference(request.inert_manifest_digest)
         || !valid_sha256_reference(request.active_manifest_digest)
         || (request.runtime_ownership == steward_types::RuntimeOwnership::Provisioned
@@ -6654,11 +6114,13 @@ fn task_reservation_matches(
         && record.agent_command == request.agent_command
         && record.execution_binding.as_ref() == request.execution_binding
         && record.direct_task_evidence.as_ref() == request.direct_task_evidence
-        && record.envelope_revision == request.envelope_revision
-        && record.orchestration_version == 2
+        && record.authority_kind.as_deref() == Some("user-envelope")
+        && record.user_envelope_snapshot.as_ref() == request.user_envelope_snapshot
+        && record.envelope_revision.is_none()
+        && record.orchestration_version == 3
         && record.orchestration_operation_id == Some(operation.operation_id)
         && record.candidate_digest.as_deref() == Some(request.candidate_digest)
-        && record.service_envelope_digest.as_deref() == Some(request.service_envelope_digest)
+        && record.service_envelope_digest.is_none()
         && record.original_admission_decision.as_deref() == Some(admission_text)
         && record.original_admission_deltas.as_deref() == Some(deltas)
         && same_server_identity
@@ -6782,16 +6244,6 @@ fn valid_sha256_reference(value: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     })
-}
-
-fn inert_task_runtime_spec(spec: &AgentRuntimeSpec, envelope: &Envelope) -> AgentRuntimeSpec {
-    let mut inert = spec.clone();
-    inert.llms.clear();
-    inert.tools.clear();
-    inert.budget.monthly_limit = "0".to_owned();
-    inert.budget.single_run_limit = Some("0".to_owned());
-    inert.budget.currency = envelope.spec.budget.currency.clone();
-    inert
 }
 
 fn valid_digest_pinned_image(value: &str) -> bool {
@@ -7009,9 +6461,7 @@ mod task_execution_binding_tests {
             agent_command: &command,
             execution_binding: Some(&binding),
             direct_task_evidence: None,
-            envelope_revision: 1,
-            service_envelope: &envelope,
-            service_envelope_digest: &digest,
+            user_envelope_snapshot: Some(&envelope),
             candidate_digest: &digest,
             admission_decision: &admission,
             inert_manifest_digest: &manifest_digest,
@@ -7458,6 +6908,8 @@ pub struct TaskRecord {
     pub user_envelope_instance_id: Option<String>,
     pub user_envelope_revision: Option<i64>,
     pub user_envelope_digest: Option<String>,
+    pub authority_kind: Option<String>,
+    pub user_envelope_snapshot: Option<Envelope>,
     pub internal_authority_id: Option<String>,
     pub internal_authority_version: Option<i64>,
     pub internal_authority_digest: Option<String>,
@@ -7471,7 +6923,7 @@ pub struct TaskRecord {
     pub agent_command: Vec<String>,
     pub execution_binding: Option<TaskExecutionBinding>,
     pub direct_task_evidence: Option<DirectTaskBindingEvidence>,
-    pub envelope_revision: i64,
+    pub envelope_revision: Option<i64>,
     pub orchestration_version: i16,
     pub orchestration_operation_id: Option<Uuid>,
     pub candidate_digest: Option<String>,
@@ -7665,8 +7117,6 @@ pub struct TaskAdmissionRecord {
 
 enum EffectiveTaskAuthority {
     Baseline { envelope_revision: i64 },
-    Pending,
-    Active(Box<GrantApplication>),
     Inactive,
 }
 
@@ -7676,11 +7126,11 @@ fn operation_authority_is_current(
 ) -> bool {
     match (authority, operation.activation_authority_kind.as_deref()) {
         (EffectiveTaskAuthority::Baseline { .. }, Some("baseline")) => true,
-        (EffectiveTaskAuthority::Baseline { envelope_revision }, Some("internal")) => {
+        (EffectiveTaskAuthority::Baseline { envelope_revision }, Some("user-envelope")) => {
             operation.activation_envelope_revision == Some(*envelope_revision)
         }
-        (EffectiveTaskAuthority::Active(application), Some("grant")) => {
-            operation.approval_id == Some(application.approval_id)
+        (EffectiveTaskAuthority::Baseline { envelope_revision }, Some("internal")) => {
+            operation.activation_envelope_revision == Some(*envelope_revision)
         }
         _ => false,
     }
@@ -8175,6 +7625,11 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
         user_envelope_digest: row
             .try_get("user_envelope_digest")
             .map_err(database_error)?,
+        authority_kind: row.try_get("authority_kind").map_err(database_error)?,
+        user_envelope_snapshot: row
+            .try_get::<Option<Json<Envelope>>, _>("user_envelope_snapshot")
+            .map_err(database_error)?
+            .map(|snapshot| snapshot.0),
         internal_authority_id: row
             .try_get("internal_authority_id")
             .map_err(database_error)?,
@@ -9044,10 +8499,10 @@ const fn task_phase_text(phase: steward_types::TaskPhase) -> &'static str {
     }
 }
 
-fn envelope_scope_kind(spec: &AgentRuntimeSpec) -> EnvelopeScopeKind {
+fn envelope_scope_kind(spec: &AgentRuntimeSpec) -> Result<EnvelopeScopeKind, StoreError> {
     match &spec.principal {
-        steward_types::Principal::User { .. } => EnvelopeScopeKind::MemberRole,
-        steward_types::Principal::Service { .. } => EnvelopeScopeKind::Service,
+        steward_types::Principal::User { .. } => Ok(EnvelopeScopeKind::MemberRole),
+        steward_types::Principal::Service { .. } => Err(StoreError::InvalidTaskTransition),
     }
 }
 
