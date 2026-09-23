@@ -222,23 +222,22 @@ Finish this step when one real assertion exchanges successfully, a replay of
 the same assertion is denied, and a wrong repository, ref, actor, and audience
 are each denied with a fresh assertion.
 
-## Step 7: accept the platform end to end
+## Step 7: accept authentication and admission in core mode
 
-Run one governed job with known inputs and an expected output hash. On the
-direct Git package path the caller references the exact package source through
-a checked-in invocation manifest; a published Workflow revision remains an
-optional curation layer over the same immutable package, not a registration
-prerequisite. In both cases Steward resolves the caller's unique active
-provisioned User Envelope as the execution authority.
+Submit one direct Git package invocation while Steward remains in core mode.
+The caller references the exact package source through a checked-in invocation
+manifest. Steward must authenticate the caller, admit the Task against the
+caller's unique active provisioned User Envelope, and record the exact User
+Envelope evidence without creating a runtime. A published Workflow revision
+remains an optional curation layer over the same immutable package, not a
+registration prerequisite.
 
-Then repeat with a wrong audience, an untrusted issuer or CA, an unauthorized
+Repeat with a wrong audience, an untrusted issuer or CA, an unauthorized
 repository, ref, and actor, and a canonical user with no active Envelope. Each
-must fail closed before a Task is created. Confirm the Run detail shows the
-exact User Envelope evidence.
-
-Record source revisions, artifact digests, the GitHub run identifier, the
-bounded Task UID and status, HTTP status, and public JWKS `kid`s only. Never
-record tokens, authorization headers, policy mappings, or response bodies.
+must fail closed before a Task is created. This step proves identity and
+authority only; core mode deliberately cannot prove agent execution or output.
+After recording the accepted Task's evidence, request its cleanup and confirm
+it is finalized so enabling execution cannot later start this staged test Task.
 
 ## Step 8: governed execution, if in scope
 
@@ -251,3 +250,14 @@ existing deployments, install the provider profile bundle, record
 ownership switches. The prerequisites and their verification live in the
 [installation guide](installation-guide.md); this page adds only their position
 in the order.
+
+## Step 9: accept governed execution end to end
+
+Submit the same package in a new governed job with known inputs and an
+expected output hash. Confirm the Task reaches its terminal success phase, the
+output hash matches, the Run detail retains the exact User Envelope evidence,
+and the runtime is finalized.
+
+Record source revisions, artifact digests, the GitHub run identifier, the
+bounded Task UID and status, HTTP status, and public JWKS `kid`s only. Never
+record tokens, authorization headers, policy mappings, or response bodies.
