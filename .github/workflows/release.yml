@@ -414,7 +414,8 @@ jobs:
     permissions:
       contents: write
       packages: read
-      attestations: read
+      id-token: write
+      attestations: write
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -459,6 +460,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          test "$version" = "0.2.0"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
           bridge_digest="$(cat dist/bridge.digest)"
@@ -466,9 +468,52 @@ jobs:
           provider_profile_bundle_digest="$(cat dist/provider-profile-bundle.digest)"
           bridge_signer_identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
           bridge_source_repository="https://github.com/$GITHUB_REPOSITORY"
+          jq -n \
+            --arg version "$version" \
+            --arg commit "$GITHUB_SHA" \
+            --arg chart_reference "oci://${chart}:${version}" \
+            --arg chart_digest "$(cat dist/helm-chart.digest)" \
+            --arg image_repository "$repository" \
+            --arg apiserver_digest "$(cat dist/apiserver.digest)" \
+            --arg controller_digest "$(cat dist/controller.digest)" \
+            --arg mint_digest "$(cat dist/mint.digest)" \
+            --arg bridge_digest "$bridge_digest" \
+            --arg web_digest "$(cat dist/web.digest)" \
+            --arg provider_digest "$provider_profile_bundle_digest" \
+            '{
+              schemaVersion: "steward.release-handoff/v1",
+              version: $version,
+              commit: $commit,
+              authorityContract: "user-envelope-only",
+              identityPolicyContract: "github-oidc-exchange.apelogic.io/v5",
+              chart: {
+                reference: $chart_reference,
+                digest: $chart_digest
+              },
+              images: {
+                apiserver: {reference: ($image_repository + ":" + $version + "-apiserver"), digest: $apiserver_digest},
+                controller: {reference: ($image_repository + ":" + $version + "-controller"), digest: $controller_digest},
+                mint: {reference: ($image_repository + ":" + $version + "-mint"), digest: $mint_digest},
+                bridge: {reference: ($image_repository + ":" + $version + "-bridge"), digest: $bridge_digest},
+                web: {reference: ($image_repository + ":" + $version + "-web"), digest: $web_digest}
+              },
+              providerProfileBundle: {
+                identity: "steward-runtime-providers@1.2.0",
+                digest: $provider_digest
+              },
+              migrations: ["0039_user_envelope_only_task_authority.sql"],
+              serviceEnvelopeSupported: false
+            }' > dist/release-handoff.json
           {
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
+            printf '## Highlights\n\n'
+            printf 'Steward v0.2.0 removes Service Envelope as a live authority, API, UI, and bootstrap concept. Exact provisioned User Envelope evidence is now the sole authority for externally submitted Tasks; product-owned operations retain fixed internal authorities. A deployment capability catalog replaces only the model/tool listing function and grants no authority.\n\n'
+            printf '## Upgrade prerequisites and rollback\n\n'
+            printf 'Before migration 0039, terminalize and finalize every unfinished legacy Task that lacks a complete User Envelope or internal-authority pin. Use Identity v0.5.0 with policy contract github-oidc-exchange.apelogic.io/v5, remove Service Envelope bootstrap configuration, and configure the non-authoritative capability catalog.\n\n'
+            printf 'Rollback to v0.1.23 is safe before migration. After migration it is safe only before any v0.2.0-only Task is admitted and requires restoring a compatible database state. After such a Task exists, image-only rollback is unsafe. See docs/installation/upgrade-v0.2.0.md.\n\n'
+            printf '## Acceptance\n\n'
+            printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
             for component in apiserver controller mint bridge web; do
               printf '| %s | %s:%s-%s | %s |\n' \
@@ -490,8 +535,29 @@ jobs:
             printf 'Provider profile bundle source repository: %s\n\n' "$bridge_source_repository"
             printf 'Provider profile bundle source commit: %s\n\n' "$GITHUB_SHA"
             printf 'Provider profile bundle verification: pin the SHA-256 above; verify GitHub artifact provenance with this signer identity, repository, tag, and source commit; then verify the downloaded archive SHA-256 before render/install.\n\n'
-            printf '\nEach image and the chart includes an SPDX SBOM, a vulnerability report, and GitHub artifact provenance.\n'
+            printf '\n## Verification\n\n'
+            printf 'Verify the release manifest with: `gh attestation verify release-handoff.json --repo %s --cert-identity %s`.\n\n' "$GITHUB_REPOSITORY" "$bridge_signer_identity"
+            printf 'Inspect every image by the exact digest above with `docker buildx imagetools inspect`, and pull the chart by its exact digest with `helm pull`.\n\n'
+            printf 'Each image and the chart includes an SPDX SBOM, a vulnerability report, and GitHub artifact provenance. The machine-readable contract is `release-handoff.json`; its verification material is `release-handoff-attestation.jsonl`.\n'
           } > dist/release-handoff.md
+
+      - name: Attest machine-readable release handoff
+        id: attest-release-handoff
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: dist/release-handoff.json
+
+      - name: Archive release handoff verification material
+        env:
+          BUNDLE_PATH: ${{ steps.attest-release-handoff.outputs.bundle-path }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -s "$BUNDLE_PATH"
+          cp "$BUNDLE_PATH" dist/release-handoff-attestation.jsonl
+          gh attestation verify dist/release-handoff.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 
       - name: Verify public artifact access
         run: |
@@ -530,3 +596,19 @@ jobs:
           actual="sha256:$(sha256sum "$destination/$asset" | awk '{print $1}')"
           expected="$(cat dist/provider-profile-bundle.digest)"
           test "$actual" = "$expected"
+
+      - name: Verify published release handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          destination="$RUNNER_TEMP/release-handoff"
+          mkdir -p "$destination"
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern release-handoff.json \
+            --pattern release-handoff-attestation.jsonl \
+            --dir "$destination"
+          cmp dist/release-handoff.json "$destination/release-handoff.json"
+          gh attestation verify "$destination/release-handoff.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
