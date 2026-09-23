@@ -975,7 +975,7 @@ mod tests {
                 mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
                 mcp_gw_version: "0.3.1".to_owned(),
                 namespace: "steward-test".to_owned(),
-                runtime_class: "kata-qemu".to_owned(),
+                runtime_class: "sandbox-vm".to_owned(),
             },
             "https://steward.example.test/",
         );

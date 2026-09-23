@@ -30,7 +30,6 @@ jobs:
         with:
           gate-tools: "true"
           kubernetes-tools: "true"
-          supervisor-tools: "true"
           workflow-tools: "true"
 
       - name: Lint privileged workflows and release scripts
@@ -40,12 +39,8 @@ jobs:
             scripts/postgres-tls-e2e.sh \
             scripts/postgres-tls-init.sh \
             scripts/package-provider-profile-bundle.sh \
-            scripts/promote-ecr-artifact.sh \
-            scripts/resolve-ecr-platform-digest.sh \
             scripts/test-package-provider-profile-bundle.sh \
-            scripts/test-promote-ecr-artifact.sh \
             scripts/test-released-artifact-acceptance.sh \
-            scripts/test-resolve-ecr-platform-digest.sh \
             scripts/test-validate-release-version.sh \
             scripts/validate-release-version.sh \
             scripts/customer-core-install-e2e.sh \
@@ -352,274 +347,6 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  promote-ecr:
-    needs: [publish-images, publish-chart]
-    if: ${{ vars.ECR_PROMOTION_ENABLED == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      packages: read
-      id-token: write
-      attestations: write
-    env:
-      AWS_REGION: ${{ vars.AWS_REGION }}
-      ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
-      STEWARD_ECR_IMAGE_REPOSITORY: ${{ vars.STEWARD_ECR_IMAGE_REPOSITORY }}
-      STEWARD_ECR_CHART_REPOSITORY: ${{ vars.STEWARD_ECR_CHART_REPOSITORY }}
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Set up ORAS
-        uses: oras-project/setup-oras@4fb5323ce5e4debde6f8fe277e461b0815a75992
-        with:
-          version: 1.3.3
-
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@874852de93c66509b01dc7cd80f7a5385182d017
-        with:
-          cosign-release: v3.1.2
-
-      - name: Download approved release evidence
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
-        with:
-          pattern: release-*
-          path: dist
-          merge-multiple: true
-
-      - name: Validate private registry coordinates
-        env:
-          AWS_RELEASE_ROLE_ARN: ${{ vars.AWS_RELEASE_ROLE_ARN }}
-        run: |
-          set -euo pipefail
-          : "${AWS_RELEASE_ROLE_ARN:?Set AWS_RELEASE_ROLE_ARN}"
-          : "${AWS_REGION:?Set AWS_REGION}"
-          : "${ECR_REGISTRY:?Set ECR_REGISTRY}"
-          : "${STEWARD_ECR_IMAGE_REPOSITORY:?Set STEWARD_ECR_IMAGE_REPOSITORY}"
-          : "${STEWARD_ECR_CHART_REPOSITORY:?Set STEWARD_ECR_CHART_REPOSITORY}"
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
-        with:
-          role-to-assume: ${{ vars.AWS_RELEASE_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-          role-session-name: steward-release-${{ github.run_id }}
-
-      - name: Authenticate registries
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          printf '%s' "$GH_TOKEN" | oras login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | oras login "$ECR_REGISTRY" --username AWS --password-stdin
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | docker login "$ECR_REGISTRY" --username AWS --password-stdin
-
-      - name: Promote exact approved manifests
-        id: promote
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          image_repository="$ECR_REGISTRY/$STEWARD_ECR_IMAGE_REPOSITORY"
-          chart_repository="$ECR_REGISTRY/$STEWARD_ECR_CHART_REPOSITORY"
-          for component in apiserver controller mint bridge web; do
-            source_digest="$(cat "dist/$component.digest")"
-            source="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward@$source_digest"
-            scripts/promote-ecr-artifact.sh \
-              "$source" \
-              "$ECR_REGISTRY" \
-              "$STEWARD_ECR_IMAGE_REPOSITORY" \
-              "$version-$component" \
-              "$source_digest"
-            printf '%s\n' "$source_digest" > "dist/ecr-$component.digest"
-          done
-          source_chart_digest="$(cat dist/helm-chart.digest)"
-          scripts/promote-ecr-artifact.sh \
-            "ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward@$source_chart_digest" \
-            "$ECR_REGISTRY" \
-            "$STEWARD_ECR_CHART_REPOSITORY" \
-            "$version" \
-            "$source_chart_digest"
-          printf '%s\n' "$source_chart_digest" > dist/ecr-helm-chart.digest
-          {
-            printf 'image-repository=%s\n' "$image_repository"
-            printf 'chart-repository=%s\n' "$chart_repository"
-            printf 'apiserver-digest=%s\n' "$(cat dist/ecr-apiserver.digest)"
-            printf 'controller-digest=%s\n' "$(cat dist/ecr-controller.digest)"
-            printf 'mint-digest=%s\n' "$(cat dist/ecr-mint.digest)"
-            printf 'bridge-digest=%s\n' "$(cat dist/ecr-bridge.digest)"
-            printf 'web-digest=%s\n' "$(cat dist/ecr-web.digest)"
-            printf 'chart-digest=%s\n' "$source_chart_digest"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Wait for and enforce native ECR image scans
-        run: |
-          set -euo pipefail
-          scan_failed=0
-          for component in apiserver controller mint bridge web; do
-            index_digest="$(cat "dist/ecr-$component.digest")"
-            index_ref="$ECR_REGISTRY/$STEWARD_ECR_IMAGE_REPOSITORY@$index_digest"
-            if ! platform_digest="$(scripts/resolve-ecr-platform-digest.sh \
-              "$index_ref" linux amd64)"
-            then
-              echo "runnable linux/amd64 manifest resolution failed for $component@$index_digest" >&2
-              scan_failed=1
-              continue
-            fi
-            printf '%s\n' "$platform_digest" > "dist/ecr-$component-scan-platform.digest"
-            report="dist/ecr-$component-scan.json"
-            if ! aws ecr wait image-scan-complete \
-              --repository-name "$STEWARD_ECR_IMAGE_REPOSITORY" \
-              --image-id "imageDigest=$platform_digest"
-            then
-              echo "ECR scan did not complete for $component platform $platform_digest (index $index_digest)" >&2
-              scan_failed=1
-              continue
-            fi
-            if ! aws ecr describe-image-scan-findings \
-              --repository-name "$STEWARD_ECR_IMAGE_REPOSITORY" \
-              --image-id "imageDigest=$platform_digest" \
-              --output json > "$report"
-            then
-              echo "ECR scan findings were unavailable for $component platform $platform_digest (index $index_digest)" >&2
-              scan_failed=1
-              continue
-            fi
-            critical="$(jq '[
-              .imageScanFindings.findingSeverityCounts.CRITICAL // 0,
-              ([.imageScanFindings.enhancedFindings[]? | select(.severity == "CRITICAL")] | length)
-            ] | max' "$report")"
-            if [[ "$critical" -ne 0 ]]; then
-              echo "ECR reported $critical critical findings for $component platform $platform_digest (index $index_digest)" >&2
-              scan_failed=1
-            fi
-          done
-          test "$scan_failed" -eq 0
-
-      - name: Retain native ECR scan evidence
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        with:
-          name: ecr-release-scan-evidence
-          path: dist/ecr-*-scan.*
-          if-no-files-found: warn
-
-      - name: Sign promoted artifacts
-        env:
-          IMAGE_REPOSITORY: ${{ steps.promote.outputs['image-repository'] }}
-          CHART_REPOSITORY: ${{ steps.promote.outputs['chart-repository'] }}
-        run: |
-          set -euo pipefail
-          for component in apiserver controller mint bridge web; do
-            digest="$(cat "dist/ecr-$component.digest")"
-            cosign sign --yes \
-              --output-signature "dist/ecr-$component.sig" \
-              --output-certificate "dist/ecr-$component.pem" \
-              "$IMAGE_REPOSITORY@$digest"
-          done
-          cosign sign --yes \
-            --output-signature dist/ecr-helm-chart.sig \
-            --output-certificate dist/ecr-helm-chart.pem \
-            "$CHART_REPOSITORY@${{ steps.promote.outputs['chart-digest'] }}"
-
-      - name: Attest promoted apiserver provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
-        with:
-          subject-name: ${{ steps.promote.outputs['image-repository'] }}
-          subject-digest: ${{ steps.promote.outputs['apiserver-digest'] }}
-          push-to-registry: true
-
-      - name: Attest promoted controller provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
-        with:
-          subject-name: ${{ steps.promote.outputs['image-repository'] }}
-          subject-digest: ${{ steps.promote.outputs['controller-digest'] }}
-          push-to-registry: true
-
-      - name: Attest promoted mint provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
-        with:
-          subject-name: ${{ steps.promote.outputs['image-repository'] }}
-          subject-digest: ${{ steps.promote.outputs['mint-digest'] }}
-          push-to-registry: true
-
-      - name: Attest promoted bridge provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
-        with:
-          subject-name: ${{ steps.promote.outputs['image-repository'] }}
-          subject-digest: ${{ steps.promote.outputs['bridge-digest'] }}
-          push-to-registry: true
-
-      - name: Attest promoted web provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
-        with:
-          subject-name: ${{ steps.promote.outputs['image-repository'] }}
-          subject-digest: ${{ steps.promote.outputs['web-digest'] }}
-          push-to-registry: true
-
-      - name: Download ECR bridge provenance bundle
-        env:
-          GH_TOKEN: ${{ github.token }}
-          IMAGE_REPOSITORY: ${{ steps.promote.outputs['image-repository'] }}
-        run: |
-          set -euo pipefail
-          bridge_digest="$(cat dist/ecr-bridge.digest)"
-          gh attestation download \
-            "oci://${IMAGE_REPOSITORY}@${bridge_digest}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --predicate-type https://slsa.dev/provenance/v1
-          bundle_file="${bridge_digest}.jsonl"
-          test -s "$bundle_file"
-          mv "$bundle_file" dist/ecr-bridge-attestation-bundle.jsonl
-
-      - name: Attest promoted chart provenance
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
-        with:
-          subject-name: ${{ steps.promote.outputs['chart-repository'] }}
-          subject-digest: ${{ steps.promote.outputs['chart-digest'] }}
-          push-to-registry: true
-
-      - name: Generate private registry handoff
-        env:
-          IMAGE_REPOSITORY: ${{ steps.promote.outputs['image-repository'] }}
-          CHART_REPOSITORY: ${{ steps.promote.outputs['chart-repository'] }}
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          bridge_digest="$(cat dist/ecr-bridge.digest)"
-          bridge_signer_identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
-          bridge_source_repository="https://github.com/$GITHUB_REPOSITORY"
-          {
-            printf '# Steward private registry handoff %s\n\n' "$version"
-            printf 'Release commit: %s\n\n' "$GITHUB_SHA"
-            printf '| Artifact | Immutable reference | Scanned linux/amd64 digest |\n|---|---|---|\n'
-            for component in apiserver controller mint bridge web; do
-              printf '| %s | %s:%s-%s@%s | %s |\n' \
-                "$component" "$IMAGE_REPOSITORY" "$version" "$component" \
-                "$(cat "dist/ecr-$component.digest")" \
-                "$(cat "dist/ecr-$component-scan-platform.digest")"
-            done
-            printf '| chart | oci://%s@%s | n/a |\n' \
-              "$CHART_REPOSITORY" "$(cat dist/ecr-helm-chart.digest)"
-            printf '\n## Stable bridge provenance inputs\n\n'
-            printf 'Bridge ECR image: %s@%s\n\n' "$IMAGE_REPOSITORY" "$bridge_digest"
-            printf 'Bridge ECR signer identity: %s\n\n' "$bridge_signer_identity"
-            printf 'Bridge ECR source repository: %s\n\n' "$bridge_source_repository"
-            printf 'Bridge ECR source commit: %s\n\n' "$GITHUB_SHA"
-            printf 'Bridge ECR attestation bundle: ecr-bridge-attestation-bundle.jsonl\n'
-          } > dist/ecr-release-handoff.md
-
-      - name: Upload private registry handoff
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        with:
-          name: ecr-release-handoff
-          path: dist/ecr-*
-          if-no-files-found: error
-
   released-artifact-acceptance:
     needs: [publish-images, publish-chart]
     runs-on: ubuntu-latest
@@ -672,7 +399,7 @@ jobs:
           bash scripts/customer-core-install-e2e.sh
 
   release:
-    needs: [publish-images, publish-provider-profile-bundle, openshell-x86-conformance, publish-chart, promote-ecr, released-artifact-acceptance]
+    needs: [publish-images, publish-provider-profile-bundle, openshell-x86-conformance, publish-chart, released-artifact-acceptance]
     if: >-
       ${{
         always() &&
@@ -680,8 +407,7 @@ jobs:
         needs.publish-provider-profile-bundle.result == 'success' &&
         needs.openshell-x86-conformance.result == 'success' &&
         needs.publish-chart.result == 'success' &&
-        needs.released-artifact-acceptance.result == 'success' &&
-        (needs.promote-ecr.result == 'success' || needs.promote-ecr.result == 'skipped')
+        needs.released-artifact-acceptance.result == 'success'
       }}
     runs-on: ubuntu-latest
     timeout-minutes: 15

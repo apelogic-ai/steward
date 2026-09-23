@@ -8,14 +8,12 @@ G1_BASE_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:aeef1c63
 case "${TARGET}" in
   pinned)
     release="v0.0.90"
-    use_chart_supervisor=0
     ;;
   latest)
     release="$(
       curl -fsSL https://api.github.com/repos/NVIDIA/OpenShell/releases/latest |
         jq -er '.tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))'
     )"
-    use_chart_supervisor=1
     ;;
   *)
     echo "STEWARD_CONFORMANCE_TARGET must be pinned or latest" >&2
@@ -23,11 +21,303 @@ case "${TARGET}" in
     ;;
 esac
 
+for command in curl helm jq kind kubectl openssl sed xxd; do
+  if ! command -v "${command}" >/dev/null 2>&1; then
+    echo "required command is missing: ${command}" >&2
+    exit 2
+  fi
+done
+
+run_id="g1-$(date -u +%Y%m%d%H%M%S)-$$"
+cluster_name="steward-${run_id}"
+kube_context="kind-${cluster_name}"
+run_dir="${ROOT}/.steward-run/${run_id}"
+kubeconfig_path="${run_dir}/kubeconfig"
+port_forward_log="${run_dir}/openshell-port-forward.log"
+port_forward_pid=""
+cluster_created=0
+
+cleanup() {
+  status="$1"
+  trap - EXIT INT TERM
+  if [[ -n "${port_forward_pid}" ]]; then
+    kill "${port_forward_pid}" >/dev/null 2>&1 || true
+    wait "${port_forward_pid}" >/dev/null 2>&1 || true
+  fi
+  if [[ "${cluster_created}" == "1" ]]; then
+    KUBECONFIG="${kubeconfig_path}" kind delete cluster \
+      --name "${cluster_name}" >/dev/null 2>&1 || true
+  fi
+  find "${run_dir}" -depth -delete 2>/dev/null || true
+  exit "${status}"
+}
+trap 'cleanup "$?"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+mkdir -p "${run_dir}"
+chmod 700 "${run_dir}"
+cat >"${run_dir}/manifest" <<EOF
+run_id=${run_id}
+cluster=${cluster_name}
+kubeconfig=${kubeconfig_path}
+context=${kube_context}
+EOF
+
+kind create cluster \
+  --name "${cluster_name}" \
+  --kubeconfig "${kubeconfig_path}" \
+  --wait 120s
+cluster_created=1
+
+"${ROOT}/scripts/g1-preload-kind-base-image.sh" \
+  "${cluster_name}" "${G1_BASE_IMAGE}"
+
+actual_context="$(kubectl --kubeconfig "${kubeconfig_path}" config current-context)"
+if [[ "${actual_context}" != "${kube_context}" ]]; then
+  echo "created context ${actual_context}, expected ${kube_context}" >&2
+  exit 1
+fi
+
+agent_sandbox_base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.5.0"
+kubectl \
+  --kubeconfig "${kubeconfig_path}" \
+  --context "${kube_context}" \
+  apply -f "${agent_sandbox_base}/manifest.yaml"
+kubectl \
+  --kubeconfig "${kubeconfig_path}" \
+  --context "${kube_context}" \
+  -n agent-sandbox-system \
+  rollout status deployment/agent-sandbox-controller \
+  --timeout=300s
+
+oidc_audience="openshell-api"
+oidc_issuer="http://oidc.openshell.svc.cluster.local:8000"
+oidc_private_key="${run_dir}/oidc-private.pem"
+oidc_discovery="${run_dir}/openid-configuration"
+oidc_jwks="${run_dir}/jwks.json"
+openssl genrsa -out "${oidc_private_key}" 2048 >/dev/null 2>&1
+chmod 600 "${oidc_private_key}"
+
+kubectl \
+  --kubeconfig "${kubeconfig_path}" \
+  --context "${kube_context}" \
+  create namespace openshell \
+  --dry-run=client \
+  -o yaml |
+  kubectl \
+    --kubeconfig "${kubeconfig_path}" \
+    --context "${kube_context}" \
+    apply -f -
+kubectl \
+  --kubeconfig "${kubeconfig_path}" \
+  --context "${kube_context}" \
+  label namespace openshell "steward.test/run-id=${run_id}" --overwrite
+
+base64url() {
+  openssl base64 -A | tr '+/' '-_' | tr -d '='
+}
+
+oidc_modulus="$(
+  openssl rsa -in "${oidc_private_key}" -noout -modulus 2>/dev/null |
+    cut -d= -f2 |
+    xxd -r -p |
+    base64url
+)"
+printf '{"issuer":"%s","jwks_uri":"%s/jwks.json"}\n' \
+  "${oidc_issuer}" "${oidc_issuer}" >"${oidc_discovery}"
+printf '{"keys":[{"kty":"RSA","kid":"steward-test","use":"sig","alg":"RS256","n":"%s","e":"AQAB"}]}\n' \
+  "${oidc_modulus}" >"${oidc_jwks}"
+
+kubectl \
+  --kubeconfig "${kubeconfig_path}" \
+  --context "${kube_context}" \
+  -n openshell \
+  create configmap test-oidc-documents \
+  --from-file=openid-configuration="${oidc_discovery}" \
+  --from-file=jwks.json="${oidc_jwks}" \
+  --dry-run=client \
+  -o yaml |
+  kubectl \
+    --kubeconfig "${kubeconfig_path}" \
+    --context "${kube_context}" \
+    apply -f -
+kubectl \
+  --kubeconfig "${kubeconfig_path}" \
+  --context "${kube_context}" \
+  apply -f - <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-oidc
+  namespace: openshell
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-oidc
+  template:
+    metadata:
+      labels:
+        app: test-oidc
+    spec:
+      containers:
+        - name: server
+          image: python:3.13.5-alpine3.22@sha256:37b14db89f587f9eaa890e4a442a3fe55db452b69cca1403cc730bd0fbdc8aaf
+          args: ["python3", "-m", "http.server", "8000", "--directory", "/srv"]
+          ports:
+            - { name: http, containerPort: 8000 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            runAsNonRoot: true
+            runAsUser: 65534
+          volumeMounts:
+            - { name: documents, mountPath: /srv, readOnly: true }
+      volumes:
+        - name: documents
+          configMap:
+            name: test-oidc-documents
+            items:
+              - { key: openid-configuration, path: .well-known/openid-configuration }
+              - { key: jwks.json, path: jwks.json }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oidc
+  namespace: openshell
+spec:
+  selector:
+    app: test-oidc
+  ports:
+    - { name: http, port: 8000, targetPort: http }
+YAML
+kubectl \
+  --kubeconfig "${kubeconfig_path}" \
+  --context "${kube_context}" \
+  -n openshell \
+  rollout status deployment/test-oidc \
+  --timeout=300s
+
+issued_at="$(date +%s)"
+expires_at="$((issued_at + 3600))"
+jwt_header="$(printf '%s' '{"alg":"RS256","kid":"steward-test","typ":"JWT"}' | base64url)"
+jwt_payload="$(
+  printf '{"iss":"%s","sub":"steward-e2e","preferred_username":"alice","aud":"%s","roles":["openshell-admin","openshell-user"],"iat":%s,"exp":%s}' \
+    "${oidc_issuer}" "${oidc_audience}" "${issued_at}" "${expires_at}" |
+    base64url
+)"
+jwt_signature="$(
+  printf '%s.%s' "${jwt_header}" "${jwt_payload}" |
+    openssl dgst -sha256 -sign "${oidc_private_key}" |
+    base64url
+)"
+oidc_token="${jwt_header}.${jwt_payload}.${jwt_signature}"
+
+env \
+  HELM_CACHE_HOME="${run_dir}/helm/cache" \
+  HELM_CONFIG_HOME="${run_dir}/helm/config" \
+  HELM_DATA_HOME="${run_dir}/helm/data" \
+  helm \
+  --kubeconfig "${kubeconfig_path}" \
+  --kube-context "${kube_context}" \
+  install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version "${release#v}" \
+  --namespace openshell \
+  --set-string server.defaultRuntimeClassName= \
+  --set server.auth.allowUnauthenticatedUsers=false \
+  --set-string "server.oidc.issuer=${oidc_issuer}" \
+  --set-string "server.oidc.audience=${oidc_audience}" \
+  --set-string server.oidc.rolesClaim=roles \
+  --set-string server.oidc.adminRole=openshell-admin \
+  --set-string server.oidc.userRole=openshell-user \
+  --wait \
+  --timeout 5m
+
+extract_secret_key() {
+  secret_name="$1"
+  secret_key="$2"
+  destination="$3"
+  encoded="$(
+    kubectl \
+      --kubeconfig "${kubeconfig_path}" \
+      --context "${kube_context}" \
+      -n openshell \
+      get secret "${secret_name}" \
+      -o "go-template={{ index .data \"${secret_key}\" }}"
+  )"
+  if [[ -z "${encoded}" ]]; then
+    echo "OpenShell Secret ${secret_name} has no ${secret_key}" >&2
+    exit 1
+  fi
+  printf '%s' "${encoded}" | openssl base64 -d -A >"${destination}"
+}
+
+gateway_ca="${run_dir}/gateway-ca.crt"
+client_certificate="${run_dir}/client.crt"
+client_private_key="${run_dir}/client.key"
+extract_secret_key openshell-client-tls ca.crt "${gateway_ca}"
+extract_secret_key openshell-client-tls tls.crt "${client_certificate}"
+extract_secret_key openshell-client-tls tls.key "${client_private_key}"
+chmod 600 "${client_private_key}"
+
+kubectl \
+  --kubeconfig "${kubeconfig_path}" \
+  --context "${kube_context}" \
+  -n openshell \
+  port-forward svc/openshell :8080 >"${port_forward_log}" 2>&1 &
+port_forward_pid=$!
+
+endpoint=""
+for _ in $(seq 1 60); do
+  if ! kill -0 "${port_forward_pid}" >/dev/null 2>&1; then
+    echo "OpenShell port-forward exited before becoming ready" >&2
+    cat "${port_forward_log}" >&2
+    exit 1
+  fi
+  port="$(sed -nE 's/.*127\.0\.0\.1:([0-9]+).*/\1/p' "${port_forward_log}" | head -1)"
+  if [[ -n "${port}" ]] && curl \
+    --silent \
+    --show-error \
+    --connect-timeout 1 \
+    --cacert "${gateway_ca}" \
+    --cert "${client_certificate}" \
+    --key "${client_private_key}" \
+    "https://localhost:${port}" >/dev/null
+  then
+    endpoint="https://localhost:${port}"
+    break
+  fi
+  sleep 1
+done
+if [[ -z "${endpoint}" ]]; then
+  echo "OpenShell authenticated TLS gateway did not become reachable" >&2
+  cat "${port_forward_log}" >&2
+  exit 1
+fi
+
+export XDG_CONFIG_HOME="${run_dir}/config"
+gateway_directory="${XDG_CONFIG_HOME}/openshell/gateways/openshell"
+mkdir -p "${gateway_directory}/mtls"
+cp "${gateway_ca}" "${gateway_directory}/mtls/ca.crt"
+cp "${client_certificate}" "${gateway_directory}/mtls/tls.crt"
+cp "${client_private_key}" "${gateway_directory}/mtls/tls.key"
+printf '%s\n' openshell >"${XDG_CONFIG_HOME}/openshell/active_gateway"
+printf '{"name":"openshell","gateway_endpoint":"%s","is_remote":false,"gateway_port":%s,"auth_mode":"oidc","oidc_issuer":"%s","oidc_client_id":"openshell-cli","oidc_audience":"%s"}\n' \
+  "${endpoint}" "${port}" "${oidc_issuer}" "${oidc_audience}" \
+  >"${gateway_directory}/metadata.json"
+printf '{"access_token":"%s","expires_at":%s,"issuer":"%s","client_id":"openshell-cli"}\n' \
+  "${oidc_token}" "${expires_at}" "${oidc_issuer}" \
+  >"${gateway_directory}/oidc_token.json"
+chmod 600 \
+  "${gateway_directory}/mtls/tls.key" \
+  "${gateway_directory}/oidc_token.json"
+
 STEWARD_OPEN_SHELL_RELEASE="${release}" \
-STEWARD_RUN_ID="g1-$(date -u +%Y%m%d%H%M%S)-$$" \
-STEWARD_USE_CHART_SUPERVISOR="${use_chart_supervisor}" \
+STEWARD_OPENSHELL_ENDPOINT="${endpoint}" \
 STEWARD_G1_BASE_IMAGE="${G1_BASE_IMAGE}" \
-  bash "${ROOT}/scripts/s0-0-openshell-spike.sh" \
+STEWARD_RUN_DIR="${run_dir}" \
   bash "${ROOT}/scripts/g1-upstream-conformance-inside.sh"
 
 echo "G-1 upstream result: 1 passed; 0 failed; 0 skipped"

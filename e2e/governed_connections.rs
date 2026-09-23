@@ -126,7 +126,8 @@ impl Harness {
                 "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
             )?),
             server_name: required("STEWARD_OPENSHELL_SERVER_NAME")?,
-            runtime_class_name: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
+            runtime_class_name: env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")
+                .unwrap_or_default(),
             task_log_mode: OpenShellTaskLogMode::Full,
             stable_bridge_image: None,
             stable_bridge_gateway_origin: None,
@@ -240,7 +241,7 @@ impl Harness {
                 mcp_gw_origin: MCP_GW_ORIGIN.to_owned(),
                 mcp_gw_version: "0.4.9".to_owned(),
                 namespace: CONNECTIONS_NAMESPACE.to_owned(),
-                runtime_class: required("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME")?,
+                runtime_class: env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME").unwrap_or_default(),
             },
             "https://steward.example.test",
         )

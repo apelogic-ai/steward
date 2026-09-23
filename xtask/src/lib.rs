@@ -3539,27 +3539,6 @@ id = "G-6"
     }
 
     #[test]
-    fn every_deployed_agentruntime_webhook_intercepts_delete() {
-        let stack_scripts = [
-            (
-                "scripts/s2-inference-inside.sh",
-                include_str!("../../scripts/s2-inference-inside.sh"),
-            ),
-            (
-                "scripts/s3-envelope-e2e.sh",
-                include_str!("../../scripts/s3-envelope-e2e.sh"),
-            ),
-        ];
-
-        for (path, script) in stack_scripts {
-            assert!(
-                script.contains("operations: [\"CREATE\", \"DELETE\", \"UPDATE\"]"),
-                "{path} must route AgentRuntime DELETE requests through validating admission"
-            );
-        }
-    }
-
-    #[test]
     fn governed_connections_bridge_image_contains_openshell_runtime_utilities() {
         let dockerfile = include_str!("../../build/connections-bridge.Dockerfile");
         let required = [

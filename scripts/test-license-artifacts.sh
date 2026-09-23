@@ -14,7 +14,6 @@ jq -e '.license == "MIT"' "${root}/web/package.json" >/dev/null
 grep -Fxq '  artifacthub.io/license: MIT' "${root}/charts/steward/Chart.yaml"
 grep -Fq '[MIT License](LICENSE)' "${root}/README.md"
 test -s "${root}/THIRD_PARTY_NOTICES.md"
-test -s "${root}/third_party/openshell-patches/v0.0.90/LICENSE"
 test -s "${root}/third_party/mcp-gw-patches/c2af10d9/LICENSE"
 
 for dockerfile in package web connections-bridge; do

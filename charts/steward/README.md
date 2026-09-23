@@ -35,16 +35,7 @@ Set `images.web.tag` and `images.web.digest` to empty strings if web is disabled
 and no web image is published. Only enabled workloads are rendered.
 
 The release handoff attached to every GitHub release records these component
-digests and the OCI chart digest. If repository variable
-`ECR_PROMOTION_ENABLED` is `true`, the release workflow also copies those exact
-manifests to the configured ECR repositories, verifies that the digests did not
-change, waits for native ECR scanning, rejects critical findings, signs them,
-and publishes a private-registry handoff artifact. Promotion is retry-safe: a
-missing immutable tag is created, a matching tag is reused, and a tag pointing
-to any other digest fails closed. For BuildKit OCI indexes, the workflow scans
-exactly one runnable `linux/amd64` child manifest (excluding SBOM/provenance
-attestations) and records both the release index digest and scanned platform
-digest. A missing or ambiguous runnable child fails closed.
+digests and the OCI chart digest published to GHCR.
 
 ## Installation contract
 
@@ -436,14 +427,3 @@ Public releases use:
 
 - images: `ghcr.io/<owner>/steward:<version>-<component>`;
 - chart: `oci://ghcr.io/<owner>/charts/steward:<version>`.
-
-Optional ECR promotion requires these repository variables:
-
-- `ECR_PROMOTION_ENABLED=true`
-- `AWS_RELEASE_ROLE_ARN`
-- `AWS_REGION`
-- `ECR_REGISTRY`
-- `STEWARD_ECR_IMAGE_REPOSITORY`
-- `STEWARD_ECR_CHART_REPOSITORY`
-
-No AWS coordinate or credential is stored in the chart or repository.

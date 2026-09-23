@@ -1064,7 +1064,7 @@ mod tests {
             mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
             mcp_gw_version: super::MCP_GW_CONTRACT_VERSION.to_owned(),
             namespace: "steward-test".to_owned(),
-            runtime_class: "kata-qemu".to_owned(),
+            runtime_class: "sandbox-vm".to_owned(),
         }
     }
 

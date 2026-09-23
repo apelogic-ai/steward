@@ -67,5 +67,5 @@ STEWARD_CONNECTIONS_TEST_MINT_IMAGE="${MINT_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE="${BRIDGE_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE="${WEBHOOK_IMAGE}" \
 STEWARD_OPENSHELL_SANDBOX_IMAGE="${SANDBOX_IMAGE}" \
-bash "${ROOT}/scripts/s0-0-openshell-spike.sh" \
+bash "${ROOT}/scripts/openshell-testbed.sh" \
   bash "${ROOT}/scripts/governed-connections-inside.sh"

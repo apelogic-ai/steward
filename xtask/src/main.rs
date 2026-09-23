@@ -50,14 +50,6 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "quality" if rest.is_empty() => quality(),
         "storage" if rest == ["check"] => storage::check(&root()),
         "storage" if rest == ["audit"] => storage::audit(&root()),
-        "e2e-s0" if rest.is_empty() => e2e_s0(),
-        "e2e-s1" if rest.is_empty() => e2e_s1(),
-        "e2e-s2" if rest.is_empty() => e2e_s2(),
-        "e2e-s3" if rest.is_empty() => e2e_s3(),
-        "e2e-s4" if rest.is_empty() => e2e_s4(),
-        "e2e-s5" if rest.is_empty() => e2e_s5(),
-        "e2e-task" if rest.is_empty() => e2e_task(),
-        "e2e-controller-runtime-lifecycle" if rest.is_empty() => e2e_controller_runtime_lifecycle(),
         "e2e-openshell-adapter" if rest.is_empty() => e2e_openshell_adapter(),
         "e2e-governed-connections" if rest.is_empty() => e2e_governed_connections(),
         "e2e-postgres-tls" if rest.is_empty() => e2e_postgres_tls(),
@@ -76,10 +68,6 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "provider-profile-bundle" => provider_profile_bundle(rest),
         "layering-test" if rest.is_empty() => layering_test(),
         "dev" => dev(rest),
-        "reap" if rest.is_empty() => Err(
-            "reaping is introduced with the ephemeral S0.0 harness; no resources exist in S-1"
-                .to_owned(),
-        ),
         _ => Err(usage()),
     }
 }
@@ -91,14 +79,6 @@ fn usage() -> String {
         "  ci",
         "  quality",
         "  storage check|audit",
-        "  e2e-s0",
-        "  e2e-s1",
-        "  e2e-s2",
-        "  e2e-s3",
-        "  e2e-s4",
-        "  e2e-s5",
-        "  e2e-task",
-        "  e2e-controller-runtime-lifecycle",
         "  e2e-openshell-adapter",
         "  e2e-governed-connections",
         "  e2e-postgres-tls",
@@ -119,8 +99,7 @@ fn usage() -> String {
         "  provider-profile-bundle reconcile --inputs <file> --output <directory>",
         "  provider-profile-bundle upgrade --from-inputs <file> --inputs <file> --output <directory>",
         "  layering-test",
-        "  dev doctor|up|down",
-        "  reap",
+        "  dev doctor",
     ]
     .join("\n")
 }
@@ -333,38 +312,6 @@ fn provider_profile_bundle_directory_for_inputs(input_content: &str) -> Result<P
             )
         })?;
     Ok(root().join(relative_directory))
-}
-
-fn e2e_s0() -> TaskResult {
-    run("bash", &["scripts/s0-0-openshell-spike.sh", "--s0-e2e"])
-}
-
-fn e2e_s1() -> TaskResult {
-    run("bash", &["scripts/s1-identity-e2e.sh"])
-}
-
-fn e2e_s2() -> TaskResult {
-    run("bash", &["scripts/s2-inference-e2e.sh"])
-}
-
-fn e2e_s3() -> TaskResult {
-    run("bash", &["scripts/s3-envelope-e2e.sh"])
-}
-
-fn e2e_s4() -> TaskResult {
-    run("bash", &["scripts/s4-escalation-e2e.sh"])
-}
-
-fn e2e_s5() -> TaskResult {
-    run("bash", &["scripts/s5-revocation-e2e.sh"])
-}
-
-fn e2e_task() -> TaskResult {
-    run("bash", &["scripts/task-submission-e2e.sh"])
-}
-
-fn e2e_controller_runtime_lifecycle() -> TaskResult {
-    run("bash", &["scripts/task-submission-e2e.sh"])
 }
 
 fn e2e_openshell_adapter() -> TaskResult {
@@ -697,10 +644,10 @@ fn validate_conformance_test_result_for(output: &str, guarantee: &str) -> TaskRe
 
 fn register(arguments: &[String]) -> TaskResult {
     if arguments != ["--check"] {
-        return Err("S-1 supports `register --check`; rendering arrives in S0.0".to_owned());
+        return Err("register accepts exactly `--check`".to_owned());
     }
     validate_register()?;
-    println!("register --check: declarative register shape is valid; evidence arrives in S0.0");
+    println!("register --check: declarative register shape is valid");
     Ok(())
 }
 
@@ -881,20 +828,14 @@ fn write_file(path: &Path, content: &str) -> TaskResult {
 
 fn dev(arguments: &[String]) -> TaskResult {
     let Some(operation) = arguments.first().map(String::as_str) else {
-        return Err("dev requires doctor, up, or down".to_owned());
+        return Err("dev requires doctor".to_owned());
     };
     if arguments.len() != 1 {
-        return Err("dev accepts exactly one operation in S-1".to_owned());
+        return Err("dev accepts exactly one operation".to_owned());
     }
     match operation {
         "doctor" => dev_doctor(),
-        "up" | "down" => {
-            require_local_test_context()?;
-            Err(format!(
-                "dev {operation} is introduced with the ephemeral S0.0 harness"
-            ))
-        }
-        _ => Err("dev requires doctor, up, or down".to_owned()),
+        _ => Err("dev requires doctor".to_owned()),
     }
 }
 
@@ -915,13 +856,6 @@ fn dev_doctor() -> TaskResult {
     }
     println!("dev doctor: no Steward run artifacts found; ambient kube context was not used");
     Ok(())
-}
-
-fn require_local_test_context() -> TaskResult {
-    let context = env::var("STEWARD_TEST_KUBE_CONTEXT").map_err(|_| {
-        "STEWARD_TEST_KUBE_CONTEXT must explicitly select an ephemeral local context".to_owned()
-    })?;
-    validate_local_test_context(&context)
 }
 
 fn validate_local_test_context(context: &str) -> TaskResult {
@@ -1079,44 +1013,11 @@ mod tests {
     };
     use std::fs;
     use std::io::ErrorKind;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_REPOSITORY_ID: AtomicU64 = AtomicU64::new(0);
-
-    fn ci_job(workflow: &str, job_name: &str) -> Result<String, String> {
-        let header = format!("\n  {job_name}:");
-        let (_, job) = workflow
-            .split_once(&header)
-            .ok_or_else(|| format!("{job_name} CI job is required"))?;
-
-        Ok(job
-            .lines()
-            .take_while(|line| {
-                line.is_empty() || line.starts_with("    ") || !line.starts_with("  ")
-            })
-            .collect::<Vec<_>>()
-            .join("\n"))
-    }
-
-    #[test]
-    fn release_ci_installs_supervisor_build_tools() -> Result<(), String> {
-        let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
-            .map_err(|error| format!("published Steward release workflow is required: {error}"))?;
-
-        assert!(
-            workflow.contains("run: cargo xtask ci"),
-            "release validation must run the complete Steward CI gate"
-        );
-        assert!(
-            workflow.contains("supervisor-tools: \"true\""),
-            "release validation must install Zig and cargo-zigbuild before pinned conformance"
-        );
-
-        Ok(())
-    }
 
     #[test]
     fn browser_e2e_ci_uses_the_pinned_nextjs_gate() -> Result<(), String> {
@@ -1312,150 +1213,6 @@ mod tests {
     }
 
     #[test]
-    fn controller_owned_task_lifecycle_is_a_named_ci_e2e_gate() -> Result<(), String> {
-        let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
-            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
-        let xtask_source = include_str!("main.rs");
-        let task_wrapper = fs::read_to_string(root().join("scripts/task-submission-e2e.sh"))
-            .map_err(|error| format!("task lifecycle wrapper is required: {error}"))?;
-        let task_callback = fs::read_to_string(root().join("scripts/task-submission-inside.sh"))
-            .map_err(|error| format!("task lifecycle image callback is required: {error}"))?;
-        let s2_harness = fs::read_to_string(root().join("scripts/s2-inference-inside.sh"))
-            .map_err(|error| format!("S2 lifecycle harness is required: {error}"))?;
-        let task_dockerfile = fs::read_to_string(root().join("e2e/Dockerfile.task"))
-            .map_err(|error| format!("task lifecycle Dockerfile is required: {error}"))?;
-
-        let lifecycle_job = ci_job(&workflow, "e2e-controller-runtime-lifecycle")?;
-        let pinned_job = ci_job(&workflow, "pinned")?;
-
-        assert!(
-            lifecycle_job.contains("cargo xtask e2e-controller-runtime-lifecycle"),
-            "controller-owned lifecycle CI must invoke the named xtask E2E gate"
-        );
-        assert!(
-            pinned_job.contains("- e2e-controller-runtime-lifecycle")
-                && pinned_job.contains(
-                    "CONTROLLER_RUNTIME_LIFECYCLE: ${{ needs.e2e-controller-runtime-lifecycle.result }}"
-                )
-                && pinned_job.contains("${CONTROLLER_RUNTIME_LIFECYCLE}"),
-            "the pinned aggregate must fail when the controller-owned lifecycle E2E fails"
-        );
-        assert!(
-            xtask_source.contains("\"e2e-controller-runtime-lifecycle\" if rest.is_empty()"),
-            "the named controller-owned lifecycle E2E must be dispatchable locally"
-        );
-        assert!(
-            xtask_source.contains("e2e_controller_runtime_lifecycle"),
-            "the named controller-owned lifecycle command must have a dedicated implementation"
-        );
-        assert!(
-            task_wrapper.contains("scripts/task-submission-inside.sh"),
-            "the task lifecycle wrapper must defer image provision until the post-S0 callback"
-        );
-        let supervisor_preflight = task_wrapper
-            .find("build-patched-openshell-supervisor.sh")
-            .ok_or_else(|| {
-                "the task lifecycle wrapper must establish the pinned supervisor before building run-scoped images"
-                    .to_owned()
-            })?;
-        let workflow_image_build = task_wrapper.find("docker build").ok_or_else(|| {
-            "the task lifecycle wrapper must build its run-scoped workflow image".to_owned()
-        })?;
-        assert!(
-            supervisor_preflight < workflow_image_build,
-            "the pinned supervisor build must complete before the run-scoped workflow image is built"
-        );
-        assert!(
-            !task_wrapper.contains("build-steward-mint-image.sh"),
-            "the task lifecycle wrapper must not build the mint image before the long S0 setup gap"
-        );
-        assert!(
-            !task_wrapper.contains("build-patched-mcp-gw.sh"),
-            "the task lifecycle wrapper must not build mcp-gw before the long S0 setup gap"
-        );
-        assert!(
-            !task_wrapper.contains("capture-proxy.test.ts"),
-            "the task lifecycle wrapper must not require the post-S0 mcp-gw image during preflight"
-        );
-        for required in [
-            "build-steward-mint-image.sh",
-            "build-patched-mcp-gw.sh",
-            "capture-proxy.test.ts",
-            "e2e/Dockerfile.task",
-            "docker image inspect",
-            "exec bash \"${ROOT}/scripts/s2-inference-inside.sh\"",
-        ] {
-            assert!(
-                task_callback.contains(required),
-                "the post-S0 task callback must provision and inspect local images before S2: missing {required}"
-            );
-        }
-        let mint_build = task_callback
-            .find("build-steward-mint-image.sh")
-            .ok_or_else(|| "task callback must build mint".to_owned())?;
-        let mcp_gw_build = task_callback
-            .find("build-patched-mcp-gw.sh")
-            .ok_or_else(|| "task callback must build mcp-gw".to_owned())?;
-        let task_build = task_callback
-            .find("e2e/Dockerfile.task")
-            .ok_or_else(|| "task callback must build controller/task image".to_owned())?;
-        let image_inspect = task_callback
-            .find("docker image inspect")
-            .ok_or_else(|| "task callback must inspect built images".to_owned())?;
-        let s2_exec = task_callback
-            .find("exec bash \"${ROOT}/scripts/s2-inference-inside.sh\"")
-            .ok_or_else(|| "task callback must enter S2 after image checks".to_owned())?;
-        assert!(
-            task_build < mint_build && task_build < mcp_gw_build,
-            "the run-scoped task image must build before the fixed dependency tags are refreshed"
-        );
-        assert!(
-            mint_build < image_inspect
-                && mcp_gw_build < image_inspect
-                && task_build < image_inspect,
-            "the post-S0 callback must build every local image before inspecting it"
-        );
-        assert!(
-            image_inspect < s2_exec,
-            "the post-S0 callback must inspect every local image before any kind load in S2"
-        );
-        assert!(
-            task_dockerfile
-                .contains("COPY config/internal-authorities ./config/internal-authorities"),
-            "the task lifecycle image must carry the immutable internal authority documents needed by the apiserver library"
-        );
-        assert!(
-            s2_harness.contains(".status.conditions[]?"),
-            "the S2 harness must tolerate a newly created CRD whose status.conditions is temporarily absent"
-        );
-        assert!(
-            !s2_harness.contains("wait --for=condition=Established"),
-            "the S2 harness must not use kubectl wait's nil-conditions race for CRD establishment"
-        );
-        assert!(
-            s2_harness
-                .contains("s#STEWARD_TASK_EXECUTION_BINDING_IMAGE_VALUE#${sandbox_digest_image}#g"),
-            "the S2 harness must replace a value-only execution-binding image placeholder"
-        );
-        assert!(
-            !s2_harness
-                .contains("s#STEWARD_TASK_EXECUTION_BINDING_IMAGE#${sandbox_digest_image}#g"),
-            "the S2 harness must not replace the execution-binding environment variable name"
-        );
-        let task_server_rollout = s2_harness
-            .find("rollout status deployment/steward-task-server")
-            .ok_or_else(|| "the Task server rollout gate is missing".to_owned())?;
-        let provider_seed = s2_harness
-            .find("wait --for=condition=complete job/seed-mcp-gw")
-            .ok_or_else(|| "the provider fixture seed gate is missing".to_owned())?;
-        assert!(
-            task_server_rollout < provider_seed,
-            "the Task server must register its canonical fixture identity before provider seeding waits for that identity"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn durable_task_orchestration_migration_declares_the_recovery_boundary() -> Result<(), String> {
         let migration_path = root().join("migrations/0028_durable_task_runtime_orchestration.sql");
         let migration = fs::read_to_string(&migration_path).map_err(|error| {
@@ -1574,49 +1331,6 @@ mod tests {
     }
 
     #[test]
-    fn versioned_workflow_e2e_creates_a_run_owned_runtime_namespace() -> Result<(), String> {
-        let harness = fs::read_to_string(root().join("scripts/s2-inference-inside.sh"))
-            .map_err(|error| format!("in-cluster task E2E harness is required: {error}"))?;
-        let task_stack = fs::read_to_string(root().join("config/task/stack.yaml"))
-            .map_err(|error| format!("versioned Workflow E2E stack is required: {error}"))?;
-
-        assert!(
-            harness.contains("namespaces+=(steward-workflows litellm)"),
-            "the versioned Workflow E2E must create its dedicated runtime namespace"
-        );
-        assert!(
-            harness.contains("wait_for_spire_admission_webhook")
-                && harness.contains("--dry-run=server")
-                && harness.contains("steward-spire-webhook-readiness"),
-            "the versioned Workflow E2E must prove the SPIRE admission webhook accepts requests before applying ClusterSPIFFEID resources"
-        );
-        assert!(
-            harness.contains(
-                "elif [[ \"${SLICE}\" == \"task\" ]]; then\n  profile_sources=(\n    \"${ROOT}/config/s5/tool-provider-profile.yaml\"\n    \"${ROOT}/config/task/tool-provider-profile.yaml\"\n    \"${ROOT}/config/task/inference-provider-profile.yaml\"\n  )"
-            ),
-            "the versioned Workflow E2E must retain the legacy tool profile while installing both execution-binding-selected provider profiles"
-        );
-        assert!(
-            harness.contains("label namespace \"${namespace}\"")
-                && harness.contains("steward.test/run-id=${STEWARD_RUN_ID}"),
-            "the versioned Workflow runtime namespace must be owned by the current test run"
-        );
-        for required in [
-            "name: steward-task-controller-credentials",
-            "name: steward-task-mint-credentials",
-            "namespace: steward-workflows",
-            "resources: [\"secrets\"]",
-        ] {
-            assert!(
-                task_stack.contains(required),
-                "the versioned Workflow E2E must grant scoped runtime-credential access: missing {required}"
-            );
-        }
-
-        Ok(())
-    }
-
-    #[test]
     fn task_codex_provider_profiles_cover_supported_linux_architectures() -> Result<(), String> {
         let arm64_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/bin/codex";
         let amd64_binary = "/usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex";
@@ -1634,14 +1348,6 @@ mod tests {
                 );
             }
         }
-        let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
-            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
-        let task_e2e = ci_job(&workflow, "e2e-controller-runtime-lifecycle")?;
-        assert!(
-            task_e2e.contains("runs-on: ubuntu-latest")
-                && task_e2e.contains("cargo xtask e2e-controller-runtime-lifecycle"),
-            "the real Codex MCP-GW E2E must exercise the linux/amd64 provider path in CI"
-        );
         Ok(())
     }
 
@@ -1858,40 +1564,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_e2e_reuses_builds_and_preserves_observed_runtime_headroom() -> Result<(), String> {
-        let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
-            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
-        let runtime = ci_job(&workflow, "e2e-runtime")?;
-
-        assert!(
-            runtime.contains("timeout-minutes: 105"),
-            "the shared runtime E2E must preserve headroom for the observed 29m05s revocation lane while reusing one Rust build"
-        );
-        assert_eq!(
-            runtime.matches("Restore shared Rust build cache").count(),
-            1,
-            "the shared runtime E2E must restore one cache for S1, S2, and S5"
-        );
-        assert_eq!(
-            runtime.matches("cargo xtask e2e-s1").count(),
-            1,
-            "the shared runtime E2E must run the S1 lane exactly once"
-        );
-        assert_eq!(
-            runtime.matches("cargo xtask e2e-s2").count(),
-            1,
-            "the shared runtime E2E must run the S2 lane exactly once"
-        );
-        assert_eq!(
-            runtime.matches("cargo xtask e2e-s5").count(),
-            1,
-            "the shared runtime E2E must run the S5 lane exactly once"
-        );
-
-        Ok(())
-    }
-
-    #[test]
     fn openshell_adapter_does_not_select_a_public_sandbox_image() -> Result<(), String> {
         let source = fs::read_to_string(root().join("adapters/openshell/src/lib.rs"))
             .map_err(|error| format!("OpenShell adapter source is required: {error}"))?;
@@ -1951,7 +1623,7 @@ mod tests {
             );
         }
         assert!(
-            !schema.contains("\"const\": \"kata-qemu\"")
+            !schema.contains("\"const\": \"sandbox-vm\"")
                 && schema.contains("openshellRuntimeClassName"),
             "the chart schema must accept valid Kubernetes RuntimeClass names without encoding a Kata-only contract"
         );
@@ -2517,15 +2189,6 @@ mod tests {
         ] {
             assert!(ci.contains(required), "pinned CI is missing {required}");
         }
-        let governed_connections_job = ci
-            .split_once("  governed-connections:\n")
-            .and_then(|(_, remainder)| remainder.split_once("\n  postgres-tls:"))
-            .map(|(job, _)| job)
-            .ok_or_else(|| "governed Connections CI job boundary is missing".to_owned())?;
-        assert!(
-            governed_connections_job.contains("supervisor-tools: \"true\""),
-            "governed Connections CI must install the pinned supervisor build tools"
-        );
         assert!(
             xtask_source.contains("\"e2e-governed-connections\" if rest.is_empty()")
                 && xtask_source.contains("scripts/governed-connections-e2e.sh"),
@@ -2536,6 +2199,7 @@ mod tests {
             "sha256:80bef7bee93482c8091335ae27c3c3e968e5c78c2bb4a40b401e6af36f70f993",
             "e2e/Dockerfile.workflow-sandbox",
             "STEWARD_OPENSHELL_SANDBOX_IMAGE",
+            "scripts/openshell-testbed.sh",
         ] {
             assert!(
                 outer.contains(required),
@@ -2570,10 +2234,6 @@ mod tests {
             stack.contains("steward-connections-e2e-mint-runtime")
                 && stack.contains("steward-connections-e2e-mint-credentials"),
             "Mint runtime reads and namespace-scoped Secret reads must be separate"
-        );
-        assert!(
-            !outer.contains("STEWARD_USE_CHART_SUPERVISOR=1"),
-            "the real-stack lane must use the repository's pinned supervisor patch contract"
         );
         assert!(
             sandbox.contains("ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:")
@@ -2621,110 +2281,6 @@ mod tests {
             );
         }
 
-        Ok(())
-    }
-
-    #[test]
-    fn controller_e2e_harnesses_require_authenticated_openshell_transport() -> Result<(), String> {
-        let shared_harness = fs::read_to_string(root().join("scripts/s0-0-openshell-spike.sh"))
-            .map_err(|error| format!("shared OpenShell E2E harness is required: {error}"))?;
-        for unsafe_setting in [
-            "server.disableTls=true",
-            "server.auth.allowUnauthenticatedUsers=true",
-        ] {
-            assert!(
-                !shared_harness.contains(unsafe_setting),
-                "controller E2E lanes must not enable unsafe OpenShell setting {unsafe_setting}"
-            );
-        }
-        for required in [
-            "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
-            "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
-            "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
-            "STEWARD_WORKLOAD_EXCHANGE_ENDPOINT",
-            "STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME",
-            "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
-            "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
-            "STEWARD_OPENSHELL_SERVER_NAME",
-            "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
-        ] {
-            assert!(
-                shared_harness.contains(required),
-                "shared controller E2E harness must export {required}"
-            );
-        }
-
-        for test_path in ["e2e/s0.rs", "e2e/s1.rs"] {
-            let harness = fs::read_to_string(root().join(test_path)).map_err(|error| {
-                format!("controller E2E launch path {test_path} is required: {error}")
-            })?;
-            for required in [
-                "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
-                "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
-                "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
-                "STEWARD_WORKLOAD_EXCHANGE_ENDPOINT",
-                "STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME",
-                "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
-                "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
-                "STEWARD_OPENSHELL_SERVER_NAME",
-                "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
-            ] {
-                assert!(
-                    harness.contains(required),
-                    "controller E2E launch path {test_path} must forward {required}"
-                );
-            }
-        }
-
-        let in_cluster_harness = fs::read_to_string(root().join("scripts/s2-inference-inside.sh"))
-            .map_err(|error| format!("in-cluster controller E2E harness is required: {error}"))?;
-        let in_cluster_controller = fs::read_to_string(root().join("config/s2/stack.yaml"))
-            .map_err(|error| format!("in-cluster controller fixture is required: {error}"))?;
-        for required in [
-            "STEWARD_OPENSHELL_CA_CERTIFICATE_FILE",
-            "STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE",
-            "STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE",
-            "STEWARD_WORKLOAD_EXCHANGE_ENDPOINT",
-            "STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME",
-            "STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE",
-            "STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE",
-            "STEWARD_OPENSHELL_SERVER_NAME",
-            "STEWARD_OPENSHELL_RUNTIME_CLASS_NAME",
-        ] {
-            assert!(
-                in_cluster_harness.contains(required),
-                "in-cluster controller E2E harness must require {required}"
-            );
-            assert!(
-                in_cluster_controller.contains(required),
-                "in-cluster controller fixture must provide {required}"
-            );
-        }
-        assert!(
-            in_cluster_controller
-                .contains("value: https://openshell.openshell.svc.cluster.local:8080"),
-            "in-cluster controller must use authenticated TLS to OpenShell"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn s2_controller_can_create_only_task_agentruntimes() -> Result<(), String> {
-        let fixture = fs::read_to_string(root().join("config/s2/stack.yaml"))
-            .map_err(|error| format!("S2 controller fixture is required: {error}"))?;
-        let controller_role = fixture
-            .split("---")
-            .find(|document| {
-                document.contains("kind: ClusterRole")
-                    && document.contains("name: steward-s2-controller")
-            })
-            .ok_or_else(|| "S2 controller ClusterRole is required".to_owned())?;
-
-        assert!(
-            controller_role.contains("resources: [\"agentruntimes\"]\n    verbs: [\"create\"]"),
-            "the Task controller must be allowed to create only AgentRuntime resources"
-        );
         Ok(())
     }
 
@@ -3016,12 +2572,6 @@ mod tests {
             root().join("scripts/validate-release-artifacts.sh"),
         )
         .map_err(|error| format!("release artifact validation script is required: {error}"))?;
-        let promotion_test =
-            fs::read_to_string(root().join("scripts/test-promote-ecr-artifact.sh"))
-                .map_err(|error| format!("ECR promotion retry tests are required: {error}"))?;
-        let platform_resolution_test =
-            fs::read_to_string(root().join("scripts/test-resolve-ecr-platform-digest.sh"))
-                .map_err(|error| format!("ECR platform resolution tests are required: {error}"))?;
         let setup_tools = fs::read_to_string(root().join(".github/actions/setup-tools/action.yml"))
             .map_err(|error| format!("Steward CI tool installer is required: {error}"))?;
         let provider_profiles = [
@@ -3186,12 +2736,6 @@ mod tests {
             "Bridge source repository:",
             "Bridge source commit:",
             "helm-chart.digest",
-            "ecr-bridge-attestation-bundle.jsonl",
-            "oci://${IMAGE_REPOSITORY}@${bridge_digest}",
-            "docker login \"$ECR_REGISTRY\" --username AWS --password-stdin",
-            "Bridge ECR signer identity:",
-            "Bridge ECR source repository:",
-            "Bridge ECR source commit:",
         ] {
             assert!(
                 workflow.contains(artifact),
@@ -3243,37 +2787,6 @@ mod tests {
             workflow.matches("exit-code: \"1\"").count() >= 2,
             "image and chart vulnerability scans must fail releases on critical findings"
         );
-        for required in [
-            "aws ecr wait image-scan-complete",
-            "aws ecr describe-image-scan-findings",
-            "scripts/promote-ecr-artifact.sh",
-            "scripts/test-promote-ecr-artifact.sh",
-            "scripts/resolve-ecr-platform-digest.sh",
-            "scripts/test-resolve-ecr-platform-digest.sh",
-            "ecr-$component-scan-platform.digest",
-            "Scanned linux/amd64 digest",
-        ] {
-            assert!(
-                workflow.contains(required) || release_validation.contains(required),
-                "release path is missing {required}"
-            );
-        }
-        for required in [
-            "one runnable linux/amd64 manifest plus SBOM and provenance attestations",
-            "missing runnable linux/amd64 manifest fails closed",
-            "ambiguous runnable linux/amd64 manifests fail closed",
-        ] {
-            assert!(
-                platform_resolution_test.contains(required),
-                "ECR platform resolution tests are missing: {required}"
-            );
-        }
-        for required in ["missing target", "matching target", "different digest"] {
-            assert!(
-                promotion_test.contains(required),
-                "ECR promotion retry tests are missing the {required} case"
-            );
-        }
         assert_eq!(
             container.matches("FROM ").count(),
             2,
@@ -3437,17 +2950,6 @@ mod tests {
         }
     }
 
-    fn write_executable(path: &Path, content: &str) -> Result<(), String> {
-        fs::write(path, content)
-            .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
-        let mut permissions = fs::metadata(path)
-            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)
-            .map_err(|error| format!("failed to make {} executable: {error}", path.display()))
-    }
-
     #[test]
     fn migration_test_git_isolates_signing_configuration() -> Result<(), String> {
         let repository = TestRepository::create()?;
@@ -3596,699 +3098,6 @@ mod tests {
     }
 
     #[test]
-    fn openshell_spike_dependencies_are_feature_isolated() -> Result<(), String> {
-        let manifest_path = root().join("adapters/openshell/Cargo.toml");
-        let content = fs::read_to_string(&manifest_path)
-            .map_err(|error| format!("failed to read {}: {error}", manifest_path.display()))?;
-        let manifest = toml::from_str::<toml::Table>(&content)
-            .map_err(|error| format!("failed to parse {}: {error}", manifest_path.display()))?;
-        let dependencies = manifest
-            .get("dependencies")
-            .and_then(toml::Value::as_table)
-            .ok_or_else(|| "OpenShell adapter must declare dependencies".to_owned())?;
-        for dependency in ["openshell-sdk", "tokio"] {
-            let optional = dependencies
-                .get(dependency)
-                .and_then(toml::Value::as_table)
-                .and_then(|specification| specification.get("optional"))
-                .and_then(toml::Value::as_bool);
-            assert_eq!(
-                optional,
-                Some(true),
-                "{dependency} must be optional so normal xtask and workspace builds exclude the OpenShell SDK graph"
-            );
-        }
-        let spike_features = manifest
-            .get("features")
-            .and_then(toml::Value::as_table)
-            .and_then(|features| features.get("s0-spike"))
-            .and_then(toml::Value::as_array)
-            .map(|features| {
-                features
-                    .iter()
-                    .filter_map(toml::Value::as_str)
-                    .collect::<Vec<_>>()
-            })
-            .ok_or_else(|| "OpenShell adapter must declare the s0-spike feature".to_owned())?;
-        for dependency in ["dep:openshell-sdk", "dep:tokio"] {
-            assert!(
-                spike_features.contains(&dependency),
-                "s0-spike must activate {dependency}"
-            );
-        }
-
-        let required_features = manifest
-            .get("example")
-            .and_then(toml::Value::as_array)
-            .and_then(|examples| {
-                examples.iter().find(|example| {
-                    example.get("name").and_then(toml::Value::as_str) == Some("workspace_contract")
-                })
-            })
-            .and_then(|example| example.get("required-features"))
-            .and_then(toml::Value::as_array)
-            .map(|features| {
-                features
-                    .iter()
-                    .filter_map(toml::Value::as_str)
-                    .collect::<Vec<_>>()
-            });
-        assert_eq!(
-            required_features,
-            Some(vec!["s0-spike"]),
-            "the live workspace example must require the feature that activates its SDK dependencies"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn openshell_spike_selects_the_host_cli_artifact_before_cluster_setup() -> Result<(), String> {
-        let operating_system = std::env::consts::OS;
-        let architecture = std::env::consts::ARCH;
-        let expected = match (operating_system, architecture) {
-            ("macos", "aarch64") => "openshell-aarch64-apple-darwin.tar.gz",
-            ("linux", "aarch64") => "openshell-aarch64-unknown-linux-musl.tar.gz",
-            ("linux", "x86_64") => "openshell-x86_64-unknown-linux-musl.tar.gz",
-            _ => return Ok(()),
-        };
-        let output = Command::new("bash")
-            .arg(root().join("scripts/s0-0-openshell-spike.sh"))
-            .arg("--print-openshell-cli-asset")
-            .output()
-            .map_err(|error| format!("failed to inspect OpenShell CLI selection: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "OpenShell CLI selection failed before cluster setup: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            expected,
-            "the spike must download the OpenShell CLI artifact for its host platform"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn carried_openshell_patch_has_a_reproducible_image_build_contract() -> Result<(), String> {
-        let output = Command::new("bash")
-            .arg(root().join("scripts/build-patched-openshell-supervisor.sh"))
-            .arg("--print-contract")
-            .output()
-            .map_err(|error| format!("failed to inspect patched supervisor build: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "patched supervisor build contract failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            concat!(
-                "source=https://github.com/NVIDIA/OpenShell.git\n",
-                "commit=1d4ac708f1d2a9ab94204cdce6ca0eee7e792839\n",
-                "patch=third_party/openshell-patches/v0.0.90/",
-                "0001-prepare-supervisor-identity-mount-namespace.patch\n",
-                "image=openshell/supervisor:steward-spiffe-v0090\n",
-                "rust=1.95.0\n",
-                "zig=0.14.1\n",
-                "cargo-zigbuild=0.22.3\n",
-                "dockerfile-frontend=docker/dockerfile:1.4@sha256:",
-                "9ba7531bd80fb0a858632727cf7a112fbfd19b17e94c4e84ced81e24ef1a0dbc\n",
-                "supervisor-base=alpine:3.22@sha256:",
-                "14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce\n",
-                "apk-packages=alpine-baselayout=3.7.0-r0 ",
-                "alpine-baselayout-data=3.7.0-r0 alpine-keys=2.5-r0 ",
-                "alpine-release=3.22.5-r0 apk-tools=2.14.10-r0 ",
-                "busybox=1.37.0-r20 busybox-binsh=1.37.0-r20 ",
-                "ca-certificates-bundle=20260611-r0 gmp=6.3.0-r3 ",
-                "iptables=1.8.11-r1 iptables-legacy=1.8.11-r1 ",
-                "jansson=2.14.1-r0 libapk2=2.14.10-r0 libcrypto3=3.5.7-r0 ",
-                "libip4tc=1.8.11-r1 libip6tc=1.8.11-r1 libmnl=1.0.5-r2 ",
-                "libncursesw=6.5_p20250503-r0 libnftnl=1.2.9-r0 ",
-                "libssl3=3.5.7-r0 libxtables=1.8.11-r1 musl=1.2.5-r12 ",
-                "musl-utils=1.2.5-r12 ncurses-terminfo-base=6.5_p20250503-r0 ",
-                "nftables=1.1.3-r0 readline=8.2.13-r1 scanelf=1.3.8-r1 ",
-                "ssl_client=1.37.0-r20 zlib=1.3.2-r0\n",
-                "apk-artifact-base=https://dl-cdn.alpinelinux.org/alpine/v3.22/main\n",
-                "apk-artifacts-aarch64=",
-                "gmp-6.3.0-r3.apk=0d2eb1079b1b5692e9e6652ff0e269caeb9c812f483e34c88d461c03bcf75460 ",
-                "iptables-1.8.11-r1.apk=0a10fe634e3525082a1219487cd044d987ac4a55ed5aa551bf758e81223e1cfb ",
-                "iptables-legacy-1.8.11-r1.apk=8beced6a354697e50014e2cebe0dcea3dc65d2dbbb708006a149999b3b029919 ",
-                "jansson-2.14.1-r0.apk=f57c3bceb823add72ee0ccbf17aa7fc98596ff9eb0c11d0e5a2c28260ea87dcd ",
-                "libip4tc-1.8.11-r1.apk=6418c50ff5287f6aca02ba7d8baab7cfe729a898793c9a8856cf8975b3f759c2 ",
-                "libip6tc-1.8.11-r1.apk=48ec17436d0e6fd754c8eb50862b5604e86e80ac7d19d7c7a48f9f622f305306 ",
-                "libmnl-1.0.5-r2.apk=213a7e87553bed3d9159b2e74d2627885c259883e61714b357949ca806eb1f8d ",
-                "libncursesw-6.5_p20250503-r0.apk=419b375e8a4345e7172b1f0f3a3c57db61374f5408cdb875d9e860bd4c243aca ",
-                "libnftnl-1.2.9-r0.apk=6912a5d56b31d3365b8dd0d6339bd70a2bfc9e25dab0c387f77174113c43e664 ",
-                "libxtables-1.8.11-r1.apk=e84f0d6b69d4318f297056d00ccbe433e6c7d163fe6767405e373248c42e3e88 ",
-                "ncurses-terminfo-base-6.5_p20250503-r0.apk=3d37403e0b5ab9eb0c1ce269444e4a385faec9fe6af452c1c6956806b13d2bd6 ",
-                "nftables-1.1.3-r0.apk=e48df72b87580444a6b3094e2292886994c3d9c600435d7a62949e3706ce2c07 ",
-                "readline-8.2.13-r1.apk=334af29dbf6b5a71a87af4d6a58e2967a8f711a51d00093de0e1498daf83ceb2\n",
-                "apk-artifacts-x86_64=",
-                "gmp-6.3.0-r3.apk=d3f987ae3836ac7774324bff443dd49d03b846209660729d0c30dfff5546e138 ",
-                "iptables-1.8.11-r1.apk=defe876173d08fe30b664b2d9f60d0237298a639e3a7d0e3f83ac637fd6519db ",
-                "iptables-legacy-1.8.11-r1.apk=aebfc932aa2e3b27e4895250aa4b73ead107116a3e8cd33ebf2d4036e46c043e ",
-                "jansson-2.14.1-r0.apk=7fde81421482507163410715a7ef7d7df6a091870edab855c24e8f6fc84e3e2d ",
-                "libip4tc-1.8.11-r1.apk=3ca5cd36732d59374d970d937f781469969bf668ff5eb65207892f7cfcd27f02 ",
-                "libip6tc-1.8.11-r1.apk=dc0e2aa34b2454bce4c8f6860484925fd6e5bea8eeb24e53d4b9526a24ed4c2c ",
-                "libmnl-1.0.5-r2.apk=e9dc63c95a0c8a263dc7f0705e6f7a2220d632a675ce85db798d33a40b1c1b0b ",
-                "libncursesw-6.5_p20250503-r0.apk=aeafdfca68147b014705b4e2564639ade6345198debb522f2c6c51d32e417651 ",
-                "libnftnl-1.2.9-r0.apk=bef674635aec00dca296b8206751245f7664ba10c416f31c01a563af596720ae ",
-                "libxtables-1.8.11-r1.apk=5367f1f5c309a0aeede0a08d73af717f582f7a135ff97080aa0e5b7c72fd97af ",
-                "ncurses-terminfo-base-6.5_p20250503-r0.apk=0815a5f0403974bb9c34d456e71dc9c0222cb5455d393bc63c44b573da3d7fe0 ",
-                "nftables-1.1.3-r0.apk=96bdef738b0ae22ad86500af3345622c7f5bdc6ade0a407d087d1ea3223c8bc7 ",
-                "readline-8.2.13-r1.apk=520fa586c689144928191bee13e2c85ff4e170ad87d1471ec48e3e97611673d8\n",
-                "build-script-sha256=",
-                "1d2caafeff04d08627cfcaf436edbcdda8ea0b57223744056e2741bed321fac8\n",
-            ),
-            "the carried patch must build from its recorded immutable source and image contract"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn mcp_gateway_patch_is_applied_in_an_isolated_repository() -> Result<(), String> {
-        let script_path = root().join("scripts/build-patched-mcp-gw.sh");
-        let script = fs::read_to_string(&script_path)
-            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
-        let source_init = script
-            .find("git -C \"${source_dir}\" init --quiet")
-            .ok_or_else(|| {
-                "the mcp-gw source archive must become an isolated repository before patching"
-                    .to_owned()
-            })?;
-        let patch_check = script
-            .find("git -C \"${source_dir}\" apply --check")
-            .ok_or_else(|| "the mcp-gw build must check its carried patch".to_owned())?;
-        assert!(
-            source_init < patch_check,
-            "the carried patch must not resolve against Steward's parent repository"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn supervisor_build_isolates_target_and_compiler_environment() -> Result<(), String> {
-        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
-        let script = fs::read_to_string(&script_path)
-            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
-        for required in [
-            "SUPERVISOR_TARGET_DIR=\"${RUN_DIR}/cargo-target\"",
-            "binary=\"${SUPERVISOR_TARGET_DIR}/${rust_target}/release/openshell-sandbox\"",
-            "CARGO_TARGET_DIR=\"${SUPERVISOR_TARGET_DIR}\"",
-            "rustup target add --toolchain \"${RUST_TOOLCHAIN}\" \"${rust_target}\"",
-            "cargo +\"${RUST_TOOLCHAIN}\" zigbuild",
-            "scrub_ambient_compiler_overrides",
-        ] {
-            assert!(
-                script.contains(required),
-                "the supervisor build must isolate its target directory and compiler environment: missing {required}"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn supervisor_build_scrubs_target_specific_compiler_overrides() -> Result<(), String> {
-        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
-        let script = fs::read_to_string(&script_path)
-            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
-        for required in [
-            "scrub_ambient_compiler_overrides()",
-            "CARGO_TARGET_*",
-            "CARGO_BUILD_* | CARGO_PROFILE_*",
-            "CC | CC_* | *_CC",
-            "CFLAGS | CFLAGS_* | *_CFLAGS",
-            "SOURCE_DATE_EPOCH",
-            "unset \"${variable_name}\"",
-        ] {
-            assert!(
-                script.contains(required),
-                "the supervisor build must remove target-specific ambient compiler inputs: missing {required}"
-            );
-        }
-        let scrub = script
-            .find("\nscrub_ambient_compiler_overrides\n")
-            .ok_or_else(|| "the build must scrub its parent environment".to_owned())?;
-        let source_checkout = script
-            .find("git init --quiet")
-            .ok_or_else(|| "the build must retain its pinned source checkout".to_owned())?;
-        let image_build = script
-            .find("docker buildx build")
-            .ok_or_else(|| "the build must retain its pinned image packaging".to_owned())?;
-        assert!(
-            scrub < source_checkout && scrub < image_build,
-            "ambient compiler inputs must be scrubbed in the parent before both compilation and image packaging"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn supervisor_cache_key_includes_its_build_implementation() -> Result<(), String> {
-        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
-        let script = fs::read_to_string(&script_path)
-            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
-        for required in [
-            "build_script_sha256()",
-            "\"build-script-sha256=$(build_script_sha256)\"",
-        ] {
-            assert!(
-                script.contains(required),
-                "the reusable supervisor image must be invalidated by build-logic changes: missing {required}"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn supervisor_build_isolates_git_and_cargo_config_discovery() -> Result<(), String> {
-        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
-        let script = fs::read_to_string(&script_path)
-            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
-        for required in [
-            "GIT_CONFIG_GLOBAL=/dev/null",
-            "GIT_CONFIG_SYSTEM=/dev/null",
-            "GIT_CONFIG_NOSYSTEM=1",
-            "\"${SOURCE_DIR}/.cargo/config.toml\"",
-            "\"${SUPERVISOR_CARGO_HOME}/config.toml\"",
-            "cd /",
-            "--manifest-path \"${SOURCE_DIR}/Cargo.toml\"",
-        ] {
-            assert!(
-                script.contains(required),
-                "the supervisor build must isolate ambient Git and Cargo config while retaining the pinned upstream config: missing {required}"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn supervisor_runtime_locks_the_complete_apk_closure() -> Result<(), String> {
-        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
-        let script = fs::read_to_string(&script_path)
-            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
-        for package in [
-            "alpine-baselayout=3.7.0-r0",
-            "alpine-baselayout-data=3.7.0-r0",
-            "alpine-keys=2.5-r0",
-            "alpine-release=3.22.5-r0",
-            "apk-tools=2.14.10-r0",
-            "busybox=1.37.0-r20",
-            "busybox-binsh=1.37.0-r20",
-            "ca-certificates-bundle=20260611-r0",
-            "gmp=6.3.0-r3",
-            "iptables=1.8.11-r1",
-            "iptables-legacy=1.8.11-r1",
-            "jansson=2.14.1-r0",
-            "libapk2=2.14.10-r0",
-            "libcrypto3=3.5.7-r0",
-            "libip4tc=1.8.11-r1",
-            "libip6tc=1.8.11-r1",
-            "libmnl=1.0.5-r2",
-            "libncursesw=6.5_p20250503-r0",
-            "libnftnl=1.2.9-r0",
-            "libssl3=3.5.7-r0",
-            "libxtables=1.8.11-r1",
-            "musl=1.2.5-r12",
-            "musl-utils=1.2.5-r12",
-            "ncurses-terminfo-base=6.5_p20250503-r0",
-            "nftables=1.1.3-r0",
-            "readline=8.2.13-r1",
-            "scanelf=1.3.8-r1",
-            "ssl_client=1.37.0-r20",
-            "zlib=1.3.2-r0",
-        ] {
-            assert!(
-                script.contains(package),
-                "the pinned supervisor runtime package closure is incomplete: missing {package}"
-            );
-        }
-        assert!(
-            script.contains(
-                "RUN --network=none apk --no-cache --no-network --repositories-file /dev/null add /tmp/steward-apks/*.apk"
-            ),
-            "the generated runtime image must install the locked package closure without repository resolution"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn supervisor_runtime_installs_checksum_pinned_apks_without_repository_indexes()
-    -> Result<(), String> {
-        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
-        let script = fs::read_to_string(&script_path)
-            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
-        for required in [
-            "APK_ARTIFACTS_AARCH64=(",
-            "APK_ARTIFACTS_X86_64=(",
-            "download_apk_artifacts()",
-            "openssl dgst -sha256 -r",
-            "RUN --network=none apk --no-cache --no-network ",
-            "--repositories-file /dev/null add /tmp/steward-apks/*.apk",
-        ] {
-            assert!(
-                script.contains(required),
-                "the supervisor runtime must install checksum-pinned APK artifacts without a mutable repository index: missing {required}"
-            );
-        }
-        assert!(
-            !script.contains("apk add --no-cache ${APK_PACKAGE_CLOSURE[*]}"),
-            "the supervisor runtime must not resolve its locked package closure through a mutable APKINDEX"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn supervisor_build_signals_terminate_after_cleanup() -> Result<(), String> {
-        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
-        let script = fs::read_to_string(&script_path)
-            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
-        for required in [
-            "trap cleanup EXIT",
-            "trap 'exit 130' INT",
-            "trap 'exit 143' TERM",
-        ] {
-            assert!(
-                script.contains(required),
-                "the supervisor build must terminate after handling signals: missing {required}"
-            );
-        }
-        assert!(
-            !script.contains("trap cleanup EXIT INT TERM"),
-            "cleanup alone must not handle INT or TERM because Bash can resume execution afterwards"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn supervisor_build_pins_runtime_layer_inputs() -> Result<(), String> {
-        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
-        let script = fs::read_to_string(&script_path)
-            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
-        for required in [
-            "# syntax=${DOCKERFILE_FRONTEND_IMAGE}",
-            "FROM ${SUPERVISOR_BASE_IMAGE} AS supervisor",
-            "COPY deploy/docker/.build/steward-apks/ /tmp/steward-apks/",
-            "RUN --network=none apk --no-cache --no-network ",
-            "--repositories-file /dev/null add /tmp/steward-apks/*.apk",
-        ] {
-            assert!(
-                script.contains(required),
-                "the supervisor runtime layer must be generated from pinned inputs: missing {required}"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn cached_openshell_supervisor_must_match_the_build_contract() -> Result<(), String> {
-        let fixture = TestRepository::create()?;
-        let bin = fixture.path.join("bin");
-        fs::create_dir(&bin)
-            .map_err(|error| format!("failed to create fake tool directory: {error}"))?;
-        write_executable(
-            &bin.join("docker"),
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-case "$1:$2" in
-  info:--format)
-    printf '%s\n' "${FAKE_DOCKER_ENGINE_ARCHITECTURE}"
-    ;;
-  image:inspect)
-    printf '%s\n' "${FAKE_DOCKER_IMAGE_METADATA}"
-    ;;
-  *)
-    exit 2
-    ;;
-esac
-"#,
-        )?;
-
-        let system_path =
-            std::env::var("PATH").map_err(|error| format!("PATH is unset: {error}"))?;
-        let path = format!("{}:{system_path}", bin.display());
-        let script = root().join("scripts/build-patched-openshell-supervisor.sh");
-        let current_metadata =
-            "d29214a0fd77894403531f86abfa7bc52db6c375c251d924be300552c1285c3d|arm64";
-        let current = Command::new("bash")
-            .arg(&script)
-            .arg("--image-is-current")
-            .env("PATH", &path)
-            .env("FAKE_DOCKER_ENGINE_ARCHITECTURE", "aarch64")
-            .env("FAKE_DOCKER_IMAGE_METADATA", current_metadata)
-            .output()
-            .map_err(|error| format!("failed to validate current supervisor image: {error}"))?;
-        assert!(
-            current.status.success(),
-            "an image matching the source, patch content, and Docker architecture must be reusable: {}",
-            String::from_utf8_lossy(&current.stderr)
-        );
-
-        for stale_metadata in [
-            // The prior build logic and partial APK closure must not be reusable.
-            "f445d04ba50e2d50690b58696fd67111ab36c74060e4229d5e0b7f33e4934d2d|arm64",
-            "d29214a0fd77894403531f86abfa7bc52db6c375c251d924be300552c1285c3d|amd64",
-        ] {
-            let stale = Command::new("bash")
-                .arg(&script)
-                .arg("--image-is-current")
-                .env("PATH", &path)
-                .env("FAKE_DOCKER_ENGINE_ARCHITECTURE", "aarch64")
-                .env("FAKE_DOCKER_IMAGE_METADATA", stale_metadata)
-                .output()
-                .map_err(|error| format!("failed to validate stale supervisor image: {error}"))?;
-            assert!(
-                !stale.status.success(),
-                "an image with a stale build contract or architecture must be rebuilt"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn openshell_identity_spike_validates_a_cached_supervisor_before_reuse() -> Result<(), String> {
-        let script_path = root().join("scripts/s0-0-openshell-spike.sh");
-        let script = fs::read_to_string(&script_path)
-            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
-        assert!(
-            script.contains(
-                "\"${ROOT}/scripts/build-patched-openshell-supervisor.sh\" --image-is-current"
-            ),
-            "the identity spike must validate the cached image against the pinned build contract"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn exact_mise_cross_tools_override_mismatched_path_tools() -> Result<(), String> {
-        let fixture = TestRepository::create()?;
-        let ambient_bin = fixture.path.join("ambient-bin");
-        let pinned_zig_bin = fixture.path.join("pinned-zig");
-        let pinned_zigbuild_bin = fixture.path.join("pinned-zigbuild");
-        for directory in [&ambient_bin, &pinned_zig_bin, &pinned_zigbuild_bin] {
-            fs::create_dir(directory)
-                .map_err(|error| format!("failed to create {}: {error}", directory.display()))?;
-        }
-        for command in ["cargo", "git"] {
-            write_executable(&ambient_bin.join(command), "#!/bin/sh\nexit 0\n")?;
-        }
-        write_executable(
-            &ambient_bin.join("rustup"),
-            r#"#!/bin/sh
-if [ "$1:$2:$3" = "run:1.95.0:rustc" ]; then
-  printf 'rustc 1.95.0 (59807616e 2026-04-14)\n'
-fi
-exit 0
-"#,
-        )?;
-        write_executable(
-            &ambient_bin.join("docker"),
-            r#"#!/bin/sh
-if [ "$1:$2" = "buildx:version" ]; then
-  exit 0
-fi
-if [ "$1:$2" = "info:--format" ]; then
-  printf 'linux\n'
-  exit 0
-fi
-exit 2
-"#,
-        )?;
-        write_executable(&ambient_bin.join("zig"), "#!/bin/sh\nprintf '0.99.0\\n'\n")?;
-        write_executable(
-            &ambient_bin.join("cargo-zigbuild"),
-            "#!/bin/sh\nprintf 'cargo-zigbuild 0.99.0\\n'\n",
-        )?;
-        write_executable(
-            &ambient_bin.join("mise"),
-            r#"#!/bin/sh
-case "$2" in
-  zig@0.14.1)
-    printf '%s\n' "${FAKE_PINNED_ZIG_BIN}"
-    ;;
-  github:rust-cross/cargo-zigbuild@0.22.3)
-    printf '%s\n' "${FAKE_PINNED_ZIGBUILD_BIN}"
-    ;;
-  *)
-    exit 1
-    ;;
-esac
-"#,
-        )?;
-        write_executable(
-            &pinned_zig_bin.join("zig"),
-            "#!/bin/sh\nprintf '0.14.1\\n'\n",
-        )?;
-        write_executable(
-            &pinned_zigbuild_bin.join("cargo-zigbuild"),
-            "#!/bin/sh\nprintf 'cargo-zigbuild 0.22.3\\n'\n",
-        )?;
-
-        let system_path =
-            std::env::var("PATH").map_err(|error| format!("PATH is unset: {error}"))?;
-        let output = Command::new("bash")
-            .arg(root().join("scripts/build-patched-openshell-supervisor.sh"))
-            .arg("--check-prerequisites")
-            .env("PATH", format!("{}:{system_path}", ambient_bin.display()))
-            .env("FAKE_PINNED_ZIG_BIN", &pinned_zig_bin)
-            .env("FAKE_PINNED_ZIGBUILD_BIN", &pinned_zigbuild_bin)
-            .output()
-            .map_err(|error| format!("failed to inspect cross-tool selection: {error}"))?;
-        assert!(
-            output.status.success(),
-            "exact mise tools must be selected when ambient versions differ: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn supervisor_build_requires_openssl_before_expensive_work() -> Result<(), String> {
-        let script_path = root().join("scripts/build-patched-openshell-supervisor.sh");
-        let script = fs::read_to_string(&script_path)
-            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
-        let requirement = script
-            .find("for command_name in cargo curl docker git openssl rustup;")
-            .ok_or_else(|| {
-                "the supervisor build must reject a missing OpenSSL before cloning or compiling"
-                    .to_owned()
-            })?;
-        let source_checkout = script
-            .find("git init --quiet")
-            .ok_or_else(|| "the supervisor build must check out its pinned source".to_owned())?;
-        assert!(
-            requirement < source_checkout,
-            "OpenSSL must be validated before the supervisor source checkout begins"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn s0_e2e_does_not_require_identity_demo_jq() -> Result<(), String> {
-        let script_path = root().join("scripts/s0-0-openshell-spike.sh");
-        let script = fs::read_to_string(&script_path)
-            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
-        let common_requirements = script
-            .split_once("for command in ")
-            .and_then(|(_, remainder)| remainder.split_once("; do"))
-            .map(|(commands, _)| commands)
-            .ok_or_else(|| "the common S0 prerequisite set must be explicit".to_owned())?;
-        assert!(
-            !common_requirements
-                .split_whitespace()
-                .any(|command| command == "jq"),
-            "the common S0 prerequisite set must not include identity-demo-only jq"
-        );
-        let jq_requirement = script
-            .find("if [[ \"$#\" -eq 0 ]] && ! command -v jq")
-            .ok_or_else(|| "the identity-demo mode must still require jq".to_owned())?;
-        let image_build = script
-            .find("build-patched-openshell-supervisor.sh\" --image-is-current")
-            .ok_or_else(|| "the identity demo must validate its patched image".to_owned())?;
-        let cluster_setup = script
-            .find("kind create cluster")
-            .ok_or_else(|| "the spike must retain its ephemeral cluster setup".to_owned())?;
-        assert!(
-            jq_requirement < image_build && jq_requirement < cluster_setup,
-            "identity-demo-only jq must be checked before image build or cluster setup"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn openshell_identity_spike_defaults_to_the_carried_supervisor_image() -> Result<(), String> {
-        let output = Command::new("bash")
-            .arg(root().join("scripts/s0-0-openshell-spike.sh"))
-            .arg("--print-identity-supervisor-image")
-            .output()
-            .map_err(|error| format!("failed to inspect identity supervisor image: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "identity supervisor selection failed before cluster setup: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            "openshell/supervisor:steward-spiffe-v0090",
-            "the identity spike must use the supervisor built from the carried patch"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn openshell_sandbox_image_override_is_optional_under_bash_nounset() -> Result<(), String> {
-        let script_path = root().join("scripts/s0-0-openshell-spike.sh");
-        let script = fs::read_to_string(&script_path)
-            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
-
-        assert!(
-            script.contains(
-                "if [[ -n \"${STEWARD_OPENSHELL_SANDBOX_IMAGE:-}\" ]]; then\n  openshell_helm_args+=(\"${sandbox_image_args[@]}\")\nfi"
-            ),
-            "the optional sandbox image args must not expand an empty array under Bash nounset"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn openshell_identity_spike_declares_its_spire_issuer_trust_bundle() -> Result<(), String> {
-        let output = Command::new("bash")
-            .arg(root().join("scripts/s0-0-openshell-spike.sh"))
-            .arg("--print-spire-issuer-ca-configmap")
-            .output()
-            .map_err(|error| format!("failed to inspect SPIRE issuer trust bundle: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "SPIRE issuer trust selection failed before cluster setup: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            "openshell-spire-oidc-ca",
-            "the token issuer must consume a named run-scoped SPIRE CA ConfigMap"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn openshell_spike_cleanup_never_updates_the_ambient_kubeconfig() -> Result<(), String> {
-        let script_path = root().join("scripts/s0-0-openshell-spike.sh");
-        let script = fs::read_to_string(&script_path)
-            .map_err(|error| format!("failed to read {}: {error}", script_path.display()))?;
-        assert!(
-            script.contains(
-                "KUBECONFIG=\"${KUBECONFIG_PATH}\" kind delete cluster --name \"${CLUSTER_NAME}\""
-            ),
-            "owned kind-cluster cleanup must use the run kubeconfig even on early interruption"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn g1_github_api_probe_uses_a_non_secret_user_agent() -> Result<(), String> {
         let script_path = root().join("scripts/g1-upstream-conformance-inside.sh");
         let script = fs::read_to_string(&script_path)
@@ -4323,50 +3132,6 @@ esac
             ),
             "G-1 must pass only on curl's failed CONNECT exit paired with OpenShell's explicit 403 denial"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn g1_pinned_base_image_is_preloaded_before_the_sandbox_probe() -> Result<(), String> {
-        let wrapper = fs::read_to_string(root().join("scripts/g1-upstream-conformance"))
-            .map_err(|error| format!("failed to read G-1 wrapper: {error}"))?;
-        let setup = fs::read_to_string(root().join("scripts/s0-0-openshell-spike.sh"))
-            .map_err(|error| format!("failed to read OpenShell setup: {error}"))?;
-        let probe = fs::read_to_string(root().join("scripts/g1-upstream-conformance-inside.sh"))
-            .map_err(|error| format!("failed to read G-1 probe: {error}"))?;
-
-        assert!(
-            wrapper.contains("STEWARD_G1_BASE_IMAGE=\"${G1_BASE_IMAGE}\""),
-            "G-1 must pass its pinned base-image digest to the run-owned setup"
-        );
-        let cluster_created = setup
-            .find("CLUSTER_CREATED=1")
-            .ok_or("OpenShell setup must track the created Kind cluster")?;
-        let preload = setup
-            .find("g1-preload-kind-base-image.sh")
-            .ok_or("G-1 must preload the pinned base image in the owned Kind node")?;
-        let helm_install = setup
-            .find("helm \"${openshell_helm_args[@]}\"")
-            .ok_or("OpenShell setup must install the upstream chart")?;
-        assert!(
-            cluster_created < preload && preload < helm_install,
-            "G-1 image preload must finish after Kind creation and before sandbox setup"
-        );
-        assert!(
-            probe
-                .contains("--from \"${STEWARD_G1_BASE_IMAGE:?G-1 pinned base image is required}\""),
-            "G-1 must create its sandbox from the same pinned image that was preloaded"
-        );
-        let regression = Command::new("bash")
-            .arg(root().join("scripts/test-g1-kind-base-image-preload.sh"))
-            .output()
-            .map_err(|error| format!("failed to run G-1 preload regressions: {error}"))?;
-        if !regression.status.success() {
-            return Err(format!(
-                "G-1 preload regressions failed: {}",
-                String::from_utf8_lossy(&regression.stderr).trim()
-            ));
-        }
         Ok(())
     }
 

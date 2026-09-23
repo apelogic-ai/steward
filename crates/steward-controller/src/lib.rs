@@ -4984,7 +4984,7 @@ mod tests {
             mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
             mcp_gw_version: "0.3.2".to_owned(),
             namespace: "steward-test".to_owned(),
-            runtime_class: "kata-qemu".to_owned(),
+            runtime_class: "sandbox-vm".to_owned(),
         };
         let current = ProviderControlExecutionBindings {
             artifact_trust_mode: persisted.artifact_trust_mode.clone(),
@@ -5136,7 +5136,7 @@ mod tests {
             mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
             mcp_gw_version: "0.3.2".to_owned(),
             namespace: "steward-connections".to_owned(),
-            runtime_class: "kata-qemu".to_owned(),
+            runtime_class: "sandbox-vm".to_owned(),
         };
         let operation = ConnectionOperationRecord {
             operation_id: serde_json::from_value(serde_json::json!(
@@ -7230,7 +7230,7 @@ mod webhook_tests {
                 mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
                 mcp_gw_version: "0.3.2".to_owned(),
                 namespace: "steward-connections".to_owned(),
-                runtime_class: "kata-qemu".to_owned(),
+                runtime_class: "sandbox-vm".to_owned(),
             },
             idempotency_identity: operation_id.to_string(),
             uncached_status: false,

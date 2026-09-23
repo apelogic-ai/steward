@@ -152,7 +152,7 @@ steward/
   conformance/                # G-1…G-6 (§8.1)
   xtask/                      # task runner; see below
   web/                        # portal; generated OpenAPI client
-  third_party/openshell-patches/   # each patch beside its upstream attempt (§8.4)
+  third_party/                # exceptional upstream patches and licenses (§8.4)
   docs/                       # these specs
   AGENTS.md  CLAUDE.md
 ```
@@ -194,7 +194,7 @@ Three things stay **out**:
 | Out | Why |
 |---|---|
 | **Existing internal systems** | They have their own lifecycles and are ordinary API clients (§2.6.1). Any migration adapter lives in their repository, not ours |
-| **An OpenShell fork** | We carry patches, not a fork. `third_party/openshell-patches/`, each with its upstream attempt and exit condition |
+| **An upstream fork** | Exceptional patches live under `third_party/`, each with its upstream attempt and exit condition |
 | **Customer/tenant config** | Not a v0.1.0 concern; when it arrives it is data, not code |
 
 One inconsistency to settle now: `observer` uses `master`. Steward uses `main`,
