@@ -257,7 +257,6 @@ export type BrowserRunTimelineResponse = {
 export type BrowserRunView = {
     codingAgentRuntime: string;
     createdAt: string;
-    envelopeRevision?: number | null;
     errorCategory?: string | null;
     finalizationRequested: boolean;
     finalized: boolean;
@@ -274,12 +273,6 @@ export type BrowserRunView = {
     workflowDigest?: string | null;
     workflowName?: string | null;
     workflowVersion?: number | null;
-};
-
-export type BrowserServiceEnvelopeResponse = {
-    apiVersion: string;
-    envelope: BrowserEnvelope;
-    service: string;
 };
 
 export type Budget = {
@@ -315,6 +308,12 @@ export type CanonicalAuthorityBinding = {
  * The value deliberately contains no email, identity-provider subject, or organization name.
  */
 export type CanonicalUserId = string;
+
+export type CapabilityCatalog = {
+    models: Array<ModelRef>;
+    schemaVersion: string;
+    tools: Array<ToolGrant>;
+};
 
 export type ClosureEntry = {
     digest: ContentDigest;
@@ -1059,6 +1058,30 @@ export type FileAdminApprovalDecisionResponses = {
 
 export type FileAdminApprovalDecisionResponse = FileAdminApprovalDecisionResponses[keyof FileAdminApprovalDecisionResponses];
 
+export type GetAdminCapabilitiesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/capabilities';
+};
+
+export type GetAdminCapabilitiesErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+};
+
+export type GetAdminCapabilitiesResponses = {
+    200: CapabilityCatalog;
+};
+
+export type GetAdminCapabilitiesResponse = GetAdminCapabilitiesResponses[keyof GetAdminCapabilitiesResponses];
+
 export type ConnectionStatusData = {
     body?: never;
     path?: never;
@@ -1347,11 +1370,11 @@ export type AuthorAdminEnvelopeTemplateErrors = {
      */
     409: unknown;
     /**
-     * Member role, envelope, or current Service Envelope model/tool subset is invalid
+     * Member role, envelope, or deployed capability selection is invalid
      */
     422: unknown;
     /**
-     * Envelope templates or the managed Service Envelope are unavailable
+     * Envelope templates are unavailable
      */
     503: unknown;
 };
@@ -1493,38 +1516,6 @@ export type AgentRunTimelineContractResponses = {
 };
 
 export type AgentRunTimelineContractResponse = AgentRunTimelineContractResponses[keyof AgentRunTimelineContractResponses];
-
-export type GetAdminServiceEnvelopeData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/admin/api/v1/service-envelope';
-};
-
-export type GetAdminServiceEnvelopeErrors = {
-    /**
-     * Browser session is absent or invalid
-     */
-    401: unknown;
-    /**
-     * Administrator role is required
-     */
-    403: unknown;
-    /**
-     * The managed Service Envelope is not provisioned
-     */
-    404: unknown;
-    /**
-     * The managed Service Envelope is unavailable
-     */
-    503: unknown;
-};
-
-export type GetAdminServiceEnvelopeResponses = {
-    200: BrowserServiceEnvelopeResponse;
-};
-
-export type GetAdminServiceEnvelopeResponse = GetAdminServiceEnvelopeResponses[keyof GetAdminServiceEnvelopeResponses];
 
 export type SessionData = {
     body?: never;
@@ -2127,7 +2118,7 @@ export type TaskSubmissionContractErrors = {
      */
     404: TaskErrorResponse;
     /**
-     * Idempotency key or adopted runtime conflicts
+     * Idempotency key conflicts with an existing Task
      */
     409: TaskErrorResponse;
     /**
@@ -2135,7 +2126,7 @@ export type TaskSubmissionContractErrors = {
      */
     415: string;
     /**
-     * Workflow, runtime version, service envelope, or authority is invalid
+     * Workflow, runtime version, User Envelope, or authority is invalid
      */
     422: TaskErrorResponse;
     /**
@@ -2152,11 +2143,7 @@ export type TaskSubmissionContractResponses = {
      */
     200: TaskStatusResponse;
     /**
-     * An exact legacy retry returns an existing Task whose runtime binding has already been observed by the controller; the request performs no runtime lifecycle effect
-     */
-    201: TaskStatusResponse;
-    /**
-     * A new Task is accepted for controller-owned runtime creation, exact legacy adopted-runtime observation, or a governed approval hold. Legacy adoption projects the immutable server-validated target runtimeUid for caller compatibility, not binding or readiness evidence; otherwise runtimeUid is null until controller binding
+     * A new direct-package or versioned Workflow Task is accepted for controller-owned runtime creation; runtimeUid is null until controller binding
      */
     202: TaskStatusResponse;
 };

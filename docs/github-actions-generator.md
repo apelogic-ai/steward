@@ -18,8 +18,9 @@ the authenticated server from:
 The renderer requires the request and context bindings to match exactly. A stale envelope, a
 different release, a template outside the envelope, an unknown field, or an unsupported schema
 fails before YAML is emitted. The envelope binding is repeated in the non-secret generated-file
-header. It is generation-time provenance; the service envelope remains the runtime authority and
-is enforced again when Steward admits the Task.
+header. It is generation-time provenance; Task admission independently resolves and snapshots the
+authenticated user's exact provisioned User Envelope. The renderer and deployment capability
+catalog grant no runtime authority.
 
 The v1 request schema is `steward/github-actions-render-request/v1`. Its only task template is
 `github-file-read/v1`, with a repository name, full 40-character Git commit, and relative file

@@ -3665,15 +3665,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "steward-adapter-jira"
-version = "0.0.0"
-dependencies = [
- "reqwest 0.12.28",
- "serde",
- "steward-ports",
-]
-
-[[package]]
 name = "steward-adapter-mcp-gw"
 version = "0.0.0"
 dependencies = [

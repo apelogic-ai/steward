@@ -8,10 +8,16 @@ endpoint, OpenShell, LiteLLM, or SPIRE. Governed
 execution and Jira are explicit opt-ins with additional prerequisites; they
 do not silently activate when an integration is absent.
 
+In Steward v0.2, every external Task is governed solely by the authenticated
+user's exact provisioned User Envelope. The controller persists and recovers
+that immutable authority snapshot. Product-owned Connection operations use
+fixed internal authorities, while the deployment capability catalog describes
+available models and tools without granting authority.
+
 Steward is available under the [MIT License](LICENSE). Checked-in upstream
 patches retain their [third-party notices](THIRD_PARTY_NOTICES.md).
 
-Current installation contract: chart `0.1.23`, Kubernetes `>=1.30`, Helm 3.17+,
+Current installation contract: chart `0.2.0`, Kubernetes `>=1.30`, Helm 3.17+,
 and PostgreSQL 16 as the tested database line. Governed adapter evidence pins
 OpenShell `v0.0.98` with agent-sandbox `v0.5.0`. No registry is a default:
 release images and the OCI
@@ -32,7 +38,9 @@ records the limits of this tested matrix.
 | Normative M1 fields, ownership, and compatibility | [Frozen `steward.m1/v1` contract](docs/contracts/m1/v1/README.md) |
 | Accepted post-M1 Agent, Task, session, and runtime semantics | [Post-M1 architecture baseline](docs/v2/README.md) |
 | Post-M1 contracts that remain unresolved | [Deferred-contract register](docs/v2/deferred-implementation-contracts.md) |
-| Implemented v0.1.x Task lifecycle and identity contract | [Task submission API](docs/task-submission-api.md) |
+| Implemented v0.2 Task lifecycle and identity contract | [Task submission API](docs/task-submission-api.md) |
+| Upgrade and rollback boundary from v0.1.23 | [v0.2 upgrade guide](docs/installation/upgrade-v0.2.0.md) |
+| Release history and security-relevant changes | [Changelog](CHANGELOG.md) |
 | Canonical browser / Task person identity | [Canonical user identity](docs/canonical-user-identity-v1.md) |
 | Understand the Task API and worker contract | [Task deployment](config/task/README.md) |
 | Configure coding-agent versions | [Execution bindings](docs/installation/execution-bindings.md) |

@@ -60,3 +60,10 @@ approved retention correction, not permission to rewrite an execution result.
 Migration 0038 permits governed connection operations to select the Kubernetes
 cluster-default runtime by storing an empty `runtime_class`. Whitespace-only
 values remain invalid, and explicit nonblank RuntimeClass bindings are unchanged.
+
+Migration 0039 removes Service Envelope authority from new and unfinished Task
+orchestration. Version 3 persists either the exact approved User Envelope snapshot
+or the existing code-owned internal authority pins. The upgrade resumes unfinished
+v0.1.23 Tasks only when that authority is recoverable exactly and aborts rather
+than guessing for unfinished legacy work. Terminal version 1/2 history remains
+readable.

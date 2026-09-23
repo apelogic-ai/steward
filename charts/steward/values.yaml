@@ -131,7 +131,11 @@ config:
     jiraProjectKey: ""
     jiraAccountEmail: ""
     kubernetesTokenReviewAudience: https://kubernetes.default.svc
-    taskWorkflowsJson: "[]"
+    # Deployment availability only. This catalog grants no Task or user authority.
+    capabilityCatalog:
+      schemaVersion: steward.capability-catalog/v1
+      models: []
+      tools: []
     # Keep staged for the first binary rollout; activate only after every controller is upgraded.
     executionBindingsMode: staged
     # Deployment-owned catalog. An empty list advertises no coding agents and creates no fallback.

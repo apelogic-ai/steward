@@ -391,7 +391,7 @@
             "jiraProjectKey",
             "jiraAccountEmail",
             "kubernetesTokenReviewAudience",
-            "taskWorkflowsJson",
+            "capabilityCatalog",
             "executionBindingsMode",
             "executionBindings",
             "inferenceEndpoint",
@@ -407,7 +407,43 @@
               "minLength": 1,
               "pattern": "\\S"
             },
-            "taskWorkflowsJson": {"type": "string", "pattern": "^\\s*\\[", "minLength": 2},
+            "capabilityCatalog": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["schemaVersion", "models", "tools"],
+              "properties": {
+                "schemaVersion": {"const": "steward.capability-catalog/v1"},
+                "models": {
+                  "type": "array",
+                  "maxItems": 256,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["provider", "model"],
+                    "properties": {
+                      "provider": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
+                      "model": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"}
+                    }
+                  }
+                },
+                "tools": {
+                  "type": "array",
+                  "maxItems": 1024,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["provider", "resource", "action"],
+                    "properties": {
+                      "provider": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
+                      "resource": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
+                      "action": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"}
+                    }
+                  }
+                }
+              }
+            },
             "executionBindingsMode": {"type": "string", "enum": ["staged", "active"]},
             "inferenceEndpoint": {"type": "string", "pattern": "^$|^https?://"},
             "anthropicInferenceEndpoint": {"type": "string", "pattern": "^$|^https?://"},

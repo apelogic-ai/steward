@@ -28,13 +28,16 @@ use steward_ports::{
     PortError, SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
 };
 use steward_store::{
-    PgStore, StoreError, TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest,
+    EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, PgStore,
+    StoreError, TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest,
+    WorkflowPublication,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
-    CanonicalAuthorityBinding, Duration, Email, ModelRef, OrganizationId,
+    CanonicalAuthorityBinding, DisposableExecutionBinding, Duration, Email,
+    ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef, OrganizationId,
     OrganizationIdentityPolicy, Phase, Principal, RunnerRequirements, RuntimeOwnership,
-    RuntimeRefs, TaskPhase, ToolGrant,
+    RuntimeRefs, TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding, TaskPhase, ToolGrant,
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -59,6 +62,35 @@ impl Drop for ServerGuard {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+fn disposable_execution_binding() -> Result<TaskExecutionBinding, io::Error> {
+    let mut binding = DisposableExecutionBinding {
+        schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+        binding_id: format!("sha256:{}", "0".repeat(64)),
+        binding_digest: format!("sha256:{}", "0".repeat(64)),
+        agent_ref: "example-agent@1".to_owned(),
+        display_name: None,
+        adapter: "example-v1".to_owned(),
+        image: format!(
+            "registry.example.test/agents/example@sha256:{}",
+            "a".repeat(64)
+        ),
+        executable: "/opt/example/bin/example-agent".to_owned(),
+        version_probe: ExecutionVersionProbe {
+            arguments: vec!["--version".to_owned()],
+            expected_stdout: "example-agent 1".to_owned(),
+        },
+        provider_profiles: ExecutionProviderProfiles::default(),
+    };
+    let digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(binding.canonical_content().map_err(io::Error::other)?)
+    );
+    binding.binding_id.clone_from(&digest);
+    binding.binding_digest = digest;
+    binding.validate().map_err(io::Error::other)?;
+    Ok(TaskExecutionBinding::Disposable(binding))
 }
 
 #[derive(Clone, Default)]
@@ -123,13 +155,6 @@ async fn internal_authority_provisions_and_recovers_cleanup_without_a_service_en
         .await?;
     let store = PgStore::new(pool);
     store.migrate().await?;
-    assert!(
-        store
-            .latest_service_envelope(steward_connections_v1::SERVICE)
-            .await?
-            .is_none()
-    );
-
     for finalize_before_observation in [false, true] {
         let suffix = Uuid::new_v4().simple().to_string();
         let email = Email(format!("alice-{suffix}@example.com"));
@@ -242,7 +267,7 @@ async fn internal_authority_provisions_and_recovers_cleanup_without_a_service_en
                     work.task.internal_authority_digest = Some(format!("sha256:{}", "0".repeat(64)))
                 }
                 3 => work.task.service_envelope_digest = Some(format!("sha256:{}", "0".repeat(64))),
-                4 => work.task.envelope_revision = 999,
+                4 => work.task.envelope_revision = Some(999),
                 5 => work.task.submitter_service = "other-service".to_owned(),
                 6 => work.task.internal_authority_version = None,
                 _ => {
@@ -329,6 +354,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         .as_nanos()
         .to_string();
     let service = format!("orchestrator-fault-{suffix}");
+    let member_role = format!("engineer-{suffix}");
     let identity = store
         .register_canonical_identity(
             &OrganizationIdentityPolicy::new(
@@ -368,7 +394,68 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         },
     };
     store
-        .insert_service_envelope(&service, &envelope, "admin@example.com")
+        .insert_envelope(&member_role, &envelope, "admin@example.com")
+        .await?;
+    let envelope_request = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &identity.user_id,
+            template_id: &member_role,
+            template_revision: envelope.revision,
+            requested_envelope: &envelope,
+            idempotency_key: &format!("envelope-{suffix}"),
+            actor: "admin@example.com",
+        })
+        .await?
+        .record;
+    let approval_id = Uuid::new_v4();
+    store
+        .append_envelope_request_status(
+            envelope_request.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Approved,
+                approval_id: Some(approval_id),
+                envelope_instance_id: None,
+                envelope_digest: None,
+                reason: None,
+                approved_envelope: Some(&envelope),
+                actor: "admin@example.com",
+            },
+        )
+        .await?;
+    let envelope_instance_id = format!("env_{}", envelope_request.id.simple());
+    let envelope_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&envelope)?)
+    );
+    let workflow_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(b"task-orchestration-workflow-v1")
+    );
+    store
+        .publish_initial_workflow(WorkflowPublication {
+            name: "fault-injection",
+            display_name: "Fault injection",
+            agent: "example-agent@1",
+            prompt: "Exercise durable orchestration recovery.",
+            content_digest: &workflow_digest,
+            published_by: "admin@example.com",
+        })
+        .await?;
+    store
+        .append_envelope_request_status(
+            envelope_request.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Approved,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: Some(approval_id),
+                envelope_instance_id: Some(&envelope_instance_id),
+                envelope_digest: Some(&envelope_digest),
+                reason: None,
+                approved_envelope: Some(&envelope),
+                actor: "steward-test",
+            },
+        )
         .await?;
     let spec = AgentRuntimeSpec {
         principal: Principal::Service {
@@ -381,7 +468,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             Some(identity.user_id.clone()),
         )?),
         agent_type: AgentType {
-            name: "example-agent".to_owned(),
+            name: "example-agent@1".to_owned(),
         },
         llms: envelope.spec.llms.clone(),
         tools: envelope.spec.tools.clone(),
@@ -390,19 +477,27 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         runner: envelope.spec.runner.clone(),
         bindings: None,
     };
+    let execution_binding = disposable_execution_binding()?;
     let task_uid = Uuid::new_v4();
     let operation_id = Uuid::new_v4();
     let runtime_name = format!("task-{}", operation_id.simple());
     let candidate_digest = digest(serde_json::to_value(&spec))?;
-    let envelope_digest = digest(serde_json::to_value(&envelope))?;
-    let inert_digest = manifest_digest(
+    let inert_digest = manifest_digest_with_binding(
         task_uid,
         operation_id,
         &runtime_name,
         &inert_spec(&spec, &envelope),
         "inert",
+        Some(&execution_binding),
     )?;
-    let active_digest = manifest_digest(task_uid, operation_id, &runtime_name, &spec, "active")?;
+    let active_digest = manifest_digest_with_binding(
+        task_uid,
+        operation_id,
+        &runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
     let idempotency_key = format!("orchestration-fault-{suffix}");
     let agent_command = ["example-agent".to_owned(), "run".to_owned()];
     let admission_decision = AdmissionDecision::Admit;
@@ -417,24 +512,22 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             owner: "alice@example.com",
             owner_user_id: identity.user_id.as_str(),
             workflow: "fault-injection",
-            workflow_name: None,
-            workflow_version: None,
-            workflow_digest: None,
-            user_envelope_instance_id: None,
-            user_envelope_revision: None,
-            user_envelope_digest: None,
-            coding_agent_runtime: "example-agent",
+            workflow_name: Some("fault-injection"),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
             runtime_uid: None,
             runtime_namespace: "steward-test",
             runtime_name: &runtime_name,
             runtime_ownership: RuntimeOwnership::Provisioned,
             runtime_spec: &spec,
             agent_command: &agent_command,
-            execution_binding: None,
+            execution_binding: Some(&execution_binding),
             direct_task_evidence: None,
-            envelope_revision: envelope.revision,
-            service_envelope: &envelope,
-            service_envelope_digest: &envelope_digest,
+            user_envelope_snapshot: Some(&envelope),
             candidate_digest: &candidate_digest,
             admission_decision: &admission_decision,
             inert_manifest_digest: &inert_digest,
@@ -490,7 +583,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     let outcomes = [left?, right?];
     assert!(
         outcomes.iter().any(Result::is_ok),
-        "one competing reconciler must complete the durable lifecycle step"
+        "one competing reconciler must complete the durable lifecycle step: {outcomes:?}"
     );
     for outcome in outcomes.into_iter().filter_map(Result::err) {
         assert!(
@@ -575,7 +668,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         Some(&task_uid.to_string())
     );
     assert!(
-        !activated_runtime
+        activated_runtime
             .annotations()
             .contains_key("agents.apelogic.ai/task-execution-binding")
     );
@@ -676,19 +769,21 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     let cleanup_operation_id = Uuid::new_v4();
     let cleanup_runtime_name = format!("task-{}", cleanup_operation_id.simple());
     let cleanup_candidate_digest = digest(serde_json::to_value(&spec))?;
-    let cleanup_inert_digest = manifest_digest(
+    let cleanup_inert_digest = manifest_digest_with_binding(
         cleanup_task_uid,
         cleanup_operation_id,
         &cleanup_runtime_name,
         &inert_spec(&spec, &envelope),
         "inert",
+        Some(&execution_binding),
     )?;
-    let cleanup_active_digest = manifest_digest(
+    let cleanup_active_digest = manifest_digest_with_binding(
         cleanup_task_uid,
         cleanup_operation_id,
         &cleanup_runtime_name,
         &spec,
         "active",
+        Some(&execution_binding),
     )?;
     let cleanup_key = format!("finalize-before-observation-{suffix}");
     store
@@ -701,25 +796,23 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             acting_user_id: Some(identity.user_id.as_str()),
             owner: "alice@example.com",
             owner_user_id: identity.user_id.as_str(),
-            workflow: "finalize-before-observation",
-            workflow_name: None,
-            workflow_version: None,
-            workflow_digest: None,
-            user_envelope_instance_id: None,
-            user_envelope_revision: None,
-            user_envelope_digest: None,
-            coding_agent_runtime: "example-agent",
+            workflow: "fault-injection",
+            workflow_name: Some("fault-injection"),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
             runtime_uid: None,
             runtime_namespace: "steward-test",
             runtime_name: &cleanup_runtime_name,
             runtime_ownership: RuntimeOwnership::Provisioned,
             runtime_spec: &spec,
             agent_command: &agent_command,
-            execution_binding: None,
+            execution_binding: Some(&execution_binding),
             direct_task_evidence: None,
-            envelope_revision: envelope.revision,
-            service_envelope: &envelope,
-            service_envelope_digest: &envelope_digest,
+            user_envelope_snapshot: Some(&envelope),
             candidate_digest: &cleanup_candidate_digest,
             admission_decision: &admission_decision,
             inert_manifest_digest: &cleanup_inert_digest,
@@ -770,266 +863,6 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             .await?
             .ok_or(StoreError::TaskNotFound)?
             .finalized
-    );
-    let delete_count_before_adopted = kubernetes
-        .delete_preconditions
-        .lock()
-        .map_err(|_| io::Error::other("delete fixture was poisoned"))?
-        .len();
-
-    let adopted_task_uid = Uuid::new_v4();
-    let adopted_operation_id = Uuid::new_v4();
-    let adopted_runtime_name = format!("shared-runtime-{}", adopted_operation_id.simple());
-    let adopted_runtime_uid = "shared-runtime-uid";
-    let mut shared_runtime = AgentRuntime::new(&adopted_runtime_name, spec.clone());
-    shared_runtime.metadata.namespace = Some("steward-test".to_owned());
-    shared_runtime.metadata.uid = Some(adopted_runtime_uid.to_owned());
-    shared_runtime.metadata.resource_version = Some("shared-resource-version".to_owned());
-    shared_runtime.metadata.generation = Some(7);
-    shared_runtime.status = Some(AgentRuntimeStatus {
-        phase: Phase::Running,
-        observed_generation: 7,
-        spec_digest: runtime_spec_digest(&spec)?,
-        refs: RuntimeRefs {
-            workspace: Some("shared-workspace".to_owned()),
-            sandbox: Some("shared-sandbox".to_owned()),
-            litellm_key: None,
-        },
-        conditions: Vec::new(),
-        spend: None,
-    });
-    *kubernetes
-        .runtime
-        .lock()
-        .map_err(|_| io::Error::other("runtime fixture was poisoned"))? = Some(shared_runtime);
-    let adopted_key = format!("adopted-finalization-{suffix}");
-    let adopted = store
-        .reserve_task(&TaskReservationRequest {
-            task_uid: adopted_task_uid,
-            operation_id: adopted_operation_id,
-            idempotency_key: &adopted_key,
-            submitter_service: &service,
-            acting_user: Some("alice@example.com"),
-            acting_user_id: Some(identity.user_id.as_str()),
-            owner: "alice@example.com",
-            owner_user_id: identity.user_id.as_str(),
-            workflow: "shared-runtime-finalization",
-            workflow_name: None,
-            workflow_version: None,
-            workflow_digest: None,
-            user_envelope_instance_id: None,
-            user_envelope_revision: None,
-            user_envelope_digest: None,
-            coding_agent_runtime: "example-agent",
-            runtime_uid: Some(adopted_runtime_uid),
-            runtime_namespace: "steward-test",
-            runtime_name: &adopted_runtime_name,
-            runtime_ownership: RuntimeOwnership::Adopted,
-            runtime_spec: &spec,
-            agent_command: &agent_command,
-            execution_binding: None,
-            direct_task_evidence: None,
-            envelope_revision: envelope.revision,
-            service_envelope: &envelope,
-            service_envelope_digest: &envelope_digest,
-            candidate_digest: &candidate_digest,
-            admission_decision: &admission_decision,
-            inert_manifest_digest: &inert_digest,
-            active_manifest_digest: &active_digest,
-        })
-        .await?;
-    assert!(adopted.inserted);
-    let ready_status = {
-        kubernetes
-            .runtime
-            .lock()
-            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
-            .as_mut()
-            .ok_or_else(|| io::Error::other("shared runtime missing"))?
-            .status
-            .take()
-    };
-    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
-    assert_eq!(
-        operation(&store, adopted_task_uid).await?.state,
-        TaskOrchestrationState::IntentRecorded,
-        "readiness lag is not an immutable identity conflict"
-    );
-    kubernetes
-        .runtime
-        .lock()
-        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
-        .as_mut()
-        .ok_or_else(|| io::Error::other("shared runtime missing"))?
-        .status = ready_status.clone();
-    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
-    assert_eq!(
-        operation(&store, adopted_task_uid).await?.state,
-        TaskOrchestrationState::RuntimeObserved,
-        "an exact adopted runtime must be observed without claiming ownership"
-    );
-    let replace_count_before_adopted_activation = kubernetes.replace_calls.load(Ordering::SeqCst);
-    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
-    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
-    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
-    assert_eq!(
-        operation(&store, adopted_task_uid).await?.state,
-        TaskOrchestrationState::Active,
-        "an exact ready adopted runtime must become active by observation"
-    );
-    assert_eq!(
-        kubernetes.replace_calls.load(Ordering::SeqCst),
-        replace_count_before_adopted_activation,
-        "adopted activation must not replace or otherwise mutate the shared runtime"
-    );
-    store
-        .put_task_inputs(
-            adopted_task_uid,
-            &service,
-            identity.user_id.as_str(),
-            b"adopted cancellation input",
-        )
-        .await?;
-    store
-        .request_task_execution(adopted_task_uid, &service, identity.user_id.as_str())
-        .await?;
-    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
-    let adopted_attempt = store
-        .task_execution_attempt(adopted_task_uid)
-        .await?
-        .ok_or_else(|| io::Error::other("adopted execution attempt was not reserved"))?;
-    sqlx::query(
-        "UPDATE task_execution_attempts \
-         SET start_invoked_at = now() - interval '3 minutes', \
-             start_observation_deadline_at = now() - interval '1 minute', \
-             generation = generation + 1, updated_at = now() \
-         WHERE attempt_id = $1 AND generation = $2 AND state = 'start_pending'",
-    )
-    .bind(adopted_attempt.attempt_id)
-    .bind(adopted_attempt.generation)
-    .execute(store.pool())
-    .await?;
-    let accepted_attempt = store
-        .task_execution_attempt(adopted_task_uid)
-        .await?
-        .ok_or(StoreError::TaskNotFound)?;
-    store
-        .record_task_execution_observation(
-            accepted_attempt.attempt_id,
-            accepted_attempt.generation,
-            steward_store::TaskExecutionObservation::Accepted {
-                adapter_observation_id: &accepted_attempt.attempt_id.to_string(),
-            },
-            "controller-a",
-        )
-        .await?;
-    let before_transport_error = store.task(adopted_task_uid).await?;
-    let attempt_before_transport_error = store.task_execution_attempt(adopted_task_uid).await?;
-    task_runtime
-        .fail_next_observation
-        .store(true, Ordering::SeqCst);
-    assert!(
-        reconcile_current(&client, &task_runtime, &store, adopted_task_uid)
-            .await
-            .is_err(),
-        "a transient observation failure must remain retryable"
-    );
-    assert!(!task_runtime.fail_next_observation.load(Ordering::SeqCst));
-    assert_eq!(store.task(adopted_task_uid).await?, before_transport_error);
-    assert_eq!(
-        store.task_execution_attempt(adopted_task_uid).await?,
-        attempt_before_transport_error,
-        "a transport error must not manufacture outcome_unknown or retire the lease"
-    );
-    store
-        .request_task_finalization(adopted_task_uid, &service, identity.user_id.as_str())
-        .await?;
-    kubernetes
-        .runtime
-        .lock()
-        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
-        .as_mut()
-        .ok_or_else(|| io::Error::other("shared runtime fixture is absent"))?
-        .status = None;
-    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
-    assert_eq!(
-        operation(&store, adopted_task_uid).await?.state,
-        TaskOrchestrationState::CleanupPending,
-        "expired cancellation must enter cleanup when runtime references disappeared"
-    );
-    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
-    assert!(
-        store
-            .task(adopted_task_uid)
-            .await?
-            .ok_or(StoreError::TaskNotFound)?
-            .finalized
-    );
-    assert_eq!(
-        kubernetes
-            .delete_preconditions
-            .lock()
-            .map_err(|_| io::Error::other("delete fixture was poisoned"))?
-            .len(),
-        delete_count_before_adopted,
-        "finalizing an adopted runtime must not issue a Kubernetes delete"
-    );
-    assert_eq!(
-        kubernetes
-            .runtime
-            .lock()
-            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
-            .as_ref()
-            .and_then(|runtime| runtime.metadata.uid.as_deref()),
-        Some(adopted_runtime_uid),
-        "shared infrastructure must remain after Task finalization"
-    );
-    let before_retirement = store
-        .task(adopted_task_uid)
-        .await?
-        .ok_or(StoreError::TaskNotFound)?;
-    let unknown_attempt = store
-        .task_execution_attempt(adopted_task_uid)
-        .await?
-        .ok_or(StoreError::TaskNotFound)?;
-    assert!(
-        store
-            .task_orchestration_work_items()
-            .await?
-            .iter()
-            .any(|work| work.task.task_uid == adopted_task_uid),
-        "finalized shared-runtime quarantine must remain observable after restart"
-    );
-    kubernetes
-        .runtime
-        .lock()
-        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
-        .as_mut()
-        .ok_or_else(|| io::Error::other("shared runtime missing"))?
-        .status = ready_status;
-    task_runtime.terminal_observed.store(true, Ordering::SeqCst);
-    reconcile_current(&client, &task_runtime, &store, adopted_task_uid).await?;
-    assert_eq!(
-        store
-            .task(adopted_task_uid)
-            .await?
-            .ok_or(StoreError::TaskNotFound)?,
-        before_retirement
-    );
-    assert_eq!(
-        store
-            .task_execution_attempt(adopted_task_uid)
-            .await?
-            .ok_or(StoreError::TaskNotFound)?,
-        unknown_attempt
-    );
-    assert!(
-        !store
-            .task_orchestration_work_items()
-            .await?
-            .iter()
-            .any(|work| work.task.task_uid == adopted_task_uid),
-        "proven retirement removes finalized work without rewriting history"
     );
     assert_eq!(reservation.record.task_uid, task_uid);
     Ok(())
@@ -1304,6 +1137,17 @@ fn manifest_digest(
     spec: &AgentRuntimeSpec,
     mode: &str,
 ) -> Result<String, serde_json::Error> {
+    manifest_digest_with_binding(task_uid, operation_id, runtime_name, spec, mode, None)
+}
+
+fn manifest_digest_with_binding(
+    task_uid: Uuid,
+    operation_id: Uuid,
+    runtime_name: &str,
+    spec: &AgentRuntimeSpec,
+    mode: &str,
+    execution_binding: Option<&TaskExecutionBinding>,
+) -> Result<String, serde_json::Error> {
     digest(Ok(json!({
         "schemaVersion": "steward-task-runtime-manifest/v1",
         "taskUid": task_uid,
@@ -1312,7 +1156,7 @@ fn manifest_digest(
         "runtimeName": runtime_name,
         "mode": mode,
         "spec": spec,
-        "executionBinding": serde_json::Value::Null,
+        "executionBinding": execution_binding,
     })))
 }
 

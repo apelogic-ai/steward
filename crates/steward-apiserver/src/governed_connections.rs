@@ -520,9 +520,9 @@ impl<B> GovernedConnectionsBroker<B> {
             namespace: plan.bindings.namespace.clone(),
             runtime_class: plan.bindings.runtime_class.clone(),
         };
-        let (service_envelope, _, _) = connection_authority(&plan.bindings.mcp_gw_version)
+        let (internal_authority, _, _) = connection_authority(&plan.bindings.mcp_gw_version)
             .map_err(|_| ConnectionBrokerError::Unavailable)?;
-        let admission = evaluate(&plan.spec, &service_envelope)
+        let admission = evaluate(&plan.spec, &internal_authority)
             .map_err(|_| ConnectionBrokerError::Unavailable)?;
         // Connection reservations use one identity for the operation and its Task.
         // Manifest digests must describe the identity the store actually persists.
@@ -533,7 +533,7 @@ impl<B> GovernedConnectionsBroker<B> {
             &bindings.namespace,
             &runtime_name,
             &plan.spec,
-            &service_envelope,
+            &internal_authority,
             None,
         )
         .map_err(|_| ConnectionBrokerError::Unavailable)?;
@@ -566,9 +566,7 @@ impl<B> GovernedConnectionsBroker<B> {
             agent_command: &plan.command,
             execution_binding: None,
             direct_task_evidence: None,
-            envelope_revision: plan.authority_version,
-            service_envelope: &service_envelope,
-            service_envelope_digest: &orchestration.service_envelope_digest,
+            user_envelope_snapshot: None,
             candidate_digest: &orchestration.candidate_digest,
             admission_decision: &admission,
             inert_manifest_digest: &orchestration.inert_manifest_digest,
