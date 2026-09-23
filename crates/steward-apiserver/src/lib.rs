@@ -3468,11 +3468,13 @@ mod tests {
             audiences: Some(vec![KUBERNETES_TOKEN_REVIEW_AUDIENCE.to_owned()]),
             user: Some(UserInfo {
                 username: Some("bootstrap@example.com".to_owned()),
-                groups: Some(vec![concat!(
-                    "agents.apelogic.ai/service-envelope-",
-                    "bootstrap:steward-run"
-                )
-                .to_owned()]),
+                groups: Some(vec![
+                    concat!(
+                        "agents.apelogic.ai/service-envelope-",
+                        "bootstrap:steward-run"
+                    )
+                    .to_owned(),
+                ]),
                 ..UserInfo::default()
             }),
             ..TokenReviewStatus::default()
