@@ -2,6 +2,10 @@
 
 Status: **Reference**
 
+Applies to Steward v0.2.0 and its User-Envelope-only Task authority model. An
+installation still on v0.1.23 follows [upgrade to v0.2.0](upgrade-v0.2.0.md)
+before using this page.
+
 Steward, `steward-run`, and `github-oidc-exchange` are separately released
 products with separate installation guides. Each guide correctly declares the
 others external and stops at its own boundary. This page supplies only what no
@@ -20,13 +24,26 @@ product's procedure, the product guide controls.
 |---|---|---|---|
 | `github-oidc-exchange` | Kubernetes Identity service issuing the task token | [quickstart](https://github.com/apelogic-ai/github-oidc-exchange/blob/main/docs/quickstart.md), [installation](https://github.com/apelogic-ai/github-oidc-exchange/blob/main/docs/installation.md) | Issuer, policy, keyring, JWKS, exchange routes |
 | `steward-run` | GitHub Action, reusable workflow, ARC runner scale set | [installation](https://github.com/apelogic-ai/steward-run/blob/main/docs/installation-v0.4.2.md) | Runner registration, workflow pinning, action inputs |
-| Steward | Control plane: API, admission webhook, controller | [installation guide](installation-guide.md) | Token acceptance, envelopes, approval, execution |
+| Steward | Control plane: API, admission webhook, controller | [installation guide](installation-guide.md) | Token acceptance, Envelope authority, approval, execution |
 | MCP-GW, LiteLLM, OpenShell, SPIRE | Customer-operated dependencies | Their own products | Their own deployment and credentials |
 
 The normative description of the token that crosses the boundary is the
 Identity product's
 [consumer contract](https://github.com/apelogic-ai/github-oidc-exchange/blob/main/docs/consumer-contract-v1.md).
-Steward's side of that contract is [task identity](#step-5-install-steward-and-wire-task-identity) below.
+Steward's side of it is
+[task identity](#step-4-install-steward-and-wire-task-identity) below.
+
+## The dependency that sets the order
+
+An external Task is admitted only by the authenticated user's exact active
+provisioned **User Envelope**. Its authority key is the opaque canonical user
+ID, and Steward allocates that ID on the person's *first browser login*. The
+Identity service must stamp that same ID into the token's `groups` claim.
+
+Identity policy therefore cannot be finalized until Steward exists and the user
+has signed in once, while `steward-run` cannot authenticate until Identity
+policy is finalized. The order below resolves that by installing Identity early
+and enrolling it late.
 
 ## Step 0: choose the Steward mode before ordering anything
 
@@ -45,6 +62,13 @@ An existing MCP-GW and LiteLLM deployment does not by itself satisfy governed
 execution. The Identity product's baseline quickstart also deliberately
 excludes the workload exchange that OpenShell requires; governed execution uses
 that product's full installation guide, not its quickstart.
+
+Both modes additionally require the human browser path. Envelope templates and
+User Envelope operations are protected by the browser session and administrator
+boundaries, and the installation guide documents no non-browser substitute, so
+`browserAuth.enabled=true` and its Google OIDC client, HTTPS edge, and exact
+callback are prerequisites for any external Task submission — not an optional
+presentation layer.
 
 ## Step 1: record the version set
 
@@ -69,7 +93,8 @@ declared ranges, which is narrower than Steward's own range alone.
 
 Install the Identity service first, because every later step needs its issuer
 URL and public JWKS. Install it before its GitHub policy is final: the policy
-requires claims that do not exist until a real workflow has run.
+requires observed GitHub claims and a Steward canonical user ID, neither of
+which exists yet.
 
 Finish this step when discovery and `GET {issuer}/jwks.json` return the exact
 configured issuer and an ES256 key.
@@ -82,22 +107,10 @@ both Identity inputs. The caller workflow shape is in the Identity product's
 integration guide; the runner and registration procedure is in the `steward-run`
 installation guide.
 
-Expect the first governed run to fail authentication. That is the correct
-result until Step 4 enrolls the claims this run produces.
+Expect governed runs to fail authentication until Step 6. That is the correct
+result, and one such run is how Step 6 observes the real GitHub claims.
 
-## Step 4: enroll the observed claims in Identity policy
-
-Identity policy admits exact observed values, not patterns. Run the pinned
-workflow once, observe the real GitHub claims, and enroll the exact subject,
-numeric repository and owner identifiers, allowed event and ref, and the
-reviewed actor mapping. This is why Identity is installed before `steward-run`
-but enrolled after it.
-
-Finish this step when one real assertion exchanges successfully, a replay of
-the same assertion is denied, and a wrong repository, ref, actor, and audience
-are each denied with a fresh assertion.
-
-## Step 5: install Steward and wire task identity
+## Step 4: install Steward and wire task identity
 
 Install Steward with its [installation guide](installation-guide.md). Core mode
 is the supported starting point even when governed execution is the goal.
@@ -152,7 +165,8 @@ object inventory row. The complete Steward-side procedure is:
 Steward then accepts a submission token only when it is ES256 from that JWKS,
 carries the exact issuer and audience, declares `identity_contract` exactly
 `steward-task-v2`, presents a bounded single-use `jti`, and is current within
-the two-minute lifetime and clock-skew allowance.
+the two-minute lifetime and clock-skew allowance. A verified token is
+authentication only; authority comes from Step 5.
 
 Steward's Mint publishes its own separate JWKS at
 `<mint-issuer>/.well-known/jwks.json` using EdDSA. It is unrelated to this
@@ -162,42 +176,73 @@ Rotate by refreshing the ConfigMap whenever the Identity issuer publishes a new
 `kid`, keeping every overlapping key until the old tokens and skew allowance
 have expired, then reproving issuer, audience, and signature.
 
-## Step 6: agree on the group vocabulary
+## Step 5: provision authority in Steward, and record the canonical user ID
 
-Identity policy stamps the `groups` claim; Steward derives the acting identity
-from it. Both sides already use the same prefixes, but nothing installs them
-together, so they must be authored as one decision. Steward requires:
+Helm creates no user, grant, template, Envelope, or approval. Follow
+[post-install administration](installation-guide.md#post-install-administration-not-helm-installation)
+to enable the browser path, have the person sign in once, record the audited
+initial RBAC grant, verify the deployment capability catalog, author versioned
+Envelope templates, and complete one User Envelope request and approval.
+
+Two outputs of this step are inputs to Step 6:
+
+- the opaque `usr_<...>` canonical user ID the person reads from `/settings`;
+- the verified email bound to that canonical identity.
+
+Finish this step when the person has exactly one active provisioned User
+Envelope with the intended revision and authority. The capability catalog
+advertises models and tools but grants no authority, and an empty catalog
+cannot narrow an Envelope that already admits a Task.
+
+## Step 6: enroll the Identity policy
+
+Identity policy admits exact observed values, not patterns. Using the claims
+observed from Step 3 and the canonical identity from Step 5, enroll the exact
+subject, numeric repository and owner identifiers, allowed event and ref, and
+the reviewed actor mapping to that verified email and canonical user ID.
+
+Steward derives the acting identity from the `groups` claim the policy stamps.
+Both products already use the same prefixes, but nothing installs them
+together, so they are one decision:
 
 | Group prefix | Cardinality |
 |---|---|
 | `agents.apelogic.ai/service-principal:` | exactly one, non-empty |
-| `agents.apelogic.ai/canonical-user:` | exactly one, parseable canonical user ID |
+| `agents.apelogic.ai/canonical-user:` | exactly one, and exactly the ID from Step 5 |
 | `agents.apelogic.ai/acting-user:` | at most one; must equal the token's verified email |
 | `agents.apelogic.ai/task-owner:` | exactly one when no acting user is present; rejected alongside an acting user |
 
-At most sixteen groups are accepted in total. The service principal named here
-must match the Service Envelope provisioned in Step 7; an envelope that does
-not exist fails submission closed even when the token verifies.
+At most sixteen groups are accepted in total. The service principal names the
+submitting service and grants no authority of its own; it participates in Task
+ownership and idempotency naming. Authority is the User Envelope bound to the
+canonical user, so a token whose canonical user has no active provisioned
+Envelope fails closed even though every signature check passed.
 
-## Step 7: post-install administration
+Finish this step when one real assertion exchanges successfully, a replay of
+the same assertion is denied, and a wrong repository, ref, actor, and audience
+are each denied with a fresh assertion.
 
-A successful Helm install creates no Steward user, Workflow, envelope, grant,
-or approval. Provision at least the `steward-run` Service Envelope and register
-the Workflow reference the action passes, per
-[post-install administration](installation-guide.md#post-install-administration-not-helm-installation).
+## Step 7: accept the platform end to end
 
-## Step 8: accept the platform end to end
+Run one governed job with known inputs and an expected output hash. On the
+direct Git package path the caller references the exact package source through
+a checked-in invocation manifest; a published Workflow revision remains an
+optional curation layer over the same immutable package, not a registration
+prerequisite. In both cases Steward resolves the caller's unique active
+provisioned User Envelope as the execution authority.
 
-Run one governed job with known inputs and an expected output hash, then repeat
-with a wrong audience, an untrusted issuer or CA, and an unauthorized
-repository, ref, and actor. Each must fail closed before a Task is created.
+Then repeat with a wrong audience, an untrusted issuer or CA, an unauthorized
+repository, ref, and actor, and a canonical user with no active Envelope. Each
+must fail closed before a Task is created. Confirm the Run detail shows the
+exact User Envelope evidence.
+
 Record source revisions, artifact digests, the GitHub run identifier, the
 bounded Task UID and status, HTTP status, and public JWKS `kid`s only. Never
 record tokens, authorization headers, policy mappings, or response bodies.
 
-## Step 9: governed execution, if in scope
+## Step 8: governed execution, if in scope
 
-Only after Step 8 passes: enable the Identity product's workload exchange mode,
+Only after Step 7 passes: enable the Identity product's workload exchange mode,
 install OpenShell, agent-sandbox, and SPIRE, create the OpenShell client, Mint,
 LiteLLM, and workload-exchange trust objects, point
 `config.apiserver.mcpGatewayEndpoint` and `config.controller.litellmUrl` at the
