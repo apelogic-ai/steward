@@ -9060,6 +9060,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn descriptive_capability_catalog_cannot_narrow_task_admission() -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        let git = direct_git_fixture(unpinned_direct_manifest()?, definition, None)?;
+        let task_app = direct_test_app(ledger.clone(), git)?;
+
+        let origin = "http://127.0.0.1:33002";
+        let (admin_auth, _, _) = signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let admin_app = browser_admin::protected_router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger.clone(),
+            FakeDecisionChannel::default(),
+            browser_admin::CapabilityCatalog {
+                schema_version: "steward.capability-catalog/v1".to_owned(),
+                models: Vec::new(),
+                tools: Vec::new(),
+            },
+            admin_auth,
+        );
+        let app = task_app.merge(admin_app);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "catalog-is-not-authority")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build direct-package request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit direct package: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .len(),
+            1,
+            "an empty browser capability catalog must not narrow User Envelope authority"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn direct_package_selects_one_allowed_model_from_a_wider_envelope() -> Result<(), String>
     {
         let ledger = versioned_task_ledger()?;
