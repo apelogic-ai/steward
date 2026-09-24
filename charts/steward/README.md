@@ -76,7 +76,7 @@ installation guide's live delivery tests before hand-off.
 
 ### Verified PostgreSQL TLS
 
-The API server and controller can mount the same customer-managed PostgreSQL
+The API server and controller can mount the same operator-managed PostgreSQL
 CA from an existing `ConfigMap` or `Secret`. The chart never creates or rotates
 that object. Enable the projection and reference its fixed read-only path from
 the database URL:

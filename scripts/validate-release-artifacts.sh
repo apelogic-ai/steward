@@ -88,7 +88,7 @@ if helm template steward "${root}/charts/steward" --namespace steward \
   "${core_image_values[@]}" \
   --set-string images.apiserver.digest="${placeholder_digest}" \
   --set-string tls.webhook.caBundlePem=public-validation-ca >/dev/null 2>&1; then
-  echo 'customer chart accepted an all-zero apiserver image digest' >&2
+  echo 'release chart accepted an all-zero apiserver image digest' >&2
   exit 1
 fi
 if [[ "${chart_contract_mode}" == customer-v1 ]]; then

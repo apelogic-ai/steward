@@ -28,7 +28,7 @@ helm_template() {
 if helm_template \
   --set-string images.apiserver.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
   --set-string tls.webhook.caBundlePem=public-test-ca > /dev/null 2>&1; then
-  echo 'customer install must reject an all-zero apiserver image digest' >&2
+  echo 'installation contract must reject an all-zero apiserver image digest' >&2
   exit 1
 fi
 
