@@ -6,6 +6,7 @@ bash "${root}/scripts/test-validate-release-version.sh"
 bash "${root}/scripts/validate-release-version.sh" >/dev/null
 bash "${root}/scripts/test-released-artifact-acceptance.sh"
 bash "${root}/scripts/test-release-chart-contract.sh"
+bash "${root}/scripts/test-steward-registry-lock.sh"
 chart_contract_mode="$(bash "${root}/scripts/release-chart-contract.sh" "${root}/charts/steward/Chart.yaml")"
 rendered="$(mktemp)"
 default_rendered="$(mktemp)"

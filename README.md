@@ -156,7 +156,9 @@ requirements in the [installation guide](docs/installation/installation-guide.md
 and [execution-binding guide](docs/installation/execution-bindings.md).
 Release assets include a standalone `linux/amd64` provider-profile validator
 and installer, so operators do not need a Steward source checkout to render the
-released runtime-provider bundle.
+released runtime-provider bundle. They also include the
+[`steward-registry-lock.py`](docs/installation/registry-mirroring.md) tool for
+verified private-registry mirroring and deterministic deployment locks.
 
 Historical design documents remain available through the documentation index;
 they are not an installation contract. The API group is

@@ -15,6 +15,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   controller connections using `sslmode=verify-full`.
 - Added a released, standalone `linux/amd64` provider-profile validator and installer with
   deterministic output and machine-readable bundle evidence.
+- Added a released registry mirror tool that preserves OCI indexes, verifies copied target
+  digests and platforms, and emits a deterministic credential-free deployment lock.
 
 ### Fixed
 

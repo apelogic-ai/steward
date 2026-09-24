@@ -44,6 +44,10 @@ turn execution off on an installation with live AgentRuntimes or Tasks.
    fork release workflow publishes to `ghcr.io/<fork-owner>/steward` and
    `oci://ghcr.io/<fork-owner>/charts/steward` from a validated version tag;
    do not substitute an upstream owner's coordinates in a customer handoff.
+   To copy released images and reference runtimes into another registry, use
+   the released [registry mirror and deployment-lock tool](registry-mirroring.md).
+   It verifies the target digests and provides the exact chart and execution-binding
+   inputs; registry credentials remain in the standard Docker credential store.
 4. HTTPS service certificates for `steward-apiserver` and `steward-webhook`.
    Choose exactly one chart TLS mode:
    - `customerSecret` (default): pre-create the two named `kubernetes.io/tls`

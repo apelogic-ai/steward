@@ -2670,6 +2670,68 @@ mod tests {
     }
 
     #[test]
+    fn registry_mirror_is_released_verified_and_documented() -> Result<(), String> {
+        let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("published Steward release workflow is required: {error}"))?;
+        let tool = fs::read_to_string(root().join("scripts/steward-registry-lock.py"))
+            .map_err(|error| format!("registry mirror tool is required: {error}"))?;
+        let test = fs::read_to_string(root().join("scripts/test-steward-registry-lock.sh"))
+            .map_err(|error| format!("registry mirror test is required: {error}"))?;
+        let guide = fs::read_to_string(root().join("docs/installation/registry-mirroring.md"))
+            .map_err(|error| format!("registry mirror guide is required: {error}"))?;
+
+        for required in [
+            "steward-registry-lock.py.sha256",
+            "steward.deployment-lock/v1",
+            "registryMirror:",
+            "Verify published registry mirror tool",
+            "sha256sum --check steward-registry-lock.py.sha256",
+            "cmp scripts/steward-registry-lock.py",
+        ] {
+            assert!(
+                workflow.contains(required),
+                "release workflow must retain registry mirror contract `{required}`"
+            );
+        }
+        for required in [
+            "referenceRuntimes",
+            "--prefer-index=false",
+            "target_manifest != selected_manifest",
+            "target_signatures != source_signatures",
+            "executionBindingImages",
+        ] {
+            assert!(
+                tool.contains(required),
+                "registry mirror tool must retain `{required}`"
+            );
+        }
+        for required in [
+            "cmp \"${temporary_directory}/lock-one.json\"",
+            "single-manifest source silently passed as a complete index",
+            "registry.example.test/team-a/steward@sha256:eeeeeeee",
+            "referenceRuntimes.codex",
+        ] {
+            assert!(
+                test.contains(required),
+                "registry mirror test must prove `{required}`"
+            );
+        }
+        for required in [
+            "Docker credential helper",
+            "source descriptor set",
+            "Single-platform mode",
+            "chartValues",
+            "executionBindingImages",
+        ] {
+            assert!(
+                guide.contains(required),
+                "registry mirror guide must document `{required}`"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn next_web_release_is_immutable_same_origin_and_least_privileged() -> Result<(), String> {
         let chart = root().join("charts/steward");
         let values = fs::read_to_string(chart.join("values.yaml"))

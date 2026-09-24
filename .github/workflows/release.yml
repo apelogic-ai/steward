@@ -40,6 +40,7 @@ jobs:
             scripts/postgres-tls-init.sh \
             scripts/package-provider-profile-bundle.sh \
             scripts/test-package-provider-profile-bundle.sh \
+            scripts/test-steward-registry-lock.sh \
             scripts/test-released-artifact-acceptance.sh \
             scripts/test-validate-release-version.sh \
             scripts/validate-release-version.sh \
@@ -477,6 +478,10 @@ jobs:
           provider_profile_bundle_digest="$(cat dist/provider-profile-bundle.digest)"
           bridge_signer_identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
           bridge_source_repository="https://github.com/$GITHUB_REPOSITORY"
+          mirror_asset="steward-registry-lock.py"
+          install -m 0755 scripts/steward-registry-lock.py "dist/$mirror_asset"
+          mirror_digest="sha256:$(sha256sum "dist/$mirror_asset" | awk '{print $1}')"
+          (cd dist && sha256sum "$mirror_asset" > "${mirror_asset}.sha256")
           jq -n \
             --arg version "$version" \
             --arg commit "$GITHUB_SHA" \
@@ -489,6 +494,8 @@ jobs:
             --arg bridge_digest "$bridge_digest" \
             --arg web_digest "$(cat dist/web.digest)" \
             --arg provider_digest "$provider_profile_bundle_digest" \
+            --arg mirror_asset "$mirror_asset" \
+            --arg mirror_digest "$mirror_digest" \
             '{
               schemaVersion: "steward.release-handoff/v1",
               version: $version,
@@ -515,6 +522,11 @@ jobs:
                   architecture: "amd64"
                 }
               },
+              registryMirror: {
+                asset: $mirror_asset,
+                digest: $mirror_digest,
+                lockSchema: "steward.deployment-lock/v1"
+              },
               migrations: ["0039_user_envelope_only_task_authority.sql"],
               serviceEnvelopeSupported: false
             }' > dist/release-handoff.json
@@ -526,6 +538,7 @@ jobs:
             printf 'Required image inputs now reject all-zero placeholder digests before deployment or runtime provisioning.\n\n'
             printf 'The chart can project an existing Secret- or ConfigMap-backed PostgreSQL CA into both database consumers for sslmode=verify-full.\n\n'
             printf 'The provider-profile release bundle now includes a standalone linux/amd64 validator and installer with deterministic output and machine-readable evidence.\n\n'
+            printf 'The release includes a registry mirror tool that preserves OCI indexes, verifies target digests and platforms, and writes a deterministic credential-free deployment lock.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
             printf 'Before migration 0039, terminalize and finalize every unfinished legacy Task that lacks a complete User Envelope or internal-authority pin. Use Identity v0.5.0 with policy contract github-oidc-exchange.apelogic.io/v5, remove Service Envelope bootstrap configuration, and configure the non-authoritative capability catalog.\n\n'
             printf 'Rollback from v0.2.2 to v0.2.1 requires no database rollback because this patch adds no migration. The v0.1.23 rollback boundary remains unchanged; see docs/installation/upgrade-v0.2.0.md.\n\n'
@@ -553,6 +566,10 @@ jobs:
             printf 'Provider profile bundle source commit: %s\n\n' "$GITHUB_SHA"
             printf 'Provider profile installer: provider-profile-bundle/v1.2.0/bin/steward-provider-profile (linux/amd64)\n\n'
             printf 'Provider profile bundle verification: pin the SHA-256 above; verify GitHub artifact provenance with this signer identity, repository, tag, and source commit; then verify the downloaded archive SHA-256 before render/install.\n\n'
+            printf '\n## Registry mirror and deployment lock\n\n'
+            printf 'Mirror tool asset: %s\n\n' "$mirror_asset"
+            printf 'Mirror tool SHA-256: %s\n\n' "$mirror_digest"
+            printf 'Use the verified release-handoff.json as input; the tool copies every listed component image and reference runtime, verifies the target registry, and emits steward.deployment-lock/v1.\n\n'
             printf '\n## Verification\n\n'
             printf "Verify the release manifest with: \`gh attestation verify release-handoff.json --repo %s --cert-identity %s\`.\n\n" "$GITHUB_REPOSITORY" "$bridge_signer_identity"
             printf "Inspect every image by the exact digest above with \`docker buildx imagetools inspect\`, and pull the chart by its exact digest with \`helm pull\`.\n\n"
@@ -630,3 +647,20 @@ jobs:
           gh attestation verify "$destination/release-handoff.json" \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
+
+      - name: Verify published registry mirror tool
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          destination="$RUNNER_TEMP/registry-mirror"
+          mkdir -p "$destination"
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern steward-registry-lock.py \
+            --pattern steward-registry-lock.py.sha256 \
+            --dir "$destination"
+          (cd "$destination" && sha256sum --check steward-registry-lock.py.sha256)
+          cmp scripts/steward-registry-lock.py "$destination/steward-registry-lock.py"
+          actual="sha256:$(sha256sum "$destination/steward-registry-lock.py" | awk '{print $1}')"
+          expected="$(jq -r '.registryMirror.digest' dist/release-handoff.json)"
+          test "$actual" = "$expected"
