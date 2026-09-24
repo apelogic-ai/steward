@@ -10,9 +10,6 @@ additional prose.
   enforcement surface unless a maintainer explicitly requests that change.
 - Never edit a rule in the same change that the rule would have blocked. An
   agent cannot authorize itself by weakening the failed test, gate, or rule.
-- A requested rule change gets its own PR containing only instruction and
-  directly corresponding enforcement changes. State what became false, not
-  merely what became inconvenient.
 - Correcting a stale command, path, or factual description is maintenance, but
   still belongs in that isolated PR. If it is unclear whether a change weakens
   a rule, treat it as a rule change.
@@ -69,17 +66,6 @@ force-push, a push to `main`, or a human-only PR action.
 - Use a conventional-commit subject for non-slice work. A slice commit records
   its ticket's exit criteria, guarantees re-run, and upstream dependencies.
 
-### Pushes and hardware approval
-
-Announce a push before running it. The SSH signing key may wait for physical
-approval and time out. On timeout, report that plainly and retry once only when
-the maintainer confirms readiness.
-
-If the SSH agent appears unavailable, run `ssh-add -l` and inspect
-`SSH_AUTH_SOCK` once. If the socket is unavailable or the single retry fails,
-stop and report it. Never work around a push failure by changing SSH to HTTPS,
-introducing a PAT or other credential, relaxing host verification, generating
-or loading another key, or disabling signing.
 
 ### Release batching
 
