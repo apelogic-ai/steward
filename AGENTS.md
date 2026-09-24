@@ -15,6 +15,8 @@ additional prose.
   a rule, treat it as a rule change.
 - Never create, modify, replace, disable, or delete GitHub branch-protection
   rules or repository/organization rulesets. Read-only inspection is allowed.
+- Cross-references to this file use section names, not numbers. Numbers shift
+  when a section is added; the pointers left behind do not.
 
 Enforcement surfaces include CI and hook configuration, lint settings and lint
 exceptions, `deny.toml`, security entries in `.gitignore`, the implementations
@@ -36,14 +38,41 @@ git pull --ff-only
 ```
 
 If `--ff-only` fails, stop and report the divergence. Use `s<N>/<slug>` for an
-active roadmap slice; otherwise use `feat/<slug>`, `fix/<slug>`, or
-`chore/<slug>`.
+active roadmap slice; otherwise use `feat/<slug>`, `fix/<slug>`, `docs/<slug>`,
+or `chore/<slug>`.
 
-Once a maintainer requests repository work, the agent may perform the normal
-workflow without separate permission to sync, switch safely, create a task
-branch, commit, push that branch, or open its PR. Inspect the worktree before
-switching and preserve unrelated work. This never authorizes data loss, a
-force-push, a push to `main`, or a human-only PR action.
+### Standing authorization
+
+A maintainer request for repository work authorizes the entire ordinary
+workflow. The operations below are **pre-authorized**: perform them without
+asking, without requesting confirmation, and without pausing for
+acknowledgement. This list grants permission; it does not require it.
+
+- `git fetch`, `git pull --ff-only`, and creating a task branch;
+- `git switch` between `main`, your own task branches, and your own worktrees,
+  after inspecting the worktree for unrelated work;
+- creating a worktree under `.worktrees/`;
+- staging explicit paths, committing, and amending an unpushed commit of your
+  own;
+- pushing that task branch, including every later push to that same branch
+  after the first (this is an ordinary push, not a force-push);
+- syncing your task branch or worktree onto an updated `origin/main`, by the
+  rule in "Force pushes and PR decisions";
+- opening its PR, editing its description, and commenting on it;
+- adding a dependency, unless it meets a condition in "Changes requiring
+  advance approval".
+
+The inverse — the short list of acts that do require approval — is "Changes
+requiring advance approval". An act absent from both lists is governed by the
+rest of this file, not by asking.
+
+Inspect the worktree before switching and preserve unrelated work. Announce a
+push before running it, per "Pushes and hardware approval"; announcing is not
+asking.
+
+This never authorizes data loss, a force-push, a push to `main`, or a human-only
+PR action. Where this file requires approval for a specific act, ask for that
+act rather than re-requesting the workflow around it.
 
 ### Force pushes and PR decisions
 
@@ -52,9 +81,11 @@ force-push, a push to `main`, or a human-only PR action.
 - Never merge, close, reopen, convert, or delete a branch with an open PR.
   Never dismiss a review. Those are human decisions.
 - If a PR appears stale, superseded, or wrong, report it and leave it open.
-- While a branch is yours alone, rebase it onto `origin/main`. Once another
-  party has pulled it, merge `origin/main` instead. Never rewrite shared
-  history.
+- Sync a task branch onto an updated `origin/main` whenever `main` has moved;
+  a stale branch is a review cost. Before the branch's first push, rebase it.
+  After its first push, merge `origin/main` into it: rebasing a pushed branch
+  requires a force-push, so it needs the explicit authorization above and is
+  not the default. Never rewrite shared history.
 
 ### Commits and staging
 
@@ -83,6 +114,23 @@ force-push, a push to `main`, or a human-only PR action.
 - Never tag a commit that the current release contract will reject. Do not call
   a standalone release-preparation change cheap or simple when repository rules
   require the full gate.
+
+### Public repository artifacts
+
+This repository is public. Commit messages, branch names, PR titles and bodies,
+review comments, and every file under version control are published the moment
+they are pushed, and stay retrievable after an edit or deletion.
+
+- Summarize internal review conversation, maintainer instruction, and relayed
+  team or customer feedback as technical facts. Never paste or quote it.
+- Name the defect, not the reporter. "A document contradicted the released
+  authority model" is publishable; who noticed it, in which channel, and what
+  else they said is not.
+- Keep the license, third-party notices, and changelog accurate for what the
+  release actually ships. A newly bundled or vendored artifact updates
+  `THIRD_PARTY_NOTICES.md` in the PR that introduces it, and a release adds its
+  `CHANGELOG.md` entry in the same PR as its version and chart updates, per
+  "Release batching".
 
 ### Worktrees
 
@@ -168,6 +216,24 @@ block; latest/nightly upstream lanes are informational.
 
 Never hand off warnings. Repository Clippy policy treats warnings as errors.
 
+### Documentation currency
+
+The documentation-only gate checks whitespace, neutral identifiers, and secret
+material. It cannot tell whether a document still agrees with the code it
+describes, so that judgement is yours:
+
+- A document describing released behavior names the release it describes, so a
+  reader can recognize staleness without diffing the source.
+- A change to a wire contract, authority model, chart value, route, or CLI
+  surface updates every document asserting the old behavior, in the same PR.
+  When that is genuinely too large, the PR names the documents left stale and
+  the follow-up that corrects them.
+- Before describing another product's procedure, read that product's current
+  released source. Do not describe it from memory or from an earlier revision
+  of this repository.
+- A green gate on a documentation-only PR is evidence about formatting, not
+  about accuracy.
+
 ## 5. Test environments
 
 Operational setup and diagnosis belong in the applicable testbed skill or
@@ -204,6 +270,11 @@ resource or namespace the current run did not create.
 
 Ask before:
 
+- adding a dependency that needs a new license class or a `deny.toml`
+  exception, duplicates a capability the workspace already has, or pulls a
+  vendor SDK into a crate outside `adapters/`. A dependency that leaves
+  `cargo xtask ci` passing unchanged and is named with its purpose in the PR
+  body needs no separate approval;
 - changing a CRD schema or a field's meaning;
 - changing an applied migration—add a new migration instead of editing history;
 - editing generated files under `manifests/` or `web/src/api-client/` rather
@@ -252,10 +323,11 @@ If a secret is committed:
 
 Never quietly amend or rewrite history to hide the incident.
 
-Customer identities, contract terms, pricing, internal-only material, and NDA
-content do not belong in source, documentation, fixtures, commit messages, or
-PR descriptions. Use a public issue reference or sanitized ticket key; never
-paste confidential ticket text.
+Customer identities, contract terms, pricing, internal-only material, internal
+review and support conversations, and NDA content do not belong in source,
+documentation, fixtures, commit messages, or PR descriptions. Use a public issue
+reference or sanitized ticket key; never paste confidential ticket text. See
+"Public repository artifacts" for what publication means in this repository.
 
 ## 10. Neutral test data
 
