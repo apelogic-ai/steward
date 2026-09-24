@@ -17,13 +17,20 @@ grep -Fxq '  steward.apelogic.ai/customer-install-contract: steward.customer-ins
 customer_images=(
   --set-string images.repository=registry.example.test/customer/steward
   --set-string images.apiserver.tag=test-apiserver
-  --set-string images.apiserver.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000
+  --set-string images.apiserver.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   --set-string images.controller.tag=test-controller
   --set-string images.controller.digest=sha256:1111111111111111111111111111111111111111111111111111111111111111
 )
 helm_template() {
   helm template steward "${root}/charts/steward" --namespace steward "${customer_images[@]}" "$@"
 }
+
+if helm_template \
+  --set-string images.apiserver.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+  --set-string tls.webhook.caBundlePem=public-test-ca > /dev/null 2>&1; then
+  echo 'customer install must reject an all-zero apiserver image digest' >&2
+  exit 1
+fi
 
 if helm_template > /dev/null 2>&1; then
   echo 'customer TLS mode must reject a missing webhook CA before install' >&2

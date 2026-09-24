@@ -33,6 +33,9 @@ images:
 ```
 
 Never set a tag without the matching digest or use a mutable image reference.
+The chart rejects the all-zero SHA-256 sentinel: it is a placeholder, not a
+released immutable digest. The same rejection applies to execution-binding
+images, provider-profile digests, and enabled bridge images.
 Set `images.web.tag` and `images.web.digest` to empty strings if web is disabled
 and no web image is published. Only enabled workloads are rendered.
 

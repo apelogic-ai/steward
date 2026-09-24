@@ -277,8 +277,9 @@ The supported release procedure installs this pulled archive; a source checkout
 or locally built image is not release evidence.
 
 1. Record the chart OCI digest and every component image digest from the same
-   release handoff. Set a
-   target-specific values file, for example:
+   release handoff. All-zero SHA-256 values are placeholders and are rejected;
+   copy the actual immutable digest for every enabled component and runtime.
+   Set a target-specific values file, for example:
 
    ```yaml
    images:
