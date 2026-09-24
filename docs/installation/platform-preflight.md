@@ -10,7 +10,8 @@ human summary.
 
 The input names every namespace, immutable image digest, public hostname,
 Gateway parent, certificate DNS name, database CA reference, provider profile,
-ARC controller service account, and external Secret. Secret bodies are neither
+ARC controller service account, external Secret, template capability catalog,
+and NetworkPolicy API/PostgreSQL destinations. Secret bodies are neither
 accepted nor emitted. Existing infrastructure remains operator-owned.
 
 ```sh
@@ -18,7 +19,7 @@ tar -xzf steward-platform-preflight-0.2.3.tar.gz
 tar -xzf steward-runtime-providers-0.2.3.tar.gz
 cd platform-preflight/v1
 ./steward-platform-preflight generate \
-  --input examples/compact.json \
+  --input examples/governed-complete.json \
   --provider-profile-bundle ../../provider-profile-bundle/v1.2.0 \
   --chart /path/to/steward-chart \
   --output rendered
@@ -39,6 +40,49 @@ tool, so component, bridge, and coding-agent coordinates require no manual
 translation. Governed execution, active execution bindings, and the
 Connections bridge are enabled together from those immutable coordinates and
 the explicitly supplied endpoints.
+
+[`examples/governed-complete.json`](../../config/platform-preflight/v1/examples/governed-complete.json)
+is the copy-ready governed input. It includes a non-empty capability catalog,
+one immutable execution binding, exact Codex Responses endpoint, MCP-GW
+endpoint, all required namespaces, browser-auth egress, Kubernetes API and
+PostgreSQL CIDRs, and every immutable component/runtime coordinate. The
+compact and separated examples exercise the same contract with different
+namespace layouts.
+
+The capability catalog is descriptive template-editor availability; it is not
+runtime authority. The execution binding selects an immutable coding-agent
+runtime. Provider profiles bind that runtime to deployment-owned inference and
+tool connectivity. A User Envelope remains Steward's per-user admission limit
+and does not replace any of those deployment settings.
+
+`config.apiserver.inferenceEndpoint` is the exact OpenAI-compatible Responses
+operation URL (`https://inference.example.test/v1/responses` in the examples).
+`config.apiserver.anthropicInferenceEndpoint` is an Anthropic-compatible API
+base URL, while `config.controller.litellmUrl` is the LiteLLM management API
+base URL with no operation path.
+
+## Post-install inspection
+
+After installing the generated values, use the following read-only checks. Set
+`STEWARD_NAMESPACE` to the generated Steward namespace and `STEWARD_RELEASE`
+to the Helm release name.
+
+```sh
+helm get values "$STEWARD_RELEASE" --namespace "$STEWARD_NAMESPACE" --all
+CAPABILITY_CONFIGMAP="$(kubectl get deployment steward-apiserver -n "$STEWARD_NAMESPACE" \
+  -o jsonpath='{.spec.template.spec.volumes[?(@.name=="capability-catalog")].configMap.name}')"
+kubectl get configmap "$CAPABILITY_CONFIGMAP" -n "$STEWARD_NAMESPACE" -o yaml
+kubectl get deployment steward-apiserver -n "$STEWARD_NAMESPACE" -o yaml | \
+  grep -E 'checksum/capability-catalog|/run/capability-catalog'
+curl --fail-with-body \
+  -H "Authorization: Bearer $STEWARD_ADMIN_TOKEN" \
+  "https://steward.example.test/admin/api/v1/capabilities"
+```
+
+The first command shows the effective Helm values. The ConfigMap output
+contains the content-addressed capability catalog. The Deployment output proves
+the catalog mount and checksum-driven rollout wiring. The final authenticated
+request reports the capability catalog exposed to the administration UI.
 
 The compact example co-locates Steward, runtime, and provider resources. The
 namespace map remains explicit even when values match so moving one component

@@ -1,18 +1,6 @@
 {
   "schemaVersion": "steward.platform-input/v1",
-  "namespaces": {
-    "steward": "steward-control",
-    "runtime": "steward-runtimes",
-    "providers": "steward-providers",
-    "gateway": "edge-system",
-    "arc": "arc-system",
-    "databaseTls": "steward-control",
-    "mcpGateway": "mcp-system",
-    "litellm": "inference-system",
-    "identityExchange": "identity-system",
-    "openshell": "sandbox-system",
-    "dns": "kube-system"
-  },
+  "namespaces": {"steward": "steward-system", "runtime": "steward-system", "providers": "steward-system", "gateway": "gateway-system", "arc": "arc-system", "databaseTls": "steward-system", "mcpGateway": "steward-system", "litellm": "steward-system", "identityExchange": "steward-system", "openshell": "steward-system", "dns": "kube-system"},
   "deploymentLock": {
     "schemaVersion": "steward.deployment-lock/v1",
     "release": {"version": "0.2.2", "commit": "1111111111111111111111111111111111111111"},
@@ -38,29 +26,16 @@
     },
     "executionBindingImages": {"codex": "registry.example.test/team-a/codex@sha256:6666666666666666666666666666666666666666666666666666666666666666"}
   },
-  "database": {
-    "urlSecret": {"name": "steward-database", "key": "url", "namespace": "steward-control"},
-    "tls": {"mode": "verify-full", "ca": {"kind": "ConfigMap", "name": "database-ca", "key": "ca.crt", "namespace": "steward-control"}}
-  },
-  "gateway": {
-    "parentRef": {"name": "public-gateway", "namespace": "edge-system", "sectionName": "https"},
-    "certificateNames": ["steward.example.test"],
-    "tlsSecretName": "steward-edge-tls",
-    "issuerRef": {"name": "platform-ca", "kind": "ClusterIssuer"}
-  },
+  "database": {"urlSecret": {"name": "steward-database", "key": "url", "namespace": "steward-system"}, "tls": {"mode": "verify-full", "ca": {"kind": "Secret", "name": "database-ca", "key": "ca.crt", "namespace": "steward-system"}}},
+  "gateway": {"parentRef": {"name": "public-gateway", "namespace": "gateway-system", "sectionName": "https"}, "certificateNames": ["*.example.test"], "tlsSecretName": "steward-edge-tls", "issuerRef": {"name": "platform-ca", "kind": "ClusterIssuer"}},
   "publicEndpoints": [{"name": "steward", "hostname": "steward.example.test"}],
   "providerProfiles": [
-    {"name": "steward-litellm", "namespace": "steward-providers", "inputs": {"gatewayOrigin": "https://inference.example.test", "runtimeGrantOrigin": "https://mint.example.test", "serviceCidrs": ["192.0.2.0/24"]}},
-    {"name": "steward-mcp-gw", "namespace": "steward-providers", "inputs": {"gatewayOrigin": "https://mcp.example.test", "runtimeGrantOrigin": "https://mint.example.test", "serviceCidrs": ["192.0.2.0/24"]}}
+    {"name": "steward-litellm", "namespace": "steward-system", "inputs": {"gatewayOrigin": "https://inference.example.test", "runtimeGrantOrigin": "https://mint.example.test", "serviceCidrs": ["192.0.2.0/24"]}},
+    {"name": "steward-mcp-gw", "namespace": "steward-system", "inputs": {"gatewayOrigin": "https://mcp.example.test", "runtimeGrantOrigin": "https://mint.example.test", "serviceCidrs": ["192.0.2.0/24"]}}
   ],
   "arc": {"controllerServiceAccount": {"name": "arc-controller", "namespace": "arc-system"}},
-  "externalSecrets": {
-    "database": {"name": "steward-database", "namespace": "steward-control"},
-    "mint": {"name": "steward-mint", "namespace": "steward-control"},
-    "litellm": {"name": "steward-litellm", "namespace": "steward-control"},
-    "openshellClient": {"name": "steward-openshell-client", "namespace": "steward-control"}
-  },
-  "externalConfigMaps": {"workloadExchangeTrust": {"name": "workload-exchange-ca", "namespace": "steward-control", "key": "ca.crt"}},
+  "externalSecrets": {"database": {"name": "steward-database", "namespace": "steward-system"}, "mint": {"name": "steward-mint", "namespace": "steward-system"}, "litellm": {"name": "steward-litellm", "namespace": "steward-system"}, "openshellClient": {"name": "steward-openshell-client", "namespace": "steward-system"}},
+  "externalConfigMaps": {"workloadExchangeTrust": {"name": "workload-exchange-ca", "namespace": "steward-system", "key": "ca.crt"}},
   "execution": {
     "endpoints": {"inference": "https://inference.example.test/v1/responses", "mcpGateway": "https://mcp.example.test/mcp", "openshell": "https://openshell.example.test:8080", "openshellServerName": "openshell.example.test", "workloadExchange": "https://identity.example.test/v1/workload/exchange", "workloadExchangeServerName": "identity.example.test", "litellm": "https://inference.example.test", "mintIssuer": "https://mint.example.test", "spiffeTrustDomain": "example.test"},
     "connectionsBridge": {"mcpGatewayOrigin": "https://mcp.example.test", "mcpGatewayVersion": "0.4.9"},

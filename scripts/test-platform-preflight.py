@@ -16,6 +16,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts" / "steward-platform-preflight.py"
 EXAMPLE = ROOT / "config" / "platform-preflight" / "v1" / "examples" / "compact.json"
 SEPARATED = ROOT / "config" / "platform-preflight" / "v1" / "examples" / "separated.json"
+COMPLETE = ROOT / "config" / "platform-preflight" / "v1" / "examples" / "governed-complete.json"
 sys.dont_write_bytecode = True
 
 
@@ -155,6 +156,26 @@ class PlatformPreflightTests(unittest.TestCase):
         separated = json.loads(SEPARATED.read_text(encoding="utf-8"))
         self.assertEqual(self.input["execution"]["binding"]["executable"], "/usr/bin/codex")
         self.assertEqual(separated["execution"]["binding"]["executable"], "/usr/bin/codex")
+        self.assertEqual(
+            self.input["execution"]["endpoints"]["inference"],
+            "https://inference.example.test/v1/responses",
+        )
+        self.assertEqual(
+            separated["execution"]["endpoints"]["inference"],
+            "https://inference.example.test/v1/responses",
+        )
+
+    def test_bare_chart_defaults_remain_fail_closed(self) -> None:
+        defaults = subprocess.run(
+            ["helm", "show", "values", str(ROOT / "charts" / "steward")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(defaults.returncode, 0, defaults.stderr)
+        self.assertIn("capabilityCatalog:\n      schemaVersion: steward.capability-catalog/v1\n      models: []\n      tools: []", defaults.stdout)
+        self.assertIn("kubeApiCidrs: []", defaults.stdout)
+        self.assertIn("postgresCidrs: []", defaults.stdout)
 
     def test_rejects_top_level_input_outside_schema(self) -> None:
         self.input["ignoredValue"] = "must-not-be-silent"
@@ -255,6 +276,146 @@ class PlatformPreflightTests(unittest.TestCase):
             self.assertEqual(profiles["inference"]["digest"], "sha256:" + "7" * 64)
             profile_inputs = json.loads((base / "first" / "provider-profile-inputs.json").read_text(encoding="utf-8"))
             self.assertEqual(profile_inputs["bundle"]["version"], "1.2.0")
+
+    def test_complete_governed_example_emits_and_renders_all_required_values(self) -> None:
+        complete = json.loads(COMPLETE.read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary)
+            input_path = base / "input.json"
+            output = base / "rendered"
+            input_path.write_text(json.dumps(complete), encoding="utf-8")
+            result = subprocess.run(
+                [
+                    str(TOOL),
+                    "generate",
+                    "--input",
+                    str(input_path),
+                    "--provider-profile-bundle",
+                    str(self.profile_bundle),
+                    "--chart",
+                    str(ROOT / "charts" / "steward"),
+                    "--output",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            values = json.loads((output / "steward-values.json").read_text(encoding="utf-8"))
+            self.assertEqual(values["config"]["apiserver"]["capabilityCatalog"], complete["capabilityCatalog"])
+            self.assertEqual(values["networkPolicy"]["kubeApiCidrs"], complete["networkPolicy"]["kubeApiCidrs"])
+            self.assertEqual(values["networkPolicy"]["postgresCidrs"], complete["networkPolicy"]["postgresCidrs"])
+            self.assertEqual(values["config"]["apiserver"]["inferenceEndpoint"], "https://inference.example.test/v1/responses")
+
+            flux = (output / "flux-values-configmap.yaml").read_text(encoding="utf-8")
+            flux_lines = flux.splitlines()
+            values_marker = flux_lines.index("  values.json: |")
+            flux_values = "\n".join(line.removeprefix("    ") for line in flux_lines[values_marker + 1 :])
+            self.assertEqual(json.loads(flux_values), values)
+            summary = (output / "summary.txt").read_text(encoding="utf-8")
+            for line in (
+                "Capability models: 1",
+                "Capability tools: 1",
+                "Execution bindings: 1",
+                "Runtime namespaces: 1",
+                "API caller namespaces: 1",
+                "Kubernetes API CIDRs: 1",
+                "PostgreSQL CIDRs: 1",
+            ):
+                self.assertIn(line, summary)
+
+            rendered = subprocess.run(
+                [
+                    "helm",
+                    "template",
+                    "steward",
+                    str(ROOT / "charts" / "steward"),
+                    "--namespace",
+                    complete["namespaces"]["steward"],
+                    "--values",
+                    str(output / "steward-values.json"),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            self.assertIn("capability-catalog.json:", rendered.stdout)
+            self.assertIn("gpt-5.4", rendered.stdout)
+            self.assertIn("actions_get", rendered.stdout)
+            self.assertIn("checksum/capability-catalog:", rendered.stdout)
+            self.assertIn("mountPath: /run/capability-catalog", rendered.stdout)
+            self.assertIn("cidr: 192.0.2.10/32", rendered.stdout)
+            self.assertIn("cidr: 192.0.2.20/32", rendered.stdout)
+
+    def test_rejects_empty_capability_catalog(self) -> None:
+        self.input["capabilityCatalog"]["models"] = []
+        self.input["capabilityCatalog"]["tools"] = []
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("capabilityCatalog must contain at least one model or tool", result.stderr)
+
+    def test_rejects_catalog_missing_category_required_by_binding(self) -> None:
+        self.input["capabilityCatalog"]["models"] = []
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be non-empty when the binding uses inference", result.stderr)
+
+        self.input = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        self.input["capabilityCatalog"]["tools"] = []
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be non-empty when the binding uses tools", result.stderr)
+
+    def test_allows_catalog_category_omitted_by_binding(self) -> None:
+        del self.input["execution"]["binding"]["toolsProfile"]
+        self.input["capabilityCatalog"]["tools"] = []
+        result = self.run_validate(self.input)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_malformed_or_duplicate_capability_entry(self) -> None:
+        self.input["capabilityCatalog"]["models"] = [
+            {"provider": "litellm", "model": "gpt-5.4"},
+            {"provider": "litellm", "model": "gpt-5.4"},
+        ]
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("contains duplicate entry", result.stderr)
+        self.input["capabilityCatalog"]["models"] = [{"provider": "litellm"}]
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("model must be a non-empty string", result.stderr)
+
+    def test_rejects_missing_empty_or_malformed_required_network_policy_cidrs(self) -> None:
+        del self.input["networkPolicy"]["kubeApiCidrs"]
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("networkPolicy.kubeApiCidrs must be a non-empty CIDR array", result.stderr)
+
+        self.input = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        self.input["networkPolicy"]["kubeApiCidrs"] = []
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("networkPolicy.kubeApiCidrs must be a non-empty CIDR array", result.stderr)
+
+        self.input = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        del self.input["networkPolicy"]["postgresCidrs"]
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("networkPolicy.postgresCidrs must be a non-empty CIDR array", result.stderr)
+
+        self.input = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        self.input["networkPolicy"]["postgresCidrs"] = []
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("networkPolicy.postgresCidrs must be a non-empty CIDR array", result.stderr)
+
+        self.input = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        self.input["networkPolicy"]["kubeApiCidrs"] = ["not-a-cidr"]
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is not a valid CIDR", result.stderr)
 
     def test_namespace_change_updates_generated_references(self) -> None:
         separated = json.loads(SEPARATED.read_text(encoding="utf-8"))
