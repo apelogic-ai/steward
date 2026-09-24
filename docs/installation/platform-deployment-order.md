@@ -81,6 +81,7 @@ A component outside that table is untested here, not merely undocumented.
 | Component | Version in this deployment | Source of truth |
 |---|---|---|
 | Steward chart and images | | Steward release handoff |
+| Steward deployment lock and platform preflight bundle | | Same Steward release handoff |
 | `steward-run` runner image, chart, workflow commit | | `steward-run` release manifest |
 | Identity application and chart | | Identity release handoff |
 | Kubernetes | | Cluster; must satisfy every chart's `kubeVersion` simultaneously |
@@ -113,7 +114,13 @@ result, and one such run is how Step 6 observes the real GitHub claims.
 ## Step 4: install Steward and wire task identity
 
 Install Steward with its [installation guide](installation-guide.md). Core mode
-is the supported starting point even when governed execution is the goal.
+is the supported starting point even when governed execution is the goal. If
+artifacts are copied to another registry, produce the verified
+[deployment lock](registry-mirroring.md), then use the released
+[platform preflight](platform-preflight.md) to generate the Helm/Flux values and
+namespace-qualified references. Run `gateway-check` before exposing the browser
+edge. On EKS, run both `network-check` and the bounded `network-smoke` before
+treating NetworkPolicy as enforced.
 
 A default installation authenticates Task submissions with Kubernetes
 TokenReview and will reject every token the Identity service issues. Accepting
@@ -245,11 +252,15 @@ Only after Step 7 passes: enable the Identity product's workload exchange mode,
 install OpenShell, agent-sandbox, and SPIRE, create the OpenShell client, Mint,
 LiteLLM, and workload-exchange trust objects, point
 `config.apiserver.mcpGatewayEndpoint` and `config.controller.litellmUrl` at the
-existing deployments, install the provider profile bundle, record
-[execution bindings](execution-bindings.md), and only then move the staged
-ownership switches. The prerequisites and their verification live in the
-[installation guide](installation-guide.md); this page adds only their position
-in the order.
+existing deployments, install the provider profile bundle, and record
+[execution bindings](execution-bindings.md). Use the preflight-generated binding
+and values so the provider-profile digests and reference runtime come from the
+same verified deployment lock; for Codex, use the supported
+[reference-runtime procedure](codex-reference-runtime.md). Re-run the live
+Gateway and applicable network checks against the final namespaces, then move
+the staged ownership switches. The prerequisites and their verification live in
+the [installation guide](installation-guide.md); this page adds only their
+position in the order.
 
 ## Step 9: accept governed execution end to end
 

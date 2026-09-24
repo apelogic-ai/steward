@@ -99,11 +99,18 @@ ordering, and identical verified inputs produce identical bytes. A shortened exa
 }
 ```
 
-Copy `chartValues` into the installation values overlay. The optional bridge entry is
-emitted as `chartValues.connectionsBridge.image`. Copy the desired value from
-`executionBindingImages` into the matching execution binding's `image` field. Keep
-deployment values digest-pinned; tags remain labels and are never the authority for a
-deployment.
+The recommended next step is to embed the complete lock unchanged in the
+[platform-preflight input](platform-preflight.md). The preflight verifies the release,
+mode, requested platform, component coordinates, reference runtime, and provider-profile
+relationships before generating the Helm/Flux values and execution binding. This avoids
+manual translation between the mirror result and deployment configuration.
+
+For an installation that does not use platform preflight, copy `chartValues` into the
+installation values overlay. The optional bridge entry is emitted as
+`chartValues.connectionsBridge.image`; copy the desired value from
+`executionBindingImages` into the matching execution binding's `image` field. Keep the
+complete lock as deployment evidence. Deployment values remain digest-pinned; tags are
+labels and never the authority for a deployment.
 
 The release gate also copies a pinned multi-platform image through this tool into an
 ephemeral registry, inspects the exact target digest, pulls its `linux/amd64` image, and

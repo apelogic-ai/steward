@@ -277,8 +277,9 @@ digests and OCI chart digest from its handoff, verify attestations against the
 fork repository/tag workflow identity, and pull the chart by digest into a
 clean directory. Never reconstruct a digest from a tag or mix components from
 different commits. If the operator uses another registry, copy the exact OCI
-manifests by digest, verify the destination digests are unchanged, and update
-only the fork-owned repository coordinates in the values file.
+manifests by digest, resolve and verify every resulting destination digest, and
+use only those destination coordinates in deployment configuration. Do not
+assume that a source digest is also the destination digest.
 
 Pull the chart through its immutable OCI manifest digest, verify Helm resolved
 that same digest, and retain the resulting local archive for lint, render, and
@@ -309,10 +310,27 @@ Keep `STEWARD_CHART_PACKAGE` in the same shell for the remaining commands.
 The supported release procedure installs this pulled archive; a source checkout
 or locally built image is not release evidence.
 
+The recommended deployment path is:
+
+1. verify `release-handoff.json` from the selected release;
+2. use the released [registry mirror tool](registry-mirroring.md) when artifacts
+   must move to another registry, producing `steward.deployment-lock/v1`;
+3. give that complete lock to the released
+   [platform preflight](platform-preflight.md), together with the explicit
+   namespace, endpoint, certificate, Secret-reference, and provider-profile
+   inputs; and
+4. install the generated `steward-values.json` only after static validation and
+   the applicable live Gateway and network checks pass.
+
+This path binds the generated Helm values and execution binding to the verified
+destination artifacts. Manual values assembly remains possible, but it must
+preserve the same immutable coordinates and cross-component relationships.
+
 1. Record the chart OCI digest and every component image digest from the same
    release handoff. All-zero SHA-256 values are placeholders and are rejected;
    copy the actual immutable digest for every enabled component and runtime.
-   Set a target-specific values file, for example:
+   Prefer the platform-preflight-generated values file. If assembling the file
+   manually, use a target-specific values file such as:
 
    ```yaml
    images:
@@ -386,7 +404,10 @@ or locally built image is not release evidence.
    [released runtime conformance](codex-reference-runtime.md) before activating its binding.
 
 2. Verify the named Secret objects and certificate SANs without displaying
-   their data. With an explicit kubeconfig/context, lint and render before
+   their data. When using platform preflight, run its `gateway-check` against
+   the explicit kubeconfig and context. On EKS, also run `network-check` and the
+   bounded `network-smoke`; detecting the policy agent alone is insufficient.
+   With the generated or manually assembled values file, lint and render before
    applying anything:
 
    ```sh
