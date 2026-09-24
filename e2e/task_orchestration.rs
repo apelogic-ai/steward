@@ -11,6 +11,8 @@ use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::{Method, Response, StatusCode, header};
 use axum::routing::any;
+use kube::api::PostParams;
+use kube::core::Request as KubeRequest;
 use kube::{Client, ResourceExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -23,9 +25,15 @@ use steward_apiserver::connections::{
 use steward_apiserver::governed_connections::{
     ConnectionExecutionBindings, GovernedConnectionsBroker, GovernedConnectionsConfig,
 };
-use steward_controller::{TaskControllerError, reconcile_task_orchestration_work_item};
+use steward_controller::{
+    TaskControllerError, reconcile_agent_runtime_work_item, reconcile_task_orchestration_work_item,
+    webhook_router_for_controller,
+};
 use steward_ports::{
-    PortError, SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
+    InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
+    InferenceRequest, PortError, ProvisionedInference, SandboxObservation, SandboxRequest,
+    SandboxRuntime, SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest,
+    SandboxTaskRuntime, TaskAttemptId,
 };
 use steward_store::{
     EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, PgStore,
@@ -44,6 +52,17 @@ use tokio::task::JoinHandle;
 
 const RUNTIME_PATH_PREFIX: &str =
     "/apis/agents.apelogic.ai/v1alpha1/namespaces/steward-test/agentruntimes";
+const SECRET_PATH_PREFIX: &str = "/api/v1/namespaces/steward-test/secrets";
+const CONTROLLER_USERNAME: &str = "system:serviceaccount:steward-system:steward-controller";
+
+#[derive(Clone)]
+struct WebhookAdmissionHarness {
+    client: Client,
+    verify_boundaries: Arc<AtomicBool>,
+    create_checks: Arc<AtomicUsize>,
+    update_checks: Arc<AtomicUsize>,
+    delete_checks: Arc<AtomicUsize>,
+}
 
 #[derive(Clone, Default)]
 struct AmbiguousKubernetes {
@@ -52,8 +71,13 @@ struct AmbiguousKubernetes {
     create_calls: Arc<AtomicUsize>,
     replace_calls: Arc<AtomicUsize>,
     fail_first_create_response: Arc<AtomicBool>,
+    reject_create_with_unprocessable_entity: Arc<AtomicBool>,
     delete_preconditions: Arc<Mutex<Vec<String>>>,
     replace_name_after_delete: Arc<AtomicBool>,
+    admission: Arc<Mutex<Option<WebhookAdmissionHarness>>>,
+    credential_secret: Arc<Mutex<Option<serde_json::Value>>>,
+    status_patches: Arc<AtomicUsize>,
+    next_runtime_uid: Arc<Mutex<Option<String>>>,
 }
 
 struct ServerGuard(JoinHandle<Result<(), io::Error>>);
@@ -96,8 +120,82 @@ fn disposable_execution_binding() -> Result<TaskExecutionBinding, io::Error> {
 #[derive(Clone, Default)]
 struct AmbiguousTaskRuntime {
     starts: Arc<AtomicUsize>,
+    ensures: Arc<AtomicUsize>,
+    deletes: Arc<AtomicUsize>,
+    succeed_next_start: Arc<AtomicBool>,
     terminal_observed: Arc<AtomicBool>,
     fail_next_observation: Arc<AtomicBool>,
+}
+
+impl SandboxRuntime for AmbiguousTaskRuntime {
+    async fn ensure(&self, request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+        self.ensures.fetch_add(1, Ordering::SeqCst);
+        Ok(SandboxObservation::Running {
+            refs: RuntimeRefs {
+                workspace: Some(format!("workspace-{}", request.workspace_key)),
+                sandbox: Some(format!("sandbox-{}", request.runtime.0)),
+                litellm_key: None,
+            },
+        })
+    }
+
+    async fn delete(&self, _request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        Ok(SandboxObservation::Absent)
+    }
+}
+
+#[derive(Clone, Default)]
+struct ActiveInference {
+    provisions: Arc<AtomicUsize>,
+    revocations: Arc<AtomicUsize>,
+}
+
+impl InferencePlane for ActiveInference {
+    fn capabilities(&self) -> InferenceCapabilities {
+        let mut capabilities = InferenceCapabilities::default();
+        capabilities.model_allowlist = true;
+        capabilities.spend_enforcement = true;
+        capabilities
+    }
+
+    async fn validate_configuration(
+        &self,
+        _models: &[ModelRef],
+        _budget: &Budget,
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn provision(
+        &self,
+        request: &InferenceRequest,
+    ) -> Result<ProvisionedInference, PortError> {
+        self.provisions.fetch_add(1, Ordering::SeqCst);
+        Ok(ProvisionedInference {
+            reference: format!("inference-{}", request.runtime.0),
+            credential: InferenceCredential::new("fixture-inference-credential".to_owned()),
+        })
+    }
+
+    async fn reconcile_configuration(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn observe(&self, request: &InferenceRequest) -> Result<InferenceObservation, PortError> {
+        Ok(InferenceObservation::Active {
+            reference: format!("inference-{}", request.runtime.0),
+            spend: steward_types::SpendSummary {
+                observed_amount: "0".to_owned(),
+                currency: request.budget.currency.clone(),
+            },
+        })
+    }
+
+    async fn revoke(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+        self.revocations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 impl SandboxTaskRuntime for AmbiguousTaskRuntime {
@@ -108,6 +206,14 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
         _input_archive: &[u8],
     ) -> Result<SandboxTaskObservation, PortError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
+        if self.succeed_next_start.swap(false, Ordering::SeqCst) {
+            return Ok(SandboxTaskObservation::Succeeded {
+                adapter_observation_id: "successful-task-execution".to_owned(),
+                output: SandboxTaskOutput {
+                    archive: b"successful task output".to_vec(),
+                },
+            });
+        }
         Err(PortError::Failed {
             reason: "execution start response was lost".to_owned(),
         })
@@ -153,7 +259,7 @@ async fn internal_authority_provisions_and_recovers_cleanup_without_a_service_en
         .max_connections(8)
         .connect(&database_url)
         .await?;
-    let store = PgStore::new(pool);
+    let store = PgStore::new(pool.clone());
     store.migrate().await?;
     for finalize_before_observation in [false, true] {
         let suffix = Uuid::new_v4().simple().to_string();
@@ -347,7 +453,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         .max_connections(8)
         .connect(&database_url)
         .await?;
-    let store = PgStore::new(pool);
+    let store = PgStore::new(pool.clone());
     store.migrate().await?;
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
@@ -550,6 +656,26 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     kubernetes
         .fail_first_create_response
         .store(true, Ordering::SeqCst);
+    let (admission_client, _admission_server) = router_client(
+        webhook_router_for_controller(store.clone(), CONTROLLER_USERNAME.to_owned()),
+        "steward-test",
+    )
+    .await?;
+    let admission_boundaries_pending = Arc::new(AtomicBool::new(true));
+    let admission_create_checks = Arc::new(AtomicUsize::new(0));
+    let admission_update_checks = Arc::new(AtomicUsize::new(0));
+    let admission_delete_checks = Arc::new(AtomicUsize::new(0));
+    *kubernetes
+        .admission
+        .lock()
+        .map_err(|_| io::Error::other("admission fixture was poisoned"))? =
+        Some(WebhookAdmissionHarness {
+            client: admission_client,
+            verify_boundaries: admission_boundaries_pending.clone(),
+            create_checks: admission_create_checks.clone(),
+            update_checks: admission_update_checks.clone(),
+            delete_checks: admission_delete_checks.clone(),
+        });
     let (client, _server) = kubernetes_client(kubernetes.clone()).await?;
     let task_runtime = AmbiguousTaskRuntime::default();
 
@@ -677,13 +803,94 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             .annotations()
             .contains_key("agents.apelogic.ai/pending-approval")
     );
-    let status = activated_runtime
+    assert!(
+        activated_runtime.status.is_none(),
+        "activation must not fabricate executable status before ordinary reconciliation"
+    );
+    assert_eq!(
+        operation(&store, task_uid).await?.state,
+        TaskOrchestrationState::ActivationPending,
+        "the Task orchestrator must wait for the ordinary runtime reconciler"
+    );
+
+    let inference = ActiveInference::default();
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        inference.clone(),
+        store.clone(),
+        activated_runtime,
+    )
+    .await?;
+    let finalizing_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("finalized runtime fixture is absent"))?;
+    assert!(
+        finalizing_runtime
+            .metadata
+            .finalizers
+            .as_ref()
+            .is_some_and(|finalizers| finalizers
+                .iter()
+                .any(|value| value == "agents.apelogic.ai/runtime")),
+        "the production runtime callback must establish its cleanup finalizer"
+    );
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        inference.clone(),
+        store.clone(),
+        finalizing_runtime,
+    )
+    .await?;
+    let provisioned_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("provisioned runtime fixture is absent"))?;
+    let status = provisioned_runtime
         .status
         .as_ref()
-        .ok_or_else(|| io::Error::other("active runtime status is absent"))?;
+        .ok_or_else(|| io::Error::other("provisioned runtime status is absent"))?;
     assert_eq!(status.phase, Phase::Running);
     assert_eq!(status.observed_generation, 2);
     assert_eq!(status.spec_digest, runtime_spec_digest(&spec)?);
+    assert!(status.refs.workspace.is_some());
+    assert!(status.refs.sandbox.is_some());
+    assert!(status.refs.litellm_key.is_some());
+    assert_eq!(inference.provisions.load(Ordering::SeqCst), 1);
+    assert_eq!(task_runtime.ensures.load(Ordering::SeqCst), 1);
+    assert!(kubernetes.status_patches.load(Ordering::SeqCst) >= 1);
+    assert_eq!(
+        task_runtime.starts.load(Ordering::SeqCst),
+        0,
+        "ordinary runtime provisioning must not start the Task"
+    );
+
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        inference.clone(),
+        store.clone(),
+        provisioned_runtime,
+    )
+    .await?;
+    assert_eq!(
+        inference.provisions.load(Ordering::SeqCst),
+        1,
+        "a restarted reconciler must reuse the runtime's provisioned inference credential"
+    );
+    assert_eq!(
+        task_runtime.starts.load(Ordering::SeqCst),
+        0,
+        "a restarted ordinary reconciler must not start Task execution"
+    );
+
+    reconcile_current(&client, &task_runtime, &store, task_uid).await?;
     assert_eq!(
         operation(&store, task_uid).await?.state,
         TaskOrchestrationState::Active
@@ -695,6 +902,18 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             .ok_or(StoreError::TaskNotFound)?
             .phase,
         TaskPhase::Queued
+    );
+    assert!(
+        !admission_boundaries_pending.load(Ordering::SeqCst),
+        "the production webhook must reject mutated and unpersisted CREATE requests"
+    );
+    assert!(
+        admission_create_checks.load(Ordering::SeqCst) >= 1,
+        "the controller-authored inert CREATE must cross the real webhook router"
+    );
+    assert!(
+        admission_update_checks.load(Ordering::SeqCst) >= 1,
+        "the inert-to-active UPDATE must cross the real webhook router"
     );
 
     reconcile_current(&client, &task_runtime, &store, task_uid).await?;
@@ -730,6 +949,49 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         .replace_name_after_delete
         .store(true, Ordering::SeqCst);
     reconcile_current(&client, &task_runtime, &store, task_uid).await?;
+    let deleting_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("deleting runtime fixture is absent"))?;
+    assert!(
+        deleting_runtime.metadata.deletion_timestamp.is_some(),
+        "Task cleanup must request Kubernetes deletion before the runtime finalizer runs"
+    );
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        inference.clone(),
+        store.clone(),
+        deleting_runtime,
+    )
+    .await?;
+    let finalized_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("finalized runtime fixture is absent"))?;
+    assert!(
+        finalized_runtime
+            .metadata
+            .finalizers
+            .as_ref()
+            .is_none_or(Vec::is_empty),
+        "the production runtime cleanup must release its finalizer"
+    );
+    assert_eq!(task_runtime.deletes.load(Ordering::SeqCst), 1);
+    assert_eq!(inference.revocations.load(Ordering::SeqCst), 1);
+    assert!(
+        kubernetes
+            .credential_secret
+            .lock()
+            .map_err(|_| io::Error::other("credential Secret fixture was poisoned"))?
+            .is_none(),
+        "runtime finalization must delete the ephemeral inference credential"
+    );
+    reconcile_current(&client, &task_runtime, &store, task_uid).await?;
     reconcile_current(&client, &task_runtime, &store, task_uid).await?;
     let finalized = store
         .task(task_uid)
@@ -748,7 +1010,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             .lock()
             .map_err(|_| io::Error::other("delete fixture was poisoned"))?
             .as_slice(),
-        ["runtime-uid-a"]
+        ["runtime-uid-a", "runtime-uid-a"]
     );
     assert_eq!(
         kubernetes
@@ -760,6 +1022,14 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         Some("runtime-uid-replacement"),
         "same-name replacement infrastructure must remain untouched"
     );
+    assert!(
+        admission_delete_checks.load(Ordering::SeqCst) >= 1,
+        "cleanup must cross the real webhook router with the exact persisted runtime UID"
+    );
+    *kubernetes
+        .admission
+        .lock()
+        .map_err(|_| io::Error::other("admission fixture was poisoned"))? = None;
 
     *kubernetes
         .runtime
@@ -864,6 +1134,733 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             .ok_or(StoreError::TaskNotFound)?
             .finalized
     );
+
+    let successful_task_uid = Uuid::new_v4();
+    let successful_operation_id = Uuid::new_v4();
+    let successful_runtime_name = format!("task-{}", successful_operation_id.simple());
+    let successful_candidate_digest = digest(serde_json::to_value(&spec))?;
+    let successful_inert_digest = manifest_digest_with_binding(
+        successful_task_uid,
+        successful_operation_id,
+        &successful_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let successful_active_digest = manifest_digest_with_binding(
+        successful_task_uid,
+        successful_operation_id,
+        &successful_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    *kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("runtime UID fixture was poisoned"))? =
+        Some("runtime-uid-success".to_owned());
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid: successful_task_uid,
+            operation_id: successful_operation_id,
+            idempotency_key: &format!("successful-execution-{suffix}"),
+            submitter_service: &service,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: identity.user_id.as_str(),
+            workflow: "fault-injection",
+            workflow_name: Some("fault-injection"),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &successful_runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &agent_command,
+            execution_binding: Some(&execution_binding),
+            direct_task_evidence: None,
+            user_envelope_snapshot: Some(&envelope),
+            candidate_digest: &successful_candidate_digest,
+            admission_decision: &admission_decision,
+            inert_manifest_digest: &successful_inert_digest,
+            active_manifest_digest: &successful_active_digest,
+        })
+        .await?;
+    store
+        .put_task_inputs(
+            successful_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"successful task input",
+        )
+        .await?;
+    store
+        .request_task_execution(successful_task_uid, &service, identity.user_id.as_str())
+        .await?;
+
+    reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
+    reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
+    reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
+    reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
+    reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
+    let successful_activated_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("successful active runtime fixture is absent"))?;
+    assert_eq!(
+        operation(&store, successful_task_uid).await?.state,
+        TaskOrchestrationState::ActivationPending
+    );
+
+    let successful_inference = ActiveInference::default();
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        successful_inference.clone(),
+        store.clone(),
+        successful_activated_runtime,
+    )
+    .await?;
+    let successful_finalizing_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("successful finalized runtime fixture is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        successful_inference.clone(),
+        store.clone(),
+        successful_finalizing_runtime,
+    )
+    .await?;
+    reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
+    assert_eq!(
+        operation(&store, successful_task_uid).await?.state,
+        TaskOrchestrationState::Active
+    );
+
+    let starts_before_success = task_runtime.starts.load(Ordering::SeqCst);
+    task_runtime
+        .succeed_next_start
+        .store(true, Ordering::SeqCst);
+    for _ in 0..8 {
+        reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
+        if task_runtime.starts.load(Ordering::SeqCst) > starts_before_success {
+            break;
+        }
+    }
+    assert_eq!(
+        task_runtime.starts.load(Ordering::SeqCst),
+        starts_before_success + 1,
+        "successful execution must cross the Task adapter exactly once"
+    );
+    assert_eq!(
+        operation(&store, successful_task_uid).await?.state,
+        TaskOrchestrationState::CleanupPending,
+        "successful execution must atomically authorize runtime cleanup"
+    );
+    assert_eq!(
+        store
+            .task(successful_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .phase,
+        TaskPhase::Succeeded
+    );
+
+    reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
+    let successful_deleting_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("successful deleting runtime fixture is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        successful_inference.clone(),
+        store.clone(),
+        successful_deleting_runtime,
+    )
+    .await?;
+    reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
+    reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
+    let successful_task = store
+        .task(successful_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert!(successful_task.finalized);
+    assert_eq!(successful_task.phase, TaskPhase::Succeeded);
+    assert_eq!(
+        successful_task.output_archive.as_deref(),
+        Some(b"successful task output".as_slice())
+    );
+    assert!(
+        kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+            .is_none(),
+        "successful Task finalization must remove its exact runtime"
+    );
+
+    let expired_task_uid = Uuid::new_v4();
+    let expired_operation_id = Uuid::new_v4();
+    let expired_runtime_name = format!("task-{}", expired_operation_id.simple());
+    let expired_candidate_digest = digest(serde_json::to_value(&spec))?;
+    let expired_inert_digest = manifest_digest_with_binding(
+        expired_task_uid,
+        expired_operation_id,
+        &expired_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let expired_active_digest = manifest_digest_with_binding(
+        expired_task_uid,
+        expired_operation_id,
+        &expired_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    *kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("runtime UID fixture was poisoned"))? =
+        Some("runtime-uid-expired".to_owned());
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid: expired_task_uid,
+            operation_id: expired_operation_id,
+            idempotency_key: &format!("expired-runtime-{suffix}"),
+            submitter_service: &service,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: identity.user_id.as_str(),
+            workflow: "fault-injection",
+            workflow_name: Some("fault-injection"),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &expired_runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &agent_command,
+            execution_binding: Some(&execution_binding),
+            direct_task_evidence: None,
+            user_envelope_snapshot: Some(&envelope),
+            candidate_digest: &expired_candidate_digest,
+            admission_decision: &admission_decision,
+            inert_manifest_digest: &expired_inert_digest,
+            active_manifest_digest: &expired_active_digest,
+        })
+        .await?;
+    store
+        .put_task_inputs(
+            expired_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"expired task input",
+        )
+        .await?;
+    store
+        .request_task_execution(expired_task_uid, &service, identity.user_id.as_str())
+        .await?;
+
+    for _ in 0..5 {
+        reconcile_current(&client, &task_runtime, &store, expired_task_uid).await?;
+    }
+    assert_eq!(
+        operation(&store, expired_task_uid).await?.state,
+        TaskOrchestrationState::ActivationPending
+    );
+    let expired_activated_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("expired active runtime fixture is absent"))?;
+    let expired_inference = ActiveInference::default();
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        expired_inference.clone(),
+        store.clone(),
+        expired_activated_runtime,
+    )
+    .await?;
+    let expired_finalizing_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("expired finalized runtime fixture is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        expired_inference.clone(),
+        store.clone(),
+        expired_finalizing_runtime,
+    )
+    .await?;
+    reconcile_current(&client, &task_runtime, &store, expired_task_uid).await?;
+    assert_eq!(
+        operation(&store, expired_task_uid).await?.state,
+        TaskOrchestrationState::Active
+    );
+
+    let mut expired_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("expired provisioned runtime fixture is absent"))?;
+    expired_runtime.metadata.creation_timestamp =
+        Some(serde_json::from_value(json!("1970-01-01T00:00:00Z"))?);
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        expired_inference.clone(),
+        store.clone(),
+        expired_runtime,
+    )
+    .await?;
+    let expired_operation = operation(&store, expired_task_uid).await?;
+    assert_eq!(
+        expired_operation.state,
+        TaskOrchestrationState::CleanupPending,
+        "Task TTL expiry must establish persisted cleanup authority before deletion"
+    );
+    assert_eq!(
+        store
+            .task(expired_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .failure_reason
+            .as_deref(),
+        Some("task_runtime_ttl_expired")
+    );
+    assert!(
+        kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+            .as_ref()
+            .is_some_and(|runtime| runtime.metadata.deletion_timestamp.is_none()),
+        "ordinary reconciliation must not delete an expired Task runtime before Task cleanup"
+    );
+
+    reconcile_current(&client, &task_runtime, &store, expired_task_uid).await?;
+    let expired_deleting_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("expired deleting runtime fixture is absent"))?;
+    assert!(
+        expired_deleting_runtime
+            .metadata
+            .deletion_timestamp
+            .is_some()
+    );
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        expired_inference.clone(),
+        store.clone(),
+        expired_deleting_runtime,
+    )
+    .await?;
+    reconcile_current(&client, &task_runtime, &store, expired_task_uid).await?;
+    reconcile_current(&client, &task_runtime, &store, expired_task_uid).await?;
+    let expired_task = store
+        .task(expired_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert!(expired_task.finalized);
+    assert_eq!(expired_task.phase, TaskPhase::Failed);
+    assert_eq!(
+        expired_task.failure_reason.as_deref(),
+        Some("task_runtime_ttl_expired")
+    );
+    assert!(
+        kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+            .is_none(),
+        "expired Task finalization must remove its exact runtime"
+    );
+
+    let cancelled_task_uid = Uuid::new_v4();
+    let cancelled_operation_id = Uuid::new_v4();
+    let cancelled_runtime_name = format!("task-{}", cancelled_operation_id.simple());
+    let cancelled_candidate_digest = digest(serde_json::to_value(&spec))?;
+    let cancelled_inert_digest = manifest_digest_with_binding(
+        cancelled_task_uid,
+        cancelled_operation_id,
+        &cancelled_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let cancelled_active_digest = manifest_digest_with_binding(
+        cancelled_task_uid,
+        cancelled_operation_id,
+        &cancelled_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    *kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("runtime UID fixture was poisoned"))? =
+        Some("runtime-uid-cancelled".to_owned());
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid: cancelled_task_uid,
+            operation_id: cancelled_operation_id,
+            idempotency_key: &format!("cancelled-runtime-{suffix}"),
+            submitter_service: &service,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: identity.user_id.as_str(),
+            workflow: "fault-injection",
+            workflow_name: Some("fault-injection"),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &cancelled_runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &agent_command,
+            execution_binding: Some(&execution_binding),
+            direct_task_evidence: None,
+            user_envelope_snapshot: Some(&envelope),
+            candidate_digest: &cancelled_candidate_digest,
+            admission_decision: &admission_decision,
+            inert_manifest_digest: &cancelled_inert_digest,
+            active_manifest_digest: &cancelled_active_digest,
+        })
+        .await?;
+    store
+        .put_task_inputs(
+            cancelled_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"cancelled task input",
+        )
+        .await?;
+    store
+        .request_task_execution(cancelled_task_uid, &service, identity.user_id.as_str())
+        .await?;
+
+    for _ in 0..5 {
+        reconcile_current(&client, &task_runtime, &store, cancelled_task_uid).await?;
+    }
+    assert_eq!(
+        operation(&store, cancelled_task_uid).await?.state,
+        TaskOrchestrationState::ActivationPending
+    );
+    let cancelled_activated_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("cancelled active runtime fixture is absent"))?;
+    let cancelled_inference = ActiveInference::default();
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        cancelled_inference.clone(),
+        store.clone(),
+        cancelled_activated_runtime,
+    )
+    .await?;
+    let cancelled_finalizing_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("cancelled finalized runtime fixture is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        cancelled_inference.clone(),
+        store.clone(),
+        cancelled_finalizing_runtime,
+    )
+    .await?;
+    reconcile_current(&client, &task_runtime, &store, cancelled_task_uid).await?;
+    assert_eq!(
+        operation(&store, cancelled_task_uid).await?.state,
+        TaskOrchestrationState::Active
+    );
+
+    let starts_before_cancellation = task_runtime.starts.load(Ordering::SeqCst);
+    let cancelled = store
+        .request_task_finalization(cancelled_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    assert!(cancelled.cancel_requested);
+    assert_eq!(cancelled.phase, TaskPhase::Cancelled);
+    reconcile_current(&client, &task_runtime, &store, cancelled_task_uid).await?;
+    assert_eq!(
+        operation(&store, cancelled_task_uid).await?.state,
+        TaskOrchestrationState::CleanupPending,
+        "cancellation must establish persisted cleanup authority before deletion"
+    );
+    assert_eq!(
+        task_runtime.starts.load(Ordering::SeqCst),
+        starts_before_cancellation,
+        "a cancelled queued Task must not begin execution"
+    );
+    assert!(
+        kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+            .as_ref()
+            .is_some_and(|runtime| runtime.metadata.deletion_timestamp.is_none()),
+        "Task cancellation must not delete the runtime before cleanup is authorized"
+    );
+
+    reconcile_current(&client, &task_runtime, &store, cancelled_task_uid).await?;
+    let cancelled_deleting_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("cancelled deleting runtime fixture is absent"))?;
+    assert!(
+        cancelled_deleting_runtime
+            .metadata
+            .deletion_timestamp
+            .is_some()
+    );
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        cancelled_inference.clone(),
+        store.clone(),
+        cancelled_deleting_runtime,
+    )
+    .await?;
+    reconcile_current(&client, &task_runtime, &store, cancelled_task_uid).await?;
+    reconcile_current(&client, &task_runtime, &store, cancelled_task_uid).await?;
+    let cancelled_task = store
+        .task(cancelled_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert!(cancelled_task.finalized);
+    assert_eq!(cancelled_task.phase, TaskPhase::Cancelled);
+    assert!(
+        kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+            .is_none(),
+        "cancelled Task finalization must remove its exact runtime"
+    );
+
+    let rejected_task_uid = Uuid::new_v4();
+    let rejected_operation_id = Uuid::new_v4();
+    let rejected_runtime_name = format!("task-{}", rejected_operation_id.simple());
+    let rejected_candidate_digest = digest(serde_json::to_value(&spec))?;
+    let rejected_inert_digest = manifest_digest_with_binding(
+        rejected_task_uid,
+        rejected_operation_id,
+        &rejected_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let rejected_active_digest = manifest_digest_with_binding(
+        rejected_task_uid,
+        rejected_operation_id,
+        &rejected_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid: rejected_task_uid,
+            operation_id: rejected_operation_id,
+            idempotency_key: &format!("deterministic-create-rejection-{suffix}"),
+            submitter_service: &service,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: identity.user_id.as_str(),
+            workflow: "fault-injection",
+            workflow_name: Some("fault-injection"),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &rejected_runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &agent_command,
+            execution_binding: Some(&execution_binding),
+            direct_task_evidence: None,
+            user_envelope_snapshot: Some(&envelope),
+            candidate_digest: &rejected_candidate_digest,
+            admission_decision: &admission_decision,
+            inert_manifest_digest: &rejected_inert_digest,
+            active_manifest_digest: &rejected_active_digest,
+        })
+        .await?;
+    reconcile_current(&client, &task_runtime, &store, rejected_task_uid).await?;
+    assert_eq!(
+        operation(&store, rejected_task_uid).await?.state,
+        TaskOrchestrationState::RuntimeCreatePending
+    );
+    kubernetes
+        .reject_create_with_unprocessable_entity
+        .store(true, Ordering::SeqCst);
+    let create_calls_before_rejection = kubernetes.create_calls.load(Ordering::SeqCst);
+    reconcile_current(&client, &task_runtime, &store, rejected_task_uid).await?;
+    let rejected_operation = operation(&store, rejected_task_uid).await?;
+    assert_eq!(
+        rejected_operation.state,
+        TaskOrchestrationState::CleanupPending,
+        "a deterministic Kubernetes rejection must leave runtime-create-pending by entering cleanup"
+    );
+    assert_eq!(
+        rejected_operation.last_error_code.as_deref(),
+        Some("runtime_create_admission_rejected")
+    );
+    assert!(rejected_operation.runtime_absent_observed_at.is_some());
+    let rejected_task = store
+        .task(rejected_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(rejected_task.phase, TaskPhase::Failed);
+    assert!(rejected_task.finalize_requested);
+
+    reconcile_current(&client, &task_runtime, &store, rejected_task_uid).await?;
+    assert_eq!(
+        operation(&store, rejected_task_uid).await?.state,
+        TaskOrchestrationState::Finalized
+    );
+    assert_eq!(
+        kubernetes.create_calls.load(Ordering::SeqCst),
+        create_calls_before_rejection + 1,
+        "cleanup must not repeat a create after deterministic non-creation was proven"
+    );
+    assert!(
+        store
+            .task_runtime_admission("steward-test", "task-unpersisted")
+            .await?
+            .is_none(),
+        "a missing Task runtime projection must remain absent"
+    );
+
+    let duplicate_task_uid = Uuid::new_v4();
+    let duplicate_operation_id = Uuid::new_v4();
+    let duplicate_inert_digest = manifest_digest_with_binding(
+        duplicate_task_uid,
+        duplicate_operation_id,
+        &runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let duplicate_active_digest = manifest_digest_with_binding(
+        duplicate_task_uid,
+        duplicate_operation_id,
+        &runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    insert_task_projection_fixture(
+        &pool,
+        TaskProjectionFixture {
+            source_task_uid: task_uid,
+            task_uid: duplicate_task_uid,
+            operation_id: duplicate_operation_id,
+            idempotency_key: &format!("duplicate-runtime-admission-{suffix}"),
+            task_runtime_name: &runtime_name,
+            operation_runtime_name: &runtime_name,
+            inert_manifest_digest: &duplicate_inert_digest,
+            active_manifest_digest: &duplicate_active_digest,
+        },
+    )
+    .await?;
+    assert!(
+        matches!(
+            store
+                .task_runtime_admission("steward-test", &runtime_name)
+                .await,
+            Err(StoreError::InvalidTaskTransition)
+        ),
+        "duplicate runtime coordinates must fail the admission projection closed"
+    );
+
+    assert!(
+        store
+            .task_runtime_admission("steward-test", &rejected_runtime_name)
+            .await?
+            .is_some(),
+        "the valid persisted projection must be readable before corruption"
+    );
+    let invalid_task_uid = Uuid::new_v4();
+    let invalid_operation_id = Uuid::new_v4();
+    let invalid_task_runtime_name = format!("task-{}", invalid_operation_id.simple());
+    insert_task_projection_fixture(
+        &pool,
+        TaskProjectionFixture {
+            source_task_uid: rejected_task_uid,
+            task_uid: invalid_task_uid,
+            operation_id: invalid_operation_id,
+            idempotency_key: &format!("invalid-runtime-admission-{suffix}"),
+            task_runtime_name: &invalid_task_runtime_name,
+            operation_runtime_name: "task-corrupted-projection",
+            inert_manifest_digest: &rejected_inert_digest,
+            active_manifest_digest: &rejected_active_digest,
+        },
+    )
+    .await?;
+    assert!(
+        matches!(
+            store
+                .task_runtime_admission("steward-test", "task-corrupted-projection")
+                .await,
+            Err(StoreError::InvalidTaskTransition)
+        ),
+        "an inconsistent persisted Task/runtime projection must fail closed"
+    );
     assert_eq!(reservation.record.task_uid, task_uid);
     Ok(())
 }
@@ -904,6 +1901,70 @@ async fn current_work(
         .ok_or_else(|| io::Error::other("Task orchestration work item is not due").into())
 }
 
+struct TaskProjectionFixture<'a> {
+    source_task_uid: Uuid,
+    task_uid: Uuid,
+    operation_id: Uuid,
+    idempotency_key: &'a str,
+    task_runtime_name: &'a str,
+    operation_runtime_name: &'a str,
+    inert_manifest_digest: &'a str,
+    active_manifest_digest: &'a str,
+}
+
+async fn insert_task_projection_fixture(
+    pool: &sqlx::PgPool,
+    fixture: TaskProjectionFixture<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let mut transaction = pool.begin().await?;
+    let inserted = sqlx::query(
+        "INSERT INTO task_submissions \
+         (task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, \
+          owner, owner_user_id, identity_binding_state, workflow, workflow_name, workflow_version, \
+          workflow_digest, user_envelope_instance_id, user_envelope_revision, \
+          user_envelope_digest, authority_kind, user_envelope_snapshot, coding_agent_runtime, \
+          runtime_uid, runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
+          agent_command, execution_binding, direct_task_evidence, envelope_revision, \
+          orchestration_version, orchestration_operation_id, candidate_digest, \
+          service_envelope_digest, original_admission_decision, original_admission_deltas) \
+         SELECT $1, $2, submitter_service, acting_user, acting_user_id, owner, owner_user_id, \
+                identity_binding_state, workflow, workflow_name, workflow_version, workflow_digest, \
+                user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
+                authority_kind, user_envelope_snapshot, coding_agent_runtime, NULL, \
+                runtime_namespace, $3, runtime_ownership, 'submitted', runtime_spec, agent_command, \
+                execution_binding, direct_task_evidence, envelope_revision, orchestration_version, \
+                $4, candidate_digest, service_envelope_digest, original_admission_decision, \
+                original_admission_deltas \
+         FROM task_submissions WHERE task_uid = $5",
+    )
+    .bind(fixture.task_uid)
+    .bind(fixture.idempotency_key)
+    .bind(fixture.task_runtime_name)
+    .bind(fixture.operation_id)
+    .bind(fixture.source_task_uid)
+    .execute(&mut *transaction)
+    .await?
+    .rows_affected();
+    if inserted != 1 {
+        return Err(io::Error::other("projection fixture source Task is absent").into());
+    }
+    sqlx::query(
+        "INSERT INTO task_runtime_operations \
+         (task_uid, operation_id, state, generation, runtime_ownership, runtime_namespace, \
+          runtime_name, inert_manifest_digest, active_manifest_digest) \
+         VALUES ($1, $2, 'intent_recorded', 1, 'provisioned', 'steward-test', $3, $4, $5)",
+    )
+    .bind(fixture.task_uid)
+    .bind(fixture.operation_id)
+    .bind(fixture.operation_runtime_name)
+    .bind(fixture.inert_manifest_digest)
+    .bind(fixture.active_manifest_digest)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
 async fn operation(
     store: &PgStore,
     task_uid: Uuid,
@@ -934,6 +1995,86 @@ async fn kubernetes_client(
     Ok((Client::try_from(config)?, ServerGuard(server)))
 }
 
+async fn router_client(
+    router: Router,
+    default_namespace: &str,
+) -> Result<(Client, ServerGuard), Box<dyn Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .map_err(io::Error::other)
+    });
+    let mut config = kube::Config::new(format!("http://{address}").parse()?);
+    config.default_namespace = default_namespace.to_owned();
+    Ok((Client::try_from(config)?, ServerGuard(server)))
+}
+
+async fn webhook_admits_runtime(
+    harness: &WebhookAdmissionHarness,
+    operation: &str,
+    runtime: &AgentRuntime,
+    old_runtime: Option<&AgentRuntime>,
+) -> Result<bool, Box<dyn Error>> {
+    let name = runtime
+        .metadata
+        .name
+        .as_deref()
+        .ok_or_else(|| io::Error::other("admission runtime name is absent"))?;
+    let namespace = runtime
+        .metadata
+        .namespace
+        .as_deref()
+        .ok_or_else(|| io::Error::other("admission runtime namespace is absent"))?;
+    let object = if operation == "DELETE" {
+        serde_json::Value::Null
+    } else {
+        serde_json::to_value(runtime)?
+    };
+    let old_object = if operation == "DELETE" {
+        serde_json::to_value(runtime)?
+    } else {
+        serde_json::to_value(old_runtime)?
+    };
+    let review = json!({
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "request": {
+            "uid": format!("{operation}-{name}"),
+            "kind": {
+                "group": "agents.apelogic.ai",
+                "version": "v1alpha1",
+                "kind": "AgentRuntime"
+            },
+            "resource": {
+                "group": "agents.apelogic.ai",
+                "version": "v1alpha1",
+                "resource": "agentruntimes"
+            },
+            "name": name,
+            "namespace": namespace,
+            "operation": operation,
+            "userInfo": {
+                "username": CONTROLLER_USERNAME,
+                "groups": ["system:serviceaccounts"]
+            },
+            "object": object,
+            "oldObject": old_object,
+            "dryRun": false,
+            "options": null
+        }
+    });
+    let request = KubeRequest::new("/validate-agent-runtime")
+        .create(&PostParams::default(), serde_json::to_vec(&review)?)?;
+    let response: serde_json::Value =
+        serde_json::from_str(&harness.client.request_text(request).await?)?;
+    response
+        .pointer("/response/allowed")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| io::Error::other("webhook response has no allowed decision").into())
+}
+
 async fn kubernetes_request(
     State(state): State<AmbiguousKubernetes>,
     request: Request,
@@ -943,6 +2084,12 @@ async fn kubernetes_request(
     let response = match method {
         Method::POST if path == RUNTIME_PATH_PREFIX => {
             state.create_calls.fetch_add(1, Ordering::SeqCst);
+            if state
+                .reject_create_with_unprocessable_entity
+                .swap(false, Ordering::SeqCst)
+            {
+                return Ok(status_response(StatusCode::UNPROCESSABLE_ENTITY, "Invalid"));
+            }
             let bytes = match to_bytes(request.into_body(), 1024 * 1024).await {
                 Ok(bytes) => bytes,
                 Err(_) => return Ok(status_response(StatusCode::BAD_REQUEST, "BadRequest")),
@@ -951,6 +2098,51 @@ async fn kubernetes_request(
                 Ok(runtime) => runtime,
                 Err(_) => return Ok(status_response(StatusCode::BAD_REQUEST, "BadRequest")),
             };
+            let admission = match state.admission.lock() {
+                Ok(admission) => admission.clone(),
+                Err(_) => {
+                    return Ok(status_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                    ));
+                }
+            };
+            if let Some(admission) = admission {
+                if admission.verify_boundaries.swap(false, Ordering::SeqCst) {
+                    let mut mutated = runtime.clone();
+                    mutated.spec.budget.monthly_limit = "999".to_owned();
+                    if !matches!(
+                        webhook_admits_runtime(&admission, "CREATE", &mutated, None).await,
+                        Ok(false)
+                    ) {
+                        return Ok(status_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "MutatedRuntimeWasNotDenied",
+                        ));
+                    }
+                    let mut unpersisted = runtime.clone();
+                    unpersisted.metadata.name = Some("task-unpersisted".to_owned());
+                    if !matches!(
+                        webhook_admits_runtime(&admission, "CREATE", &unpersisted, None).await,
+                        Ok(false)
+                    ) {
+                        return Ok(status_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "UnpersistedRuntimeWasNotDenied",
+                        ));
+                    }
+                }
+                admission.create_checks.fetch_add(1, Ordering::SeqCst);
+                if !matches!(
+                    webhook_admits_runtime(&admission, "CREATE", &runtime, None).await,
+                    Ok(true)
+                ) {
+                    return Ok(status_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "AdmissionDenied",
+                    ));
+                }
+            }
             let mut stored = match state.runtime.lock() {
                 Ok(stored) => stored,
                 Err(_) => {
@@ -963,9 +2155,27 @@ async fn kubernetes_request(
             if stored.is_some() {
                 status_response(StatusCode::CONFLICT, "AlreadyExists")
             } else {
-                runtime.metadata.uid = Some("runtime-uid-a".to_owned());
+                runtime.metadata.uid = Some(
+                    state
+                        .next_runtime_uid
+                        .lock()
+                        .ok()
+                        .and_then(|mut runtime_uid| runtime_uid.take())
+                        .unwrap_or_else(|| "runtime-uid-a".to_owned()),
+                );
                 runtime.metadata.resource_version = Some("1".to_owned());
                 runtime.metadata.generation = Some(1);
+                runtime.metadata.creation_timestamp = Some(
+                    match serde_json::from_value(serde_json::json!("2099-01-01T00:00:00Z")) {
+                        Ok(timestamp) => timestamp,
+                        Err(_) => {
+                            return Ok(status_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "InternalError",
+                            ));
+                        }
+                    },
+                );
                 *stored = Some(runtime.clone());
                 if let Ok(mut created) = state.created.lock() {
                     created.push(runtime.clone());
@@ -997,6 +2207,80 @@ async fn kubernetes_request(
                 Ok(runtime) => runtime,
                 Err(_) => return Ok(status_response(StatusCode::BAD_REQUEST, "BadRequest")),
             };
+            let current = match state.runtime.lock() {
+                Ok(stored) => stored.clone(),
+                Err(_) => {
+                    return Ok(status_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                    ));
+                }
+            };
+            let Some(current) = current else {
+                return Ok(status_response(StatusCode::NOT_FOUND, "NotFound"));
+            };
+            if desired.metadata.resource_version != current.metadata.resource_version {
+                status_response(StatusCode::CONFLICT, "Conflict")
+            } else {
+                let admission = match state.admission.lock() {
+                    Ok(admission) => admission.clone(),
+                    Err(_) => {
+                        return Ok(status_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "InternalError",
+                        ));
+                    }
+                };
+                if let Some(admission) = admission {
+                    admission.update_checks.fetch_add(1, Ordering::SeqCst);
+                    if !matches!(
+                        webhook_admits_runtime(&admission, "UPDATE", &desired, Some(&current),)
+                            .await,
+                        Ok(true)
+                    ) {
+                        return Ok(status_response(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "AdmissionDenied",
+                        ));
+                    }
+                }
+                let mut stored = match state.runtime.lock() {
+                    Ok(stored) => stored,
+                    Err(_) => {
+                        return Ok(status_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "InternalError",
+                        ));
+                    }
+                };
+                if stored
+                    .as_ref()
+                    .and_then(|runtime| runtime.metadata.resource_version.as_deref())
+                    != current.metadata.resource_version.as_deref()
+                {
+                    return Ok(status_response(StatusCode::CONFLICT, "Conflict"));
+                }
+                desired.metadata.uid.clone_from(&current.metadata.uid);
+                desired
+                    .metadata
+                    .creation_timestamp
+                    .clone_from(&current.metadata.creation_timestamp);
+                desired.metadata.resource_version = Some("2".to_owned());
+                desired.metadata.generation = Some(2);
+                desired.status = current.status;
+                *stored = Some(desired.clone());
+                json_response(StatusCode::OK, serde_json::to_value(&desired))
+            }
+        }
+        Method::PATCH if path.starts_with(RUNTIME_PATH_PREFIX) => {
+            let bytes = match to_bytes(request.into_body(), 1024 * 1024).await {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(status_response(StatusCode::BAD_REQUEST, "BadRequest")),
+            };
+            let patch = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(patch) => patch,
+                Err(_) => return Ok(status_response(StatusCode::BAD_REQUEST, "BadRequest")),
+            };
             let mut stored = match state.runtime.lock() {
                 Ok(stored) => stored,
                 Err(_) => {
@@ -1006,37 +2290,142 @@ async fn kubernetes_request(
                     ));
                 }
             };
-            let Some(current) = stored.as_ref() else {
+            let Some(runtime) = stored.as_mut() else {
                 return Ok(status_response(StatusCode::NOT_FOUND, "NotFound"));
             };
-            if desired.metadata.resource_version != current.metadata.resource_version {
-                status_response(StatusCode::CONFLICT, "Conflict")
-            } else {
-                desired.metadata.uid.clone_from(&current.metadata.uid);
-                desired.metadata.resource_version = Some("2".to_owned());
-                desired.metadata.generation = Some(2);
-                desired.status = Some(AgentRuntimeStatus {
-                    phase: Phase::Running,
-                    observed_generation: 2,
-                    spec_digest: match runtime_spec_digest(&desired.spec) {
-                        Ok(digest) => digest,
-                        Err(_) => {
-                            return Ok(status_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "InternalError",
-                            ));
+            if path.ends_with("/status") {
+                let status = match patch
+                    .get("status")
+                    .cloned()
+                    .map(serde_json::from_value::<AgentRuntimeStatus>)
+                {
+                    Some(Ok(status)) => status,
+                    _ => {
+                        return Ok(status_response(
+                            StatusCode::BAD_REQUEST,
+                            "InvalidStatusPatch",
+                        ));
+                    }
+                };
+                runtime.status = Some(status);
+                state.status_patches.fetch_add(1, Ordering::SeqCst);
+            } else if let Some(operations) = patch.as_array() {
+                for operation in operations {
+                    let Some(path) = operation.get("path").and_then(serde_json::Value::as_str)
+                    else {
+                        return Ok(status_response(StatusCode::BAD_REQUEST, "InvalidPatch"));
+                    };
+                    match (
+                        operation.get("op").and_then(serde_json::Value::as_str),
+                        path,
+                    ) {
+                        (Some("test"), "/metadata/finalizers") => {}
+                        (Some("test"), path) if path.starts_with("/metadata/finalizers/") => {}
+                        (Some("add"), "/metadata/finalizers") => {
+                            runtime.metadata.finalizers = operation
+                                .get("value")
+                                .cloned()
+                                .and_then(|value| serde_json::from_value(value).ok());
                         }
-                    },
-                    refs: RuntimeRefs {
-                        workspace: Some("workspace-a".to_owned()),
-                        sandbox: Some("sandbox-a".to_owned()),
-                        litellm_key: None,
-                    },
-                    conditions: Vec::new(),
-                    spend: None,
+                        (Some("add"), "/metadata/finalizers/-") => {
+                            let Some(value) =
+                                operation.get("value").and_then(serde_json::Value::as_str)
+                            else {
+                                return Ok(status_response(
+                                    StatusCode::BAD_REQUEST,
+                                    "InvalidPatch",
+                                ));
+                            };
+                            runtime
+                                .metadata
+                                .finalizers
+                                .get_or_insert_default()
+                                .push(value.to_owned());
+                        }
+                        (Some("remove"), path) if path.starts_with("/metadata/finalizers/") => {
+                            let Some(index) = path
+                                .rsplit('/')
+                                .next()
+                                .and_then(|value| value.parse::<usize>().ok())
+                            else {
+                                return Ok(status_response(
+                                    StatusCode::BAD_REQUEST,
+                                    "InvalidPatch",
+                                ));
+                            };
+                            let Some(finalizers) = runtime.metadata.finalizers.as_mut() else {
+                                return Ok(status_response(StatusCode::CONFLICT, "Conflict"));
+                            };
+                            if index >= finalizers.len() {
+                                return Ok(status_response(StatusCode::CONFLICT, "Conflict"));
+                            }
+                            finalizers.remove(index);
+                        }
+                        _ => {
+                            return Ok(status_response(StatusCode::BAD_REQUEST, "InvalidPatch"));
+                        }
+                    }
+                }
+            } else {
+                return Ok(status_response(StatusCode::BAD_REQUEST, "InvalidPatch"));
+            }
+            runtime.metadata.resource_version = Some(
+                runtime
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or_default()
+                    .saturating_add(1)
+                    .to_string(),
+            );
+            json_response(StatusCode::OK, serde_json::to_value(runtime))
+        }
+        Method::GET if path.starts_with(SECRET_PATH_PREFIX) => {
+            match state.credential_secret.lock() {
+                Ok(secret) => secret.as_ref().map_or_else(
+                    || status_response(StatusCode::NOT_FOUND, "NotFound"),
+                    |secret| json_response(StatusCode::OK, Ok(secret.clone())),
+                ),
+                Err(_) => status_response(StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
+            }
+        }
+        Method::POST if path == SECRET_PATH_PREFIX => {
+            let bytes = match to_bytes(request.into_body(), 1024 * 1024).await {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(status_response(StatusCode::BAD_REQUEST, "BadRequest")),
+            };
+            let mut secret = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(secret) => secret,
+                Err(_) => return Ok(status_response(StatusCode::BAD_REQUEST, "BadRequest")),
+            };
+            let credential_present = secret
+                .pointer("/stringData/access-token")
+                .and_then(serde_json::Value::as_str)
+                .is_some();
+            if credential_present {
+                secret["data"] = serde_json::json!({
+                    "access-token": "Zml4dHVyZS1pbmZlcmVuY2UtY3JlZGVudGlhbA=="
                 });
-                *stored = Some(desired.clone());
-                json_response(StatusCode::OK, serde_json::to_value(&desired))
+                if let Some(object) = secret.as_object_mut() {
+                    object.remove("stringData");
+                }
+            }
+            match state.credential_secret.lock() {
+                Ok(mut stored) => {
+                    *stored = Some(secret.clone());
+                    json_response(StatusCode::CREATED, Ok(secret))
+                }
+                Err(_) => status_response(StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
+            }
+        }
+        Method::DELETE if path.starts_with(SECRET_PATH_PREFIX) => {
+            match state.credential_secret.lock() {
+                Ok(mut stored) => {
+                    *stored = None;
+                    status_response(StatusCode::OK, "Success")
+                }
+                Err(_) => status_response(StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
             }
         }
         Method::DELETE if path.starts_with(RUNTIME_PATH_PREFIX) => {
@@ -1055,6 +2444,36 @@ async fn kubernetes_request(
             let Some(uid) = uid else {
                 return Ok(status_response(StatusCode::CONFLICT, "Conflict"));
             };
+            let current = match state.runtime.lock() {
+                Ok(stored) => stored.clone(),
+                Err(_) => {
+                    return Ok(status_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                    ));
+                }
+            };
+            let admission = match state.admission.lock() {
+                Ok(admission) => admission.clone(),
+                Err(_) => {
+                    return Ok(status_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                    ));
+                }
+            };
+            if let (Some(admission), Some(current)) = (admission, current.as_ref()) {
+                admission.delete_checks.fetch_add(1, Ordering::SeqCst);
+                if !matches!(
+                    webhook_admits_runtime(&admission, "DELETE", current, Some(current)).await,
+                    Ok(true)
+                ) {
+                    return Ok(status_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "AdmissionDenied",
+                    ));
+                }
+            }
             if let Ok(mut preconditions) = state.delete_preconditions.lock() {
                 preconditions.push(uid.clone());
             }
@@ -1073,6 +2492,38 @@ async fn kubernetes_request(
                 != Some(uid.as_str())
             {
                 status_response(StatusCode::CONFLICT, "Conflict")
+            } else if stored.as_ref().is_some_and(|runtime| {
+                runtime
+                    .metadata
+                    .finalizers
+                    .as_ref()
+                    .is_some_and(|finalizers| !finalizers.is_empty())
+            }) {
+                let runtime = stored.as_mut().unwrap_or_else(|| unreachable!());
+                if runtime.metadata.deletion_timestamp.is_none() {
+                    runtime.metadata.deletion_timestamp = Some(
+                        match serde_json::from_value(serde_json::json!("2099-01-01T00:30:00Z")) {
+                            Ok(timestamp) => timestamp,
+                            Err(_) => {
+                                return Ok(status_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "InternalError",
+                                ));
+                            }
+                        },
+                    );
+                    runtime.metadata.resource_version = Some(
+                        runtime
+                            .metadata
+                            .resource_version
+                            .as_deref()
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .unwrap_or_default()
+                            .saturating_add(1)
+                            .to_string(),
+                    );
+                }
+                status_response(StatusCode::OK, "Success")
             } else {
                 let mut replacement = stored.take().unwrap_or_else(|| unreachable!());
                 if state
