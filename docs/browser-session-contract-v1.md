@@ -30,8 +30,9 @@ There is no first-login administrator shortcut. An organization user signs in on
 operator. In the same protected runtime where `STEWARD_DATABASE_URL` is already projected, that
 operator records the initial local grant with:
 
-```text
-steward-apiserver-bin bootstrap-rbac \
+```sh
+kubectl -n <namespace> exec deploy/steward-apiserver -- \
+  /usr/local/bin/steward bootstrap-rbac \
   --user-id usr_<opaque-id> \
   --grant administrator \
   --actor <audited-operator>

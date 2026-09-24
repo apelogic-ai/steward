@@ -25,14 +25,20 @@ cleanup() {
   set +e
   if [[ "${status}" != 0 && "${cluster_created}" == 1 ]]; then
     kubectl --kubeconfig "${kubeconfig}" --context "${context}" \
-      -n "${namespace}" get gateway,httproute,backendtlspolicy,pods 2>/dev/null >&2
+      -n "${namespace}" get gateway,httproute,backendtlspolicy,pods >&2 || true
+    kubectl --kubeconfig "${kubeconfig}" --context "${context}" \
+      -n "${namespace}" get gateway,httproute,backendtlspolicy -o yaml >&2 || true
+    kubectl --kubeconfig "${kubeconfig}" --context "${context}" \
+      get gatewayclass -o yaml >&2 || true
+    kubectl --kubeconfig "${kubeconfig}" --context "${context}" \
+      -n "${namespace}" logs job/steward-gateway-session --all-containers=true >&2 || true
     kubectl --kubeconfig "${kubeconfig}" --context "${context}" \
       -n "${namespace}" get events --sort-by=.lastTimestamp 2>/dev/null | tail -30 >&2
   fi
   if [[ "${cluster_created}" == 1 ]]; then
-    kind delete cluster --name "${cluster}" >/dev/null 2>&1 || status=1
+    kind delete cluster --name "${cluster}" >/dev/null 2>&1 || true
   fi
-  find "${run_dir}" -depth -delete 2>/dev/null || status=1
+  find "${run_dir}" -depth -delete 2>/dev/null || true
   if kind get clusters 2>/dev/null | grep -Fxq "${cluster}" || [[ -e "${run_dir}" ]]; then
     echo "owned disposable resources remain; check ${cluster} and ${run_dir}" >&2
     status=1
@@ -85,6 +91,7 @@ if [[ ! -s "${gateway_chart_archive}" ]]; then
 fi
 helm upgrade --install "${envoy_gateway_release}" "${gateway_chart_archive}" \
   --namespace envoy-gateway-system \
+  --kubeconfig "${kubeconfig}" --kube-context "${context}" \
   --create-namespace --wait --timeout 5m >/dev/null
 "${K[@]}" -n envoy-gateway-system rollout status deployment/envoy-gateway --timeout=300s
 
@@ -172,6 +179,28 @@ YAML
 "${K[@]}" -n "${namespace}" rollout status deployment/steward-apiserver-tls-backend --timeout=180s
 
 set_stage route
+"${K[@]}" apply -f - >/dev/null <<YAML
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+  labels: {steward.test/run-id: ${run_id}}
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+YAML
+wait_gateway_class_condition() {
+  local attempt
+  for ((attempt = 1; attempt <= 60; attempt += 1)); do
+    if "${K[@]}" get gatewayclass/eg \
+      -o "jsonpath={range .status.conditions[?(@.type=='Accepted')]}{.status}{end}" 2>/dev/null | grep -Fxq True; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo 'GatewayClass/eg did not report Accepted=True' >&2
+  return 1
+}
+wait_gateway_class_condition
 "${K[@]}" -n "${namespace}" apply -f - >/dev/null <<YAML
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -220,21 +249,22 @@ spec:
       backendRefs: [{name: steward-apiserver, port: 443}]
 YAML
 
-wait_condition() {
-  local resource="$1"
-  local condition="$2"
+wait_listener_condition() {
+  local condition="$1"
   local attempt
   for ((attempt = 1; attempt <= 60; attempt += 1)); do
-    if "${K[@]}" -n "${namespace}" get "${resource}" \
-      -o "jsonpath={range .status.conditions[?(@.type=='${condition}')]}{.status}{end}" 2>/dev/null | grep -Fxq True; then
+    if "${K[@]}" -n "${namespace}" get gateway/steward-edge \
+      -o "jsonpath={range .status.listeners[?(@.name=='https')].conditions[?(@.type=='${condition}')]}{.status}{end}" 2>/dev/null | grep -Fxq True; then
       return 0
     fi
     sleep 2
   done
-  echo "${resource} did not report ${condition}=True" >&2
+  echo "Gateway/steward-edge HTTPS listener did not report ${condition}=True" >&2
   return 1
 }
-wait_condition gateway/steward-edge Programmed
+wait_listener_condition Accepted
+wait_listener_condition Programmed
+wait_listener_condition ResolvedRefs
 wait_route_condition() {
   local condition="$1"
   local attempt
@@ -267,7 +297,7 @@ wait_policy_condition Accepted
 wait_policy_condition ResolvedRefs
 
 set_stage public-session
-gateway_service="$(${K[@]} get service -A \
+gateway_service="$("${K[@]}" get service -A \
   -l gateway.envoyproxy.io/owning-gateway-namespace=${namespace},gateway.envoyproxy.io/owning-gateway-name=steward-edge \
   -o jsonpath='{.items[0].metadata.namespace}{"/"}{.items[0].metadata.name}')"
 if [[ ! "${gateway_service}" =~ ^[^/]+/[^/]+$ ]]; then
@@ -276,11 +306,25 @@ if [[ ! "${gateway_service}" =~ ^[^/]+/[^/]+$ ]]; then
 fi
 gateway_namespace="${gateway_service%/*}"
 gateway_service_name="${gateway_service#*/}"
-gateway_ip="$(${K[@]} -n "${gateway_namespace}" get service "${gateway_service_name}" -o jsonpath='{.spec.clusterIP}')"
+gateway_ip="$("${K[@]}" -n "${gateway_namespace}" get service "${gateway_service_name}" -o jsonpath='{.spec.clusterIP}')"
 if [[ ! "${gateway_ip}" =~ ^[0-9a-fA-F:.]+$ ]]; then
   echo 'Envoy Gateway data-plane Service has no usable ClusterIP' >&2
   exit 1
 fi
+wait_gateway_endpoint() {
+  local attempt
+  for ((attempt = 1; attempt <= 60; attempt += 1)); do
+    if "${K[@]}" -n "${gateway_namespace}" get endpointslice \
+      -l "kubernetes.io/service-name=${gateway_service_name}" \
+      -o 'jsonpath={range .items[*].endpoints[*]}{.conditions.ready}{"\n"}{end}' 2>/dev/null | grep -Fxq true; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "Envoy Gateway data-plane Service ${gateway_service} has no ready EndpointSlice" >&2
+  return 1
+}
+wait_gateway_endpoint
 "${K[@]}" -n "${namespace}" apply -f - >/dev/null <<YAML
 apiVersion: batch/v1
 kind: Job
@@ -311,4 +355,4 @@ spec:
         - {name: edge-ca, configMap: {name: steward-edge-ca}}
 YAML
 "${K[@]}" -n "${namespace}" wait --for=condition=complete job/steward-gateway-session --timeout=180s
-echo "Envoy Gateway ${envoy_gateway_version} returned Steward session status 401 through verified backend TLS"
+echo "Envoy Gateway ${envoy_gateway_version} returned the expected session status 401 through verified backend TLS"

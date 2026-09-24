@@ -414,6 +414,10 @@ preserve the same immutable coordinates and cross-component relationships.
    For `codex@0.140.0`, use or mirror the digest-selected image and run the
    [released runtime conformance](codex-reference-runtime.md) before activating its binding.
 
+   `config.controller.litellmUrl` is the LiteLLM management API base URL. The
+   controller appends `/key/delete`, `/key/list`, `/key/generate`, and
+   `/v1/model/info`; do not add an operation path to that value.
+
 2. Verify the named Secret objects and certificate SANs without displaying
    their data. When using platform preflight, run its `gateway-check` against
    the explicit kubeconfig and context. On EKS, also run `network-check` and the
@@ -486,8 +490,9 @@ enable and verify the human browser path before performing them.
    `STEWARD_DATABASE_URL` is already projected, the operator records the
    audited initial grant explicitly:
 
-   ```text
-   steward-apiserver-bin bootstrap-rbac \
+   ```sh
+   kubectl -n <namespace> exec deploy/steward-apiserver -- \
+     /usr/local/bin/steward bootstrap-rbac \
      --user-id usr_<opaque-id> \
      --grant administrator \
      --actor <audited-operator>

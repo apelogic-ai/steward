@@ -2417,7 +2417,8 @@ mod tests {
         for required in [
             "When `browserAuth.enabled=false`, skip this entire subsection",
             "There is no documented non-browser substitute",
-            "steward-apiserver-bin bootstrap-rbac",
+            "/usr/local/bin/steward bootstrap-rbac",
+            "kubectl -n <namespace> exec deploy/steward-apiserver --",
             "reads and verifies the existing Service Envelope",
             "does not provision or modify it",
         ] {

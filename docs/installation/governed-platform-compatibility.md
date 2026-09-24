@@ -39,8 +39,10 @@ archive SHA-256 before installation. Install or upgrade `spire-crds` before
 `spire`, verify the SPIRE server, agents, CSI driver, and controller manager,
 then verify Steward's `ClusterSPIFFEID` before rolling Mint.
 
-The installation trust domain is operator-supplied and immutable. Mint's
-identity is:
+The installation trust domain is operator-supplied and immutable. It is a SPIFFE
+identity namespace, not a DNS endpoint: `hypershell.dev.mirantis.app` is a
+supported trust domain, and Steward does not derive a network address from it.
+Mint's identity is:
 
 ```text
 spiffe://<trust-domain>/steward/mint
@@ -61,6 +63,11 @@ apply different URL conventions deliberately:
 |---|---|---|---|
 | `codex-v1` | Exact operation URL | `/v1/responses` | Provider-qualified; tested as `openai/gpt-5.4` |
 | `claude-code-v1` | API base URL | `/v1/messages` appended by the client | Provider-qualified; tested as `anthropic/claude-sonnet-4-6` |
+
+`config.controller.litellmUrl` is the LiteLLM management API base URL. The
+controller appends `/key/delete`, `/key/list`, `/key/generate`, and
+`/v1/model/info`; do not configure it with any of those operation paths already
+appended.
 
 Do not append `/v1/responses` twice for Codex and do not configure Claude with
 an already-expanded Messages operation URL. Before enabling a binding, prove
