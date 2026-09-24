@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 
@@ -709,6 +710,250 @@ def gateway_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def kubectl_base(args: argparse.Namespace) -> list[str]:
+    return [args.kubectl, "--kubeconfig", str(args.kubeconfig), "--context", args.context]
+
+
+def network_policy_agent(args: argparse.Namespace) -> tuple[dict[str, Any], str]:
+    command = kubectl_base(args) + [
+        "get",
+        "daemonset",
+        "aws-node",
+        "--namespace",
+        "kube-system",
+        "--output",
+        "json",
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise ValidationError(f"cannot read kube-system/aws-node DaemonSet: {detail}")
+    try:
+        daemonset = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ValidationError(f"kubectl returned invalid aws-node DaemonSet JSON: {error}") from error
+    containers = daemonset.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+    agent = next((container for container in containers if container.get("name") == "aws-network-policy-agent"), None)
+    if agent is None:
+        raise ValidationError("kube-system/aws-node has no aws-network-policy-agent container")
+    arguments = agent.get("args", [])
+    environment = {item.get("name"): item.get("value") for item in agent.get("env", [])}
+    enabled = "--enable-network-policy=true" in arguments or environment.get("ENABLE_NETWORK_POLICY", "").lower() == "true"
+    if not enabled:
+        raise ValidationError("aws-network-policy-agent is present but --enable-network-policy=true is not observable")
+    image = agent.get("image")
+    if not isinstance(image, str) or not image:
+        raise ValidationError("aws-network-policy-agent image is not observable")
+    return daemonset, image
+
+
+def network_check(args: argparse.Namespace) -> int:
+    _, image = network_policy_agent(args)
+    result = {
+        "schemaVersion": RESULT_CONTRACT,
+        "status": "preflight-valid",
+        "operation": "network-check",
+        "cni": {
+            "implementation": "Amazon VPC CNI",
+            "daemonSet": "kube-system/aws-node",
+            "networkPolicyAgentImage": image,
+            "networkPolicyEnabled": True,
+        },
+        "diagnostics": [
+            {
+                "code": "cni.network-policy-agent-observed",
+                "severity": "info",
+                "message": "aws-network-policy-agent is enabled; an actual deny/allow smoke is still required",
+            }
+        ],
+    }
+    print(canonical(result), end="")
+    return 0
+
+
+def run_kubectl(args: argparse.Namespace, arguments: list[str], stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        kubectl_base(args) + arguments,
+        input=stdin,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def apply_object(args: argparse.Namespace, value: dict[str, Any]) -> None:
+    result = run_kubectl(args, ["apply", "--filename", "-"], canonical(value))
+    if result.returncode != 0:
+        raise ValidationError(f"kubectl apply failed: {(result.stderr or result.stdout).strip()}")
+
+
+def network_smoke(args: argparse.Namespace) -> int:
+    network_policy_agent(args)
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?", args.run_id):
+        raise ValidationError("run-id must be 1-30 lowercase alphanumeric or hyphen characters")
+    if not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", args.probe_image):
+        raise ValidationError("probe-image must be an immutable image@sha256 digest")
+    if args.probe_image.endswith("sha256:" + "0" * 64):
+        raise ValidationError("probe-image must not use an all-zero placeholder digest")
+    namespace = f"steward-netpol-{args.run_id}"
+    labels = {"steward.test/run-id": args.run_id, "app.kubernetes.io/part-of": "steward-network-smoke"}
+    namespace_created = False
+    denied = False
+    allowed = False
+    cleanup_error: str | None = None
+    try:
+        apply_object(
+            args,
+            {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": namespace, "labels": labels}},
+        )
+        namespace_created = True
+        for name, role, command in (
+            ("server", "server", ["sh", "-c", "mkdir -p /tmp/www && printf ready >/tmp/www/index.html && httpd -f -p 8080 -h /tmp/www"]),
+            ("client", "client", ["sh", "-c", "trap : TERM INT; sleep 3600 & wait"]),
+        ):
+            apply_object(
+                args,
+                {
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {"name": name, "namespace": namespace, "labels": {**labels, "role": role}},
+                    "spec": {
+                        "restartPolicy": "Never",
+                        "containers": [
+                            {
+                                "name": role,
+                                "image": args.probe_image,
+                                "imagePullPolicy": "IfNotPresent",
+                                "command": command,
+                                "securityContext": {
+                                    "allowPrivilegeEscalation": False,
+                                    "capabilities": {"drop": ["ALL"]},
+                                    "runAsNonRoot": True,
+                                    "runAsUser": 65532,
+                                    "seccompProfile": {"type": "RuntimeDefault"},
+                                },
+                            }
+                        ],
+                    },
+                },
+            )
+        apply_object(
+            args,
+            {
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"name": "server", "namespace": namespace, "labels": labels},
+                "spec": {"selector": {"role": "server"}, "ports": [{"name": "http", "protocol": "TCP", "port": 8080, "targetPort": 8080}]},
+            },
+        )
+        for pod in ("server", "client"):
+            ready = run_kubectl(args, ["wait", "--namespace", namespace, "--for=condition=Ready", f"pod/{pod}", "--timeout=120s"])
+            if ready.returncode != 0:
+                raise ValidationError(f"probe Pod {pod} did not become ready: {(ready.stderr or ready.stdout).strip()}")
+        baseline = False
+        for _ in range(20):
+            baseline_attempt = run_kubectl(
+                args,
+                ["exec", "--namespace", namespace, "client", "--", "wget", "-q", "-T", "2", "-O", "-", "http://server:8080"],
+            )
+            if baseline_attempt.returncode == 0 and baseline_attempt.stdout.strip() == "ready":
+                baseline = True
+                break
+            time.sleep(1)
+        if not baseline:
+            raise ValidationError("probe Service baseline failed before policy; DNS, endpoints, or workload readiness is broken")
+        apply_object(
+            args,
+            {
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {"name": "deny-server", "namespace": namespace, "labels": labels},
+                "spec": {"podSelector": {"matchLabels": {"role": "server"}}, "policyTypes": ["Ingress"]},
+            },
+        )
+        consecutive_denials = 0
+        for _ in range(12):
+            denied_attempt = run_kubectl(
+                args,
+                ["exec", "--namespace", namespace, "client", "--", "wget", "-q", "-T", "2", "-O", "-", "http://server:8080"],
+            )
+            if denied_attempt.returncode != 0:
+                consecutive_denials += 1
+                if consecutive_denials >= 3:
+                    denied = True
+                    break
+            else:
+                consecutive_denials = 0
+            time.sleep(1)
+        if not denied:
+            raise ValidationError("NetworkPolicy deny could not be proven: client reached the protected server")
+        apply_object(
+            args,
+            {
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {"name": "allow-client", "namespace": namespace, "labels": labels},
+                "spec": {
+                    "podSelector": {"matchLabels": {"role": "server"}},
+                    "policyTypes": ["Ingress"],
+                    "ingress": [{"from": [{"podSelector": {"matchLabels": {"role": "client"}}}], "ports": [{"protocol": "TCP", "port": 8080}]}],
+                },
+            },
+        )
+        for _ in range(20):
+            allowed_attempt = run_kubectl(
+                args,
+                ["exec", "--namespace", namespace, "client", "--", "wget", "-q", "-T", "2", "-O", "-", "http://server:8080"],
+            )
+            if allowed_attempt.returncode == 0 and allowed_attempt.stdout.strip() == "ready":
+                allowed = True
+                break
+            time.sleep(1)
+        if not allowed:
+            raise ValidationError("NetworkPolicy allow could not be proven: authorized client did not reach the protected server")
+    finally:
+        if namespace_created:
+            proof = run_kubectl(
+                args,
+                ["get", "namespace", namespace, "--output", "jsonpath={.metadata.labels.steward\\.test/run-id}"],
+            )
+            if proof.returncode == 0 and proof.stdout.strip() == args.run_id:
+                deletion = run_kubectl(args, ["delete", "namespace", namespace, "--wait=true", "--timeout=120s"])
+                if deletion.returncode != 0:
+                    cleanup_error = (
+                        f"owned namespace cleanup failed: {(deletion.stderr or deletion.stdout).strip()}; "
+                        f"retry: kubectl --kubeconfig {args.kubeconfig} --context {args.context} delete namespace {namespace}"
+                    )
+            else:
+                cleanup_error = (
+                    f"refusing cleanup because namespace {namespace} lacks run ownership label {args.run_id}; "
+                    "inspect the namespace before any manual deletion"
+                )
+                print(cleanup_error, file=sys.stderr)
+    if cleanup_error is not None:
+        raise ValidationError(cleanup_error)
+    if not denied or not allowed:
+        raise ValidationError("NetworkPolicy enforcement smoke did not complete")
+    print(
+        canonical(
+            {
+                "schemaVersion": RESULT_CONTRACT,
+                "status": "valid",
+                "operation": "network-smoke",
+                "runId": args.run_id,
+                "proof": {
+                    "baselineConnectionObserved": True,
+                    "deniedConnectionObserved": True,
+                    "allowedConnectionObserved": True,
+                },
+                "cleanup": "deleted",
+            }
+        ),
+        end="",
+    )
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
@@ -725,6 +970,15 @@ def parser() -> argparse.ArgumentParser:
     gateway.add_argument("--context", required=True)
     gateway.add_argument("--kubectl", default="kubectl")
     gateway.set_defaults(handler=gateway_check)
+    for name, handler in (("network-check", network_check), ("network-smoke", network_smoke)):
+        network = commands.add_parser(name)
+        network.add_argument("--kubeconfig", type=pathlib.Path, required=True)
+        network.add_argument("--context", required=True)
+        network.add_argument("--kubectl", default="kubectl")
+        if name == "network-smoke":
+            network.add_argument("--run-id", required=True)
+            network.add_argument("--probe-image", required=True)
+        network.set_defaults(handler=handler)
     return root
 
 

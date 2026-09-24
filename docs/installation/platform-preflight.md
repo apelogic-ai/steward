@@ -69,3 +69,41 @@ ARC controller ServiceAccount, external Secrets, workload-exchange trust
 ConfigMap, and database CA source. It requests metadata only for Secret and
 ConfigMap existence checks and does not retrieve their bodies. It does not
 create DNS records, certificates, Gateways, or routes.
+
+## NetworkPolicy enforcement on EKS
+
+The supported EKS prerequisite is the Amazon VPC CNI configuration documented
+by AWS: the `kube-system/aws-node` DaemonSet must contain the
+`aws-network-policy-agent` container with network policy enabled. AWS documents
+the feature and its version prerequisites at
+<https://docs.aws.amazon.com/eks/latest/userguide/cni-network-policy-configure.html>.
+The preflight reports the observed agent image, but it does not approve a
+cluster from a version string alone.
+
+First perform the read-only check:
+
+```sh
+./steward-platform-preflight network-check \
+  --kubeconfig "$KUBECONFIG_FILE" \
+  --context "$KUBECONFIG_CONTEXT"
+```
+
+Then prove enforcement using an immutable, reviewed image that provides `sh`,
+`httpd`, `sleep`, and `wget`:
+
+```sh
+./steward-platform-preflight network-smoke \
+  --kubeconfig "$KUBECONFIG_FILE" \
+  --context "$KUBECONFIG_CONTEXT" \
+  --run-id smoke-1 \
+  --probe-image registry.example.test/team-a/network-probe@sha256:<digest>
+```
+
+The smoke creates one run-owned namespace and labeled probe resources, first
+proves the Service and its DNS/endpoints work without a policy, then proves an
+actual deny through consecutive failed probes, applies a narrowly scoped allow
+policy, proves the authorized connection, and deletes only the namespace whose
+run label matches.
+Cleanup is attempted on success, failure, and interruption. An absent or
+disabled policy agent, an unproven deny, an unproven allow, or failed owned
+namespace cleanup is blocking; cleanup failures include the exact retry command.

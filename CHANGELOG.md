@@ -25,6 +25,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   exact one-label wildcard semantics.
 - Added one explicit namespace-map schema with compact and separated layouts and deterministic
   namespace-qualified reference generation.
+- Added read-only EKS VPC CNI detection and a bounded, run-owned NetworkPolicy deny/allow
+  enforcement smoke that fails closed when enforcement cannot be proven.
 
 ### Fixed
 
