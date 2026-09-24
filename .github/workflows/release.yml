@@ -523,6 +523,9 @@ jobs:
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
             printf 'Steward v0.2.2 reconciles external Task runtimes only from their exact persisted Task authority, including ordinary runtime provisioning, successful completion, failure, cancellation, TTL expiry, finalizer cleanup, and exact-UID deletion.\n\n'
+            printf 'Required image inputs now reject all-zero placeholder digests before deployment or runtime provisioning.\n\n'
+            printf 'The chart can project an existing Secret- or ConfigMap-backed PostgreSQL CA into both database consumers for sslmode=verify-full.\n\n'
+            printf 'The provider-profile release bundle now includes a standalone linux/amd64 validator and installer with deterministic output and machine-readable evidence.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
             printf 'Before migration 0039, terminalize and finalize every unfinished legacy Task that lacks a complete User Envelope or internal-authority pin. Use Identity v0.5.0 with policy contract github-oidc-exchange.apelogic.io/v5, remove Service Envelope bootstrap configuration, and configure the non-authoritative capability catalog.\n\n'
             printf 'Rollback from v0.2.2 to v0.2.1 requires no database rollback because this patch adds no migration. The v0.1.23 rollback boundary remains unchanged; see docs/installation/upgrade-v0.2.0.md.\n\n'

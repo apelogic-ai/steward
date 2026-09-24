@@ -7,13 +7,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-## [0.2.2] - 2026-09-23
+## [0.2.2] - 2026-09-24
+
+### Added
+
+- Added optional Secret- or ConfigMap-backed PostgreSQL CA projection for API server and
+  controller connections using `sslmode=verify-full`.
+- Added a released, standalone `linux/amd64` provider-profile validator and installer with
+  deterministic output and machine-readable bundle evidence.
 
 ### Fixed
 
 - Reconciled externally submitted Task runtimes only from their exact persisted Task authority,
   including successful-completion finalization, Task-owned TTL, and cleanup ordering before
   Kubernetes deletion.
+- Rejected all-zero placeholder digests for required component, execution-binding, provider-profile,
+  stable-bridge, and Connections-bridge images before deployment or runtime provisioning.
 
 ## [0.2.1] - 2026-09-23
 
