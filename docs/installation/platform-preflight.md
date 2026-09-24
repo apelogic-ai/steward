@@ -38,3 +38,26 @@ the explicitly supplied endpoints.
 The compact example co-locates Steward, runtime, and provider resources. The
 namespace map remains explicit even when values match so moving one component
 does not leave hidden cross-namespace references.
+
+## DNS, certificate, and Gateway contract
+
+An exact certificate SAN covers only that exact hostname. A wildcard such as
+`*.example.test` covers `steward.example.test`, but it does not cover
+`service.product.example.test`: TLS wildcards match exactly one DNS label.
+
+After static validation, prove the declared parent against a live cluster with
+a read-only lookup:
+
+```sh
+./steward-platform-preflight gateway-check \
+  --input examples/compact.json \
+  --kubeconfig "$KUBECONFIG_FILE" \
+  --context "$KUBECONFIG_CONTEXT"
+```
+
+The command uses `kubectl get` only. It verifies the exact Gateway namespace
+and name, HTTPS listener section, listener hostname, referenced TLS Secret,
+ARC controller ServiceAccount, external Secrets, workload-exchange trust
+ConfigMap, and database CA source. It requests metadata only for Secret and
+ConfigMap existence checks and does not retrieve their bodies. It does not
+create DNS records, certificates, Gateways, or routes.

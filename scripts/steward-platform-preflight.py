@@ -383,6 +383,24 @@ def chart_values(data: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
+def provider_profile_inputs(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": "steward.provider-profile-inputs/v1",
+        "bundle": {"id": "steward-runtime-providers", "version": "1.2.0"},
+        "profiles": [
+            {
+                "id": profile["name"],
+                "inputs": {
+                    "gateway-origin": profile["inputs"]["gatewayOrigin"],
+                    "runtime-grant-origin": profile["inputs"]["runtimeGrantOrigin"],
+                    "service-cidrs": profile["inputs"]["serviceCidrs"],
+                },
+            }
+            for profile in data["providerProfiles"]
+        ],
+    }
+
+
 def validate_browser(data: dict[str, Any]) -> None:
     browser = require_object(data, "browserAuth", "input")
     for key in ("clientId", "workspaceDomain", "organizationId", "clientSecretName", "clientSecretKey"):
@@ -446,6 +464,7 @@ def generate(args: argparse.Namespace) -> int:
     args.output.mkdir(parents=True, exist_ok=False)
     values_path = args.output / "steward-values.json"
     values_path.write_text(canonical(values), encoding="utf-8")
+    (args.output / "provider-profile-inputs.json").write_text(canonical(provider_profile_inputs(data)), encoding="utf-8")
     if args.chart is not None:
         run_helm(args.chart, data["namespaces"]["steward"], values_path)
         diagnostics.append({"code": "chart.valid", "severity": "info", "message": "generated values pass Helm lint and template"})
@@ -481,6 +500,178 @@ def validate_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def kubectl_metadata_check(
+    args: argparse.Namespace, resource: str, namespace: str, name: str, label: str
+) -> dict[str, str]:
+    command = [
+        args.kubectl,
+        "--kubeconfig",
+        str(args.kubeconfig),
+        "--context",
+        args.context,
+        "get",
+        resource,
+        name,
+        "--namespace",
+        namespace,
+        "--output",
+        "jsonpath={.metadata.namespace}/{.metadata.name}",
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise ValidationError(f"{label} {namespace}/{name} does not exist or is unreadable: {detail}")
+    actual = result.stdout.strip()
+    if actual != f"{namespace}/{name}":
+        raise ValidationError(f"{label} identity {actual or '<empty>'} does not equal configured reference {namespace}/{name}")
+    return {
+        "code": "reference.live",
+        "severity": "info",
+        "message": f"{label} {namespace}/{name} exists",
+    }
+
+
+def gateway_check(args: argparse.Namespace) -> int:
+    data = read_json(args.input)
+    diagnostics = validate_input(data)
+    validate_browser(data)
+    parent = data["gateway"]["parentRef"]
+    command = [
+        args.kubectl,
+        "--kubeconfig",
+        str(args.kubeconfig),
+        "--context",
+        args.context,
+        "get",
+        "gateway.gateway.networking.k8s.io",
+        parent["name"],
+        "--namespace",
+        parent["namespace"],
+        "--output",
+        "json",
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise ValidationError(
+            f"Gateway {parent['namespace']}/{parent['name']} does not exist or is unreadable: {detail}"
+        )
+    try:
+        gateway = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ValidationError(f"kubectl returned invalid Gateway JSON: {error}") from error
+    metadata = gateway.get("metadata", {})
+    if gateway.get("apiVersion") != "gateway.networking.k8s.io/v1" or gateway.get("kind") != "Gateway":
+        raise ValidationError("live object is not a gateway.networking.k8s.io/v1 Gateway")
+    if metadata.get("namespace") != parent["namespace"] or metadata.get("name") != parent["name"]:
+        raise ValidationError(
+            f"live Gateway identity {metadata.get('namespace')}/{metadata.get('name')} does not equal configured parent {parent['namespace']}/{parent['name']}"
+        )
+    listeners = gateway.get("spec", {}).get("listeners", [])
+    listener = next((item for item in listeners if item.get("name") == parent["sectionName"]), None)
+    if listener is None:
+        raise ValidationError(
+            f"Gateway {parent['namespace']}/{parent['name']} has no listener named {parent['sectionName']}"
+        )
+    if listener.get("protocol") != "HTTPS":
+        raise ValidationError(f"Gateway listener {parent['sectionName']} must use HTTPS")
+    listener_hostname = listener.get("hostname")
+    if listener_hostname:
+        for endpoint in data["publicEndpoints"]:
+            if not hostname_covered(endpoint["hostname"], listener_hostname):
+                raise ValidationError(
+                    f"Gateway listener hostname {listener_hostname} does not admit {endpoint['name']} hostname {endpoint['hostname']}"
+                )
+    certificate_refs = listener.get("tls", {}).get("certificateRefs", [])
+    expected_secret = data["gateway"]["tlsSecretName"]
+    if not any(
+        reference.get("name") == expected_secret
+        and reference.get("kind", "Secret") == "Secret"
+        and reference.get("group", "") in ("", "core")
+        for reference in certificate_refs
+    ):
+        raise ValidationError(
+            f"Gateway listener {parent['sectionName']} does not reference TLS Secret {expected_secret}"
+        )
+    diagnostics.extend(
+        [
+            {
+                "code": "gateway.live",
+                "severity": "info",
+                "message": f"live Gateway {parent['namespace']}/{parent['name']} and listener {parent['sectionName']} match",
+            },
+            {
+                "code": "certificate.coverage",
+                "severity": "info",
+                "message": "every enabled public hostname is covered by the declared certificate names",
+            },
+        ]
+    )
+    arc = data["arc"]["controllerServiceAccount"]
+    diagnostics.append(
+        kubectl_metadata_check(
+            args,
+            "serviceaccount",
+            arc["namespace"],
+            arc["name"],
+            "ARC controller ServiceAccount",
+        )
+    )
+    diagnostics.append(
+        kubectl_metadata_check(
+            args,
+            "secret",
+            parent["namespace"],
+            data["gateway"]["tlsSecretName"],
+            "Gateway TLS Secret",
+        )
+    )
+    for purpose, reference in sorted(data["externalSecrets"].items()):
+        diagnostics.append(
+            kubectl_metadata_check(
+                args,
+                "secret",
+                reference["namespace"],
+                reference["name"],
+                f"{purpose} Secret",
+            )
+        )
+    for purpose, reference in sorted(data["externalConfigMaps"].items()):
+        diagnostics.append(
+            kubectl_metadata_check(
+                args,
+                "configmap",
+                reference["namespace"],
+                reference["name"],
+                f"{purpose} ConfigMap",
+            )
+        )
+    tls = data["database"]["tls"]
+    if tls["mode"] == "verify-full":
+        ca = tls["ca"]
+        diagnostics.append(
+            kubectl_metadata_check(
+                args,
+                ca["kind"].lower(),
+                ca["namespace"],
+                ca["name"],
+                "database CA source",
+            )
+        )
+    print(
+        canonical(
+            {
+                "schemaVersion": RESULT_CONTRACT,
+                "status": "valid",
+                "operation": "gateway-check",
+                "diagnostics": diagnostics,
+            }
+        ),
+        end="",
+    )
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
@@ -491,6 +682,12 @@ def parser() -> argparse.ArgumentParser:
         if name == "generate":
             command.add_argument("--output", type=pathlib.Path, required=True)
         command.set_defaults(handler=handler)
+    gateway = commands.add_parser("gateway-check")
+    gateway.add_argument("--input", type=pathlib.Path, required=True)
+    gateway.add_argument("--kubeconfig", type=pathlib.Path, required=True)
+    gateway.add_argument("--context", required=True)
+    gateway.add_argument("--kubectl", default="kubectl")
+    gateway.set_defaults(handler=gateway_check)
     return root
 
 
