@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-23
+
 ### Fixed
 
 - Reconciled externally submitted Task runtimes only from their exact persisted Task authority,
@@ -69,6 +71,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/apelogic-ai/steward/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/apelogic-ai/steward/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/apelogic-ai/steward/compare/v0.1.23...v0.2.0
