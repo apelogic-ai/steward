@@ -148,6 +148,8 @@ The chart installs Steward resources but does not create a database,
 credentials, an issuer, a Gateway, DNS, or an isolation RuntimeClass. An
 operator supplies immutable image coordinates and chooses customer-owned TLS
 Secrets plus a public webhook CA, or cert-manager with an explicit issuer.
+Verified PostgreSQL deployments can project an existing CA `ConfigMap` or
+`Secret` read-only into both database clients.
 Core mode keeps execution disabled and Task orchestration staged. To enable
 governed execution, first validate all dependency and functional sandbox
 requirements in the [installation guide](docs/installation/installation-guide.md)

@@ -36,9 +36,33 @@ openssl req \
   -newkey rsa:2048 \
   -nodes \
   -days 1 \
+  -subj "/CN=Steward test PostgreSQL CA" \
+  -keyout "${RUN_DIR}/ca.key" \
+  -out "${RUN_DIR}/ca.crt" >/dev/null 2>&1
+openssl req \
+  -newkey rsa:2048 \
+  -nodes \
   -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost" \
   -keyout "${RUN_DIR}/server.key" \
+  -out "${RUN_DIR}/server.csr" >/dev/null 2>&1
+openssl x509 \
+  -req \
+  -days 1 \
+  -in "${RUN_DIR}/server.csr" \
+  -CA "${RUN_DIR}/ca.crt" \
+  -CAkey "${RUN_DIR}/ca.key" \
+  -CAcreateserial \
+  -copy_extensions copy \
   -out "${RUN_DIR}/server.crt" >/dev/null 2>&1
+openssl req \
+  -x509 \
+  -newkey rsa:2048 \
+  -nodes \
+  -days 1 \
+  -subj "/CN=Wrong Steward test PostgreSQL CA" \
+  -keyout "${RUN_DIR}/wrong-ca.key" \
+  -out "${RUN_DIR}/wrong-ca.crt" >/dev/null 2>&1
 
 docker volume create \
   --label "steward.test/run-id=${RUN_ID}" \
@@ -92,8 +116,10 @@ fi
 
 docker exec "${CONTAINER}" createdb -U steward steward_orchestration
 export STEWARD_TEST_PLAINTEXT_DATABASE_URL="postgres://steward@127.0.0.1:${port}/steward?sslmode=disable"
-export STEWARD_TEST_TLS_DATABASE_URL="postgres://steward@127.0.0.1:${port}/steward?sslmode=require"
-export STEWARD_TEST_DATABASE_URL="postgres://steward@127.0.0.1:${port}/steward_orchestration?sslmode=require"
+export STEWARD_TEST_TLS_DATABASE_URL="postgres://steward@localhost:${port}/steward?sslmode=verify-full&sslrootcert=${RUN_DIR}/ca.crt"
+export STEWARD_TEST_WRONG_CA_DATABASE_URL="postgres://steward@localhost:${port}/steward?sslmode=verify-full&sslrootcert=${RUN_DIR}/wrong-ca.crt"
+export STEWARD_TEST_WRONG_HOSTNAME_DATABASE_URL="postgres://steward@127.0.0.1:${port}/steward?sslmode=verify-full&sslrootcert=${RUN_DIR}/ca.crt"
+export STEWARD_TEST_DATABASE_URL="postgres://steward@localhost:${port}/steward_orchestration?sslmode=verify-full&sslrootcert=${RUN_DIR}/ca.crt"
 cargo test \
   --manifest-path "${ROOT}/e2e/Cargo.toml" \
   --test postgres_tls \

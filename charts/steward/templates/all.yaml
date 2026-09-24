@@ -415,6 +415,9 @@ spec:
             - { name: STEWARD_TLS_KEY_DER, value: /run/tls/tls.key }
           volumeMounts:
             - { name: tls, mountPath: /run/tls, readOnly: true }
+{{- if eq .Values.databaseTls.mode "verify-full" }}
+            - { name: database-tls-ca, mountPath: /run/database-tls, readOnly: true }
+{{- end }}
             - { name: execution-bindings, mountPath: /run/execution-bindings, readOnly: true }
             - { name: capability-catalog, mountPath: /run/capability-catalog, readOnly: true }
 {{- if .Values.connectionsBridge.enabled }}
@@ -434,6 +437,17 @@ spec:
 {{ toYaml .Values.resources.apiserver | nindent 12 }}
       volumes:
         - { name: tls, secret: { secretName: {{ .Values.tls.api.secretName }} } }
+{{- if eq .Values.databaseTls.mode "verify-full" }}
+        - name: database-tls-ca
+{{- if eq .Values.databaseTls.ca.kind "Secret" }}
+          secret:
+            secretName: {{ .Values.databaseTls.ca.name }}
+{{- else }}
+          configMap:
+            name: {{ .Values.databaseTls.ca.name }}
+{{- end }}
+            items: [{ key: {{ .Values.databaseTls.ca.key }}, path: ca.crt }]
+{{- end }}
 {{- if .Values.connectionsBridge.enabled }}
         - name: connections-control-plane-credential
           projected:
@@ -552,6 +566,9 @@ spec:
             - { name: STEWARD_TLS_KEY_DER, value: /run/tls/tls.key }
           volumeMounts:
             - { name: tls, mountPath: /run/tls, readOnly: true }
+{{- if eq .Values.databaseTls.mode "verify-full" }}
+            - { name: database-tls-ca, mountPath: /run/database-tls, readOnly: true }
+{{- end }}
 {{- if .Values.execution.enabled }}
             - { name: openshell-client, mountPath: /run/openshell, readOnly: true }
             - { name: workload-exchange-ca, mountPath: /run/workload-exchange, readOnly: true }
@@ -564,6 +581,17 @@ spec:
 {{ toYaml .Values.resources.controller | nindent 12 }}
       volumes:
         - { name: tls, secret: { secretName: {{ .Values.tls.webhook.secretName }} } }
+{{- if eq .Values.databaseTls.mode "verify-full" }}
+        - name: database-tls-ca
+{{- if eq .Values.databaseTls.ca.kind "Secret" }}
+          secret:
+            secretName: {{ .Values.databaseTls.ca.name }}
+{{- else }}
+          configMap:
+            name: {{ .Values.databaseTls.ca.name }}
+{{- end }}
+            items: [{ key: {{ .Values.databaseTls.ca.key }}, path: ca.crt }]
+{{- end }}
 {{- if .Values.execution.enabled }}
         - name: openshell-client
           secret:

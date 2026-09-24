@@ -133,6 +133,7 @@ system. The default names can be overridden under `secrets`, `tls`,
 | Reference and namespace | Kubernetes type and keys | Producer and consumer | Rotation / condition |
 |---|---|---|---|
 | `secrets.database.name` (`steward-database`) in release namespace | `Opaque`; `secrets.database.key` (`url`) | Database operator creates; API and controller read. | Always. Rotate the database credential and restart both Deployments after the new Secret is present; verify connectivity and migrations. |
+| `databaseTls.ca.name` in release namespace | Existing `ConfigMap` or `Secret`; configured `databaseTls.ca.key` | Database/PKI operator creates; API and controller mount read-only at `/run/database-tls/ca.crt`. | Required when `databaseTls.mode=verify-full`; rotate with CA overlap, restart both consumers, and reprove hostname verification. |
 | `tls.api.secretName` and `tls.webhook.secretName` in release namespace | `kubernetes.io/tls`; both `tls.crt`, `tls.key` | Customer PKI or cert-manager creates; API and controller mount separately. | Always. Renew before expiry, verify service DNS SANs, CA chain, and webhook `caBundle`; roll the affected Deployment. |
 | `secrets.jira.name` (`steward-jira`) in release namespace | `Opaque`; `secrets.jira.key` (`token`) | Jira operator creates; API and controller read only if `jira.enabled=true`. | Optional. Use a Jira Cloud API token with a dedicated account allowed to browse/search, create Task issues, and add comments in the configured project. Rotate the token, restart consumers, and prove a decision; absent when disabled. |
 | `secrets.litellm.name` (`steward-litellm`) in release namespace | `Opaque`; `secrets.litellm.key` (`master-key`) | LiteLLM operator creates; controller reads. | Governed execution only. Coordinate credential overlap/restart with LiteLLM. |
@@ -205,6 +206,34 @@ kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
   --dry-run=client -o yaml | \
 kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" apply -f -
 ```
+
+For AWS RDS or another private CA, obtain the provider-approved public CA
+bundle and project it without placing the PEM in Helm values. A public
+`ConfigMap` is sufficient unless the platform classifies its trust bundle as a
+Secret:
+
+```sh
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  -n steward create configmap steward-postgres-ca \
+  --from-file=ca.pem=./public/postgres-ca.pem --dry-run=client -o yaml | \
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" apply -f -
+```
+
+Select the object and require verified TLS in the reviewed values:
+
+```yaml
+databaseTls:
+  mode: verify-full
+  ca:
+    kind: ConfigMap
+    name: steward-postgres-ca
+    key: ca.pem
+```
+
+The database URL Secret must use the server's certificate hostname and include
+`sslmode=verify-full&sslrootcert=/run/database-tls/ca.crt`. The same values
+shape accepts `kind: Secret`; the chart rejects `verify-full` when the source
+name or key is missing.
 
 Repeat the TLS command for `steward-webhook-tls`. cert-manager mode creates
 those two endpoint TLS Secrets from the selected issuer; it does not create

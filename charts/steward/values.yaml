@@ -74,6 +74,14 @@ secrets:
     name: steward-mint
     signingKey: signing-key
     introspectionCredential: introspection-credential
+databaseTls:
+  # Set verify-full only when the database URL also uses
+  # sslmode=verify-full&sslrootcert=/run/database-tls/ca.crt.
+  mode: disabled
+  ca:
+    kind: ConfigMap
+    name: ""
+    key: ""
 jira:
   enabled: false
 browserAuth:

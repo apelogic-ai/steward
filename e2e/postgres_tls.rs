@@ -43,9 +43,26 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
     let tls_url = env::var("STEWARD_TEST_TLS_DATABASE_URL").map_err(|_| {
         io::Error::other("STEWARD_TEST_TLS_DATABASE_URL is required for the TLS test")
     })?;
+    let wrong_ca_url = env::var("STEWARD_TEST_WRONG_CA_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_WRONG_CA_DATABASE_URL is required for the TLS test")
+    })?;
+    assert!(
+        PgStore::connect(&wrong_ca_url).await.is_err(),
+        "Steward must fail closed when PostgreSQL presents a certificate from another CA"
+    );
+    let wrong_hostname_url =
+        env::var("STEWARD_TEST_WRONG_HOSTNAME_DATABASE_URL").map_err(|_| {
+            io::Error::other(
+                "STEWARD_TEST_WRONG_HOSTNAME_DATABASE_URL is required for the TLS test",
+            )
+        })?;
+    assert!(
+        PgStore::connect(&wrong_hostname_url).await.is_err(),
+        "Steward must fail closed when the PostgreSQL certificate does not cover the hostname"
+    );
     let store = PgStore::connect(&tls_url).await.map_err(|error| {
         io::Error::other(format!(
-            "Steward must connect when PostgreSQL requires sslmode=require: {error}"
+            "Steward must connect when PostgreSQL requires sslmode=verify-full: {error}"
         ))
     })?;
     migration_set(Some(38))

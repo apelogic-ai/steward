@@ -74,6 +74,27 @@ managed Secrets. The checked-in defaults are not a usable installation
 values file. A successful render proves chart structure only; follow the
 installation guide's live delivery tests before hand-off.
 
+### Verified PostgreSQL TLS
+
+The API server and controller can mount the same customer-managed PostgreSQL
+CA from an existing `ConfigMap` or `Secret`. The chart never creates or rotates
+that object. Enable the projection and reference its fixed read-only path from
+the database URL:
+
+```yaml
+databaseTls:
+  mode: verify-full
+  ca:
+    kind: ConfigMap # or Secret
+    name: steward-postgres-ca
+    key: ca.pem
+```
+
+The database URL stored under `secrets.database` must include
+`sslmode=verify-full&sslrootcert=/run/database-tls/ca.crt`. An incomplete CA
+source fails chart validation. The default `disabled` mode mounts nothing and
+preserves existing installations.
+
 ## Workload defaults and platform integration
 
 The chart creates fixed service accounts for enabled components because

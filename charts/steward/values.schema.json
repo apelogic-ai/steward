@@ -7,6 +7,7 @@
     "execution",
     "web",
     "secrets",
+    "databaseTls",
     "jira",
     "browserAuth",
     "workloadExchangeTrust",
@@ -151,6 +152,49 @@
           }
         }
       }
+    },
+    "databaseTls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "ca"],
+      "properties": {
+        "mode": {"enum": ["disabled", "verify-full"]},
+        "ca": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "key"],
+          "properties": {
+            "kind": {"enum": ["Secret", "ConfigMap"]},
+            "name": {"type": "string"},
+            "key": {"type": "string"}
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"mode": {"const": "disabled"}}},
+          "then": {
+            "properties": {
+              "ca": {
+                "properties": {
+                  "name": {"maxLength": 0},
+                  "key": {"maxLength": 0}
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "ca": {
+                "properties": {
+                  "name": {"$ref": "#/definitions/nonempty"},
+                  "key": {"$ref": "#/definitions/nonempty"}
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "jira": {
       "type": "object",
