@@ -146,24 +146,24 @@ partially verified login.
 
 ## DEV runtime and secret projection handoff
 
-The production activation consumes the reviewed non-secret Google metadata, including the exact
+The production activation consumes reviewed non-secret Google metadata, including the exact
 client ID, HTTPS browser origin and callback, hosted domain, and organization identifier. The
-Google client credential is projected from `/apelogic/dev/steward-google-oidc` under exactly the
+Google client credential is projected from an operator-selected secret reference, for example
+`/operator/steward-google-oidc`, under exactly the
 Kubernetes key `client-secret`. Its value is one provider-issued raw plaintext scalar: no JSON
 wrapper, quoting, Base64 transform, surrounding whitespace, or trailing newline. The raw scalar is
 passed only to `GoogleOidcProvider::new` and is never included in errors or logs.
 
 No `session-key` Kubernetes key, session-key environment variable, or
-`/apelogic/dev/steward-session-key` reference is part of the product contract. The already-created
-DEV container remains empty and unprojected until the separately reviewed Infra cleanup in
-LBE-247. Its absence must not block initial activation.
+`/operator/steward-session-key` reference is part of the product contract. Its absence must not
+block initial activation.
 
 The apiserver activates the Google browser surface only when
 `STEWARD_GOOGLE_OIDC_CLIENT_ID` is present. It then requires
 `STEWARD_BROWSER_ORIGIN`, `STEWARD_GOOGLE_WORKSPACE_DOMAIN`,
 `STEWARD_ORGANIZATION_ID`, and `STEWARD_GOOGLE_OIDC_CLIENT_SECRET`; incomplete configuration
-stops rather than exposing an unverifiable sign-in route. The approved DEV values are origin
-`https://steward.dev.apelogic.io`, callback
-`https://steward.dev.apelogic.io/admin/auth/callback`, Workspace domain `apelogic.ai`, and opaque
-organization ID `org_aelogic`. Client ID and the origin/domain/organization values are non-secret
+stops rather than exposing an unverifiable sign-in route. Illustrative values are origin
+`https://steward.example.test`, callback
+`https://steward.example.test/admin/auth/callback`, Workspace domain `example.test`, and opaque
+organization ID `org_example`. Client ID and the origin/domain/organization values are non-secret
 runtime configuration; the client secret remains secret-projected only.

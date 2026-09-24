@@ -381,7 +381,7 @@ preserve the same immutable coordinates and cross-component relationships.
      taskOrchestrationMode: staged
      apiserver:
        executionBindingsMode: staged
-       inferenceEndpoint: https://inference.example.test/v1
+       inferenceEndpoint: https://inference.example.test/v1/responses
      controller:
        openshellEndpoint: https://gateway.example.test:8080
        openshellServerName: gateway.example.test

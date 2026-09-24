@@ -40,8 +40,8 @@ archive SHA-256 before installation. Install or upgrade `spire-crds` before
 then verify Steward's `ClusterSPIFFEID` before rolling Mint.
 
 The installation trust domain is operator-supplied and immutable. It is a SPIFFE
-identity namespace, not a DNS endpoint: `hypershell.dev.mirantis.app` is a
-supported trust domain, and Steward does not derive a network address from it.
+identity namespace, not a DNS endpoint: `trust.example.test` is a supported
+trust domain, and Steward does not derive a network address from it.
 Mint's identity is:
 
 ```text

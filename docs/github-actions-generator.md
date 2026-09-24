@@ -35,7 +35,7 @@ The first reviewed contract is steward-run v0.3.7. Its signed release-manifest s
 |---|---|
 | Reusable workflow | `apelogic-ai/steward-run/.github/workflows/steward-task.yml@9c7487bd18d5e90b24b3e4b296bfdd232a3f4f5a` |
 | Remote action | `apelogic-ai/steward-run@b26790e29ce9c243c6a7aa00450a2a1a98fbd250` |
-| Governed job container | `663383948333.dkr.ecr.us-east-1.amazonaws.com/steward-run@sha256:27235891b596debb1d8bba5f7763e14a56ce4435e2fc82f3de80122b19ff8c61` |
+| Governed job container | `ghcr.io/apelogic-ai/steward-run@sha256:bea4dfcdc021fb2f9c1a9948f2a0b3e06e6edab15891ad19fd279bc2e0f2e6c2` |
 
 The reusable workflow, not the caller, pins the remote action and owns the six-operation Task
 lifecycle and unconditional finalization. The generated caller retains only `contents: read` and

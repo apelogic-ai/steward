@@ -19,12 +19,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   migration path from the deprecated version-like selector.
 - Added explicit SPIRE identity/upgrade requirements and LiteLLM Responses and
   Anthropic Messages URL/model semantics to the installation contract.
+- Added a real Envoy Gateway backend-TLS E2E using an isolated Kind cluster,
+  plus public-CA rotation guidance for the apiserver `BackendTLSPolicy`.
 
 ### Changed
 
 - Replaced the Docker/buildx registry helper with a released daemonless ORAS
   image-and-chart mirror supporting explicit mappings, no-write planning,
   collision-safe resume, deterministic evidence, and Flux OCI digest output.
+- Corrected the browser-administration bootstrap procedure to run the installed
+  `/usr/local/bin/steward bootstrap-rbac` command in the apiserver Deployment.
 
 ## [0.2.2] - 2026-09-24
 
