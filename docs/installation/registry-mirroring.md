@@ -104,3 +104,8 @@ emitted as `chartValues.connectionsBridge.image`. Copy the desired value from
 `executionBindingImages` into the matching execution binding's `image` field. Keep
 deployment values digest-pinned; tags remain labels and are never the authority for a
 deployment.
+
+The release gate also copies a pinned multi-platform image through this tool into an
+ephemeral registry, inspects the exact target digest, pulls its `linux/amd64` image, and
+removes the run-owned registry. The mock-based tests remain responsible only for
+deterministic failure branches and credential-free output.

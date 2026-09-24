@@ -45,6 +45,7 @@ jobs:
             scripts/test-package-provider-profile-bundle.sh \
             scripts/test-package-platform-preflight.sh \
             scripts/test-steward-registry-lock.sh \
+            scripts/steward-registry-lock-live-conformance.sh \
             scripts/test-released-artifact-acceptance.sh \
             scripts/test-validate-release-version.sh \
             scripts/validate-release-version.sh \
@@ -426,6 +427,25 @@ jobs:
             dist/platform-preflight-bundle.digest
           if-no-files-found: error
 
+  registry-mirror-conformance:
+    needs: validate
+    name: release / live registry mirror
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Prove multi-platform registry mirroring
+        run: scripts/steward-registry-lock-live-conformance.sh
+
   openshell-x86-conformance:
     needs: validate
     name: release / linux-amd64 OpenShell adapter
@@ -600,7 +620,7 @@ jobs:
           bash scripts/customer-core-install-e2e.sh
 
   release:
-    needs: [publish-images, publish-provider-profile-bundle, publish-codex-reference-runtime, codex-reference-runtime-conformance, publish-platform-preflight-bundle, openshell-x86-conformance, publish-chart, released-artifact-acceptance]
+    needs: [publish-images, publish-provider-profile-bundle, publish-codex-reference-runtime, codex-reference-runtime-conformance, publish-platform-preflight-bundle, registry-mirror-conformance, openshell-x86-conformance, publish-chart, released-artifact-acceptance]
     if: >-
       ${{
         always() &&
@@ -609,6 +629,7 @@ jobs:
         needs.publish-codex-reference-runtime.result == 'success' &&
         needs.codex-reference-runtime-conformance.result == 'success' &&
         needs.publish-platform-preflight-bundle.result == 'success' &&
+        needs.registry-mirror-conformance.result == 'success' &&
         needs.openshell-x86-conformance.result == 'success' &&
         needs.publish-chart.result == 'success' &&
         needs.released-artifact-acceptance.result == 'success'
@@ -819,8 +840,14 @@ jobs:
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 
       - name: Verify public artifact access
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/steward-anonymous-docker
+          HELM_REGISTRY_CONFIG: ${{ runner.temp }}/steward-anonymous-helm.json
         run: |
           set -euo pipefail
+          mkdir -p "$DOCKER_CONFIG"
+          test ! -e "$DOCKER_CONFIG/config.json"
+          test ! -e "$HELM_REGISTRY_CONFIG"
           for component in apiserver controller mint bridge web; do
             docker buildx imagetools inspect \
               "ghcr.io/$GITHUB_REPOSITORY_OWNER/steward@$(cat "dist/$component.digest")"
