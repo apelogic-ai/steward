@@ -2538,6 +2538,106 @@ fn task_admission_record_is_eligible(admission: &TaskRuntimeAdmissionRecord) -> 
         && !task.finalized
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum TaskRuntimeReconciliationAction {
+    NotTaskOwned,
+    Continue,
+    WaitForTaskOrchestrator,
+    Suspend,
+    Cleanup {
+        work: Box<TaskOrchestrationWorkItem>,
+        cause: TaskCleanupCause<'static>,
+    },
+}
+
+/// A Task-owned runtime is identified from the execution-binding marker, but never trusted from
+/// that marker. The exact persisted operation and reconstructed manifest establish authority.
+/// This route deliberately runs before generic service-principal and connection policy.
+fn task_runtime_reconciliation_action(
+    runtime: &AgentRuntime,
+    admission: Option<&TaskRuntimeAdmissionRecord>,
+) -> Result<TaskRuntimeReconciliationAction, ReconcileError> {
+    if !matches!(
+        runtime.spec.principal,
+        steward_types::Principal::Service { .. }
+    ) || !runtime
+        .annotations()
+        .contains_key(TASK_EXECUTION_BINDING_ANNOTATION)
+    {
+        return Ok(TaskRuntimeReconciliationAction::NotTaskOwned);
+    }
+    let Some(admission) = admission else {
+        return Ok(TaskRuntimeReconciliationAction::Suspend);
+    };
+    if !task_admission_record_identity_is_consistent(admission) {
+        return Ok(TaskRuntimeReconciliationAction::Suspend);
+    }
+    let work = TaskOrchestrationWorkItem {
+        task: admission.task.clone(),
+        operation: admission.operation.clone(),
+    };
+    if !runtime_identity_matches(runtime, &work) {
+        return Ok(TaskRuntimeReconciliationAction::Suspend);
+    }
+    let Some(envelope) = admission.task.user_envelope_snapshot.as_ref() else {
+        return Ok(TaskRuntimeReconciliationAction::Suspend);
+    };
+    let inert = orchestrated_task_runtime_manifest(&work, Some(envelope), false)
+        .map_err(|error| ReconcileError::Authority(error.to_string()))?;
+    let active = orchestrated_task_runtime_manifest(&work, None, true)
+        .map_err(|error| ReconcileError::Authority(error.to_string()))?;
+    let operation = &admission.operation;
+    match operation.state {
+        TaskOrchestrationState::RuntimeCreatePending
+        | TaskOrchestrationState::RuntimeObserved
+        | TaskOrchestrationState::ApprovalPending
+        | TaskOrchestrationState::ActivationPending
+            if task_admission_runtime_matches(runtime, &inert, "inert") =>
+        {
+            Ok(TaskRuntimeReconciliationAction::WaitForTaskOrchestrator)
+        }
+        TaskOrchestrationState::CleanupPending | TaskOrchestrationState::Finalized => {
+            Ok(TaskRuntimeReconciliationAction::WaitForTaskOrchestrator)
+        }
+        TaskOrchestrationState::Active
+            if admission.user_envelope_authority_active
+                && !admission.task.cancel_requested
+                && !admission.task.finalize_requested
+                && !admission.task.finalized
+                && matches!(admission.task.phase, TaskPhase::Queued | TaskPhase::Running)
+                && operation.runtime_uid.as_deref() == runtime.metadata.uid.as_deref()
+                && admission.task.runtime_uid.as_deref() == operation.runtime_uid.as_deref()
+                && task_admission_runtime_matches(runtime, &active, "active") =>
+        {
+            Ok(TaskRuntimeReconciliationAction::Continue)
+        }
+        TaskOrchestrationState::Active if admission.task.cancel_requested => {
+            Ok(TaskRuntimeReconciliationAction::Cleanup {
+                work: Box::new(work),
+                cause: TaskCleanupCause::Cancelled,
+            })
+        }
+        TaskOrchestrationState::Active
+            if admission.task.finalize_requested || admission.task.finalized =>
+        {
+            Ok(TaskRuntimeReconciliationAction::Cleanup {
+                work: Box::new(work),
+                cause: TaskCleanupCause::FinalizationRequested,
+            })
+        }
+        TaskOrchestrationState::Active if !admission.user_envelope_authority_active => {
+            Ok(TaskRuntimeReconciliationAction::Cleanup {
+                work: Box::new(work),
+                cause: TaskCleanupCause::AuthorityInactive("task_runtime_authority_inactive"),
+            })
+        }
+        _ => Ok(TaskRuntimeReconciliationAction::Cleanup {
+            work: Box::new(work),
+            cause: TaskCleanupCause::Failed("task_runtime_authority_mismatch"),
+        }),
+    }
+}
+
 fn task_operation_generation_matches_transition(
     operation: &steward_store::TaskRuntimeOperationRecord,
 ) -> bool {
@@ -2609,22 +2709,13 @@ async fn validate_task_operation_admission<R: WebhookEnvelopeReader>(
         let Some(old_runtime) = request.old_object.as_ref() else {
             return Some(response.deny("external Task DELETE admission has no old object"));
         };
-        let expected_active = match orchestrated_task_runtime_manifest(&work, None, true) {
-            Ok(runtime) => runtime,
-            Err(_) => {
-                return Some(
-                    response.deny("external Task active manifest reconstruction failed closed"),
-                );
-            }
-        };
         let exact_uid = operation.runtime_uid.as_deref();
         if task_admission_record_identity_is_consistent(&admission)
             && operation.state == TaskOrchestrationState::CleanupPending
             && exact_uid.is_some()
             && admission.task.runtime_uid.as_deref() == exact_uid
             && old_runtime.metadata.uid.as_deref() == exact_uid
-            && (task_admission_runtime_matches(old_runtime, &expected_inert, "inert")
-                || task_admission_runtime_matches(old_runtime, &expected_active, "active"))
+            && runtime_identity_matches(old_runtime, &work)
         {
             return Some(response);
         }
@@ -3353,6 +3444,72 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
     finalizer(&api, FINALIZER, runtime, |event| async {
         match event {
             Event::Apply(runtime) => {
+                let task_owned_runtime = if let Some(authority) = &context.authority {
+                    let admission = if matches!(
+                        runtime.spec.principal,
+                        steward_types::Principal::Service { .. }
+                    ) && runtime
+                        .annotations()
+                        .contains_key(TASK_EXECUTION_BINDING_ANNOTATION)
+                    {
+                        let namespace = runtime
+                            .namespace()
+                            .ok_or(ControllerError::Reconcile(ReconcileError::MissingNamespace))?;
+                        Some(
+                            authority
+                                .task_runtime_admission(&namespace, &runtime.name_any())
+                                .await
+                                .map_err(|error| {
+                                    ControllerError::Reconcile(ReconcileError::Authority(
+                                        error.to_string(),
+                                    ))
+                                })?,
+                        )
+                    } else {
+                        None
+                    };
+                    match task_runtime_reconciliation_action(
+                        &runtime,
+                        admission.as_ref().and_then(Option::as_ref),
+                    )
+                    .map_err(ControllerError::Reconcile)?
+                    {
+                        TaskRuntimeReconciliationAction::NotTaskOwned => false,
+                        TaskRuntimeReconciliationAction::Continue => true,
+                        TaskRuntimeReconciliationAction::WaitForTaskOrchestrator => {
+                            return Ok(Action::requeue(StdDuration::from_secs(2)));
+                        }
+                        TaskRuntimeReconciliationAction::Cleanup { work, cause } => {
+                            authority
+                                .enter_task_cleanup(
+                                    work.task.task_uid,
+                                    work.operation.generation,
+                                    cause,
+                                    TASK_ORCHESTRATOR_ACTOR,
+                                )
+                                .await
+                                .map_err(|error| {
+                                    ControllerError::Reconcile(ReconcileError::Authority(
+                                        error.to_string(),
+                                    ))
+                                })?;
+                            return Ok(Action::requeue(StdDuration::from_secs(2)));
+                        }
+                        TaskRuntimeReconciliationAction::Suspend => {
+                            return suspend_runtime_with_inference_cleanup(
+                                &runtime,
+                                &api,
+                                &context.sandbox_runtime,
+                                context.client.clone(),
+                                &context.inference,
+                                None,
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    false
+                };
                 if !is_pending_approval(&runtime) && !has_activation_condition(&runtime) {
                     let released_hold = runtime
                         .status
@@ -3395,6 +3552,54 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     match runtime_ttl_action(&runtime).map_err(ControllerError::Reconcile)? {
                         TtlAction::Continue { requeue_after } => requeue_after,
                         TtlAction::Terminate => {
+                            if task_owned_runtime {
+                                let authority = context.authority.as_ref().ok_or(
+                                    ControllerError::Reconcile(ReconcileError::Authority(
+                                        "Task runtime has no persistence authority".to_owned(),
+                                    )),
+                                )?;
+                                let admission = authority
+                                    .task_runtime_admission(&namespace, &runtime.name_any())
+                                    .await
+                                    .map_err(|error| {
+                                        ControllerError::Reconcile(ReconcileError::Authority(
+                                            error.to_string(),
+                                        ))
+                                    })?;
+                                if !matches!(
+                                    task_runtime_reconciliation_action(
+                                        &runtime,
+                                        admission.as_ref(),
+                                    )
+                                    .map_err(ControllerError::Reconcile)?,
+                                    TaskRuntimeReconciliationAction::Continue
+                                ) {
+                                    return Err(ControllerError::Reconcile(ReconcileError::Authority(
+                                        "expired Task runtime lost its exact persisted authority"
+                                            .to_owned(),
+                                    )));
+                                }
+                                let admission = admission.ok_or(ControllerError::Reconcile(
+                                    ReconcileError::Authority(
+                                        "expired Task runtime has no persisted authority"
+                                            .to_owned(),
+                                    ),
+                                ))?;
+                                authority
+                                    .enter_task_cleanup(
+                                        admission.task.task_uid,
+                                        admission.operation.generation,
+                                        TaskCleanupCause::Failed("task_runtime_ttl_expired"),
+                                        TASK_ORCHESTRATOR_ACTOR,
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        ControllerError::Reconcile(ReconcileError::Authority(
+                                            error.to_string(),
+                                        ))
+                                    })?;
+                                return Ok(Action::requeue(StdDuration::from_secs(2)));
+                            }
                             match api
                                 .delete(&runtime.name_any(), &DeleteParams::default())
                                 .await
@@ -3487,7 +3692,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     }
                     return Ok(Action::requeue(ttl_requeue));
                 }
-                if let Some(authority) = &context.authority {
+                if !task_owned_runtime && let Some(authority) = &context.authority {
                     let runtime_uid =
                         runtime
                             .metadata
@@ -7218,9 +7423,9 @@ mod webhook_tests {
     use super::{
         FINALIZER, SERVICE_PRINCIPAL_ANNOTATION, TASK_MANIFEST_DIGEST_ANNOTATION,
         TASK_OPERATION_ANNOTATION, TASK_RUNTIME_MODE_ANNOTATION, TASK_UID_ANNOTATION,
-        WebhookEnvelopeReader, WebhookFuture, WebhookModelCatalog, validate_admission,
-        validate_admission_with_catalog, webhook_router,
-        webhook_router_for_controller_with_catalog,
+        TaskRuntimeReconciliationAction, WebhookEnvelopeReader, WebhookFuture, WebhookModelCatalog,
+        task_runtime_reconciliation_action, validate_admission, validate_admission_with_catalog,
+        webhook_router, webhook_router_for_controller_with_catalog,
     };
 
     #[derive(Clone)]
@@ -7655,6 +7860,59 @@ mod webhook_tests {
             Some("2026-09-23T00:00:02Z".to_owned());
         admission.task.runtime_uid = Some(runtime_uid);
         Ok(admission)
+    }
+
+    fn active_task_runtime_admission() -> Result<TaskRuntimeAdmissionRecord, String> {
+        let mut admission = authorized_task_activation_admission()?;
+        admission.operation.state = TaskOrchestrationState::Active;
+        admission.operation.generation = 6;
+        admission.operation.activated_at = Some("2026-09-23T00:00:03Z".to_owned());
+        admission.task.phase = TaskPhase::Queued;
+        Ok(admission)
+    }
+
+    #[test]
+    fn task_runtime_reconciliation_uses_only_the_exact_active_persisted_authority()
+    -> Result<(), String> {
+        let admission = active_task_runtime_admission()?;
+        let work = TaskOrchestrationWorkItem {
+            task: admission.task.clone(),
+            operation: admission.operation.clone(),
+        };
+        let mut runtime = super::orchestrated_task_runtime_manifest(&work, None, true)
+            .map_err(|error| format!("construct active Task runtime: {error}"))?;
+        runtime.metadata.uid = admission.operation.runtime_uid.clone();
+
+        assert_eq!(
+            task_runtime_reconciliation_action(&runtime, Some(&admission))
+                .map_err(|error| format!("classify exact active Task runtime: {error}"))?,
+            TaskRuntimeReconciliationAction::Continue,
+            "only the exact active persisted Task runtime may enter ordinary provisioning"
+        );
+
+        runtime.spec.budget.monthly_limit = "1.00".to_owned();
+        assert!(matches!(
+            task_runtime_reconciliation_action(&runtime, Some(&admission))
+                .map_err(|error| format!("classify changed Task runtime: {error}"))?,
+            TaskRuntimeReconciliationAction::Cleanup { .. }
+        ));
+
+        let mut unpersisted = runtime.clone();
+        unpersisted
+            .metadata
+            .annotations
+            .get_or_insert_default()
+            .insert(
+                TASK_OPERATION_ANNOTATION.to_owned(),
+                "not-a-persisted-operation".to_owned(),
+            );
+        assert_eq!(
+            task_runtime_reconciliation_action(&unpersisted, None)
+                .map_err(|error| format!("classify unpersisted Task marker: {error}"))?,
+            TaskRuntimeReconciliationAction::Suspend,
+            "a Task marker without persisted authority must never enter provisioning"
+        );
+        Ok(())
     }
 
     fn with_task_admission(
@@ -8206,6 +8464,20 @@ mod webhook_tests {
             review.pointer("/response/allowed"),
             Some(&serde_json::json!(true)),
             "the exact persisted cleanup UID must be deletable after authority revocation: {review}"
+        );
+
+        let mut changed_runtime = value.clone();
+        changed_runtime["request"]["oldObject"]["spec"]["budget"]["monthlyLimit"] =
+            serde_json::json!("1.00");
+        let review = call_controller_webhook(
+            changed_runtime,
+            with_task_admission(envelopes.clone(), admission.clone()),
+        )
+        .await?;
+        assert_eq!(
+            review.pointer("/response/allowed"),
+            Some(&serde_json::json!(true)),
+            "cleanup must converge for the exact persisted UID after a rejected authority mutation"
         );
 
         let mut wrong_uid = value.clone();
