@@ -33,7 +33,7 @@ case "\$arguments" in
   *'get backendtlspolicy steward-apiserver'*'caCertificateRefs'*) printf 'ConfigMap/steward-apiserver-ca' ;;
   *'get httproute/steward-api'*) printf 'Accepted=True\\nResolvedRefs=True\\n' ;;
   *'get backendtlspolicy/steward-apiserver'*) printf 'Accepted=True\\nResolvedRefs=True\\n' ;;
-  *'get configmap steward-apiserver-ca'*) printf '%s' "\${TLS_CHECK_CA_BASE64:-${ca_base64}}" | base64 -D ;;
+  *'get configmap steward-apiserver-ca'*) printf '%s' "\${TLS_CHECK_CA_BASE64:-${ca_base64}}" | base64 --decode ;;
   *'get secret steward-apiserver-tls'*) printf '%s' '${certificate_base64}' ;;
   *) echo "unexpected kubectl invocation: \$arguments" >&2; exit 1 ;;
 esac

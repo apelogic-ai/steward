@@ -91,8 +91,10 @@ Gateway API `v1.4.0` or later is required because it carries the GA
 `gateway.networking.k8s.io/v1` `BackendTLSPolicy`. The selected
 `GatewayClass.status.supportedFeatures` must include `BackendTLSPolicy`; it is
 an extended feature, so presence of the CRD alone is not sufficient. Envoy
-Gateway `v1.3.0` or later is the documented minimum for Steward's named
-Service-port attachment.
+Gateway `v1.9.1` is the currently supported, tested controller line for
+Steward's named Service-port attachment. The compatibility manifest records its
+exact OCI chart digest, which is the controller evidence coordinate rather than
+a Steward chart dependency.
 
 When `web.httpRoute.enabled=true`, the chart creates a `BackendTLSPolicy` in
 the Steward release namespace. It targets `steward-apiserver` section `https`,

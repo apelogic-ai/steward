@@ -66,6 +66,11 @@ turn execution off on an installation with live AgentRuntimes or Tasks.
    CIDRs/ports under `networkPolicy`; do not disable policy merely to make a
    failed readiness check green. Edge routing, DNS, ingress/Gateway, external
    authentication, and their certificates are operator-owned opt-ins.
+   When using `web.httpRoute.enabled=true`, publish the apiserver issuing CA
+   into the release namespace as the configured public ConfigMap at
+   `data.ca.crt` before installing Steward. A trust-distribution controller
+   must own its rotation. The chart deliberately does not create this object
+   and never copies the apiserver TLS Secret or private key to the Gateway.
 
 For governed execution, add the OpenShell gateway URL/server name/client
 certificate Secret, LiteLLM URL/master-key Secret,
@@ -95,6 +100,7 @@ cluster before enabling governed execution.
 | SPIRE | `spire-crds` 0.5.0; `spire` 0.29.0; exact rendered images in the compatibility manifest |
 | MCP-GW | `steward.connections.github/v1`: 0.3.2; `steward.connections.github/v2`: 0.4.9–0.4.11 |
 | LiteLLM | 1.93.0; Responses and Anthropic Messages contracts defined in the compatibility manifest |
+| Gateway API edge | Gateway API 1.4.0+; Envoy Gateway 1.9.1; the selected GatewayClass reports `BackendTLSPolicy` |
 | Companion products | Exact `steward-run` and `github-oidc-exchange` coordinates in the compatibility manifest |
 
 Runtime support is the Kubernetes/OpenShell default. Operators may set
@@ -152,6 +158,7 @@ system. The default names can be overridden under `secrets`, `tls`,
 | `browserAuth.google.clientSecret.name` in release namespace | `Opaque`; configured `clientSecret.key` | Identity-provider operator creates; API reads. | Only `browserAuth.enabled=true`; rotate with provider, restart API, and retest the exact HTTPS callback/origin. |
 | `githubSource.privateKeySecret.name` in release namespace | `Opaque`; configured private-key key containing the GitHub App PEM | GitHub App owner creates; API mounts read-only. | Only `githubSource.enabled=true`; App needs read-only Contents and installation only on approved repositories. Rotate the App key and retest exact Git-object resolution. |
 | `web.ingress.tlsSecretName` in release namespace | `kubernetes.io/tls`; `tls.crt`, `tls.key` | Customer edge PKI creates; Ingress controller reads. | Only legacy `web.ingress.enabled=true`; gateway-owned TLS stays outside this chart. |
+| `web.httpRoute.backendTls.caConfigMap.name` in release namespace | Public `ConfigMap`; exactly `ca.crt` | Trust-distribution controller creates; Gateway reads as the apiserver trust anchor. | Required for `web.httpRoute.enabled=true`; overlap CA rotation in the ConfigMap and verify the BackendTLSPolicy before removing an old issuer. Never copy `tls.key` or the apiserver TLS Secret. |
 | Each `imagePullSecrets` reference in release namespace | Normally `kubernetes.io/dockerconfigjson`; `.dockerconfigjson` | Registry operator creates; kubelet reads. | Only private registries; rotate before expiry and verify pulls without printing the Secret. |
 | Runtime-UID-named Secret in each allowed runtime namespace | `Opaque`; `access-token` | Controller creates from a runtime-scoped LiteLLM credential; sandbox consumes. | Governed runtime only. It is UID-bound and owner-referenced; controller deletes it on suspend/termination. Do not pre-create, back up as a reusable credential, or share across runtimes. |
 

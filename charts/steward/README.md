@@ -173,9 +173,9 @@ networkPolicy:
 ```
 
 Gateway API `v1.4.0` or later and a controller whose selected `GatewayClass`
-reports `BackendTLSPolicy` support are required. Envoy Gateway `v1.3.0` or
-later is the documented minimum for the named Service-port attachment used by
-this chart. The chart does not install Gateway API CRDs or a controller.
+reports `BackendTLSPolicy` support are required. Envoy Gateway `v1.9.1` is the
+currently supported, tested controller line for this chart. The chart does not
+install Gateway API CRDs or a controller.
 
 Publish the CA ConfigMap through the platform's public trust-distribution
 controller (for example, a trust-manager `Bundle` whose ConfigMap target is in

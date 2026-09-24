@@ -3725,6 +3725,28 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("BackendTLSPolicy")
         );
+        assert_eq!(
+            manifest
+                .pointer("/dependencies/gatewayApi/minimumEnvoyGatewayRelease")
+                .and_then(serde_json::Value::as_str),
+            Some("1.9.1")
+        );
+        assert_eq!(
+            manifest
+                .pointer("/dependencies/gatewayApi/testedEnvoyGatewayRelease")
+                .and_then(serde_json::Value::as_str),
+            Some("1.9.1")
+        );
+        let envoy_gateway_chart = manifest
+            .pointer("/dependencies/gatewayApi/testedEnvoyGatewayChart")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                "compatibility manifest is missing tested Envoy Gateway chart".to_owned()
+            })?;
+        assert!(
+            envoy_gateway_chart.starts_with("oci://") && envoy_gateway_chart.contains("@sha256:"),
+            "tested Envoy Gateway chart must be an immutable OCI reference"
+        );
         for required in [
             "steward-governed-platform-compatibility-${version}.json",
             "governedPlatformCompatibility:",

@@ -135,7 +135,7 @@ Finally, make a bounded request to the public session path. A Steward-owned
 `503` is a Gateway/backend failure, not an OAuth response:
 
 ```sh
-curl --fail-with-body --silent --show-error --output /dev/null \
+curl --silent --show-error --output /dev/null \
   --write-out '%{http_code}\n' \
   https://steward.example.test/admin/api/v1/session
 ```

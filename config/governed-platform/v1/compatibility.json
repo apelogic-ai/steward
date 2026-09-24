@@ -92,7 +92,9 @@
       "minimumCrdRelease": "1.4.0",
       "apiVersion": "gateway.networking.k8s.io/v1",
       "requiredGatewayClassFeature": "BackendTLSPolicy",
-      "minimumEnvoyGatewayRelease": "1.3.0",
+      "minimumEnvoyGatewayRelease": "1.9.1",
+      "testedEnvoyGatewayRelease": "1.9.1",
+      "testedEnvoyGatewayChart": "oci://docker.io/envoyproxy/gateway-helm@sha256:91bae9aedb91ab34731e987afe01a3ccf454393015abeca705eea8ee15553e86",
       "backendTlsPolicy": {
         "targetKind": "Service",
         "targetSectionName": "https",
