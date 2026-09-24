@@ -1315,6 +1315,378 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         "successful Task finalization must remove its exact runtime"
     );
 
+    let expired_task_uid = Uuid::new_v4();
+    let expired_operation_id = Uuid::new_v4();
+    let expired_runtime_name = format!("task-{}", expired_operation_id.simple());
+    let expired_candidate_digest = digest(serde_json::to_value(&spec))?;
+    let expired_inert_digest = manifest_digest_with_binding(
+        expired_task_uid,
+        expired_operation_id,
+        &expired_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let expired_active_digest = manifest_digest_with_binding(
+        expired_task_uid,
+        expired_operation_id,
+        &expired_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    *kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("runtime UID fixture was poisoned"))? =
+        Some("runtime-uid-expired".to_owned());
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid: expired_task_uid,
+            operation_id: expired_operation_id,
+            idempotency_key: &format!("expired-runtime-{suffix}"),
+            submitter_service: &service,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: identity.user_id.as_str(),
+            workflow: "fault-injection",
+            workflow_name: Some("fault-injection"),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &expired_runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &agent_command,
+            execution_binding: Some(&execution_binding),
+            direct_task_evidence: None,
+            user_envelope_snapshot: Some(&envelope),
+            candidate_digest: &expired_candidate_digest,
+            admission_decision: &admission_decision,
+            inert_manifest_digest: &expired_inert_digest,
+            active_manifest_digest: &expired_active_digest,
+        })
+        .await?;
+    store
+        .put_task_inputs(
+            expired_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"expired task input",
+        )
+        .await?;
+    store
+        .request_task_execution(expired_task_uid, &service, identity.user_id.as_str())
+        .await?;
+
+    for _ in 0..5 {
+        reconcile_current(&client, &task_runtime, &store, expired_task_uid).await?;
+    }
+    assert_eq!(
+        operation(&store, expired_task_uid).await?.state,
+        TaskOrchestrationState::ActivationPending
+    );
+    let expired_activated_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("expired active runtime fixture is absent"))?;
+    let expired_inference = ActiveInference::default();
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        expired_inference.clone(),
+        store.clone(),
+        expired_activated_runtime,
+    )
+    .await?;
+    let expired_finalizing_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("expired finalized runtime fixture is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        expired_inference.clone(),
+        store.clone(),
+        expired_finalizing_runtime,
+    )
+    .await?;
+    reconcile_current(&client, &task_runtime, &store, expired_task_uid).await?;
+    assert_eq!(
+        operation(&store, expired_task_uid).await?.state,
+        TaskOrchestrationState::Active
+    );
+
+    let mut expired_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("expired provisioned runtime fixture is absent"))?;
+    expired_runtime.metadata.creation_timestamp =
+        Some(serde_json::from_value(json!("1970-01-01T00:00:00Z"))?);
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        expired_inference.clone(),
+        store.clone(),
+        expired_runtime,
+    )
+    .await?;
+    let expired_operation = operation(&store, expired_task_uid).await?;
+    assert_eq!(
+        expired_operation.state,
+        TaskOrchestrationState::CleanupPending,
+        "Task TTL expiry must establish persisted cleanup authority before deletion"
+    );
+    assert_eq!(
+        store
+            .task(expired_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .failure_reason
+            .as_deref(),
+        Some("task_runtime_ttl_expired")
+    );
+    assert!(
+        kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+            .as_ref()
+            .is_some_and(|runtime| runtime.metadata.deletion_timestamp.is_none()),
+        "ordinary reconciliation must not delete an expired Task runtime before Task cleanup"
+    );
+
+    reconcile_current(&client, &task_runtime, &store, expired_task_uid).await?;
+    let expired_deleting_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("expired deleting runtime fixture is absent"))?;
+    assert!(
+        expired_deleting_runtime
+            .metadata
+            .deletion_timestamp
+            .is_some()
+    );
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        expired_inference.clone(),
+        store.clone(),
+        expired_deleting_runtime,
+    )
+    .await?;
+    reconcile_current(&client, &task_runtime, &store, expired_task_uid).await?;
+    reconcile_current(&client, &task_runtime, &store, expired_task_uid).await?;
+    let expired_task = store
+        .task(expired_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert!(expired_task.finalized);
+    assert_eq!(expired_task.phase, TaskPhase::Failed);
+    assert_eq!(
+        expired_task.failure_reason.as_deref(),
+        Some("task_runtime_ttl_expired")
+    );
+    assert!(
+        kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+            .is_none(),
+        "expired Task finalization must remove its exact runtime"
+    );
+
+    let cancelled_task_uid = Uuid::new_v4();
+    let cancelled_operation_id = Uuid::new_v4();
+    let cancelled_runtime_name = format!("task-{}", cancelled_operation_id.simple());
+    let cancelled_candidate_digest = digest(serde_json::to_value(&spec))?;
+    let cancelled_inert_digest = manifest_digest_with_binding(
+        cancelled_task_uid,
+        cancelled_operation_id,
+        &cancelled_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let cancelled_active_digest = manifest_digest_with_binding(
+        cancelled_task_uid,
+        cancelled_operation_id,
+        &cancelled_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    *kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("runtime UID fixture was poisoned"))? =
+        Some("runtime-uid-cancelled".to_owned());
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid: cancelled_task_uid,
+            operation_id: cancelled_operation_id,
+            idempotency_key: &format!("cancelled-runtime-{suffix}"),
+            submitter_service: &service,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: identity.user_id.as_str(),
+            workflow: "fault-injection",
+            workflow_name: Some("fault-injection"),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &cancelled_runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &agent_command,
+            execution_binding: Some(&execution_binding),
+            direct_task_evidence: None,
+            user_envelope_snapshot: Some(&envelope),
+            candidate_digest: &cancelled_candidate_digest,
+            admission_decision: &admission_decision,
+            inert_manifest_digest: &cancelled_inert_digest,
+            active_manifest_digest: &cancelled_active_digest,
+        })
+        .await?;
+    store
+        .put_task_inputs(
+            cancelled_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"cancelled task input",
+        )
+        .await?;
+    store
+        .request_task_execution(cancelled_task_uid, &service, identity.user_id.as_str())
+        .await?;
+
+    for _ in 0..5 {
+        reconcile_current(&client, &task_runtime, &store, cancelled_task_uid).await?;
+    }
+    assert_eq!(
+        operation(&store, cancelled_task_uid).await?.state,
+        TaskOrchestrationState::ActivationPending
+    );
+    let cancelled_activated_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("cancelled active runtime fixture is absent"))?;
+    let cancelled_inference = ActiveInference::default();
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        cancelled_inference.clone(),
+        store.clone(),
+        cancelled_activated_runtime,
+    )
+    .await?;
+    let cancelled_finalizing_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("cancelled finalized runtime fixture is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        cancelled_inference.clone(),
+        store.clone(),
+        cancelled_finalizing_runtime,
+    )
+    .await?;
+    reconcile_current(&client, &task_runtime, &store, cancelled_task_uid).await?;
+    assert_eq!(
+        operation(&store, cancelled_task_uid).await?.state,
+        TaskOrchestrationState::Active
+    );
+
+    let starts_before_cancellation = task_runtime.starts.load(Ordering::SeqCst);
+    let cancelled = store
+        .request_task_finalization(cancelled_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    assert!(cancelled.cancel_requested);
+    assert_eq!(cancelled.phase, TaskPhase::Cancelled);
+    reconcile_current(&client, &task_runtime, &store, cancelled_task_uid).await?;
+    assert_eq!(
+        operation(&store, cancelled_task_uid).await?.state,
+        TaskOrchestrationState::CleanupPending,
+        "cancellation must establish persisted cleanup authority before deletion"
+    );
+    assert_eq!(
+        task_runtime.starts.load(Ordering::SeqCst),
+        starts_before_cancellation,
+        "a cancelled queued Task must not begin execution"
+    );
+    assert!(
+        kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+            .as_ref()
+            .is_some_and(|runtime| runtime.metadata.deletion_timestamp.is_none()),
+        "Task cancellation must not delete the runtime before cleanup is authorized"
+    );
+
+    reconcile_current(&client, &task_runtime, &store, cancelled_task_uid).await?;
+    let cancelled_deleting_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("cancelled deleting runtime fixture is absent"))?;
+    assert!(
+        cancelled_deleting_runtime
+            .metadata
+            .deletion_timestamp
+            .is_some()
+    );
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        cancelled_inference.clone(),
+        store.clone(),
+        cancelled_deleting_runtime,
+    )
+    .await?;
+    reconcile_current(&client, &task_runtime, &store, cancelled_task_uid).await?;
+    reconcile_current(&client, &task_runtime, &store, cancelled_task_uid).await?;
+    let cancelled_task = store
+        .task(cancelled_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert!(cancelled_task.finalized);
+    assert_eq!(cancelled_task.phase, TaskPhase::Cancelled);
+    assert!(
+        kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+            .is_none(),
+        "cancelled Task finalization must remove its exact runtime"
+    );
+
     let rejected_task_uid = Uuid::new_v4();
     let rejected_operation_id = Uuid::new_v4();
     let rejected_runtime_name = format!("task-{}", rejected_operation_id.simple());
