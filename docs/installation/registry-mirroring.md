@@ -1,118 +1,103 @@
 # Registry mirroring and deployment locks
 
-Each Steward release attaches `steward-registry-lock.py` and
-`steward-registry-lock.py.sha256`. The tool copies every component listed in the
-verified `release-handoff.json`, including Steward images and reference coding-agent
-runtimes. It then resolves each target-registry digest, inspects the exact digest, and
-writes a deterministic `steward.deployment-lock/v1` document.
+Each Steward release attaches `steward-registry-lock.sh` and
+`steward-registry-lock.sh.sha256`. The tool plans and performs an explicit,
+daemonless OCI copy of the released chart, every Steward image, and every
+reference coding-agent runtime. It uses ORAS 1.3.0 and `jq`; it does not need a
+Docker daemon.
 
-The tool requires Python 3 and Docker with the Buildx imagetools plugin. It accepts no
-registry credential flags. Authenticate source and target registries beforehand with
-the standard `docker login` flow or a Docker credential helper, keep shell tracing
-disabled, and never place a password in an argument or lock file.
+Authenticate the source and target registries before running the tool. Keep
+credentials in the normal ORAS registry configuration, keep shell tracing
+disabled, and never put a password in a command argument, mapping document, or
+deployment lock.
 
-## Verify and run
+## Verify the tool
 
-Download `release-handoff.json`, the tool, and its checksum from the same release. First
-verify the handoff attestation as described in the release notes, then verify the tool:
-
-```sh
-sha256sum --check steward-registry-lock.py.sha256
-
-set +x
-docker login registry.example.test
-python3 steward-registry-lock.py mirror \
-  --handoff release-handoff.json \
-  --target-prefix registry.example.test/team-a \
-  --output steward-deployment-lock.json
-```
-
-The default mode requires each source artifact to be an OCI index. The target must also
-be an index with the exact source descriptor set. This preserves all released platforms
-and associated index descriptors where the target registry supports them. The target
-index digest is resolved after the copy; the source digest is never reused as an
-assumption.
-
-Some registries or deployment lanes intentionally carry one platform. Make that
-narrowing explicit and give the target tags a distinguishing suffix:
+Download `release-handoff.json`, the mirror tool, and its checksum from the same
+GitHub release. Verify the handoff attestation as described in that release,
+then verify the tool:
 
 ```sh
-python3 steward-registry-lock.py mirror \
-  --handoff release-handoff.json \
-  --target-prefix registry.example.test/team-a \
-  --platform linux/amd64 \
-  --target-tag-suffix=-amd64 \
-  --output steward-deployment-lock-linux-amd64.json
+sha256sum --check steward-registry-lock.sh.sha256
 ```
 
-Single-platform mode selects exactly one descriptor from every source index, copies it
-without wrapping it in another index, inspects the exact target digest, and records both
-the original index digest and selected platform digest. A single manifest is rejected in
-default mode so it cannot silently masquerade as the released index.
+## Declare exact targets
 
-## Lock contract
-
-The lock contains no registry credentials. Object keys and arrays have deterministic
-ordering, and identical verified inputs produce identical bytes. A shortened example is:
+Mirroring requires an explicit target for every artifact. The mapping keys must
+exactly match the chart, images, and reference runtimes in the verified handoff;
+missing and extra entries are rejected.
 
 ```json
 {
+  "schemaVersion": "steward.registry-mappings/v1",
   "artifacts": {
-    "images.apiserver": {
-      "copyMode": "index",
-      "platforms": [
-        {
-          "architecture": "amd64",
-          "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-          "os": "linux"
-        }
-      ],
-      "source": {
-        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "reference": "ghcr.io/example-org/steward:0.2.2-apiserver"
-      },
-      "target": {
-        "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "reference": "registry.example.test/team-a/steward:0.2.2-apiserver"
-      }
-    }
-  },
-  "chartValues": {
-    "images": {
-      "apiserver": {
-        "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "tag": "0.2.2-apiserver"
-      },
-      "repository": "registry.example.test/team-a/steward"
-    }
-  },
-  "executionBindingImages": {
-    "codex": "registry.example.test/team-a/steward-codex@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-  },
-  "mode": "index",
-  "release": {
-    "commit": "0123456789abcdef0123456789abcdef01234567",
-    "version": "0.2.2"
-  },
-  "requestedPlatform": null,
-  "schemaVersion": "steward.deployment-lock/v1"
+    "chart": "registry.example.test/team-a/charts/steward:0.2.3",
+    "images.apiserver": "registry.example.test/team-a/steward:0.2.3-apiserver",
+    "images.bridge": "registry.example.test/team-a/steward:0.2.3-bridge",
+    "images.controller": "registry.example.test/team-a/steward:0.2.3-controller",
+    "images.mint": "registry.example.test/team-a/steward:0.2.3-mint",
+    "images.web": "registry.example.test/team-a/steward:0.2.3-web",
+    "referenceRuntimes.codex": "registry.example.test/team-a/steward-codex-runtime:0.140.0-steward-0.2.3"
+  }
 }
 ```
 
-The recommended next step is to embed the complete lock unchanged in the
-[platform-preflight input](platform-preflight.md). The preflight verifies the release,
-mode, requested platform, component coordinates, reference runtime, and provider-profile
-relationships before generating the Helm/Flux values and execution binding. This avoids
-manual translation between the mirror result and deployment configuration.
+## Plan, then mirror
 
-For an installation that does not use platform preflight, copy `chartValues` into the
-installation values overlay. The optional bridge entry is emitted as
-`chartValues.connectionsBridge.image`; copy the desired value from
-`executionBindingImages` into the matching execution binding's `image` field. Keep the
-complete lock as deployment evidence. Deployment values remain digest-pinned; tags are
-labels and never the authority for a deployment.
+The first command is a no-write plan. It resolves and validates every source
+digest and checks that every target repository is reachable. Review the plan
+before allowing writes.
 
-The release gate also copies a pinned multi-platform image through this tool into an
-ephemeral registry, inspects the exact target digest, pulls its `linux/amd64` image, and
-removes the run-owned registry. The mock-based tests remain responsible only for
-deterministic failure branches and credential-free output.
+```sh
+set +x
+./steward-registry-lock.sh plan \
+  --handoff release-handoff.json \
+  --mappings registry-mappings.json \
+  --output steward-registry-plan.json
+
+./steward-registry-lock.sh mirror \
+  --plan steward-registry-plan.json \
+  --output steward-deployment-lock.json
+```
+
+The copy is resumable. A target tag already resolving to the planned digest is
+reported as `already-present` and skipped. A target tag resolving to any other
+digest is rejected instead of overwritten.
+
+To create a deliberately narrowed installation, add `--platform linux/amd64`
+to `plan` and use distinct target tags in the mapping. Charts are always copied
+as complete OCI artifacts; platform selection applies only to images and
+reference runtimes.
+
+For a local test registry without TLS, `plan` also accepts
+`--target-plain-http`. Do not use that option for a production registry.
+
+## Lock contract
+
+`mirror` writes deterministic `steward.deployment-lock/v1` JSON. The lock
+contains no credentials and records:
+
+- the verified release version and commit;
+- every source release digest and selected digest;
+- every exact target tag and resulting digest;
+- digest-pinned `chartValues` for Steward images;
+- digest-pinned `executionBindingImages` for reference runtimes; and
+- a Flux-ready chart source at
+  `artifacts.chart.flux.ociRepository`, including `ref.digest`.
+
+Identical verified inputs and registry state produce identical lock bytes. Keep
+the complete lock as deployment evidence. Tags remain human-readable labels;
+the recorded digests are the deployment authority.
+
+The recommended next step is to embed the lock unchanged in the
+[platform-preflight input](platform-preflight.md). The preflight validates its
+release and artifact relationships before generating Helm/Flux configuration.
+Without platform preflight, copy `chartValues` into the installation overlay,
+use `artifacts.chart.flux.ociRepository` for the Flux `OCIRepository`, and copy
+the required values from `executionBindingImages` into the corresponding
+execution bindings.
+
+The release gate exercises the same ORAS path against a run-owned registry,
+including the chart, a reference runtime, digest preservation, and resumable
+re-entry. Mocked tests cover deterministic output, incomplete mappings,
+collisions, platform narrowing, and credential-free diagnostics.

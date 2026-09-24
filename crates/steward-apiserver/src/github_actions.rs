@@ -22,7 +22,7 @@ const REVIEWED_STEWARD_RUN_ACTION_COMMIT: &str = "b26790e29ce9c243c6a7aa00450a2a
 // document has auditable, executable provenance.
 const VERSIONED_STEWARD_RUN_WORKFLOW_COMMIT: &str = "328159f3b816b8c93a9e5a8c1790243d2965aff8";
 const VERSIONED_STEWARD_RUN_ACTION_COMMIT: &str = "5a360ce51cf2307b36c3b8ca973b6dd51c7a59a9";
-const REVIEWED_STEWARD_RUN_JOB_CONTAINER: &str = "663383948333.dkr.ecr.us-east-1.amazonaws.com/steward-run@sha256:27235891b596debb1d8bba5f7763e14a56ce4435e2fc82f3de80122b19ff8c61";
+const REVIEWED_STEWARD_RUN_JOB_CONTAINER: &str = "ghcr.io/apelogic-ai/steward-run@sha256:bea4dfcdc021fb2f9c1a9948f2a0b3e06e6edab15891ad19fd279bc2e0f2e6c2";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -617,7 +617,7 @@ mod tests {
     const ACTION_COMMIT: &str = "b26790e29ce9c243c6a7aa00450a2a1a98fbd250";
     const VERSIONED_WORKFLOW_COMMIT: &str = "328159f3b816b8c93a9e5a8c1790243d2965aff8";
     const VERSIONED_ACTION_COMMIT: &str = "5a360ce51cf2307b36c3b8ca973b6dd51c7a59a9";
-    const JOB_CONTAINER: &str = "663383948333.dkr.ecr.us-east-1.amazonaws.com/steward-run@sha256:27235891b596debb1d8bba5f7763e14a56ce4435e2fc82f3de80122b19ff8c61";
+    const JOB_CONTAINER: &str = "ghcr.io/apelogic-ai/steward-run@sha256:bea4dfcdc021fb2f9c1a9948f2a0b3e06e6edab15891ad19fd279bc2e0f2e6c2";
 
     fn envelope() -> GithubActionsEnvelopeSelection {
         GithubActionsEnvelopeSelection {
@@ -912,7 +912,7 @@ mod tests {
         assert!(!first.yaml.contains(":latest"));
         assert_eq!(
             first.sha256,
-            "sha256:cd25dd0b56c699526b78165eff513f9196c940df196b91a686881922f177c2e8"
+            "sha256:7fed5352024401a228c43b0aa94360da15fab1b40f3086be30255f22f0b62e79"
         );
         Ok(())
     }

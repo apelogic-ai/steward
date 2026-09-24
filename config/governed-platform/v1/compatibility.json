@@ -1,0 +1,125 @@
+{
+  "schemaVersion": "steward.governed-platform-compatibility/v1",
+  "steward": {
+    "version": "0.2.3"
+  },
+  "companions": {
+    "stewardRun": {
+      "version": "0.5.0",
+      "commit": "3cecf26090b5fdb2fb49fcdf873c752ed769f141",
+      "image": "ghcr.io/apelogic-ai/steward-run@sha256:bea4dfcdc021fb2f9c1a9948f2a0b3e06e6edab15891ad19fd279bc2e0f2e6c2",
+      "chart": "ghcr.io/apelogic-ai/charts/steward-run-arc@sha256:59bfdf1688aac749d3cfac6ce611cd5c3ad5be0563de7ef9948b9a21ce7324d8"
+    },
+    "githubOidcExchange": {
+      "version": "0.5.1",
+      "commit": "c4d83259042bf5ad29495b2fafb9e6931a704fc0",
+      "image": "ghcr.io/apelogic-ai/github-oidc-exchange@sha256:0896762ebc5e8abf8ce27595ea6c9a4caac028e34c514af4af964f9aae0cc2bc",
+      "chart": "ghcr.io/apelogic-ai/charts/github-oidc-exchange@sha256:8dda90bce0ebb6480e4f0d0abb1d1ddb11baba84397253446819513294f3047b",
+      "policyContract": "github-oidc-exchange.apelogic.io/v5",
+      "identityContract": "steward-task-v2"
+    }
+  },
+  "dependencies": {
+    "openShell": {
+      "version": "0.0.98",
+      "commit": "832841295992f0112f43f27de5d68213376ff3cb",
+      "chart": "ghcr.io/nvidia/openshell/helm-chart:0.0.98@sha256:891b09f7d60e9341af2bb545b3d1a4a6c39870f6f48a77d8bddca3f443c6a9e6",
+      "runtimeClass": "cluster-default"
+    },
+    "agentSandbox": {
+      "version": "0.5.0",
+      "commit": "a84e2e0af7c436ebf9e9b7f652b19ba83c123c37",
+      "manifest": "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.5.0/manifest.yaml",
+      "manifestDigest": "sha256:ccfe3649de8b33f0ee0ec635e2c7b40e1c468ad9fde6aac7c7379501327d9c4c",
+      "controllerImage": "registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.5.0@sha256:e99cac42f10cac69cab09a91e59f982c9d525b2933a5f5b7dfd52dae09340aa2"
+    },
+    "spire": {
+      "crdChart": {
+        "repository": "https://spiffe.github.io/helm-charts-hardened/",
+        "name": "spire-crds",
+        "version": "0.5.0",
+        "commit": "9da5fa24dda7ad0bba4d50695d265256a237c6c6",
+        "digest": "sha256:5979c6607bc7b62c798a9cd28cf3b1861db8439cd6f069384abfc62f89bf6bca"
+      },
+      "chart": {
+        "repository": "https://spiffe.github.io/helm-charts-hardened/",
+        "name": "spire",
+        "version": "0.29.0",
+        "commit": "890bd853e33e02a109b99d40712dfc9f9e3c90d9",
+        "digest": "sha256:b73205c87c5edfdaa5dcb6d6de16685950e02a5b8f843cdc6e101d127ef7a7be"
+      },
+      "images": [
+        "ghcr.io/spiffe/spire-server:1.15.2@sha256:aa74ef1be86bc8e0684007d84a4d9859d294384d842c30425048d73429f3216e",
+        "ghcr.io/spiffe/spire-agent:1.15.2@sha256:1d042e4040466686e0ee46f74981ff2167c86adfadca19b3835946f4d6047536",
+        "ghcr.io/spiffe/spire-agent:1.15.1@sha256:501ea7072748adb74d1f9ac3320ddceedcf3b8c4a1cc9d2b4bedd427d277475b",
+        "ghcr.io/spiffe/spire-controller-manager:0.6.6@sha256:3f70cfa140a829e4ef456763e72b461b0fb491900efb89c4b34b6a10be1c2d7a",
+        "ghcr.io/spiffe/spiffe-csi-driver:0.2.7@sha256:9dfe4f0caff096164fd921aa7f15319804df2fc0325f1d90bc793ef3256ab1cd",
+        "registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.15.0@sha256:11f199f6bec47403b03cb49c79a41f445884b213b382582a60710b8c6fdc316a",
+        "ghcr.io/spiffe/spiffe-helper:0.11.0@sha256:1c92e5998ad3621e3323f25aabe40f5a88ba730ee0edb248aa8c943ca504e8a2",
+        "ghcr.io/spiffe/oidc-discovery-provider:1.15.1@sha256:bf2ba1073faaa3769ef4aab43ef2039de9008921c65cdad1b4ad7614aabf68c7",
+        "docker.io/smallstep/step-cli:0.30.2@sha256:c75414251d4d8234945fb01e1374707dcc6a7adced88679bae4f0fd526331e74",
+        "docker.io/library/busybox:1.37.0-uclibc@sha256:31b72538c3019a20336b04c4cebcd47c36511d0b45aa76666804c2845055bbd3",
+        "registry.k8s.io/kubectl:v1.32.0@sha256:8ccae74fc039a256eddf3066d02134b2d1ad55e7b646e9dd38f60b3d369ef97a",
+        "cgr.dev/chainguard/bash:latest@sha256:90041f375e30f41aa7e0390075d8a69dc61900771d52fa98d63ee5d03d866a58",
+        "cgr.dev/chainguard/min-toolkit-debug:latest@sha256:9e45e6836c28489a6e57ca1210ec66927e88eca2409e403616a1278e210e86c9"
+      ],
+      "identity": {
+        "trustDomain": "operator-supplied and immutable for an installation",
+        "spiffeIdTemplate": "spiffe://<trust-domain>/steward/mint",
+        "clusterSpiffeIdOwner": "steward-chart",
+        "selector": "Mint pod in the Steward release namespace"
+      },
+      "upgradeOrder": [
+        "upgrade spire-crds",
+        "upgrade spire",
+        "verify ClusterSPIFFEID and Workload API readiness",
+        "roll Steward Mint"
+      ]
+    },
+    "mcpGateway": {
+      "authorityContract": "steward.connections.github/v2",
+      "compatibleReleases": [
+        "0.4.9",
+        "0.4.10",
+        "0.4.11"
+      ],
+      "testedRelease": "0.4.11",
+      "commit": "e040b8177ac0cb8ba5a5d6f3ba2ef075b6e8e6c5",
+      "chart": "ghcr.io/apelogic-ai/charts/mcp-gateway:0.4.11@sha256:d213008b53aee1b5f2279fdb2fab5857f9305fa1761dbfe225d84fee0bdb78af",
+      "githubWrapperImage": "ghcr.io/apelogic-ai/mcp-gw-github-wrapper@sha256:9546728094839cd2b2be97619ddbe9bf995a0c8ca715d6e3b7d543540e08034a"
+    },
+    "gatewayApi": {
+      "minimumCrdRelease": "1.4.0",
+      "apiVersion": "gateway.networking.k8s.io/v1",
+      "requiredGatewayClassFeature": "BackendTLSPolicy",
+      "minimumEnvoyGatewayRelease": "1.9.1",
+      "testedEnvoyGatewayRelease": "1.9.1",
+      "testedEnvoyGatewayChart": "oci://docker.io/envoyproxy/gateway-helm@sha256:91bae9aedb91ab34731e987afe01a3ccf454393015abeca705eea8ee15553e86",
+      "backendTlsPolicy": {
+        "targetKind": "Service",
+        "targetSectionName": "https",
+        "caReferenceKind": "ConfigMap",
+        "caReferenceKey": "ca.crt"
+      }
+    },
+    "liteLlm": {
+      "version": "1.93.0",
+      "commit": "052b5a2169d8d3082e1d66e69f200a72b0c1e274",
+      "image": "ghcr.io/berriai/litellm-database:v1.93.0@sha256:72360d8bd5602faa49be5098a8ac3dd069d9fb74503d6bd014242d96dc753e43",
+      "interfaces": {
+        "codex-v1": {
+          "urlSemantics": "exact-operation-url",
+          "operationPath": "/v1/responses",
+          "modelId": "provider-qualified",
+          "testedModel": "openai/gpt-5.4"
+        },
+        "claude-code-v1": {
+          "urlSemantics": "base-url",
+          "operationPath": "/v1/messages",
+          "modelId": "provider-qualified",
+          "testedModel": "anthropic/claude-sonnet-4-6"
+        }
+      }
+    }
+  }
+}

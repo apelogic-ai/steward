@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.2.2` and application `0.2.2`.
+Current release contract: chart `0.2.3` and application `0.2.3`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -122,14 +122,22 @@ documented component interfaces do not expose a stable Prometheus contract.
 Use the Kubernetes deployment/probe state and the platform's approved log and
 event collection until a separately versioned observability interface exists.
 
-For a shared Envoy Gateway/Gateway API platform, set
-`web.httpRoute.enabled=true`. The chart then renders two `HTTPRoute` objects:
+For a shared Gateway API platform, set `web.httpRoute.enabled=true`. The chart
+then renders two `HTTPRoute` objects and one `BackendTLSPolicy`:
 `steward-api` targets `steward-apiserver` port `https` (443, targeting the
-apiserver's TLS listener on 8443), and `steward-web`
-targets `steward-web` port `http` (3000). Their `parentRefs`, hostname, and API
-and web paths have no defaults and must be supplied explicitly. The apiserver
-Service declares `appProtocol: https`; the platform remains responsible for any
-Gateway API `BackendTLSPolicy` required by its controller.
+apiserver's TLS listener on 8443), `steward-web` targets `steward-web` port
+`http` (3000), and the policy requires TLS for the apiserver backend. Their
+`parentRefs`, hostname, API paths, web paths, and public-CA ConfigMap have no
+defaults and must be supplied explicitly.
+
+The backend policy is a same-namespace direct attachment to
+`steward-apiserver` port section `https`. Its hostname is fixed to the full
+Service DNS identity `steward-apiserver.<release-namespace>.svc.<cluster-domain>`;
+the chart validates this rather than allowing an arbitrary SNI. The referenced
+ConfigMap must have a non-empty public PEM CA at `data.ca.crt`. Gateway API does
+not select an alternate ConfigMap key, so the chart requires that exact key.
+The ConfigMap is public trust material only: never put `tls.key`, any private
+key, or a TLS Secret in it.
 
 Set `networkPolicy.ingressNamespace` to the explicit Envoy Gateway data-plane
 namespace from which the route reaches the apiserver. It defaults to empty, so
@@ -155,9 +163,25 @@ web:
       - { type: PathPrefix, value: /v1 }
     webPaths:
       - { type: PathPrefix, value: / }
+    backendTls:
+      hostname: steward-apiserver.steward.svc.cluster.local
+      caConfigMap:
+        name: steward-apiserver-ca
+        key: ca.crt
 networkPolicy:
   ingressNamespace: envoy-gateway-system
 ```
+
+Gateway API `v1.4.0` or later and a controller whose selected `GatewayClass`
+reports `BackendTLSPolicy` support are required. Envoy Gateway `v1.9.1` is the
+currently supported, tested controller line for this chart. The chart does not
+install Gateway API CRDs or a controller.
+
+Publish the CA ConfigMap through the platform's public trust-distribution
+controller (for example, a trust-manager `Bundle` whose ConfigMap target is in
+the Steward release namespace). That controller, not a human edit, must update
+`data.ca.crt` when the issuing CA rotates. The chart never copies the
+apiserver TLS Secret or its private key to the Gateway.
 
 `web.ingress.enabled=true` remains a legacy, portable Kubernetes `Ingress`
 interface for installations that explicitly choose it. Its annotation maps are
@@ -219,8 +243,10 @@ When the legacy `web.ingress.enabled=true` interface is selected, `web.host`
 must exactly match the browser origin host and the Ingress class and TLS Secret
 are required. With it disabled, those Ingress-only inputs may be empty and no
 Ingress resources are rendered. A Gateway API deployment uses the chart's
-explicit `web.httpRoute` interface and retains ownership of Gateway and
-certificate policy outside this chart.
+explicit `web.httpRoute` interface. It retains ownership of the Gateway,
+Gateway API CRDs, controller, edge certificate, and public-CA distribution;
+the chart owns the TLS policy that attaches that public CA to its apiserver
+Service.
 
 When `networkPolicy.enabled=true`, browser authentication additionally requires
 at least one `networkPolicy.browserAuthEgressCidrs` entry. The chart allows
@@ -253,8 +279,13 @@ GitHub API CIDRs; the portable chart opens HTTPS egress only to those entries.
 `connectionsBridge` is disabled by default. Enabling it requires browser
 authentication, an immutable bridge image, an explicit artifact-trust contract,
 the exact MCP-GW origin, and a dedicated runtime namespace. Authority v1 also
-requires an exact authority-pinned MCP-GW contract (`0.3.2` for v1 or `0.4.9` for v2); another configured version fails
-closed. The apiserver records those values on each operation; the controller
+requires the named `connectionsBridge.mcpGatewayAuthorityContract` selector:
+`steward.connections.github/v1` for the legacy status route or
+`steward.connections.github/v2` for the lifecycle status contract used by
+MCP-GW 0.4.9 through 0.4.11. The deprecated `mcpGatewayVersion` input remains
+available for an existing values file and must not be set together with the
+named selector. Another configured contract fails closed. The apiserver records
+the frozen internal authority snapshot on each operation; the controller
 verifies the same snapshot before creating or executing the short-lived
 `steward-connections` runtime.
 
@@ -292,7 +323,7 @@ The browser never receives a HOP-1 token and the apiserver never calls MCP-GW
 directly. OpenShell attaches MCP-GW to the one-shot runtime and obtains its
 ordinary Steward Mint identity. The bridge has no inference provider, uses one
 fixed provider-control grant, and is finalized through the normal controller
-lifecycle. Changing a configured trust mode, image, endpoint, MCP-GW version,
+lifecycle. Changing a configured trust mode, image, endpoint, MCP-GW authority contract,
 namespace, or runtime class does not reinterpret an existing operation; it
 fails closed.
 

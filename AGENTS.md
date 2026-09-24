@@ -15,11 +15,15 @@ additional prose.
   a rule, treat it as a rule change.
 - Never create, modify, replace, disable, or delete GitHub branch-protection
   rules or repository/organization rulesets. Read-only inspection is allowed.
+- Cross-references to this file use section names, not numbers. Numbers shift
+  when a section is added; the pointers left behind do not.
 
 Enforcement surfaces include CI and hook configuration, lint settings and lint
 exceptions, `deny.toml`, security entries in `.gitignore`, the implementations
-behind mandatory `xtask` checks, and `claim` values in
-`conformance/register.toml`. A failing gate is a message, not permission to
+behind mandatory `xtask` checks, `claim` values in
+`conformance/register.toml`, and the committed agent configuration under
+`.claude/` — its permission allowlist, its deny list, and its agent
+definitions. A failing gate is a message, not permission to
 weaken the gate.
 
 ## 2. Git and pull requests
@@ -36,14 +40,41 @@ git pull --ff-only
 ```
 
 If `--ff-only` fails, stop and report the divergence. Use `s<N>/<slug>` for an
-active roadmap slice; otherwise use `feat/<slug>`, `fix/<slug>`, or
-`chore/<slug>`.
+active roadmap slice; otherwise use `feat/<slug>`, `fix/<slug>`, `docs/<slug>`,
+or `chore/<slug>`.
 
-Once a maintainer requests repository work, the agent may perform the normal
-workflow without separate permission to sync, switch safely, create a task
-branch, commit, push that branch, or open its PR. Inspect the worktree before
-switching and preserve unrelated work. This never authorizes data loss, a
-force-push, a push to `main`, or a human-only PR action.
+### Standing authorization
+
+A maintainer request for repository work authorizes the entire ordinary
+workflow. The operations below are **pre-authorized**: perform them without
+asking, without requesting confirmation, and without pausing for
+acknowledgement. This list grants permission; it does not require it.
+
+- `git fetch`, `git pull --ff-only`, and creating a task branch;
+- `git switch` between `main`, your own task branches, and your own worktrees,
+  after inspecting the worktree for unrelated work;
+- creating a worktree under `.worktrees/`;
+- staging explicit paths, committing, and amending an unpushed commit of your
+  own;
+- pushing that task branch, including every later push to that same branch
+  after the first (this is an ordinary push, not a force-push);
+- syncing your task branch or worktree onto an updated `origin/main`, by the
+  rule in "Force pushes and PR decisions";
+- opening its PR, editing its description, and commenting on it;
+- adding a dependency that leaves `cargo xtask ci`, including the `deny.toml`
+  license and advisory checks, passing unchanged.
+
+The inverse — the short list of acts that do require approval — is "Changes
+requiring advance approval". An act absent from both lists is governed by the
+rest of this file, not by asking.
+
+Inspect the worktree before switching and preserve unrelated work. Announce a
+push before running it, per "Pushes and hardware approval"; announcing is not
+asking.
+
+This never authorizes data loss, a force-push, a push to `main`, or a human-only
+PR action. Where this file requires approval for a specific act, ask for that
+act rather than re-requesting the workflow around it.
 
 ### Force pushes and PR decisions
 
@@ -52,9 +83,11 @@ force-push, a push to `main`, or a human-only PR action.
 - Never merge, close, reopen, convert, or delete a branch with an open PR.
   Never dismiss a review. Those are human decisions.
 - If a PR appears stale, superseded, or wrong, report it and leave it open.
-- While a branch is yours alone, rebase it onto `origin/main`. Once another
-  party has pulled it, merge `origin/main` instead. Never rewrite shared
-  history.
+- Sync a task branch onto an updated `origin/main` whenever `main` has moved;
+  a stale branch is a review cost. Before the branch's first push, rebase it.
+  After its first push, merge `origin/main` into it: rebasing a pushed branch
+  requires a force-push, so it needs the explicit authorization above and is
+  not the default. Never rewrite shared history.
 
 ### Commits and staging
 
@@ -83,6 +116,25 @@ force-push, a push to `main`, or a human-only PR action.
 - Never tag a commit that the current release contract will reject. Do not call
   a standalone release-preparation change cheap or simple when repository rules
   require the full gate.
+
+### Public repository artifacts
+
+This repository is public. Commit messages, branch names, PR titles and bodies,
+review comments, and every file under version control are published the moment
+they are pushed, and stay retrievable after an edit or deletion.
+
+- Summarize internal review conversation, maintainer instruction, and relayed
+  team or customer feedback as technical facts. Never paste or quote it.
+- Name the defect, not the reporter. "A document contradicted the released
+  authority model" is publishable; who noticed it, in which channel, and what
+  else they said is not.
+- Keep the license, third-party notices, and changelog accurate for what the
+  release actually ships. A newly bundled or vendored artifact updates
+  `THIRD_PARTY_NOTICES.md` in the PR that introduces it, and a release adds its
+  `CHANGELOG.md` entry in the same PR as its version and chart updates, per
+  "Release batching". A changelog entry is complete when a consumer can read it
+  and know every behavior, contract, and operational change they must act on;
+  an entry naming only the headline feature is not complete.
 
 ### Worktrees
 
@@ -147,13 +199,22 @@ cargo xtask check-neutrality
 cargo xtask check-secrets
 ```
 
-Documentation-only means Markdown and static images under `docs/`. The
-repository-root `README.md` is the sole path exception and uses the same
-documentation-only gate. Other Markdown outside `docs/` does not qualify. Agent
-instructions, executable examples, `docs/contracts/`, schemas, fixtures,
-generated artifacts, source, tests, scripts, dependencies, policy, build,
-deployment, CI, hooks, and migrations remain excluded. A mixed or uncertain diff
-uses the full gate.
+Documentation-only means Markdown and static images anywhere in the repository,
+wherever they live: `docs/`, the root `README.md` and `CHANGELOG.md`, and
+Markdown beside code. Location does not decide the gate; content does.
+
+These are Markdown and still use the full gate:
+
+- agent-instruction files — `AGENTS.md`, `CLAUDE.md`, and every nested
+  equivalent;
+- `docs/contracts/`, which is normative wire contract rather than prose;
+- executable or generated Markdown, and any Markdown a script or CI job
+  consumes as input.
+
+Everything that is not Markdown or a static image uses the full gate: source,
+tests, scripts, dependencies, policy, build, deployment, CI, hooks, schemas,
+fixtures, generated artifacts, and migrations. A mixed or uncertain diff uses
+the full gate.
 
 For every other change, run:
 
@@ -167,6 +228,45 @@ not duplicate its evolving internal command list here. Pinned upstream gates
 block; latest/nightly upstream lanes are informational.
 
 Never hand off warnings. Repository Clippy policy treats warnings as errors.
+
+### Documentation currency
+
+The documentation-only gate checks whitespace, neutral identifiers, and secret
+material. It cannot tell whether a document still agrees with the code it
+describes, so that judgement is yours:
+
+- A document describing released behavior names the release it describes, so a
+  reader can recognize staleness without diffing the source.
+- A change to a wire contract, authority model, chart value, route, or CLI
+  surface updates every document asserting the old behavior, in the same PR.
+  When that is genuinely too large, the PR names the documents left stale and
+  the follow-up that corrects them.
+- An example endpoint, path, or command in a document is part of the contract a
+  reader will copy. Re-verify every example a contract change touches.
+- Before describing another product's procedure, read that product's current
+  released source. Do not describe it from memory or from an earlier revision
+  of this repository.
+- A green gate on a documentation-only PR is evidence about formatting, not
+  about accuracy.
+
+### Independent review before handoff
+
+Before opening a PR or handing work back, the change gets one review pass from
+a context that did not author it. The gate cannot judge documentation currency,
+identifiers outside test paths, changelog completeness, or public-artifact
+hygiene, and the author is the reader least able to see what they assumed.
+
+- The mechanism is free: the `steward-reviewer` subagent, a separate session, or
+  a human. What is required is that the pass happened and that someone other
+  than the author's own working context performed it.
+- Record the outcome in the PR, including a clean result. "Reviewed for
+  documentation currency and identifiers; no findings" is a claim someone can
+  check later; silence is not.
+- This applies to review, not authorship. Do not delegate the implementation
+  loop itself; a reviewer with fresh context is valuable precisely because the
+  author's context is not fresh.
+- A finding about a rule this file does not yet carry is a rule gap. Report it
+  rather than fixing the symptom quietly.
 
 ## 5. Test environments
 
@@ -204,6 +304,11 @@ resource or namespace the current run did not create.
 
 Ask before:
 
+- adding a dependency that needs a new license class or a `deny.toml`
+  exception, duplicates a capability the workspace already has, or pulls a
+  vendor SDK into a crate outside `adapters/`. A dependency that leaves
+  `cargo xtask ci` passing unchanged and is named with its purpose in the PR
+  body needs no separate approval;
 - changing a CRD schema or a field's meaning;
 - changing an applied migration—add a new migration instead of editing history;
 - editing generated files under `manifests/` or `web/src/api-client/` rather
@@ -211,13 +316,13 @@ Ask before:
 - adding `#[allow(...)]` for a lint;
 - changing anything under `crates/steward-mint/`;
 - deploying to or operating against a manual DEV environment; or
-- force-pushing under the narrow exception in §2.
+- force-pushing under the narrow exception in "Force pushes and PR decisions".
 
 Never, even with general task approval: push to `main`; merge or close a PR;
 work around authentication/signing failure; silently weaken a test or rule; or
 rewrite history to conceal a committed secret. Materially destructive actions
 and branch-protection changes require their own explicit, precisely scoped
-authorization. No force pushe to any branch without explicit approval,
+authorization. Never force-push any branch without explicit approval.
 
 ## 8. Upstream dependencies and conformance
 
@@ -252,10 +357,11 @@ If a secret is committed:
 
 Never quietly amend or rewrite history to hide the incident.
 
-Customer identities, contract terms, pricing, internal-only material, and NDA
-content do not belong in source, documentation, fixtures, commit messages, or
-PR descriptions. Use a public issue reference or sanitized ticket key; never
-paste confidential ticket text.
+Customer identities, contract terms, pricing, internal-only material, internal
+review and support conversations, and NDA content do not belong in source,
+documentation, fixtures, commit messages, or PR descriptions. Use a public issue
+reference or sanitized ticket key; never paste confidential ticket text. See
+"Public repository artifacts" for what publication means in this repository.
 
 ## 10. Neutral test data
 

@@ -7,6 +7,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-09-24
+
+### Added
+
+- Added one attested governed-platform compatibility manifest with exact Steward,
+  companion-product, OpenShell, agent-sandbox, SPIRE, MCP-GW, and LiteLLM
+  coordinates and contracts.
+- Added the named `steward.connections.github/v1` and
+  `steward.connections.github/v2` MCP-GW authority selectors with a compatible
+  migration path from the deprecated version-like selector.
+- Added explicit SPIRE identity/upgrade requirements and LiteLLM Responses and
+  Anthropic Messages URL/model semantics to the installation contract.
+- Added a real Envoy Gateway backend-TLS E2E using an isolated Kind cluster,
+  plus public-CA rotation guidance for the apiserver `BackendTLSPolicy`.
+
+### Changed
+
+- Replaced the Docker/buildx registry helper with a released daemonless ORAS
+  image-and-chart mirror supporting explicit mappings, no-write planning,
+  collision-safe resume, deterministic evidence, and Flux OCI digest output.
+- Corrected the browser-administration bootstrap procedure to run the installed
+  `/usr/local/bin/steward bootstrap-rbac` command in the apiserver Deployment.
+
 ## [0.2.2] - 2026-09-24
 
 ### Added
@@ -23,6 +46,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   non-secret input and validates cross-component deployment relationships before rollout.
 - Added joint public-hostname, certificate-name, and live read-only Gateway validation with
   exact one-label wildcard semantics.
+- Gateway API HTTPRoute deployments now render a fail-closed `BackendTLSPolicy` for the
+  apiserver HTTPS Service, with explicit public-CA trust and full Service-DNS SNI inputs.
 - Added one explicit namespace-map schema with compact and separated layouts and deterministic
   namespace-qualified reference generation.
 - Added read-only EKS VPC CNI detection and a bounded, run-owned NetworkPolicy deny/allow
@@ -92,7 +117,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/apelogic-ai/steward/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/apelogic-ai/steward/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/apelogic-ai/steward/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/apelogic-ai/steward/compare/v0.1.23...v0.2.0

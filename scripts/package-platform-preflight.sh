@@ -16,6 +16,7 @@ trap 'rm -rf "$staging"' EXIT INT TERM
 bundle="$staging/platform-preflight/v1"
 mkdir -p "$bundle/examples" "$output_directory"
 install -m 0755 "$root/scripts/steward-platform-preflight.py" "$bundle/steward-platform-preflight"
+install -m 0755 "$root/scripts/steward-gateway-backend-tls-check.sh" "$bundle/steward-gateway-backend-tls-check"
 cp "$root/config/platform-preflight/v1/input.schema.json" "$bundle/input.schema.json"
 cp "$root/config/platform-preflight/v1/namespace-map.schema.json" "$bundle/namespace-map.schema.json"
 cp "$root/config/platform-preflight/v1/examples/compact.json" "$bundle/examples/compact.json"
@@ -31,6 +32,7 @@ paths=(
   platform-preflight/v1/examples/separated.json
   platform-preflight/v1/release.json
   platform-preflight/v1/steward-platform-preflight
+  platform-preflight/v1/steward-gateway-backend-tls-check
 )
 if tar --help 2>&1 | grep -Fq -- '--sort'; then
   tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --format=ustar \

@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.2.2`. The release workflow pulls the published OCI
+Release contract: chart `0.2.3`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -47,7 +47,7 @@ turn execution off on an installation with live AgentRuntimes or Tasks.
    To copy released images and reference runtimes into another registry, use
    the released [registry mirror and deployment-lock tool](registry-mirroring.md).
    It verifies the target digests and provides the exact chart and execution-binding
-   inputs; registry credentials remain in the standard Docker credential store.
+   inputs; registry credentials remain in the standard ORAS registry configuration.
 4. HTTPS service certificates for `steward-apiserver` and `steward-webhook`.
    Choose exactly one chart TLS mode:
    - `customerSecret` (default): pre-create the two named `kubernetes.io/tls`
@@ -66,6 +66,11 @@ turn execution off on an installation with live AgentRuntimes or Tasks.
    CIDRs/ports under `networkPolicy`; do not disable policy merely to make a
    failed readiness check green. Edge routing, DNS, ingress/Gateway, external
    authentication, and their certificates are operator-owned opt-ins.
+   When using `web.httpRoute.enabled=true`, publish the apiserver issuing CA
+   into the release namespace as the configured public ConfigMap at
+   `data.ca.crt` before installing Steward. A trust-distribution controller
+   must own its rotation. The chart deliberately does not create this object
+   and never copies the apiserver TLS Secret or private key to the Gateway.
 
 For governed execution, add the OpenShell gateway URL/server name/client
 certificate Secret, LiteLLM URL/master-key Secret,
@@ -78,9 +83,11 @@ and [execution bindings](execution-bindings.md) before activating Tasks.
 
 ### Tested versions and integration boundaries
 
-These are the versions exercised or declared by this repository, not a promise
-that every other version works. Pin each external product and prove its contract
-again in the customer's cluster before enabling governed execution.
+The released
+[governed-platform compatibility manifest](governed-platform-compatibility.md)
+is authoritative for exact versions, commits, chart/image digests, and named
+contracts. Pin each external product and prove its contract again in the target
+cluster before enabling governed execution.
 
 | Component | Supported / tested now |
 |---|---|
@@ -90,8 +97,11 @@ again in the customer's cluster before enabling governed execution.
 | OpenShell | 0.0.98 |
 | agent-sandbox | 0.5.0 |
 | Runtime | Cluster/OpenShell default; no VM-isolation claim |
-| MCP-GW | 0.3.2 authority v1; 0.4.9 authority v2 |
-| Other integrations | Operator-supplied and tested as part of the selected deployment |
+| SPIRE | `spire-crds` 0.5.0; `spire` 0.29.0; exact rendered images in the compatibility manifest |
+| MCP-GW | `steward.connections.github/v1`: 0.3.2; `steward.connections.github/v2`: 0.4.9–0.4.11 |
+| LiteLLM | 1.93.0; Responses and Anthropic Messages contracts defined in the compatibility manifest |
+| Gateway API edge | Gateway API 1.4.0+; Envoy Gateway 1.9.1; the selected GatewayClass reports `BackendTLSPolicy` |
+| Companion products | Exact `steward-run` and `github-oidc-exchange` coordinates in the compatibility manifest |
 
 Runtime support is the Kubernetes/OpenShell default. Operators may set
 `config.controller.openshellRuntimeClassName` only when their platform requires
@@ -148,6 +158,7 @@ system. The default names can be overridden under `secrets`, `tls`,
 | `browserAuth.google.clientSecret.name` in release namespace | `Opaque`; configured `clientSecret.key` | Identity-provider operator creates; API reads. | Only `browserAuth.enabled=true`; rotate with provider, restart API, and retest the exact HTTPS callback/origin. |
 | `githubSource.privateKeySecret.name` in release namespace | `Opaque`; configured private-key key containing the GitHub App PEM | GitHub App owner creates; API mounts read-only. | Only `githubSource.enabled=true`; App needs read-only Contents and installation only on approved repositories. Rotate the App key and retest exact Git-object resolution. |
 | `web.ingress.tlsSecretName` in release namespace | `kubernetes.io/tls`; `tls.crt`, `tls.key` | Customer edge PKI creates; Ingress controller reads. | Only legacy `web.ingress.enabled=true`; gateway-owned TLS stays outside this chart. |
+| `web.httpRoute.backendTls.caConfigMap.name` in release namespace | Public `ConfigMap`; exactly `ca.crt` | Trust-distribution controller creates; Gateway reads as the apiserver trust anchor. | Required for `web.httpRoute.enabled=true`; overlap CA rotation in the ConfigMap and verify the BackendTLSPolicy before removing an old issuer. Never copy `tls.key` or the apiserver TLS Secret. |
 | Each `imagePullSecrets` reference in release namespace | Normally `kubernetes.io/dockerconfigjson`; `.dockerconfigjson` | Registry operator creates; kubelet reads. | Only private registries; rotate before expiry and verify pulls without printing the Secret. |
 | Runtime-UID-named Secret in each allowed runtime namespace | `Opaque`; `access-token` | Controller creates from a runtime-scoped LiteLLM credential; sandbox consumes. | Governed runtime only. It is UID-bound and owner-referenced; controller deletes it on suspend/termination. Do not pre-create, back up as a reusable credential, or share across runtimes. |
 
@@ -370,7 +381,7 @@ preserve the same immutable coordinates and cross-component relationships.
      taskOrchestrationMode: staged
      apiserver:
        executionBindingsMode: staged
-       inferenceEndpoint: https://inference.example.test/v1
+       inferenceEndpoint: https://inference.example.test/v1/responses
      controller:
        openshellEndpoint: https://gateway.example.test:8080
        openshellServerName: gateway.example.test
@@ -402,6 +413,10 @@ preserve the same immutable coordinates and cross-component relationships.
    immutable and verify the rendered bytes against the recorded digest.
    For `codex@0.140.0`, use or mirror the digest-selected image and run the
    [released runtime conformance](codex-reference-runtime.md) before activating its binding.
+
+   `config.controller.litellmUrl` is the LiteLLM management API base URL. The
+   controller appends `/key/delete`, `/key/list`, `/key/generate`, and
+   `/v1/model/info`; do not add an operation path to that value.
 
 2. Verify the named Secret objects and certificate SANs without displaying
    their data. When using platform preflight, run its `gateway-check` against
@@ -475,8 +490,9 @@ enable and verify the human browser path before performing them.
    `STEWARD_DATABASE_URL` is already projected, the operator records the
    audited initial grant explicitly:
 
-   ```text
-   steward-apiserver-bin bootstrap-rbac \
+   ```sh
+   kubectl -n <namespace> exec deploy/steward-apiserver -- \
+     /usr/local/bin/steward bootstrap-rbac \
      --user-id usr_<opaque-id> \
      --grant administrator \
      --actor <audited-operator>
