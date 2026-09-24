@@ -589,6 +589,28 @@ pub async fn run_controller_with_planes<
     }
 }
 
+/// Reconciles one observed `AgentRuntime` through the same callback used by the production
+/// watcher. This bounded entry point lets fault-injection tests drive an exact persisted object
+/// without running an unbounded controller stream.
+pub async fn reconcile_agent_runtime_work_item<R: SandboxRuntime, I: InferencePlane>(
+    client: &Client,
+    sandbox_runtime: R,
+    inference: I,
+    authority: PgStore,
+    runtime: AgentRuntime,
+) -> Result<Action, ControllerError> {
+    reconcile(
+        Arc::new(runtime),
+        Arc::new(ControllerContext {
+            client: client.clone(),
+            inference,
+            sandbox_runtime,
+            authority: Some(authority),
+        }),
+    )
+    .await
+}
+
 async fn run_task_controller<R: SandboxTaskRuntime>(
     client: Client,
     sandbox_runtime: R,
@@ -2587,6 +2609,14 @@ fn task_runtime_reconciliation_action(
     let active = orchestrated_task_runtime_manifest(&work, None, true)
         .map_err(|error| ReconcileError::Authority(error.to_string()))?;
     let operation = &admission.operation;
+    let exact_runtime_uid = operation.runtime_uid.as_deref() == runtime.metadata.uid.as_deref()
+        && admission.task.runtime_uid.as_deref() == operation.runtime_uid.as_deref();
+    let exact_active_manifest =
+        exact_runtime_uid && task_admission_runtime_matches(runtime, &active, "active");
+    let active_task = admission.user_envelope_authority_active
+        && !admission.task.cancel_requested
+        && !admission.task.finalize_requested
+        && !admission.task.finalized;
     match operation.state {
         TaskOrchestrationState::RuntimeCreatePending
         | TaskOrchestrationState::RuntimeObserved
@@ -2596,28 +2626,41 @@ fn task_runtime_reconciliation_action(
         {
             Ok(TaskRuntimeReconciliationAction::WaitForTaskOrchestrator)
         }
-        TaskOrchestrationState::CleanupPending | TaskOrchestrationState::Finalized => {
+        TaskOrchestrationState::CleanupPending => {
             Ok(TaskRuntimeReconciliationAction::WaitForTaskOrchestrator)
         }
-        TaskOrchestrationState::Active
-            if admission.user_envelope_authority_active
-                && !admission.task.cancel_requested
-                && !admission.task.finalize_requested
-                && !admission.task.finalized
-                && matches!(admission.task.phase, TaskPhase::Queued | TaskPhase::Running)
-                && operation.runtime_uid.as_deref() == runtime.metadata.uid.as_deref()
-                && admission.task.runtime_uid.as_deref() == operation.runtime_uid.as_deref()
-                && task_admission_runtime_matches(runtime, &active, "active") =>
+        TaskOrchestrationState::Finalized => Ok(TaskRuntimeReconciliationAction::Suspend),
+        TaskOrchestrationState::ActivationPending
+            if active_task
+                && matches!(
+                    admission.task.phase,
+                    TaskPhase::Submitted | TaskPhase::Parked | TaskPhase::Queued
+                )
+                && operation.activation_effect_authorized_at.is_some()
+                && operation.activation_authority_kind.as_deref() == Some("user-envelope")
+                && operation.activation_envelope_revision
+                    == admission.task.user_envelope_revision
+                && operation.activation_envelope_digest == admission.task.user_envelope_digest
+                && exact_active_manifest =>
         {
             Ok(TaskRuntimeReconciliationAction::Continue)
         }
-        TaskOrchestrationState::Active if admission.task.cancel_requested => {
+        TaskOrchestrationState::Active
+            if active_task
+                && matches!(admission.task.phase, TaskPhase::Queued | TaskPhase::Running)
+                && exact_active_manifest =>
+        {
+            Ok(TaskRuntimeReconciliationAction::Continue)
+        }
+        TaskOrchestrationState::ActivationPending | TaskOrchestrationState::Active
+            if admission.task.cancel_requested =>
+        {
             Ok(TaskRuntimeReconciliationAction::Cleanup {
                 work: Box::new(work),
                 cause: TaskCleanupCause::Cancelled,
             })
         }
-        TaskOrchestrationState::Active
+        TaskOrchestrationState::ActivationPending | TaskOrchestrationState::Active
             if admission.task.finalize_requested || admission.task.finalized =>
         {
             Ok(TaskRuntimeReconciliationAction::Cleanup {
@@ -2625,7 +2668,9 @@ fn task_runtime_reconciliation_action(
                 cause: TaskCleanupCause::FinalizationRequested,
             })
         }
-        TaskOrchestrationState::Active if !admission.user_envelope_authority_active => {
+        TaskOrchestrationState::ActivationPending | TaskOrchestrationState::Active
+            if !admission.user_envelope_authority_active =>
+        {
             Ok(TaskRuntimeReconciliationAction::Cleanup {
                 work: Box::new(work),
                 cause: TaskCleanupCause::AuthorityInactive("task_runtime_authority_inactive"),
@@ -7408,8 +7453,8 @@ mod webhook_tests {
     use steward_store::{
         ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase, ConnectionOperationKind,
         ConnectionOperationRecord, ConnectionOperationState, ConnectionRuntimeAdmissionRecord,
-        StoreError, TaskOrchestrationState, TaskOrchestrationWorkItem, TaskRecord,
-        TaskRuntimeAdmissionRecord, TaskRuntimeOperationRecord, TaskRuntimeOwnership,
+        StoreError, TaskCleanupCause, TaskOrchestrationState, TaskOrchestrationWorkItem,
+        TaskRecord, TaskRuntimeAdmissionRecord, TaskRuntimeOperationRecord, TaskRuntimeOwnership,
     };
     use steward_types::{
         AgentRuntime, Budget, CanonicalAuthorityBinding, CanonicalUserId,
@@ -7911,6 +7956,84 @@ mod webhook_tests {
                 .map_err(|error| format!("classify unpersisted Task marker: {error}"))?,
             TaskRuntimeReconciliationAction::Suspend,
             "a Task marker without persisted authority must never enter provisioning"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_runtime_reconciliation_provisions_the_exact_authorized_activation() -> Result<(), String>
+    {
+        let admission = authorized_task_activation_admission()?;
+        let work = TaskOrchestrationWorkItem {
+            task: admission.task.clone(),
+            operation: admission.operation.clone(),
+        };
+        let mut runtime = super::orchestrated_task_runtime_manifest(&work, None, true)
+            .map_err(|error| format!("construct activating Task runtime: {error}"))?;
+        runtime.metadata.uid = admission.operation.runtime_uid.clone();
+
+        assert_eq!(
+            task_runtime_reconciliation_action(&runtime, Some(&admission))
+                .map_err(|error| format!("classify activating Task runtime: {error}"))?,
+            TaskRuntimeReconciliationAction::Continue,
+            "the exact authorized active manifest must provision before activation is observed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_runtime_reconciliation_orders_every_terminal_authority_through_cleanup()
+    -> Result<(), String> {
+        let admission = active_task_runtime_admission()?;
+        let work = TaskOrchestrationWorkItem {
+            task: admission.task.clone(),
+            operation: admission.operation.clone(),
+        };
+        let mut runtime = super::orchestrated_task_runtime_manifest(&work, None, true)
+            .map_err(|error| format!("construct active Task runtime: {error}"))?;
+        runtime.metadata.uid = admission.operation.runtime_uid.clone();
+
+        let mut cancelled = admission.clone();
+        cancelled.task.cancel_requested = true;
+        assert!(matches!(
+            task_runtime_reconciliation_action(&runtime, Some(&cancelled))
+                .map_err(|error| format!("classify cancelled Task runtime: {error}"))?,
+            TaskRuntimeReconciliationAction::Cleanup {
+                cause: TaskCleanupCause::Cancelled,
+                ..
+            }
+        ));
+
+        let mut finalizing = admission.clone();
+        finalizing.task.finalize_requested = true;
+        assert!(matches!(
+            task_runtime_reconciliation_action(&runtime, Some(&finalizing))
+                .map_err(|error| format!("classify finalizing Task runtime: {error}"))?,
+            TaskRuntimeReconciliationAction::Cleanup {
+                cause: TaskCleanupCause::FinalizationRequested,
+                ..
+            }
+        ));
+
+        let mut inactive = admission.clone();
+        inactive.user_envelope_authority_active = false;
+        assert!(matches!(
+            task_runtime_reconciliation_action(&runtime, Some(&inactive))
+                .map_err(|error| format!("classify inactive Task runtime: {error}"))?,
+            TaskRuntimeReconciliationAction::Cleanup {
+                cause: TaskCleanupCause::AuthorityInactive(_),
+                ..
+            }
+        ));
+
+        let mut finalized = admission;
+        finalized.operation.state = TaskOrchestrationState::Finalized;
+        finalized.task.finalized = true;
+        assert_eq!(
+            task_runtime_reconciliation_action(&runtime, Some(&finalized))
+                .map_err(|error| format!("classify finalized Task runtime: {error}"))?,
+            TaskRuntimeReconciliationAction::Suspend,
+            "a stale runtime must not retain execution authority after Task finalization"
         );
         Ok(())
     }

@@ -10,7 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Fixed
 
 - Reconciled externally submitted Task runtimes only from their exact persisted Task authority,
-  including Task-owned TTL and cleanup ordering before Kubernetes deletion.
+  including successful-completion finalization, Task-owned TTL, and cleanup ordering before
+  Kubernetes deletion.
 
 ## [0.2.1] - 2026-09-23
 

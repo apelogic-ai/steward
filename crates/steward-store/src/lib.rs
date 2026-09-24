@@ -4598,9 +4598,10 @@ impl PgStore {
                 .execute(&mut *transaction)
                 .await
                 .map_err(database_error)?;
-                sqlx::query(
+                let task_completed = sqlx::query(
                     "UPDATE task_submissions \
-                     SET phase = 'succeeded', output_archive = $2, updated_at = now() \
+                     SET phase = 'succeeded', output_archive = $2, \
+                         finalize_requested = true, updated_at = now() \
                      WHERE task_uid = $1 AND phase IN ('queued', 'running') \
                        AND NOT finalize_requested AND NOT cancel_requested",
                 )
@@ -4608,7 +4609,41 @@ impl PgStore {
                 .bind(output_archive)
                 .execute(&mut *transaction)
                 .await
-                .map_err(database_error)?;
+                .map_err(database_error)?
+                .rows_affected()
+                    == 1;
+                if task_completed && operation.state == TaskOrchestrationState::Active {
+                    let cleanup_authorized = sqlx::query(
+                        "UPDATE task_runtime_operations \
+                         SET state = 'cleanup_pending', generation = generation + 1, \
+                             cleanup_requested_at = now(), last_error_code = NULL, \
+                             retry_at = NULL, lease_owner = NULL, lease_expires_at = NULL, \
+                             updated_at = now() \
+                         WHERE task_uid = $1 AND generation = $2 AND state = 'active'",
+                    )
+                    .bind(current.task_uid)
+                    .bind(operation.generation)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(database_error)?
+                    .rows_affected();
+                    if cleanup_authorized != 1 {
+                        return Err(StoreError::InvalidTaskTransition);
+                    }
+                    append_task_orchestration_journal(
+                        &mut transaction,
+                        current.task_uid,
+                        operation.generation + 1,
+                        TaskOrchestrationState::CleanupPending,
+                        "execution_succeeded_cleanup_requested",
+                        actor,
+                    )
+                    .await?;
+                } else if task_completed
+                    && operation.state != TaskOrchestrationState::CleanupPending
+                {
+                    return Err(StoreError::InvalidTaskTransition);
+                }
             }
             TaskExecutionObservation::Failed {
                 adapter_observation_id,
