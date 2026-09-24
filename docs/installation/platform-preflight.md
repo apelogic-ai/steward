@@ -15,9 +15,11 @@ accepted nor emitted. Existing infrastructure remains operator-owned.
 
 ```sh
 tar -xzf steward-platform-preflight-0.2.2.tar.gz
+tar -xzf steward-runtime-providers-0.2.2.tar.gz
 cd platform-preflight/v1
 ./steward-platform-preflight generate \
   --input examples/compact.json \
+  --provider-profile-bundle ../../provider-profile-bundle/v1.2.0 \
   --chart /path/to/steward-chart \
   --output rendered
 ```
@@ -28,7 +30,10 @@ the configured certificate names, or Helm lint/render failure. The generated
 `steward-values.json` can be passed directly to `helm --values`. The generated
 `flux-values-configmap.yaml` can be committed and referenced by a Flux
 `HelmRelease.valuesFrom` entry. `provider-profile-inputs.json` is accepted by
-the released provider-profile installer. The input embeds the exact
+the released provider-profile installer. The preflight invokes that released
+installer in validation mode and puts its computed profile digests into the
+execution binding; deployment input cannot substitute unrelated profile
+digests. The input embeds the exact
 `steward.deployment-lock/v1` document produced by the released registry mirror
 tool, so component, bridge, and coding-agent coordinates require no manual
 translation. Governed execution, active execution bindings, and the
@@ -103,7 +108,8 @@ The smoke creates one run-owned namespace and labeled probe resources, first
 proves the Service and its DNS/endpoints work without a policy, then proves an
 actual deny through consecutive failed probes, applies a narrowly scoped allow
 policy, proves the authorized connection, and deletes only the namespace whose
-run label matches.
-Cleanup is attempted on success, failure, and interruption. An absent or
+run label and immutable UID still match the create-only result. A pre-existing
+namespace is never adopted. Cleanup is attempted on success, failure, SIGINT,
+and SIGTERM. An absent or
 disabled policy agent, an unproven deny, an unproven allow, or failed owned
 namespace cleanup is blocking; cleanup failures include the exact retry command.

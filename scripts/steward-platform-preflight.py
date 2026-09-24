@@ -9,6 +9,7 @@ import json
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,26 @@ class ValidationError(Exception):
     pass
 
 
+def install_cleanup_signal_handlers() -> dict[signal.Signals, Any]:
+    def interrupt(signal_number: int, _frame: Any) -> None:
+        raise ValidationError(
+            f"network smoke interrupted by {signal.Signals(signal_number).name}; cleanup was attempted"
+        )
+
+    previous = {
+        signal_number: signal.getsignal(signal_number)
+        for signal_number in (signal.SIGINT, signal.SIGTERM)
+    }
+    for signal_number in previous:
+        signal.signal(signal_number, interrupt)
+    return previous
+
+
+def restore_signal_handlers(previous: dict[signal.Signals, Any]) -> None:
+    for signal_number, handler in previous.items():
+        signal.signal(signal_number, handler)
+
+
 def canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
 
@@ -69,6 +90,12 @@ def require_string(parent: dict[str, Any], key: str, path: str) -> str:
     return value
 
 
+def require_exact_keys(parent: dict[str, Any], expected: set[str], path: str) -> None:
+    unexpected = sorted(set(parent) - expected)
+    if unexpected:
+        raise ValidationError(f"{path} contains unsupported fields: {unexpected}")
+
+
 def validate_name(value: str, path: str) -> None:
     if not K8S_NAME.fullmatch(value):
         raise ValidationError(f"{path} is not a valid Kubernetes name: {value}")
@@ -79,6 +106,16 @@ def validate_digest(value: str, path: str) -> None:
         raise ValidationError(f"{path} must be an immutable sha256 digest")
     if value == "sha256:" + ("0" * 64):
         raise ValidationError(f"{path} is an all-zero placeholder digest")
+
+
+def tagged_repository(reference: str, path: str) -> str:
+    if any(character.isspace() for character in reference) or "@" in reference:
+        raise ValidationError(f"{path} must be a tagged OCI reference")
+    slash = reference.rfind("/")
+    colon = reference.rfind(":")
+    if colon <= slash or colon == len(reference) - 1:
+        raise ValidationError(f"{path} must be a tagged OCI reference")
+    return reference[:colon]
 
 
 def hostname_covered(hostname: str, certificate_name: str) -> bool:
@@ -96,14 +133,69 @@ def hostname_covered(hostname: str, certificate_name: str) -> bool:
 def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
     if data.get("schemaVersion") != CONTRACT:
         raise ValidationError(f"schemaVersion must equal {CONTRACT}")
+    require_exact_keys(
+        data,
+        {
+            "schemaVersion",
+            "namespaces",
+            "deploymentLock",
+            "database",
+            "gateway",
+            "publicEndpoints",
+            "providerProfiles",
+            "arc",
+            "externalSecrets",
+            "externalConfigMaps",
+            "execution",
+            "browserAuth",
+            "apiTlsSecretName",
+            "webhookTlsSecretName",
+        },
+        "input",
+    )
 
     namespaces = require_object(data, "namespaces", "input")
+    require_exact_keys(namespaces, set(REQUIRED_NAMESPACES), "namespaces")
     for key in REQUIRED_NAMESPACES:
         validate_name(require_string(namespaces, key, "namespaces"), f"namespaces.{key}")
 
     lock = require_object(data, "deploymentLock", "input")
+    require_exact_keys(
+        lock,
+        {
+            "schemaVersion",
+            "release",
+            "mode",
+            "requestedPlatform",
+            "artifacts",
+            "chartValues",
+            "executionBindingImages",
+        },
+        "deploymentLock",
+    )
     if lock.get("schemaVersion") != "steward.deployment-lock/v1":
         raise ValidationError("deploymentLock.schemaVersion must equal steward.deployment-lock/v1")
+    release = require_object(lock, "release", "deploymentLock")
+    require_exact_keys(release, {"version", "commit"}, "deploymentLock.release")
+    require_string(release, "version", "deploymentLock.release")
+    commit = require_string(release, "commit", "deploymentLock.release")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValidationError("deploymentLock.release.commit must be a full lowercase Git SHA-1")
+    mode = require_string(lock, "mode", "deploymentLock")
+    if "requestedPlatform" not in lock:
+        raise ValidationError("deploymentLock.requestedPlatform is required")
+    requested_platform = lock.get("requestedPlatform")
+    if mode == "index":
+        if requested_platform is not None:
+            raise ValidationError("deploymentLock.requestedPlatform must be null in index mode")
+    elif mode == "single-platform":
+        if not isinstance(requested_platform, str) or not re.fullmatch(
+            r"[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)?",
+            requested_platform,
+        ):
+            raise ValidationError("deploymentLock.requestedPlatform must name the selected platform")
+    else:
+        raise ValidationError("deploymentLock.mode must be index or single-platform")
     artifacts = require_object(lock, "artifacts", "deploymentLock")
     chart_lock = require_object(lock, "chartValues", "deploymentLock")
     images = require_object(chart_lock, "images", "deploymentLock.chartValues")
@@ -113,6 +205,10 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
     for component in IMAGE_COMPONENTS:
         artifact = require_object(artifacts, f"images.{component}", "deploymentLock.artifacts")
         target = require_object(artifact, "target", f"deploymentLock.artifacts.images.{component}")
+        target_reference = require_string(target, "reference", f"deploymentLock.artifacts.images.{component}.target")
+        target_repository = tagged_repository(
+            target_reference, f"deploymentLock.artifacts.images.{component}.target.reference"
+        )
         target_digest = require_string(target, "digest", f"deploymentLock.artifacts.images.{component}.target")
         validate_digest(target_digest, f"deploymentLock.artifacts.images.{component}.target.digest")
         if component == "bridge":
@@ -125,10 +221,18 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
         validate_digest(digest, f"deploymentLock.chartValues.images.{component}.digest")
         if digest != target_digest:
             raise ValidationError(f"deploymentLock chartValues digest for {component} does not match artifacts target")
+        if f"{repository}:{tag}" != target_reference:
+            raise ValidationError(f"deploymentLock chartValues reference for {component} does not match artifacts target")
     bridge_values = require_object(chart_lock, "connectionsBridge", "deploymentLock.chartValues")
     bridge_image = require_string(bridge_values, "image", "deploymentLock.chartValues.connectionsBridge")
     bridge_target = require_object(artifacts["images.bridge"], "target", "deploymentLock.artifacts.images.bridge")
-    if bridge_image != f"{bridge_target['reference'].rsplit(':', 1)[0]}@{bridge_target['digest']}":
+    bridge_reference = require_string(
+        bridge_target, "reference", "deploymentLock.artifacts.images.bridge.target"
+    )
+    bridge_repository = tagged_repository(
+        bridge_reference, "deploymentLock.artifacts.images.bridge.target.reference"
+    )
+    if bridge_image != f"{bridge_repository}@{bridge_target['digest']}":
         raise ValidationError("deploymentLock connectionsBridge image does not match artifacts target")
     binding_images = require_object(lock, "executionBindingImages", "deploymentLock")
 
@@ -199,12 +303,17 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
     for index, profile in enumerate(profiles):
         if not isinstance(profile, dict):
             raise ValidationError(f"providerProfiles[{index}] must be an object")
+        require_exact_keys(profile, {"name", "namespace", "inputs"}, f"providerProfiles[{index}]")
         validate_name(require_string(profile, "name", f"providerProfiles[{index}]"), f"providerProfiles[{index}].name")
         namespace = require_string(profile, "namespace", f"providerProfiles[{index}]")
         if namespace != namespaces["providers"]:
             raise ValidationError(f"providerProfiles[{index}].namespace must equal namespaces.providers")
         inputs = require_object(profile, "inputs", f"providerProfiles[{index}]")
-        validate_digest(require_string(profile, "digest", f"providerProfiles[{index}]"), f"providerProfiles[{index}].digest")
+        require_exact_keys(
+            inputs,
+            {"gatewayOrigin", "runtimeGrantOrigin", "serviceCidrs"},
+            f"providerProfiles[{index}].inputs",
+        )
         for key in ("gatewayOrigin", "runtimeGrantOrigin"):
             value = require_string(inputs, key, f"providerProfiles[{index}].inputs")
             if not value.startswith("https://"):
@@ -259,6 +368,38 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
     runtime_image = binding_images.get(binding["runtimeName"])
     if not isinstance(runtime_image, str) or not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", runtime_image):
         raise ValidationError("execution.binding.runtimeName must select one immutable deploymentLock.executionBindingImages entry")
+    runtime_artifact = require_object(
+        artifacts,
+        f"referenceRuntimes.{binding['runtimeName']}",
+        "deploymentLock.artifacts",
+    )
+    runtime_target = require_object(
+        runtime_artifact,
+        "target",
+        f"deploymentLock.artifacts.referenceRuntimes.{binding['runtimeName']}",
+    )
+    runtime_reference = require_string(
+        runtime_target,
+        "reference",
+        f"deploymentLock.artifacts.referenceRuntimes.{binding['runtimeName']}.target",
+    )
+    runtime_repository = tagged_repository(
+        runtime_reference,
+        f"deploymentLock.artifacts.referenceRuntimes.{binding['runtimeName']}.target.reference",
+    )
+    runtime_digest = require_string(
+        runtime_target,
+        "digest",
+        f"deploymentLock.artifacts.referenceRuntimes.{binding['runtimeName']}.target",
+    )
+    validate_digest(
+        runtime_digest,
+        f"deploymentLock.artifacts.referenceRuntimes.{binding['runtimeName']}.target.digest",
+    )
+    if runtime_image != f"{runtime_repository}@{runtime_digest}":
+        raise ValidationError(
+            f"deploymentLock runtime image for {binding['runtimeName']} does not match artifacts target"
+        )
     profile_ids = {profile["name"] for profile in profiles}
     for key in ("toolsProfile", "inferenceProfile"):
         selected = require_string(binding, key, "execution.binding")
@@ -282,7 +423,7 @@ def steward_endpoint(data: dict[str, Any]) -> dict[str, str]:
     raise AssertionError("validated input has no steward endpoint")
 
 
-def chart_values(data: dict[str, Any]) -> dict[str, Any]:
+def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[str, Any]:
     lock = data["deploymentLock"]
     endpoint = steward_endpoint(data)
     parent = data["gateway"]["parentRef"]
@@ -293,7 +434,6 @@ def chart_values(data: dict[str, Any]) -> dict[str, Any]:
     execution = data["execution"]
     endpoints = execution["endpoints"]
     binding = execution["binding"]
-    profiles = {profile["name"]: profile for profile in data["providerProfiles"]}
     values: dict[str, Any] = {
         "images": images,
         "execution": {"enabled": True},
@@ -362,8 +502,8 @@ def chart_values(data: dict[str, Any]) -> dict[str, Any]:
                             "executable": binding["executable"],
                             "versionProbe": {"arguments": ["--version"], "expectedStdout": binding["expectedVersion"]},
                             "providerProfiles": {
-                                "tools": {"id": binding["toolsProfile"], "digest": profiles[binding["toolsProfile"]]["digest"]},
-                                "inference": {"id": binding["inferenceProfile"], "digest": profiles[binding["inferenceProfile"]]["digest"]},
+                                "tools": {"id": binding["toolsProfile"], "digest": profile_digests[binding["toolsProfile"]]},
+                                "inference": {"id": binding["inferenceProfile"], "digest": profile_digests[binding["inferenceProfile"]]},
                             },
                         }
                     ],
@@ -417,6 +557,72 @@ def provider_profile_inputs(data: dict[str, Any]) -> dict[str, Any]:
             for profile in data["providerProfiles"]
         ],
     }
+
+
+def resolve_provider_profile_digests(
+    data: dict[str, Any], bundle: pathlib.Path, inputs: dict[str, Any]
+) -> dict[str, str]:
+    installer = bundle / "bin" / "steward-provider-profile"
+    if not installer.is_file():
+        raise ValidationError(
+            f"released provider-profile installer is required at {installer}"
+        )
+    with tempfile.TemporaryDirectory(prefix="steward-provider-profile-") as temporary:
+        inputs_path = pathlib.Path(temporary) / "inputs.json"
+        inputs_path.write_text(canonical(inputs), encoding="utf-8")
+        result = subprocess.run(
+            [
+                str(installer),
+                "validate",
+                "--bundle",
+                str(bundle),
+                "--inputs",
+                str(inputs_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    if result.returncode != 0:
+        raise ValidationError(
+            f"released provider-profile validation failed: {(result.stderr or result.stdout).strip()}"
+        )
+    try:
+        report = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ValidationError(
+            f"released provider-profile installer returned invalid JSON: {error}"
+        ) from error
+    if not isinstance(report, dict):
+        raise ValidationError("released provider-profile installer returned a non-object result")
+    if (
+        report.get("schemaVersion") != "steward.provider-profile-result/v1"
+        or report.get("operation") != "validate"
+        or report.get("status") != "valid"
+        or report.get("bundle")
+        != {"id": "steward-runtime-providers", "version": "1.2.0"}
+    ):
+        raise ValidationError("released provider-profile installer returned an unexpected contract")
+    reported_profiles = report.get("profiles")
+    if not isinstance(reported_profiles, list):
+        raise ValidationError("released provider-profile result requires profiles")
+    digests: dict[str, str] = {}
+    for index, profile in enumerate(reported_profiles):
+        if not isinstance(profile, dict):
+            raise ValidationError(f"released provider-profile result profiles[{index}] must be an object")
+        profile_id = require_string(profile, "id", f"provider-profile result profiles[{index}]")
+        digest = require_string(profile, "digest", f"provider-profile result profiles[{index}]")
+        validate_digest(digest, f"provider-profile result profiles[{index}].digest")
+        if profile_id in digests:
+            raise ValidationError(f"released provider-profile result repeats {profile_id}")
+        digests[profile_id] = digest
+    expected = {profile["name"] for profile in data["providerProfiles"]}
+    if set(digests) != expected:
+        raise ValidationError(
+            f"released provider-profile result must exactly match requested profiles; "
+            f"expected={sorted(expected)}, actual={sorted(digests)}"
+        )
+    return digests
 
 
 def namespace_references(data: dict[str, Any]) -> dict[str, Any]:
@@ -478,7 +684,12 @@ def flux_configmap(namespace: str, values: dict[str, Any], digest: str) -> str:
     )
 
 
-def build_result(data: dict[str, Any], diagnostics: list[dict[str, str]], values: dict[str, Any]) -> dict[str, Any]:
+def build_result(
+    data: dict[str, Any],
+    diagnostics: list[dict[str, str]],
+    values: dict[str, Any],
+    profile_digests: dict[str, str],
+) -> dict[str, Any]:
     digest = "sha256:" + hashlib.sha256(canonical(values).encode()).hexdigest()
     return {
         "schemaVersion": RESULT_CONTRACT,
@@ -487,7 +698,14 @@ def build_result(data: dict[str, Any], diagnostics: list[dict[str, str]], values
         "valuesDigest": digest,
         "namespaces": data["namespaces"],
         "gatewayParentRef": data["gateway"]["parentRef"],
-        "providerProfiles": data["providerProfiles"],
+        "providerProfiles": [
+            {
+                "name": profile["name"],
+                "namespace": profile["namespace"],
+                "digest": profile_digests[profile["name"]],
+            }
+            for profile in data["providerProfiles"]
+        ],
         "arcControllerServiceAccount": data["arc"]["controllerServiceAccount"],
         "diagnostics": diagnostics,
     }
@@ -497,16 +715,27 @@ def generate(args: argparse.Namespace) -> int:
     data = read_json(args.input)
     diagnostics = validate_input(data)
     validate_browser(data)
-    values = chart_values(data)
+    profile_inputs = provider_profile_inputs(data)
+    profile_digests = resolve_provider_profile_digests(
+        data, args.provider_profile_bundle, profile_inputs
+    )
+    diagnostics.append(
+        {
+            "code": "provider-profiles.valid",
+            "severity": "info",
+            "message": "released provider-profile renderer resolved the exact binding digests",
+        }
+    )
+    values = chart_values(data, profile_digests)
     args.output.mkdir(parents=True, exist_ok=False)
     values_path = args.output / "steward-values.json"
     values_path.write_text(canonical(values), encoding="utf-8")
-    (args.output / "provider-profile-inputs.json").write_text(canonical(provider_profile_inputs(data)), encoding="utf-8")
+    (args.output / "provider-profile-inputs.json").write_text(canonical(profile_inputs), encoding="utf-8")
     (args.output / "namespace-references.json").write_text(canonical(namespace_references(data)), encoding="utf-8")
     if args.chart is not None:
         run_helm(args.chart, data["namespaces"]["steward"], values_path)
         diagnostics.append({"code": "chart.valid", "severity": "info", "message": "generated values pass Helm lint and template"})
-    result = build_result(data, diagnostics, values)
+    result = build_result(data, diagnostics, values, profile_digests)
     (args.output / "diagnostics.json").write_text(canonical(result), encoding="utf-8")
     (args.output / "flux-values-configmap.yaml").write_text(flux_configmap(data["namespaces"]["steward"], values, result["valuesDigest"]), encoding="utf-8")
     summary = (
@@ -527,14 +756,25 @@ def validate_command(args: argparse.Namespace) -> int:
     data = read_json(args.input)
     diagnostics = validate_input(data)
     validate_browser(data)
-    values = chart_values(data)
+    profile_inputs = provider_profile_inputs(data)
+    profile_digests = resolve_provider_profile_digests(
+        data, args.provider_profile_bundle, profile_inputs
+    )
+    diagnostics.append(
+        {
+            "code": "provider-profiles.valid",
+            "severity": "info",
+            "message": "released provider-profile renderer resolved the exact binding digests",
+        }
+    )
+    values = chart_values(data, profile_digests)
     with tempfile.TemporaryDirectory(prefix="steward-platform-preflight-") as temporary:
         values_path = pathlib.Path(temporary) / "values.json"
         values_path.write_text(canonical(values), encoding="utf-8")
         if args.chart is not None:
             run_helm(args.chart, data["namespaces"]["steward"], values_path)
             diagnostics.append({"code": "chart.valid", "severity": "info", "message": "generated values pass Helm lint and template"})
-    print(canonical(build_result(data, diagnostics, values)), end="")
+    print(canonical(build_result(data, diagnostics, values, profile_digests)), end="")
     return 0
 
 
@@ -626,6 +866,7 @@ def gateway_check(args: argparse.Namespace) -> int:
         reference.get("name") == expected_secret
         and reference.get("kind", "Secret") == "Secret"
         and reference.get("group", "") in ("", "core")
+        and reference.get("namespace", parent["namespace"]) == parent["namespace"]
         for reference in certificate_refs
     ):
         raise ValidationError(
@@ -787,6 +1028,35 @@ def apply_object(args: argparse.Namespace, value: dict[str, Any]) -> None:
         raise ValidationError(f"kubectl apply failed: {(result.stderr or result.stdout).strip()}")
 
 
+def create_object(args: argparse.Namespace, value: dict[str, Any]) -> None:
+    result = run_kubectl(args, ["create", "--filename", "-"], canonical(value))
+    if result.returncode != 0:
+        raise ValidationError(f"kubectl create failed: {(result.stderr or result.stdout).strip()}")
+
+
+def namespace_identity(args: argparse.Namespace, namespace: str) -> tuple[str, str]:
+    result = run_kubectl(args, ["get", "namespace", namespace, "--output", "json"])
+    if result.returncode != 0:
+        raise ValidationError(
+            f"cannot read run-owned namespace {namespace}: {(result.stderr or result.stdout).strip()}"
+        )
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ValidationError(f"kubectl returned invalid Namespace JSON: {error}") from error
+    metadata = value.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValidationError(f"namespace {namespace} has no metadata")
+    uid = metadata.get("uid")
+    labels = metadata.get("labels")
+    run_id = labels.get("steward.test/run-id") if isinstance(labels, dict) else None
+    if not isinstance(uid, str) or not uid:
+        raise ValidationError(f"namespace {namespace} has no immutable UID")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValidationError(f"namespace {namespace} has no run ownership label")
+    return uid, run_id
+
+
 def network_smoke(args: argparse.Namespace) -> int:
     network_policy_agent(args)
     if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?", args.run_id):
@@ -798,15 +1068,27 @@ def network_smoke(args: argparse.Namespace) -> int:
     namespace = f"steward-netpol-{args.run_id}"
     labels = {"steward.test/run-id": args.run_id, "app.kubernetes.io/part-of": "steward-network-smoke"}
     namespace_created = False
+    namespace_uid: str | None = None
     denied = False
     allowed = False
     cleanup_error: str | None = None
+    cleanup_signals = {signal.SIGINT, signal.SIGTERM}
+    previous_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, cleanup_signals)
+    previous_signal_handlers = install_cleanup_signal_handlers()
+    cleanup_signals_unblocked = False
     try:
-        apply_object(
+        create_object(
             args,
             {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": namespace, "labels": labels}},
         )
         namespace_created = True
+        namespace_uid, observed_run_id = namespace_identity(args, namespace)
+        if observed_run_id != args.run_id:
+            raise ValidationError(
+                f"created namespace {namespace} ownership label {observed_run_id} does not equal {args.run_id}"
+            )
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
+        cleanup_signals_unblocked = True
         for name, role, command in (
             ("server", "server", ["sh", "-c", "mkdir -p /tmp/www && printf ready >/tmp/www/index.html && httpd -f -p 8080 -h /tmp/www"]),
             ("client", "client", ["sh", "-c", "trap : TERM INT; sleep 3600 & wait"]),
@@ -912,24 +1194,30 @@ def network_smoke(args: argparse.Namespace) -> int:
         if not allowed:
             raise ValidationError("NetworkPolicy allow could not be proven: authorized client did not reach the protected server")
     finally:
+        if cleanup_signals_unblocked:
+            signal.pthread_sigmask(signal.SIG_BLOCK, cleanup_signals)
         if namespace_created:
-            proof = run_kubectl(
-                args,
-                ["get", "namespace", namespace, "--output", "jsonpath={.metadata.labels.steward\\.test/run-id}"],
-            )
-            if proof.returncode == 0 and proof.stdout.strip() == args.run_id:
+            try:
+                observed_uid, observed_run_id = namespace_identity(args, namespace)
+            except ValidationError as error:
+                cleanup_error = f"cannot prove ownership before cleanup: {error}"
+            else:
+                owned = observed_run_id == args.run_id and namespace_uid is not None and observed_uid == namespace_uid
+            if cleanup_error is None and owned:
                 deletion = run_kubectl(args, ["delete", "namespace", namespace, "--wait=true", "--timeout=120s"])
                 if deletion.returncode != 0:
                     cleanup_error = (
                         f"owned namespace cleanup failed: {(deletion.stderr or deletion.stdout).strip()}; "
                         f"retry: kubectl --kubeconfig {args.kubeconfig} --context {args.context} delete namespace {namespace}"
                     )
-            else:
+            elif cleanup_error is None:
                 cleanup_error = (
-                    f"refusing cleanup because namespace {namespace} lacks run ownership label {args.run_id}; "
+                    f"refusing cleanup because namespace {namespace} no longer has run ownership "
+                    f"label {args.run_id} and UID {namespace_uid}; "
                     "inspect the namespace before any manual deletion"
                 )
-                print(cleanup_error, file=sys.stderr)
+        restore_signal_handlers(previous_signal_handlers)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_signal_mask)
     if cleanup_error is not None:
         raise ValidationError(cleanup_error)
     if not denied or not allowed:
@@ -960,6 +1248,7 @@ def parser() -> argparse.ArgumentParser:
     for name, handler in (("generate", generate), ("validate", validate_command)):
         command = commands.add_parser(name)
         command.add_argument("--input", type=pathlib.Path, required=True)
+        command.add_argument("--provider-profile-bundle", type=pathlib.Path, required=True)
         command.add_argument("--chart", type=pathlib.Path)
         if name == "generate":
             command.add_argument("--output", type=pathlib.Path, required=True)

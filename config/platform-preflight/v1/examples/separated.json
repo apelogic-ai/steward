@@ -50,8 +50,8 @@
   },
   "publicEndpoints": [{"name": "steward", "hostname": "steward.example.test"}],
   "providerProfiles": [
-    {"name": "steward-litellm", "namespace": "steward-providers", "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777", "inputs": {"gatewayOrigin": "https://inference.example.test", "runtimeGrantOrigin": "https://mint.example.test", "serviceCidrs": ["192.0.2.0/24"]}},
-    {"name": "steward-mcp-gw", "namespace": "steward-providers", "digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888", "inputs": {"gatewayOrigin": "https://mcp.example.test", "runtimeGrantOrigin": "https://mint.example.test", "serviceCidrs": ["192.0.2.0/24"]}}
+    {"name": "steward-litellm", "namespace": "steward-providers", "inputs": {"gatewayOrigin": "https://inference.example.test", "runtimeGrantOrigin": "https://mint.example.test", "serviceCidrs": ["192.0.2.0/24"]}},
+    {"name": "steward-mcp-gw", "namespace": "steward-providers", "inputs": {"gatewayOrigin": "https://mcp.example.test", "runtimeGrantOrigin": "https://mint.example.test", "serviceCidrs": ["192.0.2.0/24"]}}
   ],
   "arc": {"controllerServiceAccount": {"name": "arc-controller", "namespace": "arc-system"}},
   "externalSecrets": {
@@ -64,10 +64,9 @@
   "execution": {
     "endpoints": {"inference": "https://inference.example.test/v1", "mcpGateway": "https://mcp.example.test/mcp", "openshell": "https://openshell.example.test:8080", "openshellServerName": "openshell.example.test", "workloadExchange": "https://identity.example.test/v1/workload/exchange", "workloadExchangeServerName": "identity.example.test", "litellm": "https://inference.example.test", "mintIssuer": "https://mint.example.test", "spiffeTrustDomain": "example.test"},
     "connectionsBridge": {"mcpGatewayOrigin": "https://mcp.example.test", "mcpGatewayVersion": "0.4.9"},
-    "binding": {"agentRef": "codex@0.140.0", "displayName": "Codex 0.140.0", "adapter": "codex-v1", "runtimeName": "codex", "executable": "/opt/codex/bin/codex", "expectedVersion": "codex-cli 0.140.0", "toolsProfile": "steward-mcp-gw", "inferenceProfile": "steward-litellm"}
+    "binding": {"agentRef": "codex@0.140.0", "displayName": "Codex 0.140.0", "adapter": "codex-v1", "runtimeName": "codex", "executable": "/usr/bin/codex", "expectedVersion": "codex-cli 0.140.0", "toolsProfile": "steward-mcp-gw", "inferenceProfile": "steward-litellm"}
   },
   "browserAuth": {"clientId": "example.apps.example.com", "workspaceDomain": "example.com", "organizationId": "example-org", "clientSecretName": "steward-browser-auth", "clientSecretKey": "client-secret", "egressCidrs": ["192.0.2.0/24"]},
   "apiTlsSecretName": "steward-apiserver-tls",
-  "webhookTlsSecretName": "steward-webhook-tls",
-  "webhookCaBundlePem": "public-validation-ca"
+  "webhookTlsSecretName": "steward-webhook-tls"
 }

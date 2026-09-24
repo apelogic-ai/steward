@@ -55,7 +55,6 @@
     {
       "name": "steward-litellm",
       "namespace": "steward-system",
-      "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
       "inputs": {
         "gatewayOrigin": "https://inference.example.test",
         "runtimeGrantOrigin": "https://mint.example.test",
@@ -65,7 +64,6 @@
     {
       "name": "steward-mcp-gw",
       "namespace": "steward-system",
-      "digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
       "inputs": {
         "gatewayOrigin": "https://mcp.example.test",
         "runtimeGrantOrigin": "https://mint.example.test",
@@ -101,7 +99,7 @@
       "displayName": "Codex 0.140.0",
       "adapter": "codex-v1",
       "runtimeName": "codex",
-      "executable": "/opt/codex/bin/codex",
+      "executable": "/usr/bin/codex",
       "expectedVersion": "codex-cli 0.140.0",
       "toolsProfile": "steward-mcp-gw",
       "inferenceProfile": "steward-litellm"
