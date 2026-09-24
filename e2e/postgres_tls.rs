@@ -43,6 +43,22 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
     let tls_url = env::var("STEWARD_TEST_TLS_DATABASE_URL").map_err(|_| {
         io::Error::other("STEWARD_TEST_TLS_DATABASE_URL is required for the TLS test")
     })?;
+    let verified_tls_url = env::var("STEWARD_TEST_VERIFIED_TLS_DATABASE_URL").map_err(|_| {
+        io::Error::other("STEWARD_TEST_VERIFIED_TLS_DATABASE_URL is required for the TLS test")
+    })?;
+    let encrypted_store = PgStore::connect(&tls_url).await.map_err(|error| {
+        io::Error::other(format!(
+            "Steward must connect when PostgreSQL requires encryption: {error}"
+        ))
+    })?;
+    let encrypted =
+        sqlx::query_scalar::<_, bool>("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+            .fetch_one(encrypted_store.pool())
+            .await?;
+    assert!(
+        encrypted,
+        "sslmode=require must establish an encrypted session"
+    );
     let wrong_ca_url = env::var("STEWARD_TEST_WRONG_CA_DATABASE_URL").map_err(|_| {
         io::Error::other("STEWARD_TEST_WRONG_CA_DATABASE_URL is required for the TLS test")
     })?;
@@ -60,7 +76,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         PgStore::connect(&wrong_hostname_url).await.is_err(),
         "Steward must fail closed when the PostgreSQL certificate does not cover the hostname"
     );
-    let store = PgStore::connect(&tls_url).await.map_err(|error| {
+    let store = PgStore::connect(&verified_tls_url).await.map_err(|error| {
         io::Error::other(format!(
             "Steward must connect when PostgreSQL requires sslmode=verify-full: {error}"
         ))

@@ -116,7 +116,8 @@ fi
 
 docker exec "${CONTAINER}" createdb -U steward steward_orchestration
 export STEWARD_TEST_PLAINTEXT_DATABASE_URL="postgres://steward@127.0.0.1:${port}/steward?sslmode=disable"
-export STEWARD_TEST_TLS_DATABASE_URL="postgres://steward@localhost:${port}/steward?sslmode=verify-full&sslrootcert=${RUN_DIR}/ca.crt"
+export STEWARD_TEST_TLS_DATABASE_URL="postgres://steward@127.0.0.1:${port}/steward?sslmode=require"
+export STEWARD_TEST_VERIFIED_TLS_DATABASE_URL="postgres://steward@localhost:${port}/steward?sslmode=verify-full&sslrootcert=${RUN_DIR}/ca.crt"
 export STEWARD_TEST_WRONG_CA_DATABASE_URL="postgres://steward@localhost:${port}/steward?sslmode=verify-full&sslrootcert=${RUN_DIR}/wrong-ca.crt"
 export STEWARD_TEST_WRONG_HOSTNAME_DATABASE_URL="postgres://steward@127.0.0.1:${port}/steward?sslmode=verify-full&sslrootcert=${RUN_DIR}/ca.crt"
 export STEWARD_TEST_DATABASE_URL="postgres://steward@localhost:${port}/steward_orchestration?sslmode=verify-full&sslrootcert=${RUN_DIR}/ca.crt"
