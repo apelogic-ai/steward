@@ -20,8 +20,10 @@ additional prose.
 
 Enforcement surfaces include CI and hook configuration, lint settings and lint
 exceptions, `deny.toml`, security entries in `.gitignore`, the implementations
-behind mandatory `xtask` checks, and `claim` values in
-`conformance/register.toml`. A failing gate is a message, not permission to
+behind mandatory `xtask` checks, `claim` values in
+`conformance/register.toml`, and the committed agent configuration under
+`.claude/` — its permission allowlist, its deny list, and its agent
+definitions. A failing gate is a message, not permission to
 weaken the gate.
 
 ## 2. Git and pull requests
@@ -246,6 +248,25 @@ describes, so that judgement is yours:
   of this repository.
 - A green gate on a documentation-only PR is evidence about formatting, not
   about accuracy.
+
+### Independent review before handoff
+
+Before opening a PR or handing work back, the change gets one review pass from
+a context that did not author it. The gate cannot judge documentation currency,
+identifiers outside test paths, changelog completeness, or public-artifact
+hygiene, and the author is the reader least able to see what they assumed.
+
+- The mechanism is free: the `steward-reviewer` subagent, a separate session, or
+  a human. What is required is that the pass happened and that someone other
+  than the author's own working context performed it.
+- Record the outcome in the PR, including a clean result. "Reviewed for
+  documentation currency and identifiers; no findings" is a claim someone can
+  check later; silence is not.
+- This applies to review, not authorship. Do not delegate the implementation
+  loop itself; a reviewer with fresh context is valuable precisely because the
+  author's context is not fresh.
+- A finding about a rule this file does not yet carry is a rule gap. Report it
+  rather than fixing the symptom quietly.
 
 ## 5. Test environments
 
