@@ -2852,6 +2852,86 @@ impl PgStore {
             .transpose()
     }
 
+    /// Internal validating-webhook lookup for one exact Task runtime transition.
+    ///
+    /// Runtime names are reusable Kubernetes identifiers, so admission receives the complete
+    /// persisted Task and orchestration operation and must prove their immutable identifiers and
+    /// desired manifests. More than one row is ambiguous and therefore fails closed.
+    pub async fn task_runtime_admission(
+        &self,
+        runtime_namespace: &str,
+        runtime_name: &str,
+    ) -> Result<Option<TaskRuntimeAdmissionRecord>, StoreError> {
+        if runtime_namespace.is_empty() || runtime_name.is_empty() {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let rows = sqlx::query(
+            "SELECT tasks.*, operation.runtime_uid AS projected_runtime_uid, \
+                    operation.task_uid AS admission_task_uid, \
+                    operation.operation_id AS admission_operation_id, \
+                    operation.state AS admission_state, \
+                    operation.generation AS admission_generation, \
+                    operation.runtime_ownership AS admission_runtime_ownership, \
+                    operation.runtime_namespace AS admission_runtime_namespace, \
+                    operation.runtime_name AS admission_runtime_name, \
+                    operation.inert_manifest_digest AS admission_inert_manifest_digest, \
+                    operation.active_manifest_digest AS admission_active_manifest_digest, \
+                    operation.expected_runtime_uid AS admission_expected_runtime_uid, \
+                    operation.runtime_uid AS admission_runtime_uid, \
+                    operation.runtime_resource_version AS admission_runtime_resource_version, \
+                    operation.activation_authority_kind AS admission_activation_authority_kind, \
+                    operation.activation_envelope_revision AS admission_activation_envelope_revision, \
+                    operation.activation_envelope_digest AS admission_activation_envelope_digest, \
+                    operation.approval_id AS admission_approval_id, \
+                    operation.retry_at::text AS admission_retry_at, \
+                    operation.last_error_code AS admission_last_error_code, \
+                    operation.lease_owner AS admission_lease_owner, \
+                    operation.lease_expires_at::text AS admission_lease_expires_at, \
+                    operation.requested_at::text AS admission_requested_at, \
+                    operation.runtime_create_authorized_at::text AS admission_runtime_create_authorized_at, \
+                    operation.observed_at::text AS admission_observed_at, \
+                    operation.activation_effect_authorized_at::text AS admission_activation_effect_authorized_at, \
+                    operation.activated_at::text AS admission_activated_at, \
+                    operation.cleanup_requested_at::text AS admission_cleanup_requested_at, \
+                    operation.runtime_absent_observed_at::text AS admission_runtime_absent_observed_at, \
+                    operation.projections_absent_observed_at::text AS admission_projections_absent_observed_at, \
+                    operation.finalized_at::text AS admission_finalized_at \
+             FROM task_runtime_operations operation \
+             JOIN task_submissions tasks ON tasks.task_uid = operation.task_uid \
+             WHERE operation.runtime_namespace = $1 AND operation.runtime_name = $2 \
+             ORDER BY operation.requested_at DESC LIMIT 2 FOR SHARE OF tasks, operation",
+        )
+        .bind(runtime_namespace)
+        .bind(runtime_name)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if rows.len() > 1 {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let operation = task_runtime_admission_operation_record(&row)?;
+        let task = task_record(row)?;
+        if task.task_uid != operation.task_uid
+            || task.orchestration_operation_id != Some(operation.operation_id)
+            || task.runtime_namespace != operation.runtime_namespace
+            || task.runtime_name != operation.runtime_name
+        {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        let user_envelope_authority_active =
+            task_user_envelope_authority_active(&mut transaction, &task).await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(Some(TaskRuntimeAdmissionRecord {
+            task,
+            operation,
+            user_envelope_authority_active,
+        }))
+    }
+
     pub async fn task_execution_attempt(
         &self,
         task_uid: Uuid,
@@ -3571,6 +3651,102 @@ impl PgStore {
         Ok(TaskOperationTransition::Applied(current))
     }
 
+    /// Records a deterministic Kubernetes rejection of a provisioned runtime CREATE.
+    ///
+    /// Unlike a transport or server failure, a deterministic client/admission rejection proves
+    /// that no runtime was created. Persisting that proof lets cleanup finalize without replaying
+    /// the CREATE or inventing a runtime UID.
+    pub async fn record_task_runtime_creation_rejected(
+        &self,
+        task_uid: Uuid,
+        expected_generation: i64,
+        actor: &str,
+    ) -> Result<TaskOperationTransition, StoreError> {
+        if expected_generation <= 0 || actor.is_empty() {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let _task = task_in_transaction_for_update(&mut transaction, task_uid).await?;
+        let current =
+            task_runtime_operation_in_transaction_for_update(&mut transaction, task_uid).await?;
+        if current.state == TaskOrchestrationState::Finalized
+            || (current.state == TaskOrchestrationState::CleanupPending
+                && current.runtime_absent_observed_at.is_some())
+        {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(TaskOperationTransition::AlreadyApplied(current));
+        }
+        if current.generation != expected_generation {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(TaskOperationTransition::Superseded(current));
+        }
+        if !matches!(
+            current.state,
+            TaskOrchestrationState::RuntimeCreatePending | TaskOrchestrationState::CleanupPending
+        ) || current.runtime_ownership != TaskRuntimeOwnership::Provisioned
+            || current.runtime_uid.is_some()
+            || current.runtime_create_authorized_at.is_none()
+        {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(TaskOperationTransition::InvariantViolation {
+                current,
+                reason: "runtime_creation_rejection_not_recordable",
+            });
+        }
+        let failed_before_cleanup = current.state == TaskOrchestrationState::RuntimeCreatePending;
+        fence_task_execution_for_cleanup(&mut transaction, task_uid).await?;
+        let updated = sqlx::query(
+            "UPDATE task_runtime_operations \
+             SET state = 'cleanup_pending', generation = generation + 1, \
+                 cleanup_requested_at = COALESCE(cleanup_requested_at, now()), \
+                 runtime_absent_observed_at = COALESCE(runtime_absent_observed_at, now()), \
+                 last_error_code = 'runtime_create_admission_rejected', retry_at = NULL, \
+                 lease_owner = NULL, lease_expires_at = NULL, updated_at = now() \
+             WHERE task_uid = $1 AND generation = $2 AND state = $3 \
+               AND runtime_ownership = 'provisioned' AND runtime_uid IS NULL \
+               AND runtime_create_authorized_at IS NOT NULL",
+        )
+        .bind(task_uid)
+        .bind(expected_generation)
+        .bind(current.state.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .rows_affected();
+        if updated != 1 {
+            let current = task_runtime_operation_in_transaction(&mut transaction, task_uid).await?;
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(TaskOperationTransition::Superseded(current));
+        }
+        if failed_before_cleanup {
+            sqlx::query(
+                "UPDATE task_submissions \
+                 SET phase = CASE WHEN phase IN ('succeeded', 'failed', 'cancelled') \
+                         THEN phase ELSE 'failed' END, \
+                     failure_reason = COALESCE(failure_reason, \
+                         'runtime_create_admission_rejected'), \
+                     finalize_requested = true, updated_at = now() \
+                 WHERE task_uid = $1 AND orchestration_version IN (2, 3) AND NOT finalized",
+            )
+            .bind(task_uid)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        }
+        append_task_orchestration_journal(
+            &mut transaction,
+            task_uid,
+            expected_generation + 1,
+            TaskOrchestrationState::CleanupPending,
+            "runtime_create_admission_rejected",
+            actor,
+        )
+        .await?;
+        let current = task_runtime_operation_in_transaction(&mut transaction, task_uid).await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(TaskOperationTransition::Applied(current))
+    }
+
     pub async fn record_task_activation_observed(
         &self,
         task_uid: Uuid,
@@ -3913,7 +4089,14 @@ impl PgStore {
         let cleanup_is_complete = match (current.runtime_uid.as_ref(), current.runtime_ownership) {
             (Some(_), TaskRuntimeOwnership::Provisioned) => observation.exact_runtime_absent,
             (Some(_), TaskRuntimeOwnership::Adopted | TaskRuntimeOwnership::Resident) => true,
-            (None, _) => current.runtime_create_authorized_at.is_none(),
+            (None, TaskRuntimeOwnership::Provisioned) => {
+                current.runtime_create_authorized_at.is_none()
+                    || (observation.exact_runtime_absent
+                        && current.runtime_absent_observed_at.is_some())
+            }
+            (None, TaskRuntimeOwnership::Adopted | TaskRuntimeOwnership::Resident) => {
+                current.runtime_create_authorized_at.is_none()
+            }
         };
         if !cleanup_is_complete {
             transaction.commit().await.map_err(database_error)?;
@@ -6547,6 +6730,13 @@ pub struct TaskRuntimeOperationRecord {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct TaskRuntimeAdmissionRecord {
+    pub task: TaskRecord,
+    pub operation: TaskRuntimeOperationRecord,
+    pub user_envelope_authority_active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct TaskOrchestrationWorkItem {
     pub task: TaskRecord,
     pub operation: TaskRuntimeOperationRecord,
@@ -8099,31 +8289,13 @@ async fn retire_task_authority_for_cleanup(
 fn task_runtime_operation_record(
     row: sqlx::postgres::PgRow,
 ) -> Result<TaskRuntimeOperationRecord, StoreError> {
-    let state = match row
-        .try_get::<String, _>("state")
-        .map_err(database_error)?
-        .as_str()
-    {
-        "intent_recorded" => TaskOrchestrationState::IntentRecorded,
-        "runtime_create_pending" => TaskOrchestrationState::RuntimeCreatePending,
-        "runtime_observed" => TaskOrchestrationState::RuntimeObserved,
-        "approval_pending" => TaskOrchestrationState::ApprovalPending,
-        "activation_pending" => TaskOrchestrationState::ActivationPending,
-        "active" => TaskOrchestrationState::Active,
-        "cleanup_pending" => TaskOrchestrationState::CleanupPending,
-        "finalized" => TaskOrchestrationState::Finalized,
-        _ => return Err(StoreError::InvalidTaskTransition),
-    };
-    let runtime_ownership = match row
-        .try_get::<String, _>("runtime_ownership")
-        .map_err(database_error)?
-        .as_str()
-    {
-        "provisioned" => TaskRuntimeOwnership::Provisioned,
-        "adopted" => TaskRuntimeOwnership::Adopted,
-        "resident" => TaskRuntimeOwnership::Resident,
-        _ => return Err(StoreError::InvalidTaskTransition),
-    };
+    let state = parse_task_orchestration_state(
+        &row.try_get::<String, _>("state").map_err(database_error)?,
+    )?;
+    let runtime_ownership = parse_task_runtime_ownership(
+        &row.try_get::<String, _>("runtime_ownership")
+            .map_err(database_error)?,
+    )?;
     Ok(TaskRuntimeOperationRecord {
         task_uid: row.try_get("task_uid").map_err(database_error)?,
         operation_id: row.try_get("operation_id").map_err(database_error)?,
@@ -8179,6 +8351,121 @@ fn task_runtime_operation_record(
             .map_err(database_error)?,
         finalized_at: row.try_get("finalized_at").map_err(database_error)?,
     })
+}
+
+fn task_runtime_admission_operation_record(
+    row: &sqlx::postgres::PgRow,
+) -> Result<TaskRuntimeOperationRecord, StoreError> {
+    Ok(TaskRuntimeOperationRecord {
+        task_uid: row.try_get("admission_task_uid").map_err(database_error)?,
+        operation_id: row
+            .try_get("admission_operation_id")
+            .map_err(database_error)?,
+        state: parse_task_orchestration_state(
+            &row.try_get::<String, _>("admission_state")
+                .map_err(database_error)?,
+        )?,
+        generation: row
+            .try_get("admission_generation")
+            .map_err(database_error)?,
+        runtime_ownership: parse_task_runtime_ownership(
+            &row.try_get::<String, _>("admission_runtime_ownership")
+                .map_err(database_error)?,
+        )?,
+        runtime_namespace: row
+            .try_get("admission_runtime_namespace")
+            .map_err(database_error)?,
+        runtime_name: row
+            .try_get("admission_runtime_name")
+            .map_err(database_error)?,
+        inert_manifest_digest: row
+            .try_get("admission_inert_manifest_digest")
+            .map_err(database_error)?,
+        active_manifest_digest: row
+            .try_get("admission_active_manifest_digest")
+            .map_err(database_error)?,
+        expected_runtime_uid: row
+            .try_get("admission_expected_runtime_uid")
+            .map_err(database_error)?,
+        runtime_uid: row
+            .try_get("admission_runtime_uid")
+            .map_err(database_error)?,
+        runtime_resource_version: row
+            .try_get("admission_runtime_resource_version")
+            .map_err(database_error)?,
+        activation_authority_kind: row
+            .try_get("admission_activation_authority_kind")
+            .map_err(database_error)?,
+        activation_envelope_revision: row
+            .try_get("admission_activation_envelope_revision")
+            .map_err(database_error)?,
+        activation_envelope_digest: row
+            .try_get("admission_activation_envelope_digest")
+            .map_err(database_error)?,
+        approval_id: row
+            .try_get("admission_approval_id")
+            .map_err(database_error)?,
+        retry_at: row.try_get("admission_retry_at").map_err(database_error)?,
+        last_error_code: row
+            .try_get("admission_last_error_code")
+            .map_err(database_error)?,
+        lease_owner: row
+            .try_get("admission_lease_owner")
+            .map_err(database_error)?,
+        lease_expires_at: row
+            .try_get("admission_lease_expires_at")
+            .map_err(database_error)?,
+        requested_at: row
+            .try_get("admission_requested_at")
+            .map_err(database_error)?,
+        runtime_create_authorized_at: row
+            .try_get("admission_runtime_create_authorized_at")
+            .map_err(database_error)?,
+        observed_at: row
+            .try_get("admission_observed_at")
+            .map_err(database_error)?,
+        activation_effect_authorized_at: row
+            .try_get("admission_activation_effect_authorized_at")
+            .map_err(database_error)?,
+        activated_at: row
+            .try_get("admission_activated_at")
+            .map_err(database_error)?,
+        cleanup_requested_at: row
+            .try_get("admission_cleanup_requested_at")
+            .map_err(database_error)?,
+        runtime_absent_observed_at: row
+            .try_get("admission_runtime_absent_observed_at")
+            .map_err(database_error)?,
+        projections_absent_observed_at: row
+            .try_get("admission_projections_absent_observed_at")
+            .map_err(database_error)?,
+        finalized_at: row
+            .try_get("admission_finalized_at")
+            .map_err(database_error)?,
+    })
+}
+
+fn parse_task_orchestration_state(value: &str) -> Result<TaskOrchestrationState, StoreError> {
+    match value {
+        "intent_recorded" => Ok(TaskOrchestrationState::IntentRecorded),
+        "runtime_create_pending" => Ok(TaskOrchestrationState::RuntimeCreatePending),
+        "runtime_observed" => Ok(TaskOrchestrationState::RuntimeObserved),
+        "approval_pending" => Ok(TaskOrchestrationState::ApprovalPending),
+        "activation_pending" => Ok(TaskOrchestrationState::ActivationPending),
+        "active" => Ok(TaskOrchestrationState::Active),
+        "cleanup_pending" => Ok(TaskOrchestrationState::CleanupPending),
+        "finalized" => Ok(TaskOrchestrationState::Finalized),
+        _ => Err(StoreError::InvalidTaskTransition),
+    }
+}
+
+fn parse_task_runtime_ownership(value: &str) -> Result<TaskRuntimeOwnership, StoreError> {
+    match value {
+        "provisioned" => Ok(TaskRuntimeOwnership::Provisioned),
+        "adopted" => Ok(TaskRuntimeOwnership::Adopted),
+        "resident" => Ok(TaskRuntimeOwnership::Resident),
+        _ => Err(StoreError::InvalidTaskTransition),
+    }
 }
 
 const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, tasks.acting_user, tasks.owner, tasks.owner_user_id, \
