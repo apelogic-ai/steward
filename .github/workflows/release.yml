@@ -38,6 +38,8 @@ jobs:
           shellcheck \
             scripts/postgres-tls-e2e.sh \
             scripts/postgres-tls-init.sh \
+            scripts/codex-reference-runtime-conformance.sh \
+            scripts/codex-reference-runtime-openshell-inside.sh \
             scripts/package-provider-profile-bundle.sh \
             scripts/test-package-provider-profile-bundle.sh \
             scripts/test-steward-registry-lock.sh \
@@ -186,6 +188,111 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  publish-codex-reference-runtime:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve release version
+        id: version
+        run: printf 'version=%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish Codex reference runtime
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: build/codex-reference.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/steward-codex-runtime:0.140.0-steward-${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=0.140.0-steward-${{ steps.version.outputs.version }}
+            org.opencontainers.image.title=steward-codex-runtime
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=steward-codex-reference-runtime
+          cache-to: type=gha,mode=max,scope=steward-codex-reference-runtime
+
+      - name: Record Codex reference runtime digest
+        run: |
+          mkdir -p dist
+          printf '%s\n' '${{ steps.build.outputs.digest }}' > dist/codex-reference-runtime.digest
+
+      - name: Generate Codex reference runtime SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          image: ghcr.io/${{ github.repository_owner }}/steward-codex-runtime@${{ steps.build.outputs.digest }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
+          format: spdx-json
+          output-file: dist/codex-reference-runtime.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate Codex reference runtime vulnerability report
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/steward-codex-runtime@${{ steps.build.outputs.digest }}
+          format: json
+          output: dist/codex-reference-runtime.vulnerabilities.json
+          exit-code: "0"
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+
+      - name: Retain Codex reference runtime vulnerability report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: release-codex-reference-runtime-vulnerability-report
+          path: dist/codex-reference-runtime.vulnerabilities.json
+          if-no-files-found: error
+
+      - name: Enforce critical Codex reference runtime vulnerability policy
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/steward-codex-runtime@${{ steps.build.outputs.digest }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+
+      - name: Attest Codex reference runtime provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/steward-codex-runtime
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Upload Codex reference runtime evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: release-codex-reference-runtime
+          path: |
+            dist/codex-reference-runtime.digest
+            dist/codex-reference-runtime.spdx.json
+          if-no-files-found: error
+
   publish-provider-profile-bundle:
     needs: validate
     runs-on: ubuntu-latest
@@ -234,6 +341,51 @@ jobs:
             dist/steward-runtime-providers-${{ steps.version.outputs.version }}.tar.gz
             dist/provider-profile-bundle.digest
           if-no-files-found: error
+
+  codex-reference-runtime-conformance:
+    needs: [publish-codex-reference-runtime, publish-provider-profile-bundle]
+    name: release / Codex reference runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install pinned Kubernetes tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+
+      - name: Download Codex runtime evidence
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: release-codex-reference-runtime
+          path: dist
+
+      - name: Download provider-profile evidence
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: release-provider-profile-bundle
+          path: dist
+
+      - name: Verify Codex runtime and released provider-profile compatibility
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          scripts/codex-reference-runtime-conformance.sh \
+            --image "ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime@$(cat dist/codex-reference-runtime.digest)" \
+            --provider-profile-bundle "dist/steward-runtime-providers-${version}.tar.gz"
 
   openshell-x86-conformance:
     needs: validate
@@ -409,12 +561,14 @@ jobs:
           bash scripts/customer-core-install-e2e.sh
 
   release:
-    needs: [publish-images, publish-provider-profile-bundle, openshell-x86-conformance, publish-chart, released-artifact-acceptance]
+    needs: [publish-images, publish-provider-profile-bundle, publish-codex-reference-runtime, codex-reference-runtime-conformance, openshell-x86-conformance, publish-chart, released-artifact-acceptance]
     if: >-
       ${{
         always() &&
         needs.publish-images.result == 'success' &&
         needs.publish-provider-profile-bundle.result == 'success' &&
+        needs.publish-codex-reference-runtime.result == 'success' &&
+        needs.codex-reference-runtime-conformance.result == 'success' &&
         needs.openshell-x86-conformance.result == 'success' &&
         needs.publish-chart.result == 'success' &&
         needs.released-artifact-acceptance.result == 'success'
@@ -472,8 +626,10 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           test "$version" = "0.2.2"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
+          codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
           bridge_digest="$(cat dist/bridge.digest)"
+          codex_digest="$(cat dist/codex-reference-runtime.digest)"
           provider_profile_bundle_asset="steward-runtime-providers-${version}.tar.gz"
           provider_profile_bundle_digest="$(cat dist/provider-profile-bundle.digest)"
           bridge_signer_identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
@@ -488,6 +644,8 @@ jobs:
             --arg chart_reference "oci://${chart}:${version}" \
             --arg chart_digest "$(cat dist/helm-chart.digest)" \
             --arg image_repository "$repository" \
+            --arg codex_reference "${codex_repository}:0.140.0-steward-${version}" \
+            --arg codex_digest "$codex_digest" \
             --arg apiserver_digest "$(cat dist/apiserver.digest)" \
             --arg controller_digest "$(cat dist/controller.digest)" \
             --arg mint_digest "$(cat dist/mint.digest)" \
@@ -512,6 +670,15 @@ jobs:
                 mint: {reference: ($image_repository + ":" + $version + "-mint"), digest: $mint_digest},
                 bridge: {reference: ($image_repository + ":" + $version + "-bridge"), digest: $bridge_digest},
                 web: {reference: ($image_repository + ":" + $version + "-web"), digest: $web_digest}
+              },
+              referenceRuntimes: {
+                codex: {
+                  agentRef: "codex@0.140.0",
+                  version: "0.140.0",
+                  reference: $codex_reference,
+                  digest: $codex_digest,
+                  platform: "linux/amd64"
+                }
               },
               providerProfileBundle: {
                 identity: "steward-runtime-providers@1.2.0",
@@ -539,6 +706,7 @@ jobs:
             printf 'The chart can project an existing Secret- or ConfigMap-backed PostgreSQL CA into both database consumers for sslmode=verify-full.\n\n'
             printf 'The provider-profile release bundle now includes a standalone linux/amd64 validator and installer with deterministic output and machine-readable evidence.\n\n'
             printf 'The release includes a registry mirror tool that preserves OCI indexes, verifies target digests and platforms, and writes a deterministic credential-free deployment lock.\n\n'
+            printf 'The release includes a supported linux/amd64 Codex 0.140.0 reference runtime, with its immutable digest, SBOM, provenance, and provider-profile conformance evidence.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
             printf 'Before migration 0039, terminalize and finalize every unfinished legacy Task that lacks a complete User Envelope or internal-authority pin. Use Identity v0.5.0 with policy contract github-oidc-exchange.apelogic.io/v5, remove Service Envelope bootstrap configuration, and configure the non-authoritative capability catalog.\n\n'
             printf 'Rollback from v0.2.2 to v0.2.1 requires no database rollback because this patch adds no migration. The v0.1.23 rollback boundary remains unchanged; see docs/installation/upgrade-v0.2.0.md.\n\n'
@@ -551,6 +719,10 @@ jobs:
             done
             printf '| chart | oci://%s:%s | %s |\n' \
               "$chart" "$version" "$(cat dist/helm-chart.digest)"
+            printf '\n## Reference runtimes\n\n'
+            printf '| Agent | Platform | Reference | Digest |\n|---|---|---|---|\n'
+            printf '| codex@0.140.0 | linux/amd64 | %s:0.140.0-steward-%s | %s |\n' \
+              "$codex_repository" "$version" "$codex_digest"
             printf '\n## Stable bridge provenance inputs\n\n'
             printf 'Bridge image: %s@%s\n\n' "$repository" "$bridge_digest"
             printf 'Bridge signer identity: %s\n\n' "$bridge_signer_identity"
@@ -601,6 +773,8 @@ jobs:
             docker buildx imagetools inspect \
               "ghcr.io/$GITHUB_REPOSITORY_OWNER/steward@$(cat "dist/$component.digest")"
           done
+          docker buildx imagetools inspect \
+            "ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime@$(cat dist/codex-reference-runtime.digest)"
           helm pull "oci://ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward" \
             --version "${GITHUB_REF_NAME#v}" \
             --destination "$RUNNER_TEMP"

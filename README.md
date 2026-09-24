@@ -45,6 +45,7 @@ records the limits of this tested matrix.
 | Canonical browser / Task person identity | [Canonical user identity](docs/canonical-user-identity-v1.md) |
 | Understand the Task API and worker contract | [Task deployment](config/task/README.md) |
 | Configure coding-agent versions | [Execution bindings](docs/installation/execution-bindings.md) |
+| Obtain, mirror, or rebuild the supported Codex image | [Codex reference runtime](docs/installation/codex-reference-runtime.md) |
 | The rules for changing this repository | [Agent rules](AGENTS.md) |
 | Run the complete local gate | `cargo xtask ci` |
 

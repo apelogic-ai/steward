@@ -57,6 +57,10 @@ and derived digest metadata, and returns nonzero for an invalid document.
 
 ## Agent images and adapter contracts
 
+Steward releases a tested `linux/amd64` image for `codex@0.140.0`. Its exact reference and digest
+are in `release-handoff.json`; see the [Codex reference runtime guide](codex-reference-runtime.md)
+for binding, mirroring, private-build, and conformance commands.
+
 `codex-v1` defines behavior, not a product-pinned Codex release. A compatible image must be
 multi-architecture for every platform the deployment admits, contain the configured absolute
 executable on each architecture, return the exact configured stdout for the configured probe

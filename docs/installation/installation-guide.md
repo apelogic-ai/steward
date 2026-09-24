@@ -382,6 +382,8 @@ or locally built image is not release evidence.
    the corresponding category. Pinned OpenShell v0.0.98 cannot attest profile
    content itself, so the deployment system must keep each installed ID
    immutable and verify the rendered bytes against the recorded digest.
+   For `codex@0.140.0`, use or mirror the digest-selected image and run the
+   [released runtime conformance](codex-reference-runtime.md) before activating its binding.
 
 2. Verify the named Secret objects and certificate SANs without displaying
    their data. With an explicit kubeconfig/context, lint and render before
