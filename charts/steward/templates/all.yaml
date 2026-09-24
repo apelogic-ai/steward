@@ -21,6 +21,12 @@
 {{- if and .Values.web.httpRoute.enabled (ne .Values.web.httpRoute.hostname .Values.web.host) }}
 {{- fail "web.httpRoute.hostname must exactly match web.host" }}
 {{- end }}
+{{- if .Values.web.httpRoute.enabled }}
+{{- $apiserverBackendHostname := printf "steward-apiserver.%s.svc.%s" .Release.Namespace .Values.services.clusterDomain }}
+{{- if ne .Values.web.httpRoute.backendTls.hostname $apiserverBackendHostname }}
+{{- fail (printf "web.httpRoute.backendTls.hostname must exactly match the apiserver certificate DNS identity %s" $apiserverBackendHostname) }}
+{{- end }}
+{{- end }}
 {{- if and .Values.web.ingress.enabled .Values.web.httpRoute.enabled }}
 {{- fail "choose exactly one edge route interface: web.ingress or web.httpRoute" }}
 {{- end }}
@@ -395,7 +401,7 @@ spec:
             - { name: STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE, value: {{ .Values.connectionsBridge.artifactTrust.mode | quote }} }
             - { name: STEWARD_CONNECTIONS_BRIDGE_IMAGE, value: {{ .Values.connectionsBridge.image | quote }} }
             - { name: STEWARD_CONNECTIONS_MCP_GW_ORIGIN, value: {{ .Values.connectionsBridge.mcpGatewayOrigin | quote }} }
-            - { name: STEWARD_CONNECTIONS_MCP_GW_VERSION, value: {{ .Values.connectionsBridge.mcpGatewayVersion | quote }} }
+            - { name: STEWARD_CONNECTIONS_MCP_GW_VERSION, value: {{ include "steward.mcpGwInternalVersion" . | quote }} }
             - { name: STEWARD_CONNECTIONS_RUNTIME_NAMESPACE, value: {{ .Values.connectionsBridge.runtimeNamespace | quote }} }
             - { name: STEWARD_CONNECTIONS_MINT_ORIGIN, value: {{ printf "http://%s:%v" (include "steward.mintName" .) .Values.services.mintPort | quote }} }
             - { name: STEWARD_CONNECTIONS_CONTROL_PLANE_CREDENTIAL_FILE, value: /var/run/secrets/steward/connections/status-token }
@@ -559,7 +565,7 @@ spec:
             - { name: STEWARD_CONNECTIONS_BRIDGE_ATTESTATION_BUNDLE_FILE, value: /run/connections-bridge-attestation/bundle.jsonl }
 {{- end }}
             - { name: STEWARD_CONNECTIONS_MCP_GW_ORIGIN, value: {{ .Values.connectionsBridge.mcpGatewayOrigin | quote }} }
-            - { name: STEWARD_CONNECTIONS_MCP_GW_VERSION, value: {{ .Values.connectionsBridge.mcpGatewayVersion | quote }} }
+            - { name: STEWARD_CONNECTIONS_MCP_GW_VERSION, value: {{ include "steward.mcpGwInternalVersion" . | quote }} }
             - { name: STEWARD_CONNECTIONS_RUNTIME_NAMESPACE, value: {{ .Values.connectionsBridge.runtimeNamespace | quote }} }
 {{- end }}
             - { name: STEWARD_TLS_CERT_DER, value: /run/tls/tls.crt }
@@ -778,6 +784,23 @@ spec:
 {{- end }}
 {{- end }}
 {{- if .Values.web.httpRoute.enabled }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: steward-apiserver
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: steward-apiserver
+      sectionName: https
+  validation:
+    hostname: {{ .Values.web.httpRoute.backendTls.hostname | quote }}
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: {{ .Values.web.httpRoute.backendTls.caConfigMap.name | quote }}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute

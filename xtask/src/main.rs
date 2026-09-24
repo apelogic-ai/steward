@@ -1028,7 +1028,7 @@ mod tests {
             .ok_or_else(|| "Steward chart version is required".to_owned())?;
         match version {
             "0.1.23" => Ok(false),
-            "0.2.2" => Ok(true),
+            "0.2.3" => Ok(true),
             other => Err(format!(
                 "release enforcement has not reviewed Steward chart version {other}"
             )),
@@ -2746,11 +2746,15 @@ mod tests {
             "identityPolicyContract: \"github-oidc-exchange.apelogic.io/v5\"",
             "0039_user_envelope_only_task_authority.sql",
             "serviceEnvelopeSupported: false",
+            "governedPlatformCompatibility:",
+            "steward.governed-platform-compatibility/v1",
+            "steward-governed-platform-compatibility-${version}.json",
             "subject-path: dist/release-handoff.json",
             "release-handoff-attestation.jsonl",
             "gh attestation verify dist/release-handoff.json",
             "Verify published release handoff",
             "cmp dist/release-handoff.json",
+            "Verify published governed-platform compatibility manifest",
         ] {
             assert!(
                 release.contains(required),
@@ -2788,7 +2792,7 @@ mod tests {
     fn registry_mirror_is_released_verified_and_documented() -> Result<(), String> {
         let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
             .map_err(|error| format!("published Steward release workflow is required: {error}"))?;
-        let tool = fs::read_to_string(root().join("scripts/steward-registry-lock.py"))
+        let tool = fs::read_to_string(root().join("scripts/steward-registry-lock.sh"))
             .map_err(|error| format!("registry mirror tool is required: {error}"))?;
         let test = fs::read_to_string(root().join("scripts/test-steward-registry-lock.sh"))
             .map_err(|error| format!("registry mirror test is required: {error}"))?;
@@ -2796,12 +2800,12 @@ mod tests {
             .map_err(|error| format!("registry mirror guide is required: {error}"))?;
 
         for required in [
-            "steward-registry-lock.py.sha256",
+            "steward-registry-lock.sh.sha256",
             "steward.deployment-lock/v1",
             "registryMirror:",
             "Verify published registry mirror tool",
-            "sha256sum --check steward-registry-lock.py.sha256",
-            "cmp scripts/steward-registry-lock.py",
+            "sha256sum --check steward-registry-lock.sh.sha256",
+            "cmp scripts/steward-registry-lock.sh",
         ] {
             assert!(
                 workflow.contains(required),
@@ -2809,10 +2813,11 @@ mod tests {
             );
         }
         for required in [
-            "referenceRuntimes",
-            "--prefer-index=false",
-            "target_manifest != selected_manifest",
-            "target_signatures != source_signatures",
+            "steward.registry-mappings/v1",
+            "steward.registry-plan/v1",
+            "oras cp --recursive",
+            "targetPlainHttp",
+            ".artifacts.chart.flux",
             "executionBindingImages",
         ] {
             assert!(
@@ -2822,9 +2827,10 @@ mod tests {
         }
         for required in [
             "cmp \"${temporary_directory}/lock-one.json\"",
-            "single-manifest source silently passed as a complete index",
-            "registry.example.test/team-a/steward@sha256:eeeeeeee",
+            "already-present",
+            "artifacts.chart.flux.ociRepository.ref.digest",
             "referenceRuntimes.codex",
+            "incomplete explicit mappings unexpectedly passed",
         ] {
             assert!(
                 test.contains(required),
@@ -2832,9 +2838,10 @@ mod tests {
             );
         }
         for required in [
-            "Docker credential helper",
-            "source descriptor set",
-            "Single-platform mode",
+            "ORAS registry configuration",
+            "no-write plan",
+            "steward.registry-mappings/v1",
+            "Flux",
             "chartValues",
             "executionBindingImages",
         ] {
@@ -3601,6 +3608,222 @@ mod tests {
         assert!(
             changes.contains("migrations/0001_feature.sql"),
             "three-dot comparison must include the feature migration: {changes}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn governed_platform_compatibility_manifest_is_complete() -> Result<(), String> {
+        let path = root().join("config/governed-platform/v1/compatibility.json");
+        let content = fs::read_to_string(&path).map_err(|error| {
+            format!("governed-platform compatibility manifest is required: {error}")
+        })?;
+        let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("release workflow is required: {error}"))?;
+        let manifest = serde_json::from_str::<serde_json::Value>(&content).map_err(|error| {
+            format!("governed-platform compatibility manifest is invalid JSON: {error}")
+        })?;
+        assert_eq!(
+            manifest
+                .pointer("/schemaVersion")
+                .and_then(serde_json::Value::as_str),
+            Some("steward.governed-platform-compatibility/v1")
+        );
+        for pointer in [
+            "/steward/version",
+            "/companions/stewardRun/image",
+            "/companions/stewardRun/chart",
+            "/companions/githubOidcExchange/image",
+            "/companions/githubOidcExchange/chart",
+            "/dependencies/openShell/chart",
+            "/dependencies/agentSandbox/controllerImage",
+            "/dependencies/liteLlm/image",
+        ] {
+            let value = manifest
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("compatibility manifest is missing {pointer}"))?;
+            if pointer.ends_with("/version") {
+                assert!(!value.is_empty(), "{pointer} must not be empty");
+            } else {
+                assert!(
+                    value.contains("@sha256:")
+                        && value
+                            .rsplit_once("@sha256:")
+                            .is_some_and(
+                                |(_, digest)| digest.len() == 64 && digest != "0".repeat(64)
+                            ),
+                    "{pointer} must be an immutable OCI reference"
+                );
+            }
+        }
+        let spire_images = manifest
+            .pointer("/dependencies/spire/images")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "compatibility manifest must list SPIRE images".to_owned())?;
+        assert!(
+            !spire_images.is_empty(),
+            "SPIRE image list must not be empty"
+        );
+        assert!(spire_images.iter().all(|image| {
+            image
+                .as_str()
+                .is_some_and(|value| value.contains("@sha256:"))
+        }));
+        assert_eq!(
+            manifest
+                .pointer("/dependencies/spire/identity/spiffeIdTemplate")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://<trust-domain>/steward/mint")
+        );
+        assert_eq!(
+            manifest
+                .pointer("/dependencies/liteLlm/interfaces/codex-v1")
+                .and_then(|value| value.get("urlSemantics"))
+                .and_then(serde_json::Value::as_str),
+            Some("exact-operation-url")
+        );
+        assert_eq!(
+            manifest
+                .pointer("/dependencies/liteLlm/interfaces/codex-v1/operationPath")
+                .and_then(serde_json::Value::as_str),
+            Some("/v1/responses")
+        );
+        assert_eq!(
+            manifest
+                .pointer("/dependencies/liteLlm/interfaces/claude-code-v1/urlSemantics")
+                .and_then(serde_json::Value::as_str),
+            Some("base-url")
+        );
+        assert_eq!(
+            manifest
+                .pointer("/dependencies/liteLlm/interfaces/claude-code-v1/operationPath")
+                .and_then(serde_json::Value::as_str),
+            Some("/v1/messages")
+        );
+        assert_eq!(
+            manifest
+                .pointer("/dependencies/mcpGateway/authorityContract")
+                .and_then(serde_json::Value::as_str),
+            Some("steward.connections.github/v2")
+        );
+        assert_eq!(
+            manifest
+                .pointer("/dependencies/gatewayApi/minimumCrdRelease")
+                .and_then(serde_json::Value::as_str),
+            Some("1.4.0")
+        );
+        assert_eq!(
+            manifest
+                .pointer("/dependencies/gatewayApi/apiVersion")
+                .and_then(serde_json::Value::as_str),
+            Some("gateway.networking.k8s.io/v1")
+        );
+        assert_eq!(
+            manifest
+                .pointer("/dependencies/gatewayApi/requiredGatewayClassFeature")
+                .and_then(serde_json::Value::as_str),
+            Some("BackendTLSPolicy")
+        );
+        for required in [
+            "steward-governed-platform-compatibility-${version}.json",
+            "governedPlatformCompatibility:",
+            "Attest governed-platform compatibility manifest",
+            "Verify published governed-platform compatibility manifest",
+            "governedPlatformCompatibility.digest",
+        ] {
+            assert!(
+                workflow.contains(required),
+                "release workflow must publish and verify compatibility contract `{required}`"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gateway_api_route_requires_verified_backend_tls() -> Result<(), String> {
+        let chart = root().join("charts/steward");
+        let values = fs::read_to_string(chart.join("values.yaml"))
+            .map_err(|error| format!("Steward chart values are required: {error}"))?;
+        let schema = fs::read_to_string(chart.join("values.schema.json"))
+            .map_err(|error| format!("Steward values schema is required: {error}"))?;
+        let templates = fs::read_to_string(chart.join("templates/all.yaml"))
+            .map_err(|error| format!("Steward chart templates are required: {error}"))?;
+        let preflight_package = fs::read_to_string(
+            root().join("scripts/package-platform-preflight.sh"),
+        )
+        .map_err(|error| format!("platform-preflight packaging script is required: {error}"))?;
+        let preflight_check =
+            fs::read_to_string(root().join("scripts/steward-gateway-backend-tls-check.sh"))
+                .map_err(|error| format!("Gateway backend TLS checker is required: {error}"))?;
+
+        for content in [&values, &schema] {
+            assert!(
+                content.contains("backendTls") && content.contains("caConfigMap"),
+                "the chart must expose explicit Gateway backend TLS trust inputs"
+            );
+        }
+        for required in [
+            "kind: BackendTLSPolicy",
+            "name: steward-apiserver",
+            "sectionName: https",
+            "caCertificateRefs",
+            "steward-apiserver.%s.svc.%s",
+        ] {
+            assert!(
+                templates.contains(required),
+                "Gateway API templates must enforce backend TLS invariant `{required}`"
+            );
+        }
+        assert!(
+            preflight_package.contains("steward-gateway-backend-tls-check"),
+            "the released preflight bundle must contain the Gateway backend TLS checker"
+        );
+        for required in [
+            "BackendTLSPolicy CRD",
+            "GatewayClass supported features",
+            "openssl verify",
+            "ResolvedRefs=True",
+            "502|503",
+        ] {
+            assert!(
+                preflight_check.contains(required),
+                "the Gateway backend TLS checker must fail closed for `{required}`"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn connections_chart_uses_a_named_authority_contract() -> Result<(), String> {
+        let chart = root().join("charts/steward");
+        let values = fs::read_to_string(chart.join("values.yaml"))
+            .map_err(|error| format!("Steward chart values are required: {error}"))?;
+        let schema = fs::read_to_string(chart.join("values.schema.json"))
+            .map_err(|error| format!("Steward values schema is required: {error}"))?;
+        let templates = fs::read_to_string(chart.join("templates/all.yaml"))
+            .map_err(|error| format!("Steward chart templates are required: {error}"))?;
+        let helpers = fs::read_to_string(chart.join("templates/_helpers.tpl"))
+            .map_err(|error| format!("Steward chart helpers are required: {error}"))?;
+        for content in [&values, &schema] {
+            assert!(
+                content.contains("mcpGatewayAuthorityContract"),
+                "the chart must expose the named MCP-GW authority contract"
+            );
+        }
+        assert!(
+            helpers.contains("steward.connections.github/v2"),
+            "the chart must document the preferred lifecycle authority contract"
+        );
+        assert!(
+            schema.contains("steward.connections.github/v1")
+                && schema.contains("steward.connections.github/v2"),
+            "the chart schema must enumerate the supported named authority contracts"
+        );
+        assert!(
+            templates.contains("STEWARD_CONNECTIONS_MCP_GW_VERSION")
+                && helpers.contains("steward.connections.github/v2"),
+            "the chart must translate named contracts to the frozen internal bridge versions"
         );
         Ok(())
     }

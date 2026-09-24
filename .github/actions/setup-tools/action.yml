@@ -18,6 +18,10 @@ inputs:
     description: Install actionlint and ShellCheck
     required: false
     default: "false"
+  oci-tools:
+    description: Install the daemonless ORAS registry client
+    required: false
+    default: "false"
   cargo-deny-version:
     description: cargo-deny version
     required: false
@@ -54,6 +58,10 @@ inputs:
     description: ShellCheck version
     required: false
     default: "0.10.0"
+  oras-version:
+    description: ORAS version
+    required: false
+    default: "1.3.0"
 
 runs:
   using: composite
@@ -200,4 +208,24 @@ runs:
         mv "${tools_dir}/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" "${tools_dir}/shellcheck"
         chmod +x "${tools_dir}/actionlint" "${tools_dir}/shellcheck"
 
+        echo "${tools_dir}" >> "${GITHUB_PATH}"
+
+    - name: Install daemonless OCI tools
+      if: inputs.oci-tools == 'true'
+      shell: bash
+      env:
+        ORAS_VERSION: ${{ inputs.oras-version }}
+      run: |
+        set -euo pipefail
+        tools_dir="${RUNNER_TEMP}/steward-tools"
+        mkdir -p "${tools_dir}"
+        oras_asset="oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+        oras_url="https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/${oras_asset}"
+        curl --fail --location --silent --show-error \
+          --output "${tools_dir}/${oras_asset}" "${oras_url}"
+        echo "6cdc692f929100feb08aa8de584d02f7bcc30ec7d88bc2adc2054d782db57c64  ${tools_dir}/${oras_asset}" \
+          | sha256sum --check -
+        tar --extract --gzip --file "${tools_dir}/${oras_asset}" \
+          --directory "${tools_dir}" oras
+        chmod +x "${tools_dir}/oras"
         echo "${tools_dir}" >> "${GITHUB_PATH}"

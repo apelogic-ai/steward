@@ -55,6 +55,14 @@ web:
     hostname: ""
     apiPaths: []
     webPaths: []
+    # The Gateway validates the apiserver's TLS certificate against this
+    # same-namespace ConfigMap. It must contain the public issuing CA at
+    # caConfigMap.key; never place a private key in this object.
+    backendTls:
+      hostname: ""
+      caConfigMap:
+        name: ""
+        key: ca.crt
 secrets:
   database:
     name: steward-database
@@ -196,7 +204,9 @@ connectionsBridge:
   sourceRepository: ""
   sourceCommit: ""
   mcpGatewayOrigin: ""
-  # Authority v1 uses MCP-GW 0.3.2; authority v2 uses MCP-GW 0.4.9.
+  # Preferred public selector. v2 covers the additive MCP-GW lifecycle-status releases.
+  mcpGatewayAuthorityContract: ""
+  # Deprecated compatibility selector. Leave empty when authorityContract is set.
   mcpGatewayVersion: ""
   runtimeNamespace: ""
   attestationBundle: ""

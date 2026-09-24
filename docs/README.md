@@ -57,6 +57,7 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | [`github-actions-generator.md`](github-actions-generator.md) | **Current implementation, renderer scope** | Bounded GitHub Actions YAML generation. |
 | [`installation/installation-guide.md`](installation/installation-guide.md) | **Current release contract** | Prerequisites, installation modes, Secret and integration inventory, post-install checks, and delivery tests. |
 | [`installation/registry-mirroring.md`](installation/registry-mirroring.md) | **Current release contract** | Manifest-preserving registry copy, target verification, and deterministic deployment-lock generation. |
+| [`installation/governed-platform-compatibility.md`](installation/governed-platform-compatibility.md) | **Current release contract** | Exact tested dependency set, SPIRE identity rules, inference URL/model semantics, and MCP-GW authority-contract mapping. |
 | [`installation/platform-preflight.md`](installation/platform-preflight.md) | **Current release contract** | Deterministic Helm/Flux generation plus Gateway, namespace, certificate, and NetworkPolicy preflight. |
 | [`installation/codex-reference-runtime.md`](installation/codex-reference-runtime.md) | **Current release contract** | Supported Codex reference image, immutable binding, mirroring, rebuild, and conformance procedure. |
 | [`installation/execution-bindings.md`](installation/execution-bindings.md) | **Current implementation** | Deployment-neutral coding-agent catalog, validation, Helm installation, and lifecycle behavior. |

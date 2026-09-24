@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.2.2`. The release workflow pulls the published OCI
+Release contract: chart `0.2.3`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -47,7 +47,7 @@ turn execution off on an installation with live AgentRuntimes or Tasks.
    To copy released images and reference runtimes into another registry, use
    the released [registry mirror and deployment-lock tool](registry-mirroring.md).
    It verifies the target digests and provides the exact chart and execution-binding
-   inputs; registry credentials remain in the standard Docker credential store.
+   inputs; registry credentials remain in the standard ORAS registry configuration.
 4. HTTPS service certificates for `steward-apiserver` and `steward-webhook`.
    Choose exactly one chart TLS mode:
    - `customerSecret` (default): pre-create the two named `kubernetes.io/tls`
@@ -78,9 +78,11 @@ and [execution bindings](execution-bindings.md) before activating Tasks.
 
 ### Tested versions and integration boundaries
 
-These are the versions exercised or declared by this repository, not a promise
-that every other version works. Pin each external product and prove its contract
-again in the customer's cluster before enabling governed execution.
+The released
+[governed-platform compatibility manifest](governed-platform-compatibility.md)
+is authoritative for exact versions, commits, chart/image digests, and named
+contracts. Pin each external product and prove its contract again in the target
+cluster before enabling governed execution.
 
 | Component | Supported / tested now |
 |---|---|
@@ -90,8 +92,10 @@ again in the customer's cluster before enabling governed execution.
 | OpenShell | 0.0.98 |
 | agent-sandbox | 0.5.0 |
 | Runtime | Cluster/OpenShell default; no VM-isolation claim |
-| MCP-GW | 0.3.2 authority v1; 0.4.9 authority v2 |
-| Other integrations | Operator-supplied and tested as part of the selected deployment |
+| SPIRE | `spire-crds` 0.5.0; `spire` 0.29.0; exact rendered images in the compatibility manifest |
+| MCP-GW | `steward.connections.github/v1`: 0.3.2; `steward.connections.github/v2`: 0.4.9–0.4.11 |
+| LiteLLM | 1.93.0; Responses and Anthropic Messages contracts defined in the compatibility manifest |
+| Companion products | Exact `steward-run` and `github-oidc-exchange` coordinates in the compatibility manifest |
 
 Runtime support is the Kubernetes/OpenShell default. Operators may set
 `config.controller.openshellRuntimeClassName` only when their platform requires

@@ -25,23 +25,18 @@ CLI version, native executable, and both released profile allowlists.
 
 ## Mirror the exact manifest
 
-Download and verify `release-handoff.json`, then copy the digest-selected manifest without rebuilding
-it:
+Use the released [daemonless registry mirror](registry-mirroring.md). Add an
+explicit `referenceRuntimes.codex` target to the mapping, review the no-write
+plan, and run `mirror`. The resulting deployment lock supplies the exact
+digest-pinned value at `executionBindingImages.codex`; use that value in the
+binding. The lock retains the source and target coordinates and digests as
+deployment evidence.
 
-```sh
-source_reference="$(jq -r '.referenceRuntimes.codex.reference' release-handoff.json)"
-source_digest="$(jq -r '.referenceRuntimes.codex.digest' release-handoff.json)"
-source_image="${source_reference}@${source_digest}"
-target_image="registry.example.test/agents/steward-codex-runtime:0.140.0-steward-0.2.2"
-
-docker buildx imagetools create --tag "${target_image}" "${source_image}"
-docker buildx imagetools inspect "${source_image}"
-docker buildx imagetools inspect "${target_image}"
-```
-
-Resolve the target registry's immutable digest after the copy and use
-`registry.example.test/agents/steward-codex-runtime@sha256:<target-digest>` in the binding. Retain the
-source coordinate, source digest, target coordinate, and target digest as deployment evidence.
+For an existing Docker-only mirror automation, the equivalent manifest copy is
+`docker buildx imagetools create --tag <target> <source@digest>`. It must copy
+the source digest without rebuilding it; use the resulting target digest in
+the binding. New installations should use the released ORAS-based mirror so a
+Docker daemon is not required.
 
 ## Build a compatible private runtime
 
@@ -64,7 +59,7 @@ bundle from a `linux/amd64` host with Docker and the pinned Kubernetes tools bef
 ```sh
 scripts/codex-reference-runtime-conformance.sh \
   --image registry.example.test/agents/codex@sha256:<private-digest> \
-  --provider-profile-bundle steward-runtime-providers-0.2.2.tar.gz
+  --provider-profile-bundle steward-runtime-providers-0.2.3.tar.gz
 ```
 
 A private image that passes this contract is compatible with `codex-v1`; it is independently built

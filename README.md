@@ -17,7 +17,7 @@ available models and tools without granting authority.
 Steward is available under the [MIT License](LICENSE). Checked-in upstream
 patches retain their [third-party notices](THIRD_PARTY_NOTICES.md).
 
-Current installation contract: chart `0.2.2`, Kubernetes `>=1.30`, Helm 3.17+,
+Current installation contract: chart `0.2.3`, Kubernetes `>=1.30`, Helm 3.17+,
 and PostgreSQL 16 as the tested database line. Governed adapter evidence pins
 OpenShell `v0.0.98` with agent-sandbox `v0.5.0`. No registry is a default:
 release images and the OCI
@@ -152,6 +152,11 @@ operator supplies immutable image coordinates and chooses customer-owned TLS
 Secrets plus a public webhook CA, or cert-manager with an explicit issuer.
 Verified PostgreSQL deployments can project an existing CA `ConfigMap` or
 `Secret` read-only into both database clients.
+When the optional Gateway API edge is used, Steward keeps the apiserver backend
+TLS-enabled: its chart renders a `BackendTLSPolicy` that verifies the apiserver
+against a public CA ConfigMap and its full in-cluster DNS identity. See the
+[Gateway backend TLS contract](docs/installation/governed-platform-compatibility.md#gateway-api-backend-tls-contract)
+before enabling `web.httpRoute`.
 Core mode keeps execution disabled and Task orchestration staged. To enable
 governed execution, first validate all dependency and functional sandbox
 requirements in the [installation guide](docs/installation/installation-guide.md)
@@ -159,8 +164,10 @@ and [execution-binding guide](docs/installation/execution-bindings.md).
 Release assets include a standalone `linux/amd64` provider-profile validator
 and installer, so operators do not need a Steward source checkout to render the
 released runtime-provider bundle. They also include the
-[`steward-registry-lock.py`](docs/installation/registry-mirroring.md) tool for
-verified private-registry mirroring and deterministic deployment locks.
+[`steward-registry-lock.sh`](docs/installation/registry-mirroring.md) tool for
+verified private-registry mirroring and deterministic deployment locks, plus an
+attested [governed-platform compatibility manifest](docs/installation/governed-platform-compatibility.md)
+with the exact tested product and dependency coordinates.
 
 Historical design documents remain available through the documentation index;
 they are not an installation contract. The API group is

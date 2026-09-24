@@ -1,8 +1,8 @@
 # Platform preflight bundle
 
-Status: **Supported for Steward v0.2.2**
+Status: **Supported for Steward v0.2.3**
 
-The release asset `steward-platform-preflight-0.2.2.tar.gz` contains a
+The release asset `steward-platform-preflight-0.2.3.tar.gz` contains a
 dependency-free Python validator and generator, its input schema, and neutral
 examples. It converts one reviewed non-secret input into deterministic Steward
 Helm values, a Flux-compatible values `ConfigMap`, machine diagnostics, and a
@@ -14,8 +14,8 @@ ARC controller service account, and external Secret. Secret bodies are neither
 accepted nor emitted. Existing infrastructure remains operator-owned.
 
 ```sh
-tar -xzf steward-platform-preflight-0.2.2.tar.gz
-tar -xzf steward-runtime-providers-0.2.2.tar.gz
+tar -xzf steward-platform-preflight-0.2.3.tar.gz
+tar -xzf steward-runtime-providers-0.2.3.tar.gz
 cd platform-preflight/v1
 ./steward-platform-preflight generate \
   --input examples/compact.json \
@@ -74,6 +74,79 @@ ARC controller ServiceAccount, external Secrets, workload-exchange trust
 ConfigMap, and database CA source. It requests metadata only for Secret and
 ConfigMap existence checks and does not retrieve their bodies. It does not
 create DNS records, certificates, Gateways, or routes.
+
+## Gateway backend TLS
+
+The chart requires Gateway API `v1.4.0` or later and a `GatewayClass` that
+reports the extended `BackendTLSPolicy` feature. The platform owns those CRDs,
+the controller, and CA distribution; the chart owns the `BackendTLSPolicy`
+attached to the apiserver HTTPS Service. The released preflight bundle also
+contains `steward-gateway-backend-tls-check`, which performs the complete
+read-only validation without printing Secret contents or private keys:
+
+```sh
+./steward-gateway-backend-tls-check \
+  --kubeconfig "$CLUSTER_KUBECONFIG" \
+  --context "$CLUSTER_CONTEXT" \
+  --namespace steward \
+  --gateway-class <gateway-class> \
+  --ca-config-map steward-apiserver-ca \
+  --api-tls-secret steward-apiserver-tls \
+  --public-url https://steward.example.test
+```
+
+For an initial platform inspection, use the following read-only checks:
+
+```sh
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  get crd backendtlspolicies.gateway.networking.k8s.io
+
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  get gatewayclass <gateway-class> \
+  -o json | jq -e '
+    [.status.supportedFeatures[]? | if type == "string" then . else .name end]
+    | index("BackendTLSPolicy")
+  ' >/dev/null
+
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  -n steward get configmap steward-apiserver-ca \
+  -o jsonpath='{.data.ca\\.crt}' >/dev/null
+
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  -n steward get service steward-apiserver \
+  -o jsonpath='{.spec.ports[?(@.name=="https")].port}{"\\n"}'
+
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  -n steward get httproute steward-api
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  -n steward get backendtlspolicy steward-apiserver
+```
+
+The API route and policy must both report `Accepted=True` and
+`ResolvedRefs=True` for the selected Gateway controller. The apiserver policy
+must target `Service/steward-apiserver`, section `https`, use the full Service
+DNS name, and reference the same-namespace public CA ConfigMap at `ca.crt`.
+Use a trust-distribution controller to keep that ConfigMap current when the
+issuer rotates; never copy `tls.key` or the apiserver TLS Secret into the
+Gateway namespace.
+
+Finally, make a bounded request to the public session path. A Steward-owned
+`200`, `401`, or `403` proves the request reached the application. A `502` or
+`503` is a Gateway/backend failure, not an OAuth response:
+
+```sh
+curl --fail-with-body --silent --show-error --output /dev/null \
+  --write-out '%{http_code}\n' \
+  https://steward.example.test/admin/api/v1/session
+```
+
+For diagnostics, distinguish: no ready `EndpointSlice` entries (backend has no
+ready Pods); `HTTPRoute ResolvedRefs=False` (wrong Service/port or route
+reference); `BackendTLSPolicy ResolvedRefs=False` (missing or invalid CA
+reference); policy `Accepted=False` (the controller does not support or accept
+the policy); and a public `502`/`503` with accepted objects (CA, SNI, or
+backend TLS protocol mismatch). Do not work around any of these by changing
+the apiserver Service to plaintext.
 
 ## NetworkPolicy enforcement on EKS
 

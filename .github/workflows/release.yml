@@ -44,6 +44,7 @@ jobs:
             scripts/package-platform-preflight.sh \
             scripts/test-package-provider-profile-bundle.sh \
             scripts/test-package-platform-preflight.sh \
+            scripts/steward-registry-lock.sh \
             scripts/test-steward-registry-lock.sh \
             scripts/steward-registry-lock-live-conformance.sh \
             scripts/test-released-artifact-acceptance.sh \
@@ -440,8 +441,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Install daemonless OCI tools
+        uses: ./.github/actions/setup-tools
+        with:
+          oci-tools: "true"
 
       - name: Prove multi-platform registry mirroring
         run: scripts/steward-registry-lock-live-conformance.sh
@@ -685,7 +688,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.2.2"
+          test "$version" = "0.2.3"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
@@ -696,10 +699,36 @@ jobs:
           platform_preflight_bundle_digest="$(cat dist/platform-preflight-bundle.digest)"
           bridge_signer_identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
           bridge_source_repository="https://github.com/$GITHUB_REPOSITORY"
-          mirror_asset="steward-registry-lock.py"
-          install -m 0755 scripts/steward-registry-lock.py "dist/$mirror_asset"
+          mirror_asset="steward-registry-lock.sh"
+          install -m 0755 scripts/steward-registry-lock.sh "dist/$mirror_asset"
           mirror_digest="sha256:$(sha256sum "dist/$mirror_asset" | awk '{print $1}')"
           (cd dist && sha256sum "$mirror_asset" > "${mirror_asset}.sha256")
+          compatibility_asset="steward-governed-platform-compatibility-${version}.json"
+          jq \
+            --arg version "$version" \
+            --arg commit "$GITHUB_SHA" \
+            --arg chart_reference "oci://${chart}:${version}" \
+            --arg chart_digest "$(cat dist/helm-chart.digest)" \
+            --arg image_repository "$repository" \
+            --arg apiserver_digest "$(cat dist/apiserver.digest)" \
+            --arg controller_digest "$(cat dist/controller.digest)" \
+            --arg mint_digest "$(cat dist/mint.digest)" \
+            --arg bridge_digest "$bridge_digest" \
+            --arg web_digest "$(cat dist/web.digest)" \
+            '.steward = {
+              version: $version,
+              commit: $commit,
+              chart: {reference: $chart_reference, digest: $chart_digest},
+              images: {
+                apiserver: {reference: ($image_repository + ":" + $version + "-apiserver"), digest: $apiserver_digest},
+                controller: {reference: ($image_repository + ":" + $version + "-controller"), digest: $controller_digest},
+                mint: {reference: ($image_repository + ":" + $version + "-mint"), digest: $mint_digest},
+                bridge: {reference: ($image_repository + ":" + $version + "-bridge"), digest: $bridge_digest},
+                web: {reference: ($image_repository + ":" + $version + "-web"), digest: $web_digest}
+              }
+            }' config/governed-platform/v1/compatibility.json > "dist/$compatibility_asset"
+          compatibility_digest="sha256:$(sha256sum "dist/$compatibility_asset" | awk '{print $1}')"
+          (cd dist && sha256sum "$compatibility_asset" > "${compatibility_asset}.sha256")
           jq -n \
             --arg version "$version" \
             --arg commit "$GITHUB_SHA" \
@@ -716,6 +745,8 @@ jobs:
             --arg provider_digest "$provider_profile_bundle_digest" \
             --arg mirror_asset "$mirror_asset" \
             --arg mirror_digest "$mirror_digest" \
+            --arg compatibility_asset "$compatibility_asset" \
+            --arg compatibility_digest "$compatibility_digest" \
             --arg platform_preflight_digest "$platform_preflight_bundle_digest" \
             '{
               schemaVersion: "steward.release-handoff/v1",
@@ -757,6 +788,11 @@ jobs:
                 digest: $mirror_digest,
                 lockSchema: "steward.deployment-lock/v1"
               },
+              governedPlatformCompatibility: {
+                schemaVersion: "steward.governed-platform-compatibility/v1",
+                asset: $compatibility_asset,
+                digest: $compatibility_digest
+              },
               platformPreflightBundle: {
                 identity: "steward.platform-preflight/v1",
                 asset: ("steward-platform-preflight-" + $version + ".tar.gz"),
@@ -769,15 +805,16 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.2.2 reconciles external Task runtimes only from their exact persisted Task authority, including ordinary runtime provisioning, successful completion, failure, cancellation, TTL expiry, finalizer cleanup, and exact-UID deletion.\n\n'
+            printf 'Steward v0.2.3 publishes one exact governed-platform compatibility contract, uses a named MCP-GW authority selector, and ships a daemonless image-and-chart mirror with explicit planning and Flux-ready deployment locks.\n\n'
             printf 'Required image inputs now reject all-zero placeholder digests before deployment or runtime provisioning.\n\n'
             printf 'The chart can project an existing Secret- or ConfigMap-backed PostgreSQL CA into both database consumers for sslmode=verify-full.\n\n'
             printf 'The provider-profile release bundle now includes a standalone linux/amd64 validator and installer with deterministic output and machine-readable evidence.\n\n'
-            printf 'The release includes a registry mirror tool that preserves OCI indexes, verifies target digests and platforms, and writes a deterministic credential-free deployment lock.\n\n'
+            printf 'The release includes a daemonless ORAS mirror for the OCI chart, component images, and reference runtimes, with explicit planning, collision-safe resume, target digest verification, and a deterministic credential-free deployment lock.\n\n'
+            printf 'The release includes one attested compatibility manifest with exact Steward, companion-product, OpenShell, agent-sandbox, SPIRE, MCP-GW, and LiteLLM coordinates and contracts.\n\n'
             printf 'The release includes a supported linux/amd64 Codex 0.140.0 reference runtime, with its immutable digest, SBOM, provenance, and provider-profile conformance evidence.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
             printf 'Before migration 0039, terminalize and finalize every unfinished legacy Task that lacks a complete User Envelope or internal-authority pin. Use Identity v0.5.0 with policy contract github-oidc-exchange.apelogic.io/v5, remove Service Envelope bootstrap configuration, and configure the non-authoritative capability catalog.\n\n'
-            printf 'Rollback from v0.2.2 to v0.2.1 requires no database rollback because this patch adds no migration. The v0.1.23 rollback boundary remains unchanged; see docs/installation/upgrade-v0.2.0.md.\n\n'
+            printf 'Rollback from v0.2.3 to v0.2.2 requires no database rollback because this patch adds no migration. The v0.1.23 rollback boundary remains unchanged; see docs/installation/upgrade-v0.2.0.md.\n\n'
             printf '## Acceptance\n\n'
             printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
@@ -809,7 +846,11 @@ jobs:
             printf '\n## Registry mirror and deployment lock\n\n'
             printf 'Mirror tool asset: %s\n\n' "$mirror_asset"
             printf 'Mirror tool SHA-256: %s\n\n' "$mirror_digest"
-            printf 'Use the verified release-handoff.json as input; the tool copies every listed component image and reference runtime, verifies the target registry, and emits steward.deployment-lock/v1.\n\n'
+            printf 'Use the verified release-handoff.json plus an explicit steward.registry-mappings/v1 document; the tool plans and copies the chart, every component image, and every reference runtime, then emits steward.deployment-lock/v1 with Flux-ready chart coordinates.\n\n'
+            printf '\n## Governed-platform compatibility\n\n'
+            printf 'Compatibility manifest asset: %s\n\n' "$compatibility_asset"
+            printf 'Compatibility manifest SHA-256: %s\n\n' "$compatibility_digest"
+            printf 'This attested manifest is the exact tested product and dependency combination for this release.\n\n'
             printf '\n## Platform preflight bundle\n\n'
             printf 'Platform preflight asset: steward-platform-preflight-%s.tar.gz\n\n' "$version"
             printf 'Platform preflight identity: steward.platform-preflight/v1\n\n'
@@ -836,6 +877,24 @@ jobs:
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/release-handoff-attestation.jsonl
           gh attestation verify dist/release-handoff.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
+
+      - name: Attest governed-platform compatibility manifest
+        id: attest-governed-platform-compatibility
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: dist/steward-governed-platform-compatibility-0.2.3.json
+
+      - name: Archive governed-platform compatibility verification material
+        env:
+          BUNDLE_PATH: ${{ steps.attest-governed-platform-compatibility.outputs.bundle-path }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -s "$BUNDLE_PATH"
+          cp "$BUNDLE_PATH" dist/steward-governed-platform-compatibility-attestation.jsonl
+          gh attestation verify dist/steward-governed-platform-compatibility-0.2.3.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 
@@ -909,11 +968,34 @@ jobs:
           destination="$RUNNER_TEMP/registry-mirror"
           mkdir -p "$destination"
           gh release download "$GITHUB_REF_NAME" \
-            --pattern steward-registry-lock.py \
-            --pattern steward-registry-lock.py.sha256 \
+            --pattern steward-registry-lock.sh \
+            --pattern steward-registry-lock.sh.sha256 \
             --dir "$destination"
-          (cd "$destination" && sha256sum --check steward-registry-lock.py.sha256)
-          cmp scripts/steward-registry-lock.py "$destination/steward-registry-lock.py"
-          actual="sha256:$(sha256sum "$destination/steward-registry-lock.py" | awk '{print $1}')"
+          (cd "$destination" && sha256sum --check steward-registry-lock.sh.sha256)
+          cmp scripts/steward-registry-lock.sh "$destination/steward-registry-lock.sh"
+          actual="sha256:$(sha256sum "$destination/steward-registry-lock.sh" | awk '{print $1}')"
           expected="$(jq -r '.registryMirror.digest' dist/release-handoff.json)"
+          test "$actual" = "$expected"
+
+      - name: Verify published governed-platform compatibility manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          asset="steward-governed-platform-compatibility-${version}.json"
+          destination="$RUNNER_TEMP/governed-platform-compatibility"
+          mkdir -p "$destination"
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "$asset" \
+            --pattern "${asset}.sha256" \
+            --pattern steward-governed-platform-compatibility-attestation.jsonl \
+            --dir "$destination"
+          (cd "$destination" && sha256sum --check "${asset}.sha256")
+          cmp "dist/$asset" "$destination/$asset"
+          gh attestation verify "$destination/$asset" \
+            --repo "$GITHUB_REPOSITORY" \
+            --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
+          actual="sha256:$(sha256sum "$destination/$asset" | awk '{print $1}')"
+          expected="$(jq -r '.governedPlatformCompatibility.digest' dist/release-handoff.json)"
           test "$actual" = "$expected"

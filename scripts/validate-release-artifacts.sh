@@ -7,6 +7,7 @@ bash "${root}/scripts/validate-release-version.sh" >/dev/null
 bash "${root}/scripts/test-released-artifact-acceptance.sh"
 bash "${root}/scripts/test-release-chart-contract.sh"
 bash "${root}/scripts/test-steward-registry-lock.sh"
+bash "${root}/scripts/test-steward-gateway-backend-tls-check.sh"
 python3 "${root}/scripts/test-platform-preflight.py"
 bash "${root}/scripts/test-package-platform-preflight.sh"
 chart_contract_mode="$(bash "${root}/scripts/release-chart-contract.sh" "${root}/charts/steward/Chart.yaml")"
@@ -22,6 +23,9 @@ connections_bridge_bundle="$(mktemp)"
 connections_bridge_configmap="$(mktemp)"
 connections_bridge_apiserver_deployment="$(mktemp)"
 connections_bridge_controller_deployment="$(mktemp)"
+authority_contract_connections_bridge_rendered="$(mktemp)"
+authority_contract_connections_bridge_apiserver_deployment="$(mktemp)"
+authority_contract_connections_bridge_controller_deployment="$(mktemp)"
 operator_connections_bridge_rendered="$(mktemp)"
 operator_connections_bridge_apiserver_deployment="$(mktemp)"
 operator_connections_bridge_controller_deployment="$(mktemp)"
@@ -35,6 +39,7 @@ web_rendered="$(mktemp)"
 web_deployment="$(mktemp)"
 external_edge_rendered="$(mktemp)"
 http_route_rendered="$(mktemp)"
+backend_tls_policy="$(mktemp)"
 secret_trust_rendered="$(mktemp)"
 mint_synthetic_kubeconfig="$(mktemp)"
 mint_startup_output="$(mktemp)"
@@ -53,6 +58,9 @@ cleanup() {
     "${connections_bridge_bundle}" "${connections_bridge_configmap}" \
     "${connections_bridge_apiserver_deployment}" \
     "${connections_bridge_controller_deployment}" \
+    "${authority_contract_connections_bridge_rendered}" \
+    "${authority_contract_connections_bridge_apiserver_deployment}" \
+    "${authority_contract_connections_bridge_controller_deployment}" \
     "${operator_connections_bridge_rendered}" \
     "${operator_connections_bridge_apiserver_deployment}" \
     "${operator_connections_bridge_controller_deployment}" "${browser_auth_rendered}" \
@@ -60,6 +68,7 @@ cleanup() {
     "${task_identity_deployment}" "${task_execution_bindings_rendered}" \
     "${github_source_rendered}" \
     "${web_rendered}" "${web_deployment}" "${external_edge_rendered}" "${http_route_rendered}" \
+    "${backend_tls_policy}" \
     "${secret_trust_rendered}" \
     "${mint_synthetic_kubeconfig}" "${mint_startup_output}"
   exit "${status}"
@@ -520,11 +529,12 @@ if grep -Fq 'kind: Ingress' "${external_edge_rendered}"; then
   echo "environment-owned web edge must not render Steward Ingress resources" >&2
   exit 1
 fi
+if grep -Fq 'kind: BackendTLSPolicy' "${external_edge_rendered}"; then
+  echo "disabled Gateway API routing must not render a backend TLS policy" >&2
+  exit 1
+fi
 
-helm template steward "${root}/charts/steward" \
-  --namespace steward \
-  --include-crds \
-  "${image_values[@]}" \
+http_route_values=(
   --set web.enabled=true \
   --set web.httpRoute.enabled=true \
   --set-string web.host=steward.example.test \
@@ -536,6 +546,9 @@ helm template steward "${root}/charts/steward" \
   --set-string 'web.httpRoute.apiPaths[0].value=/admin/api' \
   --set-string 'web.httpRoute.webPaths[0].type=PathPrefix' \
   --set-string 'web.httpRoute.webPaths[0].value=/' \
+  --set-string web.httpRoute.backendTls.hostname=steward-apiserver.steward.svc.cluster.local \
+  --set-string web.httpRoute.backendTls.caConfigMap.name=steward-apiserver-ca \
+  --set-string web.httpRoute.backendTls.caConfigMap.key=ca.crt \
   --set images.web.tag=validation-web \
   --set "images.web.digest=${digest3}" \
   --set browserAuth.enabled=true \
@@ -546,8 +559,19 @@ helm template steward "${root}/charts/steward" \
   --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
   --set-string browserAuth.google.clientSecret.key=client-secret \
   --set networkPolicy.ingressNamespace=envoy-gateway-system \
-  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' > "${http_route_rendered}"
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24'
+)
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  "${http_route_values[@]}" > "${http_route_rendered}"
 test "$(grep -c '^kind: HTTPRoute$' "${http_route_rendered}")" -eq 2
+test "$(grep -c '^kind: BackendTLSPolicy$' "${http_route_rendered}")" -eq 1
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: BackendTLSPolicy/ && $0 ~ /name: steward-apiserver/ { print; exit }
+' "${http_route_rendered}" > "${backend_tls_policy}"
 for required in \
   'name: steward-api' \
   'name: steward-web' \
@@ -563,8 +587,37 @@ for required in \
 do
   grep -Fq "${required}" "${http_route_rendered}"
 done
+for required in \
+  'group: ""' \
+  'kind: Service' \
+  'name: steward-apiserver' \
+  'sectionName: https' \
+  'hostname: "steward-apiserver.steward.svc.cluster.local"' \
+  'kind: ConfigMap' \
+  'name: "steward-apiserver-ca"'
+do
+  grep -Fq "${required}" "${backend_tls_policy}"
+done
 if grep -Fq 'kind: Ingress' "${http_route_rendered}"; then
   echo "Gateway API routing must not render a legacy Ingress" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  "${image_values[@]}" \
+  "${http_route_values[@]}" \
+  --set-string web.httpRoute.backendTls.hostname=wrong.example.test >/dev/null 2>&1
+then
+  echo "a Gateway API apiserver policy with an incorrect backend SNI must fail chart validation" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  "${image_values[@]}" \
+  "${http_route_values[@]}" \
+  --set-string web.httpRoute.backendTls.caConfigMap.name= >/dev/null 2>&1
+then
+  echo "a Gateway API apiserver policy without a public CA ConfigMap must fail chart validation" >&2
   exit 1
 fi
 if helm template steward "${root}/charts/steward" \
@@ -720,6 +773,57 @@ do
     exit 1
   fi
 done
+
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  "${connections_bridge_values[@]}" \
+  --set-string connectionsBridge.mcpGatewayVersion= \
+  --set-string connectionsBridge.mcpGatewayAuthorityContract=steward.connections.github/v2 \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
+  --set-file "connectionsBridge.attestationBundle=${connections_bridge_bundle}" \
+  > "${authority_contract_connections_bridge_rendered}"
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-apiserver/ { print; exit }
+' "${authority_contract_connections_bridge_rendered}" > "${authority_contract_connections_bridge_apiserver_deployment}"
+awk '
+  BEGIN { RS = "---\\n" }
+  $0 ~ /kind: Deployment/ && $0 ~ /name: steward-controller/ { print; exit }
+' "${authority_contract_connections_bridge_rendered}" > "${authority_contract_connections_bridge_controller_deployment}"
+for deployment in \
+  "${authority_contract_connections_bridge_apiserver_deployment}" \
+  "${authority_contract_connections_bridge_controller_deployment}"
+do
+  grep -Fxq '            - { name: STEWARD_CONNECTIONS_MCP_GW_VERSION, value: "0.4.9" }' "${deployment}"
+done
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  "${connections_bridge_values[@]}" \
+  --set-string connectionsBridge.mcpGatewayAuthorityContract=steward.connections.github/v2 \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
+  --set-file "connectionsBridge.attestationBundle=${connections_bridge_bundle}" >/dev/null 2>&1
+then
+  echo 'Connections bridge must reject simultaneous named and legacy authority selectors' >&2
+  exit 1
+fi
 
 helm template steward "${root}/charts/steward" \
   --namespace steward \
