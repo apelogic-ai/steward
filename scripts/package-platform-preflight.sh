@@ -17,14 +17,18 @@ bundle="$staging/platform-preflight/v1"
 mkdir -p "$bundle/examples" "$output_directory"
 install -m 0755 "$root/scripts/steward-platform-preflight.py" "$bundle/steward-platform-preflight"
 cp "$root/config/platform-preflight/v1/input.schema.json" "$bundle/input.schema.json"
+cp "$root/config/platform-preflight/v1/namespace-map.schema.json" "$bundle/namespace-map.schema.json"
 cp "$root/config/platform-preflight/v1/examples/compact.json" "$bundle/examples/compact.json"
+cp "$root/config/platform-preflight/v1/examples/separated.json" "$bundle/examples/separated.json"
 cp "$root/docs/installation/platform-preflight.md" "$bundle/README.md"
 printf '{"schemaVersion":"steward.platform-preflight-release/v1","sourceRelease":"v%s"}\n' "$version" > "$bundle/release.json"
 find "$staging" -type f -exec touch -t 197001010000 {} +
 paths=(
   platform-preflight/v1/README.md
   platform-preflight/v1/input.schema.json
+  platform-preflight/v1/namespace-map.schema.json
   platform-preflight/v1/examples/compact.json
+  platform-preflight/v1/examples/separated.json
   platform-preflight/v1/release.json
   platform-preflight/v1/steward-platform-preflight
 )

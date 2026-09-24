@@ -12,6 +12,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts" / "steward-platform-preflight.py"
 EXAMPLE = ROOT / "config" / "platform-preflight" / "v1" / "examples" / "compact.json"
+SEPARATED = ROOT / "config" / "platform-preflight" / "v1" / "examples" / "separated.json"
 
 
 class PlatformPreflightTests(unittest.TestCase):
@@ -44,6 +45,11 @@ class PlatformPreflightTests(unittest.TestCase):
         result = self.run_validate(self.input)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["status"], "valid")
+
+    def test_valid_separated_input(self) -> None:
+        separated = json.loads(SEPARATED.read_text(encoding="utf-8"))
+        result = self.run_validate(separated)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rejects_placeholder_digest(self) -> None:
         self.input["deploymentLock"]["artifacts"]["images.apiserver"]["target"]["digest"] = "sha256:" + "0" * 64
@@ -83,7 +89,7 @@ class PlatformPreflightTests(unittest.TestCase):
             for name in ("first", "second"):
                 result = subprocess.run([str(TOOL), "generate", "--input", str(input_path), "--output", str(base / name)], capture_output=True, text=True, check=False)
                 self.assertEqual(result.returncode, 0, result.stderr)
-            for filename in ("steward-values.json", "provider-profile-inputs.json", "diagnostics.json", "flux-values-configmap.yaml", "summary.txt"):
+            for filename in ("steward-values.json", "provider-profile-inputs.json", "namespace-references.json", "diagnostics.json", "flux-values-configmap.yaml", "summary.txt"):
                 self.assertEqual((base / "first" / filename).read_bytes(), (base / "second" / filename).read_bytes())
             values = (base / "first" / "steward-values.json").read_text(encoding="utf-8")
             self.assertNotIn("not-allowed", values)
@@ -94,6 +100,28 @@ class PlatformPreflightTests(unittest.TestCase):
             self.assertEqual(rendered_values["config"]["apiserver"]["executionBindingsMode"], "active")
             profile_inputs = json.loads((base / "first" / "provider-profile-inputs.json").read_text(encoding="utf-8"))
             self.assertEqual(profile_inputs["bundle"]["version"], "1.2.0")
+
+    def test_namespace_change_updates_generated_references(self) -> None:
+        separated = json.loads(SEPARATED.read_text(encoding="utf-8"))
+        separated["namespaces"]["gateway"] = "edge-v2"
+        separated["gateway"]["parentRef"]["namespace"] = "edge-v2"
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary)
+            input_path = base / "input.json"
+            input_path.write_text(json.dumps(separated), encoding="utf-8")
+            result = subprocess.run([str(TOOL), "generate", "--input", str(input_path), "--output", str(base / "rendered")], capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            values = json.loads((base / "rendered" / "steward-values.json").read_text(encoding="utf-8"))
+            references = json.loads((base / "rendered" / "namespace-references.json").read_text(encoding="utf-8"))
+            self.assertEqual(values["web"]["httpRoute"]["parentRefs"][0]["namespace"], "edge-v2")
+            self.assertEqual(values["networkPolicy"]["ingressNamespace"], "edge-v2")
+            self.assertEqual(references["gatewayParentRef"]["namespace"], "edge-v2")
+
+    def test_stale_namespace_reference_is_rejected(self) -> None:
+        self.input["namespaces"]["providers"] = "providers-v2"
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must equal namespaces.providers", result.stderr)
 
     def test_live_gateway_identity_listener_and_certificate(self) -> None:
         gateway = {

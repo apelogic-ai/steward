@@ -20,7 +20,19 @@ RESULT_CONTRACT = "steward.platform-preflight-result/v1"
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 DNS_NAME = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 K8S_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
-REQUIRED_NAMESPACES = ("steward", "runtime", "providers", "gateway", "arc", "databaseTls")
+REQUIRED_NAMESPACES = (
+    "steward",
+    "runtime",
+    "providers",
+    "gateway",
+    "arc",
+    "databaseTls",
+    "mcpGateway",
+    "litellm",
+    "identityExchange",
+    "openshell",
+    "dns",
+)
 IMAGE_COMPONENTS = ("apiserver", "controller", "mint", "web", "bridge")
 
 
@@ -371,8 +383,13 @@ def chart_values(data: dict[str, Any]) -> dict[str, Any]:
         },
         "networkPolicy": {
             "enabled": True,
+            "dnsNamespace": data["namespaces"]["dns"],
             "ingressNamespace": data["namespaces"]["gateway"],
             "arcNamespace": data["namespaces"]["arc"],
+            "mcpGatewayNamespace": data["namespaces"]["mcpGateway"],
+            "litellmNamespace": data["namespaces"]["litellm"],
+            "identityExchangeNamespace": data["namespaces"]["identityExchange"],
+            "openshellNamespace": data["namespaces"]["openshell"],
             "apiserverIngressNamespaces": [data["namespaces"]["arc"]],
             "browserAuthEgressCidrs": data["browserAuth"]["egressCidrs"],
         },
@@ -399,6 +416,25 @@ def provider_profile_inputs(data: dict[str, Any]) -> dict[str, Any]:
             for profile in data["providerProfiles"]
         ],
     }
+
+
+def namespace_references(data: dict[str, Any]) -> dict[str, Any]:
+    tls = data["database"]["tls"]
+    references: dict[str, Any] = {
+        "schemaVersion": "steward.namespace-references/v1",
+        "namespaceMap": data["namespaces"],
+        "gatewayParentRef": data["gateway"]["parentRef"],
+        "arcControllerServiceAccount": data["arc"]["controllerServiceAccount"],
+        "externalSecrets": data["externalSecrets"],
+        "externalConfigMaps": data["externalConfigMaps"],
+        "providerProfiles": [
+            {"name": profile["name"], "namespace": profile["namespace"]}
+            for profile in data["providerProfiles"]
+        ],
+    }
+    if tls["mode"] == "verify-full":
+        references["databaseCa"] = tls["ca"]
+    return references
 
 
 def validate_browser(data: dict[str, Any]) -> None:
@@ -465,6 +501,7 @@ def generate(args: argparse.Namespace) -> int:
     values_path = args.output / "steward-values.json"
     values_path.write_text(canonical(values), encoding="utf-8")
     (args.output / "provider-profile-inputs.json").write_text(canonical(provider_profile_inputs(data)), encoding="utf-8")
+    (args.output / "namespace-references.json").write_text(canonical(namespace_references(data)), encoding="utf-8")
     if args.chart is not None:
         run_helm(args.chart, data["namespaces"]["steward"], values_path)
         diagnostics.append({"code": "chart.valid", "severity": "info", "message": "generated values pass Helm lint and template"})

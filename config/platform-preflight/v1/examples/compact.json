@@ -6,7 +6,12 @@
     "providers": "steward-system",
     "gateway": "gateway-system",
     "arc": "arc-system",
-    "databaseTls": "steward-system"
+    "databaseTls": "steward-system",
+    "mcpGateway": "steward-system",
+    "litellm": "steward-system",
+    "identityExchange": "steward-system",
+    "openshell": "steward-system",
+    "dns": "kube-system"
   },
   "deploymentLock": {
     "schemaVersion": "steward.deployment-lock/v1",

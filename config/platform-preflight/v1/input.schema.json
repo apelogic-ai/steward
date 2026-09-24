@@ -23,7 +23,7 @@
     "schemaVersion": {"const": "steward.platform-input/v1"},
     "namespaces": {
       "type": "object",
-      "required": ["steward", "runtime", "providers", "gateway", "arc", "databaseTls"],
+      "required": ["steward", "runtime", "providers", "gateway", "arc", "databaseTls", "mcpGateway", "litellm", "identityExchange", "openshell", "dns"],
       "additionalProperties": false,
       "properties": {
         "steward": {"$ref": "#/$defs/name"},
@@ -31,7 +31,12 @@
         "providers": {"$ref": "#/$defs/name"},
         "gateway": {"$ref": "#/$defs/name"},
         "arc": {"$ref": "#/$defs/name"},
-        "databaseTls": {"$ref": "#/$defs/name"}
+        "databaseTls": {"$ref": "#/$defs/name"},
+        "mcpGateway": {"$ref": "#/$defs/name"},
+        "litellm": {"$ref": "#/$defs/name"},
+        "identityExchange": {"$ref": "#/$defs/name"},
+        "openshell": {"$ref": "#/$defs/name"},
+        "dns": {"$ref": "#/$defs/name"}
       }
     },
     "deploymentLock": {

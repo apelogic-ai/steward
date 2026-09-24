@@ -1,0 +1,73 @@
+{
+  "schemaVersion": "steward.platform-input/v1",
+  "namespaces": {
+    "steward": "steward-control",
+    "runtime": "steward-runtimes",
+    "providers": "steward-providers",
+    "gateway": "edge-system",
+    "arc": "arc-system",
+    "databaseTls": "steward-control",
+    "mcpGateway": "mcp-system",
+    "litellm": "inference-system",
+    "identityExchange": "identity-system",
+    "openshell": "sandbox-system",
+    "dns": "kube-system"
+  },
+  "deploymentLock": {
+    "schemaVersion": "steward.deployment-lock/v1",
+    "release": {"version": "0.2.2", "commit": "1111111111111111111111111111111111111111"},
+    "mode": "single-platform",
+    "requestedPlatform": "linux/amd64",
+    "artifacts": {
+      "images.apiserver": {"target": {"reference": "registry.example.test/team-a/steward:0.2.2-apiserver", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"}},
+      "images.controller": {"target": {"reference": "registry.example.test/team-a/steward:0.2.2-controller", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"}},
+      "images.mint": {"target": {"reference": "registry.example.test/team-a/steward:0.2.2-mint", "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"}},
+      "images.web": {"target": {"reference": "registry.example.test/team-a/steward:0.2.2-web", "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"}},
+      "images.bridge": {"target": {"reference": "registry.example.test/team-a/steward:0.2.2-bridge", "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"}},
+      "referenceRuntimes.codex": {"target": {"reference": "registry.example.test/team-a/codex:0.140.0", "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"}}
+    },
+    "chartValues": {
+      "images": {
+        "repository": "registry.example.test/team-a/steward",
+        "apiserver": {"tag": "0.2.2-apiserver", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+        "controller": {"tag": "0.2.2-controller", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+        "mint": {"tag": "0.2.2-mint", "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
+        "web": {"tag": "0.2.2-web", "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"}
+      },
+      "connectionsBridge": {"image": "registry.example.test/team-a/steward@sha256:5555555555555555555555555555555555555555555555555555555555555555"}
+    },
+    "executionBindingImages": {"codex": "registry.example.test/team-a/codex@sha256:6666666666666666666666666666666666666666666666666666666666666666"}
+  },
+  "database": {
+    "urlSecret": {"name": "steward-database", "key": "url", "namespace": "steward-control"},
+    "tls": {"mode": "verify-full", "ca": {"kind": "ConfigMap", "name": "database-ca", "key": "ca.crt", "namespace": "steward-control"}}
+  },
+  "gateway": {
+    "parentRef": {"name": "public-gateway", "namespace": "edge-system", "sectionName": "https"},
+    "certificateNames": ["steward.example.test"],
+    "tlsSecretName": "steward-edge-tls",
+    "issuerRef": {"name": "platform-ca", "kind": "ClusterIssuer"}
+  },
+  "publicEndpoints": [{"name": "steward", "hostname": "steward.example.test"}],
+  "providerProfiles": [
+    {"name": "steward-litellm", "namespace": "steward-providers", "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777", "inputs": {"gatewayOrigin": "https://inference.example.test", "runtimeGrantOrigin": "https://mint.example.test", "serviceCidrs": ["192.0.2.0/24"]}},
+    {"name": "steward-mcp-gw", "namespace": "steward-providers", "digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888", "inputs": {"gatewayOrigin": "https://mcp.example.test", "runtimeGrantOrigin": "https://mint.example.test", "serviceCidrs": ["192.0.2.0/24"]}}
+  ],
+  "arc": {"controllerServiceAccount": {"name": "arc-controller", "namespace": "arc-system"}},
+  "externalSecrets": {
+    "database": {"name": "steward-database", "namespace": "steward-control"},
+    "mint": {"name": "steward-mint", "namespace": "steward-control"},
+    "litellm": {"name": "steward-litellm", "namespace": "steward-control"},
+    "openshellClient": {"name": "steward-openshell-client", "namespace": "steward-control"}
+  },
+  "externalConfigMaps": {"workloadExchangeTrust": {"name": "workload-exchange-ca", "namespace": "steward-control", "key": "ca.crt"}},
+  "execution": {
+    "endpoints": {"inference": "https://inference.example.test/v1", "mcpGateway": "https://mcp.example.test/mcp", "openshell": "https://openshell.example.test:8080", "openshellServerName": "openshell.example.test", "workloadExchange": "https://identity.example.test/v1/workload/exchange", "workloadExchangeServerName": "identity.example.test", "litellm": "https://inference.example.test", "mintIssuer": "https://mint.example.test", "spiffeTrustDomain": "example.test"},
+    "connectionsBridge": {"mcpGatewayOrigin": "https://mcp.example.test", "mcpGatewayVersion": "0.4.9"},
+    "binding": {"agentRef": "codex@0.140.0", "displayName": "Codex 0.140.0", "adapter": "codex-v1", "runtimeName": "codex", "executable": "/opt/codex/bin/codex", "expectedVersion": "codex-cli 0.140.0", "toolsProfile": "steward-mcp-gw", "inferenceProfile": "steward-litellm"}
+  },
+  "browserAuth": {"clientId": "example.apps.example.com", "workspaceDomain": "example.com", "organizationId": "example-org", "clientSecretName": "steward-browser-auth", "clientSecretKey": "client-secret", "egressCidrs": ["192.0.2.0/24"]},
+  "apiTlsSecretName": "steward-apiserver-tls",
+  "webhookTlsSecretName": "steward-webhook-tls",
+  "webhookCaBundlePem": "public-validation-ca"
+}

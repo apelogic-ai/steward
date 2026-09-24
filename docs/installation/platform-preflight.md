@@ -39,6 +39,14 @@ The compact example co-locates Steward, runtime, and provider resources. The
 namespace map remains explicit even when values match so moving one component
 does not leave hidden cross-namespace references.
 
+`namespace-map.schema.json` is the single namespace contract. The separated
+example assigns distinct namespaces to the control plane, runtimes, provider
+profiles, edge, ARC, MCP gateway, inference gateway, identity exchange,
+OpenShell, and DNS. Database Secret and CA objects remain in the Steward
+namespace because Kubernetes Pod volume references cannot cross namespaces.
+Generation emits `namespace-references.json` so external-object ownership and
+every namespace-qualified reference can be reviewed before apply.
+
 ## DNS, certificate, and Gateway contract
 
 An exact certificate SAN covers only that exact hostname. A wildcard such as

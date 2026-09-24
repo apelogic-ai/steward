@@ -23,6 +23,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   non-secret input and validates cross-component deployment relationships before rollout.
 - Added joint public-hostname, certificate-name, and live read-only Gateway validation with
   exact one-label wildcard semantics.
+- Added one explicit namespace-map schema with compact and separated layouts and deterministic
+  namespace-qualified reference generation.
 
 ### Fixed
 

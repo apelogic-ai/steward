@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://steward.example.com/schemas/namespace-map-v1.json",
+  "title": "Steward platform namespace map",
+  "type": "object",
+  "required": [
+    "steward",
+    "runtime",
+    "providers",
+    "gateway",
+    "arc",
+    "databaseTls",
+    "mcpGateway",
+    "litellm",
+    "identityExchange",
+    "openshell",
+    "dns"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "steward": {"$ref": "#/$defs/name"},
+    "runtime": {"$ref": "#/$defs/name"},
+    "providers": {"$ref": "#/$defs/name"},
+    "gateway": {"$ref": "#/$defs/name"},
+    "arc": {"$ref": "#/$defs/name"},
+    "databaseTls": {"$ref": "#/$defs/name"},
+    "mcpGateway": {"$ref": "#/$defs/name"},
+    "litellm": {"$ref": "#/$defs/name"},
+    "identityExchange": {"$ref": "#/$defs/name"},
+    "openshell": {"$ref": "#/$defs/name"},
+    "dns": {"$ref": "#/$defs/name"}
+  },
+  "$defs": {
+    "name": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$"}
+  }
+}
