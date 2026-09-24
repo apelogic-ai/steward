@@ -59,8 +59,8 @@ acknowledgement. This list grants permission; it does not require it.
 - syncing your task branch or worktree onto an updated `origin/main`, by the
   rule in "Force pushes and PR decisions";
 - opening its PR, editing its description, and commenting on it;
-- adding a dependency, unless it meets a condition in "Changes requiring
-  advance approval".
+- adding a dependency that leaves `cargo xtask ci`, including the `deny.toml`
+  license and advisory checks, passing unchanged.
 
 The inverse — the short list of acts that do require approval — is "Changes
 requiring advance approval". An act absent from both lists is governed by the
@@ -130,7 +130,9 @@ they are pushed, and stay retrievable after an edit or deletion.
   release actually ships. A newly bundled or vendored artifact updates
   `THIRD_PARTY_NOTICES.md` in the PR that introduces it, and a release adds its
   `CHANGELOG.md` entry in the same PR as its version and chart updates, per
-  "Release batching".
+  "Release batching". A changelog entry is complete when a consumer can read it
+  and know every behavior, contract, and operational change they must act on;
+  an entry naming only the headline feature is not complete.
 
 ### Worktrees
 
@@ -195,13 +197,22 @@ cargo xtask check-neutrality
 cargo xtask check-secrets
 ```
 
-Documentation-only means Markdown and static images under `docs/`. The
-repository-root `README.md` is the sole path exception and uses the same
-documentation-only gate. Other Markdown outside `docs/` does not qualify. Agent
-instructions, executable examples, `docs/contracts/`, schemas, fixtures,
-generated artifacts, source, tests, scripts, dependencies, policy, build,
-deployment, CI, hooks, and migrations remain excluded. A mixed or uncertain diff
-uses the full gate.
+Documentation-only means Markdown and static images anywhere in the repository,
+wherever they live: `docs/`, the root `README.md` and `CHANGELOG.md`, and
+Markdown beside code. Location does not decide the gate; content does.
+
+These are Markdown and still use the full gate:
+
+- agent-instruction files — `AGENTS.md`, `CLAUDE.md`, and every nested
+  equivalent;
+- `docs/contracts/`, which is normative wire contract rather than prose;
+- executable or generated Markdown, and any Markdown a script or CI job
+  consumes as input.
+
+Everything that is not Markdown or a static image uses the full gate: source,
+tests, scripts, dependencies, policy, build, deployment, CI, hooks, schemas,
+fixtures, generated artifacts, and migrations. A mixed or uncertain diff uses
+the full gate.
 
 For every other change, run:
 
@@ -228,6 +239,8 @@ describes, so that judgement is yours:
   surface updates every document asserting the old behavior, in the same PR.
   When that is genuinely too large, the PR names the documents left stale and
   the follow-up that corrects them.
+- An example endpoint, path, or command in a document is part of the contract a
+  reader will copy. Re-verify every example a contract change touches.
 - Before describing another product's procedure, read that product's current
   released source. Do not describe it from memory or from an earlier revision
   of this repository.
@@ -282,13 +295,13 @@ Ask before:
 - adding `#[allow(...)]` for a lint;
 - changing anything under `crates/steward-mint/`;
 - deploying to or operating against a manual DEV environment; or
-- force-pushing under the narrow exception in §2.
+- force-pushing under the narrow exception in "Force pushes and PR decisions".
 
 Never, even with general task approval: push to `main`; merge or close a PR;
 work around authentication/signing failure; silently weaken a test or rule; or
 rewrite history to conceal a committed secret. Materially destructive actions
 and branch-protection changes require their own explicit, precisely scoped
-authorization. No force pushe to any branch without explicit approval,
+authorization. Never force-push any branch without explicit approval.
 
 ## 8. Upstream dependencies and conformance
 
