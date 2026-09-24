@@ -62,9 +62,20 @@ after the command succeeds.
 Fresh installations use the ordinary exact-version path:
 
 ```sh
-cargo xtask provider-profile-bundle install --inputs inputs-1.2.0.json --output rendered-profiles
-cargo xtask provider-profile-bundle reconcile --inputs inputs-1.2.0.json --output rendered-profiles
+bundle=provider-profile-bundle/v1.2.0
+tool="$bundle/bin/steward-provider-profile"
+cp "$bundle/examples/inputs.json" inputs-1.2.0.json
+# Replace only the declared environment origins and CIDRs.
+"$tool" validate --bundle "$bundle" --inputs inputs-1.2.0.json
+"$tool" install --bundle "$bundle" --inputs inputs-1.2.0.json --output rendered-profiles
+"$tool" reconcile --bundle "$bundle" --inputs inputs-1.2.0.json --output rendered-profiles
 ```
+
+The released `linux/amd64` tool is inside the attested archive. It emits a
+machine-readable result containing the Steward source release, bundle identity,
+rendered closure digest, and each profile digest. It writes no Secret values
+and does not access Kubernetes. Identical inputs produce byte-identical
+profiles and the same closure digest.
 
 ## Verify a released bundle before rendering or installation
 
@@ -100,8 +111,8 @@ test "$actual_digest" = "$expected_digest"
 ```
 
 Only after all checks succeed may the consumer extract the archive, confirm
-that `bundle.json` identifies `steward-runtime-providers@1.2.0`, validate the
-manifest and templates, and run the product-owned renderer, installer, or
-upgrade command. The source-only validation does not make this bundle eligible for release.
+that `bundle.json` identifies `steward-runtime-providers@1.2.0`, and use the
+bundled product-owned renderer/installer. No Steward source checkout or Rust
+toolchain is required. The source-only validation does not make this bundle eligible for release.
 The release workflow also requires the authenticated OpenShell adapter and governed
 Connections E2E lanes on their native linux/amd64 runners.

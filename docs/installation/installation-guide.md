@@ -366,10 +366,12 @@ or locally built image is not release evidence.
    `steward-openshell-client`, `steward-mint`, and
    `steward-workload-exchange-ca` objects named above. Install the matching
    OpenShell provider profiles outside this chart. For the product-owned
-   versioned bundle, create a deployment-neutral inputs file, then run
-   `cargo xtask provider-profile-bundle install --inputs <inputs.json>
-   --output <rendered-directory>` followed by the matching `reconcile` command
-   from the [bundle guide](../../config/provider-profile-bundle/v1.2.0/README.md).
+   versioned bundle, extract the attested release asset and use its bundled
+   `bin/steward-provider-profile` executable to validate, install, and reconcile
+   the deployment-neutral inputs as shown in the
+   [bundle guide](../../config/provider-profile-bundle/v1.2.0/README.md). The
+   released tool is self-contained for `linux/amd64`; no Steward checkout or
+   Rust toolchain is required.
    Record each installed profile ID and immutable policy digest in the
    [execution binding](execution-bindings.md); a model-free copy task attaches
    neither tool nor inference profile, while an approved model/tool requires

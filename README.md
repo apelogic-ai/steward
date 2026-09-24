@@ -154,6 +154,9 @@ Core mode keeps execution disabled and Task orchestration staged. To enable
 governed execution, first validate all dependency and functional sandbox
 requirements in the [installation guide](docs/installation/installation-guide.md)
 and [execution-binding guide](docs/installation/execution-bindings.md).
+Release assets include a standalone `linux/amd64` provider-profile validator
+and installer, so operators do not need a Steward source checkout to render the
+released runtime-provider bundle.
 
 Historical design documents remain available through the documentation index;
 they are not an installation contract. The API group is

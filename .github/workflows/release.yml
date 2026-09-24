@@ -203,12 +203,21 @@ jobs:
         id: version
         run: printf 'version=%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Build standalone provider-profile installer
+        run: cargo build --locked --release --package xtask --bin steward-provider-profile
+
       - name: Package immutable provider-profile bundle
         run: |
           set -euo pipefail
           mkdir -p dist
           scripts/package-provider-profile-bundle.sh \
             --version '${{ steps.version.outputs.version }}' \
+            --installer target/release/steward-provider-profile \
+            --installer-os linux \
+            --installer-architecture amd64 \
             --output dist
 
       - name: Attest provider-profile bundle provenance
@@ -499,7 +508,12 @@ jobs:
               },
               providerProfileBundle: {
                 identity: "steward-runtime-providers@1.2.0",
-                digest: $provider_digest
+                digest: $provider_digest,
+                installer: {
+                  path: "provider-profile-bundle/v1.2.0/bin/steward-provider-profile",
+                  os: "linux",
+                  architecture: "amd64"
+                }
               },
               migrations: ["0039_user_envelope_only_task_authority.sql"],
               serviceEnvelopeSupported: false
@@ -534,6 +548,7 @@ jobs:
             printf 'Provider profile bundle signer identity: %s\n\n' "$bridge_signer_identity"
             printf 'Provider profile bundle source repository: %s\n\n' "$bridge_source_repository"
             printf 'Provider profile bundle source commit: %s\n\n' "$GITHUB_SHA"
+            printf 'Provider profile installer: provider-profile-bundle/v1.2.0/bin/steward-provider-profile (linux/amd64)\n\n'
             printf 'Provider profile bundle verification: pin the SHA-256 above; verify GitHub artifact provenance with this signer identity, repository, tag, and source commit; then verify the downloaded archive SHA-256 before render/install.\n\n'
             printf '\n## Verification\n\n'
             printf "Verify the release manifest with: \`gh attestation verify release-handoff.json --repo %s --cert-identity %s\`.\n\n" "$GITHUB_REPOSITORY" "$bridge_signer_identity"
