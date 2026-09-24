@@ -328,8 +328,8 @@ The recommended deployment path is:
    must move to another registry, producing `steward.deployment-lock/v1`;
 3. give that complete lock to the released
    [platform preflight](platform-preflight.md), together with the explicit
-   namespace, endpoint, certificate, Secret-reference, and provider-profile
-   inputs. Start from the copy-ready
+   namespace, endpoint, certificate, backend-TLS CA ConfigMap,
+   Secret-reference, and provider-profile inputs. Start from the copy-ready
    [`governed-complete.json`](../../config/platform-preflight/v1/examples/governed-complete.json)
    rather than assembling a partial governed values file; and
 4. install the generated `steward-values.json` only after static validation and

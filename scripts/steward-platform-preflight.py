@@ -338,11 +338,31 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
         raise ValidationError("database.tls.ca must be omitted when mode is disabled")
 
     gateway = require_object(data, "gateway", "input")
+    require_exact_keys(
+        gateway,
+        {"parentRef", "certificateNames", "tlsSecretName", "issuerRef", "backendTls"},
+        "gateway",
+    )
     parent = require_object(gateway, "parentRef", "gateway")
     for key in ("name", "namespace", "sectionName"):
         validate_name(require_string(parent, key, "gateway.parentRef"), f"gateway.parentRef.{key}")
     if parent["namespace"] != namespaces["gateway"]:
         raise ValidationError("gateway.parentRef.namespace must equal namespaces.gateway")
+
+    validate_name(require_string(gateway, "tlsSecretName", "gateway"), "gateway.tlsSecretName")
+    issuer = require_object(gateway, "issuerRef", "gateway")
+    require_exact_keys(issuer, {"name", "kind"}, "gateway.issuerRef")
+    for key in ("name", "kind"):
+        require_string(issuer, key, "gateway.issuerRef")
+    backend_tls = require_object(gateway, "backendTls", "gateway")
+    require_exact_keys(backend_tls, {"caConfigMap"}, "gateway.backendTls")
+    backend_ca = require_object(backend_tls, "caConfigMap", "gateway.backendTls")
+    require_exact_keys(backend_ca, {"name", "namespace", "key"}, "gateway.backendTls.caConfigMap")
+    validate_name(require_string(backend_ca, "name", "gateway.backendTls.caConfigMap"), "gateway.backendTls.caConfigMap.name")
+    if require_string(backend_ca, "key", "gateway.backendTls.caConfigMap") != "ca.crt":
+        raise ValidationError("gateway.backendTls.caConfigMap.key must equal ca.crt")
+    if require_string(backend_ca, "namespace", "gateway.backendTls.caConfigMap") != namespaces["steward"]:
+        raise ValidationError("gateway.backendTls.caConfigMap.namespace must equal namespaces.steward")
 
     certificate_names = gateway.get("certificateNames")
     if not isinstance(certificate_names, list) or not certificate_names:
@@ -441,7 +461,12 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
     bridge_origin = require_string(bridge, "mcpGatewayOrigin", "execution.connectionsBridge")
     if not bridge_origin.startswith("https://"):
         raise ValidationError("execution.connectionsBridge.mcpGatewayOrigin must use HTTPS")
-    require_string(bridge, "mcpGatewayVersion", "execution.connectionsBridge")
+    require_exact_keys(bridge, {"mcpGatewayOrigin", "mcpGatewayAuthorityContract"}, "execution.connectionsBridge")
+    if require_string(bridge, "mcpGatewayAuthorityContract", "execution.connectionsBridge") not in (
+        "steward.connections.github/v1",
+        "steward.connections.github/v2",
+    ):
+        raise ValidationError("execution.connectionsBridge.mcpGatewayAuthorityContract is unsupported")
     binding = require_object(execution, "binding", "execution")
     for key in ("agentRef", "displayName", "adapter", "executable", "expectedVersion", "runtimeName"):
         require_string(binding, key, "execution.binding")
@@ -515,6 +540,7 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
     lock = data["deploymentLock"]
     endpoint = steward_endpoint(data)
     parent = data["gateway"]["parentRef"]
+    backend_tls = data["gateway"]["backendTls"]
     database = data["database"]
     external = data["externalSecrets"]
     chart_lock = lock["chartValues"]
@@ -534,6 +560,13 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
                 "hostname": endpoint["hostname"],
                 "apiPaths": [{"type": "PathPrefix", "value": "/api"}],
                 "webPaths": [{"type": "PathPrefix", "value": "/"}],
+                "backendTls": {
+                    "hostname": f"steward-apiserver.{data['namespaces']['steward']}.svc.cluster.local",
+                    "caConfigMap": {
+                        "name": backend_tls["caConfigMap"]["name"],
+                        "key": backend_tls["caConfigMap"]["key"],
+                    },
+                },
             },
         },
         "browserAuth": {
@@ -565,7 +598,8 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
             "artifactTrust": {"mode": "operator-pinned"},
             "image": chart_lock["connectionsBridge"]["image"],
             "mcpGatewayOrigin": execution["connectionsBridge"]["mcpGatewayOrigin"],
-            "mcpGatewayVersion": execution["connectionsBridge"]["mcpGatewayVersion"],
+            "mcpGatewayAuthorityContract": execution["connectionsBridge"]["mcpGatewayAuthorityContract"],
+            "mcpGatewayVersion": "",
             "runtimeNamespace": data["namespaces"]["runtime"],
         },
         "workloadExchangeTrust": {

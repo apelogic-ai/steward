@@ -43,16 +43,19 @@ the explicitly supplied endpoints.
 
 [`examples/governed-complete.json`](../../config/platform-preflight/v1/examples/governed-complete.json)
 is the copy-ready governed input. It includes a non-empty capability catalog,
-one immutable execution binding, exact Codex Responses endpoint, MCP-GW
-endpoint, all required namespaces, browser-auth egress, Kubernetes API and
-PostgreSQL CIDRs, and every immutable component/runtime coordinate. The
+one immutable execution binding, exact Codex Responses endpoint, named MCP-GW
+authority contract, backend-TLS CA ConfigMap, all required namespaces,
+browser-auth egress, Kubernetes API and PostgreSQL CIDRs, and every immutable
+component/runtime coordinate. The
 compact and separated examples exercise the same contract with different
 namespace layouts.
 
 The capability catalog is descriptive template-editor availability; it is not
 runtime authority. The execution binding selects an immutable coding-agent
 runtime. Provider profiles bind that runtime to deployment-owned inference and
-tool connectivity. A User Envelope remains Steward's per-user admission limit
+tool connectivity. Gateway backend TLS uses the explicitly named public CA
+ConfigMap; preflight derives the apiserver Service DNS name from the generated
+Steward namespace. A User Envelope remains Steward's per-user admission limit
 and does not replace any of those deployment settings.
 
 `config.apiserver.inferenceEndpoint` is the exact OpenAI-compatible Responses

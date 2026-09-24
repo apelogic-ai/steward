@@ -46,7 +46,8 @@
     "parentRef": {"name": "public-gateway", "namespace": "gateway-system", "sectionName": "https"},
     "certificateNames": ["*.example.test"],
     "tlsSecretName": "steward-edge-tls",
-    "issuerRef": {"name": "platform-ca", "kind": "ClusterIssuer"}
+    "issuerRef": {"name": "platform-ca", "kind": "ClusterIssuer"},
+    "backendTls": {"caConfigMap": {"name": "steward-apiserver-ca", "namespace": "steward-system", "key": "ca.crt"}}
   },
   "publicEndpoints": [
     {"name": "steward", "hostname": "steward.example.test"}
@@ -93,7 +94,7 @@
       "mintIssuer": "https://mint.example.test",
       "spiffeTrustDomain": "example.test"
     },
-    "connectionsBridge": {"mcpGatewayOrigin": "https://mcp.example.test", "mcpGatewayVersion": "0.4.9"},
+    "connectionsBridge": {"mcpGatewayOrigin": "https://mcp.example.test", "mcpGatewayAuthorityContract": "steward.connections.github/v2"},
     "binding": {
       "agentRef": "codex@0.140.0",
       "displayName": "Codex 0.140.0",

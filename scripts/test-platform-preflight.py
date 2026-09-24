@@ -307,6 +307,18 @@ class PlatformPreflightTests(unittest.TestCase):
             self.assertEqual(values["networkPolicy"]["kubeApiCidrs"], complete["networkPolicy"]["kubeApiCidrs"])
             self.assertEqual(values["networkPolicy"]["postgresCidrs"], complete["networkPolicy"]["postgresCidrs"])
             self.assertEqual(values["config"]["apiserver"]["inferenceEndpoint"], "https://inference.example.test/v1/responses")
+            self.assertEqual(
+                values["web"]["httpRoute"]["backendTls"],
+                {
+                    "hostname": "steward-apiserver.steward-system.svc.cluster.local",
+                    "caConfigMap": {"name": "steward-apiserver-ca", "key": "ca.crt"},
+                },
+            )
+            self.assertEqual(
+                values["connectionsBridge"]["mcpGatewayAuthorityContract"],
+                "steward.connections.github/v2",
+            )
+            self.assertEqual(values["connectionsBridge"]["mcpGatewayVersion"], "")
 
             flux = (output / "flux-values-configmap.yaml").read_text(encoding="utf-8")
             flux_lines = flux.splitlines()
@@ -348,6 +360,20 @@ class PlatformPreflightTests(unittest.TestCase):
             self.assertIn("mountPath: /run/capability-catalog", rendered.stdout)
             self.assertIn("cidr: 192.0.2.10/32", rendered.stdout)
             self.assertIn("cidr: 192.0.2.20/32", rendered.stdout)
+            self.assertIn("kind: BackendTLSPolicy", rendered.stdout)
+            self.assertIn('name: "steward-apiserver-ca"', rendered.stdout)
+
+    def test_rejects_incomplete_gateway_tls_or_unknown_connection_contract(self) -> None:
+        del self.input["gateway"]["backendTls"]
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gateway.backendTls must be an object", result.stderr)
+
+        self.input = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        self.input["execution"]["connectionsBridge"]["mcpGatewayAuthorityContract"] = "unknown"
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mcpGatewayAuthorityContract is unsupported", result.stderr)
 
     def test_rejects_empty_capability_catalog(self) -> None:
         self.input["capabilityCatalog"]["models"] = []
