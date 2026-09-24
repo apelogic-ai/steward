@@ -81,6 +81,23 @@ stop and report it. Never work around a push failure by changing SSH to HTTPS,
 introducing a PAT or other credential, relaxing host verification, generating
 or loading another key, or disabling signing.
 
+### Release batching
+
+- When a maintainer identifies a change as the next release before its PR
+  merges, include every required version, changelog, chart, documentation,
+  release-workflow, and release-contract update in that same PR. Its existing
+  CI run is the release-candidate gate; do not defer mechanical release metadata
+  to a second PR.
+- A request to cut, tag, or publish a release after the product PR has merged is
+  not authority to create a standalone release-preparation PR. If `main` is not
+  release-ready, stop before creating a branch, commit, push, PR, or tag. Report
+  the exact missing release surfaces, that correcting them requires another
+  full CI run, and the expected wait. Proceed only after the maintainer
+  explicitly approves that additional PR and CI cost.
+- Never tag a commit that the current release contract will reject. Do not call
+  a standalone release-preparation change cheap or simple when repository rules
+  require the full gate.
+
 ### Worktrees
 
 - Create worktrees only inside `.worktrees/` under the repository root.
