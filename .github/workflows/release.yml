@@ -41,7 +41,9 @@ jobs:
             scripts/codex-reference-runtime-conformance.sh \
             scripts/codex-reference-runtime-openshell-inside.sh \
             scripts/package-provider-profile-bundle.sh \
+            scripts/package-platform-preflight.sh \
             scripts/test-package-provider-profile-bundle.sh \
+            scripts/test-package-platform-preflight.sh \
             scripts/test-steward-registry-lock.sh \
             scripts/test-released-artifact-acceptance.sh \
             scripts/test-validate-release-version.sh \
@@ -387,6 +389,43 @@ jobs:
             --image "ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime@$(cat dist/codex-reference-runtime.digest)" \
             --provider-profile-bundle "dist/steward-runtime-providers-${version}.tar.gz"
 
+  publish-platform-preflight-bundle:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve release version
+        id: platform-preflight-version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Package platform preflight bundle
+        run: scripts/package-platform-preflight.sh '${{ steps.platform-preflight-version.outputs.version }}' dist
+
+      - name: Attest platform preflight bundle provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: dist/steward-platform-preflight-${{ steps.platform-preflight-version.outputs.version }}.tar.gz
+
+      - name: Upload platform preflight release evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: release-platform-preflight-bundle
+          path: |
+            dist/steward-platform-preflight-*.tar.gz
+            dist/platform-preflight-bundle.digest
+          if-no-files-found: error
+
   openshell-x86-conformance:
     needs: validate
     name: release / linux-amd64 OpenShell adapter
@@ -561,7 +600,7 @@ jobs:
           bash scripts/customer-core-install-e2e.sh
 
   release:
-    needs: [publish-images, publish-provider-profile-bundle, publish-codex-reference-runtime, codex-reference-runtime-conformance, openshell-x86-conformance, publish-chart, released-artifact-acceptance]
+    needs: [publish-images, publish-provider-profile-bundle, publish-codex-reference-runtime, codex-reference-runtime-conformance, publish-platform-preflight-bundle, openshell-x86-conformance, publish-chart, released-artifact-acceptance]
     if: >-
       ${{
         always() &&
@@ -569,6 +608,7 @@ jobs:
         needs.publish-provider-profile-bundle.result == 'success' &&
         needs.publish-codex-reference-runtime.result == 'success' &&
         needs.codex-reference-runtime-conformance.result == 'success' &&
+        needs.publish-platform-preflight-bundle.result == 'success' &&
         needs.openshell-x86-conformance.result == 'success' &&
         needs.publish-chart.result == 'success' &&
         needs.released-artifact-acceptance.result == 'success'
@@ -632,6 +672,7 @@ jobs:
           codex_digest="$(cat dist/codex-reference-runtime.digest)"
           provider_profile_bundle_asset="steward-runtime-providers-${version}.tar.gz"
           provider_profile_bundle_digest="$(cat dist/provider-profile-bundle.digest)"
+          platform_preflight_bundle_digest="$(cat dist/platform-preflight-bundle.digest)"
           bridge_signer_identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
           bridge_source_repository="https://github.com/$GITHUB_REPOSITORY"
           mirror_asset="steward-registry-lock.py"
@@ -654,6 +695,7 @@ jobs:
             --arg provider_digest "$provider_profile_bundle_digest" \
             --arg mirror_asset "$mirror_asset" \
             --arg mirror_digest "$mirror_digest" \
+            --arg platform_preflight_digest "$platform_preflight_bundle_digest" \
             '{
               schemaVersion: "steward.release-handoff/v1",
               version: $version,
@@ -693,6 +735,11 @@ jobs:
                 asset: $mirror_asset,
                 digest: $mirror_digest,
                 lockSchema: "steward.deployment-lock/v1"
+              },
+              platformPreflightBundle: {
+                identity: "steward.platform-preflight/v1",
+                asset: ("steward-platform-preflight-" + $version + ".tar.gz"),
+                digest: $platform_preflight_digest
               },
               migrations: ["0039_user_envelope_only_task_authority.sql"],
               serviceEnvelopeSupported: false
@@ -742,6 +789,11 @@ jobs:
             printf 'Mirror tool asset: %s\n\n' "$mirror_asset"
             printf 'Mirror tool SHA-256: %s\n\n' "$mirror_digest"
             printf 'Use the verified release-handoff.json as input; the tool copies every listed component image and reference runtime, verifies the target registry, and emits steward.deployment-lock/v1.\n\n'
+            printf '\n## Platform preflight bundle\n\n'
+            printf 'Platform preflight asset: steward-platform-preflight-%s.tar.gz\n\n' "$version"
+            printf 'Platform preflight identity: steward.platform-preflight/v1\n\n'
+            printf 'Platform preflight SHA-256: %s\n\n' "$(cat dist/platform-preflight-bundle.digest)"
+            printf 'The bundle generates deterministic Helm/Flux inputs without Secret bodies and emits machine-readable validation diagnostics.\n\n'
             printf '\n## Verification\n\n'
             printf "Verify the release manifest with: \`gh attestation verify release-handoff.json --repo %s --cert-identity %s\`.\n\n" "$GITHUB_REPOSITORY" "$bridge_signer_identity"
             printf "Inspect every image by the exact digest above with \`docker buildx imagetools inspect\`, and pull the chart by its exact digest with \`helm pull\`.\n\n"

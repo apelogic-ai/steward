@@ -19,6 +19,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   digests and platforms, and emits a deterministic credential-free deployment lock.
 - Added a supported `linux/amd64` Codex 0.140.0 reference runtime with an immutable release digest,
   SBOM, provenance, provider-profile conformance, and mirroring instructions.
+- Added a deterministic platform preflight bundle that generates Helm/Flux values from one
+  non-secret input and validates cross-component deployment relationships before rollout.
 
 ### Fixed
 

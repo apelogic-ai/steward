@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://steward.example.com/schemas/platform-input-v1.json",
+  "title": "Steward platform preflight input",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "namespaces",
+    "deploymentLock",
+    "database",
+    "gateway",
+    "publicEndpoints",
+    "providerProfiles",
+    "arc",
+    "externalSecrets",
+    "externalConfigMaps",
+    "execution",
+    "browserAuth",
+    "apiTlsSecretName",
+    "webhookTlsSecretName"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "steward.platform-input/v1"},
+    "namespaces": {
+      "type": "object",
+      "required": ["steward", "runtime", "providers", "gateway", "arc", "databaseTls"],
+      "additionalProperties": false,
+      "properties": {
+        "steward": {"$ref": "#/$defs/name"},
+        "runtime": {"$ref": "#/$defs/name"},
+        "providers": {"$ref": "#/$defs/name"},
+        "gateway": {"$ref": "#/$defs/name"},
+        "arc": {"$ref": "#/$defs/name"},
+        "databaseTls": {"$ref": "#/$defs/name"}
+      }
+    },
+    "deploymentLock": {
+      "type": "object",
+      "required": ["schemaVersion", "release", "mode", "artifacts", "chartValues", "executionBindingImages"],
+      "properties": {
+        "schemaVersion": {"const": "steward.deployment-lock/v1"},
+        "release": {"type": "object"},
+        "mode": {"enum": ["index", "single-platform"]},
+        "requestedPlatform": {"type": ["string", "null"]},
+        "artifacts": {"type": "object"},
+        "chartValues": {"type": "object"},
+        "executionBindingImages": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "database": {"type": "object"},
+    "gateway": {"type": "object"},
+    "publicEndpoints": {"type": "array", "minItems": 1},
+    "providerProfiles": {"type": "array", "minItems": 1},
+    "arc": {"type": "object"},
+    "externalSecrets": {"type": "object"},
+    "externalConfigMaps": {"type": "object"},
+    "execution": {"type": "object"},
+    "browserAuth": {"type": "object"},
+    "apiTlsSecretName": {"$ref": "#/$defs/name"},
+    "webhookTlsSecretName": {"$ref": "#/$defs/name"}
+  },
+  "$defs": {
+    "name": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "image": {
+      "type": "object",
+      "required": ["tag", "digest"],
+      "additionalProperties": false,
+      "properties": {
+        "tag": {"type": "string", "minLength": 1, "not": {"const": "latest"}},
+        "digest": {"$ref": "#/$defs/digest"}
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -34,6 +34,7 @@ records the limits of this tested matrix.
 |---|---|
 | Prerequisites, installation, secrets, post-install checks, and delivery tests | [Installation guide](docs/installation/installation-guide.md) |
 | Install order across Steward, `steward-run`, and the identity exchange | [Platform deployment order](docs/installation/platform-deployment-order.md) |
+| Generate and validate Helm/Flux deployment values | [Platform preflight](docs/installation/platform-preflight.md) |
 | All chart values and optional integrations | [Helm chart reference](charts/steward/README.md) |
 | Documentation authority, status, and navigation | [Documentation index](docs/README.md) |
 | Normative M1 fields, ownership, and compatibility | [Frozen `steward.m1/v1` contract](docs/contracts/m1/v1/README.md) |
