@@ -7,11 +7,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-24
+
+### Added
+
+- Added optional Secret- or ConfigMap-backed PostgreSQL CA projection for API server and
+  controller connections using `sslmode=verify-full`.
+- Added a released, standalone `linux/amd64` provider-profile validator and installer with
+  deterministic output and machine-readable bundle evidence.
+- Added a released registry mirror tool that preserves OCI indexes, verifies copied target
+  digests and platforms, and emits a deterministic credential-free deployment lock.
+- Added a supported `linux/amd64` Codex 0.140.0 reference runtime with an immutable release digest,
+  SBOM, provenance, provider-profile conformance, and mirroring instructions.
+- Added a deterministic platform preflight bundle that generates Helm/Flux values from one
+  non-secret input and validates cross-component deployment relationships before rollout.
+- Added joint public-hostname, certificate-name, and live read-only Gateway validation with
+  exact one-label wildcard semantics.
+- Added one explicit namespace-map schema with compact and separated layouts and deterministic
+  namespace-qualified reference generation.
+- Added read-only EKS VPC CNI detection and a bounded, run-owned NetworkPolicy deny/allow
+  enforcement smoke that fails closed when enforcement cannot be proven.
+
 ### Fixed
 
 - Reconciled externally submitted Task runtimes only from their exact persisted Task authority,
   including successful-completion finalization, Task-owned TTL, and cleanup ordering before
   Kubernetes deletion.
+- Rejected all-zero placeholder digests for required component, execution-binding, provider-profile,
+  stable-bridge, and Connections-bridge images before deployment or runtime provisioning.
 
 ## [0.2.1] - 2026-09-23
 
@@ -69,6 +92,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/apelogic-ai/steward/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/apelogic-ai/steward/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/apelogic-ai/steward/compare/v0.1.23...v0.2.0

@@ -1,0 +1,22 @@
+{
+  "schema": "steward.provider-profile-inputs/v1",
+  "bundle": {"id": "steward-runtime-providers", "version": "1.2.0"},
+  "profiles": [
+    {
+      "id": "steward-mcp-gw",
+      "inputs": {
+        "gateway-origin": "https://mcp.gateway.test",
+        "runtime-grant-origin": "https://mint.gateway.test",
+        "service-cidrs": ["192.0.2.0/24"]
+      }
+    },
+    {
+      "id": "steward-litellm",
+      "inputs": {
+        "gateway-origin": "https://inference.gateway.test",
+        "runtime-grant-origin": "https://mint.gateway.test",
+        "service-cidrs": ["192.0.2.0/24"]
+      }
+    }
+  ]
+}

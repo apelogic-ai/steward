@@ -130,6 +130,7 @@ fn valid_operator_pinned_image(value: &str) -> bool {
             && hex
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && hex.bytes().any(|byte| byte != b'0')
     })
 }
 
@@ -185,6 +186,7 @@ impl ConnectionExecutionBindings {
                     && digest
                         .bytes()
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    && digest.bytes().any(|byte| byte != b'0')
             });
         if !match self.artifact_trust_mode.as_str() {
             GITHUB_ATTESTATION_TRUST_MODE => github_attested_image_is_digest_pinned,
@@ -1385,6 +1387,10 @@ mod tests {
         )));
         for invalid in [
             "registry.example.test/team/bridge:latest".to_owned(),
+            format!(
+                "registry.example.test/team/bridge@sha256:{}",
+                "0".repeat(64)
+            ),
             format!("registry.example.test/team/bridge:tag@sha256:{digest}"),
             format!("registry.example.test/team:5000/bridge@sha256:{digest}"),
             format!("registry.example.test/team/bridge@@sha256:{digest}"),

@@ -1028,7 +1028,7 @@ mod tests {
             .ok_or_else(|| "Steward chart version is required".to_owned())?;
         match version {
             "0.1.23" => Ok(false),
-            "0.2.1" => Ok(true),
+            "0.2.2" => Ok(true),
             other => Err(format!(
                 "release enforcement has not reviewed Steward chart version {other}"
             )),
@@ -1406,6 +1406,121 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn codex_reference_runtime_is_a_released_conformant_artifact() -> Result<(), String> {
+        let container = fs::read_to_string(root().join("build/codex-reference.Dockerfile"))
+            .map_err(|error| format!("Codex reference runtime build is required: {error}"))?;
+        let conformance =
+            fs::read_to_string(root().join("scripts/codex-reference-runtime-conformance.sh"))
+                .map_err(|error| {
+                    format!("Codex reference runtime conformance is required: {error}")
+                })?;
+        let openshell_conformance =
+            fs::read_to_string(root().join("scripts/codex-reference-runtime-openshell-inside.sh"))
+                .map_err(|error| format!("Codex OpenShell conformance is required: {error}"))?;
+        let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("release workflow is required: {error}"))?;
+        let documentation =
+            fs::read_to_string(root().join("docs/installation/codex-reference-runtime.md"))
+                .map_err(|error| {
+                    format!("Codex reference runtime documentation is required: {error}")
+                })?;
+        let readme = fs::read_to_string(root().join("README.md"))
+            .map_err(|error| format!("public README is required: {error}"))?;
+
+        for required in [
+            "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:",
+            "@openai/codex@0.140.0",
+            "codex-cli 0.140.0",
+        ] {
+            assert!(
+                container.contains(required),
+                "Codex reference runtime must pin {required}"
+            );
+        }
+        for required in [
+            "STEWARD_OPEN_SHELL_RELEASE=v0.0.98",
+            "scripts/openshell-testbed.sh",
+            "scripts/codex-reference-runtime-openshell-inside.sh",
+        ] {
+            assert!(
+                conformance.contains(required),
+                "Codex reference runtime conformance must execute {required}"
+            );
+        }
+        for required in [
+            "provider profile import --global",
+            "--provider steward-litellm",
+            "--provider steward-mcp-gw",
+            "/usr/bin/codex --version",
+            "codex-cli 0.140.0",
+        ] {
+            assert!(
+                openshell_conformance.contains(required),
+                "Codex OpenShell conformance must prove {required}"
+            );
+        }
+        for required in [
+            "codex-cli 0.140.0",
+            "provider-profile-bundle/v1.2.0/profiles/steward-litellm.json",
+            "provider-profile-bundle/v1.2.0/profiles/steward-mcp-gw.json",
+            "requiredBinaries",
+        ] {
+            assert!(
+                conformance.contains(required),
+                "Codex reference runtime conformance must prove {required}"
+            );
+        }
+        for required in [
+            "publish-codex-reference-runtime:",
+            "build/codex-reference.Dockerfile",
+            "provenance: mode=max",
+            "sbom: true",
+            "release-codex-reference-runtime",
+            "codex-reference-runtime.digest",
+            "codex-reference-runtime-conformance:",
+            "scripts/codex-reference-runtime-conformance.sh",
+            "referenceRuntimes:",
+            "agentRef: \"codex@0.140.0\"",
+            "platform: \"linux/amd64\"",
+        ] {
+            assert!(
+                workflow.contains(required),
+                "release workflow must include {required}"
+            );
+        }
+        let conformance_job = workflow
+            .split_once("  codex-reference-runtime-conformance:")
+            .and_then(|(_, remainder)| remainder.split_once("\n  openshell-x86-conformance:"))
+            .map(|(job, _)| job)
+            .ok_or_else(|| "Codex reference runtime conformance job is required".to_string())?;
+        for required in [
+            "uses: ./.github/actions/setup-tools",
+            "kubernetes-tools: \"true\"",
+        ] {
+            assert!(
+                conformance_job.contains(required),
+                "Codex reference runtime conformance job must include {required}"
+            );
+        }
+        for required in [
+            "codex@0.140.0",
+            "docker buildx imagetools create",
+            "build/codex-reference.Dockerfile",
+            "scripts/codex-reference-runtime-conformance.sh",
+        ] {
+            assert!(
+                documentation.contains(required),
+                "Codex reference runtime documentation must include {required}"
+            );
+        }
+        assert!(
+            readme.contains("docs/installation/codex-reference-runtime.md"),
+            "public README must link the Codex reference runtime guide"
+        );
         Ok(())
     }
 
@@ -2666,6 +2781,68 @@ mod tests {
                 && publication < public_verification,
             "release handoff must be generated, attested, published, and then publicly verified"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn registry_mirror_is_released_verified_and_documented() -> Result<(), String> {
+        let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("published Steward release workflow is required: {error}"))?;
+        let tool = fs::read_to_string(root().join("scripts/steward-registry-lock.py"))
+            .map_err(|error| format!("registry mirror tool is required: {error}"))?;
+        let test = fs::read_to_string(root().join("scripts/test-steward-registry-lock.sh"))
+            .map_err(|error| format!("registry mirror test is required: {error}"))?;
+        let guide = fs::read_to_string(root().join("docs/installation/registry-mirroring.md"))
+            .map_err(|error| format!("registry mirror guide is required: {error}"))?;
+
+        for required in [
+            "steward-registry-lock.py.sha256",
+            "steward.deployment-lock/v1",
+            "registryMirror:",
+            "Verify published registry mirror tool",
+            "sha256sum --check steward-registry-lock.py.sha256",
+            "cmp scripts/steward-registry-lock.py",
+        ] {
+            assert!(
+                workflow.contains(required),
+                "release workflow must retain registry mirror contract `{required}`"
+            );
+        }
+        for required in [
+            "referenceRuntimes",
+            "--prefer-index=false",
+            "target_manifest != selected_manifest",
+            "target_signatures != source_signatures",
+            "executionBindingImages",
+        ] {
+            assert!(
+                tool.contains(required),
+                "registry mirror tool must retain `{required}`"
+            );
+        }
+        for required in [
+            "cmp \"${temporary_directory}/lock-one.json\"",
+            "single-manifest source silently passed as a complete index",
+            "registry.example.test/team-a/steward@sha256:eeeeeeee",
+            "referenceRuntimes.codex",
+        ] {
+            assert!(
+                test.contains(required),
+                "registry mirror test must prove `{required}`"
+            );
+        }
+        for required in [
+            "Docker credential helper",
+            "source descriptor set",
+            "Single-platform mode",
+            "chartValues",
+            "executionBindingImages",
+        ] {
+            assert!(
+                guide.contains(required),
+                "registry mirror guide must document `{required}`"
+            );
+        }
         Ok(())
     }
 

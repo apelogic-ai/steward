@@ -204,6 +204,8 @@ jobs:
           actionlint
           shellcheck \
             scripts/openshell-adapter-e2e.sh \
+            scripts/package-platform-preflight.sh \
+            scripts/test-package-platform-preflight.sh \
             scripts/validate-release-artifacts.sh
 
       - name: Render the chart and build all component images

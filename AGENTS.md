@@ -10,9 +10,6 @@ additional prose.
   enforcement surface unless a maintainer explicitly requests that change.
 - Never edit a rule in the same change that the rule would have blocked. An
   agent cannot authorize itself by weakening the failed test, gate, or rule.
-- A requested rule change gets its own PR containing only instruction and
-  directly corresponding enforcement changes. State what became false, not
-  merely what became inconvenient.
 - Correcting a stale command, path, or factual description is maintenance, but
   still belongs in that isolated PR. If it is unclear whether a change weakens
   a rule, treat it as a rule change.
@@ -69,17 +66,6 @@ force-push, a push to `main`, or a human-only PR action.
 - Use a conventional-commit subject for non-slice work. A slice commit records
   its ticket's exit criteria, guarantees re-run, and upstream dependencies.
 
-### Pushes and hardware approval
-
-Announce a push before running it. The SSH signing key may wait for physical
-approval and time out. On timeout, report that plainly and retry once only when
-the maintainer confirms readiness.
-
-If the SSH agent appears unavailable, run `ssh-add -l` and inspect
-`SSH_AUTH_SOCK` once. If the socket is unavailable or the single retry fails,
-stop and report it. Never work around a push failure by changing SSH to HTTPS,
-introducing a PAT or other credential, relaxing host verification, generating
-or loading another key, or disabling signing.
 
 ### Release batching
 
@@ -209,35 +195,15 @@ resource or namespace the current run did not create.
 
 ## 6. Architectural invariants
 
-1. **One admission library.** Every path that writes desired state goes through
-   `steward-admission`. The webhook enforces; the API enforces and escalates.
-   Tests use an admitted fixture rather than creating another write door.
-2. **Vendor semantics stay in adapters.** Only `adapters/<vendor>` may depend on
-   a vendor SDK or encode vendor-specific types and quirks. Core crates depend
-   on `steward-ports`; widen a port in Steward terms instead of leaking vendor
-   shapes into core types or CRDs.
-3. **AgentRuntime phase is controller-owned.** Current AgentRuntime phase lives
-   in CRD `status`, written by the controller. Postgres may hold Task and
-   connection-operation state, history, queue detail, and observations; it is
-   not the source of truth for current AgentRuntime phase.
-4. **Runtime identity is the UID.** Join runtime-owned records on `runtime_uid`,
-   never a reusable runtime name.
-5. **Grants do not mutate envelopes.** Approval of an over-envelope request
-   creates an instance-bound grant; it never widens or edits the envelope.
-6. **Spend is observed, not custodied.** LiteLLM remains the usage source of
-   truth.
-7. **The mint accepts a `Principal`.** Do not introduce a bare acting-user email
-   mint interface.
-8. **No chat egress in core.** Chat surfaces use `NotificationSink` through a
+1. **No chat egress in core.** Chat surfaces use `NotificationSink` through a
    connector; core crates do not acquire Slack or other chat clients.
-9. **No panics in production.** `unwrap()`, `expect()`, and `panic!()` are
+2. **No panics in production.** `unwrap()`, `expect()`, and `panic!()` are
    denied outside tests by workspace lint policy.
 
 ## 7. Changes requiring advance approval
 
 Ask before:
 
-- adding a dependency;
 - changing a CRD schema or a field's meaning;
 - changing an applied migration—add a new migration instead of editing history;
 - editing generated files under `manifests/` or `web/src/api-client/` rather
@@ -251,7 +217,7 @@ Never, even with general task approval: push to `main`; merge or close a PR;
 work around authentication/signing failure; silently weaken a test or rule; or
 rewrite history to conceal a committed secret. Materially destructive actions
 and branch-protection changes require their own explicit, precisely scoped
-authorization.
+authorization. No force pushe to any branch without explicit approval,
 
 ## 8. Upstream dependencies and conformance
 
@@ -281,9 +247,8 @@ ephemeral credentials and use obviously fake, neutral fixtures.
 
 If a secret is committed:
 
-1. Rotate or revoke it immediately.
-2. Report what leaked and where.
-3. Decide about history only afterward.
+1. Report what leaked and where.
+2. Decide about history only afterward.
 
 Never quietly amend or rewrite history to hide the incident.
 

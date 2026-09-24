@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.2.1` and application `0.2.1`.
+Current release contract: chart `0.2.2` and application `0.2.2`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -33,6 +33,9 @@ images:
 ```
 
 Never set a tag without the matching digest or use a mutable image reference.
+The chart rejects the all-zero SHA-256 sentinel: it is a placeholder, not a
+released immutable digest. The same rejection applies to execution-binding
+images, provider-profile digests, and enabled bridge images.
 Set `images.web.tag` and `images.web.digest` to empty strings if web is disabled
 and no web image is published. Only enabled workloads are rendered.
 
@@ -70,6 +73,27 @@ image coordinates, approved network CIDRs, and names/keys of externally
 managed Secrets. The checked-in defaults are not a usable installation
 values file. A successful render proves chart structure only; follow the
 installation guide's live delivery tests before hand-off.
+
+### Verified PostgreSQL TLS
+
+The API server and controller can mount the same operator-managed PostgreSQL
+CA from an existing `ConfigMap` or `Secret`. The chart never creates or rotates
+that object. Enable the projection and reference its fixed read-only path from
+the database URL:
+
+```yaml
+databaseTls:
+  mode: verify-full
+  ca:
+    kind: ConfigMap # or Secret
+    name: steward-postgres-ca
+    key: ca.pem
+```
+
+The database URL stored under `secrets.database` must include
+`sslmode=verify-full&sslrootcert=/run/database-tls/ca.crt`. An incomplete CA
+source fails chart validation. The default `disabled` mode mounts nothing and
+preserves existing installations.
 
 ## Workload defaults and platform integration
 

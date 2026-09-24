@@ -3,12 +3,12 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 run_dir="$(mktemp -d)"
-trap 'rm -f "${run_dir}/default.yaml" "${run_dir}/cert-manager.yaml" "${run_dir}/jira.yaml" "${run_dir}/customer.yaml"; rmdir "${run_dir}"' EXIT
+trap 'rm -f "${run_dir}/default.yaml" "${run_dir}/cert-manager.yaml" "${run_dir}/jira.yaml" "${run_dir}/customer.yaml" "${run_dir}/database-secret.yaml" "${run_dir}/database-configmap.yaml"; rmdir "${run_dir}"' EXIT
 
 # The release validator selects its strict customer contract only for a
 # deliberately versioned chart; a missing or stale marker must fail the handoff.
-if ! grep -Eq '^version: (0\.1\.23|0\.2\.1)$' "${root}/charts/steward/Chart.yaml"; then
-  echo 'customer install contract supports only the v0.1.23 transition base or v0.2.1' >&2
+if ! grep -Eq '^version: (0\.1\.23|0\.2\.2)$' "${root}/charts/steward/Chart.yaml"; then
+  echo 'customer install contract supports only the v0.1.23 transition base or v0.2.2' >&2
   exit 1
 fi
 grep -Fxq '  steward.apelogic.ai/customer-install-contract: steward.customer-install/v1' \
@@ -17,13 +17,20 @@ grep -Fxq '  steward.apelogic.ai/customer-install-contract: steward.customer-ins
 customer_images=(
   --set-string images.repository=registry.example.test/customer/steward
   --set-string images.apiserver.tag=test-apiserver
-  --set-string images.apiserver.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000
+  --set-string images.apiserver.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   --set-string images.controller.tag=test-controller
   --set-string images.controller.digest=sha256:1111111111111111111111111111111111111111111111111111111111111111
 )
 helm_template() {
   helm template steward "${root}/charts/steward" --namespace steward "${customer_images[@]}" "$@"
 }
+
+if helm_template \
+  --set-string images.apiserver.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+  --set-string tls.webhook.caBundlePem=public-test-ca > /dev/null 2>&1; then
+  echo 'installation contract must reject an all-zero apiserver image digest' >&2
+  exit 1
+fi
 
 if helm_template > /dev/null 2>&1; then
   echo 'customer TLS mode must reject a missing webhook CA before install' >&2
@@ -40,6 +47,31 @@ if rg -q 'STEWARD_JIRA_|secretName: steward-jira|kind: Certificate|cert-manager.
   echo 'default install must not require Jira or cert-manager' >&2
   exit 1
 fi
+
+if helm_template \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  --set-string databaseTls.mode=verify-full > /dev/null 2>&1; then
+  echo 'verified database TLS must reject an incomplete CA source' >&2
+  exit 1
+fi
+helm_template \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  --set-string databaseTls.mode=verify-full \
+  --set-string databaseTls.ca.kind=Secret \
+  --set-string databaseTls.ca.name=steward-postgres-ca \
+  --set-string databaseTls.ca.key=ca.pem > "${run_dir}/database-secret.yaml"
+test "$(rg -c 'mountPath: /run/database-tls, readOnly: true' "${run_dir}/database-secret.yaml")" = 2
+test "$(rg -c 'secretName: steward-postgres-ca' "${run_dir}/database-secret.yaml")" = 2
+test "$(rg -c 'key: ca.pem, path: ca.crt' "${run_dir}/database-secret.yaml")" = 2
+
+helm_template \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  --set-string databaseTls.mode=verify-full \
+  --set-string databaseTls.ca.kind=ConfigMap \
+  --set-string databaseTls.ca.name=steward-postgres-ca \
+  --set-string databaseTls.ca.key=ca.pem > "${run_dir}/database-configmap.yaml"
+test "$(rg -c 'name: database-tls-ca' "${run_dir}/database-configmap.yaml")" = 4
+test "$(rg -c 'name: steward-postgres-ca' "${run_dir}/database-configmap.yaml")" = 2
 if rg -q 'jira.example.com|sandbox-vm|cluster-issuer' "${run_dir}/default.yaml"; then
   echo 'default install contains environment-specific placeholders' >&2
   exit 1

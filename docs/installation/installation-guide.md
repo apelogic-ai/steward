@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.2.1`. The release workflow pulls the published OCI
+Release contract: chart `0.2.2`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -44,6 +44,10 @@ turn execution off on an installation with live AgentRuntimes or Tasks.
    fork release workflow publishes to `ghcr.io/<fork-owner>/steward` and
    `oci://ghcr.io/<fork-owner>/charts/steward` from a validated version tag;
    do not substitute an upstream owner's coordinates in a customer handoff.
+   To copy released images and reference runtimes into another registry, use
+   the released [registry mirror and deployment-lock tool](registry-mirroring.md).
+   It verifies the target digests and provides the exact chart and execution-binding
+   inputs; registry credentials remain in the standard Docker credential store.
 4. HTTPS service certificates for `steward-apiserver` and `steward-webhook`.
    Choose exactly one chart TLS mode:
    - `customerSecret` (default): pre-create the two named `kubernetes.io/tls`
@@ -133,6 +137,7 @@ system. The default names can be overridden under `secrets`, `tls`,
 | Reference and namespace | Kubernetes type and keys | Producer and consumer | Rotation / condition |
 |---|---|---|---|
 | `secrets.database.name` (`steward-database`) in release namespace | `Opaque`; `secrets.database.key` (`url`) | Database operator creates; API and controller read. | Always. Rotate the database credential and restart both Deployments after the new Secret is present; verify connectivity and migrations. |
+| `databaseTls.ca.name` in release namespace | Existing `ConfigMap` or `Secret`; configured `databaseTls.ca.key` | Database/PKI operator creates; API and controller mount read-only at `/run/database-tls/ca.crt`. | Required when `databaseTls.mode=verify-full`; rotate with CA overlap, restart both consumers, and reprove hostname verification. |
 | `tls.api.secretName` and `tls.webhook.secretName` in release namespace | `kubernetes.io/tls`; both `tls.crt`, `tls.key` | Customer PKI or cert-manager creates; API and controller mount separately. | Always. Renew before expiry, verify service DNS SANs, CA chain, and webhook `caBundle`; roll the affected Deployment. |
 | `secrets.jira.name` (`steward-jira`) in release namespace | `Opaque`; `secrets.jira.key` (`token`) | Jira operator creates; API and controller read only if `jira.enabled=true`. | Optional. Use a Jira Cloud API token with a dedicated account allowed to browse/search, create Task issues, and add comments in the configured project. Rotate the token, restart consumers, and prove a decision; absent when disabled. |
 | `secrets.litellm.name` (`steward-litellm`) in release namespace | `Opaque`; `secrets.litellm.key` (`master-key`) | LiteLLM operator creates; controller reads. | Governed execution only. Coordinate credential overlap/restart with LiteLLM. |
@@ -206,6 +211,34 @@ kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
 kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" apply -f -
 ```
 
+For AWS RDS or another private CA, obtain the provider-approved public CA
+bundle and project it without placing the PEM in Helm values. A public
+`ConfigMap` is sufficient unless the platform classifies its trust bundle as a
+Secret:
+
+```sh
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+  -n steward create configmap steward-postgres-ca \
+  --from-file=ca.pem=./public/postgres-ca.pem --dry-run=client -o yaml | \
+kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" apply -f -
+```
+
+Select the object and require verified TLS in the reviewed values:
+
+```yaml
+databaseTls:
+  mode: verify-full
+  ca:
+    kind: ConfigMap
+    name: steward-postgres-ca
+    key: ca.pem
+```
+
+The database URL Secret must use the server's certificate hostname and include
+`sslmode=verify-full&sslrootcert=/run/database-tls/ca.crt`. The same values
+shape accepts `kind: Secret`; the chart rejects `verify-full` when the source
+name or key is missing.
+
 Repeat the TLS command for `steward-webhook-tls`. cert-manager mode creates
 those two endpoint TLS Secrets from the selected issuer; it does not create
 database, Mint, OpenShell, or integration Secrets.
@@ -244,8 +277,9 @@ digests and OCI chart digest from its handoff, verify attestations against the
 fork repository/tag workflow identity, and pull the chart by digest into a
 clean directory. Never reconstruct a digest from a tag or mix components from
 different commits. If the operator uses another registry, copy the exact OCI
-manifests by digest, verify the destination digests are unchanged, and update
-only the fork-owned repository coordinates in the values file.
+manifests by digest, resolve and verify every resulting destination digest, and
+use only those destination coordinates in deployment configuration. Do not
+assume that a source digest is also the destination digest.
 
 Pull the chart through its immutable OCI manifest digest, verify Helm resolved
 that same digest, and retain the resulting local archive for lint, render, and
@@ -276,9 +310,27 @@ Keep `STEWARD_CHART_PACKAGE` in the same shell for the remaining commands.
 The supported release procedure installs this pulled archive; a source checkout
 or locally built image is not release evidence.
 
+The recommended deployment path is:
+
+1. verify `release-handoff.json` from the selected release;
+2. use the released [registry mirror tool](registry-mirroring.md) when artifacts
+   must move to another registry, producing `steward.deployment-lock/v1`;
+3. give that complete lock to the released
+   [platform preflight](platform-preflight.md), together with the explicit
+   namespace, endpoint, certificate, Secret-reference, and provider-profile
+   inputs; and
+4. install the generated `steward-values.json` only after static validation and
+   the applicable live Gateway and network checks pass.
+
+This path binds the generated Helm values and execution binding to the verified
+destination artifacts. Manual values assembly remains possible, but it must
+preserve the same immutable coordinates and cross-component relationships.
+
 1. Record the chart OCI digest and every component image digest from the same
-   release handoff. Set a
-   target-specific values file, for example:
+   release handoff. All-zero SHA-256 values are placeholders and are rejected;
+   copy the actual immutable digest for every enabled component and runtime.
+   Prefer the platform-preflight-generated values file. If assembling the file
+   manually, use a target-specific values file such as:
 
    ```yaml
    images:
@@ -336,19 +388,26 @@ or locally built image is not release evidence.
    `steward-openshell-client`, `steward-mint`, and
    `steward-workload-exchange-ca` objects named above. Install the matching
    OpenShell provider profiles outside this chart. For the product-owned
-   versioned bundle, create a deployment-neutral inputs file, then run
-   `cargo xtask provider-profile-bundle install --inputs <inputs.json>
-   --output <rendered-directory>` followed by the matching `reconcile` command
-   from the [bundle guide](../../config/provider-profile-bundle/v1.2.0/README.md).
+   versioned bundle, extract the attested release asset and use its bundled
+   `bin/steward-provider-profile` executable to validate, install, and reconcile
+   the deployment-neutral inputs as shown in the
+   [bundle guide](../../config/provider-profile-bundle/v1.2.0/README.md). The
+   released tool is self-contained for `linux/amd64`; no Steward checkout or
+   Rust toolchain is required.
    Record each installed profile ID and immutable policy digest in the
    [execution binding](execution-bindings.md); a model-free copy task attaches
    neither tool nor inference profile, while an approved model/tool requires
    the corresponding category. Pinned OpenShell v0.0.98 cannot attest profile
    content itself, so the deployment system must keep each installed ID
    immutable and verify the rendered bytes against the recorded digest.
+   For `codex@0.140.0`, use or mirror the digest-selected image and run the
+   [released runtime conformance](codex-reference-runtime.md) before activating its binding.
 
 2. Verify the named Secret objects and certificate SANs without displaying
-   their data. With an explicit kubeconfig/context, lint and render before
+   their data. When using platform preflight, run its `gateway-check` against
+   the explicit kubeconfig and context. On EKS, also run `network-check` and the
+   bounded `network-smoke`; detecting the policy agent alone is insufficient.
+   With the generated or manually assembled values file, lint and render before
    applying anything:
 
    ```sh

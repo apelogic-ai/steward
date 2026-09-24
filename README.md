@@ -17,7 +17,7 @@ available models and tools without granting authority.
 Steward is available under the [MIT License](LICENSE). Checked-in upstream
 patches retain their [third-party notices](THIRD_PARTY_NOTICES.md).
 
-Current installation contract: chart `0.2.1`, Kubernetes `>=1.30`, Helm 3.17+,
+Current installation contract: chart `0.2.2`, Kubernetes `>=1.30`, Helm 3.17+,
 and PostgreSQL 16 as the tested database line. Governed adapter evidence pins
 OpenShell `v0.0.98` with agent-sandbox `v0.5.0`. No registry is a default:
 release images and the OCI
@@ -34,6 +34,7 @@ records the limits of this tested matrix.
 |---|---|
 | Prerequisites, installation, secrets, post-install checks, and delivery tests | [Installation guide](docs/installation/installation-guide.md) |
 | Install order across Steward, `steward-run`, and the identity exchange | [Platform deployment order](docs/installation/platform-deployment-order.md) |
+| Generate and validate Helm/Flux deployment values | [Platform preflight](docs/installation/platform-preflight.md) |
 | All chart values and optional integrations | [Helm chart reference](charts/steward/README.md) |
 | Documentation authority, status, and navigation | [Documentation index](docs/README.md) |
 | Normative M1 fields, ownership, and compatibility | [Frozen `steward.m1/v1` contract](docs/contracts/m1/v1/README.md) |
@@ -45,6 +46,7 @@ records the limits of this tested matrix.
 | Canonical browser / Task person identity | [Canonical user identity](docs/canonical-user-identity-v1.md) |
 | Understand the Task API and worker contract | [Task deployment](config/task/README.md) |
 | Configure coding-agent versions | [Execution bindings](docs/installation/execution-bindings.md) |
+| Obtain, mirror, or rebuild the supported Codex image | [Codex reference runtime](docs/installation/codex-reference-runtime.md) |
 | The rules for changing this repository | [Agent rules](AGENTS.md) |
 | Run the complete local gate | `cargo xtask ci` |
 
@@ -148,10 +150,17 @@ The chart installs Steward resources but does not create a database,
 credentials, an issuer, a Gateway, DNS, or an isolation RuntimeClass. An
 operator supplies immutable image coordinates and chooses customer-owned TLS
 Secrets plus a public webhook CA, or cert-manager with an explicit issuer.
+Verified PostgreSQL deployments can project an existing CA `ConfigMap` or
+`Secret` read-only into both database clients.
 Core mode keeps execution disabled and Task orchestration staged. To enable
 governed execution, first validate all dependency and functional sandbox
 requirements in the [installation guide](docs/installation/installation-guide.md)
 and [execution-binding guide](docs/installation/execution-bindings.md).
+Release assets include a standalone `linux/amd64` provider-profile validator
+and installer, so operators do not need a Steward source checkout to render the
+released runtime-provider bundle. They also include the
+[`steward-registry-lock.py`](docs/installation/registry-mirroring.md) tool for
+verified private-registry mirroring and deterministic deployment locks.
 
 Historical design documents remain available through the documentation index;
 they are not an installation contract. The API group is

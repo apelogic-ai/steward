@@ -738,6 +738,9 @@ impl ExecutionProviderProfile {
         if !valid_bounded_binding_scalar(&self.id)
             || self.id.chars().any(char::is_whitespace)
             || !valid_sha256_digest(&self.digest)
+            || self.digest["sha256:".len()..]
+                .bytes()
+                .all(|byte| byte == b'0')
         {
             return Err("execution provider profile is incomplete or mutable".to_owned());
         }
@@ -873,6 +876,7 @@ fn valid_digest_pinned_image(value: &str) -> bool {
         && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && digest.bytes().any(|byte| byte != b'0')
 }
 
 fn valid_oci_registry(value: &str) -> bool {
@@ -1275,6 +1279,10 @@ mod tests {
             "registry.example.test:5000/team-a/agent@sha256:{digest}"
         )));
         for invalid in [
+            format!(
+                "registry.example.test/team-a/agent@sha256:{}",
+                "0".repeat(64)
+            ),
             format!("registry::5000/agent@sha256:{digest}"),
             format!("registry.example.test:00001/agent@sha256:{digest}"),
             format!("registry.example.test/team-a/-agent@sha256:{digest}"),
@@ -1289,6 +1297,19 @@ mod tests {
                 "accepted malformed or unbounded OCI image reference {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn execution_provider_profiles_reject_placeholder_digests() {
+        let profile = super::ExecutionProviderProfile {
+            id: "example-profile-v1".to_owned(),
+            digest: digest('0'),
+        };
+
+        assert!(
+            profile.validate().is_err(),
+            "an all-zero digest is a placeholder, not an immutable provider-profile identity"
+        );
     }
 
     #[test]

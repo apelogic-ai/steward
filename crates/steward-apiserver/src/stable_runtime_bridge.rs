@@ -304,6 +304,7 @@ fn verified_artifact(image_reference: String) -> Result<VerifiedBridgeArtifact, 
         || !digest["sha256:".len()..]
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || digest["sha256:".len()..].bytes().all(|byte| byte == b'0')
     {
         return Err(StableBridgeError::ArtifactUnverified);
     }
@@ -326,11 +327,26 @@ mod tests {
     use super::{
         ActiveTaskRuntimeSource, BridgeArtifactVerifier, BridgeRuntimeReference, BridgeService,
         STABLE_RUNTIME_BRIDGE_PATH, StableBridgeError, StableRuntimeBridge, protected_router,
+        verified_artifact,
     };
+
     use crate::browser_auth::{
         BrowserAuthService, LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service,
     };
     use crate::{AdmissionContext, BoxFuture, RuntimeCreateError, RuntimeRepository};
+
+    #[test]
+    fn verified_bridge_artifacts_reject_placeholder_digests() {
+        let image = format!(
+            "registry.example.test/steward-bridge@sha256:{}",
+            "0".repeat(64)
+        );
+
+        assert_eq!(
+            verified_artifact(image),
+            Err(StableBridgeError::ArtifactUnverified)
+        );
+    }
 
     #[derive(Clone)]
     struct Source(Option<BridgeRuntimeReference>);

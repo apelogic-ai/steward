@@ -6,6 +6,9 @@ bash "${root}/scripts/test-validate-release-version.sh"
 bash "${root}/scripts/validate-release-version.sh" >/dev/null
 bash "${root}/scripts/test-released-artifact-acceptance.sh"
 bash "${root}/scripts/test-release-chart-contract.sh"
+bash "${root}/scripts/test-steward-registry-lock.sh"
+python3 "${root}/scripts/test-platform-preflight.py"
+bash "${root}/scripts/test-package-platform-preflight.sh"
 chart_contract_mode="$(bash "${root}/scripts/release-chart-contract.sh" "${root}/charts/steward/Chart.yaml")"
 rendered="$(mktemp)"
 default_rendered="$(mktemp)"
@@ -63,7 +66,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-digest0="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+placeholder_digest="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+digest0="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 digest1="sha256:1111111111111111111111111111111111111111111111111111111111111111"
 digest2="sha256:2222222222222222222222222222222222222222222222222222222222222222"
 digest3="sha256:3333333333333333333333333333333333333333333333333333333333333333"
@@ -83,6 +87,13 @@ core_image_values=(
   --set images.controller.tag=validation-controller
   --set "images.controller.digest=${digest1}"
 )
+if helm template steward "${root}/charts/steward" --namespace steward \
+  "${core_image_values[@]}" \
+  --set-string images.apiserver.digest="${placeholder_digest}" \
+  --set-string tls.webhook.caBundlePem=public-validation-ca >/dev/null 2>&1; then
+  echo 'release chart accepted an all-zero apiserver image digest' >&2
+  exit 1
+fi
 if [[ "${chart_contract_mode}" == customer-v1 ]]; then
   image_values+=(
     --set execution.enabled=true
@@ -349,6 +360,26 @@ helm template steward "${root}/charts/steward" \
 if [[ "$(grep -c 'name: STEWARD_TASK_EXECUTION_BINDINGS_FILE' \
   "${task_execution_bindings_rendered}")" != "1" ]]; then
   echo "configured execution binding catalog must reach only the apiserver file mount" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  "${image_values[@]}" \
+  "${task_execution_binding_values[@]}" \
+  --set-string 'config.apiserver.executionBindings.bindings[0].image=registry.example.test/agents/example@sha256:0000000000000000000000000000000000000000000000000000000000000000' \
+  >/dev/null 2>&1
+then
+  echo "structured execution binding values must reject placeholder image digests" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  "${image_values[@]}" \
+  "${task_execution_binding_values[@]}" \
+  --set-string 'config.apiserver.executionBindings.bindings[0].providerProfiles.tools.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000' \
+  >/dev/null 2>&1
+then
+  echo "structured execution binding values must reject placeholder provider-profile digests" >&2
   exit 1
 fi
 if helm template steward "${root}/charts/steward" \

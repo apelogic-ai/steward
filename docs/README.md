@@ -56,6 +56,9 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | [`canonical-user-identity-v1.md`](canonical-user-identity-v1.md) | **Current implementation** | Canonical person identity and ownership keys. |
 | [`github-actions-generator.md`](github-actions-generator.md) | **Current implementation, renderer scope** | Bounded GitHub Actions YAML generation. |
 | [`installation/installation-guide.md`](installation/installation-guide.md) | **Current release contract** | Prerequisites, installation modes, Secret and integration inventory, post-install checks, and delivery tests. |
+| [`installation/registry-mirroring.md`](installation/registry-mirroring.md) | **Current release contract** | Manifest-preserving registry copy, target verification, and deterministic deployment-lock generation. |
+| [`installation/platform-preflight.md`](installation/platform-preflight.md) | **Current release contract** | Deterministic Helm/Flux generation plus Gateway, namespace, certificate, and NetworkPolicy preflight. |
+| [`installation/codex-reference-runtime.md`](installation/codex-reference-runtime.md) | **Current release contract** | Supported Codex reference image, immutable binding, mirroring, rebuild, and conformance procedure. |
 | [`installation/execution-bindings.md`](installation/execution-bindings.md) | **Current implementation** | Deployment-neutral coding-agent catalog, validation, Helm installation, and lifecycle behavior. |
 | [`installation/upgrade-execution-bindings.md`](installation/upgrade-execution-bindings.md) | **Current implementation** | Upgrade from implicit coding-agent behavior to explicit deployment bindings. |
 | [`installation/upgrade-v0.2.0.md`](installation/upgrade-v0.2.0.md) | **Current release contract** | v0.1.23 preconditions, migration result, and rollback boundary. |
