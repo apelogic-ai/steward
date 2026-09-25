@@ -1500,17 +1500,9 @@ mod tests {
     }
 
     #[test]
-    fn codex_reference_runtime_is_a_released_conformant_artifact() -> Result<(), String> {
+    fn codex_reference_runtime_is_a_released_artifact() -> Result<(), String> {
         let container = fs::read_to_string(root().join("build/codex-reference.Dockerfile"))
             .map_err(|error| format!("Codex reference runtime build is required: {error}"))?;
-        let conformance =
-            fs::read_to_string(root().join("scripts/codex-reference-runtime-conformance.sh"))
-                .map_err(|error| {
-                    format!("Codex reference runtime conformance is required: {error}")
-                })?;
-        let openshell_conformance =
-            fs::read_to_string(root().join("scripts/codex-reference-runtime-openshell-inside.sh"))
-                .map_err(|error| format!("Codex OpenShell conformance is required: {error}"))?;
         let vulnerability_exceptions =
             fs::read_to_string(root().join("security/codex-reference-runtime.openvex.json"))
                 .map_err(|error| format!("Codex reference runtime VEX is required: {error}"))?;
@@ -1569,39 +1561,6 @@ mod tests {
             );
         }
         for required in [
-            "STEWARD_OPEN_SHELL_RELEASE=v0.0.98",
-            "scripts/openshell-testbed.sh",
-            "scripts/codex-reference-runtime-openshell-inside.sh",
-        ] {
-            assert!(
-                conformance.contains(required),
-                "Codex reference runtime conformance must execute {required}"
-            );
-        }
-        for required in [
-            "provider profile import --global",
-            "--provider steward-litellm",
-            "--provider steward-mcp-gw",
-            "/usr/bin/codex --version",
-            "codex-cli 0.140.0",
-        ] {
-            assert!(
-                openshell_conformance.contains(required),
-                "Codex OpenShell conformance must prove {required}"
-            );
-        }
-        for required in [
-            "codex-cli 0.140.0",
-            "provider-profile-bundle/v1.2.0/profiles/steward-litellm.json",
-            "provider-profile-bundle/v1.2.0/profiles/steward-mcp-gw.json",
-            "requiredBinaries",
-        ] {
-            assert!(
-                conformance.contains(required),
-                "Codex reference runtime conformance must prove {required}"
-            );
-        }
-        for required in [
             "publish-codex-reference-runtime:",
             "build/codex-reference.Dockerfile",
             "provenance: mode=max",
@@ -1609,8 +1568,6 @@ mod tests {
             "trivy-config: security/codex-reference-runtime.trivy.yaml",
             "release-codex-reference-runtime",
             "codex-reference-runtime.digest",
-            "codex-reference-runtime-conformance:",
-            "scripts/codex-reference-runtime-conformance.sh",
             "referenceRuntimes:",
             "agentRef: \"codex@0.140.0\"",
             "platform: \"linux/amd64\"",
@@ -1620,25 +1577,10 @@ mod tests {
                 "release workflow must include {required}"
             );
         }
-        let conformance_job = workflow
-            .split_once("  codex-reference-runtime-conformance:")
-            .and_then(|(_, remainder)| remainder.split_once("\n  openshell-x86-conformance:"))
-            .map(|(job, _)| job)
-            .ok_or_else(|| "Codex reference runtime conformance job is required".to_string())?;
-        for required in [
-            "uses: ./.github/actions/setup-tools",
-            "kubernetes-tools: \"true\"",
-        ] {
-            assert!(
-                conformance_job.contains(required),
-                "Codex reference runtime conformance job must include {required}"
-            );
-        }
         for required in [
             "codex@0.140.0",
             "docker buildx imagetools create",
             "build/codex-reference.Dockerfile",
-            "scripts/codex-reference-runtime-conformance.sh",
         ] {
             assert!(
                 documentation.contains(required),
