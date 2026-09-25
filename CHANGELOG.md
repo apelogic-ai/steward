@@ -7,6 +7,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-09-24
+
+### Fixed
+
+- Removed the newly introduced release-only Codex/OpenShell runtime gate because it exercised a
+  different supervisor topology from the established runtime E2E path and blocked publication
+  without providing representative deployment evidence. Codex image build, vulnerability
+  scanning, SBOM, provenance, and publication remain required.
+
 ## [0.2.5] - 2026-09-24
 
 ### Added
@@ -137,7 +146,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/apelogic-ai/steward/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/apelogic-ai/steward/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/apelogic-ai/steward/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/apelogic-ai/steward/compare/v0.2.2...v0.2.3

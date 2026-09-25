@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.2.5`. The release workflow pulls the published OCI
+Release contract: chart `0.2.6`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.

@@ -38,10 +38,10 @@ case "${1:-} ${2:-}" in
       previous="${argument}"
     done
     case "${reference}" in
-      ghcr.io/example-org/charts/steward:0.2.5@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)
+      ghcr.io/example-org/charts/steward:0.2.6@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)
         digest='sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
         ;;
-      ghcr.io/example-org/steward:0.2.5-apiserver@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
+      ghcr.io/example-org/steward:0.2.6-apiserver@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
         if [[ -n "${platform}" ]]; then
           digest='sha256:1111111111111111111111111111111111111111111111111111111111111111'
         else
@@ -80,15 +80,15 @@ chmod +x "${mock_directory}/oras"
 cat >"${temporary_directory}/handoff.json" <<'JSON'
 {
   "schemaVersion": "steward.release-handoff/v1",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "commit": "0123456789abcdef0123456789abcdef01234567",
   "chart": {
-    "reference": "oci://ghcr.io/example-org/charts/steward:0.2.5",
+    "reference": "oci://ghcr.io/example-org/charts/steward:0.2.6",
     "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
   },
   "images": {
     "apiserver": {
-      "reference": "ghcr.io/example-org/steward:0.2.5-apiserver",
+      "reference": "ghcr.io/example-org/steward:0.2.6-apiserver",
       "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
   },
@@ -105,8 +105,8 @@ cat >"${temporary_directory}/mappings.json" <<'JSON'
 {
   "schemaVersion": "steward.registry-mappings/v1",
   "artifacts": {
-    "chart": "registry.example.test/team-a/charts/steward:0.2.5",
-    "images.apiserver": "registry.example.test/team-a/steward:0.2.5-apiserver",
+    "chart": "registry.example.test/team-a/charts/steward:0.2.6",
+    "images.apiserver": "registry.example.test/team-a/steward:0.2.6-apiserver",
     "referenceRuntimes.codex": "registry.example.test/team-a/steward-codex:0.140.0"
   }
 }
@@ -128,7 +128,7 @@ jq -e '
   .schemaVersion == "steward.registry-plan/v1" and
   .platform == null and
   (.artifacts | keys) == ["chart", "images.apiserver", "referenceRuntimes.codex"] and
-  .artifacts.chart.target.reference == "registry.example.test/team-a/charts/steward:0.2.5"
+  .artifacts.chart.target.reference == "registry.example.test/team-a/charts/steward:0.2.6"
 ' "${temporary_directory}/plan-one.json" >/dev/null
 if grep -Fq 'cp --recursive' "${command_log}"; then
   echo 'no-write plan unexpectedly copied an artifact' >&2
@@ -151,7 +151,7 @@ jq -e '
   .artifacts.chart.flux.ociRepository.url == "oci://registry.example.test/team-a/charts/steward" and
   .artifacts.chart.flux.ociRepository.ref.digest == "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" and
   .chartValues.images.repository == "registry.example.test/team-a/steward" and
-  .chartValues.images.apiserver.tag == "0.2.5-apiserver" and
+  .chartValues.images.apiserver.tag == "0.2.6-apiserver" and
   .executionBindingImages.codex == "registry.example.test/team-a/steward-codex@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 ' "${temporary_directory}/lock-one.json" >/dev/null
 
@@ -171,7 +171,7 @@ jq -e '
 grep -Fq -- '--platform linux/amd64' "${command_log}"
 
 cat >"${temporary_directory}/bad-mappings.json" <<'JSON'
-{"schemaVersion":"steward.registry-mappings/v1","artifacts":{"chart":"registry.example.test/team-a/charts/steward:0.2.5"}}
+{"schemaVersion":"steward.registry-mappings/v1","artifacts":{"chart":"registry.example.test/team-a/charts/steward:0.2.6"}}
 JSON
 if PATH="${mock_directory}:${PATH}" "${root}/scripts/steward-registry-lock.sh" plan \
   --handoff "${temporary_directory}/handoff.json" \
