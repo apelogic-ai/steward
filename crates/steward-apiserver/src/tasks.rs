@@ -3569,9 +3569,10 @@ mod workflow_request_tests {
 #[cfg(test)]
 mod identity_task_authentication_tests {
     use super::{
-        IdentityTaskClaims, MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS, TaskAuthenticationError,
-        compatibility_task_identity_from_claims, task_identity_from_identity_claims,
-        valid_identity_issuer, validate_identity_task_jwks, verify_identity_task_token,
+        IDENTITY_CLOCK_SKEW_SECONDS, IdentityTaskClaims, MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS,
+        TaskAuthenticationError, compatibility_task_identity_from_claims,
+        task_identity_from_identity_claims, valid_identity_issuer, validate_identity_task_jwks,
+        verify_identity_task_token,
     };
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -3769,16 +3770,25 @@ mod identity_task_authentication_tests {
         expired_claims.exp = now.saturating_sub(61);
         let expired = federated_token_with(&key, KID, expired_claims)?;
         let mut future_claims = federated_claims(now);
-        future_claims.nbf = now + 61;
+        future_claims.nbf = now + IDENTITY_CLOCK_SKEW_SECONDS + 60;
         let future = federated_token_with(&key, KID, future_claims)?;
         let mut over_age_claims = federated_claims(now);
         over_age_claims.iat = now.saturating_sub(MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS + 1);
         let over_age = federated_token_with(&key, KID, over_age_claims)?;
-        for assertion in [wrong_kid, wrong_signature, expired, future, over_age] {
-            assert!(matches!(
-                verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE),
-                Err(TaskAuthenticationError::InvalidCredentials)
-            ));
+        for (case, assertion) in [
+            ("unknown key ID", wrong_kid),
+            ("wrong signature", wrong_signature),
+            ("expired", expired),
+            ("not yet valid", future),
+            ("over maximum age", over_age),
+        ] {
+            assert!(
+                matches!(
+                    verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE),
+                    Err(TaskAuthenticationError::InvalidCredentials)
+                ),
+                "accepted {case} federated task credential"
+            );
         }
 
         let mut header = Header::new(Algorithm::HS256);
