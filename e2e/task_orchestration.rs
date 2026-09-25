@@ -534,6 +534,46 @@ async fn multiple_named_envelope_templates_coexist_for_one_role_and_pin_requests
         request_ids.push(request.id);
     }
     assert_ne!(request_ids[0], request_ids[1]);
+
+    let filing_token = store
+        .claim_envelope_request_decision_filing(request_ids[0], "admin-test")
+        .await?;
+    assert!(matches!(
+        store
+            .claim_envelope_request_decision_filing(request_ids[0], "admin-retry")
+            .await,
+        Err(StoreError::DecisionFilingInProgress)
+    ));
+    store
+        .complete_envelope_request_decision_filing(
+            request_ids[0],
+            filing_token,
+            "PROJ-123",
+            "https://jira.example.com/browse/PROJ-123",
+            "admin-test",
+        )
+        .await?;
+    let reference = store
+        .envelope_request_decision_reference(request_ids[0])
+        .await?
+        .ok_or(StoreError::DecisionReferenceMismatch)?;
+    assert_eq!(reference.decision_key, "PROJ-123");
+    assert!(matches!(
+        store
+            .claim_envelope_request_decision_filing(request_ids[0], "admin-retry")
+            .await,
+        Err(StoreError::DecisionReferenceMismatch)
+    ));
+
+    let released_token = store
+        .claim_envelope_request_decision_filing(request_ids[1], "admin-test")
+        .await?;
+    store
+        .release_envelope_request_decision_filing(request_ids[1], released_token)
+        .await?;
+    store
+        .claim_envelope_request_decision_filing(request_ids[1], "admin-retry")
+        .await?;
     Ok(())
 }
 
@@ -800,11 +840,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         }
     };
     let attempt = match store
-        .authorize_task_execution_start(
-            attempt.attempt_id,
-            attempt.generation,
-            "test-controller",
-        )
+        .authorize_task_execution_start(attempt.attempt_id, attempt.generation, "test-controller")
         .await?
     {
         TaskExecutionTransition::Applied(attempt) => attempt,

@@ -1183,6 +1183,33 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         request_id: Uuid,
     ) -> BoxFuture<'_, Result<Option<EnvelopeRequestDecisionReference>, StoreError>>;
 
+    fn claim_envelope_request_decision_filing<'a>(
+        &'a self,
+        _request_id: Uuid,
+        _claimed_by: &'a str,
+    ) -> BoxFuture<'a, Result<Uuid, StoreError>> {
+        Box::pin(async { Err(StoreError::DecisionFilingInProgress) })
+    }
+
+    fn complete_envelope_request_decision_filing<'a>(
+        &'a self,
+        _request_id: Uuid,
+        _token: Uuid,
+        _decision_key: &'a str,
+        _evidence_url: &'a str,
+        _filed_by: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async { Err(StoreError::DecisionFilingClaimLost) })
+    }
+
+    fn release_envelope_request_decision_filing(
+        &self,
+        _request_id: Uuid,
+        _token: Uuid,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        Box::pin(async { Err(StoreError::DecisionFilingClaimLost) })
+    }
+
     fn link_envelope_request_decision_reference<'a>(
         &'a self,
         request_id: Uuid,
@@ -1569,6 +1596,47 @@ impl AdmissionLedger for PgStore {
         Box::pin(
             async move { PgStore::envelope_request_decision_reference(self, request_id).await },
         )
+    }
+
+    fn claim_envelope_request_decision_filing<'a>(
+        &'a self,
+        request_id: Uuid,
+        claimed_by: &'a str,
+    ) -> BoxFuture<'a, Result<Uuid, StoreError>> {
+        Box::pin(async move {
+            PgStore::claim_envelope_request_decision_filing(self, request_id, claimed_by).await
+        })
+    }
+
+    fn complete_envelope_request_decision_filing<'a>(
+        &'a self,
+        request_id: Uuid,
+        token: Uuid,
+        decision_key: &'a str,
+        evidence_url: &'a str,
+        filed_by: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            PgStore::complete_envelope_request_decision_filing(
+                self,
+                request_id,
+                token,
+                decision_key,
+                evidence_url,
+                filed_by,
+            )
+            .await
+        })
+    }
+
+    fn release_envelope_request_decision_filing(
+        &self,
+        request_id: Uuid,
+        token: Uuid,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        Box::pin(async move {
+            PgStore::release_envelope_request_decision_filing(self, request_id, token).await
+        })
     }
 
     fn link_envelope_request_decision_reference<'a>(
@@ -6162,6 +6230,7 @@ mod tests {
         pending_envelope_requests: Vec<PendingEnvelopeRequest>,
         decision_references: DecisionReferences,
         decision_filing_claim: Arc<Mutex<Option<Uuid>>>,
+        envelope_request_decision_filing_claim: Arc<Mutex<Option<(Uuid, Uuid)>>>,
         revoke_rows: u64,
         reversion: Option<GrantReversion>,
         application: Arc<Mutex<Option<GrantReversion>>>,
@@ -6835,6 +6904,90 @@ mod tests {
                             },
                         )
                     })
+            })
+        }
+
+        fn claim_envelope_request_decision_filing<'a>(
+            &'a self,
+            request_id: Uuid,
+            _claimed_by: &'a str,
+        ) -> BoxFuture<'a, Result<Uuid, StoreError>> {
+            Box::pin(async move {
+                if self
+                    .envelope_request_decision_reference(request_id)
+                    .await?
+                    .is_some()
+                {
+                    return Err(StoreError::DecisionReferenceMismatch);
+                }
+                let mut claim =
+                    self.envelope_request_decision_filing_claim
+                        .lock()
+                        .map_err(|_| {
+                            StoreError::Database(
+                                "fake envelope-request filing claim lock was poisoned".to_owned(),
+                            )
+                        })?;
+                if claim.is_some() {
+                    return Err(StoreError::DecisionFilingInProgress);
+                }
+                let token = Uuid::new_v4();
+                *claim = Some((request_id, token));
+                Ok(token)
+            })
+        }
+
+        fn complete_envelope_request_decision_filing<'a>(
+            &'a self,
+            request_id: Uuid,
+            token: Uuid,
+            decision_key: &'a str,
+            evidence_url: &'a str,
+            _filed_by: &'a str,
+        ) -> BoxFuture<'a, Result<(), StoreError>> {
+            Box::pin(async move {
+                let mut claim =
+                    self.envelope_request_decision_filing_claim
+                        .lock()
+                        .map_err(|_| {
+                            StoreError::Database(
+                                "fake envelope-request filing claim lock was poisoned".to_owned(),
+                            )
+                        })?;
+                if *claim != Some((request_id, token)) {
+                    return Err(StoreError::DecisionFilingClaimLost);
+                }
+                self.decision_references
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake envelope-request decision-reference lock was poisoned".to_owned(),
+                        )
+                    })?
+                    .push((request_id, decision_key.to_owned(), evidence_url.to_owned()));
+                *claim = None;
+                Ok(())
+            })
+        }
+
+        fn release_envelope_request_decision_filing(
+            &self,
+            request_id: Uuid,
+            token: Uuid,
+        ) -> BoxFuture<'_, Result<(), StoreError>> {
+            Box::pin(async move {
+                let mut claim =
+                    self.envelope_request_decision_filing_claim
+                        .lock()
+                        .map_err(|_| {
+                            StoreError::Database(
+                                "fake envelope-request filing claim lock was poisoned".to_owned(),
+                            )
+                        })?;
+                if *claim == Some((request_id, token)) {
+                    *claim = None;
+                }
+                Ok(())
             })
         }
 
@@ -7838,6 +7991,7 @@ mod tests {
             ],
             decision_references: Arc::new(Mutex::new(Vec::new())),
             decision_filing_claim: Arc::new(Mutex::new(None)),
+            envelope_request_decision_filing_claim: Arc::new(Mutex::new(None)),
             revoke_rows: 0,
             reversion: None,
             application: Arc::new(Mutex::new(None)),

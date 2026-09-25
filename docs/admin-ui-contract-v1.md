@@ -56,25 +56,63 @@ opt-in.
 
 ### Approvals
 
-The Next.js `/admin/approvals` page consumes
-`GET /admin/api/v1/approvals` and the versioned decision APIs. Approval
-evidence remains bound to the authenticated actor and exact runtime UID. The
-browser must not infer state transitions from database shape.
+The Next.js `/admin/approvals` page consumes the unified, cursor-paginated
+`GET /admin/api/v1/requests` read model, its exact-ID detail route, and
+`GET /admin/api/v1/requests/summary`. The queue combines Envelope requests,
+runtime exceptions, and cumulative-spend escalations without flattening their
+source-specific decision routes. Structured `DirectAdmissionDelta` values are
+the only source for rendering requested changes; the browser must not parse the
+legacy runtime-exception `counterexample` string.
+
+Automatic Envelope provisioning is recorded with `system:auto` as the status
+actor. Manual approvals retain rationale, evidence URL, expiry, and the exact
+canonical administrator actor. Filing an external decision first acquires a
+short-lived per-request lease, so concurrent browser retries cannot create two
+external decisions. The completed reference and status history are append-only.
 
 ### Envelopes
 
 The Next.js envelope administration pages consume versioned JSON template and
-request APIs. Admission remains the authority for exact counterexamples and
-envelope revisions. Presentation must not claim that OpenShell, MCP-GW, or
-LiteLLM updates are observed until the API represents their reconciliation
-state.
+request APIs. Templates have immutable IDs, administrator-authored display
+names, one or more eligible member roles, and append-only revisions. More than
+one active template may target the same role; an Envelope request pins the
+chosen template ID and revision.
+
+Provisioned Envelope requests may include current-period spend usage. Usage is
+the sum of the latest observation for each runtime bound to that Envelope
+instance, plus active instance-scoped top-up grants in the effective limit. An
+`available`, `partial`, or `unavailable` status is authoritative; presentation
+must never guess a missing value. Request detail includes append-only status
+history.
+
+Capability metadata supplies tool access class and provider catalog
+availability. The browser must not infer either from display text. Unsupported
+models are omitted rather than rendered as guessed disabled options. Admission
+remains the authority for exact deltas and Envelope revisions.
+
+### Connections and onboarding
+
+`GET /app/api/v1/connections` returns connected providers and the available
+provider catalog. GitHub is enabled; unavailable providers remain explicit and
+disabled. Provider `start` and `disconnect` mutations are browser-session and
+CSRF scoped. The onboarding aggregate composes connection, Envelope, workflow,
+and run evidence; dismissal is a server-side preference.
 
 ### Fleet and runs
 
-Kubernetes `AgentRuntime.status` remains the current lifecycle source of
-truth. PostgreSQL holds append-only history and observations, not current
-phase. Browser run views consume the versioned run and timeline APIs and must
-preserve provenance and data-availability distinctions.
+PostgreSQL Task state is the browser run source of truth. User routes are
+exact-owner scoped; administrator `all-runs` routes use browser administrator
+authority and may expose the owner's display email. List responses include
+phase facets computed from the current filter with the phase predicate removed.
+
+Run detail exposes validated GitHub source provenance when it was captured at
+submission, four bounded stages (admission, runtime provisioning, agent
+execution, and finalization), and one execution step with stdout/stderr streams.
+The separate log endpoint supports bounded byte-offset reads while a Task is
+running and marks whether the stream is complete. Cancel is owner scoped.
+Re-run creates a fresh Task only for a versioned Steward workflow; a
+GitHub-triggered run fails closed until a governed provider dispatch can create
+a new upstream run without inventing provenance.
 
 ### Federated Task subjects
 

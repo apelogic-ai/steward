@@ -134,7 +134,33 @@ pub(crate) struct BrowserRunStep {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BrowserRunFacets {
-    phase: std::collections::BTreeMap<String, u64>,
+    phase: BrowserRunPhaseFacets,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct BrowserRunPhaseFacets {
+    submitted: u64,
+    parked: u64,
+    queued: u64,
+    running: u64,
+    succeeded: u64,
+    failed: u64,
+    cancelled: u64,
+}
+
+impl BrowserRunPhaseFacets {
+    fn from_counts(counts: &std::collections::BTreeMap<String, u64>) -> Self {
+        Self {
+            submitted: counts.get("submitted").copied().unwrap_or_default(),
+            parked: counts.get("parked").copied().unwrap_or_default(),
+            queued: counts.get("queued").copied().unwrap_or_default(),
+            running: counts.get("running").copied().unwrap_or_default(),
+            succeeded: counts.get("succeeded").copied().unwrap_or_default(),
+            failed: counts.get("failed").copied().unwrap_or_default(),
+            cancelled: counts.get("cancelled").copied().unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -332,7 +358,9 @@ where
         task_uid: None,
     };
     let facets = match state.ledger.agent_run_phase_facets(&query).await {
-        Ok(phase) => BrowserRunFacets { phase },
+        Ok(phase) => BrowserRunFacets {
+            phase: BrowserRunPhaseFacets::from_counts(&phase),
+        },
         Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
     };
     match state.ledger.agent_runs(&query).await {
@@ -392,7 +420,9 @@ where
         task_uid: None,
     };
     let facets = match state.ledger.agent_run_phase_facets(&query).await {
-        Ok(phase) => BrowserRunFacets { phase },
+        Ok(phase) => BrowserRunFacets {
+            phase: BrowserRunPhaseFacets::from_counts(&phase),
+        },
         Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
     };
     match state.ledger.agent_runs(&query).await {
@@ -692,7 +722,7 @@ where
     responses(
         (status = 200, body = BrowserExecutionLogResponse),
         (status = 401, description = "Browser session is absent or invalid"),
-        (status = 404, description = "Terminal execution log was not found in the user's scope"),
+        (status = 404, description = "Execution log was not found in the user's scope"),
         (status = 503, description = "Run history is unavailable")
     ),
     security(("browserSession" = []))
@@ -731,7 +761,7 @@ where
         (status = 200, body = BrowserExecutionLogResponse),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Administrator role is required"),
-        (status = 404, description = "Terminal execution log was not found"),
+        (status = 404, description = "Execution log was not found"),
         (status = 503, description = "Run history is unavailable")
     ),
     security(("browserSession" = []))

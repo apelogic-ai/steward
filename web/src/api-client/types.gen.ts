@@ -358,9 +358,17 @@ export type BrowserPreferencesView = {
 export type BrowserRole = 'user' | 'admin';
 
 export type BrowserRunFacets = {
-    phase: {
-        [key: string]: number;
-    };
+    phase: BrowserRunPhaseFacets;
+};
+
+export type BrowserRunPhaseFacets = {
+    cancelled: number;
+    failed: number;
+    parked: number;
+    queued: number;
+    running: number;
+    submitted: number;
+    succeeded: number;
 };
 
 export type BrowserRunResponse = {
@@ -1173,7 +1181,7 @@ export type AllRunExecutionLogErrors = {
      */
     403: unknown;
     /**
-     * Terminal execution log was not found
+     * Execution log was not found
      */
     404: unknown;
     /**
@@ -2705,7 +2713,7 @@ export type MyRunExecutionLogErrors = {
      */
     401: unknown;
     /**
-     * Terminal execution log was not found in the user's scope
+     * Execution log was not found in the user's scope
      */
     404: unknown;
     /**

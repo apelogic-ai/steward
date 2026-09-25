@@ -359,7 +359,8 @@ mod capability_catalog_tests {
     }
 
     #[test]
-    fn capability_catalog_requires_access_classes_and_provider_availability() {
+    fn capability_catalog_requires_access_classes_and_provider_availability() -> Result<(), String>
+    {
         let value = r#"{
           "schemaVersion":"steward.capability-catalog/v2",
           "models":[{"provider":"provider-a","model":"model-a"}],
@@ -376,9 +377,11 @@ mod capability_catalog_tests {
             "available":true
           }]
         }"#;
-        let parsed = CapabilityCatalog::from_json(value)
-            .expect("the v2 catalog should carry presentation metadata from the backend");
-        let serialized = serde_json::to_value(parsed).expect("serialize capability catalog");
+        let parsed = CapabilityCatalog::from_json(value).map_err(|error| {
+            format!("the v2 catalog should carry presentation metadata from the backend: {error}")
+        })?;
+        let serialized = serde_json::to_value(parsed)
+            .map_err(|error| format!("failed to serialize capability catalog: {error}"))?;
         assert_eq!(
             serialized.pointer("/tools/0/accessClass"),
             Some(&serde_json::json!("read"))
@@ -387,6 +390,7 @@ mod capability_catalog_tests {
             serialized.pointer("/catalogs/0/version"),
             Some(&serde_json::json!("1.6.0"))
         );
+        Ok(())
     }
 }
 
@@ -956,8 +960,8 @@ where
         .await
     {
         Ok(request) => {
-            if let (Some(key), Some(evidence_url)) = (decision_key, evidence_url) {
-                if let Err(error) = state
+            if let (Some(key), Some(evidence_url)) = (decision_key, evidence_url)
+                && let Err(error) = state
                     .decisions
                     .record_resolution(&steward_ports::DecisionResolution {
                         request_id: request_id.to_string(),
@@ -967,9 +971,8 @@ where
                         evidence_url: evidence_url.to_owned(),
                     })
                     .await
-                {
-                    return ApiError::DecisionChannel(format!("{error:?}")).into_response();
-                }
+            {
+                return ApiError::DecisionChannel(format!("{error:?}")).into_response();
             }
             Json(BrowserEnvelopeRequestDecisionResponse {
                 api_version: BROWSER_ADMIN_API_VERSION,
@@ -1137,6 +1140,35 @@ where
             }
             Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
         };
+    let actor = authority.principal().canonical_user_id.as_str();
+    let token = match state
+        .ledger
+        .claim_envelope_request_decision_filing(request_id, actor)
+        .await
+    {
+        Ok(token) => token,
+        Err(StoreError::DecisionReferenceMismatch) => {
+            return match state
+                .ledger
+                .envelope_request_decision_reference(request_id)
+                .await
+            {
+                Ok(Some(reference)) => Json(BrowserEnvelopeRequestDecisionReferenceResponse {
+                    api_version: BROWSER_ADMIN_API_VERSION,
+                    request_id,
+                    decision_key: reference.decision_key,
+                    evidence_url: reference.evidence_url,
+                })
+                .into_response(),
+                Ok(None) => StatusCode::CONFLICT.into_response(),
+                Err(error) => ApiError::Store(error).into_response(),
+            };
+        }
+        Err(StoreError::DecisionFilingInProgress) => {
+            return StatusCode::CONFLICT.into_response();
+        }
+        Err(error) => return ApiError::Store(error).into_response(),
+    };
     let reference = match state
         .decisions
         .request(&steward_ports::DecisionRequest {
@@ -1149,15 +1181,25 @@ where
         .await
     {
         Ok(reference) => reference,
-        Err(error) => return ApiError::DecisionChannel(format!("{error:?}")).into_response(),
+        Err(error) => {
+            if let Err(release_error) = state
+                .ledger
+                .release_envelope_request_decision_filing(request_id, token)
+                .await
+            {
+                return ApiError::Store(release_error).into_response();
+            }
+            return ApiError::DecisionChannel(format!("{error:?}")).into_response();
+        }
     };
     if let Err(error) = state
         .ledger
-        .link_envelope_request_decision_reference(
+        .complete_envelope_request_decision_filing(
             request_id,
+            token,
             &reference.key,
             &reference.evidence_url,
-            authority.principal().canonical_user_id.as_str(),
+            actor,
         )
         .await
     {

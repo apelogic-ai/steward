@@ -1,21 +1,24 @@
 # Steward administrator Agent Runs API v1
 
-Status: source-backed read-model contract. This document defines the read-only
-server contract for the Agent Runs dashboard. It deliberately distinguishes
+Status: source-backed browser contract. This document defines the server
+contract for the Agent Runs dashboard. It deliberately distinguishes
 recorded facts from desired configuration and from data Steward does not
 persist. The browser must never fill an unavailable field from a heuristic.
 
 ## Authority and privacy boundary
 
-All operations are below `/admin/api/v1/runs` and use the existing exact
-Steward administrator `RequestAuthenticator` and Kubernetes `TokenReview`
-boundary. A member-role identity, Task identity, runtime identity, or provider
-credential has no read authority.
+User operations are below `/app/api/v1/runs`; reads are restricted to the exact
+canonical owner and mutations additionally require the browser CSRF proof.
+Administrator reads are below `/admin/api/v1/all-runs` and require exact
+browser administrator authority. A member-role identity, Task identity,
+runtime identity, provider credential, or Kubernetes bearer token is not
+browser authority.
 
-Responses contain no input or output archives, command arguments, provider
-payloads, raw logs, prompts, model output, tokens, credentials, assertions,
-HTTP headers or bodies. A Task failure is reduced to a bounded category; the
-stored free-form failure reason is not returned.
+The run read model contains no input or output archives, command arguments,
+provider payloads, raw logs, prompts, model output, tokens, credentials,
+assertions, HTTP headers or bodies. A Task failure is reduced to a bounded
+category; the stored free-form failure reason is not returned. Execution logs
+are available only through the separate bounded stream endpoint.
 
 ## Source and gap matrix
 
@@ -34,7 +37,9 @@ stored free-form failure reason is not returned.
 | Inference calls, actual model, input/output tokens | Not persisted by Steward | Unknown | Explicitly unavailable. Configured models are returned separately. |
 | Tool calls and outcomes | Not persisted by Steward | Unknown | Explicitly unavailable. Granted tools are returned separately. |
 | Runtime CPU, memory, storage and network use | Not persisted by Steward | Unknown | Explicitly unavailable. |
-| GitHub repository/workflow/run URL | No dedicated Task correlation record | Unknown | Explicitly unavailable. The submitter idempotency key is not interpreted as GitHub metadata. |
+| GitHub repository/workflow/run URL | validated `DirectTaskBindingEvidence.sourceProvenance` submission snapshot | Submission snapshot | Available for direct GitHub Tasks; otherwise absent. The submitter idempotency key is never interpreted as GitHub metadata. |
+| Stages | append-only lifecycle stage events plus current Task binding/state | Transactional/current | Admission, runtime binding, execution, and finalization are available. |
+| Execution step | bounded run presentation | Current | One agent-execution step names its stdout/stderr streams. Fine-grained agent steps are not claimed. |
 | Failure | `task_submissions.failure_reason` | Terminal Task snapshot | A bounded category only; the stored reason is never returned. |
 
 `runtime_events` is not used for this API. It is not populated by the Task
@@ -44,7 +49,7 @@ truth.
 
 ## Operations
 
-### `GET /admin/api/v1/runs`
+### `GET /app/api/v1/runs` and `GET /admin/api/v1/all-runs`
 
 Returns newest-first runs ordered by immutable `(created_at, task_uid)`. The
 optional `cursor` is the last Task UUID from the preceding page. The store
@@ -56,21 +61,45 @@ Supported query parameters:
 - `limit`: 1 through 100; default 50;
 - `cursor`: Task UUID;
 - `phase`: one Task phase;
-- `workflow`: exact non-empty workflow name.
+- `workflow`: exact non-empty workflow name;
+- user list only: `runtimeUid` and `envelopeInstanceId`;
+- administrator list only: `runtimeUid` and opaque `ownerUserId`.
 
 Unknown query parameters are rejected.
 
-### `GET /admin/api/v1/runs/{taskUid}`
+Each response includes counts for every Task phase. Counts use the current
+query with `phase` removed so phase chips remain useful while one phase is
+selected. Administrator rows also include `ownerDisplayEmail` under the same
+administrator authority as the list.
 
-Returns one canonical Steward Task read model. A valid but absent Task UUID is
-`404`. The response uses the same summary shape as the list and never resolves
-an external run in place of the Task UUID.
+### Run detail and timeline
 
-### `GET /admin/api/v1/runs/{taskUid}/timeline`
+`GET /app/api/v1/runs/{taskUid}` and
+`GET /admin/api/v1/all-runs/{taskUid}` return one canonical Steward Task read
+model. A valid but absent Task UUID is `404`. The response uses the same summary
+shape as the list and never resolves an external run in place of the Task UUID.
 
-Returns lifecycle events in `(at, id)` order. Event provenance is `recorded` or
-`backfilled`. A response containing any backfilled event declares its history
-`partial`; consumers must not invent the missing transitions.
+The corresponding `/timeline` routes return lifecycle events in `(at, id)`
+order. Events include phase/finalization changes and bounded structured stage
+events such as `admitted`, `runtimeBound`, `executionStarted`, and
+`executionEnded`. Consumers must not invent missing transitions.
+
+### Execution logs
+
+`GET .../{taskUid}/logs/{stream}?after={byteOffset}` accepts only `stdout` or
+`stderr`. It returns `{ stream, content, truncated, sizeBytes, complete }` and
+at most 64 KiB per read. A live OpenShell transcript is readable before the
+Task becomes terminal; terminal captured output remains readable afterward.
+The owner/admin scope of the parent route applies unchanged.
+
+### Cancel and re-run
+
+`POST /app/api/v1/runs/{taskUid}/cancel` transitions the caller's eligible Task
+to `cancelled`. `POST /app/api/v1/runs/{taskUid}/rerun` takes an idempotency key
+and creates a fresh Task against the same active Envelope instance for a
+versioned Steward workflow. Direct GitHub Tasks return `409` until Steward can
+perform a governed upstream workflow dispatch; cloning the Task and copying old
+provenance is forbidden.
 
 ## Availability model
 
@@ -99,7 +128,8 @@ admission; existing rows retain `NULL` and surface that gap explicitly.
   bounded metadata keyed to `task_uid` or its immutable `runtime_uid`.
 - Never put raw logs, prompts, model output, request/response bodies or
   credentials into this read model.
-- A future GitHub correlation write must validate structured repository,
-  workflow and run fields. It must not reinterpret `idempotency_key`.
+- GitHub correlation writes validate structured repository, workflow, actor,
+  ref, SHA, run ID/attempt, and caller-workflow fields. They never reinterpret
+  `idempotency_key`.
 - Live diagnostics are a separate bounded contract; this API remains useful
   when they are absent.

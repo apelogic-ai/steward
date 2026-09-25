@@ -95,6 +95,26 @@ pub(crate) struct ConnectionsCollectionResponse {
     available: Vec<AvailableProviderConnection>,
 }
 
+fn available_provider_connections() -> Vec<AvailableProviderConnection> {
+    vec![
+        AvailableProviderConnection {
+            provider: "github",
+            display_name: "GitHub",
+            enabled: true,
+        },
+        AvailableProviderConnection {
+            provider: "gitlab",
+            display_name: "GitLab",
+            enabled: false,
+        },
+        AvailableProviderConnection {
+            provider: "jira",
+            display_name: "Jira",
+            enabled: false,
+        },
+    ]
+}
+
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DisconnectConnectionRequest {
@@ -482,11 +502,7 @@ where
                             renewal_credential_expires_at: None,
                         },
                     }],
-                    available: vec![AvailableProviderConnection {
-                        provider: "github",
-                        display_name: "GitHub",
-                        enabled: true,
-                    }],
+                    available: available_provider_connections(),
                 }),
             )
                 .into_response();
@@ -499,11 +515,7 @@ where
             display_name: "GitHub",
             status,
         }],
-        available: vec![AvailableProviderConnection {
-            provider: "github",
-            display_name: "GitHub",
-            enabled: true,
-        }],
+        available: available_provider_connections(),
     })
     .into_response()
 }
@@ -746,6 +758,33 @@ mod tests {
                 "status response exposed forbidden broker/session material: {forbidden}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_collection_advertises_enabled_and_disabled_options() -> Result<(), String> {
+        let response = router(FakeBroker::default())
+            .layer(axum::Extension(session()?))
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/connections")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build provider collection request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request provider collection: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read provider collection: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode provider collection: {error}"))?;
+        assert_eq!(value["connections"][0]["provider"], "github");
+        assert_eq!(value["available"][0]["enabled"], true);
+        assert_eq!(value["available"][1]["provider"], "gitlab");
+        assert_eq!(value["available"][1]["enabled"], false);
+        assert_eq!(value["available"][2]["provider"], "jira");
+        assert_eq!(value["available"][2]["enabled"], false);
         Ok(())
     }
 

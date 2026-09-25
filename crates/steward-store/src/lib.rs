@@ -2485,6 +2485,168 @@ impl PgStore {
         .transpose()
     }
 
+    pub async fn claim_envelope_request_decision_filing(
+        &self,
+        request_id: Uuid,
+        claimed_by: &str,
+    ) -> Result<Uuid, StoreError> {
+        if claimed_by.trim().is_empty() {
+            return Err(StoreError::InvalidEnvelopeRequest);
+        }
+        let token = Uuid::new_v4();
+        let claimed = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO envelope_request_decision_filing_claims \
+             (request_id, token, claimed_by) \
+             SELECT requests.id, $2, $3 FROM envelope_requests requests \
+             JOIN LATERAL ( \
+                 SELECT events.status FROM envelope_request_events events \
+                 WHERE events.request_id = requests.id \
+                 ORDER BY events.id DESC LIMIT 1 \
+             ) current_status ON true \
+             WHERE requests.id = $1 AND current_status.status = 'pending' \
+               AND NOT EXISTS (SELECT 1 FROM envelope_request_decision_references decision_refs \
+                               WHERE decision_refs.request_id = requests.id) \
+             ON CONFLICT (request_id) DO UPDATE \
+             SET token = EXCLUDED.token, claimed_by = EXCLUDED.claimed_by, started_at = now() \
+             WHERE envelope_request_decision_filing_claims.started_at \
+                     < now() - interval '5 minutes' \
+             RETURNING token",
+        )
+        .bind(request_id)
+        .bind(token)
+        .bind(claimed_by)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if let Some(token) = claimed {
+            return Ok(token);
+        }
+        if !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM envelope_requests WHERE id = $1)",
+        )
+        .bind(request_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?
+        {
+            return Err(StoreError::EnvelopeRequestNotFound);
+        }
+        if self
+            .envelope_request_decision_reference(request_id)
+            .await?
+            .is_some()
+        {
+            return Err(StoreError::DecisionReferenceMismatch);
+        }
+        let pending = sqlx::query_scalar::<_, bool>(
+            "SELECT status = 'pending' FROM envelope_request_events \
+             WHERE request_id = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .unwrap_or(false);
+        if pending {
+            Err(StoreError::DecisionFilingInProgress)
+        } else {
+            Err(StoreError::InvalidEnvelopeRequestTransition)
+        }
+    }
+
+    pub async fn complete_envelope_request_decision_filing(
+        &self,
+        request_id: Uuid,
+        token: Uuid,
+        decision_key: &str,
+        evidence_url: &str,
+        filed_by: &str,
+    ) -> Result<(), StoreError> {
+        if decision_key.trim().is_empty()
+            || evidence_url.trim().is_empty()
+            || filed_by.trim().is_empty()
+        {
+            return Err(StoreError::InvalidEnvelopeRequest);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let claimed = sqlx::query_scalar::<_, bool>(
+            "SELECT token = $2 FROM envelope_request_decision_filing_claims \
+             WHERE request_id = $1 FOR UPDATE",
+        )
+        .bind(request_id)
+        .bind(token)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .unwrap_or(false);
+        if !claimed {
+            return Err(StoreError::DecisionFilingClaimLost);
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO envelope_request_decision_references \
+             (request_id, decision_key, evidence_url, filed_by) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (request_id) DO NOTHING",
+        )
+        .bind(request_id)
+        .bind(decision_key)
+        .bind(evidence_url)
+        .bind(filed_by)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .rows_affected();
+        if inserted == 0 {
+            let matches = sqlx::query_scalar::<_, bool>(
+                "SELECT decision_key = $2 AND evidence_url = $3 \
+                 FROM envelope_request_decision_references WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .bind(decision_key)
+            .bind(evidence_url)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if !matches {
+                return Err(StoreError::DecisionReferenceMismatch);
+            }
+        }
+        let released = sqlx::query(
+            "DELETE FROM envelope_request_decision_filing_claims \
+             WHERE request_id = $1 AND token = $2",
+        )
+        .bind(request_id)
+        .bind(token)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .rows_affected();
+        if released != 1 {
+            return Err(StoreError::DecisionFilingClaimLost);
+        }
+        transaction.commit().await.map_err(database_error)
+    }
+
+    pub async fn release_envelope_request_decision_filing(
+        &self,
+        request_id: Uuid,
+        token: Uuid,
+    ) -> Result<(), StoreError> {
+        let released = sqlx::query(
+            "DELETE FROM envelope_request_decision_filing_claims \
+             WHERE request_id = $1 AND token = $2",
+        )
+        .bind(request_id)
+        .bind(token)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if released.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::DecisionFilingClaimLost)
+        }
+    }
+
     pub async fn link_envelope_request_decision_reference(
         &self,
         request_id: Uuid,
