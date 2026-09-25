@@ -29,9 +29,9 @@ use steward_ports::{
     TaskExecutionAdapter, TaskExecutionPlanRequest,
 };
 use steward_store::{
-    EnvelopeRequestRecord, FederatedSubjectObservation, PgStore, StoreError, TaskOrchestrationMode,
-    TaskRecord, TaskReservationRequest, TaskRuntimeOperationRecord, TaskRuntimeOwnership,
-    WorkflowRevisionRecord,
+    EnvelopeRequestRecord, FederatedSubjectObservation, FederatedSubjectRecord, PgStore,
+    StoreError, TaskOrchestrationMode, TaskRecord, TaskReservationRequest,
+    TaskRuntimeOperationRecord, TaskRuntimeOwnership, WorkflowRevisionRecord,
 };
 use steward_types::direct_package::{
     BoundedText, ClosureEntry, ClosureEntryKind, ContentDigest, DirectAdmissionDelta,
@@ -42,8 +42,8 @@ use steward_types::direct_package::{
     StableProviderId, TASK_BINDING_EVIDENCE_SCHEMA, TriggerRepository, canonical_json_bytes,
 };
 use steward_types::{
-    AgentRuntimeSpec, CanonicalAuthorityBinding, CanonicalUserId, Email, ModelRef, Principal,
-    RuntimeOwnership, TaskExecutionBinding, TaskPhase, ToolGrant,
+    AgentRuntimeSpec, CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId, Email,
+    ModelRef, Principal, RuntimeOwnership, TaskExecutionBinding, TaskPhase, ToolGrant,
 };
 use uuid::Uuid;
 
@@ -563,8 +563,77 @@ pub struct IdentityTaskIdentityResolver {
     jwks: JwkSet,
     issuer: String,
     audience: String,
-    canonical_identities: PgStore,
+    canonical_identities: Arc<dyn IdentityTaskStore>,
     federated_subjects_enabled: bool,
+}
+
+trait IdentityTaskStore: Send + Sync {
+    fn resolve_canonical_principal<'a>(
+        &'a self,
+        user_id: &'a CanonicalUserId,
+        current_verified_email: &'a Email,
+    ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>>;
+
+    fn seed_federated_subject_association<'a>(
+        &'a self,
+        observation: FederatedSubjectObservation<'a>,
+        canonical_user_id: &'a CanonicalUserId,
+        actor: &'a str,
+    ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>>;
+
+    fn observe_federated_subject<'a>(
+        &'a self,
+        observation: FederatedSubjectObservation<'a>,
+    ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>>;
+
+    fn resolve_federated_subject<'a>(
+        &'a self,
+        issuer: &'a str,
+        subject: &'a str,
+    ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>>;
+}
+
+impl IdentityTaskStore for PgStore {
+    fn resolve_canonical_principal<'a>(
+        &'a self,
+        user_id: &'a CanonicalUserId,
+        current_verified_email: &'a Email,
+    ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>> {
+        Box::pin(PgStore::resolve_canonical_principal(
+            self,
+            user_id,
+            current_verified_email,
+        ))
+    }
+
+    fn seed_federated_subject_association<'a>(
+        &'a self,
+        observation: FederatedSubjectObservation<'a>,
+        canonical_user_id: &'a CanonicalUserId,
+        actor: &'a str,
+    ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>> {
+        Box::pin(PgStore::seed_federated_subject_association(
+            self,
+            observation,
+            canonical_user_id,
+            actor,
+        ))
+    }
+
+    fn observe_federated_subject<'a>(
+        &'a self,
+        observation: FederatedSubjectObservation<'a>,
+    ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>> {
+        Box::pin(PgStore::observe_federated_subject(self, observation))
+    }
+
+    fn resolve_federated_subject<'a>(
+        &'a self,
+        issuer: &'a str,
+        subject: &'a str,
+    ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>> {
+        Box::pin(PgStore::resolve_federated_subject(self, issuer, subject))
+    }
 }
 
 #[derive(Clone)]
@@ -691,7 +760,7 @@ impl IdentityTaskIdentityResolver {
             jwks,
             issuer,
             audience,
-            canonical_identities,
+            canonical_identities: Arc::new(canonical_identities),
             federated_subjects_enabled,
         })
     }
@@ -736,7 +805,7 @@ impl TaskIdentityResolver for IdentityTaskIdentityResolver {
                         // claims. Transition seeding is deliberately best-effort: a disabled or
                         // conflicting v3 association, or an unavailable observation store, must
                         // not add a new authentication or admission condition to v2.
-                        let _ = self
+                        if let Err(error) = self
                             .canonical_identities
                             .seed_federated_subject_association(
                                 FederatedSubjectObservation {
@@ -748,7 +817,13 @@ impl TaskIdentityResolver for IdentityTaskIdentityResolver {
                                 &identity.canonical_user_id,
                                 "task-auth-v2",
                             )
-                            .await;
+                            .await
+                        {
+                            eprintln!(
+                                "best-effort v2 federated-subject seeding failed: category={}",
+                                v2_seed_failure_category(&error)
+                            );
+                        }
                     }
                     Ok(identity)
                 }
@@ -805,6 +880,15 @@ impl TaskIdentityResolver for IdentityTaskIdentityResolver {
                 _ => Err(TaskAuthenticationError::InvalidCredentials),
             }
         })
+    }
+}
+
+fn v2_seed_failure_category(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::FederatedSubjectDisabled => "disabled",
+        StoreError::FederatedSubjectConflict => "conflict",
+        StoreError::Database(_) => "unavailable",
+        _ => "rejected",
     }
 }
 
@@ -3569,8 +3653,9 @@ mod workflow_request_tests {
 #[cfg(test)]
 mod identity_task_authentication_tests {
     use super::{
-        IDENTITY_CLOCK_SKEW_SECONDS, IdentityTaskClaims, MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS,
-        TaskAuthenticationError, compatibility_task_identity_from_claims,
+        BoxFuture, IDENTITY_CLOCK_SKEW_SECONDS, IdentityTaskClaims, IdentityTaskIdentityResolver,
+        IdentityTaskStore, MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS, TaskAuthenticationError,
+        TaskIdentityResolver, compatibility_task_identity_from_claims,
         task_identity_from_identity_claims, valid_identity_issuer, validate_identity_task_jwks,
         verify_identity_task_token,
     };
@@ -3583,6 +3668,9 @@ mod identity_task_authentication_tests {
     use p256::pkcs8::EncodePrivateKey;
     use rand_core::OsRng;
     use serde::Serialize;
+    use std::sync::Arc;
+    use steward_store::{FederatedSubjectObservation, FederatedSubjectRecord, StoreError};
+    use steward_types::{CanonicalPrincipal, CanonicalUserId, Email, OrganizationId};
 
     const ISSUER: &str = "https://identity.localhost:18444";
     const AUDIENCE: &str = "steward-task-api";
@@ -3621,6 +3709,60 @@ mod identity_task_authentication_tests {
         groups: Option<Vec<&'a str>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         canonical_user_id: Option<&'a str>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum SeedFailure {
+        Disabled,
+        Conflict,
+        Unavailable,
+    }
+
+    struct V2SeedFailureStore {
+        principal: CanonicalPrincipal,
+        seed_failure: SeedFailure,
+    }
+
+    impl IdentityTaskStore for V2SeedFailureStore {
+        fn resolve_canonical_principal<'a>(
+            &'a self,
+            _user_id: &'a CanonicalUserId,
+            _current_verified_email: &'a Email,
+        ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>> {
+            Box::pin(async move { Ok(self.principal.clone()) })
+        }
+
+        fn seed_federated_subject_association<'a>(
+            &'a self,
+            _observation: FederatedSubjectObservation<'a>,
+            _canonical_user_id: &'a CanonicalUserId,
+            _actor: &'a str,
+        ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>> {
+            Box::pin(async move {
+                Err(match self.seed_failure {
+                    SeedFailure::Disabled => StoreError::FederatedSubjectDisabled,
+                    SeedFailure::Conflict => StoreError::FederatedSubjectConflict,
+                    SeedFailure::Unavailable => {
+                        StoreError::Database("synthetic availability failure".to_owned())
+                    }
+                })
+            })
+        }
+
+        fn observe_federated_subject<'a>(
+            &'a self,
+            _observation: FederatedSubjectObservation<'a>,
+        ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>> {
+            Box::pin(async { Err(StoreError::FederatedSubjectNotFound) })
+        }
+
+        fn resolve_federated_subject<'a>(
+            &'a self,
+            _issuer: &'a str,
+            _subject: &'a str,
+        ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>> {
+            Box::pin(async { Err(StoreError::FederatedSubjectNotFound) })
+        }
     }
 
     fn key_material() -> Result<(EncodingKey, JwkSet), String> {
@@ -3706,6 +3848,45 @@ mod identity_task_authentication_tests {
     fn federated_token(key: &EncodingKey) -> Result<String, String> {
         let now = jsonwebtoken::get_current_timestamp();
         federated_token_with(key, KID, federated_claims(now))
+    }
+
+    #[tokio::test]
+    async fn v2_resolver_keeps_authentication_authoritative_when_transition_seeding_fails()
+    -> Result<(), String> {
+        let (key, jwks) = key_material()?;
+        let assertion = token(&key, ISSUER, AUDIENCE, "steward-task-v2")?;
+        let principal = CanonicalPrincipal::new(
+            CanonicalUserId::parse("usr_528fc0fed6cf400abb93a3f327d9a809")?,
+            OrganizationId::parse("org_example")?,
+            Email::parse("alice@example.com")?,
+        )?;
+
+        for seed_failure in [
+            SeedFailure::Disabled,
+            SeedFailure::Conflict,
+            SeedFailure::Unavailable,
+        ] {
+            let resolver = IdentityTaskIdentityResolver {
+                jwks: jwks.clone(),
+                issuer: ISSUER.to_owned(),
+                audience: AUDIENCE.to_owned(),
+                canonical_identities: Arc::new(V2SeedFailureStore {
+                    principal: principal.clone(),
+                    seed_failure,
+                }),
+                federated_subjects_enabled: true,
+            };
+
+            let identity = resolver.resolve(&assertion).await.map_err(|error| {
+                format!("v2 authentication was rejected by best-effort seeding: {error:?}")
+            })?;
+            assert_eq!(identity.owner.as_str(), "alice@example.com");
+            assert_eq!(
+                identity.canonical_user_id.as_str(),
+                "usr_528fc0fed6cf400abb93a3f327d9a809"
+            );
+        }
+        Ok(())
     }
 
     #[test]
