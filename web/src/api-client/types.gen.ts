@@ -310,6 +310,7 @@ export type BrowserEnvelopeSpec = {
     budget: Budget;
     llms: Array<ModelRef>;
     runner?: RunnerRequirements;
+    runtimeMinutesLimit?: string | null;
     tools: Array<ToolGrant>;
     ttl: Duration;
 };
@@ -567,6 +568,10 @@ export type DirectAdmissionDelta = {
     ceiling: Decimal;
     currency: Currency;
     dimension: 'singleRunBudget';
+    requested?: null | Decimal;
+} | {
+    ceiling: Decimal;
+    dimension: 'runtimeMinutes';
     requested?: null | Decimal;
 } | {
     ceiling: Duration;
@@ -1771,7 +1776,7 @@ export type DenyAdminEscalationData = {
         'X-Steward-CSRF': string;
     };
     path: {
-        escalation_id: number;
+        escalation_id: string;
     };
     query?: never;
     url: '/admin/api/v1/escalations/{escalation_id}/deny';
@@ -1816,7 +1821,7 @@ export type TopUpAdminEscalationData = {
         'X-Steward-CSRF': string;
     };
     path: {
-        escalation_id: number;
+        escalation_id: string;
     };
     query?: never;
     url: '/admin/api/v1/escalations/{escalation_id}/top-up';

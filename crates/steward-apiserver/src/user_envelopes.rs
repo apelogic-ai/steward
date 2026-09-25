@@ -11,15 +11,14 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use steward_admission::{
-    AdmissionDecision, Envelope, add_budget_amount, evaluate, validate_envelope,
+    AdmissionDecision, Envelope, add_budget_amount, envelope_is_within, validate_envelope,
 };
 use steward_store::{
     EnvelopeRequestRecord, EnvelopeRequestReservationRequest, EnvelopeRequestStatusEventRecord,
     EnvelopeRequestStatusUpdate, EnvelopeUsageRecord, PgStore, StoreError, WorkflowRevisionRecord,
 };
 use steward_types::{
-    AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email, ModelRef, Principal,
-    RunnerRequirements, ToolGrant,
+    Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
 };
 use uuid::Uuid;
 
@@ -160,6 +159,8 @@ pub struct BrowserEnvelopeSpec {
     pub llms: Vec<ModelRef>,
     pub tools: Vec<ToolGrant>,
     pub budget: Budget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_minutes_limit: Option<String>,
     pub ttl: Duration,
     #[serde(default)]
     pub runner: RunnerRequirements,
@@ -173,6 +174,7 @@ impl From<Envelope> for BrowserEnvelope {
                 llms: envelope.spec.llms,
                 tools: envelope.spec.tools,
                 budget: envelope.spec.budget,
+                runtime_minutes_limit: envelope.spec.runtime_minutes_limit,
                 ttl: envelope.spec.ttl,
                 runner: envelope.spec.runner,
             },
@@ -188,6 +190,7 @@ impl From<BrowserEnvelope> for Envelope {
                 llms: envelope.spec.llms,
                 tools: envelope.spec.tools,
                 budget: envelope.spec.budget,
+                runtime_minutes_limit: envelope.spec.runtime_minutes_limit,
                 ttl: envelope.spec.ttl,
                 runner: envelope.spec.runner,
             },
@@ -966,12 +969,10 @@ where
     {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    let request_spec = envelope_as_user_runtime(&requested_envelope, &session.subject);
-    let inside_ceiling = matches!(
-        evaluate(&request_spec, &template.ceiling),
+    let auto_provision = matches!(
+        envelope_is_within(&requested_envelope, &template.ceiling),
         Ok(AdmissionDecision::Admit)
     );
-    let auto_provision = inside_ceiling;
     match state
         .broker
         .create(
@@ -1090,28 +1091,6 @@ fn github_actions_envelope(
         revision,
         digest: envelope_digest.clone(),
     })
-}
-
-fn envelope_as_user_runtime(
-    envelope: &Envelope,
-    subject: &UserEnvelopeSubject,
-) -> AgentRuntimeSpec {
-    AgentRuntimeSpec {
-        principal: Principal::User {
-            acting_user: subject.display_email.clone(),
-        },
-        owner: subject.display_email.clone(),
-        canonical_authority: None,
-        agent_type: AgentType {
-            name: "user-envelope-request".to_owned(),
-        },
-        llms: envelope.spec.llms.clone(),
-        tools: envelope.spec.tools.clone(),
-        budget: envelope.spec.budget.clone(),
-        ttl: envelope.spec.ttl.clone(),
-        runner: envelope.spec.runner.clone(),
-        bindings: None,
-    }
 }
 
 fn broker_error_response(error: EnvelopeRequestBrokerError) -> Response {
@@ -1328,6 +1307,7 @@ mod tests {
                     single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: Some("120".to_owned()),
                 ttl: Duration("72h".to_owned()),
                 runner: steward_types::RunnerRequirements::default(),
             },
@@ -1669,6 +1649,41 @@ mod tests {
             serde_json::to_value(review_only.ceiling)
                 .map_err(|error| format!("serialize expected approved envelope: {error}"))?
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_minutes_above_the_template_ceiling_enter_review() -> Result<(), String> {
+        let broker = TestBroker::default();
+        let mut requested = template().ceiling;
+        requested.spec.runtime_minutes_limit = Some("180".to_owned());
+        let response = inner_router(broker)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "templateId": "engineer",
+                            "templateRevision": 3,
+                            "requestedEnvelope": requested,
+                            "idempotencyKey": "runtime-minutes-review",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit request: {error}"))?;
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read response: {error}"))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|error| format!("parse response: {error}"))?;
+        assert_eq!(value["request"]["status"], "pending");
         Ok(())
     }
 

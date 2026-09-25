@@ -386,6 +386,7 @@ impl Harness {
                     single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: None,
                 ttl: StewardDuration("1h".to_owned()),
                 runner: RunnerRequirements::default(),
             },

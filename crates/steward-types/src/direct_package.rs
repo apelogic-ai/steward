@@ -475,6 +475,10 @@ pub enum DirectAdmissionDelta {
         ceiling: Decimal,
         currency: Currency,
     },
+    RuntimeMinutes {
+        requested: Option<Decimal>,
+        ceiling: Decimal,
+    },
     Ttl {
         requested: Duration,
         ceiling: Duration,

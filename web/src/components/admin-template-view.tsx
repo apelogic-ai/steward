@@ -47,6 +47,7 @@ export const initialEnvelopeTemplate: BrowserEnvelope = {
     },
     llms: [],
     tools: [],
+    runtimeMinutesLimit: "60",
     ttl: "15m",
     runner: { platforms: ["linux"] },
   },
@@ -80,7 +81,10 @@ function isBrowserEnvelope(value: unknown): value is BrowserEnvelope {
     && (spec.runner.memory === undefined || typeof spec.runner.memory === "string")
     && (spec.runner.compute === undefined || typeof spec.runner.compute === "string")
     && (spec.runner.storage === undefined || typeof spec.runner.storage === "string"));
-  return validBudget && validModels && validTools && validRunner && typeof spec.ttl === "string";
+  const validRuntimeMinutes = spec.runtimeMinutesLimit === undefined
+    || spec.runtimeMinutesLimit === null
+    || typeof spec.runtimeMinutesLimit === "string";
+  return validBudget && validModels && validTools && validRunner && validRuntimeMinutes && typeof spec.ttl === "string";
 }
 
 function normalizeEnvelopeTemplateResponse(value: unknown, templateId: string): BrowserEnvelopeTemplateResponse | null {
@@ -399,6 +403,7 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, member
   const [limitType, setLimitType] = useState<LimitType>("singleRun");
   const [monthlyLimit, setMonthlyLimit] = useState(template.spec.budget.monthlyLimit);
   const [singleRunLimit, setSingleRunLimit] = useState(template.spec.budget.singleRunLimit ?? "");
+  const [runtimeMinutesLimit, setRuntimeMinutesLimit] = useState(template.spec.runtimeMinutesLimit ?? "");
   const [name, setName] = useState(templateDisplayName);
   const [roles, setRoles] = useState(memberRoles.join(", "));
   const limitAmount = limitType === "singleRun" ? singleRunLimit : monthlyLimit;
@@ -458,6 +463,7 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, member
         },
         llms: models,
         tools,
+        ...(runtimeMinutesLimit.trim() ? { runtimeMinutesLimit: runtimeMinutesLimit.trim() } : {}),
         ttl: String(fields.get("ttl") ?? "").trim(),
         runner: {
           platforms,
@@ -506,8 +512,8 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, member
         </label>
       </fieldset>
 
-      <fieldset className="grid gap-4 sm:grid-cols-4">
-        <legend className="mb-3 text-base font-semibold">Inference usage and TTL</legend>
+      <fieldset className="grid gap-4 sm:grid-cols-5">
+        <legend className="mb-3 text-base font-semibold">Cumulative usage and TTL</legend>
         <label className="grid gap-2 text-sm font-semibold">Currency
           <select className={fieldClass} defaultValue="USD" name="currency"><option value="USD">USD</option></select>
         </label>
@@ -532,8 +538,11 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, member
         <label className="grid gap-2 text-sm font-semibold">TTL
           <input className={fieldClass} defaultValue={template.spec.ttl} name="ttl" required />
         </label>
-        <p className="text-sm text-muted-ink sm:col-span-4">
-          Single run: {singleRunLimit || "Not set"} USD · Monthly: {monthlyLimit || "Not set"} USD
+        <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month
+          <input className={fieldClass} inputMode="decimal" onChange={(event) => setRuntimeMinutesLimit(event.target.value)} placeholder="Unlimited" value={runtimeMinutesLimit} />
+        </label>
+        <p className="text-sm text-muted-ink sm:col-span-5">
+          Single run: {singleRunLimit || "Not set"} USD · Monthly: {monthlyLimit || "Not set"} USD · Runtime: {runtimeMinutesLimit || "Unlimited"} min
         </p>
       </fieldset>
 

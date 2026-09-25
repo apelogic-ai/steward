@@ -34,6 +34,7 @@ are available only through the separate bounded stream endpoint.
 | Configured models and tool grants | immutable `task_submissions.runtime_spec` snapshot | Submission snapshot | Available as configured authority only, never described as calls. |
 | Budget allocation | `task_submissions.runtime_spec.budget` | Submission snapshot | Available. |
 | Observed spend | latest append-only `spend_observations` row joined by `runtime_uid` | Observation timestamp | Available when observed; otherwise unavailable. Spend is observed, never custodied. |
+| Runtime-minute authority and usage | immutable User Envelope snapshot plus append-only `task_lifecycle_events` and runtime-minute observations/grants | Envelope-instance period/current observation | Available when the Envelope sets a limit. Usage is derived from running-to-terminal intervals clipped to the UTC month; it is not inferred from runtime age or added to the AgentRuntime CRD. |
 | Inference calls, actual model, input/output tokens | Not persisted by Steward | Unknown | Explicitly unavailable. Configured models are returned separately. |
 | Tool calls and outcomes | Not persisted by Steward | Unknown | Explicitly unavailable. Granted tools are returned separately. |
 | Runtime CPU, memory, storage and network use | Not persisted by Steward | Unknown | Explicitly unavailable. |

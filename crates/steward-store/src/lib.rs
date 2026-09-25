@@ -1414,9 +1414,10 @@ impl PgStore {
         if exhausted {
             sqlx::query(
                 "INSERT INTO inference_exhaustions \
-                 (runtime_uid, observed_generation, spec_digest, observed_amount, currency) \
-                 VALUES ($1, $2, $3, $4::numeric, $5)",
+                 (public_id, runtime_uid, observed_generation, spec_digest, observed_amount, currency) \
+                 VALUES ($1, $2, $3, $4, $5::numeric, $6)",
             )
+            .bind(Uuid::new_v4())
             .bind(runtime_uid)
             .bind(observed_generation)
             .bind(spec_digest)
@@ -1468,20 +1469,39 @@ impl PgStore {
     /// Return the current cumulative-spend escalation per exhausted runtime. A durable grant or
     /// denial remains attached so the browser queue can show both pending and decided history.
     pub async fn admin_escalations(&self) -> Result<Vec<CumulativeEscalationRecord>, StoreError> {
-        sqlx::query(CUMULATIVE_ESCALATION_SELECT)
+        let mut records = sqlx::query(CUMULATIVE_ESCALATION_SELECT)
             .fetch_all(&self.pool)
             .await
             .map_err(database_error)?
             .into_iter()
             .map(cumulative_escalation_record)
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        records.extend(
+            sqlx::query(RUNTIME_MINUTES_ESCALATION_SELECT)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(database_error)?
+                .into_iter()
+                .map(cumulative_escalation_record)
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        Ok(records)
     }
 
     pub async fn cumulative_escalation(
         &self,
-        escalation_id: i64,
+        escalation_id: Uuid,
     ) -> Result<Option<CumulativeEscalationRecord>, StoreError> {
-        let statement = format!("{CUMULATIVE_ESCALATION_SELECT} AND exhaustions.id = $1");
+        let statement = format!("{CUMULATIVE_ESCALATION_SELECT} AND exhaustions.public_id = $1");
+        if let Some(record) = sqlx::query(&statement)
+            .bind(escalation_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?
+        {
+            return cumulative_escalation_record(record).map(Some);
+        }
+        let statement = format!("{RUNTIME_MINUTES_ESCALATION_SELECT} AND exhaustions.id = $1");
         sqlx::query(&statement)
             .bind(escalation_id)
             .fetch_optional(&self.pool)
@@ -1493,7 +1513,40 @@ impl PgStore {
 
     pub async fn record_escalation_top_up(
         &self,
-        escalation_id: i64,
+        escalation_id: Uuid,
+        amount: &str,
+        valid_until: &str,
+        rationale: &str,
+        granted_by: &str,
+    ) -> Result<EnvelopeInstanceGrantRecord, StoreError> {
+        let escalation = self
+            .cumulative_escalation(escalation_id)
+            .await?
+            .ok_or(StoreError::CumulativeEscalationNotFound)?;
+        if escalation.dimension == "runtime_minutes" {
+            self.record_runtime_minutes_escalation_top_up(
+                escalation_id,
+                amount,
+                valid_until,
+                rationale,
+                granted_by,
+            )
+            .await
+        } else {
+            self.record_spend_escalation_top_up(
+                escalation_id,
+                amount,
+                valid_until,
+                rationale,
+                granted_by,
+            )
+            .await
+        }
+    }
+
+    async fn record_spend_escalation_top_up(
+        &self,
+        escalation_id: Uuid,
         amount: &str,
         valid_until: &str,
         rationale: &str,
@@ -1512,7 +1565,8 @@ impl PgStore {
         }
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let row = sqlx::query(
-            "SELECT exhaustions.id, exhaustions.currency, tasks.task_uid, \
+            "SELECT exhaustions.id, exhaustions.observed_amount::text AS observed_amount, \
+                    exhaustions.currency, tasks.task_uid, \
                     tasks.user_envelope_instance_id, tasks.runtime_spec \
              FROM inference_exhaustions exhaustions \
              JOIN task_submissions tasks ON tasks.task_uid = ( \
@@ -1522,19 +1576,20 @@ impl PgStore {
                  WHERE COALESCE(orchestration.runtime_uid, candidate.runtime_uid) = exhaustions.runtime_uid \
                    AND candidate.user_envelope_instance_id IS NOT NULL \
                  ORDER BY candidate.created_at DESC, candidate.task_uid DESC LIMIT 1) \
-             WHERE exhaustions.id = $1 FOR UPDATE OF exhaustions",
+             WHERE exhaustions.public_id = $1 FOR UPDATE OF exhaustions",
         )
         .bind(escalation_id)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?
         .ok_or(StoreError::CumulativeEscalationNotFound)?;
+        let internal_escalation_id: i64 = row.try_get("id").map_err(database_error)?;
         let currency: String = row.try_get("currency").map_err(database_error)?;
         if currency != "USD"
             || sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM cumulative_escalation_denials WHERE escalation_id = $1)",
             )
-            .bind(escalation_id)
+            .bind(internal_escalation_id)
             .fetch_one(&mut *transaction)
             .await
             .map_err(database_error)?
@@ -1552,7 +1607,7 @@ impl PgStore {
                     rationale, granted_by \
              FROM envelope_instance_grants WHERE escalation_id = $1",
         )
-        .bind(escalation_id)
+        .bind(internal_escalation_id)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?
@@ -1562,7 +1617,7 @@ impl PgStore {
                     AND rationale = $4 AND granted_by = $5 \
                  FROM envelope_instance_grants WHERE escalation_id = $1",
             )
-            .bind(escalation_id)
+            .bind(internal_escalation_id)
             .bind(&amount)
             .bind(valid_until)
             .bind(rationale)
@@ -1604,6 +1659,16 @@ impl PgStore {
             .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
         let target_limit = add_budget_amount(&base_limit, &amount)
             .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+        let observed_amount: String = row.try_get("observed_amount").map_err(database_error)?;
+        let resumes = sqlx::query_scalar::<_, bool>("SELECT $1::numeric > $2::numeric")
+            .bind(&target_limit)
+            .bind(&observed_amount)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        if !resumes {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
         let inserted = sqlx::query(
             "INSERT INTO envelope_instance_grants \
              (id, escalation_id, envelope_instance_id, task_uid, dimension, amount, \
@@ -1613,7 +1678,7 @@ impl PgStore {
              ON CONFLICT (escalation_id) DO NOTHING",
         )
         .bind(Uuid::new_v4())
-        .bind(escalation_id)
+        .bind(internal_escalation_id)
         .bind(&envelope_instance_id)
         .bind(task_uid)
         .bind(&amount)
@@ -1633,7 +1698,7 @@ impl PgStore {
                     AND rationale = $4 AND granted_by = $5 \
                  FROM envelope_instance_grants WHERE escalation_id = $1",
             )
-            .bind(escalation_id)
+            .bind(internal_escalation_id)
             .bind(&amount)
             .bind(valid_until)
             .bind(rationale)
@@ -1651,6 +1716,159 @@ impl PgStore {
                     to_char(valid_until AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS valid_until, \
                     rationale, granted_by \
              FROM envelope_instance_grants WHERE escalation_id = $1",
+        )
+        .bind(internal_escalation_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let record = envelope_instance_grant_record(&grant)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(record)
+    }
+
+    async fn record_runtime_minutes_escalation_top_up(
+        &self,
+        escalation_id: Uuid,
+        amount: &str,
+        valid_until: &str,
+        rationale: &str,
+        granted_by: &str,
+    ) -> Result<EnvelopeInstanceGrantRecord, StoreError> {
+        if rationale.trim().is_empty() || granted_by.trim().is_empty() {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        let amount =
+            add_budget_amount("0", amount).map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+        if !amount
+            .bytes()
+            .any(|byte| byte.is_ascii_digit() && byte != b'0')
+        {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let exhaustion = sqlx::query(
+            "SELECT id, envelope_instance_id, task_uid, base_limit_minutes::text AS base_limit \
+             FROM runtime_minute_exhaustions WHERE id = $1 FOR UPDATE",
+        )
+        .bind(escalation_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::CumulativeEscalationNotFound)?;
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM runtime_minute_escalation_denials \
+                           WHERE escalation_id = $1)",
+        )
+        .bind(escalation_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        {
+            return Err(StoreError::CumulativeEscalationConflict);
+        }
+        if let Some(grant) = sqlx::query(
+            "SELECT id, amount::text AS amount, base_limit::text AS base_limit, \
+                    target_limit::text AS target_limit, \
+                    to_char(valid_until AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS valid_until, \
+                    rationale, granted_by \
+             FROM runtime_minute_instance_grants WHERE escalation_id = $1",
+        )
+        .bind(escalation_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        {
+            let same_request = sqlx::query_scalar::<_, bool>(
+                "SELECT amount = $2::numeric AND valid_until = $3::timestamptz \
+                    AND rationale = $4 AND granted_by = $5 \
+                 FROM runtime_minute_instance_grants WHERE escalation_id = $1",
+            )
+            .bind(escalation_id)
+            .bind(&amount)
+            .bind(valid_until)
+            .bind(rationale)
+            .bind(granted_by)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(grant_expiry_error)?;
+            if !same_request {
+                return Err(StoreError::CumulativeEscalationConflict);
+            }
+            let record = envelope_instance_grant_record(&grant)?;
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(record);
+        }
+        let future =
+            sqlx::query_scalar::<_, bool>("SELECT ($1::text)::timestamptz > clock_timestamp()")
+                .bind(valid_until)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(grant_expiry_error)?;
+        if !future {
+            return Err(StoreError::InvalidGrantExpiry);
+        }
+        let envelope_instance_id: String = exhaustion
+            .try_get("envelope_instance_id")
+            .map_err(database_error)?;
+        let task_uid: Uuid = exhaustion.try_get("task_uid").map_err(database_error)?;
+        let original_base_limit: String =
+            exhaustion.try_get("base_limit").map_err(database_error)?;
+        let active_top_up = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(sum(amount), 0)::text \
+             FROM runtime_minute_instance_grants \
+             WHERE envelope_instance_id = $1 AND valid_until > clock_timestamp()",
+        )
+        .bind(&envelope_instance_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let base_limit = add_budget_amount(&original_base_limit, &active_top_up)
+            .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+        let target_limit = add_budget_amount(&base_limit, &amount)
+            .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+        let usage = sqlx::query(RUNTIME_MINUTES_USAGE_SELECT)
+            .bind(&envelope_instance_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let observed_minutes: String = usage.try_get("observed_minutes").map_err(database_error)?;
+        let resumes = sqlx::query_scalar::<_, bool>("SELECT $1::numeric > $2::numeric")
+            .bind(&target_limit)
+            .bind(&observed_minutes)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        if !resumes {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        sqlx::query(
+            "INSERT INTO runtime_minute_instance_grants \
+             (id, escalation_id, envelope_instance_id, task_uid, amount, base_limit, \
+              target_limit, valid_until, rationale, granted_by) \
+             VALUES ($1, $2, $3, $4, $5::numeric, $6::numeric, $7::numeric, \
+                     $8::timestamptz, $9, $10) ON CONFLICT (escalation_id) DO NOTHING",
+        )
+        .bind(Uuid::new_v4())
+        .bind(escalation_id)
+        .bind(&envelope_instance_id)
+        .bind(task_uid)
+        .bind(&amount)
+        .bind(&base_limit)
+        .bind(&target_limit)
+        .bind(valid_until)
+        .bind(rationale)
+        .bind(granted_by)
+        .execute(&mut *transaction)
+        .await
+        .map_err(grant_expiry_error)?;
+        let grant = sqlx::query(
+            "SELECT id, amount::text AS amount, base_limit::text AS base_limit, \
+                    target_limit::text AS target_limit, \
+                    to_char(valid_until AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS valid_until, \
+                    rationale, granted_by \
+             FROM runtime_minute_instance_grants WHERE escalation_id = $1",
         )
         .bind(escalation_id)
         .fetch_one(&mut *transaction)
@@ -1679,22 +1897,282 @@ impl PgStore {
         Ok((amount != "0").then_some(amount))
     }
 
+    /// Observe and enforce cumulative execution time for one provisioned Envelope instance.
+    /// The observation is derived from append-only Task running-to-terminal lifecycle facts and
+    /// clipped to the current UTC month. The instance lock prevents duplicate pending
+    /// escalations when multiple runtimes reconcile concurrently.
+    pub async fn observe_envelope_instance_runtime_minutes(
+        &self,
+        envelope_instance_id: &str,
+        task_uid: Uuid,
+        runtime_uid: &str,
+        base_limit: &str,
+    ) -> Result<RuntimeMinutesAuthorityRecord, StoreError> {
+        if envelope_instance_id.trim().is_empty() || runtime_uid.trim().is_empty() {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        let base_limit = add_budget_amount("0", base_limit)
+            .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("runtime-minutes:{envelope_instance_id}"))
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let bound = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS( \
+                SELECT 1 FROM task_submissions tasks \
+                LEFT JOIN task_runtime_operations operation ON operation.task_uid = tasks.task_uid \
+                WHERE tasks.task_uid = $1 AND tasks.user_envelope_instance_id = $2 \
+                  AND COALESCE(operation.runtime_uid, tasks.runtime_uid) = $3)",
+        )
+        .bind(task_uid)
+        .bind(envelope_instance_id)
+        .bind(runtime_uid)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if !bound {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        let active_top_up = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(sum(amount), 0)::text \
+             FROM runtime_minute_instance_grants \
+             WHERE envelope_instance_id = $1 AND valid_until > clock_timestamp()",
+        )
+        .bind(envelope_instance_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let effective_limit = add_budget_amount(&base_limit, &active_top_up)
+            .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+        let usage = sqlx::query(RUNTIME_MINUTES_USAGE_SELECT)
+            .bind(envelope_instance_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let period_start: String = usage.try_get("period_start").map_err(database_error)?;
+        let period_end: String = usage.try_get("period_end").map_err(database_error)?;
+        let observed_seconds: String = usage.try_get("observed_seconds").map_err(database_error)?;
+        let observed_minutes: String = usage.try_get("observed_minutes").map_err(database_error)?;
+        let observed_at: String = usage.try_get("observed_at").map_err(database_error)?;
+        let exhausted = sqlx::query_scalar::<_, bool>("SELECT $1::numeric >= $2::numeric")
+            .bind(&observed_minutes)
+            .bind(&effective_limit)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let observation_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO runtime_minute_observations \
+             (envelope_instance_id, task_uid, runtime_uid, period_start, period_end, \
+              observed_seconds, base_limit_minutes, effective_limit_minutes, exhausted) \
+             VALUES ($1, $2, $3, $4::timestamptz, $5::timestamptz, $6::numeric, \
+                     $7::numeric, $8::numeric, $9) RETURNING id",
+        )
+        .bind(envelope_instance_id)
+        .bind(task_uid)
+        .bind(runtime_uid)
+        .bind(&period_start)
+        .bind(&period_end)
+        .bind(&observed_seconds)
+        .bind(&base_limit)
+        .bind(&effective_limit)
+        .bind(exhausted)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let escalation_id = if exhausted {
+            if let Some(existing) = sqlx::query_scalar::<_, Uuid>(
+                "SELECT exhaustion.id FROM runtime_minute_exhaustions exhaustion \
+                 LEFT JOIN runtime_minute_instance_grants grants \
+                   ON grants.escalation_id = exhaustion.id \
+                 LEFT JOIN runtime_minute_escalation_denials denials \
+                   ON denials.escalation_id = exhaustion.id \
+                 WHERE exhaustion.runtime_uid = $1 \
+                   AND exhaustion.period_start = $2::timestamptz \
+                   AND grants.id IS NULL AND denials.escalation_id IS NULL \
+                 ORDER BY exhaustion.at DESC LIMIT 1",
+            )
+            .bind(runtime_uid)
+            .bind(&period_start)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?
+            {
+                Some(existing)
+            } else {
+                let escalation_id = Uuid::new_v4();
+                sqlx::query(
+                    "INSERT INTO runtime_minute_exhaustions \
+                     (id, observation_id, envelope_instance_id, task_uid, runtime_uid, \
+                      period_start, period_end, observed_minutes, base_limit_minutes, \
+                      effective_limit_minutes) \
+                     VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::timestamptz, \
+                             $8::numeric, $9::numeric, $10::numeric)",
+                )
+                .bind(escalation_id)
+                .bind(observation_id)
+                .bind(envelope_instance_id)
+                .bind(task_uid)
+                .bind(runtime_uid)
+                .bind(&period_start)
+                .bind(&period_end)
+                .bind(&observed_minutes)
+                .bind(&base_limit)
+                .bind(&effective_limit)
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+                Some(escalation_id)
+            }
+        } else {
+            None
+        };
+        transaction.commit().await.map_err(database_error)?;
+        Ok(RuntimeMinutesAuthorityRecord {
+            period_start,
+            period_end,
+            observed_minutes,
+            base_limit,
+            effective_limit,
+            observed_at,
+            exhausted,
+            escalation_id,
+        })
+    }
+
+    pub async fn active_envelope_instance_runtime_minutes_top_up(
+        &self,
+        envelope_instance_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let amount = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(sum(amount), 0)::text \
+             FROM runtime_minute_instance_grants \
+             WHERE envelope_instance_id = $1 AND valid_until > clock_timestamp()",
+        )
+        .bind(envelope_instance_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok((amount != "0").then_some(amount))
+    }
+
     pub async fn deny_cumulative_escalation(
         &self,
-        escalation_id: i64,
+        escalation_id: Uuid,
+        rationale: &str,
+        denied_by: &str,
+    ) -> Result<(), StoreError> {
+        let escalation = self
+            .cumulative_escalation(escalation_id)
+            .await?
+            .ok_or(StoreError::CumulativeEscalationNotFound)?;
+        if escalation.dimension == "runtime_minutes" {
+            self.deny_runtime_minutes_escalation(escalation, rationale, denied_by)
+                .await
+        } else {
+            self.deny_spend_escalation(escalation, rationale, denied_by)
+                .await
+        }
+    }
+
+    async fn deny_spend_escalation(
+        &self,
+        escalation: CumulativeEscalationRecord,
         rationale: &str,
         denied_by: &str,
     ) -> Result<(), StoreError> {
         if rationale.trim().is_empty() || denied_by.trim().is_empty() {
             return Err(StoreError::InvalidCumulativeEscalation);
         }
-        let escalation = self
-            .cumulative_escalation(escalation_id)
-            .await?
-            .ok_or(StoreError::CumulativeEscalationNotFound)?;
+        let escalation_id = escalation.escalation_id;
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        if sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM inference_exhaustions WHERE id = $1 FOR UPDATE",
+        let Some(internal_escalation_id) = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM inference_exhaustions WHERE public_id = $1 FOR UPDATE",
+        )
+        .bind(escalation_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        else {
+            return Err(StoreError::CumulativeEscalationNotFound);
+        };
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM envelope_instance_grants WHERE escalation_id = $1)",
+        )
+        .bind(internal_escalation_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        {
+            return Err(StoreError::CumulativeEscalationConflict);
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO cumulative_escalation_denials \
+             (escalation_id, envelope_instance_id, task_uid, rationale, denied_by) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (escalation_id) DO NOTHING",
+        )
+        .bind(internal_escalation_id)
+        .bind(&escalation.envelope_instance_id)
+        .bind(escalation.blocked_task_uid)
+        .bind(rationale)
+        .bind(denied_by)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .rows_affected()
+            == 1;
+        if !inserted {
+            let matches = sqlx::query_scalar::<_, bool>(
+                "SELECT envelope_instance_id = $2 AND task_uid = $3 \
+                    AND rationale = $4 AND denied_by = $5 \
+                 FROM cumulative_escalation_denials WHERE escalation_id = $1",
+            )
+            .bind(internal_escalation_id)
+            .bind(&escalation.envelope_instance_id)
+            .bind(escalation.blocked_task_uid)
+            .bind(rationale)
+            .bind(denied_by)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if !matches {
+                return Err(StoreError::CumulativeEscalationConflict);
+            }
+        }
+        let task =
+            task_in_transaction_for_update(&mut transaction, escalation.blocked_task_uid).await?;
+        if matches!(task.orchestration_version, 2 | 3) {
+            task_runtime_operation_in_transaction_for_update(&mut transaction, task.task_uid)
+                .await?;
+            fence_task_execution_for_cleanup(&mut transaction, task.task_uid).await?;
+        }
+        sqlx::query(
+            "UPDATE task_submissions SET finalize_requested = true, cancel_requested = true, \
+                 phase = CASE WHEN phase IN ('submitted', 'parked', 'queued') THEN 'cancelled' ELSE phase END, \
+                 failure_reason = COALESCE(failure_reason, 'cumulative authority escalation denied'), \
+                 updated_at = now() WHERE task_uid = $1",
+        )
+        .bind(task.task_uid)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)
+    }
+
+    async fn deny_runtime_minutes_escalation(
+        &self,
+        escalation: CumulativeEscalationRecord,
+        rationale: &str,
+        denied_by: &str,
+    ) -> Result<(), StoreError> {
+        if rationale.trim().is_empty() || denied_by.trim().is_empty() {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        let escalation_id = escalation.escalation_id;
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        if sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM runtime_minute_exhaustions WHERE id = $1 FOR UPDATE",
         )
         .bind(escalation_id)
         .fetch_optional(&mut *transaction)
@@ -1705,7 +2183,8 @@ impl PgStore {
             return Err(StoreError::CumulativeEscalationNotFound);
         }
         if sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM envelope_instance_grants WHERE escalation_id = $1)",
+            "SELECT EXISTS(SELECT 1 FROM runtime_minute_instance_grants \
+                           WHERE escalation_id = $1)",
         )
         .bind(escalation_id)
         .fetch_one(&mut *transaction)
@@ -1715,7 +2194,7 @@ impl PgStore {
             return Err(StoreError::CumulativeEscalationConflict);
         }
         let inserted = sqlx::query(
-            "INSERT INTO cumulative_escalation_denials \
+            "INSERT INTO runtime_minute_escalation_denials \
              (escalation_id, envelope_instance_id, task_uid, rationale, denied_by) \
              VALUES ($1, $2, $3, $4, $5) ON CONFLICT (escalation_id) DO NOTHING",
         )
@@ -1733,7 +2212,7 @@ impl PgStore {
             let matches = sqlx::query_scalar::<_, bool>(
                 "SELECT envelope_instance_id = $2 AND task_uid = $3 \
                     AND rationale = $4 AND denied_by = $5 \
-                 FROM cumulative_escalation_denials WHERE escalation_id = $1",
+                 FROM runtime_minute_escalation_denials WHERE escalation_id = $1",
             )
             .bind(escalation_id)
             .bind(&escalation.envelope_instance_id)
@@ -1757,7 +2236,7 @@ impl PgStore {
         sqlx::query(
             "UPDATE task_submissions SET finalize_requested = true, cancel_requested = true, \
                  phase = CASE WHEN phase IN ('submitted', 'parked', 'queued') THEN 'cancelled' ELSE phase END, \
-                 failure_reason = COALESCE(failure_reason, 'cumulative authority escalation denied'), \
+                 failure_reason = COALESCE(failure_reason, 'cumulative runtime-minute escalation denied'), \
                  updated_at = now() WHERE task_uid = $1",
         )
         .bind(task.task_uid)
@@ -8488,6 +8967,7 @@ mod task_execution_binding_tests {
                 llms: spec.llms.clone(),
                 tools: spec.tools.clone(),
                 budget: spec.budget.clone(),
+                runtime_minutes_limit: None,
                 ttl: spec.ttl.clone(),
                 runner: spec.runner.clone(),
             },
@@ -9250,7 +9730,8 @@ pub struct AdminApprovalRecord {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CumulativeEscalationRecord {
-    pub escalation_id: i64,
+    pub escalation_id: Uuid,
+    pub dimension: String,
     pub runtime_uid: String,
     pub runtime_namespace: String,
     pub runtime_name: String,
@@ -9289,6 +9770,18 @@ pub struct EnvelopeInstanceGrantRecord {
     pub valid_until: String,
     pub rationale: String,
     pub granted_by: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeMinutesAuthorityRecord {
+    pub period_start: String,
+    pub period_end: String,
+    pub observed_minutes: String,
+    pub base_limit: String,
+    pub effective_limit: String,
+    pub observed_at: String,
+    pub exhausted: bool,
+    pub escalation_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -10653,7 +11146,45 @@ fn parse_task_runtime_ownership(value: &str) -> Result<TaskRuntimeOwnership, Sto
     }
 }
 
-const CUMULATIVE_ESCALATION_SELECT: &str = "SELECT exhaustions.id AS escalation_id, \
+const RUNTIME_MINUTES_USAGE_SELECT: &str = "WITH bounds AS ( \
+        SELECT date_trunc('month', clock_timestamp()) AS period_start, \
+               date_trunc('month', clock_timestamp()) + interval '1 month' AS period_end, \
+               clock_timestamp() AS observed_at), \
+     intervals AS ( \
+        SELECT tasks.task_uid, COALESCE(operation.runtime_uid, tasks.runtime_uid) AS runtime_uid, \
+               started.at AS started_at, ( \
+                   SELECT terminal.at FROM task_lifecycle_events terminal \
+                   WHERE terminal.task_uid = tasks.task_uid \
+                     AND terminal.event_kind = 'phase' \
+                     AND terminal.phase IN ('succeeded', 'failed', 'cancelled') \
+                     AND terminal.at >= started.at \
+                   ORDER BY terminal.at, terminal.id LIMIT 1) AS ended_at \
+        FROM task_submissions tasks \
+        LEFT JOIN task_runtime_operations operation ON operation.task_uid = tasks.task_uid \
+        JOIN LATERAL ( \
+            SELECT lifecycle.at FROM task_lifecycle_events lifecycle \
+            WHERE lifecycle.task_uid = tasks.task_uid \
+              AND lifecycle.event_kind = 'phase' AND lifecycle.phase = 'running' \
+            ORDER BY lifecycle.at, lifecycle.id LIMIT 1) started ON true \
+        WHERE tasks.user_envelope_instance_id = $1), \
+     measured AS ( \
+        SELECT GREATEST(0::numeric, EXTRACT(EPOCH FROM ( \
+                   LEAST(COALESCE(intervals.ended_at, bounds.observed_at), bounds.period_end) \
+                   - GREATEST(intervals.started_at, bounds.period_start)))) AS seconds \
+        FROM intervals CROSS JOIN bounds) \
+     SELECT to_char(bounds.period_start AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS period_start, \
+            to_char(bounds.period_end AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS period_end, \
+            COALESCE(sum(measured.seconds), 0)::text AS observed_seconds, \
+            (COALESCE(sum(measured.seconds), 0) / 60)::text AS observed_minutes, \
+            to_char(bounds.observed_at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS observed_at \
+     FROM bounds LEFT JOIN measured ON true \
+     GROUP BY bounds.period_start, bounds.period_end, bounds.observed_at";
+
+const CUMULATIVE_ESCALATION_SELECT: &str = "SELECT exhaustions.public_id AS escalation_id, \
+            'llm_spend'::text AS dimension, \
             exhaustions.runtime_uid, tasks.runtime_namespace, tasks.runtime_name, \
             tasks.user_envelope_instance_id AS envelope_instance_id, tasks.task_uid, \
             tasks.owner_user_id AS requester_user_id, users.display_email AS requester_display_email, \
@@ -10715,11 +11246,65 @@ const CUMULATIVE_ESCALATION_SELECT: &str = "SELECT exhaustions.id AS escalation_
      LEFT JOIN cumulative_escalation_denials denials ON denials.escalation_id = exhaustions.id \
      WHERE tasks.user_envelope_instance_id IS NOT NULL";
 
+const RUNTIME_MINUTES_ESCALATION_SELECT: &str = "SELECT exhaustions.id AS escalation_id, \
+            'runtime_minutes'::text AS dimension, exhaustions.runtime_uid, \
+            tasks.runtime_namespace, tasks.runtime_name, \
+            exhaustions.envelope_instance_id, exhaustions.task_uid, \
+            tasks.owner_user_id AS requester_user_id, users.display_email AS requester_display_email, \
+            requests.template_id, templates.display_name AS template_display_name, \
+            requests.template_revision, \
+            to_char(exhaustions.period_start AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS period_start, \
+            to_char(exhaustions.period_end AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS period_end, \
+            exhaustions.observed_minutes::text AS observed_amount, \
+            (exhaustions.base_limit_minutes + COALESCE(instance_grants.active_amount, 0))::text AS limit, \
+            'min'::text AS currency, \
+            to_char(observations.at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS observed_at, \
+            to_char(exhaustions.at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS parked_at, \
+            grants.id AS grant_id, \
+            CASE WHEN grants.id IS NULL THEN NULL \
+                 ELSE grants.valid_until > clock_timestamp() END AS grant_active, \
+            grants.amount::text AS grant_amount, grants.base_limit::text AS grant_base_limit, \
+            grants.target_limit::text AS grant_target_limit, \
+            CASE WHEN grants.valid_until IS NULL THEN NULL ELSE \
+                to_char(grants.valid_until AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS grant_valid_until, \
+            grants.rationale AS grant_rationale, denials.rationale AS denial_rationale, \
+            CASE WHEN COALESCE(grants.at, denials.at) IS NULL THEN NULL ELSE \
+                to_char(COALESCE(grants.at, denials.at) AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS decision_at, \
+            COALESCE(grants.granted_by, denials.denied_by) AS decision_actor \
+     FROM (SELECT DISTINCT ON (runtime_uid) * FROM runtime_minute_exhaustions \
+           ORDER BY runtime_uid, at DESC) exhaustions \
+     JOIN runtime_minute_observations observations ON observations.id = exhaustions.observation_id \
+     JOIN task_submissions tasks ON tasks.task_uid = exhaustions.task_uid \
+     LEFT JOIN LATERAL ( \
+         SELECT sum(instance_grant.amount) AS active_amount \
+         FROM runtime_minute_instance_grants instance_grant \
+         WHERE instance_grant.envelope_instance_id = exhaustions.envelope_instance_id \
+           AND instance_grant.valid_until > clock_timestamp()) instance_grants ON true \
+     JOIN canonical_users users ON users.user_id = tasks.owner_user_id \
+     JOIN LATERAL ( \
+         SELECT events.request_id FROM envelope_request_events events \
+         WHERE events.envelope_instance_id = exhaustions.envelope_instance_id \
+         ORDER BY events.id DESC LIMIT 1) envelope_binding ON true \
+     JOIN envelope_requests requests ON requests.id = envelope_binding.request_id \
+     JOIN envelope_template_revisions templates \
+       ON templates.template_id = requests.template_id \
+      AND templates.revision = requests.template_revision \
+     LEFT JOIN runtime_minute_instance_grants grants ON grants.escalation_id = exhaustions.id \
+     LEFT JOIN runtime_minute_escalation_denials denials ON denials.escalation_id = exhaustions.id \
+     WHERE true";
+
 fn cumulative_escalation_record(
     row: sqlx::postgres::PgRow,
 ) -> Result<CumulativeEscalationRecord, StoreError> {
     Ok(CumulativeEscalationRecord {
         escalation_id: row.try_get("escalation_id").map_err(database_error)?,
+        dimension: row.try_get("dimension").map_err(database_error)?,
         runtime_uid: row.try_get("runtime_uid").map_err(database_error)?,
         runtime_namespace: row.try_get("runtime_namespace").map_err(database_error)?,
         runtime_name: row.try_get("runtime_name").map_err(database_error)?,
@@ -11178,6 +11763,7 @@ fn grant_dimension(delta: &AdmissionDelta) -> &'static str {
     match delta {
         AdmissionDelta::Budget { .. } => "budget",
         AdmissionDelta::SingleRunBudget { .. } => "budget-single-run",
+        AdmissionDelta::RuntimeMinutes { .. } => "runtime-minutes",
         AdmissionDelta::Ttl { .. } => "ttl",
         AdmissionDelta::Models { .. } => "models",
         AdmissionDelta::Tools { .. } => "tools",

@@ -1883,6 +1883,7 @@ fn approval_admin_request(record: AdminApprovalRecord) -> AdminRequestView {
             llms: record.proposed_spec.llms,
             tools: record.proposed_spec.tools,
             budget: record.proposed_spec.budget,
+            runtime_minutes_limit: None,
             ttl: record.proposed_spec.ttl,
             runner: record.proposed_spec.runner,
         },
@@ -1989,7 +1990,11 @@ fn escalation_admin_request(record: CumulativeEscalationRecord) -> AdminRequestV
                 end: record.period_end,
             },
             meters: vec![EscalationMeter {
-                dimension: EscalationDimension::LlmSpend,
+                dimension: if record.dimension == "runtime_minutes" {
+                    EscalationDimension::RuntimeMinutes
+                } else {
+                    EscalationDimension::LlmSpend
+                },
                 used: record.observed_amount,
                 limit: record.limit,
                 unit: record.currency,
@@ -2050,7 +2055,7 @@ where
     operation_id = "topUpAdminEscalation",
     path = "/admin/api/v1/escalations/{escalation_id}/top-up",
     params(
-        ("escalation_id" = i64, Path),
+        ("escalation_id" = String, Path, format = "uuid"),
         ("X-Steward-CSRF" = String, Header)
     ),
     request_body = EscalationTopUpRequest,
@@ -2069,7 +2074,7 @@ pub(crate) async fn top_up_escalation<R, L, D>(
     Extension(authority): Extension<BrowserAdminAuthority>,
     proof: Option<Extension<BrowserMutationProof>>,
     State(state): State<BrowserAdminState<R, L, D>>,
-    Path(escalation_id): Path<i64>,
+    Path(escalation_id): Path<Uuid>,
     Json(request): Json<EscalationTopUpRequest>,
 ) -> Response
 where
@@ -2083,15 +2088,20 @@ where
     if request.rationale.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    if request.dimension != EscalationDimension::LlmSpend {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
     let Some(escalation) = (match state.ledger.cumulative_escalation(escalation_id).await {
         Ok(escalation) => escalation,
         Err(error) => return ApiError::Store(error).into_response(),
     }) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let expected_dimension = if escalation.dimension == "runtime_minutes" {
+        EscalationDimension::RuntimeMinutes
+    } else {
+        EscalationDimension::LlmSpend
+    };
+    if request.dimension != expected_dimension {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     if state
         .runtimes
         .get_bound(
@@ -2144,7 +2154,7 @@ where
     operation_id = "denyAdminEscalation",
     path = "/admin/api/v1/escalations/{escalation_id}/deny",
     params(
-        ("escalation_id" = i64, Path),
+        ("escalation_id" = String, Path, format = "uuid"),
         ("X-Steward-CSRF" = String, Header)
     ),
     request_body = EscalationDenyRequest,
@@ -2163,7 +2173,7 @@ pub(crate) async fn deny_escalation<R, L, D>(
     Extension(authority): Extension<BrowserAdminAuthority>,
     proof: Option<Extension<BrowserMutationProof>>,
     State(state): State<BrowserAdminState<R, L, D>>,
-    Path(escalation_id): Path<i64>,
+    Path(escalation_id): Path<Uuid>,
     Json(request): Json<EscalationDenyRequest>,
 ) -> Response
 where
@@ -2552,6 +2562,7 @@ mod request_projection_tests {
                     llms: Vec::new(),
                     tools: Vec::new(),
                     budget,
+                    runtime_minutes_limit: None,
                     ttl: Duration("1h".to_owned()),
                     runner: RunnerRequirements::default(),
                 },

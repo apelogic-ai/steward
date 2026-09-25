@@ -59,7 +59,7 @@ opt-in.
 The Next.js `/admin/approvals` page consumes the unified, cursor-paginated
 `GET /admin/api/v1/requests` read model, its exact-ID detail route, and
 `GET /admin/api/v1/requests/summary`. The queue combines Envelope requests,
-runtime exceptions, and cumulative-spend escalations without flattening their
+runtime exceptions, and cumulative spend or runtime-minute escalations without flattening their
 source-specific decision routes. Structured `DirectAdmissionDelta` values are
 the only source for rendering requested changes; the browser must not parse the
 legacy runtime-exception `counterexample` string.
@@ -84,6 +84,15 @@ instance, plus active instance-scoped top-up grants in the effective limit. An
 `available`, `partial`, or `unavailable` status is authoritative; presentation
 must never guess a missing value. Request detail includes append-only status
 history.
+
+An Envelope revision may also constrain cumulative runtime minutes for each
+provisioned instance. This authority is stored in the immutable Envelope snapshot,
+not added to the AgentRuntime CRD. Steward derives current-period usage from
+append-only Task running-to-terminal lifecycle intervals, records observations and
+exhaustions append-only, and suspends execution when the effective limit is
+exhausted. Administrator top-ups are instance-scoped append-only grants; a
+successful grant must raise the effective limit above the recorded usage before
+the controller can resume the parked Task. Denial cancels the parked Task.
 
 Capability metadata supplies tool access class and provider catalog
 availability. The browser must not infer either from display text. Unsupported

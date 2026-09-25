@@ -3382,6 +3382,7 @@ mod workflow_request_tests {
                     single_run_limit: Some("1.00".to_owned()),
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: None,
                 ttl: Duration("15m".to_owned()),
                 runner: RunnerRequirements::default(),
             },

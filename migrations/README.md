@@ -74,3 +74,10 @@ Tasks, runs, runtimes, Envelopes, or historical identity. The new
 `steward-task-v3` writer remains disabled by default; older binaries ignore the
 additive tables during a rolling upgrade. After v3 observations are written,
 rollback requires disabling v3 first and preserving migration 0040 data.
+
+Migration 0047 adds append-only runtime-minute observations, exhaustion records,
+instance-scoped grants, and denial decisions. Runtime usage is derived from
+`task_lifecycle_events` running-to-terminal intervals, with a running Task clipped
+at observation time and every interval clipped to the current UTC month. The same
+migration adds a stable UUID public identifier to existing spend exhaustions so
+the unified escalation API does not expose an internal sequence key.

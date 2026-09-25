@@ -153,11 +153,13 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
   async function topUp(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (session.status !== "authenticated") return;
+    const meter = request.escalation?.meters[0];
+    if (!meter) return;
     const fields = new FormData(event.currentTarget);
     setStatus("approving");
     const result = await topUpAdminEscalation({
       body: {
-        dimension: "llm_spend",
+        dimension: meter.dimension,
         amount: String(fields.get("amount") ?? "").trim(),
         validUntil: String(fields.get("validUntil") ?? "").trim(),
         rationale: String(fields.get("rationale") ?? "").trim(),
@@ -165,7 +167,7 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
       cache: "no-store",
       credentials: "same-origin",
       headers: { "X-Steward-CSRF": session.value.csrf },
-      path: { escalation_id: Number(request.id) },
+      path: { escalation_id: request.id },
     });
     setStatus(result.data && result.response?.ok ? "approved" : classifyMutationFailure(result.response?.status));
   }
@@ -180,7 +182,7 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
       cache: "no-store",
       credentials: "same-origin",
       headers: { "X-Steward-CSRF": session.value.csrf },
-      path: { escalation_id: Number(request.id) },
+      path: { escalation_id: request.id },
     });
     setStatus(result.data && result.response?.ok ? "rejected" : classifyMutationFailure(result.response?.status));
   }
@@ -192,7 +194,7 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
         <DefinitionList items={[["Requested by", request.requester.displayEmail], ["Envelope instance", request.escalation.envelopeInstanceId], ["Blocked task", request.escalation.blockedTaskUid], ["Parked", request.escalation.parkedAt]]} />
         <ul className="space-y-2">{request.escalation.meters.map((meter) => <li className="rounded-md border p-4" key={meter.dimension}><p className="font-semibold">{meter.dimension === "llm_spend" ? "LLM spend" : "Runtime minutes"}</p><p className="mt-1 text-sm">{meter.used} / {meter.limit} {meter.unit}</p><p className="mt-1 text-xs text-muted-ink">Observed {meter.observedAt}</p></li>)}</ul>
         <form className="grid gap-3 border-t pt-5 sm:grid-cols-2" onSubmit={topUp}>
-          <label className="grid gap-2 text-sm font-semibold">Top-up amount (USD)<input className="min-h-11 rounded-md border px-3 font-normal" inputMode="decimal" name="amount" required /></label>
+          <label className="grid gap-2 text-sm font-semibold">Top-up amount ({request.escalation.meters[0]?.unit ?? "units"})<input className="min-h-11 rounded-md border px-3 font-normal" inputMode="decimal" name="amount" required /></label>
           <label className="grid gap-2 text-sm font-semibold">Valid until (RFC 3339)<input className="min-h-11 rounded-md border px-3 font-normal" name="validUntil" placeholder="2026-08-25T17:00:00Z" required /></label>
           <label className="grid gap-2 text-sm font-semibold sm:col-span-2">Rationale<textarea className="min-h-20 rounded-md border p-3 font-normal" name="rationale" required /></label>
           <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 sm:justify-self-start" disabled={status === "approving" || status === "approved" || status === "rejected"} type="submit">Top up and resume</button>

@@ -102,6 +102,7 @@ const envelopeRequest = {
   reason: null,
   createdAt: "2026-08-24T17:00:00Z",
   statusAt: "2026-08-24T17:01:00Z",
+  history: [{ status: "provisioned", at: "2026-08-24T17:01:00Z", actor: "system:auto", reason: null }],
 };
 
 const pendingEnvelopeRequest = {
@@ -134,6 +135,52 @@ const run = {
   updatedAt: "2026-08-24T17:03:00Z",
   observedSpend: { observedAmount: "1.25", currency: "USD", exhausted: false },
   errorCategory: null,
+  stages: [
+    { id: "admission", displayName: "Admission", state: "succeeded", steps: [] },
+    { id: "provision-runtime", displayName: "Provision runtime", state: "succeeded", steps: [] },
+    { id: "agent-execution", displayName: "Agent execution", state: "succeeded", steps: [{ id: "execution", displayName: "Execution", state: "succeeded", logStreams: ["stdout", "stderr"] }] },
+    { id: "finalize", displayName: "Finalize", state: "succeeded", steps: [] },
+  ],
+};
+
+const runFacets = {
+  submitted: 0,
+  queued: 0,
+  running: 0,
+  parked: 0,
+  succeeded: 1,
+  failed: 0,
+  cancelled: 0,
+};
+
+const unifiedEnvelopeRequest = {
+  id: pendingEnvelopeRequest.requestId,
+  kind: "ceiling_exceeded",
+  source: "envelope_request",
+  state: "requested",
+  requester: { userId: pendingEnvelopeRequest.ownerUserId, displayEmail: pendingEnvelopeRequest.ownerDisplayEmail },
+  template: { id: pendingEnvelopeRequest.templateId, displayName: "Developer", revision: pendingEnvelopeRequest.templateRevision },
+  createdAt: pendingEnvelopeRequest.createdAt,
+  stateAt: pendingEnvelopeRequest.createdAt,
+  stateActor: pendingEnvelopeRequest.ownerUserId,
+  deltas: [{ dimension: "budget", requested: "40.00", ceiling: "25.00", currency: "USD" }],
+  requestedEnvelope: pendingEnvelopeRequest.requestedEnvelope,
+  templateEnvelope: pendingEnvelopeRequest.templateEnvelope,
+  history: [{ state: "requested", at: pendingEnvelopeRequest.createdAt, actor: pendingEnvelopeRequest.ownerUserId, reason: null }],
+};
+
+const unifiedRuntimeApproval = {
+  id: approvalId,
+  kind: "ceiling_exceeded",
+  source: "runtime_exception",
+  state: "requested",
+  requester: { userId: developerSession.principal.userId, displayEmail: "alice@example.com" },
+  template: { id: "analyst", displayName: "Analyst", revision: 4 },
+  createdAt: "2026-08-24T17:05:00Z",
+  stateAt: "2026-08-24T17:05:00Z",
+  stateActor: developerSession.principal.userId,
+  deltas: [{ dimension: "budget", requested: "40.00", ceiling: "25.00", currency: "USD" }],
+  history: [{ state: "requested", at: "2026-08-24T17:05:00Z", actor: developerSession.principal.userId, reason: null }],
 };
 
 const workflowRevision = {
@@ -185,7 +232,7 @@ const presentationRoutes = [
   { path: "/admin/workflows/repository-review/new-version", heading: "New repository-review version", activeNavigation: "Workflows" },
   { path: "/admin/runs", heading: "All runs", activeNavigation: "Runs" },
   { path: `/admin/runs/${taskUid}`, heading: "Run detail", activeNavigation: "Runs" },
-  { path: "/admin/approvals", heading: "Pending approvals", activeNavigation: "Approvals" },
+  { path: "/admin/approvals", heading: "Requests", activeNavigation: "Approvals" },
   { path: "/admin/settings", heading: "Settings", activeNavigation: "Settings" },
 ];
 
@@ -255,6 +302,8 @@ async function startWeb() {
         || requestUrl.pathname === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/reject`
         || requestUrl.pathname === `/admin/api/v1/approvals/${approvalId}/approve`
         || requestUrl.pathname === `/admin/api/v1/approvals/${approvalId}/file`
+        || requestUrl.pathname === "/app/api/v1/connections/github/start"
+        || requestUrl.pathname === "/app/api/v1/connections/github/disconnect"
         || requestUrl.pathname === "/admin/api/v1/connections/github/start"
         || requestUrl.pathname === "/admin/api/v1/connections/github/disconnect"
         || requestUrl.pathname === "/admin/auth/logout"
@@ -304,7 +353,7 @@ async function startWeb() {
         }
         if (requestUrl.pathname.endsWith("/github-actions-workflow")) {
           response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-          response.end(JSON.stringify({ apiVersion: "steward.envelope-requests/v1", workflow: { schemaVersion: "v2", contentType: "application/yaml", sha256: "abc123", yaml: ["name: Steward governed run", "on:", "  workflow_dispatch:", "jobs:", "  governed:", "    with:", "      workflow: repository-review@1", ""].join("\n") } }));
+          response.end(JSON.stringify({ apiVersion: "steward.envelope-requests/v1", workflow: { schemaVersion: "v2", contentType: "application/yaml", suggestedPath: ".github/workflows/steward-repository-review.yml", sha256: "abc123", yaml: ["name: Steward governed run", "on:", "  workflow_dispatch:", "jobs:", "  governed:", "    with:", "      workflow: repository-review@1", ""].join("\n") } }));
           return;
         }
         if (requestUrl.pathname.startsWith("/admin/api/v1/envelope-requests/")) {
@@ -452,7 +501,10 @@ async function guardedPage(browser, {
   web.useMutationFailures(mutationFailures);
   web.useMutationSink(mutations);
   await context.addInitScript(() => {
-    const allowedPreference = (key) => typeof key === "string" && key.startsWith("steward.ui.envelope-accordion.");
+    const allowedPreference = (key) => typeof key === "string" && (
+      key.startsWith("steward.ui.envelope-accordion.")
+      || key === "steward.ui.onboarding.workflow-reference"
+    );
     for (const method of ["getItem", "removeItem", "setItem"]) {
       const original = Storage.prototype[method];
       Object.defineProperty(Storage.prototype, method, {
@@ -524,7 +576,7 @@ async function guardedPage(browser, {
     }
     await json(route, { apiVersion: "steward.envelope-requests/v1", request: envelopeRequest });
   });
-  await context.route(`${origin}/app/api/v1/runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [run], nextCursor: null }));
+  await context.route(`${origin}/app/api/v1/runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [run], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } }));
   await context.route(`${origin}/app/api/v1/runs/**`, (route) => route.request().url().endsWith("/timeline")
     ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
     : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...run, phase: runPhase } }));
@@ -532,14 +584,15 @@ async function guardedPage(browser, {
     const stream = new URL(route.request().url()).pathname.split("/").at(-1);
     executionLogRequests.push(route.request());
     const fixture = executionLogs[stream];
+    const content = fixture?.body ?? "";
     await route.fulfill({
       status: fixture?.status ?? 404,
-      contentType: "text/plain; charset=utf-8",
-      body: fixture?.body ?? "",
+      contentType: "application/json",
+      body: fixture?.status === 200 ? JSON.stringify({ stream, content, truncated: false, sizeBytes: Buffer.byteLength(content), complete: true }) : "",
       headers: { "cache-control": "no-store" },
     });
   });
-  await context.route(`${origin}/admin/api/v1/all-runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [{ ...run, ownerUserId: developerSession.principal.userId }], nextCursor: null }));
+  await context.route(`${origin}/admin/api/v1/all-runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [{ ...run, ownerUserId: developerSession.principal.userId, ownerDisplayEmail: developerSession.principal.displayEmail }], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } }));
   await context.route(`${origin}/admin/api/v1/all-runs/**`, (route) => route.request().url().endsWith("/timeline")
     ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
     : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...run, phase: runPhase } }));
@@ -547,10 +600,11 @@ async function guardedPage(browser, {
     const stream = new URL(route.request().url()).pathname.split("/").at(-1);
     executionLogRequests.push(route.request());
     const fixture = executionLogs[stream];
+    const content = fixture?.body ?? "";
     await route.fulfill({
       status: fixture?.status ?? 404,
-      contentType: "text/plain; charset=utf-8",
-      body: fixture?.body ?? "",
+      contentType: "application/json",
+      body: fixture?.status === 200 ? JSON.stringify({ stream, content, truncated: false, sizeBytes: Buffer.byteLength(content), complete: true }) : "",
       headers: { "cache-control": "no-store" },
     });
   });
@@ -607,6 +661,17 @@ async function guardedPage(browser, {
     approvals: emptyCollections ? [] : [approval],
     envelopeRequests: emptyCollections ? [] : [pendingEnvelopeRequest],
   }));
+  await context.route(`${origin}/admin/api/v1/requests*`, (route) => json(route, {
+    apiVersion: "steward.browser-admin/v1",
+    requests: emptyCollections ? [] : [unifiedEnvelopeRequest, unifiedRuntimeApproval],
+    nextCursor: null,
+  }));
+  await context.route(`${origin}/admin/api/v1/requests/summary`, (route) => json(route, {
+    apiVersion: "steward.browser-admin/v1",
+    needsAction: emptyCollections ? 0 : 2,
+    escalated: 0,
+    requested: emptyCollections ? 0 : 2,
+  }));
   await context.route(`${origin}/admin/api/v1/approvals/**`, (route) => route.continue());
   await context.route(`${origin}/admin/api/v1/connections/github`, (route) => json(route, {
     apiVersion: "steward.connections/v1",
@@ -616,6 +681,17 @@ async function guardedPage(browser, {
       : { phase: connectionPhase, accountEmail: null, scopesRequired: ["repo"], scopesGranted: [], scopesMissing: ["repo"], expiresAt: null },
   }));
   await context.route(`${origin}/admin/api/v1/connections/github/*`, (route) => route.continue());
+  await context.route(`${origin}/app/api/v1/connections`, (route) => json(route, {
+    apiVersion: "steward.connections/v1",
+    connections: [{
+      provider: "github",
+      displayName: "GitHub",
+      status: connectionPhase === "connected"
+        ? { phase: "connected", accountEmail: "alice@example.com", scopesRequired: ["repo"], scopesGranted: ["repo"], scopesMissing: [], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null }
+        : { phase: connectionPhase, accountEmail: null, scopesRequired: ["repo"], scopesGranted: [], scopesMissing: ["repo"], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
+    }],
+    available: [{ provider: "github", displayName: "GitHub", enabled: true }],
+  }));
   const page = await context.newPage();
   const consoleErrors = [];
   const crossOriginRequests = [];
@@ -903,7 +979,10 @@ test("every presentation route remains navigable at a narrow viewport", async ({
       await test.step(route.path, async () => {
         await session.page.goto(`${origin}${route.path}`);
         await expect(session.page.getByRole("heading", { name: route.heading, exact: true }).first()).toBeVisible();
-        await expect(session.page.getByRole("link", { name: route.activeNavigation, exact: true })).toHaveAttribute("aria-current", "page");
+        const activeLink = route.activeNavigation === "Approvals"
+          ? session.page.getByRole("link", { name: /^Approvals/ })
+          : session.page.getByRole("link", { name: route.activeNavigation, exact: true });
+        await expect(activeLink).toHaveAttribute("aria-current", "page");
         const dimensions = await session.page.evaluate(() => ({
           clientWidth: document.documentElement.clientWidth,
           scrollWidth: document.documentElement.scrollWidth,
@@ -975,7 +1054,7 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await expect(developer.page.getByLabel("Time to live")).toHaveValue("4h");
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
-    const provisioned = developer.page.getByText("provisioned", { exact: true });
+    const provisioned = developer.page.getByRole("article").getByText("provisioned", { exact: true });
     await expect(provisioned).toHaveCSS("background-color", "rgb(18, 53, 36)");
     await expect(provisioned).toHaveCSS("border-color", "rgb(47, 128, 85)");
     await expect(provisioned).toHaveCSS("color", "rgb(134, 239, 172)");
@@ -1082,7 +1161,7 @@ test("failed run phases expose stdout and stderr as escaped sensitive output", a
     ]);
     for (const request of developer.executionLogRequests) {
       expect(new URL(request.url()).origin).toBe(origin);
-      expect(request.headers().accept).toBe("text/plain");
+      expect(request.headers().accept).toBe("application/json");
       expect(request.headers().cookie).toContain("execution-log-session=present");
     }
   } finally {
@@ -1236,31 +1315,31 @@ test("administrator templates and approvals use typed browser authority", async 
     ]);
 
     await administrator.page.goto(`${origin}/admin/approvals`);
-    await expect(administrator.page.getByRole("heading", { name: "Pending approvals" })).toBeVisible();
+    await expect(administrator.page.getByRole("heading", { name: "Requests" })).toBeVisible();
     const envelopeRequestCard = administrator.page.getByRole("listitem").filter({
-      has: administrator.page.getByRole("heading", { name: "User envelope request" }),
+      has: administrator.page.getByText(pendingEnvelopeRequest.requestId, { exact: true }),
     });
     await expect(envelopeRequestCard).toBeVisible();
     await expect(envelopeRequestCard.getByText("alice@example.com")).toBeVisible();
-    await expect(envelopeRequestCard.getByText("developer", { exact: true })).toBeVisible();
-    await expect(envelopeRequestCard.getByRole("heading", { name: "Requested authority" })).toBeVisible();
-    await expect(envelopeRequestCard.getByRole("heading", { name: "Governing template" })).toBeVisible();
+    await expect(envelopeRequestCard.getByText("envelope_request", { exact: true })).toBeVisible();
+    await expect(envelopeRequestCard.getByRole("heading", { name: "Requested changes" })).toBeVisible();
     await expect(envelopeRequestCard.getByRole("button", { name: "Reject request" })).toBeVisible();
-    await envelopeRequestCard.getByLabel("Approval rationale").fill("Approved for the requested bounded envelope.");
-    await envelopeRequestCard.getByRole("button", { name: "Approve request" }).click();
-    await expect(envelopeRequestCard.getByText("The exact requested envelope was provisioned.")).toBeVisible();
-    await expect(envelopeRequestCard.getByText("env_00000000000000000000000000000004")).toBeVisible();
+    await envelopeRequestCard.getByLabel("Rationale", { exact: true }).fill("Approved for the requested bounded envelope.");
+    await envelopeRequestCard.getByRole("button", { name: "Approve", exact: true }).click();
+    await expect(envelopeRequestCard.getByText("Approval applied through the governed Rust admission path.")).toBeVisible();
     const envelopeApprovalMutation = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/approve`);
     expectMutationProof(envelopeApprovalMutation);
     expect(envelopeApprovalMutation.body.rationale).toBe("Approved for the requested bounded envelope.");
-    await expect(administrator.page.getByText("runtime-example-2")).toBeVisible();
-    await administrator.page.getByRole("button", { name: "File decision reference" }).click();
-    await expect(administrator.page.getByText("Decision reference filed through the server-owned channel.")).toBeVisible();
-    expectMutationProof(administrator.mutations.find((mutation) => mutation.path.endsWith("/file")));
-    await administrator.page.getByLabel("Rationale", { exact: true }).fill("Approved for one bounded investigation.");
-    await administrator.page.getByLabel("Expires at (RFC 3339)").fill("2026-08-25T17:00:00Z");
-    await administrator.page.getByRole("button", { name: "Approve exception" }).click();
-    await expect(administrator.page.getByText("Approval applied through the governed Rust admission path.")).toBeVisible();
+    const runtimeApprovalCard = administrator.page.getByRole("listitem").filter({
+      has: administrator.page.getByText(approvalId, { exact: true }),
+    });
+    await runtimeApprovalCard.getByRole("button", { name: "File decision reference" }).click();
+    await expect(runtimeApprovalCard.getByText("Decision reference filed through the server-owned channel.")).toBeVisible();
+    expectMutationProof(administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/approvals/${approvalId}/file`));
+    await runtimeApprovalCard.getByLabel("Rationale", { exact: true }).fill("Approved for one bounded investigation.");
+    await runtimeApprovalCard.getByLabel("Expires at (RFC 3339)").fill("2026-08-25T17:00:00Z");
+    await runtimeApprovalCard.getByRole("button", { name: "Approve", exact: true }).click();
+    await expect(runtimeApprovalCard.getByText("Approval applied through the governed Rust admission path.")).toBeVisible();
     const approvalMutation = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/approvals/${approvalId}/approve`);
     expectMutationProof(approvalMutation);
     expect(approvalMutation.body.evidenceUrl).toBe("https://example.com/decisions/PROJ-123");
@@ -1481,12 +1560,11 @@ test("administrator can reject a pending envelope request with an optional reaso
   try {
     await administrator.page.goto(`${origin}/admin/approvals`);
     const envelopeRequestCard = administrator.page.getByRole("listitem").filter({
-      has: administrator.page.getByRole("heading", { name: "User envelope request" }),
+      has: administrator.page.getByText(pendingEnvelopeRequest.requestId, { exact: true }),
     });
     await envelopeRequestCard.getByLabel("Rejection reason (optional)").fill("Authority is not appropriate for this user.");
     await envelopeRequestCard.getByRole("button", { name: "Reject request" }).click();
-    await expect(envelopeRequestCard.getByText("The envelope request was rejected without creating an envelope.")).toBeVisible();
-    await expect(envelopeRequestCard.getByText("Not created")).toBeVisible();
+    await expect(envelopeRequestCard.getByText("The envelope request was rejected through the governed Rust admission path.")).toBeVisible();
     const rejection = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/reject`);
     expectMutationProof(rejection);
     expect(rejection.body).toEqual({ reason: "Authority is not appropriate for this user." });
@@ -1570,7 +1648,7 @@ test("connection action keeps a Rust authorization denial explicit", async ({ br
   const developer = await guardedPage(browser, {
     connectionPhase: "disconnected",
     expectedHttpStatuses: [403],
-    mutationFailures: { "/admin/api/v1/connections/github/start": 403 },
+    mutationFailures: { "/app/api/v1/connections/github/start": 403 },
   });
   try {
     await developer.page.goto(`${origin}/connections`);

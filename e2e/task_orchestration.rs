@@ -489,6 +489,7 @@ async fn multiple_named_envelope_templates_coexist_for_one_role_and_pin_requests
                 single_run_limit: Some("5.00".to_owned()),
                 currency: "USD".to_owned(),
             },
+            runtime_minutes_limit: None,
             ttl: Duration("1h".to_owned()),
             runner: RunnerRequirements::default(),
         },
@@ -624,6 +625,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 single_run_limit: Some("10.00".to_owned()),
                 currency: "USD".to_owned(),
             },
+            runtime_minutes_limit: Some("1.00".to_owned()),
             ttl: Duration("1h".to_owned()),
             runner: RunnerRequirements::default(),
         },
@@ -879,13 +881,70 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         !live_log.complete,
         "a running transcript must remain pollable"
     );
+    sqlx::query(
+        "INSERT INTO task_lifecycle_events \
+         (task_uid, event_kind, phase, provenance, at) \
+         VALUES ($1, 'phase', 'running', 'recorded', clock_timestamp() - interval '2 minutes')",
+    )
+    .bind(task_uid)
+    .execute(&pool)
+    .await?;
+    let runtime_minutes = store
+        .observe_envelope_instance_runtime_minutes(
+            &envelope_instance_id,
+            task_uid,
+            &runtime_uid,
+            envelope
+                .spec
+                .runtime_minutes_limit
+                .as_deref()
+                .ok_or_else(|| io::Error::other("runtime-minute limit is missing"))?,
+        )
+        .await?;
+    assert!(runtime_minutes.exhausted);
+    let runtime_minutes_escalation = store
+        .admin_escalations()
+        .await?
+        .into_iter()
+        .find(|record| record.runtime_uid == runtime_uid && record.dimension == "runtime_minutes")
+        .ok_or_else(|| io::Error::other("runtime-minute escalation was not projected"))?;
+    assert_eq!(runtime_minutes_escalation.currency, "min");
+    let runtime_grant = store
+        .record_escalation_top_up(
+            runtime_minutes_escalation.escalation_id,
+            "10.00",
+            "2999-01-01T00:00:00Z",
+            "finish the bounded task",
+            "test-admin",
+        )
+        .await?;
+    assert_eq!(runtime_grant.base_limit, "1.00");
+    assert_eq!(runtime_grant.target_limit, "11.00");
+    assert_eq!(
+        store
+            .active_envelope_instance_runtime_minutes_top_up(&envelope_instance_id)
+            .await?,
+        Some("10.00".to_owned())
+    );
+    let resumed_runtime_minutes = store
+        .observe_envelope_instance_runtime_minutes(
+            &envelope_instance_id,
+            task_uid,
+            &runtime_uid,
+            "1.00",
+        )
+        .await?;
+    assert!(
+        !resumed_runtime_minutes.exhausted,
+        "the active instance grant must resume execution above observed runtime minutes"
+    );
     store
         .record_spend_observation(
             &runtime_uid,
             1,
             "immutable-runtime-spec",
             &SpendSummary {
-                observed_amount: "100.00".to_owned(),
+                observed_amount: "110.00".to_owned(),
                 currency: "USD".to_owned(),
             },
             true,
@@ -896,10 +955,23 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .admin_escalations()
         .await?
         .into_iter()
-        .find(|record| record.runtime_uid == runtime_uid)
+        .find(|record| record.runtime_uid == runtime_uid && record.dimension == "llm_spend")
         .ok_or_else(|| io::Error::other("spend escalation was not projected"))?;
     assert_eq!(escalation.envelope_instance_id, envelope_instance_id);
     assert_eq!(escalation.limit, "100.00");
+    assert_eq!(
+        store
+            .record_escalation_top_up(
+                escalation.escalation_id,
+                "5.00",
+                "2999-01-01T00:00:00Z",
+                "insufficient to resume the task",
+                "test-admin",
+            )
+            .await,
+        Err(StoreError::InvalidCumulativeEscalation),
+        "a successful top-up must raise the effective limit above observed spend"
+    );
     let grant = store
         .record_escalation_top_up(
             escalation.escalation_id,
@@ -918,7 +990,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         Some("25.00".to_owned())
     );
     let usage = store.envelope_usage(&envelope_instance_id).await?;
-    assert_eq!(usage.observed_amount, Some("100.00".to_owned()));
+    assert_eq!(usage.observed_amount, Some("110.00".to_owned()));
     assert_eq!(usage.active_top_up_amount, Some("25.00".to_owned()));
     let retry = store
         .record_escalation_top_up(
@@ -1008,6 +1080,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
                 single_run_limit: Some("10.00".to_owned()),
                 currency: "USD".to_owned(),
             },
+            runtime_minutes_limit: None,
             ttl: Duration("1h".to_owned()),
             runner: RunnerRequirements::default(),
         },

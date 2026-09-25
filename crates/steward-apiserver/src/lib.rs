@@ -1143,14 +1143,14 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
 
     fn cumulative_escalation(
         &self,
-        _escalation_id: i64,
+        _escalation_id: Uuid,
     ) -> BoxFuture<'_, Result<Option<CumulativeEscalationRecord>, StoreError>> {
         Box::pin(async { Ok(None) })
     }
 
     fn record_escalation_top_up<'a>(
         &'a self,
-        _escalation_id: i64,
+        _escalation_id: Uuid,
         _amount: &'a str,
         _valid_until: &'a str,
         _rationale: &'a str,
@@ -1161,7 +1161,7 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
 
     fn deny_cumulative_escalation<'a>(
         &'a self,
-        _escalation_id: i64,
+        _escalation_id: Uuid,
         _rationale: &'a str,
         _denied_by: &'a str,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
@@ -1538,14 +1538,14 @@ impl AdmissionLedger for PgStore {
 
     fn cumulative_escalation(
         &self,
-        escalation_id: i64,
+        escalation_id: Uuid,
     ) -> BoxFuture<'_, Result<Option<CumulativeEscalationRecord>, StoreError>> {
         Box::pin(async move { PgStore::cumulative_escalation(self, escalation_id).await })
     }
 
     fn record_escalation_top_up<'a>(
         &'a self,
-        escalation_id: i64,
+        escalation_id: Uuid,
         amount: &'a str,
         valid_until: &'a str,
         rationale: &'a str,
@@ -1566,7 +1566,7 @@ impl AdmissionLedger for PgStore {
 
     fn deny_cumulative_escalation<'a>(
         &'a self,
-        escalation_id: i64,
+        escalation_id: Uuid,
         rationale: &'a str,
         denied_by: &'a str,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
@@ -5153,11 +5153,13 @@ mod tests {
     -> Result<(), String> {
         let origin = "http://127.0.0.1:33002";
         let ledger = ledger();
+        let escalation_id = Uuid::from_u128(41);
+        let top_up_path = format!("/admin/api/v1/escalations/{escalation_id}/top-up");
         ledger
             .cumulative_escalations
             .lock()
             .map_err(|_| "lock fake escalation")?
-            .push(pending_cumulative_escalation(41));
+            .push(pending_cumulative_escalation(escalation_id));
         let runtime_repository = FakeRuntimeRepository {
             runtime: Arc::new(Mutex::new(runtime())),
         };
@@ -5176,7 +5178,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/api/v1/escalations/41/top-up")
+                    .uri(&top_up_path)
                     .header(header::COOKIE, &cookie)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(body))
@@ -5192,7 +5194,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method("POST")
-                        .uri("/admin/api/v1/escalations/41/top-up")
+                        .uri(&top_up_path)
                         .header(header::COOKIE, &cookie)
                         .header(header::ORIGIN, origin)
                         .header("sec-fetch-site", "same-origin")
@@ -5428,6 +5430,7 @@ mod tests {
                     single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: None,
                 ttl: Duration("8h".to_owned()),
                 runner: steward_types::RunnerRequirements::default(),
             },
@@ -6246,7 +6249,7 @@ mod tests {
         agent_run_events: AgentRunEvents,
         source_repository_bindings: SourceRepositoryBindings,
         cumulative_escalations: Arc<Mutex<Vec<CumulativeEscalationRecord>>>,
-        envelope_instance_grants: Arc<Mutex<Vec<(i64, EnvelopeInstanceGrantRecord)>>>,
+        envelope_instance_grants: Arc<Mutex<Vec<(Uuid, EnvelopeInstanceGrantRecord)>>>,
     }
 
     #[derive(Clone)]
@@ -6683,7 +6686,7 @@ mod tests {
 
         fn cumulative_escalation(
             &self,
-            escalation_id: i64,
+            escalation_id: Uuid,
         ) -> BoxFuture<'_, Result<Option<CumulativeEscalationRecord>, StoreError>> {
             Box::pin(async move {
                 self.cumulative_escalations
@@ -6702,7 +6705,7 @@ mod tests {
 
         fn record_escalation_top_up<'a>(
             &'a self,
-            escalation_id: i64,
+            escalation_id: Uuid,
             amount: &'a str,
             valid_until: &'a str,
             rationale: &'a str,
@@ -6772,7 +6775,7 @@ mod tests {
 
         fn deny_cumulative_escalation<'a>(
             &'a self,
-            escalation_id: i64,
+            escalation_id: Uuid,
             rationale: &'a str,
             denied_by: &'a str,
         ) -> BoxFuture<'a, Result<(), StoreError>> {
@@ -7937,6 +7940,7 @@ mod tests {
                     single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: None,
                 ttl: Duration("24h".to_owned()),
                 runner: steward_types::RunnerRequirements::default(),
             },
@@ -7961,6 +7965,7 @@ mod tests {
                             single_run_limit: None,
                             currency: "USD".to_owned(),
                         },
+                        runtime_minutes_limit: None,
                         ttl: Duration("24h".to_owned()),
                         runner: steward_types::RunnerRequirements::default(),
                     },
@@ -7978,6 +7983,7 @@ mod tests {
                             single_run_limit: None,
                             currency: "USD".to_owned(),
                         },
+                        runtime_minutes_limit: None,
                         ttl: Duration("24h".to_owned()),
                         runner: steward_types::RunnerRequirements::default(),
                     },
@@ -8043,6 +8049,7 @@ mod tests {
                         single_run_limit: None,
                         currency: "USD".to_owned(),
                     },
+                    runtime_minutes_limit: None,
                     ttl: Duration("24h".to_owned()),
                     runner: steward_types::RunnerRequirements::default(),
                 },
@@ -8060,6 +8067,7 @@ mod tests {
                         single_run_limit: None,
                         currency: "USD".to_owned(),
                     },
+                    runtime_minutes_limit: None,
                     ttl: Duration("24h".to_owned()),
                     runner: steward_types::RunnerRequirements::default(),
                 },
@@ -8068,9 +8076,10 @@ mod tests {
         }
     }
 
-    fn pending_cumulative_escalation(escalation_id: i64) -> CumulativeEscalationRecord {
+    fn pending_cumulative_escalation(escalation_id: Uuid) -> CumulativeEscalationRecord {
         CumulativeEscalationRecord {
             escalation_id,
+            dimension: "llm_spend".to_owned(),
             runtime_uid: "runtime-uid-a".to_owned(),
             runtime_namespace: "team-a".to_owned(),
             runtime_name: "runtime-a".to_owned(),
@@ -8130,6 +8139,7 @@ mod tests {
                     single_run_limit: Some("5.00".to_owned()),
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: None,
                 ttl: Duration("4h".to_owned()),
                 runner: steward_types::RunnerRequirements {
                     platforms: vec![steward_types::RunnerPlatform::Linux],
@@ -8180,6 +8190,7 @@ mod tests {
                     single_run_limit: Some("20.00".to_owned()),
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: None,
                 ttl: Duration("24h".to_owned()),
                 runner: steward_types::RunnerRequirements {
                     platforms: vec![steward_types::RunnerPlatform::Linux],

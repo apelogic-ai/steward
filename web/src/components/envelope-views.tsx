@@ -38,6 +38,9 @@ function EnvelopeSummary({ envelope }: Readonly<{ envelope: BrowserEnvelope }>) 
     ["Single-run limit", envelope.spec.budget.singleRunLimit
       ? `${envelope.spec.budget.singleRunLimit} ${envelope.spec.budget.currency}`
       : "Not set"],
+    ["Runtime minutes", envelope.spec.runtimeMinutesLimit
+      ? `${envelope.spec.runtimeMinutesLimit} min / month`
+      : "Unlimited"],
     ["TTL", envelope.spec.ttl],
     ["Models", envelope.spec.llms.length ? envelope.spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ") : "None"],
     ["Tools", envelope.spec.tools.length ? envelope.spec.tools.map((tool) => `${tool.provider}:${tool.resource}:${tool.action}`).join(", ") : "None"],
@@ -112,6 +115,7 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
   const [templateId, setTemplateId] = useState(templates[0]?.id ?? "");
   const template = templates.find((item) => item.id === templateId) ?? templates[0];
   const [budget, setBudget] = useState(template.ceiling.spec.budget.monthlyLimit);
+  const [runtimeMinutes, setRuntimeMinutes] = useState(template.ceiling.spec.runtimeMinutesLimit ?? "");
   const [ttl, setTtl] = useState(template.ceiling.spec.ttl);
   const [models, setModels] = useState(() => new Set(template.ceiling.spec.llms.map((item) => `${item.provider}\u0000${item.model}`)));
   const [tools, setTools] = useState(() => new Set(template.ceiling.spec.tools.map((item) => `${item.provider}\u0000${item.resource}\u0000${item.action}`)));
@@ -122,6 +126,7 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
     if (!next) return;
     setTemplateId(id);
     setBudget(next.ceiling.spec.budget.monthlyLimit);
+    setRuntimeMinutes(next.ceiling.spec.runtimeMinutesLimit ?? "");
     setTtl(next.ceiling.spec.ttl);
     setModels(new Set(next.ceiling.spec.llms.map((item) => `${item.provider}\u0000${item.model}`)));
     setTools(new Set(next.ceiling.spec.tools.map((item) => `${item.provider}\u0000${item.resource}\u0000${item.action}`)));
@@ -146,6 +151,7 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
               monthlyLimit: budget,
               singleRunLimit: template.ceiling.spec.budget.singleRunLimit,
             },
+            ...(runtimeMinutes.trim() ? { runtimeMinutesLimit: runtimeMinutes.trim() } : {}),
             ttl,
             llms: template.ceiling.spec.llms.filter((item) => models.has(`${item.provider}\u0000${item.model}`)),
             tools: template.ceiling.spec.tools.filter((item) => tools.has(`${item.provider}\u0000${item.resource}\u0000${item.action}`)),
@@ -170,13 +176,16 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
           {templates.map((item) => <option key={item.id} value={item.id}>{item.displayName} · revision {item.revision}</option>)}
         </select>
       </label>
-      <div className="grid gap-4 sm:grid-cols-2">
+      <div className="grid gap-4 sm:grid-cols-3">
         <label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})
           <input className="min-h-11 rounded-md border px-3 font-normal" inputMode="decimal" onChange={(event) => setBudget(event.target.value)} required value={budget} />
         </label>
         <label className="grid gap-2 text-sm font-semibold">Time to live
           <input className="min-h-11 rounded-md border px-3 font-normal" onChange={(event) => setTtl(event.target.value)} required value={ttl} />
         </label>
+        {template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month
+          <input className="min-h-11 rounded-md border px-3 font-normal" inputMode="decimal" onChange={(event) => setRuntimeMinutes(event.target.value)} required value={runtimeMinutes} />
+        </label> : null}
       </div>
       <Accordion preferenceKey={`steward.ui.envelope-accordion.${template.id}.models`} title="Models">
         <div className="space-y-3">{template.ceiling.spec.llms.map((item) => {

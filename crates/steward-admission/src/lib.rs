@@ -58,6 +58,7 @@ pub mod internal_authorities {
                         single_run_limit: Some("0.00".to_owned()),
                         currency: "USD".to_owned(),
                     },
+                    runtime_minutes_limit: None,
                     ttl: Duration("2m".to_owned()),
                     runner: RunnerRequirements {
                         platforms: vec![RunnerPlatform::Linux],
@@ -131,6 +132,10 @@ pub struct EnvelopeSpec {
     pub llms: Vec<ModelRef>,
     pub tools: Vec<ToolGrant>,
     pub budget: Budget,
+    /// Cumulative execution allowance for one provisioned envelope instance.
+    /// This is instance authority, not part of the AgentRuntime CRD manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_minutes_limit: Option<String>,
     pub ttl: Duration,
     #[serde(default)]
     pub runner: RunnerRequirements,
@@ -169,6 +174,10 @@ pub enum AdmissionDelta {
         requested: Option<String>,
         ceiling: String,
         currency: String,
+    },
+    RuntimeMinutes {
+        requested: Option<String>,
+        ceiling: String,
     },
     Ttl {
         requested: String,
@@ -216,6 +225,10 @@ impl AdmissionDelta {
                 currency,
             } => format!(
                 "budget.singleRunLimit requested {} {currency}, ceiling {ceiling} {currency}",
+                requested.as_deref().unwrap_or("unbounded")
+            ),
+            Self::RuntimeMinutes { requested, ceiling } => format!(
+                "runtimeMinutesLimit requested {} min, ceiling {ceiling} min",
                 requested.as_deref().unwrap_or("unbounded")
             ),
             Self::Ttl { requested, ceiling } => {
@@ -287,6 +300,9 @@ pub fn validate_envelope(envelope: &Envelope) -> Result<(), AdmissionError> {
     if let Some(single_run_limit) = &envelope.spec.budget.single_run_limit {
         Decimal::parse(single_run_limit)?;
     }
+    if let Some(runtime_minutes_limit) = &envelope.spec.runtime_minutes_limit {
+        Decimal::parse(runtime_minutes_limit)?;
+    }
     if envelope.spec.budget.currency.len() != 3
         || !envelope
             .spec
@@ -329,6 +345,7 @@ pub fn evaluate(
             llms: request.llms.clone(),
             tools: request.tools.clone(),
             budget: request.budget.clone(),
+            runtime_minutes_limit: envelope.spec.runtime_minutes_limit.clone(),
             ttl: request.ttl.clone(),
             runner: request.runner.clone(),
         },
@@ -384,6 +401,23 @@ fn evaluate_envelope_spec(
                 requested: request.budget.single_run_limit.clone(),
                 ceiling: ceiling_value.to_owned(),
                 currency: request.budget.currency.clone(),
+            });
+        }
+    }
+    let requested_runtime_minutes = request
+        .runtime_minutes_limit
+        .as_deref()
+        .map(Decimal::parse)
+        .transpose()?;
+    if let Some(ceiling_value) = envelope.spec.runtime_minutes_limit.as_deref() {
+        let ceiling_runtime_minutes = Decimal::parse(ceiling_value)?;
+        if requested_runtime_minutes
+            .as_ref()
+            .is_none_or(|requested| requested.cmp(&ceiling_runtime_minutes) == Ordering::Greater)
+        {
+            deltas.push(AdmissionDelta::RuntimeMinutes {
+                requested: request.runtime_minutes_limit.clone(),
+                ceiling: ceiling_value.to_owned(),
             });
         }
     }
@@ -816,6 +850,18 @@ fn grant_covers(
             }
         }
         (
+            AdmissionDelta::RuntimeMinutes {
+                requested: granted, ..
+            },
+            AdmissionDelta::RuntimeMinutes { requested, .. },
+        ) => match (granted.as_deref(), requested.as_deref()) {
+            (None, _) => Ok(true),
+            (Some(_), None) => Ok(false),
+            (Some(granted), Some(requested)) => {
+                Ok(Decimal::parse(requested)?.cmp(&Decimal::parse(granted)?) != Ordering::Greater)
+            }
+        },
+        (
             AdmissionDelta::Ttl {
                 requested: granted, ..
             },
@@ -897,6 +943,7 @@ mod tests {
                         single_run_limit: None,
                         currency: currency.to_owned(),
                     },
+                    runtime_minutes_limit: None,
                     ttl: Duration(ttl.to_owned()),
                     runner: RunnerRequirements::default(),
                 },
@@ -948,6 +995,7 @@ mod tests {
                     single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: None,
                 ttl: Duration("24h".to_owned()),
                 runner: RunnerRequirements::default(),
             },
@@ -1017,6 +1065,39 @@ mod tests {
             Some(
                 "envelope exceeded: budget.singleRunLimit requested unbounded USD, ceiling 2.00 USD"
             )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_request_cannot_exceed_runtime_minutes_limit() -> Result<(), String> {
+        let mut requested = envelope_with_budget("100.00");
+        requested.spec.runtime_minutes_limit = Some("180".to_owned());
+        let mut ceiling = envelope_with_budget("200.00");
+        ceiling.spec.runtime_minutes_limit = Some("120".to_owned());
+
+        assert_eq!(
+            envelope_is_within(&requested, &ceiling)
+                .map_err(|error| format!("evaluate envelope request: {error:?}"))?
+                .counterexample()
+                .as_deref(),
+            Some("envelope exceeded: runtimeMinutesLimit requested 180 min, ceiling 120 min")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn constrained_template_rejects_unbounded_runtime_minutes() -> Result<(), String> {
+        let requested = envelope_with_budget("100.00");
+        let mut ceiling = envelope_with_budget("200.00");
+        ceiling.spec.runtime_minutes_limit = Some("120".to_owned());
+
+        assert_eq!(
+            envelope_is_within(&requested, &ceiling)
+                .map_err(|error| format!("evaluate envelope request: {error:?}"))?
+                .counterexample()
+                .as_deref(),
+            Some("envelope exceeded: runtimeMinutesLimit requested unbounded min, ceiling 120 min")
         );
         Ok(())
     }
