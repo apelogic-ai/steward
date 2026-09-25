@@ -7,7 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-## [0.2.3] - 2026-09-24
+## [0.2.4] - 2026-09-24
 
 ### Added
 
@@ -29,6 +29,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   collision-safe resume, deterministic evidence, and Flux OCI digest output.
 - Corrected the browser-administration bootstrap procedure to run the installed
   `/usr/local/bin/steward bootstrap-rbac` command in the apiserver Deployment.
+
+### Fixed
+
+- Corrected release-only shell lint failures in the registry mirror. The
+  `v0.2.3` workflow stopped before publishing images, charts, bundles, or a
+  GitHub release.
+
+## [0.2.3] - 2026-09-24
+
+The release workflow stopped during validation and published no artifacts.
 
 ## [0.2.2] - 2026-09-24
 
@@ -117,7 +127,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/apelogic-ai/steward/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/apelogic-ai/steward/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/apelogic-ai/steward/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/apelogic-ai/steward/compare/v0.2.0...v0.2.1

@@ -1,8 +1,8 @@
 # Platform preflight bundle
 
-Status: **Supported for Steward v0.2.3**
+Status: **Supported for Steward v0.2.4**
 
-The release asset `steward-platform-preflight-0.2.3.tar.gz` contains a
+The release asset `steward-platform-preflight-0.2.4.tar.gz` contains a
 dependency-free Python validator and generator, its input schema, and neutral
 examples. It converts one reviewed non-secret input into deterministic Steward
 Helm values, a Flux-compatible values `ConfigMap`, machine diagnostics, and a
@@ -15,8 +15,8 @@ and NetworkPolicy API/PostgreSQL destinations. Secret bodies are neither
 accepted nor emitted. Existing infrastructure remains operator-owned.
 
 ```sh
-tar -xzf steward-platform-preflight-0.2.3.tar.gz
-tar -xzf steward-runtime-providers-0.2.3.tar.gz
+tar -xzf steward-platform-preflight-0.2.4.tar.gz
+tar -xzf steward-runtime-providers-0.2.4.tar.gz
 cd platform-preflight/v1
 ./steward-platform-preflight generate \
   --input examples/governed-complete.json \

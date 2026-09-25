@@ -8,7 +8,7 @@ trap 'rm -f "${run_dir}/default.yaml" "${run_dir}/cert-manager.yaml" "${run_dir}
 # The release validator selects its strict customer contract only for a
 # deliberately versioned chart; a missing or stale marker must fail the handoff.
 if ! grep -Eq '^version: (0\.1\.23|0\.2\.3)$' "${root}/charts/steward/Chart.yaml"; then
-  echo 'installation contract supports only the v0.1.23 transition base or v0.2.3' >&2
+  echo 'installation contract supports only the v0.1.23 transition base or v0.2.4' >&2
   exit 1
 fi
 grep -Fxq '  steward.apelogic.ai/customer-install-contract: steward.customer-install/v1' \

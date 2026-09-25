@@ -138,7 +138,8 @@ plan() {
     printf '%s\n' "${target_repository}" >>"${targets}"
 
     local source_exact="${source_reference}@${release_digest}"
-    local descriptor_file="${temporary_directory}/source-$(printf '%s' "${key}" | tr -c 'a-zA-Z0-9' '_').json"
+    local descriptor_file
+    descriptor_file="${temporary_directory}/source-$(printf '%s' "${key}" | tr -c 'a-zA-Z0-9' '_').json"
     local selected_digest
     if [[ -n "${platform}" && "${kind}" != chart ]]; then
       selected_digest="$(descriptor_digest "${source_exact}" "${descriptor_file}" --platform "${platform}")"
@@ -213,7 +214,8 @@ mirror() {
     require_digest "${source_digest}" "${key} selected source digest"
     require_digest "${release_digest}" "${key} release digest"
     local status='copied'
-    local target_descriptor="${temporary_directory}/target-$(printf '%s' "${key}" | tr -c 'a-zA-Z0-9' '_').json"
+    local target_descriptor
+    target_descriptor="${temporary_directory}/target-$(printf '%s' "${key}" | tr -c 'a-zA-Z0-9' '_').json"
     local current_digest=''
     if [[ "${target_plain_http}" == true ]]; then
       if oras manifest fetch --descriptor --plain-http "${target_reference}" >"${target_descriptor}" 2>/dev/null; then
