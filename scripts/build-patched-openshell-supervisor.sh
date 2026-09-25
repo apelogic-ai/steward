@@ -438,6 +438,7 @@ install \
   cd "${SOURCE_DIR}"
   export PATH="${CROSS_TOOL_PATH}"
   scrub_ambient_compiler_overrides
+  # shellcheck source=/dev/null
   source tasks/scripts/build-env.sh
   ensure_build_nofile_limit
   rustup target add --toolchain "${RUST_TOOLCHAIN}" "${rust_target}"

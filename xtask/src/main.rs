@@ -48,6 +48,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
     match command {
         "ci" if rest.is_empty() => ci(),
         "quality" if rest.is_empty() => quality(),
+        "workflow-lint" if rest.is_empty() => workflow_lint(),
         "storage" if rest == ["check"] => storage::check(&root()),
         "storage" if rest == ["audit"] => storage::audit(&root()),
         "e2e-openshell-adapter" if rest.is_empty() => e2e_openshell_adapter(),
@@ -78,6 +79,7 @@ fn usage() -> String {
         "commands:",
         "  ci",
         "  quality",
+        "  workflow-lint",
         "  storage check|audit",
         "  e2e-openshell-adapter",
         "  e2e-governed-connections",
@@ -117,6 +119,7 @@ fn ci() -> TaskResult {
 
 fn quality() -> TaskResult {
     storage::check(&root())?;
+    workflow_lint()?;
     run("cargo", &["fmt", "--all", "--", "--check"])?;
     run(
         "cargo",
@@ -157,6 +160,93 @@ fn quality() -> TaskResult {
     register(&["--check".to_owned()])?;
     ports_check()?;
     layering_test()
+}
+
+fn workflow_lint() -> TaskResult {
+    require_tool_version(
+        "actionlint",
+        &["-version"],
+        "1.7.7",
+        "https://github.com/rhysd/actionlint/releases/tag/v1.7.7",
+    )?;
+    require_tool_version(
+        "shellcheck",
+        &["--version"],
+        "0.10.0",
+        "https://github.com/koalaman/shellcheck/releases/tag/v0.10.0",
+    )?;
+    run("actionlint", &[])?;
+
+    let output = git_command_in_repository(&root())
+        .args(["ls-files", "-z", "--", "*.sh"])
+        .output()
+        .map_err(|error| format!("failed to discover tracked shell scripts: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git could not discover tracked shell scripts: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let scripts = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            String::from_utf8(path.to_vec())
+                .map_err(|_| "git returned a non-UTF-8 shell script path".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if scripts.is_empty() {
+        return Err("no tracked shell scripts were discovered".to_owned());
+    }
+
+    println!("+ shellcheck {}", scripts.join(" "));
+    let status = Command::new("shellcheck")
+        .args(&scripts)
+        .current_dir(root())
+        .status()
+        .map_err(|error| format!("failed to run shellcheck: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("shellcheck exited with {status}"))
+    }
+}
+
+fn require_tool_version(
+    program: &str,
+    arguments: &[&str],
+    expected: &str,
+    installation_url: &str,
+) -> TaskResult {
+    let output = Command::new(program)
+        .args(arguments)
+        .output()
+        .map_err(|error| {
+            format!("{program} {expected} is required; install it from {installation_url}: {error}")
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "{program} version check failed with {}; install {program} {expected} from {installation_url}",
+            output.status
+        ));
+    }
+    let version_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if version_output
+        .split(|character: char| character.is_whitespace())
+        .any(|word| word.trim_start_matches('v') == expected)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{program} {expected} is required, observed `{}`; install the pinned version from {installation_url}",
+            version_output.trim()
+        ))
+    }
 }
 
 fn m1_contracts_check() -> TaskResult {
@@ -2985,6 +3075,41 @@ mod tests {
     }
 
     #[test]
+    fn shellcheck_uses_one_discovered_script_set_before_release() -> Result<(), String> {
+        let xtask = fs::read_to_string(root().join("xtask/src/main.rs"))
+            .map_err(|error| format!("xtask source is required: {error}"))?;
+        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let release = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("Steward release workflow is required: {error}"))?;
+
+        assert!(
+            xtask.contains("workflow_lint()?;"),
+            "cargo xtask ci must run the shared workflow lint before release"
+        );
+        assert!(
+            xtask.contains(".args([\"ls-files\", \"-z\", \"--\", \"*.sh\"])")
+                && xtask.contains("Command::new(\"shellcheck\")"),
+            "the shared ShellCheck gate must discover every tracked shell script"
+        );
+        assert!(
+            ci.contains("gate-tools: \"true\"\n          workflow-tools: \"true\""),
+            "pull-request quality CI must install the pinned workflow lint tools"
+        );
+        for (name, workflow) in [("pull-request", ci), ("release", release)] {
+            assert!(
+                workflow.contains("cargo xtask workflow-lint"),
+                "{name} workflow must invoke the shared workflow lint"
+            );
+            assert!(
+                !workflow.contains("shellcheck \\\n"),
+                "{name} workflow must not maintain a ShellCheck file list"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn production_release_contract_is_complete_and_fail_closed() -> Result<(), String> {
         let chart = root().join("charts/steward");
         let values = fs::read_to_string(chart.join("values.yaml"))
@@ -3278,8 +3403,7 @@ mod tests {
         for required in [
             "release-candidate:",
             "scripts/validate-release-artifacts.sh --build-images",
-            "actionlint",
-            "shellcheck",
+            "cargo xtask workflow-lint",
         ] {
             assert!(
                 ci.contains(required),

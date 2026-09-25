@@ -77,15 +77,6 @@ for command in kind kubectl helm cargo curl jq openssl python3 sed tar xxd; do
   fi
 done
 
-if command -v sha256sum >/dev/null 2>&1; then
-  checksum_command=(sha256sum -c -)
-elif command -v shasum >/dev/null 2>&1; then
-  checksum_command=(shasum -a 256 -c -)
-else
-  echo "required command is missing: sha256sum or shasum" >&2
-  exit 2
-fi
-
 mkdir -p "${RUN_DIR}"
 kind create cluster \
   --name "${CLUSTER_NAME}" \

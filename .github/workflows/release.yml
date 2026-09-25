@@ -33,25 +33,7 @@ jobs:
           workflow-tools: "true"
 
       - name: Lint privileged workflows and release scripts
-        run: |
-          actionlint
-          shellcheck \
-            scripts/postgres-tls-e2e.sh \
-            scripts/postgres-tls-init.sh \
-            scripts/codex-reference-runtime-conformance.sh \
-            scripts/codex-reference-runtime-openshell-inside.sh \
-            scripts/package-provider-profile-bundle.sh \
-            scripts/package-platform-preflight.sh \
-            scripts/test-package-provider-profile-bundle.sh \
-            scripts/test-package-platform-preflight.sh \
-            scripts/steward-registry-lock.sh \
-            scripts/test-steward-registry-lock.sh \
-            scripts/steward-registry-lock-live-conformance.sh \
-            scripts/test-released-artifact-acceptance.sh \
-            scripts/test-validate-release-version.sh \
-            scripts/validate-release-version.sh \
-            scripts/customer-core-install-e2e.sh \
-            scripts/validate-release-artifacts.sh
+        run: cargo xtask workflow-lint
 
       - name: Run Steward quality gates
         env:
