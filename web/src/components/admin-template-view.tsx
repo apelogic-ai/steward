@@ -24,7 +24,9 @@ type TemplateMutationState = "idle" | "saving" | "saved" | "conflict" | "rejecte
 type LimitType = "singleRun" | "monthly";
 
 type AdminTemplateListItem = {
-  memberRole: string;
+  id: string;
+  displayName: string;
+  memberRoles: Array<string>;
   envelope: BrowserEnvelope;
 };
 
@@ -81,16 +83,31 @@ function isBrowserEnvelope(value: unknown): value is BrowserEnvelope {
   return validBudget && validModels && validTools && validRunner && typeof spec.ttl === "string";
 }
 
-function normalizeEnvelopeTemplateResponse(value: unknown, selectedRole: string): BrowserEnvelopeTemplateResponse | null {
+function normalizeEnvelopeTemplateResponse(value: unknown, templateId: string): BrowserEnvelopeTemplateResponse | null {
   if (!isRecord(value)) return null;
   if (value.apiVersion === "steward.browser-admin/v1"
-    && value.memberRole === selectedRole
+    && value.id === templateId
+    && typeof value.displayName === "string"
+    && Array.isArray(value.memberRoles)
+    && value.memberRoles.every((role) => typeof role === "string")
     && isBrowserEnvelope(value.envelope)) {
     return value as BrowserEnvelopeTemplateResponse;
   }
+  // Accept the pre-catalog response during a rolling deployment.
+  if (value.apiVersion === "steward.browser-admin/v1"
+    && value.memberRole === templateId
+    && isBrowserEnvelope(value.envelope)) {
+    return {
+      apiVersion: "steward.browser-admin/v1",
+      id: templateId,
+      displayName: displayName(templateId),
+      memberRoles: [templateId],
+      envelope: value.envelope,
+    };
+  }
   if (value.apiVersion !== "steward.admin/v1" || !isRecord(value.template)) return null;
   const template = value.template;
-  if (template.id !== selectedRole
+  if (template.id !== templateId
     || typeof template.revision !== "number"
     || !Number.isSafeInteger(template.revision)
     || !isBrowserEnvelope(template.envelope)
@@ -99,7 +116,11 @@ function normalizeEnvelopeTemplateResponse(value: unknown, selectedRole: string)
   }
   return {
     apiVersion: "steward.browser-admin/v1",
-    memberRole: selectedRole,
+    id: templateId,
+    displayName: typeof template.displayName === "string" ? template.displayName : displayName(templateId),
+    memberRoles: Array.isArray(template.memberRoles) && template.memberRoles.every((role) => typeof role === "string")
+      ? template.memberRoles
+      : [templateId],
     envelope: template.envelope,
   };
 }
@@ -108,25 +129,37 @@ function normalizeTemplateList(value: unknown): AdminTemplateListResponse | null
   if (!isRecord(value) || value.apiVersion !== "steward.browser-admin/v1" || !Array.isArray(value.templates)) return null;
   const templates: Array<AdminTemplateListItem> = [];
   for (const item of value.templates) {
-    if (!isRecord(item) || typeof item.memberRole !== "string" || !isBrowserEnvelope(item.envelope)) return null;
-    templates.push({ memberRole: item.memberRole, envelope: item.envelope });
+    if (!isRecord(item) || !isBrowserEnvelope(item.envelope)) return null;
+    if (typeof item.id === "string" && typeof item.displayName === "string"
+      && Array.isArray(item.memberRoles) && item.memberRoles.every((role) => typeof role === "string")) {
+      templates.push({ id: item.id, displayName: item.displayName, memberRoles: item.memberRoles, envelope: item.envelope });
+    } else if (typeof item.memberRole === "string") {
+      templates.push({ id: item.memberRole, displayName: displayName(item.memberRole), memberRoles: [item.memberRole], envelope: item.envelope });
+    } else return null;
   }
   return { apiVersion: "steward.browser-admin/v1", templates };
 }
 
 function normalizeCapabilityCatalog(value: unknown): CapabilityCatalog | null {
   if (!isRecord(value)
-    || value.schemaVersion !== "steward.capability-catalog/v1"
+    || value.schemaVersion !== "steward.capability-catalog/v2"
     || !Array.isArray(value.models)
-    || !Array.isArray(value.tools)) return null;
+    || !Array.isArray(value.tools)
+    || !Array.isArray(value.catalogs)) return null;
   const modelsValid = value.models.every((model) => isRecord(model)
     && typeof model.provider === "string"
     && typeof model.model === "string");
   const toolsValid = value.tools.every((tool) => isRecord(tool)
-    && typeof tool.provider === "string"
-    && typeof tool.resource === "string"
-    && typeof tool.action === "string");
-  return modelsValid && toolsValid ? value as CapabilityCatalog : null;
+      && typeof tool.provider === "string"
+      && typeof tool.resource === "string"
+      && typeof tool.action === "string"
+      && (tool.accessClass === "read" || tool.accessClass === "write" || tool.accessClass === "destructive"));
+  const catalogsValid = value.catalogs.every((catalog) => isRecord(catalog)
+    && typeof catalog.provider === "string"
+    && typeof catalog.catalogId === "string"
+    && typeof catalog.version === "string"
+    && typeof catalog.available === "boolean");
+  return modelsValid && toolsValid && catalogsValid ? value as CapabilityCatalog : null;
 }
 
 async function getAdminEnvelopeTemplates(): Promise<{ data?: unknown; response?: Response }> {
@@ -228,12 +261,12 @@ function AuthenticatedTemplateList() {
         <EmptyState title="No data" />
       ) : (
         <ul className="grid gap-3" role="list">
-          {templates.map(({ memberRole, envelope }) => (
-            <li key={memberRole}>
-              <Link className="flex min-h-20 items-center justify-between gap-4 rounded-panel border bg-panel px-5 py-4 shadow-sm hover:border-brand" href={`/admin/envelopes/templates/${encodeURIComponent(memberRole)}`}>
+          {templates.map(({ id, displayName: templateDisplayName, memberRoles, envelope }) => (
+            <li key={id}>
+              <Link className="flex min-h-20 items-center justify-between gap-4 rounded-panel border bg-panel px-5 py-4 shadow-sm hover:border-brand" href={`/admin/envelopes/templates/${encodeURIComponent(id)}`}>
                 <span>
-                  <span className="block font-semibold">{displayName(memberRole)}</span>
-                  <span className="mt-1 block text-sm text-muted-ink">{memberRole}</span>
+                  <span className="block font-semibold">{templateDisplayName}</span>
+                  <span className="mt-1 block text-sm text-muted-ink">{id} · {memberRoles.join(", ")}</span>
                 </span>
                 <span className="text-sm text-muted-ink">Revision {envelope.revision}</span>
               </Link>
@@ -257,7 +290,7 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
   const load = useCallback(() => getAdminEnvelopeTemplate({
     cache: "no-store",
     credentials: "same-origin",
-    path: { member_role: memberRole },
+    path: { template_id: memberRole },
   }), [memberRole]);
   const state = useApiResource<BrowserEnvelopeTemplateResponse>(load);
   const loadCapabilities = useCallback(() => getAdminCapabilities({
@@ -286,13 +319,15 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
         description="Inspect the current immutable revision and author a successor."
         title="Envelope template"
       />
-      <ResourceBoundary state={acceptedState}>{({ envelope }) => (
+      <ResourceBoundary state={acceptedState}>{({ displayName: templateDisplayName, envelope, memberRoles }) => (
         <ResourceBoundary state={acceptedCapabilitiesState}>{(capabilities) => (
           <TemplateEditor
             capabilities={capabilities}
             csrf={csrf}
             key={`${memberRole}:${envelope.revision}:${capabilities.models.length}:${capabilities.tools.length}`}
             memberRole={memberRole}
+            memberRoles={memberRoles}
+            templateDisplayName={templateDisplayName}
             template={envelope}
           />
         )}</ResourceBoundary>
@@ -334,6 +369,8 @@ function AuthenticatedNewTemplate({ csrf }: Readonly<{ csrf: string }>) {
           csrf={csrf}
           key={`new:${capabilities.models.length}:${capabilities.tools.length}`}
           memberRole=""
+          memberRoles={[]}
+          templateDisplayName=""
           template={initialTemplateForCatalog(capabilities)}
         />
       )}</ResourceBoundary>
@@ -341,7 +378,7 @@ function AuthenticatedNewTemplate({ csrf }: Readonly<{ csrf: string }>) {
   );
 }
 
-function TemplateEditor({ capabilities, create = false, csrf, memberRole, template }: Readonly<{ capabilities: CapabilityCatalog; create?: boolean; csrf: string; memberRole: string; template: BrowserEnvelope }>) {
+function TemplateEditor({ capabilities, create = false, csrf, memberRole, memberRoles, templateDisplayName, template }: Readonly<{ capabilities: CapabilityCatalog; create?: boolean; csrf: string; memberRole: string; memberRoles: Array<string>; templateDisplayName: string; template: BrowserEnvelope }>) {
   const router = useRouter();
   const modelCatalog = capabilities.models;
   const allowedModels = new Set(modelCatalog.map(modelKey));
@@ -352,12 +389,18 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, templa
   const [currentRevision, setCurrentRevision] = useState(template.revision);
   const [models, setModels] = useState<Array<ModelRef>>(template.spec.llms);
   const [modelInput, setModelInput] = useState(modelCatalog[0] ? modelKey(modelCatalog[0]) : "");
-  const [tools, setTools] = useState<Array<ToolGrant>>(template.spec.tools);
+  const [tools, setTools] = useState<Array<ToolGrant>>(template.spec.tools.map((tool) => ({
+    provider: tool.provider,
+    resource: tool.resource,
+    action: tool.action,
+  })));
   const [toolProviderInput, setToolProviderInput] = useState(toolProviders[0] ?? "");
   const [toolInput, setToolInput] = useState(toolCatalog[0] ? toolKey(toolCatalog[0]) : "");
   const [limitType, setLimitType] = useState<LimitType>("singleRun");
   const [monthlyLimit, setMonthlyLimit] = useState(template.spec.budget.monthlyLimit);
   const [singleRunLimit, setSingleRunLimit] = useState(template.spec.budget.singleRunLimit ?? "");
+  const [name, setName] = useState(templateDisplayName);
+  const [roles, setRoles] = useState(memberRoles.join(", "));
   const limitAmount = limitType === "singleRun" ? singleRunLimit : monthlyLimit;
 
   function addModel() {
@@ -373,7 +416,7 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, templa
   function addTool() {
     const selected = toolCatalog.find((tool) => toolKey(tool) === toolInput && tool.provider === toolProviderInput);
     if (!selected || tools.some((tool) => toolKey(tool) === toolInput)) return;
-    setTools([...tools, selected]);
+    setTools([...tools, { provider: selected.provider, resource: selected.resource, action: selected.action }]);
   }
 
   function removeTool(index: number) {
@@ -387,10 +430,13 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, templa
     const action = submitter instanceof HTMLButtonElement ? submitter.value : (create ? "create" : "version");
     const saveAsNew = action === "copy";
     const newTemplateId = String(fields.get("newTemplateId") ?? "").trim();
-    const targetRole = create || saveAsNew ? newTemplateId : memberRole;
+    const templateId = create || saveAsNew ? newTemplateId : memberRole;
+    const selectedRoles = [...new Set(roles.split(",").map((role) => role.trim()).filter(Boolean))].sort();
     const platforms = fields.getAll("platforms").filter((value): value is RunnerPlatform =>
       value === "linux" || value === "mac" || value === "windows");
-    if (!targetRole
+    if (!templateId
+      || !name.trim()
+      || selectedRoles.length === 0
       || !monthlyLimit.trim()
       || !singleRunLimit.trim()
       || models.length === 0
@@ -402,7 +448,7 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, templa
     const memory = String(fields.get("memory") ?? "").trim();
     const compute = String(fields.get("compute") ?? "").trim();
     const storage = String(fields.get("storage") ?? "").trim();
-    const body: BrowserEnvelope = {
+    const envelope: BrowserEnvelope = {
       revision: create || saveAsNew ? 1 : currentRevision + 1,
       spec: {
         budget: {
@@ -423,16 +469,20 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, templa
     };
     setStatus("saving");
     const result = await authorAdminEnvelopeTemplate({
-      body,
+      body: {
+        displayName: name.trim(),
+        memberRoles: selectedRoles,
+        envelope,
+      },
       cache: "no-store",
       credentials: "same-origin",
       headers: { "X-Steward-CSRF": csrf },
-      path: { member_role: targetRole },
+      path: { template_id: templateId },
     });
     if (result.data && result.response?.status === 201) {
       setCurrentRevision(result.data.envelope.revision);
       setStatus("saved");
-      if (create || saveAsNew) router.push(`/admin/envelopes/templates/${encodeURIComponent(targetRole)}`);
+      if (create || saveAsNew) router.push(`/admin/envelopes/templates/${encodeURIComponent(templateId)}`);
       return;
     }
     setStatus(classifyMutationFailure(result.response?.status));
@@ -442,9 +492,19 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, templa
   return (
     <form className="space-y-6 rounded-panel border bg-panel p-6 shadow-sm" onSubmit={submit}>
       <div>
-        <h2 className="text-xl font-semibold">{create ? "New template" : displayName(memberRole)}</h2>
+        <h2 className="text-xl font-semibold">{create ? "New template" : name}</h2>
         <p className="mt-1 text-sm text-muted-ink">{create ? "Initial revision 1" : `Current revision ${currentRevision}`}</p>
       </div>
+
+      <fieldset className="grid gap-4 sm:grid-cols-2">
+        <legend className="mb-3 text-base font-semibold">Template identity and eligibility</legend>
+        <label className="grid gap-2 text-sm font-semibold">Display name
+          <input className={fieldClass} name="displayName" onChange={(event) => setName(event.target.value)} required value={name} />
+        </label>
+        <label className="grid gap-2 text-sm font-semibold">Eligible member roles
+          <input className={fieldClass} name="memberRoles" onChange={(event) => setRoles(event.target.value)} placeholder="developer, analyst" required value={roles} />
+        </label>
+      </fieldset>
 
       <fieldset className="grid gap-4 sm:grid-cols-4">
         <legend className="mb-3 text-base font-semibold">Inference usage and TTL</legend>

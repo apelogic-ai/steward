@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use steward_admission::{AdmissionDecision, Envelope, evaluate, validate_envelope};
 use steward_store::{
-    EnvelopeRequestRecord, EnvelopeRequestReservationRequest, EnvelopeRequestStatusUpdate, PgStore,
-    StoreError, WorkflowRevisionRecord,
+    EnvelopeRequestRecord, EnvelopeRequestReservationRequest, EnvelopeRequestStatusEventRecord,
+    EnvelopeRequestStatusUpdate, PgStore, StoreError, WorkflowRevisionRecord,
 };
 use steward_types::{
     AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email, ModelRef, Principal,
@@ -102,6 +102,19 @@ pub struct UserEnvelopeRequest {
     pub status_template_revision: i64,
     pub created_at: String,
     pub status_at: String,
+    pub history: Vec<EnvelopeRequestHistoryEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvelopeRequestHistoryEvent {
+    pub status: EnvelopeRequestStatus,
+    pub at: String,
+    pub actor: String,
+    pub reason: Option<String>,
+    pub rationale: Option<String>,
+    pub evidence_url: Option<String>,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -260,25 +273,22 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
         session: &'a UserEnvelopeSession<BrowserSessionBinding>,
     ) -> BoxFuture<'a, Result<Vec<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>> {
         Box::pin(async move {
-            let mut templates = Vec::new();
-            for member_role in &session.subject.member_roles {
-                if let Some(ceiling) = self
-                    .store
-                    .latest_envelope(member_role)
-                    .await
-                    .map_err(map_store_broker_error)?
-                {
-                    templates.push(AvailableEnvelopeTemplate {
-                        id: member_role.clone(),
-                        display_name: member_role.clone(),
-                        revision: ceiling.revision,
-                        auto_provision_threshold: Some(ceiling.clone()),
-                        ceiling,
-                    });
-                }
-            }
-            templates.sort_by(|left, right| left.id.cmp(&right.id));
-            Ok(templates)
+            self.store
+                .available_envelope_templates(&session.subject.member_roles)
+                .await
+                .map(|templates| {
+                    templates
+                        .into_iter()
+                        .map(|template| AvailableEnvelopeTemplate {
+                            id: template.template_id,
+                            display_name: template.display_name,
+                            revision: template.ceiling.revision,
+                            ceiling: template.ceiling,
+                            auto_provision_threshold: template.auto_provision_threshold,
+                        })
+                        .collect()
+                })
+                .map_err(map_store_broker_error)
         })
     }
 
@@ -289,31 +299,28 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
         revision: i64,
     ) -> BoxFuture<'a, Result<Option<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>> {
         Box::pin(async move {
-            if !session
-                .subject
-                .member_roles
-                .iter()
-                .any(|member_role| member_role == template_id)
-            {
-                return Ok(None);
-            }
-            let Some(ceiling) = self
+            let Some(template) = self
                 .store
-                .latest_envelope(template_id)
+                .latest_envelope_template(template_id)
                 .await
                 .map_err(map_store_broker_error)?
             else {
                 return Ok(None);
             };
-            if ceiling.revision != revision {
+            if template.ceiling.revision != revision
+                || !template
+                    .member_roles
+                    .iter()
+                    .any(|role| session.subject.member_roles.contains(role))
+            {
                 return Ok(None);
             }
             Ok(Some(AvailableEnvelopeTemplate {
-                id: template_id.to_owned(),
-                display_name: template_id.to_owned(),
+                id: template.template_id,
+                display_name: template.display_name,
                 revision,
-                auto_provision_threshold: Some(ceiling.clone()),
-                ceiling,
+                ceiling: template.ceiling,
+                auto_provision_threshold: template.auto_provision_threshold,
             }))
         })
     }
@@ -337,11 +344,25 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
         request_id: Uuid,
     ) -> BoxFuture<'a, Result<Option<UserEnvelopeRequest>, EnvelopeRequestBrokerError>> {
         Box::pin(async move {
-            self.store
+            let record = self
+                .store
                 .envelope_request(&session.subject.canonical_user_id, request_id)
                 .await
-                .map(|record| record.map(user_envelope_request))
-                .map_err(map_store_broker_error)
+                .map_err(map_store_broker_error)?;
+            let Some(record) = record else {
+                return Ok(None);
+            };
+            let history = self
+                .store
+                .envelope_request_history(request_id)
+                .await
+                .map_err(map_store_broker_error)?;
+            let mut request = user_envelope_request(record);
+            request.history = history
+                .into_iter()
+                .map(envelope_request_history_event)
+                .collect();
+            Ok(Some(request))
         })
     }
 
@@ -380,6 +401,9 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                         envelope_instance_id: Some(&instance_id),
                         envelope_digest: Some(&digest),
                         reason: None,
+                        rationale: None,
+                        evidence_url: None,
+                        expires_at: None,
                         approved_envelope: Some(request.requested_envelope),
                         actor: session.subject.canonical_user_id.as_str(),
                     },
@@ -440,6 +464,28 @@ fn user_envelope_request(record: EnvelopeRequestRecord) -> UserEnvelopeRequest {
         status_template_revision: record.status_template_revision,
         created_at: record.created_at,
         status_at: record.status_at,
+        history: Vec::new(),
+    }
+}
+
+fn envelope_request_history_event(
+    event: EnvelopeRequestStatusEventRecord,
+) -> EnvelopeRequestHistoryEvent {
+    EnvelopeRequestHistoryEvent {
+        status: match event.status {
+            steward_store::EnvelopeRequestStatus::Pending => EnvelopeRequestStatus::Pending,
+            steward_store::EnvelopeRequestStatus::Approved => EnvelopeRequestStatus::Approved,
+            steward_store::EnvelopeRequestStatus::Rejected => EnvelopeRequestStatus::Rejected,
+            steward_store::EnvelopeRequestStatus::Provisioned => EnvelopeRequestStatus::Provisioned,
+            steward_store::EnvelopeRequestStatus::Stale => EnvelopeRequestStatus::Stale,
+            steward_store::EnvelopeRequestStatus::Conflict => EnvelopeRequestStatus::Conflict,
+        },
+        at: event.at,
+        actor: event.actor,
+        reason: event.reason,
+        rationale: event.rationale,
+        evidence_url: event.evidence_url,
+        expires_at: event.expires_at,
     }
 }
 
@@ -1000,6 +1046,7 @@ mod tests {
                     status_template_revision: 3,
                     created_at: "2026-08-17T00:00:00Z".to_owned(),
                     status_at: "2026-08-17T00:00:00Z".to_owned(),
+                    history: Vec::new(),
                 }))
             })
         }
@@ -1042,6 +1089,7 @@ mod tests {
                     status_template_revision: template_revision,
                     created_at: "2026-08-17T00:00:00Z".to_owned(),
                     status_at: "2026-08-17T00:00:00Z".to_owned(),
+                    history: Vec::new(),
                 })
             })
         }
@@ -1367,6 +1415,7 @@ mod tests {
                         status_template_revision: 3,
                         created_at: "2026-08-17T00:00:00Z".to_owned(),
                         status_at: "2026-08-17T00:00:00Z".to_owned(),
+                        history: Vec::new(),
                     })
                 })
             }

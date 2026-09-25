@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use steward_admission::{AdmissionDecision, Envelope, validate_envelope};
 use steward_store::{
     EnvelopeRequestRecord, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
+    EnvelopeTemplatePublication, EnvelopeTemplateRevisionRecord,
     FederatedSubjectAssociation, FederatedSubjectAuditRecord, FederatedSubjectDisable,
     FederatedSubjectRecord, PendingApproval, PendingEnvelopeRequest, PgStore, StoreError,
 };
@@ -29,6 +30,41 @@ const BROWSER_ADMIN_API_VERSION: &str = "steward.browser-admin/v1";
 pub const MAX_CAPABILITY_CATALOG_BYTES: usize = 256 * 1024;
 const MAX_CAPABILITY_MODELS: usize = 256;
 const MAX_CAPABILITY_TOOLS: usize = 1024;
+const MAX_CAPABILITY_CATALOGS: usize = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolAccessClass {
+    Read,
+    Write,
+    Destructive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityTool {
+    pub provider: String,
+    pub resource: String,
+    pub action: String,
+    pub access_class: ToolAccessClass,
+}
+
+impl CapabilityTool {
+    fn grants(&self, requested: &ToolGrant) -> bool {
+        self.provider == requested.provider
+            && self.resource == requested.resource
+            && self.action == requested.action
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityProviderCatalog {
+    pub provider: String,
+    pub catalog_id: String,
+    pub version: String,
+    pub available: bool,
+}
 
 #[derive(Clone)]
 pub(crate) struct FederatedSubjectAdminState {
@@ -162,7 +198,8 @@ pub(crate) struct BrowserAdminState<R, L, D> {
 pub struct CapabilityCatalog {
     pub schema_version: String,
     pub models: Vec<ModelRef>,
-    pub tools: Vec<ToolGrant>,
+    pub tools: Vec<CapabilityTool>,
+    pub catalogs: Vec<CapabilityProviderCatalog>,
 }
 
 impl CapabilityCatalog {
@@ -177,12 +214,15 @@ impl CapabilityCatalog {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != "steward.capability-catalog/v1" {
+        if self.schema_version != "steward.capability-catalog/v2" {
             return Err(
-                "capability catalog schemaVersion must be steward.capability-catalog/v1".to_owned(),
+                "capability catalog schemaVersion must be steward.capability-catalog/v2".to_owned(),
             );
         }
-        if self.models.len() > MAX_CAPABILITY_MODELS || self.tools.len() > MAX_CAPABILITY_TOOLS {
+        if self.models.len() > MAX_CAPABILITY_MODELS
+            || self.tools.len() > MAX_CAPABILITY_TOOLS
+            || self.catalogs.len() > MAX_CAPABILITY_CATALOGS
+        {
             return Err("capability catalog exceeds its bounded model or tool count".to_owned());
         }
         let valid = |value: &str| {
@@ -198,6 +238,9 @@ impl CapabilityCatalog {
             || self.tools.iter().any(|tool| {
                 !valid(&tool.provider) || !valid(&tool.resource) || !valid(&tool.action)
             })
+            || self.catalogs.iter().any(|catalog| {
+                !valid(&catalog.provider) || !valid(&catalog.catalog_id) || !valid(&catalog.version)
+            })
         {
             return Err(
                 "capability catalog entries must contain bounded exact identifiers".to_owned(),
@@ -205,6 +248,7 @@ impl CapabilityCatalog {
         }
         let mut model_keys = std::collections::BTreeSet::new();
         let mut tool_keys = std::collections::BTreeSet::new();
+        let mut catalog_keys = std::collections::BTreeSet::new();
         if self
             .models
             .iter()
@@ -213,6 +257,10 @@ impl CapabilityCatalog {
                 .tools
                 .iter()
                 .any(|tool| !tool_keys.insert((&tool.provider, &tool.resource, &tool.action)))
+            || self
+                .catalogs
+                .iter()
+                .any(|catalog| !catalog_keys.insert((&catalog.provider, &catalog.catalog_id)))
         {
             return Err("capability catalog entries must be unique".to_owned());
         }
@@ -223,22 +271,29 @@ impl CapabilityCatalog {
 #[cfg(test)]
 mod capability_catalog_tests {
     use super::{
-        CapabilityCatalog, MAX_CAPABILITY_CATALOG_BYTES, MAX_CAPABILITY_MODELS,
-        MAX_CAPABILITY_TOOLS,
+        CapabilityCatalog, CapabilityProviderCatalog, CapabilityTool, MAX_CAPABILITY_CATALOG_BYTES,
+        MAX_CAPABILITY_MODELS, MAX_CAPABILITY_TOOLS, ToolAccessClass,
     };
-    use steward_types::{ModelRef, ToolGrant};
+    use steward_types::ModelRef;
 
     fn catalog() -> CapabilityCatalog {
         CapabilityCatalog {
-            schema_version: "steward.capability-catalog/v1".to_owned(),
+            schema_version: "steward.capability-catalog/v2".to_owned(),
             models: vec![ModelRef {
                 provider: "provider-a".to_owned(),
                 model: "model-a".to_owned(),
             }],
-            tools: vec![ToolGrant {
+            tools: vec![CapabilityTool {
                 provider: "github".to_owned(),
                 resource: "actions_get".to_owned(),
                 action: "read".to_owned(),
+                access_class: ToolAccessClass::Read,
+            }],
+            catalogs: vec![CapabilityProviderCatalog {
+                provider: "github".to_owned(),
+                catalog_id: "github-tools".to_owned(),
+                version: "1.6.0".to_owned(),
+                available: true,
             }],
         }
     }
@@ -258,7 +313,7 @@ mod capability_catalog_tests {
 
     #[test]
     fn rejects_unknown_fields_duplicates_and_malformed_identifiers() {
-        let unknown = r#"{"schemaVersion":"steward.capability-catalog/v1","models":[],"tools":[],"budget":{}}"#;
+        let unknown = r#"{"schemaVersion":"steward.capability-catalog/v2","models":[],"tools":[],"catalogs":[],"budget":{}}"#;
         assert!(CapabilityCatalog::from_json(unknown).is_err());
 
         let mut duplicate = catalog();
@@ -286,13 +341,45 @@ mod capability_catalog_tests {
 
         let mut too_many_tools = catalog();
         too_many_tools.tools = (0..=MAX_CAPABILITY_TOOLS)
-            .map(|index| ToolGrant {
+            .map(|index| CapabilityTool {
                 provider: "github".to_owned(),
                 resource: format!("resource-{index}"),
                 action: "read".to_owned(),
+                access_class: ToolAccessClass::Read,
             })
             .collect();
         assert!(too_many_tools.validate().is_err());
+    }
+
+    #[test]
+    fn capability_catalog_requires_access_classes_and_provider_availability() {
+        let value = r#"{
+          "schemaVersion":"steward.capability-catalog/v2",
+          "models":[{"provider":"provider-a","model":"model-a"}],
+          "tools":[{
+            "provider":"github",
+            "resource":"actions_get",
+            "action":"read",
+            "accessClass":"read"
+          }],
+          "catalogs":[{
+            "provider":"github",
+            "catalogId":"github-tools",
+            "version":"1.6.0",
+            "available":true
+          }]
+        }"#;
+        let parsed = CapabilityCatalog::from_json(value)
+            .expect("the v2 catalog should carry presentation metadata from the backend");
+        let serialized = serde_json::to_value(parsed).expect("serialize capability catalog");
+        assert_eq!(
+            serialized.pointer("/tools/0/accessClass"),
+            Some(&serde_json::json!("read"))
+        );
+        assert_eq!(
+            serialized.pointer("/catalogs/0/version"),
+            Some(&serde_json::json!("1.6.0"))
+        );
     }
 }
 
@@ -300,15 +387,21 @@ mod capability_catalog_tests {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BrowserEnvelopeTemplateResponse {
     api_version: &'static str,
-    member_role: String,
+    id: String,
+    display_name: String,
+    member_roles: Vec<String>,
     envelope: BrowserEnvelope,
+    auto_provision_threshold: Option<BrowserEnvelope>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BrowserEnvelopeTemplateListItem {
-    member_role: String,
+    id: String,
+    display_name: String,
+    member_roles: Vec<String>,
     envelope: BrowserEnvelope,
+    auto_provision_threshold: Option<BrowserEnvelope>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -316,6 +409,38 @@ pub(crate) struct BrowserEnvelopeTemplateListItem {
 pub(crate) struct BrowserEnvelopeTemplateListResponse {
     api_version: &'static str,
     templates: Vec<BrowserEnvelopeTemplateListItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AuthorEnvelopeTemplateBody {
+    display_name: String,
+    member_roles: Vec<String>,
+    envelope: BrowserEnvelope,
+    auto_provision_threshold: Option<BrowserEnvelope>,
+}
+
+impl From<EnvelopeTemplateRevisionRecord> for BrowserEnvelopeTemplateListItem {
+    fn from(template: EnvelopeTemplateRevisionRecord) -> Self {
+        Self {
+            id: template.template_id,
+            display_name: template.display_name,
+            member_roles: template.member_roles,
+            envelope: template.ceiling.into(),
+            auto_provision_threshold: template.auto_provision_threshold.map(Into::into),
+        }
+    }
+}
+
+fn template_response(template: EnvelopeTemplateRevisionRecord) -> BrowserEnvelopeTemplateResponse {
+    BrowserEnvelopeTemplateResponse {
+        api_version: BROWSER_ADMIN_API_VERSION,
+        id: template.template_id,
+        display_name: template.display_name,
+        member_roles: template.member_roles,
+        envelope: template.ceiling.into(),
+        auto_provision_threshold: template.auto_provision_threshold.map(Into::into),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -396,6 +521,10 @@ pub(crate) struct BrowserEnvelopeRequestDecisionView {
     envelope_instance_id: Option<String>,
     envelope_digest: Option<String>,
     reason: Option<String>,
+    rationale: Option<String>,
+    evidence_url: Option<String>,
+    decision_key: Option<String>,
+    expires_at: Option<String>,
     acted_by: String,
     status_at: String,
 }
@@ -413,6 +542,10 @@ impl From<EnvelopeRequestRecord> for BrowserEnvelopeRequestDecisionView {
             envelope_instance_id: request.envelope_instance_id,
             envelope_digest: request.envelope_digest,
             reason: request.reason,
+            rationale: request.rationale,
+            evidence_url: request.evidence_url,
+            decision_key: request.decision_key,
+            expires_at: request.expires_at,
             acted_by: request.status_actor,
             status_at: request.status_at,
         }
@@ -426,10 +559,28 @@ pub(crate) struct BrowserEnvelopeRequestDecisionResponse {
     request: BrowserEnvelopeRequestDecisionView,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserEnvelopeRequestDecisionReferenceResponse {
+    api_version: &'static str,
+    #[schema(value_type = String, format = "uuid")]
+    request_id: Uuid,
+    decision_key: String,
+    evidence_url: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RejectEnvelopeRequestBody {
     reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ApproveEnvelopeRequestBody {
+    rationale: String,
+    evidence_url: Option<String>,
+    expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -467,8 +618,10 @@ where
             get(list_envelope_templates::<R, L, D>),
         )
         .route(
-            "/admin/api/v1/envelope-templates/{member_role}",
-            get(get_envelope_template::<R, L, D>).post(author_envelope_template::<R, L, D>),
+            "/admin/api/v1/envelope-templates/{template_id}",
+            get(get_envelope_template::<R, L, D>)
+                .post(author_legacy_envelope_template::<R, L, D>)
+                .put(author_envelope_template::<R, L, D>),
         )
         .route(
             "/admin/api/v1/capabilities",
@@ -482,6 +635,10 @@ where
         .route(
             "/admin/api/v1/envelope-requests/{request_id}/reject",
             post(reject_envelope_request::<R, L, D>),
+        )
+        .route(
+            "/admin/api/v1/envelope-requests/{request_id}/file",
+            post(file_envelope_request::<R, L, D>),
         )
         .route(
             "/admin/api/v1/approvals/{approval_id}/approve",
@@ -530,7 +687,7 @@ where
         ("request_id" = String, Path),
         ("X-Steward-CSRF" = String, Header)
     ),
-    request_body = BrowserMutationRequest,
+    request_body = ApproveEnvelopeRequestBody,
     responses(
         (status = 200, body = BrowserEnvelopeRequestDecisionResponse),
         (status = 401, description = "Browser session is absent or invalid"),
@@ -546,18 +703,37 @@ pub(crate) async fn approve_envelope_request<R, L, D>(
     Extension(_proof): Extension<BrowserMutationProof>,
     State(state): State<BrowserAdminState<R, L, D>>,
     Path(request_id): Path<Uuid>,
-    Json(_request): Json<BrowserMutationRequest>,
+    Json(body): Json<ApproveEnvelopeRequestBody>,
 ) -> Response
 where
     R: RuntimeRepository,
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
+    let rationale = body.rationale.trim();
+    if rationale.is_empty() || rationale.len() > 2_000 {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
     let request = match state.ledger.envelope_request_for_admin(request_id).await {
         Ok(Some(request)) => request,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return ApiError::Store(error).into_response(),
     };
+    if body
+        .evidence_url
+        .as_ref()
+        .zip(request.evidence_url.as_ref())
+        .is_some_and(|(provided, filed)| provided != filed)
+    {
+        return StatusCode::CONFLICT.into_response();
+    }
+    let evidence_url = body
+        .evidence_url
+        .as_deref()
+        .or(request.evidence_url.as_deref());
+    if evidence_url.is_some_and(|value| !valid_https_url(value)) {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
     let instance_id = envelope_instance_id(request.id);
     let digest = match envelope_content_digest(&request.requested_envelope) {
         Ok(digest) => digest,
@@ -576,6 +752,9 @@ where
                 envelope_instance_id: Some(&instance_id),
                 envelope_digest: Some(&digest),
                 reason: None,
+                rationale: Some(rationale),
+                evidence_url,
+                expires_at: body.expires_at.as_deref(),
                 approved_envelope: Some(&request.requested_envelope),
                 actor,
             },
@@ -589,6 +768,16 @@ where
         .into_response(),
         Err(error) => ApiError::Store(error).into_response(),
     }
+}
+
+fn valid_https_url(value: &str) -> bool {
+    value.len() <= 2_048
+        && reqwest::Url::parse(value).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
 }
 
 #[utoipa::path(
@@ -643,6 +832,9 @@ where
                 envelope_instance_id: None,
                 envelope_digest: None,
                 reason,
+                rationale: None,
+                evidence_url: None,
+                expires_at: None,
                 approved_envelope: None,
                 actor,
             },
@@ -657,6 +849,116 @@ where
         Err(StoreError::EnvelopeRequestNotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => ApiError::Store(error).into_response(),
     }
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "fileAdminEnvelopeRequest",
+    path = "/admin/api/v1/envelope-requests/{request_id}/file",
+    params(
+        ("request_id" = String, Path, format = "uuid"),
+        ("X-Steward-CSRF" = String, Header)
+    ),
+    request_body = BrowserMutationRequest,
+    responses(
+        (status = 200, body = BrowserEnvelopeRequestDecisionReferenceResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Envelope request was not found"),
+        (status = 409, description = "Envelope request is no longer governed by the current template revision"),
+        (status = 422, description = "Envelope request does not exceed its template ceiling"),
+        (status = 503, description = "Envelope request or decision channel is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn file_envelope_request<R, L, D>(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+    Extension(_proof): Extension<BrowserMutationProof>,
+    State(state): State<BrowserAdminState<R, L, D>>,
+    Path(request_id): Path<Uuid>,
+    Json(_request): Json<BrowserMutationRequest>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    match state
+        .ledger
+        .envelope_request_decision_reference(request_id)
+        .await
+    {
+        Ok(Some(reference)) => {
+            return Json(BrowserEnvelopeRequestDecisionReferenceResponse {
+                api_version: BROWSER_ADMIN_API_VERSION,
+                request_id,
+                decision_key: reference.decision_key,
+                evidence_url: reference.evidence_url,
+            })
+            .into_response();
+        }
+        Ok(None) => {}
+        Err(error) => return ApiError::Store(error).into_response(),
+    }
+    let request = match state.ledger.envelope_request_for_admin(request_id).await {
+        Ok(Some(request)) => request,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return ApiError::Store(error).into_response(),
+    };
+    let template = match state
+        .ledger
+        .latest_envelope_template(&request.template_id)
+        .await
+    {
+        Ok(Some(template)) if template.ceiling.revision == request.template_revision => template,
+        Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return ApiError::Store(error).into_response(),
+    };
+    let counterexample =
+        match steward_admission::envelope_is_within(&request.requested_envelope, &template.ceiling)
+        {
+            Ok(AdmissionDecision::Reject { deltas }) => AdmissionDecision::Reject { deltas }
+                .counterexample()
+                .unwrap_or_else(|| "Envelope request exceeds its template ceiling".to_owned()),
+            Ok(AdmissionDecision::Admit) => {
+                return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+            }
+            Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+        };
+    let reference = match state
+        .decisions
+        .request(&steward_ports::DecisionRequest {
+            request_id: request_id.to_string(),
+            runtime_uid: format!("envelope-request/{request_id}"),
+            actor: request.owner_user_id.as_str().to_owned(),
+            member_role: request.template_id.clone(),
+            counterexample,
+        })
+        .await
+    {
+        Ok(reference) => reference,
+        Err(error) => return ApiError::DecisionChannel(format!("{error:?}")).into_response(),
+    };
+    if let Err(error) = state
+        .ledger
+        .link_envelope_request_decision_reference(
+            request_id,
+            &reference.key,
+            &reference.evidence_url,
+            authority.principal().canonical_user_id.as_str(),
+        )
+        .await
+    {
+        return ApiError::Store(error).into_response();
+    }
+    Json(BrowserEnvelopeRequestDecisionReferenceResponse {
+        api_version: BROWSER_ADMIN_API_VERSION,
+        request_id,
+        decision_key: reference.key,
+        evidence_url: reference.evidence_url,
+    })
+    .into_response()
 }
 
 /// Mount the administrator data plane behind the shared opaque browser-session boundary.
@@ -948,16 +1250,10 @@ where
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
-    match state.ledger.latest_envelopes().await {
+    match state.ledger.latest_envelope_templates().await {
         Ok(templates) => Json(BrowserEnvelopeTemplateListResponse {
             api_version: BROWSER_ADMIN_API_VERSION,
-            templates: templates
-                .into_iter()
-                .map(|(member_role, envelope)| BrowserEnvelopeTemplateListItem {
-                    member_role,
-                    envelope: envelope.into(),
-                })
-                .collect(),
+            templates: templates.into_iter().map(Into::into).collect(),
         })
         .into_response(),
         Err(error) => ApiError::Store(error).into_response(),
@@ -967,8 +1263,8 @@ where
 #[utoipa::path(
     get,
     operation_id = "getAdminEnvelopeTemplate",
-    path = "/admin/api/v1/envelope-templates/{member_role}",
-    params(("member_role" = String, Path)),
+    path = "/admin/api/v1/envelope-templates/{template_id}",
+    params(("template_id" = String, Path)),
     responses(
         (status = 200, body = BrowserEnvelopeTemplateResponse),
         (status = 401, description = "Browser session is absent or invalid"),
@@ -981,34 +1277,29 @@ where
 pub(crate) async fn get_envelope_template<R, L, D>(
     Extension(_authority): Extension<BrowserAdminAuthority>,
     State(state): State<BrowserAdminState<R, L, D>>,
-    Path(member_role): Path<String>,
+    Path(template_id): Path<String>,
 ) -> Response
 where
     R: RuntimeRepository,
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
-    match state.ledger.latest_envelope(&member_role).await {
-        Ok(Some(envelope)) => Json(BrowserEnvelopeTemplateResponse {
-            api_version: BROWSER_ADMIN_API_VERSION,
-            member_role,
-            envelope: envelope.into(),
-        })
-        .into_response(),
+    match state.ledger.latest_envelope_template(&template_id).await {
+        Ok(Some(template)) => Json(template_response(template)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => ApiError::Store(error).into_response(),
     }
 }
 
 #[utoipa::path(
-    post,
+    put,
     operation_id = "authorAdminEnvelopeTemplate",
-    path = "/admin/api/v1/envelope-templates/{member_role}",
+    path = "/admin/api/v1/envelope-templates/{template_id}",
     params(
-        ("member_role" = String, Path),
+        ("template_id" = String, Path),
         ("X-Steward-CSRF" = String, Header)
     ),
-    request_body = BrowserEnvelope,
+    request_body = AuthorEnvelopeTemplateBody,
     responses(
         (status = 201, body = BrowserEnvelopeTemplateResponse),
         (status = 401, description = "Browser session is absent or invalid"),
@@ -1023,24 +1314,27 @@ pub(crate) async fn author_envelope_template<R, L, D>(
     Extension(authority): Extension<BrowserAdminAuthority>,
     Extension(_proof): Extension<BrowserMutationProof>,
     State(state): State<BrowserAdminState<R, L, D>>,
-    Path(member_role): Path<String>,
-    Json(browser_envelope): Json<BrowserEnvelope>,
+    Path(template_id): Path<String>,
+    Json(body): Json<AuthorEnvelopeTemplateBody>,
 ) -> Response
 where
     R: RuntimeRepository,
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
-    let envelope: Envelope = browser_envelope.into();
-    if member_role.is_empty()
-        || envelope.revision <= 0
-        || envelope.spec.llms.is_empty()
-        || validate_envelope(&envelope).is_err()
-    {
+    let envelope: Envelope = body.envelope.into();
+    let auto_provision_threshold = body.auto_provision_threshold.map(Into::into);
+    if !valid_template_authoring(
+        &template_id,
+        &body.display_name,
+        &body.member_roles,
+        &envelope,
+        auto_provision_threshold.as_ref(),
+    ) {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    match state.ledger.latest_envelope(&member_role).await {
-        Ok(Some(current)) if envelope.revision <= current.revision => {
+    match state.ledger.latest_envelope_template(&template_id).await {
+        Ok(Some(current)) if envelope.revision <= current.ceiling.revision => {
             return StatusCode::CONFLICT.into_response();
         }
         Ok(_) => {}
@@ -1052,35 +1346,130 @@ where
             .llms
             .iter()
             .any(|model| !state.capabilities.models.contains(model))
-        || envelope
-            .spec
-            .tools
-            .iter()
-            .any(|tool| !state.capabilities.tools.contains(tool))
+        || envelope.spec.tools.iter().any(|tool| {
+            !state
+                .capabilities
+                .tools
+                .iter()
+                .any(|available| available.grants(tool))
+        })
     {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
     match state
         .ledger
-        .insert_envelope(
-            &member_role,
-            &envelope,
-            authority.principal().canonical_user_id.as_str(),
-        )
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &template_id,
+            display_name: &body.display_name,
+            member_roles: &body.member_roles,
+            ceiling: &envelope,
+            auto_provision_threshold: auto_provision_threshold.as_ref(),
+            authored_by: authority.principal().canonical_user_id.as_str(),
+        })
         .await
     {
         Ok(()) => (
             StatusCode::CREATED,
             Json(BrowserEnvelopeTemplateResponse {
                 api_version: BROWSER_ADMIN_API_VERSION,
-                member_role,
+                id: template_id,
+                display_name: body.display_name,
+                member_roles: body.member_roles,
                 envelope: envelope.into(),
+                auto_provision_threshold: auto_provision_threshold.map(Into::into),
             }),
         )
             .into_response(),
         Err(StoreError::EnvelopeRevisionNotIncreasing) => StatusCode::CONFLICT.into_response(),
+        Err(StoreError::InvalidEnvelopeTemplate) => {
+            StatusCode::UNPROCESSABLE_ENTITY.into_response()
+        }
         Err(error) => ApiError::Store(error).into_response(),
     }
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "authorLegacyAdminEnvelopeTemplate",
+    path = "/admin/api/v1/envelope-templates/{template_id}",
+    params(
+        ("template_id" = String, Path),
+        ("X-Steward-CSRF" = String, Header)
+    ),
+    request_body = BrowserEnvelope,
+    responses(
+        (status = 201, body = BrowserEnvelopeTemplateResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 409, description = "Envelope revision is not newer than the current revision"),
+        (status = 422, description = "Template identifier, envelope, or deployed capability selection is invalid"),
+        (status = 503, description = "Envelope templates are unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn author_legacy_envelope_template<R, L, D>(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+    Extension(_proof): Extension<BrowserMutationProof>,
+    State(state): State<BrowserAdminState<R, L, D>>,
+    Path(template_id): Path<String>,
+    Json(browser_envelope): Json<BrowserEnvelope>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    let body = AuthorEnvelopeTemplateBody {
+        display_name: template_id.clone(),
+        member_roles: vec![template_id.clone()],
+        envelope: browser_envelope,
+        auto_provision_threshold: None,
+    };
+    author_envelope_template::<R, L, D>(
+        Extension(authority),
+        Extension(_proof),
+        State(state),
+        Path(template_id),
+        Json(body),
+    )
+    .await
+}
+
+fn valid_template_authoring(
+    template_id: &str,
+    display_name: &str,
+    member_roles: &[String],
+    envelope: &Envelope,
+    auto_provision_threshold: Option<&Envelope>,
+) -> bool {
+    let valid_identifier = |value: &str| {
+        let bytes = value.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= 128
+            && bytes[0].is_ascii_alphanumeric()
+            && bytes.iter().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
+            })
+    };
+    valid_identifier(template_id)
+        && !display_name.is_empty()
+        && display_name.trim() == display_name
+        && display_name.chars().count() <= 128
+        && !member_roles.is_empty()
+        && member_roles.len() <= 64
+        && member_roles.iter().all(|role| valid_identifier(role))
+        && member_roles.windows(2).all(|roles| roles[0] < roles[1])
+        && envelope.revision > 0
+        && !envelope.spec.llms.is_empty()
+        && validate_envelope(envelope).is_ok()
+        && auto_provision_threshold.is_none_or(|threshold| {
+            threshold.revision == envelope.revision
+                && validate_envelope(threshold).is_ok()
+                && matches!(
+                    steward_admission::envelope_is_within(threshold, envelope),
+                    Ok(AdmissionDecision::Admit)
+                )
+        })
 }
 
 #[utoipa::path(

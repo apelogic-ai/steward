@@ -92,11 +92,18 @@ export function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnve
   const governing = request.templateEnvelope.spec;
   const terminal = decision?.request.status === "provisioned" || decision?.request.status === "rejected";
 
-  async function approveRequest() {
+  async function approveRequest(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
     if (session.status !== "authenticated" || terminal) return;
+    const fields = new FormData(event.currentTarget);
+    const expiresAt = String(fields.get("expiresAt") ?? "").trim();
     setStatus("approving");
     const result = await approveAdminEnvelopeRequest({
-      body: {},
+      body: {
+        rationale: String(fields.get("rationale") ?? "").trim(),
+        evidenceUrl: String(fields.get("evidenceUrl") ?? "").trim() || null,
+        expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+      },
       cache: "no-store",
       credentials: "same-origin",
       headers: { "X-Steward-CSRF": session.value.csrf },
@@ -153,9 +160,20 @@ export function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnve
           <DefinitionList items={envelopeAuthorityItems(governing)} />
         </section>
       </div>
-      <div className="flex flex-wrap gap-3 border-t pt-5">
-        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={terminal || status === "approving" || status === "rejecting"} onClick={() => void approveRequest()} type="button">{status === "approving" ? "Approving…" : "Approve request"}</button>
-      </div>
+      <form className="grid gap-3 border-t pt-5" onSubmit={approveRequest}>
+        <label className="grid gap-2 text-sm font-semibold">Approval rationale
+          <textarea className="min-h-20 rounded-md border p-3 font-normal" disabled={terminal} maxLength={2000} name="rationale" required />
+        </label>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="grid gap-2 text-sm font-semibold">Evidence URL (optional)
+            <input className="min-h-11 rounded-md border px-3 font-normal" disabled={terminal} name="evidenceUrl" placeholder="https://…" type="url" />
+          </label>
+          <label className="grid gap-2 text-sm font-semibold">Expires at (optional)
+            <input className="min-h-11 rounded-md border px-3 font-normal" disabled={terminal} name="expiresAt" type="datetime-local" />
+          </label>
+        </div>
+        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 sm:justify-self-start" disabled={terminal || status === "approving" || status === "rejecting"} type="submit">{status === "approving" ? "Approving…" : "Approve request"}</button>
+      </form>
       <form className="grid gap-3" onSubmit={rejectRequest}>
         <label className="grid gap-2 text-sm font-semibold">Rejection reason (optional)
           <textarea className="min-h-20 rounded-md border p-3 font-normal" disabled={terminal} maxLength={2000} name="reason" />

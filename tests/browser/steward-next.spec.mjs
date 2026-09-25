@@ -75,18 +75,19 @@ const adminEnvelope = {
 };
 
 const capabilityCatalog = {
-  schemaVersion: "steward.capability-catalog/v1",
+  schemaVersion: "steward.capability-catalog/v2",
   models: [
     { provider: "provider-a", model: "model-a" },
     { provider: "provider-b", model: "model-b" },
   ],
-  tools: envelope.spec.tools,
+  tools: envelope.spec.tools.map((tool) => ({ ...tool, accessClass: "read" })),
+  catalogs: [{ provider: "github", catalogId: "github-tools", version: "1.6.0", available: true }],
 };
 
 const githubReadTools = [
   "actions_get", "actions_list", "get_job_logs", "get_file_contents", "list_commits",
   "get_commit", "get_release", "list_releases", "get_workflow", "list_workflows",
-].map((resource) => ({ provider: "github", resource, action: "read" }));
+].map((resource) => ({ provider: "github", resource, action: "read", accessClass: "read" }));
 
 const envelopeRequest = {
   id: envelopeId,
@@ -242,7 +243,9 @@ async function startWeb() {
   const proxy = createServer(async (request, response) => {
     try {
       const requestUrl = new URL(request.url ?? "/", nextOrigin);
-      const browserMutation = request.method === "POST" && (
+      const templateMutation = request.method === "PUT"
+        && requestUrl.pathname.startsWith("/admin/api/v1/envelope-templates/");
+      const browserMutation = templateMutation || (request.method === "POST" && (
         requestUrl.pathname === "/app/api/v1/envelope-requests"
         || requestUrl.pathname.endsWith("/github-actions-workflow")
         || requestUrl.pathname.startsWith("/admin/api/v1/envelope-templates/")
@@ -255,7 +258,7 @@ async function startWeb() {
         || requestUrl.pathname === "/admin/api/v1/connections/github/start"
         || requestUrl.pathname === "/admin/api/v1/connections/github/disconnect"
         || requestUrl.pathname === "/admin/auth/logout"
-      );
+      ));
       if (browserMutation) {
         const chunks = [];
         for await (const chunk of request) chunks.push(chunk);
@@ -272,9 +275,17 @@ async function startWeb() {
           return;
         }
         if (requestUrl.pathname.startsWith("/admin/api/v1/envelope-templates/")) {
-          const memberRole = decodeURIComponent(requestUrl.pathname.split("/").at(-1) ?? "");
+          const templateId = decodeURIComponent(requestUrl.pathname.split("/").at(-1) ?? "");
+          const submitted = JSON.parse(rawBody);
           response.writeHead(201, { "content-type": "application/json", "cache-control": "no-store" });
-          response.end(JSON.stringify({ apiVersion: "steward.browser-admin/v1", memberRole, envelope: JSON.parse(rawBody) }));
+          response.end(JSON.stringify({
+            apiVersion: "steward.browser-admin/v1",
+            id: templateId,
+            displayName: submitted.displayName,
+            memberRoles: submitted.memberRoles,
+            envelope: submitted.envelope,
+            autoProvisionThreshold: submitted.autoProvisionThreshold ?? null,
+          }));
           return;
         }
         if (requestUrl.pathname === "/admin/api/v1/workflows" || requestUrl.pathname.endsWith("/versions")) {
@@ -544,7 +555,7 @@ async function guardedPage(browser, {
     });
   });
   await context.route(`${origin}/admin/api/v1/envelope-templates/**`, async (route) => {
-    if (route.request().method() === "POST") {
+    if (route.request().method() === "POST" || route.request().method() === "PUT") {
       await route.continue();
       return;
     }
@@ -553,7 +564,7 @@ async function guardedPage(browser, {
       ? { apiVersion: "steward.browser-admin/v1", memberRole }
       : legacyAdminTemplate
         ? { apiVersion: "steward.admin/v1", template: { id: memberRole, revision: 4, envelope } }
-        : { apiVersion: "steward.browser-admin/v1", memberRole, envelope: {
+        : { apiVersion: "steward.browser-admin/v1", id: memberRole, displayName: `${memberRole.charAt(0).toUpperCase()}${memberRole.slice(1)}`, memberRoles: [memberRole], envelope: {
           ...adminEnvelope,
           spec: { ...adminEnvelope.spec, llms: adminTemplateModels, tools: adminTemplateTools },
         } });
@@ -561,15 +572,16 @@ async function guardedPage(browser, {
   await context.route(`${origin}/admin/api/v1/envelope-templates`, (route) => json(route, {
     apiVersion: "steward.browser-admin/v1",
     templates: emptyCollections ? [] : [
-      { memberRole: "analyst", envelope: adminEnvelope },
-      { memberRole: "developer", envelope },
+      { id: "analyst", displayName: "Analyst", memberRoles: ["analyst"], envelope: adminEnvelope, autoProvisionThreshold: null },
+      { id: "developer", displayName: "Developer", memberRoles: ["developer"], envelope, autoProvisionThreshold: null },
     ],
   }));
   await context.route(`${origin}/admin/api/v1/capabilities`, (route) => capabilityCatalogStatus === 200
     ? json(route, {
-      schemaVersion: "steward.capability-catalog/v1",
+      schemaVersion: "steward.capability-catalog/v2",
       models: capabilityCatalogModels,
       tools: capabilityCatalogTools,
+      catalogs: capabilityCatalog.catalogs,
     })
     : route.fulfill({ status: capabilityCatalogStatus, body: "" }));
   await context.route(`${origin}/admin/api/v1/workflows`, async (route) => {
@@ -1200,19 +1212,21 @@ test("administrator templates and approvals use typed browser authority", async 
     await expect(administrator.page.getByText("Current revision 5")).toBeVisible();
     const templateMutation = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst");
     expectMutationProof(templateMutation);
-    expect(templateMutation.body.revision).toBe(5);
-    expect(templateMutation.body.spec.budget).toEqual({
+    expect(templateMutation.body.displayName).toBe("Analyst");
+    expect(templateMutation.body.memberRoles).toEqual(["analyst"]);
+    expect(templateMutation.body.envelope.revision).toBe(5);
+    expect(templateMutation.body.envelope.spec.budget).toEqual({
       currency: "USD",
       monthlyLimit: "30.00",
       singleRunLimit: "3.00",
     });
-    expect(templateMutation.body.spec.llms).toEqual(capabilityCatalog.models);
+    expect(templateMutation.body.envelope.spec.llms).toEqual(capabilityCatalog.models);
     await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("reviewer");
     await administrator.page.getByRole("button", { name: "Save as new" }).click();
     await expect.poll(() => administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/reviewer")).toBe(true);
     const copiedTemplate = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/reviewer");
     expectMutationProof(copiedTemplate);
-    expect(copiedTemplate.body.revision).toBe(1);
+    expect(copiedTemplate.body.envelope.revision).toBe(1);
 
     await administrator.page.goto(`${origin}/admin/envelopes/templates/new`);
     await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText(["provider-a/model-a"]);
@@ -1232,17 +1246,18 @@ test("administrator templates and approvals use typed browser authority", async 
     await expect(envelopeRequestCard.getByRole("heading", { name: "Requested authority" })).toBeVisible();
     await expect(envelopeRequestCard.getByRole("heading", { name: "Governing template" })).toBeVisible();
     await expect(envelopeRequestCard.getByRole("button", { name: "Reject request" })).toBeVisible();
+    await envelopeRequestCard.getByLabel("Approval rationale").fill("Approved for the requested bounded envelope.");
     await envelopeRequestCard.getByRole("button", { name: "Approve request" }).click();
     await expect(envelopeRequestCard.getByText("The exact requested envelope was provisioned.")).toBeVisible();
     await expect(envelopeRequestCard.getByText("env_00000000000000000000000000000004")).toBeVisible();
     const envelopeApprovalMutation = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/approve`);
     expectMutationProof(envelopeApprovalMutation);
-    expect(envelopeApprovalMutation.body).toEqual({});
+    expect(envelopeApprovalMutation.body.rationale).toBe("Approved for the requested bounded envelope.");
     await expect(administrator.page.getByText("runtime-example-2")).toBeVisible();
     await administrator.page.getByRole("button", { name: "File decision reference" }).click();
     await expect(administrator.page.getByText("Decision reference filed through the server-owned channel.")).toBeVisible();
     expectMutationProof(administrator.mutations.find((mutation) => mutation.path.endsWith("/file")));
-    await administrator.page.getByLabel("Rationale").fill("Approved for one bounded investigation.");
+    await administrator.page.getByLabel("Rationale", { exact: true }).fill("Approved for one bounded investigation.");
     await administrator.page.getByLabel("Expires at (RFC 3339)").fill("2026-08-25T17:00:00Z");
     await administrator.page.getByRole("button", { name: "Approve exception" }).click();
     await expect(administrator.page.getByText("Approval applied through the governed Rust admission path.")).toBeVisible();
@@ -1291,16 +1306,16 @@ test("administrator can revise and copy a ten-grant template listed in the capab
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer")).toBeTruthy();
     const revised = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer");
     expectMutationProof(revised);
-    expect(revised.body.revision).toBe(adminEnvelope.revision + 1);
-    expect(revised.body.spec.tools).toEqual(githubReadTools);
+    expect(revised.body.envelope.revision).toBe(adminEnvelope.revision + 1);
+    expect(revised.body.envelope.spec.tools).toEqual(githubReadTools.map(({ accessClass: _accessClass, ...tool }) => tool));
 
     await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("engineer");
     await administrator.page.getByRole("button", { name: "Save as new" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/engineer")).toBeTruthy();
     const copied = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/engineer");
     expectMutationProof(copied);
-    expect(copied.body.revision).toBe(1);
-    expect(copied.body.spec.tools).toEqual(githubReadTools);
+    expect(copied.body.envelope.revision).toBe(1);
+    expect(copied.body.envelope.spec.tools).toEqual(githubReadTools.map(({ accessClass: _accessClass, ...tool }) => tool));
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1325,7 +1340,9 @@ test("administrator can replace a template tool absent from the capability catal
     await tools.getByRole("button", { name: "Add tool" }).click();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
-    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.spec.tools).toEqual([replacement]);
+    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.tools).toEqual([
+      { provider: replacement.provider, resource: replacement.resource, action: replacement.action },
+    ]);
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1346,7 +1363,7 @@ test("administrator template tool controls offer no fallback when the capability
     await expect(tools.getByText("No tools are listed in the deployment capability catalog.")).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
-    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.spec.tools).toEqual([]);
+    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.tools).toEqual([]);
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1390,8 +1407,8 @@ test("administrator can replace a template model absent from the capability cata
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     const mutation = administrator.mutations.find((entry) => entry.path === "/admin/api/v1/envelope-templates/analyst");
-    expect(mutation.body.spec.llms).toEqual([{ provider: "anthropic", model: "claude-sonnet-4" }]);
-    expect(mutation.body.revision).toBe(adminEnvelope.revision + 1);
+    expect(mutation.body.envelope.spec.llms).toEqual([{ provider: "anthropic", model: "claude-sonnet-4" }]);
+    expect(mutation.body.envelope.revision).toBe(adminEnvelope.revision + 1);
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1419,7 +1436,7 @@ test("administrator template model identity does not collide across provider and
     await expect(models.getByRole("listitem")).toHaveCount(1);
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
-    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.spec.llms).toEqual([second]);
+    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.llms).toEqual([second]);
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1437,7 +1454,7 @@ test("administrator template model identity does not collide across provider and
     await expect(models.getByRole("listitem")).toHaveCount(1);
     await stale.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => stale.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
-    expect(stale.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.spec.llms).toEqual([second]);
+    expect(stale.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.llms).toEqual([second]);
   } finally {
     await closeGuardedPage(stale);
   }

@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { AgentRunContractData, AgentRunContractErrors, AgentRunContractResponses, AgentRunsContractData, AgentRunsContractErrors, AgentRunsContractResponses, AgentRunTimelineContractData, AgentRunTimelineContractErrors, AgentRunTimelineContractResponses, AllRunData, AllRunErrors, AllRunExecutionLogData, AllRunExecutionLogErrors, AllRunExecutionLogResponses, AllRunResponses, AllRunsData, AllRunsErrors, AllRunsResponses, AllRunTimelineData, AllRunTimelineErrors, AllRunTimelineResponses, ApproveAdminApprovalData, ApproveAdminApprovalErrors, ApproveAdminApprovalResponses, ApproveAdminEnvelopeRequestData, ApproveAdminEnvelopeRequestErrors, ApproveAdminEnvelopeRequestResponses, AssociateAdminFederatedSubjectData, AssociateAdminFederatedSubjectErrors, AssociateAdminFederatedSubjectResponses, AuthorAdminEnvelopeTemplateData, AuthorAdminEnvelopeTemplateErrors, AuthorAdminEnvelopeTemplateResponses, BudgetIncreaseContractData, BudgetIncreaseContractErrors, BudgetIncreaseContractResponses, ConnectionStatusData, ConnectionStatusErrors, ConnectionStatusResponses, CreateRequestData, CreateRequestErrors, CreateRequestResponses, CreateRuntimeContractData, CreateRuntimeContractErrors, CreateRuntimeContractResponses, DisableAdminFederatedSubjectData, DisableAdminFederatedSubjectErrors, DisableAdminFederatedSubjectResponses, DisconnectConnectionData, DisconnectConnectionErrors, DisconnectConnectionResponses, FileAdminApprovalDecisionData, FileAdminApprovalDecisionErrors, FileAdminApprovalDecisionResponses, GetAdminCapabilitiesData, GetAdminCapabilitiesErrors, GetAdminCapabilitiesResponses, GetAdminEnvelopeTemplateData, GetAdminEnvelopeTemplateErrors, GetAdminEnvelopeTemplateResponses, GetAdminFederatedSubjectAuditData, GetAdminFederatedSubjectAuditErrors, GetAdminFederatedSubjectAuditResponses, GetAdminFederatedSubjectData, GetAdminFederatedSubjectErrors, GetAdminFederatedSubjectResponses, GetAdminWorkflowVersionData, GetAdminWorkflowVersionErrors, GetAdminWorkflowVersionResponses, GetRequestData, GetRequestErrors, GetRequestResponses, ListAdminApprovalsData, ListAdminApprovalsErrors, ListAdminApprovalsResponses, ListAdminEnvelopeTemplatesData, ListAdminEnvelopeTemplatesErrors, ListAdminEnvelopeTemplatesResponses, ListAdminFederatedSubjectsData, ListAdminFederatedSubjectsErrors, ListAdminFederatedSubjectsResponses, ListAdminWorkflowsData, ListAdminWorkflowsErrors, ListAdminWorkflowsResponses, ListPublishedWorkflowsData, ListPublishedWorkflowsErrors, ListPublishedWorkflowsResponses, ListRequestsData, ListRequestsErrors, ListRequestsResponses, ListTemplatesData, ListTemplatesErrors, ListTemplatesResponses, MyRunData, MyRunErrors, MyRunExecutionLogData, MyRunExecutionLogErrors, MyRunExecutionLogResponses, MyRunResponses, MyRunsData, MyRunsErrors, MyRunsResponses, MyRunTimelineData, MyRunTimelineErrors, MyRunTimelineResponses, PublishAdminWorkflowData, PublishAdminWorkflowErrors, PublishAdminWorkflowResponses, PublishAdminWorkflowVersionData, PublishAdminWorkflowVersionErrors, PublishAdminWorkflowVersionResponses, RejectAdminEnvelopeRequestData, RejectAdminEnvelopeRequestErrors, RejectAdminEnvelopeRequestResponses, RenderGithubActionsForEnvelopeData, RenderGithubActionsForEnvelopeErrors, RenderGithubActionsForEnvelopeResponses, ReplaceAdminFederatedSubjectAssociationData, ReplaceAdminFederatedSubjectAssociationErrors, ReplaceAdminFederatedSubjectAssociationResponses, SessionData, SessionErrors, SessionResponses, StartConnectionData, StartConnectionErrors, StartConnectionResponses, TaskDeleteContractData, TaskDeleteContractErrors, TaskDeleteContractResponses, TaskExecuteContractData, TaskExecuteContractErrors, TaskExecuteContractResponses, TaskInputsContractData, TaskInputsContractErrors, TaskInputsContractResponses, TaskOutputsContractData, TaskOutputsContractErrors, TaskOutputsContractResponses, TaskStatusContractData, TaskStatusContractErrors, TaskStatusContractResponses, TaskSubmissionContractData, TaskSubmissionContractErrors, TaskSubmissionContractResponses } from './types.gen';
+import type { AgentRunContractData, AgentRunContractErrors, AgentRunContractResponses, AgentRunsContractData, AgentRunsContractErrors, AgentRunsContractResponses, AgentRunTimelineContractData, AgentRunTimelineContractErrors, AgentRunTimelineContractResponses, AllRunData, AllRunErrors, AllRunExecutionLogData, AllRunExecutionLogErrors, AllRunExecutionLogResponses, AllRunResponses, AllRunsData, AllRunsErrors, AllRunsResponses, AllRunTimelineData, AllRunTimelineErrors, AllRunTimelineResponses, ApproveAdminApprovalData, ApproveAdminApprovalErrors, ApproveAdminApprovalResponses, ApproveAdminEnvelopeRequestData, ApproveAdminEnvelopeRequestErrors, ApproveAdminEnvelopeRequestResponses, AuthorAdminEnvelopeTemplateData, AuthorAdminEnvelopeTemplateErrors, AuthorAdminEnvelopeTemplateResponses, AuthorLegacyAdminEnvelopeTemplateData, AuthorLegacyAdminEnvelopeTemplateErrors, AuthorLegacyAdminEnvelopeTemplateResponses, BudgetIncreaseContractData, BudgetIncreaseContractErrors, BudgetIncreaseContractResponses, ConnectionStatusData, ConnectionStatusErrors, ConnectionStatusResponses, CreateRequestData, CreateRequestErrors, CreateRequestResponses, CreateRuntimeContractData, CreateRuntimeContractErrors, CreateRuntimeContractResponses, DisconnectConnectionData, DisconnectConnectionErrors, DisconnectConnectionResponses, FileAdminApprovalDecisionData, FileAdminApprovalDecisionErrors, FileAdminApprovalDecisionResponses, FileAdminEnvelopeRequestData, FileAdminEnvelopeRequestErrors, FileAdminEnvelopeRequestResponses, GetAdminCapabilitiesData, GetAdminCapabilitiesErrors, GetAdminCapabilitiesResponses, GetAdminEnvelopeTemplateData, GetAdminEnvelopeTemplateErrors, GetAdminEnvelopeTemplateResponses, GetAdminWorkflowVersionData, GetAdminWorkflowVersionErrors, GetAdminWorkflowVersionResponses, GetRequestData, GetRequestErrors, GetRequestResponses, ListAdminApprovalsData, ListAdminApprovalsErrors, ListAdminApprovalsResponses, ListAdminEnvelopeTemplatesData, ListAdminEnvelopeTemplatesErrors, ListAdminEnvelopeTemplatesResponses, ListAdminWorkflowsData, ListAdminWorkflowsErrors, ListAdminWorkflowsResponses, ListPublishedWorkflowsData, ListPublishedWorkflowsErrors, ListPublishedWorkflowsResponses, ListRequestsData, ListRequestsErrors, ListRequestsResponses, ListTemplatesData, ListTemplatesErrors, ListTemplatesResponses, MyRunData, MyRunErrors, MyRunExecutionLogData, MyRunExecutionLogErrors, MyRunExecutionLogResponses, MyRunResponses, MyRunsData, MyRunsErrors, MyRunsResponses, MyRunTimelineData, MyRunTimelineErrors, MyRunTimelineResponses, PublishAdminWorkflowData, PublishAdminWorkflowErrors, PublishAdminWorkflowResponses, PublishAdminWorkflowVersionData, PublishAdminWorkflowVersionErrors, PublishAdminWorkflowVersionResponses, RejectAdminEnvelopeRequestData, RejectAdminEnvelopeRequestErrors, RejectAdminEnvelopeRequestResponses, RenderGithubActionsForEnvelopeData, RenderGithubActionsForEnvelopeErrors, RenderGithubActionsForEnvelopeResponses, SessionData, SessionErrors, SessionResponses, StartConnectionData, StartConnectionErrors, StartConnectionResponses, TaskDeleteContractData, TaskDeleteContractErrors, TaskDeleteContractResponses, TaskExecuteContractData, TaskExecuteContractErrors, TaskExecuteContractResponses, TaskInputsContractData, TaskInputsContractErrors, TaskInputsContractResponses, TaskOutputsContractData, TaskOutputsContractErrors, TaskOutputsContractResponses, TaskStatusContractData, TaskStatusContractErrors, TaskStatusContractResponses, TaskSubmissionContractData, TaskSubmissionContractErrors, TaskSubmissionContractResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -158,6 +158,20 @@ export const approveAdminEnvelopeRequest = <ThrowOnError extends boolean = false
     }
 });
 
+export const fileAdminEnvelopeRequest = <ThrowOnError extends boolean = false>(options: Options<FileAdminEnvelopeRequestData, ThrowOnError>): RequestResult<FileAdminEnvelopeRequestResponses, FileAdminEnvelopeRequestErrors, ThrowOnError> => (options.client ?? client).post<FileAdminEnvelopeRequestResponses, FileAdminEnvelopeRequestErrors, ThrowOnError>({
+    security: [{
+            in: 'cookie',
+            name: '__Host-steward-session',
+            type: 'apiKey'
+        }],
+    url: '/admin/api/v1/envelope-requests/{request_id}/file',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
 export const rejectAdminEnvelopeRequest = <ThrowOnError extends boolean = false>(options: Options<RejectAdminEnvelopeRequestData, ThrowOnError>): RequestResult<RejectAdminEnvelopeRequestResponses, RejectAdminEnvelopeRequestErrors, ThrowOnError> => (options.client ?? client).post<RejectAdminEnvelopeRequestResponses, RejectAdminEnvelopeRequestErrors, ThrowOnError>({
     security: [{
             in: 'cookie',
@@ -188,17 +202,17 @@ export const getAdminEnvelopeTemplate = <ThrowOnError extends boolean = false>(o
             name: '__Host-steward-session',
             type: 'apiKey'
         }],
-    url: '/admin/api/v1/envelope-templates/{member_role}',
+    url: '/admin/api/v1/envelope-templates/{template_id}',
     ...options
 });
 
-export const authorAdminEnvelopeTemplate = <ThrowOnError extends boolean = false>(options: Options<AuthorAdminEnvelopeTemplateData, ThrowOnError>): RequestResult<AuthorAdminEnvelopeTemplateResponses, AuthorAdminEnvelopeTemplateErrors, ThrowOnError> => (options.client ?? client).post<AuthorAdminEnvelopeTemplateResponses, AuthorAdminEnvelopeTemplateErrors, ThrowOnError>({
+export const authorLegacyAdminEnvelopeTemplate = <ThrowOnError extends boolean = false>(options: Options<AuthorLegacyAdminEnvelopeTemplateData, ThrowOnError>): RequestResult<AuthorLegacyAdminEnvelopeTemplateResponses, AuthorLegacyAdminEnvelopeTemplateErrors, ThrowOnError> => (options.client ?? client).post<AuthorLegacyAdminEnvelopeTemplateResponses, AuthorLegacyAdminEnvelopeTemplateErrors, ThrowOnError>({
     security: [{
             in: 'cookie',
             name: '__Host-steward-session',
             type: 'apiKey'
         }],
-    url: '/admin/api/v1/envelope-templates/{member_role}',
+    url: '/admin/api/v1/envelope-templates/{template_id}',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -206,71 +220,13 @@ export const authorAdminEnvelopeTemplate = <ThrowOnError extends boolean = false
     }
 });
 
-export const listAdminFederatedSubjects = <ThrowOnError extends boolean = false>(options?: Options<ListAdminFederatedSubjectsData, ThrowOnError>): RequestResult<ListAdminFederatedSubjectsResponses, ListAdminFederatedSubjectsErrors, ThrowOnError> => (options?.client ?? client).get<ListAdminFederatedSubjectsResponses, ListAdminFederatedSubjectsErrors, ThrowOnError>({
+export const authorAdminEnvelopeTemplate = <ThrowOnError extends boolean = false>(options: Options<AuthorAdminEnvelopeTemplateData, ThrowOnError>): RequestResult<AuthorAdminEnvelopeTemplateResponses, AuthorAdminEnvelopeTemplateErrors, ThrowOnError> => (options.client ?? client).put<AuthorAdminEnvelopeTemplateResponses, AuthorAdminEnvelopeTemplateErrors, ThrowOnError>({
     security: [{
             in: 'cookie',
             name: '__Host-steward-session',
             type: 'apiKey'
         }],
-    url: '/admin/api/v1/federated-subjects',
-    ...options
-});
-
-export const getAdminFederatedSubject = <ThrowOnError extends boolean = false>(options: Options<GetAdminFederatedSubjectData, ThrowOnError>): RequestResult<GetAdminFederatedSubjectResponses, GetAdminFederatedSubjectErrors, ThrowOnError> => (options.client ?? client).get<GetAdminFederatedSubjectResponses, GetAdminFederatedSubjectErrors, ThrowOnError>({
-    security: [{
-            in: 'cookie',
-            name: '__Host-steward-session',
-            type: 'apiKey'
-        }],
-    url: '/admin/api/v1/federated-subjects/{subject_id}',
-    ...options
-});
-
-export const associateAdminFederatedSubject = <ThrowOnError extends boolean = false>(options: Options<AssociateAdminFederatedSubjectData, ThrowOnError>): RequestResult<AssociateAdminFederatedSubjectResponses, AssociateAdminFederatedSubjectErrors, ThrowOnError> => (options.client ?? client).post<AssociateAdminFederatedSubjectResponses, AssociateAdminFederatedSubjectErrors, ThrowOnError>({
-    security: [{
-            in: 'cookie',
-            name: '__Host-steward-session',
-            type: 'apiKey'
-        }],
-    url: '/admin/api/v1/federated-subjects/{subject_id}/associate',
-    ...options,
-    headers: {
-        'Content-Type': 'application/json',
-        ...options.headers
-    }
-});
-
-export const getAdminFederatedSubjectAudit = <ThrowOnError extends boolean = false>(options: Options<GetAdminFederatedSubjectAuditData, ThrowOnError>): RequestResult<GetAdminFederatedSubjectAuditResponses, GetAdminFederatedSubjectAuditErrors, ThrowOnError> => (options.client ?? client).get<GetAdminFederatedSubjectAuditResponses, GetAdminFederatedSubjectAuditErrors, ThrowOnError>({
-    security: [{
-            in: 'cookie',
-            name: '__Host-steward-session',
-            type: 'apiKey'
-        }],
-    url: '/admin/api/v1/federated-subjects/{subject_id}/audit',
-    ...options
-});
-
-export const disableAdminFederatedSubject = <ThrowOnError extends boolean = false>(options: Options<DisableAdminFederatedSubjectData, ThrowOnError>): RequestResult<DisableAdminFederatedSubjectResponses, DisableAdminFederatedSubjectErrors, ThrowOnError> => (options.client ?? client).post<DisableAdminFederatedSubjectResponses, DisableAdminFederatedSubjectErrors, ThrowOnError>({
-    security: [{
-            in: 'cookie',
-            name: '__Host-steward-session',
-            type: 'apiKey'
-        }],
-    url: '/admin/api/v1/federated-subjects/{subject_id}/disable',
-    ...options,
-    headers: {
-        'Content-Type': 'application/json',
-        ...options.headers
-    }
-});
-
-export const replaceAdminFederatedSubjectAssociation = <ThrowOnError extends boolean = false>(options: Options<ReplaceAdminFederatedSubjectAssociationData, ThrowOnError>): RequestResult<ReplaceAdminFederatedSubjectAssociationResponses, ReplaceAdminFederatedSubjectAssociationErrors, ThrowOnError> => (options.client ?? client).post<ReplaceAdminFederatedSubjectAssociationResponses, ReplaceAdminFederatedSubjectAssociationErrors, ThrowOnError>({
-    security: [{
-            in: 'cookie',
-            name: '__Host-steward-session',
-            type: 'apiKey'
-        }],
-    url: '/admin/api/v1/federated-subjects/{subject_id}/replace',
+    url: '/admin/api/v1/envelope-templates/{template_id}',
     ...options,
     headers: {
         'Content-Type': 'application/json',

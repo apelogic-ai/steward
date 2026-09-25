@@ -376,7 +376,7 @@ that allowlist remain inaccessible to both service accounts.
   config:
     apiserver:
       capabilityCatalog:
-        schemaVersion: steward.capability-catalog/v1
+        schemaVersion: steward.capability-catalog/v2
         models:
           - provider: openai
             model: gpt-5.4
@@ -384,9 +384,16 @@ that allowlist remain inaccessible to both service accounts.
           - provider: github
             resource: actions_get
             action: read
+            accessClass: read
+        catalogs:
+          - provider: github
+            catalogId: github-tools
+            version: 1.6.0
+            available: true
   ```
 
-  Authority, budget, TTL, template, and user fields are intentionally not part of this catalog.
+  Tool access classes and provider catalog availability are display metadata. Authority,
+  budget, TTL, template, and user fields are intentionally not part of this catalog.
 - `config.apiserver.executionBindings` is the structured, deployment-owned coding-agent
   catalog. The default `bindings: []` advertises no agents and creates no fallback.
   The chart validates it, renders it into an immutable content-addressed ConfigMap,
