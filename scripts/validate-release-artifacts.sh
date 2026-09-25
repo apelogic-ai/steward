@@ -690,6 +690,7 @@ for required in \
   '            - { name: STEWARD_IDENTITY_TASK_ISSUER, value: "https://identity.example.test" }' \
   '            - { name: STEWARD_IDENTITY_TASK_AUDIENCE, value: "steward-task-api" }' \
   '            - { name: STEWARD_IDENTITY_TASK_JWKS_FILE, value: /run/identity-task/jwks.json }' \
+  '            - { name: STEWARD_FEDERATED_TASK_IDENTITY_ENABLED, value: "false" }' \
   '            - { name: identity-task, mountPath: /run/identity-task, readOnly: true }' \
   '        - name: identity-task' \
   '            name: identity-task-jwks' \
@@ -697,6 +698,34 @@ for required in \
 do
   grep -Fxq "${required}" "${task_identity_deployment}"
 done
+federated_task_identity_rendered="${workdir}/federated-task-identity.yaml"
+helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set taskIdentity.enabled=true \
+  --set-string taskIdentity.issuer=https://identity.example.test \
+  --set-string taskIdentity.audience=steward-task-api \
+  --set-string taskIdentity.resource=https://steward.example.test \
+  --set taskIdentity.federatedSubjects.enabled=true \
+  --set-string taskIdentity.publicJwksConfigMap.name=identity-task-jwks \
+  --set-string taskIdentity.publicJwksConfigMap.key=jwks.json > "${federated_task_identity_rendered}"
+grep -Fq 'name: STEWARD_FEDERATED_TASK_IDENTITY_ENABLED, value: "true"' "${federated_task_identity_rendered}"
+grep -Fq 'name: STEWARD_TASK_AUTH_RESOURCE, value: "https://steward.example.test"' "${federated_task_identity_rendered}"
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set taskIdentity.enabled=true \
+  --set-string taskIdentity.issuer=https://identity.example.test \
+  --set-string taskIdentity.audience=steward-task-api \
+  --set taskIdentity.federatedSubjects.enabled=true \
+  --set-string taskIdentity.publicJwksConfigMap.name=identity-task-jwks \
+  --set-string taskIdentity.publicJwksConfigMap.key=jwks.json >/dev/null 2>&1
+then
+  echo "federated task identity without its exact Steward resource URL must fail chart validation" >&2
+  exit 1
+fi
 if helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
