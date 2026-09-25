@@ -588,6 +588,9 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .await?;
     let store = PgStore::new(pool.clone());
     store.migrate().await?;
+    // Exercise the unified runtime-approval projection against real PostgreSQL even when this
+    // isolated run has not yet created an exception approval.
+    store.admin_approvals().await?;
     let suffix = Uuid::new_v4().simple().to_string();
     let email = Email(format!("alice-{suffix}@example.com"));
     let identity = store

@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import type { BrowserEnvelopeRequestView } from "@/api-client";
+import type { AdminRequestView, BrowserEnvelopeRequestView } from "@/api-client";
 
-import { EnvelopeRequestCard } from "./admin-approvals-view";
+import { EnvelopeRequestCard, UnifiedRequestCard } from "./admin-approvals-view";
 
 const source = readFileSync(new URL("./admin-approvals-view.tsx", import.meta.url), "utf8");
 
@@ -36,7 +36,37 @@ const request: BrowserEnvelopeRequestView = {
   templateRevision: 7,
 };
 
+const unifiedRequest: AdminRequestView = {
+  createdAt: "2026-08-30T12:00:00Z",
+  deltas: [],
+  history: [],
+  id: request.requestId,
+  kind: "within_ceiling",
+  requester: {
+    displayEmail: request.ownerDisplayEmail,
+    userId: "user-alice",
+  },
+  source: "envelope_request",
+  state: "requested",
+  stateActor: "alice",
+  stateAt: "2026-08-30T12:00:00Z",
+  template: {
+    displayName: "Engineering",
+    id: request.templateId,
+    revision: request.templateRevision,
+  },
+};
+
 describe("envelope request approval controls", () => {
+  test("unified queue preserves rejection and optional approval evidence", () => {
+    const html = renderToStaticMarkup(<UnifiedRequestCard request={unifiedRequest} />);
+
+    expect(html).toContain("Reject request");
+    expect(html).toContain('name="reason"');
+    expect(html).toContain("Expires at (optional)");
+    expect(html).not.toContain('name="expiresAt" placeholder="2026-08-25T17:00:00Z" required=""');
+  });
+
   test("offer governed approve and reject mutations with an optional rejection reason", () => {
     const html = renderToStaticMarkup(<EnvelopeRequestCard request={request} />);
 

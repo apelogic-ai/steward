@@ -3522,6 +3522,9 @@ impl PgStore {
         sqlx::query(
             "SELECT approvals.id AS approval_id, approvals.runtime_uid, approvals.state, \
                     approvals.decision_key, approvals.evidence_url, approvals.rationale, \
+                    (SELECT to_char(min(grants.expires_at) AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
+                     FROM grants WHERE grants.approval_id = approvals.id) AS expires_at, \
                     admission_decisions.deltas, admission_decisions.proposed_spec, \
                     admission_decisions.envelope_rev, admission_decisions.member_role, \
                     envelopes.spec AS template_spec, \
@@ -3555,6 +3558,7 @@ impl PgStore {
                 decision_key: row.try_get("decision_key").map_err(database_error)?,
                 evidence_url: row.try_get("evidence_url").map_err(database_error)?,
                 rationale: row.try_get("rationale").map_err(database_error)?,
+                expires_at: row.try_get("expires_at").map_err(database_error)?,
                 deltas: row
                     .try_get::<Json<Vec<AdmissionDelta>>, _>("deltas")
                     .map_err(database_error)?
@@ -9231,6 +9235,7 @@ pub struct AdminApprovalRecord {
     pub decision_key: Option<String>,
     pub evidence_url: Option<String>,
     pub rationale: Option<String>,
+    pub expires_at: Option<String>,
     pub deltas: Vec<AdmissionDelta>,
     pub proposed_spec: AgentRuntimeSpec,
     pub envelope_revision: i64,

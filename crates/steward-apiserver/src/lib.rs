@@ -6610,6 +6610,7 @@ mod tests {
                         decision_key: approval.decision_key,
                         evidence_url: approval.evidence_url,
                         rationale: None,
+                        expires_at: None,
                         deltas: approval.deltas,
                         proposed_spec: approval.proposed_spec,
                         envelope_revision: approval.envelope_revision,

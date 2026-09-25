@@ -1854,6 +1854,29 @@ fn approval_admin_request(record: AdminApprovalRecord) -> AdminRequestView {
         "rejected" => AdminRequestState::Rejected,
         _ => AdminRequestState::Escalated,
     };
+    let history = if state == AdminRequestState::Escalated {
+        vec![AdminRequestHistoryEvent {
+            state,
+            at: record.state_at.clone(),
+            actor: record.state_actor.clone(),
+            reason: None,
+        }]
+    } else {
+        vec![
+            AdminRequestHistoryEvent {
+                state: AdminRequestState::Escalated,
+                at: record.created_at.clone(),
+                actor: record.requester_user_id.clone(),
+                reason: None,
+            },
+            AdminRequestHistoryEvent {
+                state,
+                at: record.state_at.clone(),
+                actor: record.state_actor.clone(),
+                reason: None,
+            },
+        ]
+    };
     let requested = BrowserEnvelope {
         revision: record.envelope_revision,
         spec: BrowserEnvelopeSpec {
@@ -1889,14 +1912,9 @@ fn approval_admin_request(record: AdminApprovalRecord) -> AdminRequestView {
             record.rationale,
             record.evidence_url,
             record.decision_key,
-            None,
+            record.expires_at,
         ),
-        history: vec![AdminRequestHistoryEvent {
-            state,
-            at: record.state_at,
-            actor: record.state_actor,
-            reason: None,
-        }],
+        history,
     }
 }
 
@@ -2479,5 +2497,83 @@ where
         })
         .into_response(),
         Err(error) => error.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod request_projection_tests {
+    use steward_admission::{Envelope, EnvelopeSpec};
+    use steward_store::AdminApprovalRecord;
+    use steward_types::{
+        AgentRuntimeSpec, AgentType, Budget, Duration, Email, Principal, RunnerRequirements,
+    };
+    use uuid::Uuid;
+
+    use super::approval_admin_request;
+
+    #[test]
+    fn runtime_approval_decision_preserves_grant_expiry() -> Result<(), String> {
+        let budget = Budget {
+            monthly_limit: "100.00".to_owned(),
+            single_run_limit: Some("10.00".to_owned()),
+            currency: "USD".to_owned(),
+        };
+        let expires_at = "2999-01-01T00:00:00.000000Z";
+        let request = approval_admin_request(AdminApprovalRecord {
+            approval_id: Uuid::nil(),
+            runtime_uid: "runtime-a".to_owned(),
+            state: "approved".to_owned(),
+            decision_key: Some("PROJ-123".to_owned()),
+            evidence_url: Some("https://jira.example.com/browse/PROJ-123".to_owned()),
+            rationale: Some("bounded exception".to_owned()),
+            expires_at: Some(expires_at.to_owned()),
+            deltas: Vec::new(),
+            proposed_spec: AgentRuntimeSpec {
+                principal: Principal::User {
+                    acting_user: Email::parse("alice@example.com")?,
+                },
+                owner: Email::parse("alice@example.com")?,
+                canonical_authority: None,
+                agent_type: AgentType {
+                    name: "codex".to_owned(),
+                },
+                llms: Vec::new(),
+                tools: Vec::new(),
+                budget: budget.clone(),
+                ttl: Duration("1h".to_owned()),
+                runner: RunnerRequirements::default(),
+                bindings: None,
+            },
+            envelope_revision: 1,
+            member_role: "engineer".to_owned(),
+            template_envelope: Envelope {
+                revision: 1,
+                spec: EnvelopeSpec {
+                    llms: Vec::new(),
+                    tools: Vec::new(),
+                    budget,
+                    ttl: Duration("1h".to_owned()),
+                    runner: RunnerRequirements::default(),
+                },
+            },
+            requester_user_id: "usr_0123456789abcdef0123456789abcdef".to_owned(),
+            requester_display_email: "alice@example.com".to_owned(),
+            created_at: "2026-08-24T17:05:00.000000Z".to_owned(),
+            state_at: "2026-08-24T17:06:00.000000Z".to_owned(),
+            state_actor: "admin".to_owned(),
+        });
+
+        assert_eq!(request.history.len(), 2);
+        assert_eq!(
+            request.history[0].state,
+            super::AdminRequestState::Escalated
+        );
+        assert_eq!(request.history[0].at, "2026-08-24T17:05:00.000000Z");
+        assert_eq!(request.history[1].state, super::AdminRequestState::Approved);
+        assert_eq!(
+            request.decision.and_then(|decision| decision.expires_at),
+            Some(expires_at.to_owned())
+        );
+        Ok(())
     }
 }

@@ -25,12 +25,14 @@ import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
 type ApprovalActionState = "idle" | "filing" | "filed" | "approving" | "approved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
+type UnifiedRequestActionState = ApprovalActionState | "rejecting" | "rejection-complete";
 type EnvelopeActionState = "idle" | "approving" | "rejecting" | "provisioned" | "rejection-complete" | "rejected" | "conflict" | "forbidden" | "unavailable" | "error";
 
-function actionMessage(status: Exclude<ApprovalActionState, "idle" | "filing" | "approving">): string {
+function actionMessage(status: Exclude<UnifiedRequestActionState, "idle" | "filing" | "approving" | "rejecting">): string {
   return {
     filed: "Decision reference filed through the server-owned channel.",
     approved: "Approval applied through the governed Rust admission path.",
+    "rejection-complete": "The envelope request was rejected through the governed Rust admission path.",
     conflict: "This approval or its runtime is stale. Reload the authoritative queue.",
     rejected: "The approval evidence or expiry is invalid.",
     forbidden: "The Rust authorization boundary rejected this mutation.",
@@ -79,13 +81,13 @@ function deltaValue(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequestView }>) {
+export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequestView }>) {
   const session = useSession();
   const [reference, setReference] = useState<{ decisionKey: string; evidenceUrl: string } | null>(request.decision?.decisionKey && request.decision.evidenceUrl ? {
     decisionKey: request.decision.decisionKey,
     evidenceUrl: request.decision.evidenceUrl,
   } : null);
-  const [status, setStatus] = useState<ApprovalActionState>("idle");
+  const [status, setStatus] = useState<UnifiedRequestActionState>("idle");
 
   async function fileDecision() {
     if (session.status !== "authenticated") return;
@@ -107,12 +109,45 @@ function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequestView }>
     const rationale = String(fields.get("rationale") ?? "").trim();
     const expiresAt = String(fields.get("expiresAt") ?? "").trim();
     setStatus("approving");
-    const options = { body: { evidenceUrl: reference?.evidenceUrl ?? "", expiresAt, rationale }, cache: "no-store" as const, credentials: "same-origin" as const, headers: { "X-Steward-CSRF": session.value.csrf } };
     const result = request.source === "envelope_request"
-      ? await approveAdminEnvelopeRequest({ ...options, path: { request_id: request.id } })
-      : await approveAdminApproval({ ...options, path: { approval_id: request.id } });
+      ? await approveAdminEnvelopeRequest({
+          body: { evidenceUrl: reference?.evidenceUrl ?? null, expiresAt: expiresAt || null, rationale },
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "X-Steward-CSRF": session.value.csrf },
+          path: { request_id: request.id },
+        })
+      : reference
+        ? await approveAdminApproval({
+            body: { evidenceUrl: reference.evidenceUrl, expiresAt, rationale },
+            cache: "no-store",
+            credentials: "same-origin",
+            headers: { "X-Steward-CSRF": session.value.csrf },
+            path: { approval_id: request.id },
+          })
+        : null;
+    if (!result) {
+      setStatus("error");
+      return;
+    }
     if (result.response?.ok) setStatus("approved");
     else setStatus(classifyMutationFailure(result.response?.status));
+  }
+
+  async function rejectEnvelope(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (session.status !== "authenticated" || request.source !== "envelope_request") return;
+    const fields = new FormData(event.currentTarget);
+    const reason = String(fields.get("reason") ?? "").trim();
+    setStatus("rejecting");
+    const result = await rejectAdminEnvelopeRequest({
+      body: { reason: reason || null },
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "X-Steward-CSRF": session.value.csrf },
+      path: { request_id: request.id },
+    });
+    setStatus(result.data && result.response?.ok ? "rejection-complete" : classifyMutationFailure(result.response?.status));
   }
 
   async function topUp(event: FormEvent<HTMLFormElement>) {
@@ -172,16 +207,20 @@ function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequestView }>
 
   return (
     <li className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
-      <div className="flex flex-wrap items-start justify-between gap-4"><div><h2 className="text-xl font-semibold">{request.template.displayName}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.id}</p></div><StatusBadge value={status === "approved" ? "approved" : request.state} /></div>
+      <div className="flex flex-wrap items-start justify-between gap-4"><div><h2 className="text-xl font-semibold">{request.template.displayName}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.id}</p></div><StatusBadge value={status === "approved" ? "approved" : status === "rejection-complete" ? "rejected" : request.state} /></div>
       <DefinitionList items={[["Kind", request.kind], ["Source", request.source], ["Requested by", request.requester.displayEmail], ["Created", request.createdAt], ["State actor", request.stateActor]]} />
       {request.deltas.length ? <section className="space-y-3"><h3 className="font-semibold">Requested changes</h3><ul className="space-y-2">{request.deltas.map((delta, index) => <li className="rounded-md border p-3 text-sm" key={`${delta.dimension}-${index}`}><strong>{delta.dimension}</strong>: {deltaValue(delta.requested)} <span className="text-muted-ink">(ceiling {deltaValue(delta.ceiling)})</span></li>)}</ul></section> : <p className="rounded-md bg-notice p-4 text-sm">This request is within the configured ceiling.</p>}
       {reference ? <DefinitionList items={[["Decision key", reference.decisionKey], ["Evidence URL", reference.evidenceUrl]]} /> : <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={status === "filing"} onClick={() => void fileDecision()} type="button">{status === "filing" ? "Filing…" : "File decision reference"}</button>}
       <form className="grid gap-4 border-t pt-5 sm:grid-cols-2" onSubmit={approve}>
         <label className="grid gap-2 text-sm font-semibold sm:col-span-2">Rationale<textarea className="min-h-24 rounded-md border p-3 font-normal" name="rationale" required /></label>
-        <label className="grid gap-2 text-sm font-semibold">Expires at (RFC 3339)<input className="min-h-11 rounded-md border px-3 font-normal" name="expiresAt" placeholder="2026-08-25T17:00:00Z" required /></label>
-        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 sm:self-end" disabled={!reference || status === "approving" || status === "approved"} type="submit">{status === "approving" ? "Approving…" : status === "approved" ? "Approved" : "Approve"}</button>
+        <label className="grid gap-2 text-sm font-semibold">Expires at{request.source === "envelope_request" ? " (optional)" : " (RFC 3339)"}<input className="min-h-11 rounded-md border px-3 font-normal" name="expiresAt" placeholder="2026-08-25T17:00:00Z" required={request.source !== "envelope_request"} /></label>
+        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 sm:self-end" disabled={(request.source !== "envelope_request" && !reference) || status === "approving" || status === "rejecting" || status === "approved" || status === "rejection-complete"} type="submit">{status === "approving" ? "Approving…" : status === "approved" ? "Approved" : "Approve"}</button>
       </form>
-      {status !== "idle" && status !== "filing" && status !== "approving" ? <p className={status === "approved" || status === "filed" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "approved" || status === "filed" ? "status" : "alert"}>{actionMessage(status)}</p> : null}
+      {request.source === "envelope_request" ? <form className="grid gap-3" onSubmit={rejectEnvelope}>
+        <label className="grid gap-2 text-sm font-semibold">Rejection reason (optional)<textarea className="min-h-20 rounded-md border p-3 font-normal" maxLength={2000} name="reason" /></label>
+        <button className="min-h-11 rounded-md border border-red-700 px-4 py-2 text-sm font-semibold text-red-800 disabled:opacity-50 sm:justify-self-start" disabled={status === "approving" || status === "rejecting" || status === "approved" || status === "rejection-complete"} type="submit">{status === "rejecting" ? "Rejecting…" : "Reject request"}</button>
+      </form> : null}
+      {status !== "idle" && status !== "filing" && status !== "approving" && status !== "rejecting" ? <p className={status === "approved" || status === "filed" || status === "rejection-complete" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "approved" || status === "filed" || status === "rejection-complete" ? "status" : "alert"}>{actionMessage(status)}</p> : null}
     </li>
   );
 }
