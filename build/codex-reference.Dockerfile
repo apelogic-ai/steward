@@ -7,7 +7,7 @@ RUN curl --fail --silent --show-error --location \
         "https://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-libc-dev_${LINUX_LIBC_DEV_VERSION}_amd64.deb" \
         --output /tmp/linux-libc-dev.deb \
     && printf '%s  %s\n' "${LINUX_LIBC_DEV_SHA256}" /tmp/linux-libc-dev.deb | sha256sum --check --strict \
-    && dpkg --install /tmp/linux-libc-dev.deb \
+    && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin dpkg --install /tmp/linux-libc-dev.deb \
     && rm /tmp/linux-libc-dev.deb \
     && npm install --global --ignore-scripts=false @openai/codex@0.140.0 tar@7.5.22 \
     && npm pack --silent tar@7.5.22 --pack-destination /tmp \

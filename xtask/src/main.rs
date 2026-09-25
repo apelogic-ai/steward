@@ -1533,6 +1533,7 @@ mod tests {
             "codex-cli 0.140.0",
             "LINUX_LIBC_DEV_VERSION=6.8.0-142.142",
             "LINUX_LIBC_DEV_SHA256=937db1a88a4fa2ea97fd4eab89f2cd9d077290f6a26bcd27b1a6d24fa3d706b6",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin dpkg --install",
             "tar@7.5.22",
             "/usr/lib/node_modules/npm/node_modules/tar/package.json",
             "node --print 'require(\"/usr/lib/node_modules/tar/package.json\").version'",
