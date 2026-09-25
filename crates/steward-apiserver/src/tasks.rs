@@ -655,6 +655,12 @@ struct IdentityTaskClaims {
     email_verified: Option<bool>,
     #[serde(default)]
     groups: Option<Vec<String>>,
+    #[serde(default)]
+    actor_login: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    canonical_user_id: Option<String>,
     identity_contract: String,
     #[serde(default)]
     source_provenance: Option<SourceProvenance>,
@@ -841,6 +847,15 @@ fn validate_identity_task_claims(
             .is_some_and(|groups| groups.len() <= 16);
     let valid_federated_identity = claims.identity_contract == FEDERATED_TASK_CONTRACT
         && valid_github_actions_subject(&claims.sub)
+        && claims.canonical_user_id.is_none()
+        && claims
+            .actor_login
+            .as_deref()
+            .is_none_or(|value| bounded_display_metadata(value, 128))
+        && claims
+            .display_name
+            .as_deref()
+            .is_none_or(|value| bounded_display_metadata(value, 256))
         && claims
             .groups
             .as_ref()
@@ -912,6 +927,13 @@ fn valid_github_actions_subject(value: &str) -> bool {
 
 fn bounded_non_whitespace(value: &str, maximum: usize) -> bool {
     !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_whitespace)
+}
+
+fn bounded_display_metadata(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
 }
 
 #[cfg(test)]
@@ -3454,6 +3476,8 @@ mod identity_task_authentication_tests {
         nbf: u64,
         jti: &'a str,
         identity_contract: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        canonical_user_id: Option<&'a str>,
     }
 
     fn key_material() -> Result<(EncodingKey, JwkSet), String> {
@@ -3524,10 +3548,41 @@ mod identity_task_authentication_tests {
                 nbf: now.saturating_sub(1),
                 jti: "federated-task-test-jti",
                 identity_contract: "steward-task-v3",
+                canonical_user_id: None,
             },
             key,
         )
         .map_err(|error| format!("sign federated task token: {error}"))
+    }
+
+    #[test]
+    fn federated_task_contract_rejects_caller_supplied_canonical_identity()
+    -> Result<(), String> {
+        let (key, jwks) = key_material()?;
+        let now = jsonwebtoken::get_current_timestamp();
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(KID.to_owned());
+        let assertion = encode(
+            &header,
+            &FederatedClaims {
+                iss: ISSUER,
+                sub: "github-actions:actor:16106037",
+                aud: vec![AUDIENCE],
+                exp: now + 60,
+                iat: now,
+                nbf: now.saturating_sub(1),
+                jti: "caller-identity-injection",
+                identity_contract: "steward-task-v3",
+                canonical_user_id: Some("usr_0123456789abcdef0123456789abcdef"),
+            },
+            &key,
+        )
+        .map_err(|error| format!("sign injected identity token: {error}"))?;
+        assert!(matches!(
+            verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE),
+            Err(TaskAuthenticationError::InvalidCredentials)
+        ));
+        Ok(())
     }
 
     #[test]
