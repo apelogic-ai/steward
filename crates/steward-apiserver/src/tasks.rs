@@ -50,8 +50,7 @@ use uuid::Uuid;
 use crate::WorkflowReference;
 use crate::execution_bindings::ExecutionBindingCatalog;
 use crate::task_auth::{
-    FEDERATED_TASK_TOKEN_CONTRACT, LEGACY_TASK_TOKEN_CONTRACT,
-    valid_authorization_server_url,
+    FEDERATED_TASK_TOKEN_CONTRACT, LEGACY_TASK_TOKEN_CONTRACT, valid_authorization_server_url,
 };
 use crate::{
     AdmissionLedger, ApiError, BoxFuture, KubernetesTokenReviewAudience,
@@ -485,6 +484,8 @@ fn resolve_versioned_task_plan(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskAuthenticationError {
     InvalidCredentials,
+    Unassociated { issuer: String, subject: String },
+    Disabled { issuer: String, subject: String },
     Unavailable,
 }
 
@@ -860,10 +861,7 @@ fn validate_identity_task_claims(
             .groups
             .as_ref()
             .is_none_or(|groups| groups.len() <= 16)
-        && claims
-            .email
-            .as_deref()
-            .is_none_or(valid_email)
+        && claims.email.as_deref().is_none_or(valid_email)
         && claims.email.is_some() == claims.email_verified.is_some()
         && claims.email_verified.is_none_or(|verified| verified);
     if claims.iss != issuer
@@ -1295,6 +1293,15 @@ pub enum TaskAdmissionDelta {
 #[serde(rename_all = "camelCase")]
 pub struct TaskErrorResponse {
     pub error: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FederatedTaskIdentityErrorResponse {
+    pub error: String,
+    pub issuer: String,
+    pub subject: String,
+    pub message: String,
 }
 
 #[derive(utoipa::ToSchema)]
@@ -2688,6 +2695,12 @@ async fn resolve_task_identity<I: TaskIdentityResolver>(
         .await
         .map_err(|error| match error {
             TaskAuthenticationError::InvalidCredentials => ApiError::TaskAuthentication,
+            TaskAuthenticationError::Unassociated { issuer, subject } => {
+                ApiError::TaskIdentityUnassociated { issuer, subject }
+            }
+            TaskAuthenticationError::Disabled { issuer, subject } => {
+                ApiError::TaskIdentityDisabled { issuer, subject }
+            }
             TaskAuthenticationError::Unavailable => ApiError::TaskAuthenticationUnavailable,
         })
 }
@@ -3434,9 +3447,9 @@ mod workflow_request_tests {
 #[cfg(test)]
 mod identity_task_authentication_tests {
     use super::{
-        IdentityTaskClaims, TaskAuthenticationError, task_identity_from_identity_claims,
-        valid_identity_issuer, validate_identity_task_jwks, verify_identity_task_token,
-        MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS,
+        IdentityTaskClaims, MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS, TaskAuthenticationError,
+        task_identity_from_identity_claims, valid_identity_issuer, validate_identity_task_jwks,
+        verify_identity_task_token,
     };
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -3541,8 +3554,7 @@ mod identity_task_authentication_tests {
     ) -> Result<String, String> {
         let mut header = Header::new(Algorithm::ES256);
         header.kid = Some(kid.to_owned());
-        encode(&header, &claims, key)
-        .map_err(|error| format!("sign federated task token: {error}"))
+        encode(&header, &claims, key).map_err(|error| format!("sign federated task token: {error}"))
     }
 
     fn federated_claims(now: u64) -> FederatedClaims<'static> {
@@ -3565,8 +3577,7 @@ mod identity_task_authentication_tests {
     }
 
     #[test]
-    fn federated_task_contract_rejects_caller_supplied_canonical_identity()
-    -> Result<(), String> {
+    fn federated_task_contract_rejects_caller_supplied_canonical_identity() -> Result<(), String> {
         let (key, jwks) = key_material()?;
         let now = jsonwebtoken::get_current_timestamp();
         let mut header = Header::new(Algorithm::ES256);
@@ -3595,8 +3606,8 @@ mod identity_task_authentication_tests {
     }
 
     #[test]
-    fn federated_task_contract_fails_closed_on_subject_key_signature_and_time()
-    -> Result<(), String> {
+    fn federated_task_contract_fails_closed_on_subject_key_signature_and_time() -> Result<(), String>
+    {
         let (key, jwks) = key_material()?;
         let (other_key, _) = key_material()?;
         let now = jsonwebtoken::get_current_timestamp();
@@ -3673,7 +3684,10 @@ mod identity_task_authentication_tests {
             "https://identity.example.test#fragment",
             "https://identity.example.test/../issuer",
         ] {
-            assert!(!valid_identity_issuer(invalid), "accepted invalid issuer {invalid}");
+            assert!(
+                !valid_identity_issuer(invalid),
+                "accepted invalid issuer {invalid}"
+            );
         }
     }
 

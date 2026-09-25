@@ -116,11 +116,13 @@ fn validate_resource_url(value: &str, allow_loopback_http: bool) -> Result<(), S
     Ok(())
 }
 
-fn validate_authorization_server_url(
-    value: &str,
-    allow_loopback_http: bool,
-) -> Result<(), String> {
-    validate_url(value, allow_loopback_http, "task token authorization server").map(|_| ())
+fn validate_authorization_server_url(value: &str, allow_loopback_http: bool) -> Result<(), String> {
+    validate_url(
+        value,
+        allow_loopback_http,
+        "task token authorization server",
+    )
+    .map(|_| ())
 }
 
 fn validate_url(
@@ -168,8 +170,8 @@ mod tests {
     use super::{TaskAuthDiscoveryConfig, task_auth_discovery_router};
 
     #[tokio::test]
-    async fn discovery_advertises_exact_resource_issuer_and_enabled_contracts()
-    -> Result<(), String> {
+    async fn discovery_advertises_exact_resource_issuer_and_enabled_contracts() -> Result<(), String>
+    {
         let config = TaskAuthDiscoveryConfig::new(
             "https://steward.example.test".to_owned(),
             "https://identity.example.test".to_owned(),
@@ -232,8 +234,8 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body)
-                .map_err(|error| error.to_string())?["error"],
+            serde_json::from_slice::<serde_json::Value>(&body).map_err(|error| error.to_string())?
+                ["error"],
             "task_auth.discovery_unavailable"
         );
         Ok(())

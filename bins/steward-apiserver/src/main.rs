@@ -12,6 +12,7 @@ use steward_adapter_codex::CodexTaskExecutionAdapter;
 use steward_adapter_github_artifact::GitHubArtifactVerifier;
 use steward_adapter_github_source::{GitHubAppCredentials, GitHubSourceAdapter};
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
+use steward_apiserver::task_auth::{TaskAuthDiscoveryConfig, task_auth_discovery_router};
 use steward_apiserver::{
     ConfiguredTaskIdentityResolver, ExecutionBindingCatalog,
     IdentityOrKubernetesTokenAuthenticator, KubeRuntimeRepository, KubernetesTokenAuthenticator,
@@ -19,9 +20,6 @@ use steward_apiserver::{
     MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, TaskApiConfig, agent_runs_ui, browser_admin,
     browser_auth, connections, google_oidc, governed_connections, router, stable_runtime_bridge,
     task_router, user_envelopes, workflows,
-};
-use steward_apiserver::task_auth::{
-    TaskAuthDiscoveryConfig, task_auth_discovery_router,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
@@ -484,12 +482,8 @@ fn configured_task_identity_resolver(
     let issuer = required(issuer)?;
     let discovery = match resource {
         Some(resource) => Some(
-            TaskAuthDiscoveryConfig::new(
-                resource,
-                issuer.clone(),
-                federated_subjects_enabled,
-            )
-            .map_err(io::Error::other)?,
+            TaskAuthDiscoveryConfig::new(resource, issuer.clone(), federated_subjects_enabled)
+                .map_err(io::Error::other)?,
         ),
         None if federated_subjects_enabled => {
             return Err(io::Error::other(
