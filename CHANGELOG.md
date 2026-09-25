@@ -33,8 +33,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Fixed
 
 - Kept registry-mirror progress output separate from its machine-readable JSONL
-  result. The `v0.2.4` workflow stopped during live mirror conformance and did
-  not publish a GitHub release or complete handoff.
+  result. The `v0.2.4` workflow stopped during live mirror conformance and the
+  Codex image scan; it did not publish a GitHub release or complete handoff.
+- Updated the Codex reference runtime's inherited kernel headers and Node tar
+  packages, recorded narrowly scoped VEX evidence for kernel implementations
+  absent from the image, and added the complete native `linux/amd64` image scan
+  to pull-request CI before a release tag can be cut.
 
 ## [0.2.4] - 2026-09-24
 

@@ -242,6 +242,7 @@ jobs:
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
           image-ref: ghcr.io/${{ github.repository_owner }}/steward-codex-runtime@${{ steps.build.outputs.digest }}
+          trivy-config: security/codex-reference-runtime.trivy.yaml
           format: json
           output: dist/codex-reference-runtime.vulnerabilities.json
           exit-code: "0"
@@ -259,6 +260,7 @@ jobs:
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
           image-ref: ghcr.io/${{ github.repository_owner }}/steward-codex-runtime@${{ steps.build.outputs.digest }}
+          trivy-config: security/codex-reference-runtime.trivy.yaml
           format: table
           exit-code: "1"
           severity: CRITICAL

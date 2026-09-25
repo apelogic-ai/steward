@@ -206,6 +206,9 @@ jobs:
       - name: Render the chart and build all component images
         run: scripts/validate-release-artifacts.sh --build-images
 
+      - name: Build Codex reference runtime
+        run: docker build --platform linux/amd64 --file build/codex-reference.Dockerfile --tag steward-codex-runtime:release-validation .
+
       - name: Verify Gateway API backend TLS with Envoy Gateway
         run: scripts/steward-gateway-backend-tls-e2e.sh
 
@@ -237,6 +240,15 @@ jobs:
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
           image-ref: steward-bridge:release-validation
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+
+      - name: Enforce critical Codex reference runtime policy
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: steward-codex-runtime:release-validation
+          trivy-config: security/codex-reference-runtime.trivy.yaml
           format: table
           exit-code: "1"
           severity: CRITICAL
