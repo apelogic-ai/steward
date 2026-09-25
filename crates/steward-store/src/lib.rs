@@ -284,14 +284,11 @@ mod migration_tests {
     #[test]
     fn federated_subject_migration_is_embedded_additively() {
         let migrations = sqlx::migrate!("../../migrations");
-        let migration = migrations
-            .migrations
-            .iter()
-            .find(|migration| migration.version == 40)
-            .expect("migration 40 must remain embedded once released");
         assert!(
-            migration.description.contains("federated subject"),
-            "migration 40 must describe its additive federated-subject boundary"
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 40 && migration.description.contains("federated subject")
+            }),
+            "migration 40 must remain embedded and describe its additive federated-subject boundary"
         );
     }
 }
