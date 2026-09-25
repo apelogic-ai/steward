@@ -46,7 +46,8 @@
     "parentRef": {"name": "public-gateway", "namespace": "gateway-system", "sectionName": "https"},
     "certificateNames": ["*.example.test"],
     "tlsSecretName": "steward-edge-tls",
-    "issuerRef": {"name": "platform-ca", "kind": "ClusterIssuer"}
+    "issuerRef": {"name": "platform-ca", "kind": "ClusterIssuer"},
+    "backendTls": {"caConfigMap": {"name": "steward-apiserver-ca", "namespace": "steward-system", "key": "ca.crt"}}
   },
   "publicEndpoints": [
     {"name": "steward", "hostname": "steward.example.test"}
@@ -83,7 +84,7 @@
   },
   "execution": {
     "endpoints": {
-      "inference": "https://inference.example.test/v1",
+      "inference": "https://inference.example.test/v1/responses",
       "mcpGateway": "https://mcp.example.test/mcp",
       "openshell": "https://openshell.example.test:8080",
       "openshellServerName": "openshell.example.test",
@@ -93,7 +94,7 @@
       "mintIssuer": "https://mint.example.test",
       "spiffeTrustDomain": "example.test"
     },
-    "connectionsBridge": {"mcpGatewayOrigin": "https://mcp.example.test", "mcpGatewayVersion": "0.4.9"},
+    "connectionsBridge": {"mcpGatewayOrigin": "https://mcp.example.test", "mcpGatewayAuthorityContract": "steward.connections.github/v2"},
     "binding": {
       "agentRef": "codex@0.140.0",
       "displayName": "Codex 0.140.0",
@@ -104,6 +105,19 @@
       "toolsProfile": "steward-mcp-gw",
       "inferenceProfile": "steward-litellm"
     }
+  },
+  "capabilityCatalog": {
+    "schemaVersion": "steward.capability-catalog/v1",
+    "models": [
+      {"provider": "litellm", "model": "gpt-5.4"}
+    ],
+    "tools": [
+      {"provider": "github", "resource": "actions_get", "action": "read"}
+    ]
+  },
+  "networkPolicy": {
+    "kubeApiCidrs": ["192.0.2.10/32"],
+    "postgresCidrs": ["192.0.2.20/32"]
   },
   "browserAuth": {
     "clientId": "example.apps.example.com",

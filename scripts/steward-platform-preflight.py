@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import pathlib
 import re
@@ -108,6 +109,78 @@ def validate_digest(value: str, path: str) -> None:
         raise ValidationError(f"{path} is an all-zero placeholder digest")
 
 
+def validate_required_cidrs(parent: dict[str, Any], key: str, path: str) -> list[str]:
+    cidrs = parent.get(key)
+    if not isinstance(cidrs, list) or not cidrs:
+        raise ValidationError(f"{path}.{key} must be a non-empty CIDR array")
+    seen: set[str] = set()
+    for index, value in enumerate(cidrs):
+        if not isinstance(value, str):
+            raise ValidationError(f"{path}.{key}[{index}] must be a CIDR string")
+        try:
+            network = ipaddress.ip_network(value, strict=True)
+        except ValueError as error:
+            raise ValidationError(f"{path}.{key}[{index}] is not a valid CIDR: {value}") from error
+        normalized = str(network)
+        if normalized in seen:
+            raise ValidationError(f"{path}.{key} contains duplicate CIDR {normalized}")
+        seen.add(normalized)
+    return cidrs
+
+
+def validate_capability_catalog(
+    catalog: dict[str, Any], requires_inference: bool, requires_tools: bool
+) -> None:
+    require_exact_keys(catalog, {"schemaVersion", "models", "tools"}, "capabilityCatalog")
+    if catalog.get("schemaVersion") != "steward.capability-catalog/v1":
+        raise ValidationError("capabilityCatalog.schemaVersion must equal steward.capability-catalog/v1")
+    models = catalog.get("models")
+    tools = catalog.get("tools")
+    if not isinstance(models, list):
+        raise ValidationError("capabilityCatalog.models must be an array")
+    if not isinstance(tools, list):
+        raise ValidationError("capabilityCatalog.tools must be an array")
+    if not models and not tools:
+        raise ValidationError("capabilityCatalog must contain at least one model or tool")
+
+    model_keys: set[tuple[str, str]] = set()
+    for index, model in enumerate(models):
+        if not isinstance(model, dict):
+            raise ValidationError(f"capabilityCatalog.models[{index}] must be an object")
+        require_exact_keys(model, {"provider", "model"}, f"capabilityCatalog.models[{index}]")
+        model_key = (
+            require_string(model, "provider", f"capabilityCatalog.models[{index}]"),
+            require_string(model, "model", f"capabilityCatalog.models[{index}]"),
+        )
+        if model_key in model_keys:
+            raise ValidationError(
+                f"capabilityCatalog.models contains duplicate entry {model_key[0]}/{model_key[1]}"
+            )
+        model_keys.add(model_key)
+
+    tool_keys: set[tuple[str, str, str]] = set()
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise ValidationError(f"capabilityCatalog.tools[{index}] must be an object")
+        require_exact_keys(tool, {"provider", "resource", "action"}, f"capabilityCatalog.tools[{index}]")
+        tool_key = (
+            require_string(tool, "provider", f"capabilityCatalog.tools[{index}]"),
+            require_string(tool, "resource", f"capabilityCatalog.tools[{index}]"),
+            require_string(tool, "action", f"capabilityCatalog.tools[{index}]"),
+        )
+        if tool_key in tool_keys:
+            raise ValidationError(
+                "capabilityCatalog.tools contains duplicate entry "
+                f"{tool_key[0]}/{tool_key[1]}/{tool_key[2]}"
+            )
+        tool_keys.add(tool_key)
+
+    if requires_inference and not models:
+        raise ValidationError("capabilityCatalog.models must be non-empty when the binding uses inference")
+    if requires_tools and not tools:
+        raise ValidationError("capabilityCatalog.tools must be non-empty when the binding uses tools")
+
+
 def tagged_repository(reference: str, path: str) -> str:
     if any(character.isspace() for character in reference) or "@" in reference:
         raise ValidationError(f"{path} must be a tagged OCI reference")
@@ -150,6 +223,8 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
             "browserAuth",
             "apiTlsSecretName",
             "webhookTlsSecretName",
+            "capabilityCatalog",
+            "networkPolicy",
         },
         "input",
     )
@@ -263,11 +338,31 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
         raise ValidationError("database.tls.ca must be omitted when mode is disabled")
 
     gateway = require_object(data, "gateway", "input")
+    require_exact_keys(
+        gateway,
+        {"parentRef", "certificateNames", "tlsSecretName", "issuerRef", "backendTls"},
+        "gateway",
+    )
     parent = require_object(gateway, "parentRef", "gateway")
     for key in ("name", "namespace", "sectionName"):
         validate_name(require_string(parent, key, "gateway.parentRef"), f"gateway.parentRef.{key}")
     if parent["namespace"] != namespaces["gateway"]:
         raise ValidationError("gateway.parentRef.namespace must equal namespaces.gateway")
+
+    validate_name(require_string(gateway, "tlsSecretName", "gateway"), "gateway.tlsSecretName")
+    issuer = require_object(gateway, "issuerRef", "gateway")
+    require_exact_keys(issuer, {"name", "kind"}, "gateway.issuerRef")
+    for key in ("name", "kind"):
+        require_string(issuer, key, "gateway.issuerRef")
+    backend_tls = require_object(gateway, "backendTls", "gateway")
+    require_exact_keys(backend_tls, {"caConfigMap"}, "gateway.backendTls")
+    backend_ca = require_object(backend_tls, "caConfigMap", "gateway.backendTls")
+    require_exact_keys(backend_ca, {"name", "namespace", "key"}, "gateway.backendTls.caConfigMap")
+    validate_name(require_string(backend_ca, "name", "gateway.backendTls.caConfigMap"), "gateway.backendTls.caConfigMap.name")
+    if require_string(backend_ca, "key", "gateway.backendTls.caConfigMap") != "ca.crt":
+        raise ValidationError("gateway.backendTls.caConfigMap.key must equal ca.crt")
+    if require_string(backend_ca, "namespace", "gateway.backendTls.caConfigMap") != namespaces["steward"]:
+        raise ValidationError("gateway.backendTls.caConfigMap.namespace must equal namespaces.steward")
 
     certificate_names = gateway.get("certificateNames")
     if not isinstance(certificate_names, list) or not certificate_names:
@@ -342,6 +437,11 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
     if external["database"]["name"] != database_secret["name"]:
         raise ValidationError("externalSecrets.database.name must equal database.urlSecret.name")
 
+    network_policy = require_object(data, "networkPolicy", "input")
+    require_exact_keys(network_policy, {"kubeApiCidrs", "postgresCidrs"}, "networkPolicy")
+    validate_required_cidrs(network_policy, "kubeApiCidrs", "networkPolicy")
+    validate_required_cidrs(network_policy, "postgresCidrs", "networkPolicy")
+
     execution = require_object(data, "execution", "input")
     endpoints = require_object(execution, "endpoints", "execution")
     for key in (
@@ -361,7 +461,12 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
     bridge_origin = require_string(bridge, "mcpGatewayOrigin", "execution.connectionsBridge")
     if not bridge_origin.startswith("https://"):
         raise ValidationError("execution.connectionsBridge.mcpGatewayOrigin must use HTTPS")
-    require_string(bridge, "mcpGatewayVersion", "execution.connectionsBridge")
+    require_exact_keys(bridge, {"mcpGatewayOrigin", "mcpGatewayAuthorityContract"}, "execution.connectionsBridge")
+    if require_string(bridge, "mcpGatewayAuthorityContract", "execution.connectionsBridge") not in (
+        "steward.connections.github/v1",
+        "steward.connections.github/v2",
+    ):
+        raise ValidationError("execution.connectionsBridge.mcpGatewayAuthorityContract is unsupported")
     binding = require_object(execution, "binding", "execution")
     for key in ("agentRef", "displayName", "adapter", "executable", "expectedVersion", "runtimeName"):
         require_string(binding, key, "execution.binding")
@@ -402,9 +507,17 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
         )
     profile_ids = {profile["name"] for profile in profiles}
     for key in ("toolsProfile", "inferenceProfile"):
+        if key not in binding:
+            continue
         selected = require_string(binding, key, "execution.binding")
         if selected not in profile_ids:
             raise ValidationError(f"execution.binding.{key} must select one providerProfiles name")
+
+    validate_capability_catalog(
+        require_object(data, "capabilityCatalog", "input"),
+        requires_inference="inferenceProfile" in binding,
+        requires_tools="toolsProfile" in binding,
+    )
 
     config_maps = require_object(data, "externalConfigMaps", "input")
     workload_trust = require_object(config_maps, "workloadExchangeTrust", "externalConfigMaps")
@@ -427,6 +540,7 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
     lock = data["deploymentLock"]
     endpoint = steward_endpoint(data)
     parent = data["gateway"]["parentRef"]
+    backend_tls = data["gateway"]["backendTls"]
     database = data["database"]
     external = data["externalSecrets"]
     chart_lock = lock["chartValues"]
@@ -446,6 +560,13 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
                 "hostname": endpoint["hostname"],
                 "apiPaths": [{"type": "PathPrefix", "value": "/api"}],
                 "webPaths": [{"type": "PathPrefix", "value": "/"}],
+                "backendTls": {
+                    "hostname": f"steward-apiserver.{data['namespaces']['steward']}.svc.cluster.local",
+                    "caConfigMap": {
+                        "name": backend_tls["caConfigMap"]["name"],
+                        "key": backend_tls["caConfigMap"]["key"],
+                    },
+                },
             },
         },
         "browserAuth": {
@@ -477,7 +598,8 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
             "artifactTrust": {"mode": "operator-pinned"},
             "image": chart_lock["connectionsBridge"]["image"],
             "mcpGatewayOrigin": execution["connectionsBridge"]["mcpGatewayOrigin"],
-            "mcpGatewayVersion": execution["connectionsBridge"]["mcpGatewayVersion"],
+            "mcpGatewayAuthorityContract": execution["connectionsBridge"]["mcpGatewayAuthorityContract"],
+            "mcpGatewayVersion": "",
             "runtimeNamespace": data["namespaces"]["runtime"],
         },
         "workloadExchangeTrust": {
@@ -488,6 +610,7 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
         "config": {
             "taskOrchestrationMode": "active",
             "apiserver": {
+                "capabilityCatalog": data["capabilityCatalog"],
                 "inferenceEndpoint": endpoints["inference"],
                 "mcpGatewayEndpoint": endpoints["mcpGateway"],
                 "executionBindingsMode": "active",
@@ -502,8 +625,12 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
                             "executable": binding["executable"],
                             "versionProbe": {"arguments": ["--version"], "expectedStdout": binding["expectedVersion"]},
                             "providerProfiles": {
-                                "tools": {"id": binding["toolsProfile"], "digest": profile_digests[binding["toolsProfile"]]},
-                                "inference": {"id": binding["inferenceProfile"], "digest": profile_digests[binding["inferenceProfile"]]},
+                                key.removesuffix("Profile"): {
+                                    "id": binding[key],
+                                    "digest": profile_digests[binding[key]],
+                                }
+                                for key in ("toolsProfile", "inferenceProfile")
+                                if key in binding
                             },
                         }
                     ],
@@ -533,6 +660,8 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
             "openshellNamespace": data["namespaces"]["openshell"],
             "apiserverIngressNamespaces": [data["namespaces"]["arc"]],
             "browserAuthEgressCidrs": data["browserAuth"]["egressCidrs"],
+            "kubeApiCidrs": data["networkPolicy"]["kubeApiCidrs"],
+            "postgresCidrs": data["networkPolicy"]["postgresCidrs"],
         },
     }
     if database["tls"]["mode"] == "verify-full":
@@ -745,6 +874,13 @@ def generate(args: argparse.Namespace) -> int:
         f"runtime namespace: {data['namespaces']['runtime']}\n"
         f"public endpoint: {steward_endpoint(data)['hostname']}\n"
         f"Gateway: {data['gateway']['parentRef']['namespace']}/{data['gateway']['parentRef']['name']}\n"
+        f"Capability models: {len(data['capabilityCatalog']['models'])}\n"
+        f"Capability tools: {len(data['capabilityCatalog']['tools'])}\n"
+        f"Execution bindings: {len(values['config']['apiserver']['executionBindings']['bindings'])}\n"
+        f"Runtime namespaces: {len(values['runtimeNamespaces'])}\n"
+        f"API caller namespaces: {len(values['networkPolicy']['apiserverIngressNamespaces'])}\n"
+        f"Kubernetes API CIDRs: {len(data['networkPolicy']['kubeApiCidrs'])}\n"
+        f"PostgreSQL CIDRs: {len(data['networkPolicy']['postgresCidrs'])}\n"
         "Secret bodies emitted: no\n"
     )
     (args.output / "summary.txt").write_text(summary, encoding="utf-8")

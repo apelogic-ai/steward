@@ -107,7 +107,7 @@ if [[ "${chart_contract_mode}" == customer-v1 ]]; then
   image_values+=(
     --set execution.enabled=true
     --set-string tls.webhook.caBundlePem=public-validation-ca
-    --set-string config.apiserver.inferenceEndpoint=https://inference.example.test/v1
+    --set-string config.apiserver.inferenceEndpoint=https://inference.example.test/v1/responses
     --set-string config.controller.openshellEndpoint=https://gateway.example.test:8080
     --set-string config.controller.openshellServerName=gateway.example.test
     --set-string config.controller.workloadExchangeEndpoint=https://identity.example.test/v1/workload/exchange

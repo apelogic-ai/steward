@@ -328,8 +328,10 @@ The recommended deployment path is:
    must move to another registry, producing `steward.deployment-lock/v1`;
 3. give that complete lock to the released
    [platform preflight](platform-preflight.md), together with the explicit
-   namespace, endpoint, certificate, Secret-reference, and provider-profile
-   inputs; and
+   namespace, endpoint, certificate, backend-TLS CA ConfigMap,
+   Secret-reference, and provider-profile inputs. Start from the copy-ready
+   [`governed-complete.json`](../../config/platform-preflight/v1/examples/governed-complete.json)
+   rather than assembling a partial governed values file; and
 4. install the generated `steward-values.json` only after static validation and
    the applicable live Gateway and network checks pass.
 
@@ -394,6 +396,22 @@ preserve the same immutable coordinates and cross-component relationships.
        openshellNamespace: customer-openshell
    runtimeNamespaces: [steward-tasks]
    ```
+
+   The endpoint fields have different contracts: `config.apiserver.inferenceEndpoint`
+   is the exact OpenAI-compatible Responses operation URL (ending in
+   `/v1/responses` for Codex); `config.apiserver.anthropicInferenceEndpoint` is
+   the Anthropic-compatible API base URL; and `config.controller.litellmUrl` is
+   the LiteLLM management API base URL with no operation path appended.
+
+   The complete preflight input makes the ownership boundaries explicit:
+
+   - the capability catalog is the bounded set of models and tools administrators
+     may select in templates;
+   - the execution binding selects the immutable agent image that may execute;
+   - provider profiles supply the immutable, deployment-owned inference and tool
+     connectivity rendered into that binding; and
+   - a User Envelope is the per-user authority limit evaluated by Steward at
+     admission, not a substitute for any deployment setting above.
 
    The chart references the existing `steward-litellm`,
    `steward-openshell-client`, `steward-mint`, and

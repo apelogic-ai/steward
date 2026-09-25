@@ -29,9 +29,12 @@ bundle="$temporary/platform-preflight/v1"
 "$bundle/steward-platform-preflight" validate \
   --input "$bundle/examples/compact.json" \
   --provider-profile-bundle "$provider_bundle" >/dev/null
+"$bundle/steward-platform-preflight" validate \
+  --input "$bundle/examples/governed-complete.json" \
+  --provider-profile-bundle "$provider_bundle" >/dev/null
 generated="$temporary/generated"
 "$bundle/steward-platform-preflight" generate \
-  --input "$bundle/examples/compact.json" \
+  --input "$bundle/examples/governed-complete.json" \
   --provider-profile-bundle "$provider_bundle" \
   --output "$generated" >/dev/null
 profile_result="$("$provider_bundle/bin/steward-provider-profile" validate \
