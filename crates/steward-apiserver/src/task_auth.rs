@@ -173,9 +173,7 @@ mod tests {
     fn current_task_auth_docs_match_the_implemented_contracts_and_defaults() {
         let values = include_str!("../../../charts/steward/values.yaml");
         let api = include_str!("../../../docs/task-submission-api.md");
-        let upgrade = include_str!(
-            "../../../docs/installation/federated-task-identity-upgrade.md"
-        );
+        let upgrade = include_str!("../../../docs/installation/federated-task-identity-upgrade.md");
         let chart = include_str!("../../../charts/steward/README.md");
 
         for required in [
@@ -204,7 +202,10 @@ mod tests {
             "/admin/api/v1/federated-subjects/{subject_id}/replace",
             "/admin/api/v1/federated-subjects/{subject_id}/disable",
         ] {
-            assert!(api.contains(required), "Task API documentation omits {required}");
+            assert!(
+                api.contains(required),
+                "Task API documentation omits {required}"
+            );
         }
     }
 
