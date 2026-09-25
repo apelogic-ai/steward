@@ -76,6 +76,20 @@ truth. PostgreSQL holds append-only history and observations, not current
 phase. Browser run views consume the versioned run and timeline APIs and must
 preserve provenance and data-availability distinctions.
 
+### Federated Task subjects
+
+The browser administrator API exposes read-only list/detail/audit operations at
+`/admin/api/v1/federated-subjects` and revision-checked `associate`, `replace`,
+and `disable` mutations below each subject ID. These APIs manage the exact
+verified issuer/subject association only. They do not create a canonical user,
+approve a User Envelope, or authorize a Task. Mutation actor identity always
+comes from `BrowserAdminAuthority`; request bodies cannot name the actor.
+
+An administrator should first inspect the observation and intended canonical
+user, then submit `expectedRevision` and `canonicalUserId`. A `409` requires a
+fresh read and review, not an automatic retry. Disabling may retain the former
+canonical-user reference for audit while immediately preventing resolution.
+
 ## Deployment boundary
 
 The chart routes browser API and authentication prefixes to the apiserver and

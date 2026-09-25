@@ -342,6 +342,31 @@ that allowlist remain inaccessible to both service accounts.
   delegated TokenReview audience differs. This is distinct from the exchanged
   JWT's `steward-task-api` audience. The Task API is enabled on the apiserver
   service; its internal port is `services.apiserverPort`.
+- `taskIdentity.enabled=true` selects direct Identity-issued ES256 Task tokens
+  instead of Kubernetes TokenReview. With `federatedSubjects.enabled=false`
+  (the default), Steward accepts only `steward-task-v2`; `resource` may remain
+  empty and no discovery document is published. To opt into
+  `steward-task-v3`, set the exact public Steward origin in `resource` and set
+  `federatedSubjects.enabled=true`:
+
+  ```yaml
+  taskIdentity:
+    enabled: true
+    issuer: https://identity.example.test
+    audience: steward-task-api
+    resource: https://steward.example.test
+    federatedSubjects:
+      enabled: true
+    publicJwksConfigMap:
+      name: steward-task-identity-jwks
+      key: jwks.json
+  ```
+
+  `GET /.well-known/oauth-protected-resource` then advertises that resource,
+  the exact issuer, bearer authentication, and accepted `steward-task-v2` and
+  `steward-task-v3` contracts. A verified v3 subject is recorded but receives
+  no authority until an administrator associates it with an existing active
+  canonical user. User Envelope admission remains unchanged.
 - `config.apiserver.capabilityCatalog` is the bounded, deployment-owned model/tool
   catalog used by the template editor. The chart validates it, renders it into an
   immutable content-addressed ConfigMap, mounts it read-only, and rolls the apiserver
@@ -441,7 +466,7 @@ that allowlist remain inaccessible to both service accounts.
   (`/steward/mint` by default).
 
 Both the apiserver and controller apply the embedded append-only Postgres
-migration set on startup (currently through migration `0039`). They must
+migration set on startup (currently through migration `0040`). They must
 receive the same database URL. Review the
 [installation upgrade and backup procedure](../../docs/installation/installation-guide.md#upgrade-rollback-backup-and-removal)
 before upgrading; a Helm rollback does not reverse database migrations.

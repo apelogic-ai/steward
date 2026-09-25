@@ -44,10 +44,26 @@ states fail with bounded categories that contain no claim or token material.
 
 ## Task binding
 
-The trusted TokenReview result must contain exactly one
+The default `steward-task-v2` path keeps the existing trusted TokenReview or
+direct Identity result: it must contain exactly one
 `agents.apelogic.ai/canonical-user:<user-id>` group in addition to the existing service and
 acting-user/owner groups. The Task request body rejects `canonicalUserId`, `actingUser`, and all
 other unknown fields, so the caller cannot select another person.
+
+The opt-in `steward-task-v3` path uses the exact verified `(issuer, subject)` as
+an upstream identity key. First verification creates only an `observed` record;
+it does not create a canonical user, User Envelope, Task, role, or authority.
+Administrator association names one existing active canonical user and is
+revision-checked and append-only audited. Replacement and disable are equally
+explicit. Actor login, display name, and email are metadata and are never lookup
+or matching keys. A valid v2 token may seed only its same issuer/subject and its
+already verified canonical-user binding.
+
+After association, Steward resolves the canonical user's current display email
+from the canonical store and server-authors the v3 service, acting user, owner,
+and canonical user ID. The caller cannot supply those fields. The resulting
+canonical ID enters the same Task ownership, idempotency, runtime-authority,
+source-provenance, and User Envelope admission paths described below.
 
 New Task rows bind lifecycle ownership and idempotency to
 `(service, canonical owner ID, idempotency key)`. The stable provisioned AgentRuntime name is
@@ -85,6 +101,11 @@ must not infer it from `principal`, `owner`, email, annotations, or generic `bin
 Migration `0012_canonical_user_identity.sql` is append-only. It creates the canonical user,
 external-subject, and audit ledgers. Existing Task rows remain nullable and explicitly marked for
 reconnect; no migration infers identity from email.
+
+Migration `0040_federated_subject_identity.sql` separately adds observed,
+associated, and disabled federated-subject state plus append-only audit. It does
+not backfill canonical users or reinterpret historical Tasks, runs, runtimes,
+Envelopes, or identity events.
 
 The following integrations consume this foundation and must preserve its boundary:
 

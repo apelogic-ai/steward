@@ -169,6 +169,45 @@ mod tests {
 
     use super::{TaskAuthDiscoveryConfig, task_auth_discovery_router};
 
+    #[test]
+    fn current_task_auth_docs_match_the_implemented_contracts_and_defaults() {
+        let values = include_str!("../../../charts/steward/values.yaml");
+        let api = include_str!("../../../docs/task-submission-api.md");
+        let upgrade = include_str!(
+            "../../../docs/installation/federated-task-identity-upgrade.md"
+        );
+        let chart = include_str!("../../../charts/steward/README.md");
+
+        for required in [
+            "resource: \"\"",
+            "federatedSubjects:\n    # Opts into steward-task-v3 subject observation. The unchanged default accepts v2 only.\n    enabled: false",
+        ] {
+            assert!(
+                values.contains(required),
+                "chart defaults drifted from the documented compatibility boundary: {required}"
+            );
+        }
+        for document in [api, upgrade, chart] {
+            for required in [
+                "steward-task-v2",
+                "steward-task-v3",
+                "/.well-known/oauth-protected-resource",
+            ] {
+                assert!(
+                    document.contains(required),
+                    "current task-auth documentation omits {required}"
+                );
+            }
+        }
+        for required in [
+            "/admin/api/v1/federated-subjects/{subject_id}/associate",
+            "/admin/api/v1/federated-subjects/{subject_id}/replace",
+            "/admin/api/v1/federated-subjects/{subject_id}/disable",
+        ] {
+            assert!(api.contains(required), "Task API documentation omits {required}");
+        }
+    }
+
     #[tokio::test]
     async fn discovery_advertises_exact_resource_issuer_and_enabled_contracts() -> Result<(), String>
     {

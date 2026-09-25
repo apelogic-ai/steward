@@ -7,6 +7,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Added unauthenticated OAuth protected-resource discovery and an explicitly
+  enabled `steward-task-v3` contract keyed by the verified Identity issuer and
+  stable numeric GitHub actor subject. The default remains v2-only.
+- Added additive migration 0040 for idempotent federated-subject observation,
+  conflict-safe association/replacement/disable, and append-only administrator
+  audit. It performs no historical identity, Task, run, runtime, or Envelope
+  backfill.
+- Added browser-administrator APIs to inspect and manage observed federated
+  subjects. First observation and association grant no User Envelope or Task
+  authority; normal source and active User Envelope admission remain required.
+
+### Changed
+
+- Valid v2 credentials may idempotently seed only their same verified
+  issuer/subject and already-resolved canonical user, providing a non-breaking
+  transition to v3. V2 verification and admission otherwise remain unchanged.
+- Rollback now requires disabling v3 before returning to a v2-only binary and
+  preserving migration 0040 data; the federated identity upgrade guide records
+  the backup, activation, verification, and rollback sequence.
+
 ## [0.2.6] - 2026-09-24
 
 ### Fixed
