@@ -34,7 +34,7 @@ jq -n \
   --arg digest "${source_digest}" \
   '{
     schemaVersion: "steward.release-handoff/v1",
-    version: "0.2.4",
+    version: "0.2.5",
     commit: "0123456789abcdef0123456789abcdef01234567",
     chart: {reference: ("oci://" + $reference), digest: $digest},
     images: {apiserver: {reference: $reference, digest: $digest}}

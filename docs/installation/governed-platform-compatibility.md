@@ -1,8 +1,8 @@
 # Governed-platform compatibility
 
-Status: **Current release contract for Steward v0.2.4**
+Status: **Current release contract for Steward v0.2.5**
 
-The release asset `steward-governed-platform-compatibility-0.2.4.json` is the
+The release asset `steward-governed-platform-compatibility-0.2.5.json` is the
 machine-readable source of truth for the exact combination tested with this
 Steward release. It covers Steward, `steward-run`,
 `github-oidc-exchange`, OpenShell, agent-sandbox, SPIRE, MCP-GW, and LiteLLM.
@@ -14,16 +14,16 @@ Download the compatibility manifest, checksum, release handoff, and attestation
 from the same GitHub release:
 
 ```sh
-gh release download v0.2.4 \
+gh release download v0.2.5 \
   --repo apelogic-ai/steward \
-  --pattern steward-governed-platform-compatibility-0.2.4.json \
-  --pattern steward-governed-platform-compatibility-0.2.4.json.sha256 \
+  --pattern steward-governed-platform-compatibility-0.2.5.json \
+  --pattern steward-governed-platform-compatibility-0.2.5.json.sha256 \
   --pattern release-handoff.json
 
-sha256sum --check steward-governed-platform-compatibility-0.2.4.json.sha256
-gh attestation verify steward-governed-platform-compatibility-0.2.4.json \
+sha256sum --check steward-governed-platform-compatibility-0.2.5.json.sha256
+gh attestation verify steward-governed-platform-compatibility-0.2.5.json \
   --repo apelogic-ai/steward \
-  --cert-identity https://github.com/apelogic-ai/steward/.github/workflows/release.yml@refs/tags/v0.2.4
+  --cert-identity https://github.com/apelogic-ai/steward/.github/workflows/release.yml@refs/tags/v0.2.5
 ```
 
 Also compare the calculated digest with

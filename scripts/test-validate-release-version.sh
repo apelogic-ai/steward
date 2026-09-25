@@ -47,14 +47,14 @@ for mismatch in app readme guide tag; do
   fi
 done
 
-write_fixture 0.2.4 0.2.4 0.2.4 0.2.4
-test "$(bash "${root}/scripts/validate-release-version.sh" "${fixture}")" = 0.2.4
+write_fixture 0.2.5 0.2.5 0.2.5 0.2.5
+test "$(bash "${root}/scripts/validate-release-version.sh" "${fixture}")" = 0.2.5
 for mismatch in chart-readme changelog upgrade; do
-  write_fixture 0.2.4 0.2.4 0.2.4 0.2.4
+  write_fixture 0.2.5 0.2.5 0.2.5 0.2.5
   case "${mismatch}" in
-    chart-readme) sed -i.bak "s/chart \`0.2.4\`/chart \`0.1.23\`/" "${fixture}/charts/steward/README.md" ;;
-    changelog) sed -i.bak 's/\[0.2.4\]/[0.1.23]/' "${fixture}/CHANGELOG.md" ;;
-    upgrade) sed -i.bak 's/v0.2.4/v0.1.23/' "${fixture}/docs/installation/upgrade-v0.2.0.md" ;;
+    chart-readme) sed -i.bak "s/chart \`0.2.5\`/chart \`0.1.23\`/" "${fixture}/charts/steward/README.md" ;;
+    changelog) sed -i.bak 's/\[0.2.5\]/[0.1.23]/' "${fixture}/CHANGELOG.md" ;;
+    upgrade) sed -i.bak 's/v0.2.5/v0.1.23/' "${fixture}/docs/installation/upgrade-v0.2.0.md" ;;
   esac
   if bash "${root}/scripts/validate-release-version.sh" "${fixture}" >/dev/null 2>&1; then
     echo "mismatched ${mismatch} version unexpectedly passed" >&2

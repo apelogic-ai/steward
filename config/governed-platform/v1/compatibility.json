@@ -1,7 +1,7 @@
 {
   "schemaVersion": "steward.governed-platform-compatibility/v1",
   "steward": {
-    "version": "0.2.4"
+    "version": "0.2.5"
   },
   "companions": {
     "stewardRun": {
