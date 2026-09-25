@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useState, useSyncExternalStore } from "react";
 
 import {
   getBrowserPreferences,
@@ -17,6 +17,7 @@ import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspac
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
+import { ONBOARDING_WORKFLOW_PATH_KEY } from "@/workflows/contracts";
 
 type OnboardingData = {
   connections: ConnectionsCollectionResponse;
@@ -25,8 +26,28 @@ type OnboardingData = {
   runs: MyRunsResponse;
 };
 
+export function workflowSetupDone(
+  runs: Array<{ trigger?: null | { callerWorkflow: string } }>,
+  acknowledged: boolean,
+  suggestedPath: string | null,
+) {
+  if (acknowledged) return true;
+  if (!suggestedPath) return false;
+  return runs.some((run) => {
+    const workflowRef = run.trigger?.callerWorkflow.split("@", 1)[0];
+    const pathStart = workflowRef?.indexOf("/.github/workflows/") ?? -1;
+    return pathStart >= 0 && workflowRef?.slice(pathStart + 1) === suggestedPath;
+  });
+}
+
 export function OnboardingView() {
   const session = useSession();
+  const [workflowAcknowledged, setWorkflowAcknowledged] = useState(false);
+  const suggestedWorkflowPath = useSyncExternalStore(
+    () => () => undefined,
+    () => localStorage.getItem(ONBOARDING_WORKFLOW_PATH_KEY),
+    () => null,
+  );
   const [dismissal, setDismissal] = useState<"idle" | "working" | "done" | MutationFailureState>("idle");
   const load = useCallback(async () => {
     const [connections, envelopes, preferences, runs] = await Promise.all([
@@ -53,12 +74,12 @@ export function OnboardingView() {
       <ResourceBoundary state={state}>{(data) => {
         const connected = data.connections.connections.some((connection) => connection.status.phase === "connected");
         const provisioned = data.envelopes.requests.some((request) => request.status === "provisioned");
-        const workflowDetected = data.runs.runs.some((run) => Boolean(run.trigger?.callerWorkflow));
+        const workflowReady = workflowSetupDone(data.runs.runs, workflowAcknowledged, suggestedWorkflowPath);
         const firstRun = data.runs.runs.length > 0;
         const steps = [
           ["Connect GitHub", connected, "Authorize GitHub from Connections."],
           ["Provision an envelope", provisioned, "Choose any eligible named envelope template."],
-          ["Add the generated workflow", workflowDetected, "Render a published Workflow from the envelope detail and commit it to GitHub."],
+          ["Add the generated workflow", workflowReady, "Render the sample Workflow from the envelope detail and commit it to GitHub."],
           ["Run the test workflow", firstRun, "Run it from GitHub with gh workflow run or the Actions UI."],
           ["Inspect the governed run", firstRun, "Return here to inspect stages, logs, provenance, and spend."],
         ] as const;
@@ -68,6 +89,7 @@ export function OnboardingView() {
         return (
           <div className="space-y-5">
             <ol className="space-y-3">{steps.map(([label, done, detail], index) => <li className="rounded-panel border bg-panel p-5 shadow-sm" key={label}><div className="flex items-center justify-between gap-3"><h2 className="font-semibold">{index + 1}. {label}</h2><StatusBadge value={done ? "done" : "pending"} /></div><p className="mt-2 text-sm text-muted-ink">{detail}</p></li>)}</ol>
+            {!workflowReady ? <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold" onClick={() => setWorkflowAcknowledged(true)} type="button">I added the workflow</button> : null}
             <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={dismissal === "working"} onClick={async () => {
               if (session.status !== "authenticated") return;
               setDismissal("working");

@@ -131,15 +131,22 @@ def validate_required_cidrs(parent: dict[str, Any], key: str, path: str) -> list
 def validate_capability_catalog(
     catalog: dict[str, Any], requires_inference: bool, requires_tools: bool
 ) -> None:
-    require_exact_keys(catalog, {"schemaVersion", "models", "tools"}, "capabilityCatalog")
-    if catalog.get("schemaVersion") != "steward.capability-catalog/v1":
-        raise ValidationError("capabilityCatalog.schemaVersion must equal steward.capability-catalog/v1")
+    require_exact_keys(
+        catalog,
+        {"schemaVersion", "models", "tools", "catalogs"},
+        "capabilityCatalog",
+    )
+    if catalog.get("schemaVersion") != "steward.capability-catalog/v2":
+        raise ValidationError("capabilityCatalog.schemaVersion must equal steward.capability-catalog/v2")
     models = catalog.get("models")
     tools = catalog.get("tools")
+    catalogs = catalog.get("catalogs")
     if not isinstance(models, list):
         raise ValidationError("capabilityCatalog.models must be an array")
     if not isinstance(tools, list):
         raise ValidationError("capabilityCatalog.tools must be an array")
+    if not isinstance(catalogs, list):
+        raise ValidationError("capabilityCatalog.catalogs must be an array")
     if not models and not tools:
         raise ValidationError("capabilityCatalog must contain at least one model or tool")
 
@@ -162,7 +169,11 @@ def validate_capability_catalog(
     for index, tool in enumerate(tools):
         if not isinstance(tool, dict):
             raise ValidationError(f"capabilityCatalog.tools[{index}] must be an object")
-        require_exact_keys(tool, {"provider", "resource", "action"}, f"capabilityCatalog.tools[{index}]")
+        require_exact_keys(
+            tool,
+            {"provider", "resource", "action", "accessClass"},
+            f"capabilityCatalog.tools[{index}]",
+        )
         tool_key = (
             require_string(tool, "provider", f"capabilityCatalog.tools[{index}]"),
             require_string(tool, "resource", f"capabilityCatalog.tools[{index}]"),
@@ -174,6 +185,36 @@ def validate_capability_catalog(
                 f"{tool_key[0]}/{tool_key[1]}/{tool_key[2]}"
             )
         tool_keys.add(tool_key)
+        access_class = require_string(tool, "accessClass", f"capabilityCatalog.tools[{index}]")
+        if access_class not in {"read", "write", "destructive"}:
+            raise ValidationError(
+                f"capabilityCatalog.tools[{index}].accessClass must be read, write, or destructive"
+            )
+
+    catalog_keys: set[tuple[str, str]] = set()
+    for index, provider_catalog in enumerate(catalogs):
+        if not isinstance(provider_catalog, dict):
+            raise ValidationError(f"capabilityCatalog.catalogs[{index}] must be an object")
+        require_exact_keys(
+            provider_catalog,
+            {"provider", "catalogId", "version", "available"},
+            f"capabilityCatalog.catalogs[{index}]",
+        )
+        catalog_key = (
+            require_string(provider_catalog, "provider", f"capabilityCatalog.catalogs[{index}]"),
+            require_string(provider_catalog, "catalogId", f"capabilityCatalog.catalogs[{index}]"),
+        )
+        require_string(provider_catalog, "version", f"capabilityCatalog.catalogs[{index}]")
+        if not isinstance(provider_catalog.get("available"), bool):
+            raise ValidationError(
+                f"capabilityCatalog.catalogs[{index}].available must be a boolean"
+            )
+        if catalog_key in catalog_keys:
+            raise ValidationError(
+                "capabilityCatalog.catalogs contains duplicate entry "
+                f"{catalog_key[0]}/{catalog_key[1]}"
+            )
+        catalog_keys.add(catalog_key)
 
     if requires_inference and not models:
         raise ValidationError("capabilityCatalog.models must be non-empty when the binding uses inference")

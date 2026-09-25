@@ -27,6 +27,7 @@ use crate::browser_auth::{
     BrowserAuthService, BrowserMutationProof, BrowserSessionBinding, BrowserSessionContext,
     protect_browser_routes,
 };
+use crate::workflows::SAMPLE_WORKFLOW_NAME;
 use crate::{
     AgentRunAvailability, AgentRunDataStatus, BoxFuture, GithubActionsEnvelopeSelection,
     VersionedGithubActionsWorkflowContext, render_versioned_github_actions_workflow,
@@ -258,7 +259,7 @@ pub(crate) struct PublishedWorkflowOption {
 
 impl From<WorkflowRevisionRecord> for PublishedWorkflowOption {
     fn from(record: WorkflowRevisionRecord) -> Self {
-        let sample = record.name == "repo-summary";
+        let sample = record.name == SAMPLE_WORKFLOW_NAME;
         Self {
             name: record.name,
             version: record.version,
@@ -1132,8 +1133,9 @@ mod tests {
 
     use super::{
         AvailableEnvelopeTemplate, EnvelopeRequestBroker, EnvelopeRequestBrokerError,
-        EnvelopeRequestStatus, UserEnvelopeMutationProof, UserEnvelopeRequest, UserEnvelopeSession,
-        UserEnvelopeSubject, ValidatedEnvelopeRequest, envelope_usage_view, inner_router,
+        EnvelopeRequestStatus, PublishedWorkflowOption, UserEnvelopeMutationProof,
+        UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject, ValidatedEnvelopeRequest,
+        envelope_usage_view, inner_router,
     };
     use crate::BoxFuture;
     use crate::connections::{
@@ -1288,6 +1290,24 @@ mod tests {
             published_by: "usr_abcdef0123456789abcdef0123456789".to_owned(),
             published_at: "2026-08-24T00:00:00.000000Z".to_owned(),
         }
+    }
+
+    #[test]
+    fn reserved_repository_summary_is_advertised_as_the_sample_workflow() {
+        let option = PublishedWorkflowOption::from(WorkflowRevisionRecord {
+            name: "repo-summary".to_owned(),
+            version: 1,
+            display_name: "Repository summary".to_owned(),
+            agent: "example-agent@1.0.0".to_owned(),
+            prompt: "Summarize the repository.".to_owned(),
+            content_digest:
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
+            published_by: "system:sample-workflow".to_owned(),
+            published_at: "2026-09-24T00:00:00.000000Z".to_owned(),
+        });
+
+        assert!(option.sample);
+        assert_eq!(option.name, "repo-summary");
     }
 
     fn template() -> AvailableEnvelopeTemplate {

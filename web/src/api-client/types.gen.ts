@@ -747,6 +747,7 @@ export type GeneratedGithubActionsWorkflow = {
     contentType: string;
     schemaVersion: string;
     sha256: string;
+    suggestedPath: string;
     yaml: string;
 };
 

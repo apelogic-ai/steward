@@ -25,7 +25,7 @@ import { classifyMutationFailure, type MutationFailureState } from "@/data/mutat
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 import { listPublishedWorkflows, renderWorkflowForEnvelope, type PublishedWorkflowListResponse } from "@/workflows/api";
-import { workflowReference } from "@/workflows/contracts";
+import { ONBOARDING_WORKFLOW_PATH_KEY, workflowReference } from "@/workflows/contracts";
 
 function dateTime(value: string): string {
   const parsed = new Date(value);
@@ -247,7 +247,11 @@ function WorkflowGenerator({ requestId }: Readonly<{ requestId: string }>) {
     if (!selected) { setStatus("rejected"); return; }
     setStatus("loading");
     const result = await renderWorkflowForEnvelope(session.value.csrf, requestId, selected);
-    if (result.data && result.response?.ok) { setWorkflow(result.data); setStatus("idle"); } else setStatus(classifyMutationFailure(result.response?.status));
+    if (result.data && result.response?.ok) {
+      setWorkflow(result.data);
+      localStorage.setItem(ONBOARDING_WORKFLOW_PATH_KEY, result.data.workflow.suggestedPath);
+      setStatus("idle");
+    } else setStatus(classifyMutationFailure(result.response?.status));
   }
   return (
     <section className="space-y-4 rounded-panel border bg-panel p-6 shadow-sm" aria-labelledby="workflow-title">
@@ -259,7 +263,7 @@ function WorkflowGenerator({ requestId }: Readonly<{ requestId: string }>) {
         </form>
       )}</ResourceBoundary>
       {status !== "idle" && status !== "loading" ? <p role="alert" className="text-sm text-red-800">{{ conflict: "The envelope changed before the workflow could be rendered. Reload before retrying.", rejected: "Rust rejected the workflow inputs.", forbidden: "The Rust authorization boundary rejected workflow rendering.", unavailable: "The authoritative workflow service is unavailable.", error: "The workflow response could not be accepted." }[status]}</p> : null}
-      {workflow ? <div className="space-y-2"><p className="text-xs text-muted-ink">SHA-256: <span className="break-all font-mono">{workflow.workflow.sha256}</span></p><textarea aria-label="Generated workflow" className="min-h-80 w-full rounded-md border bg-canvas p-4 font-mono text-xs" readOnly value={workflow.workflow.yaml} /></div> : null}
+      {workflow ? <div className="space-y-2"><p className="text-xs text-muted-ink">Suggested path: <span className="break-all font-mono">{workflow.workflow.suggestedPath}</span></p><p className="text-xs text-muted-ink">SHA-256: <span className="break-all font-mono">{workflow.workflow.sha256}</span></p><textarea aria-label="Generated workflow" className="min-h-80 w-full rounded-md border bg-canvas p-4 font-mono text-xs" readOnly value={workflow.workflow.yaml} /></div> : null}
     </section>
   );
 }

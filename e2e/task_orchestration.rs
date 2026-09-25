@@ -1012,6 +1012,16 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     store
         .insert_envelope(&member_role, &envelope, "admin@example.com")
         .await?;
+    store
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &member_role,
+            display_name: &member_role,
+            member_roles: std::slice::from_ref(&member_role),
+            ceiling: &envelope,
+            auto_provision_threshold: Some(&envelope),
+            authored_by: "admin@example.com",
+        })
+        .await?;
     let envelope_request = store
         .reserve_envelope_request(EnvelopeRequestReservationRequest {
             owner_user_id: &identity.user_id,

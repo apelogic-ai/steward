@@ -107,12 +107,15 @@
     }
   },
   "capabilityCatalog": {
-    "schemaVersion": "steward.capability-catalog/v1",
+    "schemaVersion": "steward.capability-catalog/v2",
     "models": [
       {"provider": "litellm", "model": "gpt-5.4"}
     ],
     "tools": [
-      {"provider": "github", "resource": "actions_get", "action": "read"}
+      {"provider": "github", "resource": "actions_get", "action": "read", "accessClass": "read"}
+    ],
+    "catalogs": [
+      {"provider": "github", "catalogId": "github-tools", "version": "1.6.0", "available": true}
     ]
   },
   "networkPolicy": {

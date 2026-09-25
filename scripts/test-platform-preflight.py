@@ -173,7 +173,14 @@ class PlatformPreflightTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(defaults.returncode, 0, defaults.stderr)
-        self.assertIn("capabilityCatalog:\n      schemaVersion: steward.capability-catalog/v1\n      models: []\n      tools: []", defaults.stdout)
+        self.assertIn(
+            "capabilityCatalog:\n"
+            "      schemaVersion: steward.capability-catalog/v2\n"
+            "      models: []\n"
+            "      tools: []\n"
+            "      catalogs: []",
+            defaults.stdout,
+        )
         self.assertIn("kubeApiCidrs: []", defaults.stdout)
         self.assertIn("postgresCidrs: []", defaults.stdout)
 
@@ -412,6 +419,18 @@ class PlatformPreflightTests(unittest.TestCase):
         result = self.run_validate(self.input)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("model must be a non-empty string", result.stderr)
+
+        self.input = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        self.input["capabilityCatalog"]["tools"][0]["accessClass"] = "unknown"
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("accessClass must be read, write, or destructive", result.stderr)
+
+        self.input = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        self.input["capabilityCatalog"]["catalogs"][0]["available"] = "yes"
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("available must be a boolean", result.stderr)
 
     def test_rejects_missing_empty_or_malformed_required_network_policy_cidrs(self) -> None:
         del self.input["networkPolicy"]["kubeApiCidrs"]

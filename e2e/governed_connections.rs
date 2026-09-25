@@ -1017,6 +1017,26 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     .await?;
     assert!(continuation_redacted);
 
+    let reauthorization_count = harness.operation_count(&alice_id, "start").await?;
+    let reauthorization = connection_result(broker.start(&alice).await)?;
+    assert_ne!(
+        reauthorization.authorization_url.as_str(),
+        started.authorization_url.as_str(),
+        "MCP-GW 0.4.9 must issue a new state-bound flow when start is called while connected"
+    );
+    let reauthorization_operation = harness
+        .latest_operation(&alice_id, "start", reauthorization_count)
+        .await?;
+    harness
+        .wait_operation_finalized(reauthorization_operation, Duration::from_secs(90))
+        .await?;
+    harness.callback(oauth_state(reauthorization.authorization_url.as_str())?)?;
+    assert_eq!(
+        connection_result(broker.status(&alice).await)?.phase,
+        ConnectionPhase::Connected,
+        "connected-state start must complete as reauthorization without an intervening disconnect"
+    );
+
     harness.wait_tool_contains(
         ALICE_NAMESPACE,
         ALICE_RUNTIME,

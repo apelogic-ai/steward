@@ -19,6 +19,10 @@ use crate::browser_auth::{
 use crate::{ApiError, BoxFuture};
 
 const BROWSER_WORKFLOW_API_VERSION: &str = "steward.workflows/v1";
+pub(crate) const SAMPLE_WORKFLOW_NAME: &str = "repo-summary";
+const SAMPLE_WORKFLOW_DISPLAY_NAME: &str = "Repository summary";
+const SAMPLE_WORKFLOW_PROMPT: &str = "Summarize the repository structure, its primary components, and the most important developer entry points. Do not modify repository contents.";
+const SAMPLE_WORKFLOW_ACTOR: &str = "system:sample-workflow";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowReference {
@@ -203,6 +207,73 @@ impl WorkflowRepository for PgStore {
         publication: WorkflowPublication<'a>,
     ) -> BoxFuture<'a, Result<WorkflowRevisionRecord, StoreError>> {
         Box::pin(async move { PgStore::publish_next_workflow(self, publication).await })
+    }
+}
+
+/// Ensure the browser onboarding catalog contains one executable, deployment-bound sample.
+///
+/// The logical agent is chosen deterministically from the deployment-owned execution catalog.
+/// The reserved sample name is immutable: an existing conflicting revision fails closed instead
+/// of being reinterpreted as Steward's sample.
+pub async fn ensure_sample_workflow<L>(
+    repository: &L,
+    agents: &[ExecutionBindingAdvertisement],
+) -> Result<Option<WorkflowRevisionRecord>, StoreError>
+where
+    L: WorkflowRepository,
+{
+    if agents.is_empty() {
+        return Ok(None);
+    }
+    if let Some(existing) = repository
+        .workflow_revision(SAMPLE_WORKFLOW_NAME, 1)
+        .await?
+    {
+        return sample_workflow_record(existing, agents).map(Some);
+    }
+    let agent = agents
+        .iter()
+        .map(|agent| agent.agent_ref.as_str())
+        .min()
+        .ok_or(StoreError::InvalidWorkflow)?;
+    let digest = workflow_content_digest(agent, SAMPLE_WORKFLOW_PROMPT);
+    let publication = WorkflowPublication {
+        name: SAMPLE_WORKFLOW_NAME,
+        display_name: SAMPLE_WORKFLOW_DISPLAY_NAME,
+        agent,
+        prompt: SAMPLE_WORKFLOW_PROMPT,
+        content_digest: &digest,
+        published_by: SAMPLE_WORKFLOW_ACTOR,
+    };
+    match repository.publish_initial_workflow(publication).await {
+        Ok(record) => sample_workflow_record(record, agents).map(Some),
+        Err(StoreError::WorkflowAlreadyExists) => repository
+            .workflow_revision(SAMPLE_WORKFLOW_NAME, 1)
+            .await?
+            .ok_or(StoreError::WorkflowNotFound)
+            .and_then(|record| sample_workflow_record(record, agents))
+            .map(Some),
+        Err(error) => Err(error),
+    }
+}
+
+fn sample_workflow_record(
+    record: WorkflowRevisionRecord,
+    agents: &[ExecutionBindingAdvertisement],
+) -> Result<WorkflowRevisionRecord, StoreError> {
+    let advertised = agents.iter().any(|agent| agent.agent_ref == record.agent);
+    let digest = workflow_content_digest(&record.agent, SAMPLE_WORKFLOW_PROMPT);
+    if record.name == SAMPLE_WORKFLOW_NAME
+        && record.version == 1
+        && record.display_name == SAMPLE_WORKFLOW_DISPLAY_NAME
+        && advertised
+        && record.prompt == SAMPLE_WORKFLOW_PROMPT
+        && record.content_digest == digest
+        && record.published_by == SAMPLE_WORKFLOW_ACTOR
+    {
+        Ok(record)
+    } else {
+        Err(StoreError::InvalidWorkflow)
     }
 }
 
@@ -452,7 +523,7 @@ mod tests {
 
     use super::{
         PublishWorkflowError, PublishWorkflowRequest, WorkflowReference, WorkflowReferenceError,
-        WorkflowRepository, protected_admin_router_with_agents,
+        WorkflowRepository, ensure_sample_workflow, protected_admin_router_with_agents,
     };
     use crate::BoxFuture;
     use crate::ExecutionBindingAdvertisement;
@@ -702,6 +773,49 @@ mod tests {
                 Ok(record)
             })
         }
+    }
+
+    #[tokio::test]
+    async fn sample_workflow_is_seeded_once_with_a_deployment_agent() -> Result<(), String> {
+        let repository = FakeWorkflowRepository::default();
+        let agents = vec![
+            advertised_agent(TEST_AGENT_TWO, "Example Agent 2"),
+            advertised_agent(TEST_AGENT, "Example Agent 1"),
+        ];
+
+        let first = ensure_sample_workflow(&repository, &agents)
+            .await
+            .map_err(|error| format!("seed sample workflow: {error}"))?
+            .ok_or_else(|| "configured agents should produce a sample workflow".to_owned())?;
+        let second = ensure_sample_workflow(&repository, &agents)
+            .await
+            .map_err(|error| format!("reconcile sample workflow: {error}"))?
+            .ok_or_else(|| "the sample workflow should remain available".to_owned())?;
+
+        assert_eq!(first, second);
+        assert_eq!(first.name, "repo-summary");
+        assert_eq!(first.version, 1);
+        assert_eq!(first.agent, TEST_AGENT);
+        assert_eq!(
+            repository
+                .records
+                .lock()
+                .map_err(|_| "lock Workflow records".to_owned())?
+                .len(),
+            1,
+            "startup reconciliation must not append duplicate sample revisions"
+        );
+
+        let mut expanded_agents = agents;
+        expanded_agents.push(advertised_agent("aaa-agent@1", "Earlier Agent"));
+        assert_eq!(
+            ensure_sample_workflow(&repository, &expanded_agents)
+                .await
+                .map_err(|error| format!("reconcile expanded agent catalog: {error}"))?,
+            Some(first),
+            "adding a lexically earlier agent must not reinterpret immutable sample revision 1"
+        );
+        Ok(())
     }
 
     fn browser_cookie(response: &axum::response::Response, name: &str) -> Result<String, String> {

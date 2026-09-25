@@ -73,6 +73,7 @@ pub struct GithubActionsRenderContext {
 pub struct GeneratedGithubActionsWorkflow {
     pub schema_version: String,
     pub content_type: String,
+    pub suggested_path: String,
     pub sha256: String,
     pub yaml: String,
 }
@@ -189,6 +190,7 @@ pub fn render_versioned_github_actions_workflow(
     Ok(GeneratedGithubActionsWorkflow {
         schema_version: VERSIONED_GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA.to_owned(),
         content_type: "application/yaml".to_owned(),
+        suggested_path: format!(".github/workflows/steward-{}.yml", reference.name),
         sha256,
         yaml,
     })
@@ -388,6 +390,7 @@ pub fn render_github_actions_workflow(
     Ok(GeneratedGithubActionsWorkflow {
         schema_version: GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA.to_owned(),
         content_type: "application/yaml".to_owned(),
+        suggested_path: ".github/workflows/steward-governed.yml".to_owned(),
         sha256,
         yaml,
     })
@@ -643,6 +646,26 @@ mod tests {
                 reviewed_release: versioned_release(),
             },
         )?;
+        assert_eq!(
+            generated.suggested_path,
+            ".github/workflows/steward-repository-review.yml"
+        );
+        let differently_named = render_versioned_github_actions_workflow(
+            "repo-summary@1",
+            &VersionedGithubActionsWorkflowContext {
+                envelope: envelope(),
+                workflow_name: "repo-summary".to_owned(),
+                workflow_version: 1,
+                workflow_digest:
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_owned(),
+                reviewed_release: versioned_release(),
+            },
+        )?;
+        assert_eq!(
+            differently_named.suggested_path,
+            ".github/workflows/steward-repo-summary.yml"
+        );
         assert!(generated.yaml.contains("  workflow_dispatch:"));
         assert!(
             generated
