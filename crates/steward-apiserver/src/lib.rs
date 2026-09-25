@@ -362,6 +362,12 @@ pub struct GrantRevocationRequest {
         browser_admin::reject_envelope_request,
         browser_admin::approve,
         browser_admin::file_decision,
+        browser_admin::list_federated_subjects,
+        browser_admin::get_federated_subject,
+        browser_admin::get_federated_subject_audit,
+        browser_admin::associate_federated_subject,
+        browser_admin::replace_federated_subject,
+        browser_admin::disable_federated_subject,
         agent_runs_contract,
         agent_run_contract,
         agent_run_timeline_contract
@@ -379,6 +385,13 @@ pub struct GrantRevocationRequest {
         browser_auth::BrowserRole,
         browser_auth::SessionPrincipalResponse,
         browser_auth::SessionResponse,
+        browser_admin::BrowserFederatedSubjectView,
+        browser_admin::BrowserFederatedSubjectAuditView,
+        browser_admin::BrowserFederatedSubjectResponse,
+        browser_admin::BrowserFederatedSubjectListResponse,
+        browser_admin::BrowserFederatedSubjectAuditResponse,
+        browser_admin::AssociateFederatedSubjectBody,
+        browser_admin::DisableFederatedSubjectBody,
         AgentRunAvailability,
         AgentRunDataStatus,
         AgentRunSpendView,
@@ -4029,6 +4042,27 @@ mod tests {
                 "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1file/post",
                 "200",
             ),
+            ("/paths/~1admin~1api~1v1~1federated-subjects/get", "200"),
+            (
+                "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}/get",
+                "200",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1audit/get",
+                "200",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1associate/post",
+                "200",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1replace/post",
+                "200",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1disable/post",
+                "200",
+            ),
         ];
         for (pointer, success_status) in operations {
             let operation = document
@@ -4073,6 +4107,9 @@ mod tests {
             "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1reject/post",
             "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1approve/post",
             "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1file/post",
+            "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1associate/post",
+            "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1replace/post",
+            "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1disable/post",
         ] {
             let operation = document
                 .pointer(pointer)

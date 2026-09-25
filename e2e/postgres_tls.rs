@@ -359,6 +359,19 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
         .await?;
     assert_eq!(replaced.canonical_user_id.as_ref(), Some(&bob));
     assert_eq!(replaced.revision, 3);
+    sqlx::query("UPDATE canonical_users SET display_email = 'bob.updated@example.org' WHERE user_id = $1")
+        .bind(bob.as_str())
+        .execute(store.pool())
+        .await?;
+    assert_eq!(
+        store
+            .resolve_federated_subject(&first.issuer, &first.subject)
+            .await?
+            .display_email
+            .as_str(),
+        "bob.updated@example.org",
+        "federated resolution must use the canonical store's current display identity"
+    );
     assert!(matches!(
         store
             .replace_federated_subject_association(FederatedSubjectAssociation {
@@ -383,6 +396,12 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
     assert!(matches!(
         store
             .resolve_federated_subject(&first.issuer, &first.subject)
+            .await,
+        Err(StoreError::FederatedSubjectDisabled)
+    ));
+    assert!(matches!(
+        store
+            .seed_federated_subject_association(observation(), &bob, "steward-task-v2")
             .await,
         Err(StoreError::FederatedSubjectDisabled)
     ));

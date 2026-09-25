@@ -29,8 +29,8 @@ use steward_ports::{
     TaskExecutionAdapter, TaskExecutionPlanRequest,
 };
 use steward_store::{
-    EnvelopeRequestRecord, PgStore, StoreError, TaskOrchestrationMode, TaskRecord,
-    TaskReservationRequest, TaskRuntimeOperationRecord, TaskRuntimeOwnership,
+    EnvelopeRequestRecord, FederatedSubjectObservation, PgStore, StoreError, TaskOrchestrationMode,
+    TaskRecord, TaskReservationRequest, TaskRuntimeOperationRecord, TaskRuntimeOwnership,
     WorkflowRevisionRecord,
 };
 use steward_types::direct_package::{
@@ -566,6 +566,7 @@ pub struct IdentityTaskIdentityResolver {
     issuer: String,
     audience: String,
     canonical_identities: PgStore,
+    federated_subjects_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -592,6 +593,7 @@ impl ConfiguredTaskIdentityResolver {
         audience: String,
         jwks_file: &FilePath,
         canonical_identities: PgStore,
+        federated_subjects_enabled: bool,
     ) -> Result<Self, TaskAuthenticationError> {
         Ok(Self::Identity(
             IdentityTaskIdentityResolver::from_jwks_file(
@@ -599,6 +601,7 @@ impl ConfiguredTaskIdentityResolver {
                 audience,
                 jwks_file,
                 canonical_identities,
+                federated_subjects_enabled,
             )?,
         ))
     }
@@ -673,6 +676,7 @@ impl IdentityTaskIdentityResolver {
         audience: String,
         jwks_file: &FilePath,
         canonical_identities: PgStore,
+        federated_subjects_enabled: bool,
     ) -> Result<Self, TaskAuthenticationError> {
         if !valid_identity_issuer(&issuer) || !bounded_non_whitespace(&audience, 256) {
             return Err(TaskAuthenticationError::InvalidCredentials);
@@ -690,6 +694,7 @@ impl IdentityTaskIdentityResolver {
             issuer,
             audience,
             canonical_identities,
+            federated_subjects_enabled,
         })
     }
 }
@@ -721,16 +726,117 @@ impl TaskIdentityResolver for IdentityTaskIdentityResolver {
         Box::pin(async move {
             let claims =
                 verify_identity_task_token(assertion, &self.jwks, &self.issuer, &self.audience)?;
-            let identity = task_identity_from_identity_claims(claims)?;
-            self.canonical_identities
-                .resolve_canonical_principal(&identity.canonical_user_id, &identity.owner)
-                .await
-                .map_err(|error| match error {
-                    StoreError::Database(_) => TaskAuthenticationError::Unavailable,
-                    _ => TaskAuthenticationError::InvalidCredentials,
-                })?;
-            Ok(identity)
+            match claims.identity_contract.as_str() {
+                IDENTITY_TASK_CONTRACT => {
+                    let identity = task_identity_from_identity_claims(claims.clone())?;
+                    self.canonical_identities
+                        .resolve_canonical_principal(&identity.canonical_user_id, &identity.owner)
+                        .await
+                        .map_err(map_canonical_identity_error)?;
+                    if self.federated_subjects_enabled {
+                        self.canonical_identities
+                            .seed_federated_subject_association(
+                                FederatedSubjectObservation {
+                                    issuer: &claims.iss,
+                                    subject: &claims.sub,
+                                    actor_login: None,
+                                    display_name: None,
+                                },
+                                &identity.canonical_user_id,
+                                "task-auth-v2",
+                            )
+                            .await
+                            .map_err(|error| {
+                                map_federated_subject_error(error, &claims.iss, &claims.sub)
+                            })?;
+                    }
+                    Ok(identity)
+                }
+                FEDERATED_TASK_CONTRACT if self.federated_subjects_enabled => {
+                    let observation = FederatedSubjectObservation {
+                        issuer: &claims.iss,
+                        subject: &claims.sub,
+                        actor_login: claims.actor_login.as_deref(),
+                        display_name: claims.display_name.as_deref(),
+                    };
+                    let principal = if claims.email.is_some() {
+                        let compatibility = compatibility_task_identity_from_claims(&claims)?;
+                        let principal = self
+                            .canonical_identities
+                            .resolve_canonical_principal(
+                                &compatibility.canonical_user_id,
+                                &compatibility.owner,
+                            )
+                            .await
+                            .map_err(map_canonical_identity_error)?;
+                        self.canonical_identities
+                            .seed_federated_subject_association(
+                                observation,
+                                &principal.user_id,
+                                "task-auth-v2-compatibility",
+                            )
+                            .await
+                            .map_err(|error| {
+                                map_federated_subject_error(error, &claims.iss, &claims.sub)
+                            })?;
+                        principal
+                    } else {
+                        self.canonical_identities
+                            .observe_federated_subject(observation)
+                            .await
+                            .map_err(|error| {
+                                map_federated_subject_error(error, &claims.iss, &claims.sub)
+                            })?;
+                        self.canonical_identities
+                            .resolve_federated_subject(&claims.iss, &claims.sub)
+                            .await
+                            .map_err(|error| {
+                                map_federated_subject_error(error, &claims.iss, &claims.sub)
+                            })?
+                    };
+                    Ok(TaskIdentity {
+                        service: "steward-run".to_owned(),
+                        acting_user: Some(principal.display_email.clone()),
+                        owner: principal.display_email,
+                        canonical_user_id: principal.user_id,
+                        source_provenance: claims.source_provenance,
+                    })
+                }
+                _ => Err(TaskAuthenticationError::InvalidCredentials),
+            }
         })
+    }
+}
+
+fn map_canonical_identity_error(error: StoreError) -> TaskAuthenticationError {
+    match error {
+        StoreError::Database(_) | StoreError::InvalidFederatedSubjectRecord => {
+            TaskAuthenticationError::Unavailable
+        }
+        _ => TaskAuthenticationError::InvalidCredentials,
+    }
+}
+
+fn map_federated_subject_error(
+    error: StoreError,
+    issuer: &str,
+    subject: &str,
+) -> TaskAuthenticationError {
+    match error {
+        StoreError::FederatedSubjectNotFound | StoreError::FederatedSubjectUnassociated => {
+            TaskAuthenticationError::Unassociated {
+                issuer: issuer.to_owned(),
+                subject: subject.to_owned(),
+            }
+        }
+        StoreError::FederatedSubjectDisabled => TaskAuthenticationError::Disabled {
+            issuer: issuer.to_owned(),
+            subject: subject.to_owned(),
+        },
+        StoreError::Database(_) | StoreError::InvalidFederatedSubjectRecord => {
+            TaskAuthenticationError::Unavailable
+        }
+        _ => TaskAuthenticationError::InvalidCredentials,
     }
 }
 

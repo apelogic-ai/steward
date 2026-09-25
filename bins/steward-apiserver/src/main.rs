@@ -497,6 +497,7 @@ fn configured_task_identity_resolver(
         required(audience)?,
         std::path::Path::new(&required(jwks_file)?),
         store,
+        federated_subjects_enabled,
     )
     .map_err(|_| io::Error::other("Identity task authentication configuration is invalid"))?;
     Ok(ConfiguredTaskIdentity {
@@ -572,6 +573,10 @@ fn browser_application_router(
             store.clone(),
             decisions,
             capability_catalog,
+            auth.clone(),
+        ))
+        .merge(browser_admin::protected_federated_subject_router(
+            store.clone(),
             auth.clone(),
         ))
         .merge(workflows::protected_admin_router_with_agents(

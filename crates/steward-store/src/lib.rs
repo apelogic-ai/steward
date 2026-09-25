@@ -1048,9 +1048,10 @@ impl PgStore {
             {
                 observed
             }
-            FederatedSubjectState::Associated | FederatedSubjectState::Disabled => {
+            FederatedSubjectState::Associated => {
                 return Err(StoreError::FederatedSubjectConflict);
             }
+            FederatedSubjectState::Disabled => return Err(StoreError::FederatedSubjectDisabled),
         };
         transaction.commit().await.map_err(database_error)?;
         Ok(record)

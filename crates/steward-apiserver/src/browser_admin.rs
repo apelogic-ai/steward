@@ -8,10 +8,11 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_admission::{AdmissionDecision, Envelope, validate_envelope};
 use steward_store::{
-    EnvelopeRequestRecord, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, PendingApproval,
-    PendingEnvelopeRequest, StoreError,
+    EnvelopeRequestRecord, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
+    FederatedSubjectAssociation, FederatedSubjectAuditRecord, FederatedSubjectDisable,
+    FederatedSubjectRecord, PendingApproval, PendingEnvelopeRequest, PgStore, StoreError,
 };
-use steward_types::{AgentRuntimeSpec, ModelRef, ToolGrant};
+use steward_types::{AgentRuntimeSpec, CanonicalUserId, ModelRef, ToolGrant};
 use uuid::Uuid;
 
 use crate::browser_auth::{
@@ -28,6 +29,115 @@ const BROWSER_ADMIN_API_VERSION: &str = "steward.browser-admin/v1";
 pub const MAX_CAPABILITY_CATALOG_BYTES: usize = 256 * 1024;
 const MAX_CAPABILITY_MODELS: usize = 256;
 const MAX_CAPABILITY_TOOLS: usize = 1024;
+
+#[derive(Clone)]
+pub(crate) struct FederatedSubjectAdminState {
+    store: PgStore,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserFederatedSubjectView {
+    #[schema(value_type = String, format = "uuid")]
+    subject_id: Uuid,
+    issuer: String,
+    subject: String,
+    state: String,
+    canonical_user_id: Option<CanonicalUserId>,
+    actor_login: Option<String>,
+    display_name: Option<String>,
+    revision: i64,
+    first_seen_at: String,
+    last_seen_at: String,
+    updated_at: String,
+}
+
+impl From<FederatedSubjectRecord> for BrowserFederatedSubjectView {
+    fn from(record: FederatedSubjectRecord) -> Self {
+        Self {
+            subject_id: record.subject_id,
+            issuer: record.issuer,
+            subject: record.subject,
+            state: record.state.as_str().to_owned(),
+            canonical_user_id: record.canonical_user_id,
+            actor_login: record.actor_login,
+            display_name: record.display_name,
+            revision: record.revision,
+            first_seen_at: record.first_seen_at,
+            last_seen_at: record.last_seen_at,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserFederatedSubjectAuditView {
+    #[schema(value_type = String, format = "uuid")]
+    event_id: Uuid,
+    #[schema(value_type = String, format = "uuid")]
+    subject_id: Uuid,
+    action: String,
+    actor: String,
+    previous_canonical_user_id: Option<CanonicalUserId>,
+    canonical_user_id: Option<CanonicalUserId>,
+    previous_revision: i64,
+    revision: i64,
+    reason: Option<String>,
+    created_at: String,
+}
+
+impl From<FederatedSubjectAuditRecord> for BrowserFederatedSubjectAuditView {
+    fn from(record: FederatedSubjectAuditRecord) -> Self {
+        Self {
+            event_id: record.event_id,
+            subject_id: record.subject_id,
+            action: record.action.as_str().to_owned(),
+            actor: record.actor,
+            previous_canonical_user_id: record.previous_canonical_user_id,
+            canonical_user_id: record.canonical_user_id,
+            previous_revision: record.previous_revision,
+            revision: record.revision,
+            reason: record.reason,
+            created_at: record.created_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserFederatedSubjectResponse {
+    api_version: &'static str,
+    federated_subject: BrowserFederatedSubjectView,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserFederatedSubjectListResponse {
+    api_version: &'static str,
+    federated_subjects: Vec<BrowserFederatedSubjectView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserFederatedSubjectAuditResponse {
+    api_version: &'static str,
+    events: Vec<BrowserFederatedSubjectAuditView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AssociateFederatedSubjectBody {
+    expected_revision: i64,
+    canonical_user_id: CanonicalUserId,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DisableFederatedSubjectBody {
+    expected_revision: i64,
+    reason: Option<String>,
+}
 
 #[derive(Clone)]
 pub(crate) struct BrowserAdminState<R, L, D> {
@@ -560,6 +670,239 @@ where
         inner_router(runtimes, ledger, decisions, capabilities),
         browser_auth,
     )
+}
+
+/// Mount federated-subject administration behind the same browser administrator boundary.
+pub fn protected_federated_subject_router(
+    store: PgStore,
+    browser_auth: BrowserAuthService,
+) -> Router {
+    let routes = Router::new()
+        .route(
+            "/admin/api/v1/federated-subjects",
+            get(list_federated_subjects),
+        )
+        .route(
+            "/admin/api/v1/federated-subjects/{subject_id}",
+            get(get_federated_subject),
+        )
+        .route(
+            "/admin/api/v1/federated-subjects/{subject_id}/audit",
+            get(get_federated_subject_audit),
+        )
+        .route(
+            "/admin/api/v1/federated-subjects/{subject_id}/associate",
+            post(associate_federated_subject),
+        )
+        .route(
+            "/admin/api/v1/federated-subjects/{subject_id}/replace",
+            post(replace_federated_subject),
+        )
+        .route(
+            "/admin/api/v1/federated-subjects/{subject_id}/disable",
+            post(disable_federated_subject),
+        )
+        .with_state(FederatedSubjectAdminState { store });
+    protect_browser_admin_routes(routes, browser_auth)
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "listAdminFederatedSubjects",
+    path = "/admin/api/v1/federated-subjects",
+    responses(
+        (status = 200, body = BrowserFederatedSubjectListResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role is required"),
+        (status = 503, description = "Federated subjects are unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn list_federated_subjects(
+    Extension(_authority): Extension<BrowserAdminAuthority>,
+    State(state): State<FederatedSubjectAdminState>,
+) -> Response {
+    match state.store.list_federated_subjects(200).await {
+        Ok(subjects) => Json(BrowserFederatedSubjectListResponse {
+            api_version: BROWSER_ADMIN_API_VERSION,
+            federated_subjects: subjects.into_iter().map(Into::into).collect(),
+        })
+        .into_response(),
+        Err(error) => ApiError::Store(error).into_response(),
+    }
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "getAdminFederatedSubject",
+    path = "/admin/api/v1/federated-subjects/{subject_id}",
+    params(("subject_id" = String, Path)),
+    responses(
+        (status = 200, body = BrowserFederatedSubjectResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role is required"),
+        (status = 404, description = "Federated subject was not found"),
+        (status = 503, description = "Federated subject is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn get_federated_subject(
+    Extension(_authority): Extension<BrowserAdminAuthority>,
+    State(state): State<FederatedSubjectAdminState>,
+    Path(subject_id): Path<Uuid>,
+) -> Response {
+    federated_subject_response(state.store.federated_subject(subject_id).await)
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "getAdminFederatedSubjectAudit",
+    path = "/admin/api/v1/federated-subjects/{subject_id}/audit",
+    params(("subject_id" = String, Path)),
+    responses(
+        (status = 200, body = BrowserFederatedSubjectAuditResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role is required"),
+        (status = 404, description = "Federated subject was not found"),
+        (status = 503, description = "Federated-subject audit is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn get_federated_subject_audit(
+    Extension(_authority): Extension<BrowserAdminAuthority>,
+    State(state): State<FederatedSubjectAdminState>,
+    Path(subject_id): Path<Uuid>,
+) -> Response {
+    match state.store.federated_subject_audit(subject_id).await {
+        Ok(events) => Json(BrowserFederatedSubjectAuditResponse {
+            api_version: BROWSER_ADMIN_API_VERSION,
+            events: events.into_iter().map(Into::into).collect(),
+        })
+        .into_response(),
+        Err(error) => ApiError::Store(error).into_response(),
+    }
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "associateAdminFederatedSubject",
+    path = "/admin/api/v1/federated-subjects/{subject_id}/associate",
+    params(("subject_id" = String, Path), ("X-Steward-CSRF" = String, Header)),
+    request_body = AssociateFederatedSubjectBody,
+    responses(
+        (status = 200, body = BrowserFederatedSubjectResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Federated subject or canonical user was not found"),
+        (status = 409, description = "Subject state or revision conflicts"),
+        (status = 422, description = "Association request is invalid"),
+        (status = 503, description = "Federated subject is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn associate_federated_subject(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+    Extension(_proof): Extension<BrowserMutationProof>,
+    State(state): State<FederatedSubjectAdminState>,
+    Path(subject_id): Path<Uuid>,
+    Json(body): Json<AssociateFederatedSubjectBody>,
+) -> Response {
+    federated_subject_response(
+        state
+            .store
+            .associate_federated_subject(FederatedSubjectAssociation {
+                subject_id,
+                expected_revision: body.expected_revision,
+                canonical_user_id: &body.canonical_user_id,
+                actor: authority.principal().canonical_user_id.as_str(),
+            })
+            .await,
+    )
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "replaceAdminFederatedSubjectAssociation",
+    path = "/admin/api/v1/federated-subjects/{subject_id}/replace",
+    params(("subject_id" = String, Path), ("X-Steward-CSRF" = String, Header)),
+    request_body = AssociateFederatedSubjectBody,
+    responses(
+        (status = 200, body = BrowserFederatedSubjectResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Federated subject or canonical user was not found"),
+        (status = 409, description = "Subject state or revision conflicts"),
+        (status = 422, description = "Replacement request is invalid"),
+        (status = 503, description = "Federated subject is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn replace_federated_subject(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+    Extension(_proof): Extension<BrowserMutationProof>,
+    State(state): State<FederatedSubjectAdminState>,
+    Path(subject_id): Path<Uuid>,
+    Json(body): Json<AssociateFederatedSubjectBody>,
+) -> Response {
+    federated_subject_response(
+        state
+            .store
+            .replace_federated_subject_association(FederatedSubjectAssociation {
+                subject_id,
+                expected_revision: body.expected_revision,
+                canonical_user_id: &body.canonical_user_id,
+                actor: authority.principal().canonical_user_id.as_str(),
+            })
+            .await,
+    )
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "disableAdminFederatedSubject",
+    path = "/admin/api/v1/federated-subjects/{subject_id}/disable",
+    params(("subject_id" = String, Path), ("X-Steward-CSRF" = String, Header)),
+    request_body = DisableFederatedSubjectBody,
+    responses(
+        (status = 200, body = BrowserFederatedSubjectResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Federated subject was not found"),
+        (status = 409, description = "Subject revision conflicts"),
+        (status = 422, description = "Disable request is invalid"),
+        (status = 503, description = "Federated subject is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn disable_federated_subject(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+    Extension(_proof): Extension<BrowserMutationProof>,
+    State(state): State<FederatedSubjectAdminState>,
+    Path(subject_id): Path<Uuid>,
+    Json(body): Json<DisableFederatedSubjectBody>,
+) -> Response {
+    federated_subject_response(
+        state
+            .store
+            .disable_federated_subject(FederatedSubjectDisable {
+                subject_id,
+                expected_revision: body.expected_revision,
+                actor: authority.principal().canonical_user_id.as_str(),
+                reason: body.reason.as_deref(),
+            })
+            .await,
+    )
+}
+
+fn federated_subject_response(result: Result<FederatedSubjectRecord, StoreError>) -> Response {
+    match result {
+        Ok(record) => Json(BrowserFederatedSubjectResponse {
+            api_version: BROWSER_ADMIN_API_VERSION,
+            federated_subject: record.into(),
+        })
+        .into_response(),
+        Err(error) => ApiError::Store(error).into_response(),
+    }
 }
 
 #[utoipa::path(
