@@ -1,4 +1,4 @@
-# Upgrade to Steward v0.2.4
+# Upgrade to Steward v0.2.5
 
 Status: current release contract for upgrades from v0.1.23.
 
@@ -26,7 +26,7 @@ It also fails if an exact approved User Envelope snapshot cannot be recovered.
 
 ## Upgrade
 
-1. Install the exact v0.2.4 chart and image digests from the release handoff with orchestration
+1. Install the exact v0.2.5 chart and image digests from the release handoff with orchestration
    still `staged`.
 2. Allow the apiserver or controller to apply the append-only migration set through `0039`.
 3. Verify that unfinished user Tasks are version 3 with `authority_kind=user-envelope`, their

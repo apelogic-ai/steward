@@ -2,8 +2,8 @@
 
 Status: **Reference**
 
-Applies to Steward v0.2.4 and its User-Envelope-only Task authority model. An
-installation still on v0.1.23 follows [upgrade to v0.2.4](upgrade-v0.2.0.md)
+Applies to Steward v0.2.5 and its User-Envelope-only Task authority model. An
+installation still on v0.1.23 follows [upgrade to v0.2.5](upgrade-v0.2.0.md)
 before using this page.
 
 Steward, `steward-run`, and `github-oidc-exchange` are separately released

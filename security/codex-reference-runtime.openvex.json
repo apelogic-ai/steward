@@ -1,0 +1,64 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://example.com/steward/vex/codex-reference-runtime-linux-libc-dev-6.8.0-142.142",
+  "author": "Steward maintainers",
+  "timestamp": "2026-09-24T19:00:00-07:00",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": { "name": "CVE-2026-53398" },
+      "products": [
+        {
+          "@id": "pkg:deb/ubuntu/linux-libc-dev@6.8.0-142.142?arch=amd64&distro=ubuntu-24.04"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "The package supplies user-space UAPI headers; the affected NFSD kernel implementation is not present in the image."
+    },
+    {
+      "vulnerability": { "name": "CVE-2026-63940" },
+      "products": [
+        {
+          "@id": "pkg:deb/ubuntu/linux-libc-dev@6.8.0-142.142?arch=amd64&distro=ubuntu-24.04"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "The package supplies user-space UAPI headers; the affected KVM kernel implementation is not present in the image."
+    },
+    {
+      "vulnerability": { "name": "CVE-2026-64535" },
+      "products": [
+        {
+          "@id": "pkg:deb/ubuntu/linux-libc-dev@6.8.0-142.142?arch=amd64&distro=ubuntu-24.04"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "The package supplies user-space UAPI headers; the affected NVMe target kernel implementation is not present in the image."
+    },
+    {
+      "vulnerability": { "name": "CVE-2026-64564" },
+      "products": [
+        {
+          "@id": "pkg:deb/ubuntu/linux-libc-dev@6.8.0-142.142?arch=amd64&distro=ubuntu-24.04"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "The package supplies user-space UAPI headers; the affected SCTP kernel implementation is not present in the image."
+    },
+    {
+      "vulnerability": { "name": "CVE-2026-74394" },
+      "products": [
+        {
+          "@id": "pkg:deb/ubuntu/linux-libc-dev@6.8.0-142.142?arch=amd64&distro=ubuntu-24.04"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_present",
+      "impact_statement": "The package supplies user-space UAPI headers; the affected RDMA target kernel implementation is not present in the image."
+    }
+  ]
+}

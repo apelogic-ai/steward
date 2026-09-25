@@ -1118,7 +1118,7 @@ mod tests {
             .ok_or_else(|| "Steward chart version is required".to_owned())?;
         match version {
             "0.1.23" => Ok(false),
-            "0.2.4" => Ok(true),
+            "0.2.5" => Ok(true),
             other => Err(format!(
                 "release enforcement has not reviewed Steward chart version {other}"
             )),
@@ -1511,6 +1511,12 @@ mod tests {
         let openshell_conformance =
             fs::read_to_string(root().join("scripts/codex-reference-runtime-openshell-inside.sh"))
                 .map_err(|error| format!("Codex OpenShell conformance is required: {error}"))?;
+        let vulnerability_exceptions =
+            fs::read_to_string(root().join("security/codex-reference-runtime.openvex.json"))
+                .map_err(|error| format!("Codex reference runtime VEX is required: {error}"))?;
+        let vulnerability_exceptions: serde_json::Value =
+            serde_json::from_str(&vulnerability_exceptions)
+                .map_err(|error| format!("Codex reference runtime VEX must be JSON: {error}"))?;
         let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
             .map_err(|error| format!("release workflow is required: {error}"))?;
         let documentation =
@@ -1525,10 +1531,41 @@ mod tests {
             "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:",
             "@openai/codex@0.140.0",
             "codex-cli 0.140.0",
+            "LINUX_LIBC_DEV_VERSION=6.8.0-142.142",
+            "LINUX_LIBC_DEV_SHA256=937db1a88a4fa2ea97fd4eab89f2cd9d077290f6a26bcd27b1a6d24fa3d706b6",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin dpkg --install",
+            "tar@7.5.22",
+            "/usr/lib/node_modules/npm/node_modules/tar/package.json",
+            "node --print 'require(\"/usr/lib/node_modules/tar/package.json\").version'",
+            "node --print 'require(\"/usr/lib/node_modules/npm/node_modules/tar/package.json\").version'",
         ] {
             assert!(
                 container.contains(required),
                 "Codex reference runtime must pin {required}"
+            );
+        }
+        let statements = vulnerability_exceptions["statements"]
+            .as_array()
+            .ok_or_else(|| "Codex reference runtime VEX statements are required".to_string())?;
+        let expected_vulnerabilities = [
+            "CVE-2026-53398",
+            "CVE-2026-63940",
+            "CVE-2026-64535",
+            "CVE-2026-64564",
+            "CVE-2026-74394",
+        ];
+        assert_eq!(
+            statements.len(),
+            expected_vulnerabilities.len(),
+            "Codex reference runtime VEX must cover only the reviewed non-applicable findings"
+        );
+        for (statement, vulnerability) in statements.iter().zip(expected_vulnerabilities) {
+            assert_eq!(statement["vulnerability"]["name"], vulnerability);
+            assert_eq!(statement["status"], "not_affected");
+            assert_eq!(statement["justification"], "vulnerable_code_not_present");
+            assert_eq!(
+                statement["products"][0]["@id"],
+                "pkg:deb/ubuntu/linux-libc-dev@6.8.0-142.142?arch=amd64&distro=ubuntu-24.04"
             );
         }
         for required in [
@@ -1569,6 +1606,7 @@ mod tests {
             "build/codex-reference.Dockerfile",
             "provenance: mode=max",
             "sbom: true",
+            "trivy-config: security/codex-reference-runtime.trivy.yaml",
             "release-codex-reference-runtime",
             "codex-reference-runtime.digest",
             "codex-reference-runtime-conformance:",
@@ -1788,9 +1826,14 @@ mod tests {
     }
 
     #[test]
-    fn release_candidate_fails_closed_on_critical_component_images() -> Result<(), String> {
+    fn release_candidates_fail_closed_on_critical_component_images() -> Result<(), String> {
         let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let codex_candidate = workflow
+            .split("  codex-reference-runtime:")
+            .nth(1)
+            .and_then(|jobs| jobs.split("\n  release-candidate:").next())
+            .ok_or_else(|| "isolated Codex reference runtime CI job is required".to_owned())?;
         let release_candidate = workflow
             .split("  release-candidate:")
             .nth(1)
@@ -1805,12 +1848,22 @@ mod tests {
                 "release-candidate CI must scan the {component} production image"
             );
         }
+        for required in [
+            "docker build --platform linux/amd64 --file build/codex-reference.Dockerfile --tag steward-codex-runtime:release-validation .",
+            "image-ref: steward-codex-runtime:release-validation",
+            "trivy-config: security/codex-reference-runtime.trivy.yaml",
+        ] {
+            assert!(
+                codex_candidate.contains(required),
+                "isolated Codex reference runtime CI must validate with {required}"
+            );
+        }
         assert_eq!(
             release_candidate
                 .matches("aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8")
                 .count(),
             4,
-            "release-candidate CI must use the pinned Trivy action for every component image"
+            "release-candidate CI must use the pinned Trivy action for every Steward component image"
         );
         assert_eq!(
             release_candidate.matches("exit-code: \"1\"").count(),
@@ -1821,6 +1874,15 @@ mod tests {
             release_candidate.matches("severity: CRITICAL").count(),
             4,
             "every release-candidate image scan must enforce CRITICAL findings"
+        );
+        assert!(
+            workflow.contains("      - codex-reference-runtime"),
+            "the pinned aggregate must require the isolated Codex runtime lane"
+        );
+        assert!(
+            workflow
+                .contains("CODEX_REFERENCE_RUNTIME: ${{ needs.codex-reference-runtime.result }}"),
+            "the pinned aggregate must inspect the isolated Codex runtime result"
         );
 
         Ok(())

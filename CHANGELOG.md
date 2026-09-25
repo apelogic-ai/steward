@@ -7,7 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-## [0.2.4] - 2026-09-24
+## [0.2.5] - 2026-09-24
 
 ### Added
 
@@ -32,9 +32,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
-- Corrected release-only shell lint failures in the registry mirror. The
-  `v0.2.3` workflow stopped before publishing images, charts, bundles, or a
-  GitHub release.
+- Kept registry-mirror progress output separate from its machine-readable JSONL
+  result. The `v0.2.4` workflow stopped during live mirror conformance and the
+  Codex image scan; it did not publish a GitHub release or complete handoff.
+- Updated the Codex reference runtime's inherited kernel headers and Node tar
+  packages, recorded narrowly scoped VEX evidence for kernel implementations
+  absent from the image, and added the complete native `linux/amd64` image scan
+  to pull-request CI before a release tag can be cut.
+
+## [0.2.4] - 2026-09-24
+
+The release workflow stopped during live registry-mirror conformance. It did
+not publish a GitHub release or complete release handoff; OCI artifacts created
+by the incomplete workflow are not a complete Steward release.
 
 ## [0.2.3] - 2026-09-24
 
@@ -127,7 +137,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/apelogic-ai/steward/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/apelogic-ai/steward/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/apelogic-ai/steward/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/apelogic-ai/steward/compare/v0.2.1...v0.2.2

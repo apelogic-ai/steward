@@ -235,9 +235,9 @@ mirror() {
     else
       if [[ "${target_plain_http}" == true ]]; then
         oras cp --recursive --no-tty --to-plain-http \
-          "${source_reference}@${source_digest}" "${target_reference}"
+          "${source_reference}@${source_digest}" "${target_reference}" >&2
       else
-        oras cp --recursive --no-tty "${source_reference}@${source_digest}" "${target_reference}"
+        oras cp --recursive --no-tty "${source_reference}@${source_digest}" "${target_reference}" >&2
       fi
     fi
     local target_digest

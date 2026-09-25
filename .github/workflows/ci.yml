@@ -184,6 +184,28 @@ jobs:
       - name: Verify loopback browser journeys
         run: cargo xtask browser-e2e --browser-ready
 
+  codex-reference-runtime:
+    name: release / Codex reference runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build Codex reference runtime
+        run: docker build --platform linux/amd64 --file build/codex-reference.Dockerfile --tag steward-codex-runtime:release-validation .
+
+      - name: Enforce critical Codex reference runtime policy
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: steward-codex-runtime:release-validation
+          trivy-config: security/codex-reference-runtime.trivy.yaml
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+
   release-candidate:
     name: release / chart and images
     runs-on: ubuntu-latest
@@ -251,6 +273,7 @@ jobs:
       - governed-connections
       - postgres-tls
       - browser-e2e
+      - codex-reference-runtime
       - release-candidate
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -264,6 +287,7 @@ jobs:
           GOVERNED_CONNECTIONS: ${{ needs.governed-connections.result }}
           POSTGRES_TLS: ${{ needs.postgres-tls.result }}
           BROWSER_E2E: ${{ needs.browser-e2e.result }}
+          CODEX_REFERENCE_RUNTIME: ${{ needs.codex-reference-runtime.result }}
           RELEASE_CANDIDATE: ${{ needs.release-candidate.result }}
         run: |
           set -euo pipefail
@@ -274,6 +298,7 @@ jobs:
             "${GOVERNED_CONNECTIONS}" \
             "${POSTGRES_TLS}" \
             "${BROWSER_E2E}" \
+            "${CODEX_REFERENCE_RUNTIME}" \
             "${RELEASE_CANDIDATE}"
           do
             if [[ "${result}" != "success" ]]; then

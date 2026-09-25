@@ -59,7 +59,7 @@ bundle from a `linux/amd64` host with Docker and the pinned Kubernetes tools bef
 ```sh
 scripts/codex-reference-runtime-conformance.sh \
   --image registry.example.test/agents/codex@sha256:<private-digest> \
-  --provider-profile-bundle steward-runtime-providers-0.2.4.tar.gz
+  --provider-profile-bundle steward-runtime-providers-0.2.5.tar.gz
 ```
 
 A private image that passes this contract is compatible with `codex-v1`; it is independently built
