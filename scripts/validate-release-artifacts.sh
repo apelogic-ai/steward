@@ -33,6 +33,7 @@ browser_auth_rendered="$(mktemp)"
 browser_auth_deployment="$(mktemp)"
 task_identity_rendered="$(mktemp)"
 task_identity_deployment="$(mktemp)"
+federated_task_identity_rendered="$(mktemp)"
 task_execution_bindings_rendered="$(mktemp)"
 github_source_rendered="$(mktemp)"
 web_rendered="$(mktemp)"
@@ -65,7 +66,8 @@ cleanup() {
     "${operator_connections_bridge_apiserver_deployment}" \
     "${operator_connections_bridge_controller_deployment}" "${browser_auth_rendered}" \
     "${browser_auth_deployment}" "${task_identity_rendered}" \
-    "${task_identity_deployment}" "${task_execution_bindings_rendered}" \
+    "${task_identity_deployment}" "${federated_task_identity_rendered}" \
+    "${task_execution_bindings_rendered}" \
     "${github_source_rendered}" \
     "${web_rendered}" "${web_deployment}" "${external_edge_rendered}" "${http_route_rendered}" \
     "${backend_tls_policy}" \
@@ -698,7 +700,6 @@ for required in \
 do
   grep -Fxq "${required}" "${task_identity_deployment}"
 done
-federated_task_identity_rendered="${workdir}/federated-task-identity.yaml"
 helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
