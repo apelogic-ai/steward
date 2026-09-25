@@ -3436,6 +3436,7 @@ mod identity_task_authentication_tests {
     use super::{
         IdentityTaskClaims, TaskAuthenticationError, task_identity_from_identity_claims,
         valid_identity_issuer, validate_identity_task_jwks, verify_identity_task_token,
+        MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS,
     };
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -3533,26 +3534,34 @@ mod identity_task_authentication_tests {
         .map_err(|error| format!("sign Identity task token: {error}"))
     }
 
+    fn federated_token_with<'a>(
+        key: &EncodingKey,
+        kid: &str,
+        claims: FederatedClaims<'a>,
+    ) -> Result<String, String> {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(kid.to_owned());
+        encode(&header, &claims, key)
+        .map_err(|error| format!("sign federated task token: {error}"))
+    }
+
+    fn federated_claims(now: u64) -> FederatedClaims<'static> {
+        FederatedClaims {
+            iss: ISSUER,
+            sub: "github-actions:actor:16106037",
+            aud: vec![AUDIENCE],
+            exp: now + 60,
+            iat: now,
+            nbf: now.saturating_sub(1),
+            jti: "federated-task-test-jti",
+            identity_contract: "steward-task-v3",
+            canonical_user_id: None,
+        }
+    }
+
     fn federated_token(key: &EncodingKey) -> Result<String, String> {
         let now = jsonwebtoken::get_current_timestamp();
-        let mut header = Header::new(Algorithm::ES256);
-        header.kid = Some(KID.to_owned());
-        encode(
-            &header,
-            &FederatedClaims {
-                iss: ISSUER,
-                sub: "github-actions:actor:16106037",
-                aud: vec![AUDIENCE],
-                exp: now + 60,
-                iat: now,
-                nbf: now.saturating_sub(1),
-                jti: "federated-task-test-jti",
-                identity_contract: "steward-task-v3",
-                canonical_user_id: None,
-            },
-            key,
-        )
-        .map_err(|error| format!("sign federated task token: {error}"))
+        federated_token_with(key, KID, federated_claims(now))
     }
 
     #[test]
@@ -3580,6 +3589,63 @@ mod identity_task_authentication_tests {
         .map_err(|error| format!("sign injected identity token: {error}"))?;
         assert!(matches!(
             verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE),
+            Err(TaskAuthenticationError::InvalidCredentials)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn federated_task_contract_fails_closed_on_subject_key_signature_and_time()
+    -> Result<(), String> {
+        let (key, jwks) = key_material()?;
+        let (other_key, _) = key_material()?;
+        let now = jsonwebtoken::get_current_timestamp();
+
+        let invalid_subjects = [
+            "",
+            "github-actions:actor:0",
+            "github-actions:actor:016106037",
+            "github-actions:actor:alice",
+            "github-actions:login:16106037",
+        ];
+        for subject in invalid_subjects {
+            let mut claims = federated_claims(now);
+            claims.sub = subject;
+            let assertion = federated_token_with(&key, KID, claims)?;
+            assert!(matches!(
+                verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE),
+                Err(TaskAuthenticationError::InvalidCredentials)
+            ));
+        }
+
+        let wrong_kid = federated_token_with(&key, "unknown-key", federated_claims(now))?;
+        let wrong_signature = federated_token_with(&other_key, KID, federated_claims(now))?;
+        let mut expired_claims = federated_claims(now);
+        expired_claims.exp = now.saturating_sub(61);
+        let expired = federated_token_with(&key, KID, expired_claims)?;
+        let mut future_claims = federated_claims(now);
+        future_claims.nbf = now + 61;
+        let future = federated_token_with(&key, KID, future_claims)?;
+        let mut over_age_claims = federated_claims(now);
+        over_age_claims.iat = now.saturating_sub(MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS + 1);
+        let over_age = federated_token_with(&key, KID, over_age_claims)?;
+        for assertion in [wrong_kid, wrong_signature, expired, future, over_age] {
+            assert!(matches!(
+                verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE),
+                Err(TaskAuthenticationError::InvalidCredentials)
+            ));
+        }
+
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some(KID.to_owned());
+        let wrong_algorithm = encode(
+            &header,
+            &federated_claims(now),
+            &EncodingKey::from_secret(b"obviously-fake-test-key"),
+        )
+        .map_err(|error| format!("sign wrong-algorithm token: {error}"))?;
+        assert!(matches!(
+            verify_identity_task_token(&wrong_algorithm, &jwks, ISSUER, AUDIENCE),
             Err(TaskAuthenticationError::InvalidCredentials)
         ));
         Ok(())
