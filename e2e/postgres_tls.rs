@@ -141,6 +141,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         0,
         "migration 0040 must not synthesize federated subjects from historical identity data"
     );
+    assert_template_catalog_upgrade_result(&store).await?;
     verify_federated_subject_lifecycle(&store).await?;
 
     let tls_active =
@@ -598,7 +599,7 @@ async fn seed_v0123_upgrade_fixture(store: &PgStore) -> Result<(), Box<dyn Error
     Ok(())
 }
 
-async fn assert_v02_upgrade_result(store: &PgStore) -> Result<(), Box<dyn Error>> {
+async fn assert_template_catalog_upgrade_result(store: &PgStore) -> Result<(), Box<dyn Error>> {
     let migrated_template = sqlx::query_as::<_, (String, Vec<String>, i64)>(
         "SELECT display_name, member_roles, revision \
          FROM envelope_template_revisions \
@@ -619,6 +620,10 @@ async fn assert_v02_upgrade_result(store: &PgStore) -> Result<(), Box<dyn Error>
     .await?;
     assert_eq!(preserved_request, ("engineer".to_owned(), 7));
 
+    Ok(())
+}
+
+async fn assert_v02_upgrade_result(store: &PgStore) -> Result<(), Box<dyn Error>> {
     let user = sqlx::query_as::<
         _,
         (
