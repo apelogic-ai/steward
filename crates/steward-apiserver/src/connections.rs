@@ -2,7 +2,7 @@
 
 use std::hash::Hash;
 
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -69,6 +69,30 @@ pub(crate) struct ConnectionStatusResponse {
     api_version: &'static str,
     provider: &'static str,
     status: ProviderConnectionStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderConnectionView {
+    provider: &'static str,
+    display_name: &'static str,
+    status: ProviderConnectionStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AvailableProviderConnection {
+    provider: &'static str,
+    display_name: &'static str,
+    enabled: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConnectionsCollectionResponse {
+    api_version: &'static str,
+    connections: Vec<ProviderConnectionView>,
+    available: Vec<AvailableProviderConnection>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -162,6 +186,15 @@ where
     B: Clone + Eq + Hash + Send + Sync + 'static,
 {
     Router::new()
+        .route("/app/api/v1/connections", get(list_connections::<P, B>))
+        .route(
+            "/app/api/v1/connections/{provider}/start",
+            post(start_provider_connection::<P, B>),
+        )
+        .route(
+            "/app/api/v1/connections/{provider}/disconnect",
+            post(disconnect_provider_connection::<P, B>),
+        )
         .route(
             "/admin/api/v1/connections/github",
             get(connection_status::<P, B>),
@@ -266,6 +299,38 @@ where
 
 #[utoipa::path(
     post,
+    operation_id = "startProviderConnection",
+    path = "/app/api/v1/connections/{provider}/start",
+    params(("provider" = String, Path), ("X-Steward-CSRF" = String, Header)),
+    request_body = BrowserMutationRequest,
+    responses(
+        (status = 200, body = StartConnectionResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Provider is unavailable"),
+        (status = 503, description = "Connection broker is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn start_provider_connection<P, B>(
+    Path(provider): Path<String>,
+    session: Option<Extension<ConnectionSession<B>>>,
+    proof: Option<Extension<ConnectionMutationProof>>,
+    State(state): State<ConnectionsState<P>>,
+    Json(request): Json<BrowserMutationRequest>,
+) -> Response
+where
+    P: ProviderConnectionBroker<B>,
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    if provider != "github" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    start_connection(session, proof, State(state), Json(request)).await
+}
+
+#[utoipa::path(
+    post,
     path = "/admin/api/v1/connections/github/disconnect",
     params(("X-Steward-CSRF" = String, Header)),
     request_body = DisconnectConnectionRequest,
@@ -307,6 +372,39 @@ where
 }
 
 #[utoipa::path(
+    post,
+    operation_id = "disconnectProviderConnection",
+    path = "/app/api/v1/connections/{provider}/disconnect",
+    params(("provider" = String, Path), ("X-Steward-CSRF" = String, Header)),
+    request_body = DisconnectConnectionRequest,
+    responses(
+        (status = 204, description = "Connection was disconnected"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Provider is unavailable"),
+        (status = 409, body = ConnectionOperationErrorResponse),
+        (status = 503, description = "Connection broker is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn disconnect_provider_connection<P, B>(
+    Path(provider): Path<String>,
+    session: Option<Extension<ConnectionSession<B>>>,
+    proof: Option<Extension<ConnectionMutationProof>>,
+    State(state): State<ConnectionsState<P>>,
+    Json(request): Json<DisconnectConnectionRequest>,
+) -> Response
+where
+    P: ProviderConnectionBroker<B>,
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    if provider != "github" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    disconnect_connection(session, proof, State(state), Json(request)).await
+}
+
+#[utoipa::path(
     get,
     path = "/admin/api/v1/connections/github",
     responses(
@@ -339,6 +437,75 @@ where
             unavailable_status_response()
         }
     }
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "listProviderConnections",
+    path = "/app/api/v1/connections",
+    responses(
+        (status = 200, body = ConnectionsCollectionResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 503, description = "Connection broker is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn list_connections<P, B>(
+    session: Option<Extension<ConnectionSession<B>>>,
+    State(state): State<ConnectionsState<P>>,
+) -> Response
+where
+    P: ProviderConnectionBroker<B>,
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let status = match state.broker.status(&session).await {
+        Ok(status) => status,
+        Err(ConnectionBrokerError::OAuthFlowPending | ConnectionBrokerError::Unavailable) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ConnectionsCollectionResponse {
+                    api_version: CONNECTIONS_API_VERSION,
+                    connections: vec![ProviderConnectionView {
+                        provider: "github",
+                        display_name: "GitHub",
+                        status: ProviderConnectionStatus {
+                            phase: ConnectionPhase::Unavailable,
+                            account_email: None,
+                            scopes_required: Vec::new(),
+                            scopes_granted: Vec::new(),
+                            scopes_missing: Vec::new(),
+                            expires_at: None,
+                            active_credential_expires_at: None,
+                            renewal_credential_expires_at: None,
+                        },
+                    }],
+                    available: vec![AvailableProviderConnection {
+                        provider: "github",
+                        display_name: "GitHub",
+                        enabled: true,
+                    }],
+                }),
+            )
+                .into_response();
+        }
+    };
+    Json(ConnectionsCollectionResponse {
+        api_version: CONNECTIONS_API_VERSION,
+        connections: vec![ProviderConnectionView {
+            provider: "github",
+            display_name: "GitHub",
+            status,
+        }],
+        available: vec![AvailableProviderConnection {
+            provider: "github",
+            display_name: "GitHub",
+            enabled: true,
+        }],
+    })
+    .into_response()
 }
 
 fn oauth_flow_pending_response() -> Response {

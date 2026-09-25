@@ -2452,7 +2452,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         }
         let (state, payload) = split_task_attempt_observation(&observed.stdout)?;
         let correlation = attempt_id.0.clone();
-        let transcript = if matches!(state, "succeeded" | "failed")
+        let transcript = if matches!(state, "running" | "succeeded" | "failed")
             && task_transcript_requested(request.execution_class, request.diagnostics.execution_log)
         {
             Some(
@@ -2466,8 +2466,15 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             "claimed" => Ok(SandboxTaskObservation::Accepted {
                 adapter_observation_id: correlation,
             }),
-            "running" => Ok(SandboxTaskObservation::Running {
-                adapter_observation_id: correlation,
+            "running" => Ok(if let Some(transcript) = transcript {
+                SandboxTaskObservation::RunningWithTranscript {
+                    adapter_observation_id: correlation,
+                    transcript,
+                }
+            } else {
+                SandboxTaskObservation::Running {
+                    adapter_observation_id: correlation,
+                }
             }),
             "succeeded" => {
                 if request.agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE {
@@ -2527,7 +2534,9 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             | SandboxTaskObservation::Failed { .. }
             | SandboxTaskObservation::FailedWithTranscript { .. }
             | SandboxTaskObservation::OutcomeUnknown { .. }) => Ok(terminal),
-            SandboxTaskObservation::Accepted { .. } | SandboxTaskObservation::Running { .. } => {
+            SandboxTaskObservation::Accepted { .. }
+            | SandboxTaskObservation::Running { .. }
+            | SandboxTaskObservation::RunningWithTranscript { .. } => {
                 Ok(SandboxTaskObservation::OutcomeUnknown {
                     reason: "OpenShell does not expose a proven attempt-scoped cancellation acknowledgement"
                         .to_owned(),

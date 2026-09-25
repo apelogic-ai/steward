@@ -25,8 +25,8 @@ use kube::{Client, Resource, ResourceExt};
 use sha2::{Digest, Sha256};
 use steward_admission::internal_authorities::steward_connections_v1;
 use steward_admission::{
-    AdmissionDecision, AdmissionDelta, Envelope, budget_is_exhausted, duration_seconds, evaluate,
-    evaluate_with_grants,
+    AdmissionDecision, AdmissionDelta, Envelope, add_budget_amount, budget_is_exhausted,
+    duration_seconds, evaluate, evaluate_with_grants,
 };
 use steward_ports::{
     DecisionChannel, DecisionRequest, InferenceCapabilities, InferenceCredential,
@@ -258,6 +258,22 @@ fn exhausted_spend_to_preserve(
         return Ok(None);
     };
     spend_still_exhausts_runtime(runtime, spend)
+}
+
+fn runtime_with_spend_top_up(
+    runtime: &AgentRuntime,
+    top_up: Option<&str>,
+) -> Result<AgentRuntime, ReconcileError> {
+    let mut effective = runtime.clone();
+    if let Some(top_up) = top_up {
+        effective.spec.budget.monthly_limit =
+            add_budget_amount(&runtime.spec.budget.monthly_limit, top_up).map_err(|error| {
+                ReconcileError::InvalidSpec {
+                    reason: format!("instance spend top-up could not be applied: {error:?}"),
+                }
+            })?;
+    }
+    Ok(effective)
 }
 
 fn runtime_spec_digest(runtime: &AgentRuntime) -> Result<String, ReconcileError> {
@@ -1426,7 +1442,9 @@ async fn reconcile_task_cancellation<R: SandboxTaskRuntime>(
         return Ok(());
     };
     match observation {
-        SandboxTaskObservation::Accepted { .. } | SandboxTaskObservation::Running { .. } => Ok(()),
+        SandboxTaskObservation::Accepted { .. }
+        | SandboxTaskObservation::Running { .. }
+        | SandboxTaskObservation::RunningWithTranscript { .. } => Ok(()),
         observation => {
             persist_execution_observation(authority, &attempt, attempt.generation, observation)
                 .await
@@ -2070,6 +2088,25 @@ async fn persist_execution_observation(
                     generation,
                     TaskExecutionObservation::Running {
                         adapter_observation_id: &adapter_observation_id,
+                        execution_stdout: None,
+                        execution_stderr: None,
+                    },
+                    "task-orchestrator",
+                )
+                .await
+        }
+        SandboxTaskObservation::RunningWithTranscript {
+            adapter_observation_id,
+            transcript,
+        } => {
+            authority
+                .record_task_execution_observation(
+                    attempt.attempt_id,
+                    generation,
+                    TaskExecutionObservation::Running {
+                        adapter_observation_id: &adapter_observation_id,
+                        execution_stdout: Some(&transcript.stdout),
+                        execution_stderr: Some(&transcript.stderr),
                     },
                     "task-orchestrator",
                 )
@@ -3489,72 +3526,81 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
     finalizer(&api, FINALIZER, runtime, |event| async {
         match event {
             Event::Apply(runtime) => {
-                let task_owned_runtime = if let Some(authority) = &context.authority {
-                    let admission = if matches!(
-                        runtime.spec.principal,
-                        steward_types::Principal::Service { .. }
-                    ) && runtime
-                        .annotations()
-                        .contains_key(TASK_EXECUTION_BINDING_ANNOTATION)
-                    {
-                        let namespace = runtime
-                            .namespace()
-                            .ok_or(ControllerError::Reconcile(ReconcileError::MissingNamespace))?;
-                        Some(
-                            authority
-                                .task_runtime_admission(&namespace, &runtime.name_any())
-                                .await
-                                .map_err(|error| {
-                                    ControllerError::Reconcile(ReconcileError::Authority(
-                                        error.to_string(),
-                                    ))
-                                })?,
-                        )
-                    } else {
-                        None
-                    };
-                    match task_runtime_reconciliation_action(
-                        &runtime,
-                        admission.as_ref().and_then(Option::as_ref),
-                    )
-                    .map_err(ControllerError::Reconcile)?
-                    {
-                        TaskRuntimeReconciliationAction::NotTaskOwned => false,
-                        TaskRuntimeReconciliationAction::Continue => true,
-                        TaskRuntimeReconciliationAction::WaitForTaskOrchestrator => {
-                            return Ok(Action::requeue(StdDuration::from_secs(2)));
-                        }
-                        TaskRuntimeReconciliationAction::Cleanup { work, cause } => {
-                            authority
-                                .enter_task_cleanup(
-                                    work.task.task_uid,
-                                    work.operation.generation,
-                                    cause,
-                                    TASK_ORCHESTRATOR_ACTOR,
-                                )
-                                .await
-                                .map_err(|error| {
-                                    ControllerError::Reconcile(ReconcileError::Authority(
-                                        error.to_string(),
-                                    ))
-                                })?;
-                            return Ok(Action::requeue(StdDuration::from_secs(2)));
-                        }
-                        TaskRuntimeReconciliationAction::Suspend => {
-                            return suspend_runtime_with_inference_cleanup(
-                                &runtime,
-                                &api,
-                                &context.sandbox_runtime,
-                                context.client.clone(),
-                                &context.inference,
-                                None,
+                let (task_owned_runtime, task_envelope_instance_id) =
+                    if let Some(authority) = &context.authority {
+                        let admission = if matches!(
+                            runtime.spec.principal,
+                            steward_types::Principal::Service { .. }
+                        ) && runtime
+                            .annotations()
+                            .contains_key(TASK_EXECUTION_BINDING_ANNOTATION)
+                        {
+                            let namespace = runtime.namespace().ok_or(
+                                ControllerError::Reconcile(ReconcileError::MissingNamespace),
+                            )?;
+                            Some(
+                                authority
+                                    .task_runtime_admission(&namespace, &runtime.name_any())
+                                    .await
+                                    .map_err(|error| {
+                                        ControllerError::Reconcile(ReconcileError::Authority(
+                                            error.to_string(),
+                                        ))
+                                    })?,
                             )
-                            .await;
+                        } else {
+                            None
+                        };
+                        match task_runtime_reconciliation_action(
+                            &runtime,
+                            admission.as_ref().and_then(Option::as_ref),
+                        )
+                        .map_err(ControllerError::Reconcile)?
+                        {
+                            TaskRuntimeReconciliationAction::NotTaskOwned => (false, None),
+                            TaskRuntimeReconciliationAction::Continue => (
+                                true,
+                                admission
+                                    .as_ref()
+                                    .and_then(Option::as_ref)
+                                    .and_then(|admission| {
+                                        admission.task.user_envelope_instance_id.clone()
+                                    }),
+                            ),
+                            TaskRuntimeReconciliationAction::WaitForTaskOrchestrator => {
+                                return Ok(Action::requeue(StdDuration::from_secs(2)));
+                            }
+                            TaskRuntimeReconciliationAction::Cleanup { work, cause } => {
+                                authority
+                                    .enter_task_cleanup(
+                                        work.task.task_uid,
+                                        work.operation.generation,
+                                        cause,
+                                        TASK_ORCHESTRATOR_ACTOR,
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        ControllerError::Reconcile(ReconcileError::Authority(
+                                            error.to_string(),
+                                        ))
+                                    })?;
+                                return Ok(Action::requeue(StdDuration::from_secs(2)));
+                            }
+                            TaskRuntimeReconciliationAction::Suspend => {
+                                return suspend_runtime_with_inference_cleanup(
+                                    &runtime,
+                                    &api,
+                                    &context.sandbox_runtime,
+                                    context.client.clone(),
+                                    &context.inference,
+                                    None,
+                                )
+                                .await;
+                            }
                         }
-                    }
-                } else {
-                    false
-                };
+                    } else {
+                        (false, None)
+                    };
                 if !is_pending_approval(&runtime) && !has_activation_condition(&runtime) {
                     let released_hold = runtime
                         .status
@@ -3968,8 +4014,23 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         }
                     }
                 }
-                if let Some(spend) =
-                    exhausted_spend_to_preserve(&runtime).map_err(ControllerError::Reconcile)?
+                let active_instance_top_up = if let (Some(authority), Some(instance_id)) =
+                    (&context.authority, task_envelope_instance_id.as_deref())
+                {
+                    authority
+                        .active_envelope_instance_spend_top_up(instance_id)
+                        .await
+                        .map_err(|error| {
+                            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
+                        })?
+                } else {
+                    None
+                };
+                let inference_runtime =
+                    runtime_with_spend_top_up(&runtime, active_instance_top_up.as_deref())
+                        .map_err(ControllerError::Reconcile)?;
+                if let Some(spend) = exhausted_spend_to_preserve(&inference_runtime)
+                    .map_err(ControllerError::Reconcile)?
                 {
                     return suspend_runtime_with_inference_cleanup(
                         &runtime,
@@ -3981,9 +4042,12 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     )
                     .await;
                 }
-                let inference =
-                    reconcile_inference(context.client.clone(), &runtime, &context.inference)
-                        .await?;
+                let inference = reconcile_inference(
+                    context.client.clone(),
+                    &inference_runtime,
+                    &context.inference,
+                )
+                .await?;
                 if let (Some(authority), Some((spend, exhausted))) = (
                     context.authority.as_ref(),
                     match &inference {
@@ -5088,9 +5152,10 @@ mod tests {
         connection_operation_authority_action, create_task_runtime_inner,
         exhausted_spend_to_preserve, inference_action, provider_control_bindings_match,
         reconcile_once, replace_as_authority, runtime_authority_action, runtime_ttl_action,
-        sandbox_execution_class, sandbox_task_diagnostics, server_task_runtime_manifest,
-        status_merge_patch, suspend_runtime, suspend_runtime_with_inference_cleanup,
-        task_output_archive_failure, task_runtime, task_runtime_action, ttl_action,
+        runtime_with_spend_top_up, sandbox_execution_class, sandbox_task_diagnostics,
+        server_task_runtime_manifest, status_merge_patch, suspend_runtime,
+        suspend_runtime_with_inference_cleanup, task_output_archive_failure, task_runtime,
+        task_runtime_action, ttl_action,
     };
 
     #[test]
@@ -6205,6 +6270,40 @@ mod tests {
             })?,
             None,
             "a budget raised above accumulated spend must allow reconciliation to resume"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn instance_top_up_changes_inference_authority_without_rewriting_the_runtime_manifest()
+    -> Result<(), String> {
+        let mut runtime = fixture();
+        runtime.status = Some(steward_types::AgentRuntimeStatus {
+            phase: Phase::Suspended,
+            observed_generation: 3,
+            spec_digest: "immutable-spec-digest".to_owned(),
+            refs: RuntimeRefs::default(),
+            conditions: Vec::new(),
+            spend: Some(steward_types::SpendSummary {
+                observed_amount: "1.25".to_owned(),
+                currency: "USD".to_owned(),
+            }),
+        });
+        let original_spec = runtime.spec.clone();
+
+        let effective = runtime_with_spend_top_up(&runtime, Some("0.50"))
+            .map_err(|error| format!("top-up must produce an effective budget: {error:?}"))?;
+
+        assert_eq!(
+            runtime.spec, original_spec,
+            "the CRD manifest stays immutable"
+        );
+        assert_eq!(effective.spec.budget.monthly_limit, "1.50");
+        assert_eq!(
+            exhausted_spend_to_preserve(&effective)
+                .map_err(|error| format!("top-up spend must remain comparable: {error:?}"))?,
+            None,
+            "the effective instance grant must resume inference above accumulated spend"
         );
         Ok(())
     }

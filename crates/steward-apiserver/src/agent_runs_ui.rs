@@ -6,22 +6,24 @@
 //! independent at `/admin/api/v1/runs`.
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
+use steward_admission::AdmissionDecision;
 use steward_store::{
-    AgentRunLogStream, AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent,
-    AgentRunTimelineKind, StoreError,
+    AgentRunExecutionLog, AgentRunLogStream, AgentRunPage, AgentRunQuery, AgentRunRecord,
+    AgentRunTimelineEvent, AgentRunTimelineKind, StoreError, TaskReservationRequest,
 };
 use steward_types::{CanonicalUserId, RuntimeOwnership, TaskPhase};
 use uuid::Uuid;
 
 use crate::browser_auth::{
-    BrowserAdminAuthority, BrowserAuthService, BrowserSessionContext, protect_browser_admin_routes,
-    protect_browser_routes,
+    BrowserAdminAuthority, BrowserAuthService, BrowserMutationProof, BrowserSessionContext,
+    protect_browser_admin_routes, protect_browser_routes,
 };
+use crate::tasks::{stable_task_runtime_name, task_orchestration_reservation};
 use crate::{AgentRunLedger, AgentRunSpendView, bounded_task_error_category};
 
 pub const BROWSER_AGENT_RUNS_API_VERSION: &str = "steward.browser-runs/v1";
@@ -81,6 +83,58 @@ pub(crate) struct BrowserRunView {
     updated_at: String,
     observed_spend: Option<AgentRunSpendView>,
     error_category: Option<String>,
+    trigger: Option<BrowserRunTrigger>,
+    stages: Vec<BrowserRunStage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserRunTrigger {
+    provider: &'static str,
+    repository: String,
+    event: String,
+    actor: String,
+    #[serde(rename = "ref")]
+    git_ref: String,
+    sha: String,
+    run_id: String,
+    run_attempt: u32,
+    run_url: String,
+    caller_workflow: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BrowserRunStageState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserRunStage {
+    id: &'static str,
+    display_name: &'static str,
+    state: BrowserRunStageState,
+    steps: Vec<BrowserRunStep>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserRunStep {
+    id: &'static str,
+    display_name: &'static str,
+    state: BrowserRunStageState,
+    log_streams: Vec<&'static str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserRunFacets {
+    phase: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -90,6 +144,7 @@ pub(crate) struct MyRunsResponse {
     runs: Vec<BrowserRunView>,
     #[schema(value_type = Option<String>, format = "uuid")]
     next_cursor: Option<Uuid>,
+    facets: BrowserRunFacets,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -99,6 +154,7 @@ pub(crate) struct AllRunsView {
     run: BrowserRunView,
     /// Opaque canonical identifier only; display email and acting-user identities stay server-side.
     owner_user_id: Option<String>,
+    owner_display_email: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -108,6 +164,7 @@ pub(crate) struct AllRunsResponse {
     runs: Vec<AllRunsView>,
     #[schema(value_type = Option<String>, format = "uuid")]
     next_cursor: Option<Uuid>,
+    facets: BrowserRunFacets,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -117,12 +174,38 @@ pub(crate) struct BrowserRunResponse {
     run: BrowserRunView,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RerunRequest {
+    idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RerunResponse {
+    api_version: &'static str,
+    #[schema(value_type = String, format = "uuid")]
+    task_uid: Uuid,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub(crate) enum BrowserRunTimelineEvent {
-    Phase { phase: TaskPhase, at: String },
-    FinalizationRequested { at: String },
-    Finalized { at: String },
+    Phase {
+        phase: TaskPhase,
+        at: String,
+    },
+    FinalizationRequested {
+        at: String,
+    },
+    Finalized {
+        at: String,
+    },
+    Stage {
+        stage: String,
+        details: serde_json::Value,
+        at: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -134,6 +217,24 @@ pub(crate) struct BrowserRunTimelineResponse {
     events: Vec<BrowserRunTimelineEvent>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct BrowserExecutionLogQuery {
+    after: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserExecutionLogResponse {
+    stream: String,
+    content: String,
+    truncated: bool,
+    size_bytes: usize,
+    complete: bool,
+}
+
+const MAX_BROWSER_LOG_CHUNK_BYTES: usize = 64 * 1024;
+
 fn my_runs_router<L>(ledger: L) -> Router
 where
     L: AgentRunLedger,
@@ -141,6 +242,11 @@ where
     Router::new()
         .route("/app/api/v1/runs", get(my_runs::<L>))
         .route("/app/api/v1/runs/{task_uid}", get(my_run::<L>))
+        .route(
+            "/app/api/v1/runs/{task_uid}/cancel",
+            post(cancel_my_run::<L>),
+        )
+        .route("/app/api/v1/runs/{task_uid}/rerun", post(rerun_my_run::<L>))
         .route(
             "/app/api/v1/runs/{task_uid}/timeline",
             get(my_run_timeline::<L>),
@@ -225,11 +331,16 @@ where
         user_envelope_instance_id: query.envelope_instance_id,
         task_uid: None,
     };
+    let facets = match state.ledger.agent_run_phase_facets(&query).await {
+        Ok(phase) => BrowserRunFacets { phase },
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
     match state.ledger.agent_runs(&query).await {
         Ok(page) => Json(MyRunsResponse {
             api_version: BROWSER_AGENT_RUNS_API_VERSION,
             runs: page.records.into_iter().map(browser_run_view).collect(),
             next_cursor: page.next_cursor,
+            facets,
         })
         .into_response(),
         Err(StoreError::InvalidRunQuery | StoreError::InvalidRunCursor) => {
@@ -280,6 +391,10 @@ where
         user_envelope_instance_id: None,
         task_uid: None,
     };
+    let facets = match state.ledger.agent_run_phase_facets(&query).await {
+        Ok(phase) => BrowserRunFacets { phase },
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
     match state.ledger.agent_runs(&query).await {
         Ok(AgentRunPage {
             records,
@@ -290,10 +405,12 @@ where
                 .into_iter()
                 .map(|record| AllRunsView {
                     owner_user_id: record.owner_user_id.clone(),
+                    owner_display_email: record.owner_display_email.clone(),
                     run: browser_run_view(record),
                 })
                 .collect(),
             next_cursor,
+            facets,
         })
         .into_response(),
         Err(StoreError::InvalidRunQuery | StoreError::InvalidRunCursor) => {
@@ -335,6 +452,209 @@ where
 }
 
 #[utoipa::path(
+    post,
+    operation_id = "cancelMyRun",
+    path = "/app/api/v1/runs/{task_uid}/cancel",
+    params(
+        ("task_uid" = String, Path, format = "uuid"),
+        ("X-Steward-CSRF" = String, Header)
+    ),
+    responses(
+        (status = 200, body = BrowserRunResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Run was not found in the user's scope"),
+        (status = 503, description = "Run cancellation is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn cancel_my_run<L>(
+    session: Option<Extension<BrowserSessionContext>>,
+    _proof: Extension<BrowserMutationProof>,
+    State(state): State<BrowserRunsState<L>>,
+    Path(task_uid): Path<Uuid>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match state
+        .ledger
+        .cancel_agent_run(task_uid, session.principal.canonical_user_id.as_str())
+        .await
+    {
+        Ok(Some(record)) => Json(BrowserRunResponse {
+            api_version: BROWSER_AGENT_RUNS_API_VERSION,
+            run: browser_run_view(record),
+        })
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "rerunMyRun",
+    path = "/app/api/v1/runs/{task_uid}/rerun",
+    params(("task_uid" = String, Path, format = "uuid"), ("X-Steward-CSRF" = String, Header)),
+    request_body = RerunRequest,
+    responses(
+        (status = 201, body = RerunResponse),
+        (status = 200, body = RerunResponse, description = "Idempotent replay"),
+        (status = 400, description = "Idempotency key is invalid"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Run was not found in the user's scope"),
+        (status = 409, description = "The original envelope is no longer active or GitHub provider dispatch is required"),
+        (status = 503, description = "Run submission is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn rerun_my_run<L>(
+    session: Option<Extension<BrowserSessionContext>>,
+    _proof: Extension<BrowserMutationProof>,
+    State(state): State<BrowserRunsState<L>>,
+    Path(source_task_uid): Path<Uuid>,
+    Json(request): Json<RerunRequest>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let key = request.idempotency_key.trim();
+    if key.is_empty() || key.len() > 255 || key.bytes().any(|byte| byte.is_ascii_control()) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let owner_user_id = session.principal.canonical_user_id.as_str();
+    let source = match state
+        .ledger
+        .rerun_source(source_task_uid, owner_user_id)
+        .await
+    {
+        Ok(Some(source)) => source,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    // A GitHub-triggered rerun must create a new upstream workflow run through the user's
+    // provider connection. Cloning the Task would falsely attach the original run provenance to
+    // unrelated work, so fail closed until that governed provider dispatch succeeds.
+    if source.direct_task_evidence.is_some() {
+        return StatusCode::CONFLICT.into_response();
+    }
+    let idempotency_key = format!("browser-rerun:{source_task_uid}:{key}");
+    match state
+        .ledger
+        .rerun_by_idempotency(&source.submitter_service, owner_user_id, &idempotency_key)
+        .await
+    {
+        Ok(Some(existing)) => {
+            return (
+                StatusCode::OK,
+                Json(RerunResponse {
+                    api_version: BROWSER_AGENT_RUNS_API_VERSION,
+                    task_uid: existing.task_uid,
+                }),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    }
+    let Some(envelope) = source.user_envelope_snapshot.as_ref() else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let Some(envelope_instance_id) = source.user_envelope_instance_id.as_deref() else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let Some(envelope_revision) = source.user_envelope_revision else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let Some(envelope_digest) = source.user_envelope_digest.as_deref() else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let task_uid = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let runtime_name = stable_task_runtime_name(operation_id);
+    let orchestration = match task_orchestration_reservation(
+        task_uid,
+        operation_id,
+        &source.runtime_namespace,
+        &runtime_name,
+        &source.runtime_spec,
+        envelope,
+        source.execution_binding.as_ref(),
+    ) {
+        Ok(orchestration) => orchestration,
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let expected_runtime_uid = (source.runtime_ownership == RuntimeOwnership::Adopted)
+        .then_some(source.runtime_uid.as_deref())
+        .flatten();
+    let decision = AdmissionDecision::Admit;
+    let reservation = state
+        .ledger
+        .reserve_rerun(TaskReservationRequest {
+            task_uid,
+            operation_id,
+            idempotency_key: &idempotency_key,
+            submitter_service: &source.submitter_service,
+            acting_user: source.acting_user.as_deref(),
+            acting_user_id: source.acting_user_id.as_deref(),
+            owner: &source.owner,
+            owner_user_id,
+            workflow: &source.workflow,
+            workflow_name: source.workflow_name.as_deref(),
+            workflow_version: source.workflow_version,
+            workflow_digest: source.workflow_digest.as_deref(),
+            user_envelope_instance_id: Some(envelope_instance_id),
+            user_envelope_revision: Some(envelope_revision),
+            user_envelope_digest: Some(envelope_digest),
+            coding_agent_runtime: &source.coding_agent_runtime,
+            runtime_uid: expected_runtime_uid,
+            runtime_namespace: &source.runtime_namespace,
+            runtime_name: &runtime_name,
+            runtime_ownership: source.runtime_ownership,
+            runtime_spec: &source.runtime_spec,
+            agent_command: &source.agent_command,
+            execution_binding: source.execution_binding.as_ref(),
+            direct_task_evidence: None,
+            user_envelope_snapshot: Some(envelope),
+            candidate_digest: &orchestration.candidate_digest,
+            admission_decision: &decision,
+            inert_manifest_digest: &orchestration.inert_manifest_digest,
+            active_manifest_digest: &orchestration.active_manifest_digest,
+        })
+        .await;
+    let reservation = match reservation {
+        Ok(reservation) => reservation,
+        Err(StoreError::StaleEnvelope) => return StatusCode::CONFLICT.into_response(),
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    if reservation.inserted
+        && state
+            .ledger
+            .activate_rerun(source_task_uid, reservation.record.task_uid)
+            .await
+            .is_err()
+    {
+        return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    (
+        StatusCode::CREATED,
+        Json(RerunResponse {
+            api_version: BROWSER_AGENT_RUNS_API_VERSION,
+            task_uid: reservation.record.task_uid,
+        }),
+    )
+        .into_response()
+}
+
+#[utoipa::path(
     get,
     path = "/admin/api/v1/all-runs/{task_uid}",
     params(("task_uid" = String, Path)),
@@ -366,10 +686,11 @@ where
     path = "/app/api/v1/runs/{task_uid}/logs/{stream}",
     params(
         ("task_uid" = String, Path, format = "uuid"),
-        ("stream" = String, Path, description = "Exact execution stream: stdout or stderr")
+        ("stream" = String, Path, description = "Exact execution stream: stdout or stderr"),
+        ("after" = Option<usize>, Query, description = "Zero-based byte offset")
     ),
     responses(
-        (status = 200, description = "Bounded execution log", content_type = "text/plain"),
+        (status = 200, body = BrowserExecutionLogResponse),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 404, description = "Terminal execution log was not found in the user's scope"),
         (status = 503, description = "Run history is unavailable")
@@ -380,6 +701,7 @@ pub(crate) async fn my_run_execution_log<L>(
     session: Option<Extension<BrowserSessionContext>>,
     State(state): State<BrowserRunsState<L>>,
     Path((task_uid, stream)): Path<(Uuid, String)>,
+    Query(query): Query<BrowserExecutionLogQuery>,
 ) -> Response
 where
     L: AgentRunLedger,
@@ -392,6 +714,7 @@ where
         task_uid,
         Some(session.principal.canonical_user_id.as_str()),
         &stream,
+        query.after.unwrap_or(0),
     )
     .await
 }
@@ -401,10 +724,11 @@ where
     path = "/admin/api/v1/all-runs/{task_uid}/logs/{stream}",
     params(
         ("task_uid" = String, Path, format = "uuid"),
-        ("stream" = String, Path, description = "Exact execution stream: stdout or stderr")
+        ("stream" = String, Path, description = "Exact execution stream: stdout or stderr"),
+        ("after" = Option<usize>, Query, description = "Zero-based byte offset")
     ),
     responses(
-        (status = 200, description = "Bounded execution log", content_type = "text/plain"),
+        (status = 200, body = BrowserExecutionLogResponse),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Administrator role is required"),
         (status = 404, description = "Terminal execution log was not found"),
@@ -416,6 +740,7 @@ pub(crate) async fn all_run_execution_log<L>(
     authority: Option<Extension<BrowserAdminAuthority>>,
     State(state): State<BrowserRunsState<L>>,
     Path((task_uid, stream)): Path<(Uuid, String)>,
+    Query(query): Query<BrowserExecutionLogQuery>,
 ) -> Response
 where
     L: AgentRunLedger,
@@ -423,7 +748,14 @@ where
     if authority.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    execution_log_response(&state.ledger, task_uid, None, &stream).await
+    execution_log_response(
+        &state.ledger,
+        task_uid,
+        None,
+        &stream,
+        query.after.unwrap_or(0),
+    )
+    .await
 }
 
 async fn execution_log_response<L>(
@@ -431,39 +763,40 @@ async fn execution_log_response<L>(
     task_uid: Uuid,
     owner_user_id: Option<&str>,
     stream: &str,
+    after: usize,
 ) -> Response
 where
     L: AgentRunLedger,
 {
-    let stream = match stream {
+    let stream_kind = match stream {
         "stdout" => AgentRunLogStream::Stdout,
         "stderr" => AgentRunLogStream::Stderr,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     match ledger
-        .agent_run_execution_log(task_uid, owner_user_id, stream)
+        .agent_run_execution_log(task_uid, owner_user_id, stream_kind)
         .await
     {
-        Ok(Some(log)) => execution_log_body(log),
+        Ok(Some(log)) => execution_log_body(stream, log, after),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
 
-fn execution_log_body(log: Vec<u8>) -> Response {
-    let mut response = log.into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response.headers_mut().insert(
-        HeaderName::from_static("x-content-type-options"),
-        HeaderValue::from_static("nosniff"),
-    );
-    response
+fn execution_log_body(stream: &str, log: AgentRunExecutionLog, after: usize) -> Response {
+    let size_bytes = log.content.len();
+    let start = after.min(size_bytes);
+    let end = start
+        .saturating_add(MAX_BROWSER_LOG_CHUNK_BYTES)
+        .min(size_bytes);
+    Json(BrowserExecutionLogResponse {
+        stream: stream.to_owned(),
+        content: String::from_utf8_lossy(&log.content[start..end]).into_owned(),
+        truncated: end < size_bytes,
+        size_bytes,
+        complete: log.complete,
+    })
+    .into_response()
 }
 
 #[utoipa::path(
@@ -601,6 +934,16 @@ where
 }
 
 fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
+    let trigger = record
+        .direct_task_evidence
+        .as_ref()
+        .map(|evidence| browser_run_trigger(&evidence.source_provenance));
+    let stages = browser_run_stages(
+        record.phase,
+        record.runtime_uid.is_some(),
+        record.finalize_requested,
+        record.finalized,
+    );
     BrowserRunView {
         task_uid: record.task_uid,
         workflow: record.workflow,
@@ -625,7 +968,106 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         }),
         error_category: bounded_task_error_category(record.failure_reason.as_deref())
             .map(str::to_owned),
+        trigger,
+        stages,
     }
+}
+
+fn browser_run_trigger(
+    provenance: &steward_types::direct_package::SourceProvenance,
+) -> BrowserRunTrigger {
+    let repository = provenance.repository.name.as_str().to_owned();
+    let run_id = provenance.run.id.as_str().to_owned();
+    BrowserRunTrigger {
+        provider: "github",
+        run_url: format!("https://github.com/{repository}/actions/runs/{run_id}"),
+        repository,
+        event: provenance.event.as_str().to_owned(),
+        actor: provenance.actor.as_str().to_owned(),
+        git_ref: provenance.git_ref.as_str().to_owned(),
+        sha: provenance
+            .triggered_sha
+            .as_str()
+            .strip_prefix("git:sha1:")
+            .unwrap_or(provenance.triggered_sha.as_str())
+            .to_owned(),
+        run_id,
+        run_attempt: provenance.run.attempt,
+        caller_workflow: provenance.caller_workflow.workflow_ref.as_str().to_owned(),
+    }
+}
+
+fn browser_run_stages(
+    phase: TaskPhase,
+    runtime_bound: bool,
+    finalization_requested: bool,
+    finalized: bool,
+) -> Vec<BrowserRunStage> {
+    let terminal = matches!(
+        phase,
+        TaskPhase::Succeeded | TaskPhase::Failed | TaskPhase::Cancelled
+    );
+    let provision_state = if runtime_bound {
+        BrowserRunStageState::Succeeded
+    } else if phase == TaskPhase::Cancelled {
+        BrowserRunStageState::Cancelled
+    } else if phase == TaskPhase::Failed {
+        BrowserRunStageState::Failed
+    } else if matches!(
+        phase,
+        TaskPhase::Submitted | TaskPhase::Parked | TaskPhase::Queued
+    ) {
+        BrowserRunStageState::Running
+    } else {
+        BrowserRunStageState::Pending
+    };
+    let execution_state = match phase {
+        TaskPhase::Submitted | TaskPhase::Parked | TaskPhase::Queued => {
+            BrowserRunStageState::Pending
+        }
+        TaskPhase::Running => BrowserRunStageState::Running,
+        TaskPhase::Succeeded => BrowserRunStageState::Succeeded,
+        TaskPhase::Failed => BrowserRunStageState::Failed,
+        TaskPhase::Cancelled => BrowserRunStageState::Cancelled,
+    };
+    let finalize_state = if finalized {
+        BrowserRunStageState::Succeeded
+    } else if finalization_requested || terminal {
+        BrowserRunStageState::Running
+    } else {
+        BrowserRunStageState::Pending
+    };
+    vec![
+        BrowserRunStage {
+            id: "admission",
+            display_name: "Admission",
+            state: BrowserRunStageState::Succeeded,
+            steps: Vec::new(),
+        },
+        BrowserRunStage {
+            id: "provision_runtime",
+            display_name: "Provision runtime",
+            state: provision_state,
+            steps: Vec::new(),
+        },
+        BrowserRunStage {
+            id: "agent_execution",
+            display_name: "Agent execution",
+            state: execution_state,
+            steps: vec![BrowserRunStep {
+                id: "execution",
+                display_name: "Agent execution",
+                state: execution_state,
+                log_streams: vec!["stdout", "stderr"],
+            }],
+        },
+        BrowserRunStage {
+            id: "finalize",
+            display_name: "Finalize",
+            state: finalize_state,
+            steps: Vec::new(),
+        },
+    ]
 }
 
 fn browser_timeline_event(event: AgentRunTimelineEvent) -> BrowserRunTimelineEvent {
@@ -638,6 +1080,14 @@ fn browser_timeline_event(event: AgentRunTimelineEvent) -> BrowserRunTimelineEve
             BrowserRunTimelineEvent::FinalizationRequested { at: event.at }
         }
         AgentRunTimelineKind::Finalized => BrowserRunTimelineEvent::Finalized { at: event.at },
+        AgentRunTimelineKind::Stage {
+            event_kind,
+            details,
+        } => BrowserRunTimelineEvent::Stage {
+            stage: event_kind,
+            details,
+            at: event.at,
+        },
     }
 }
 
@@ -722,6 +1172,73 @@ mod tests {
             Box::pin(async { Ok(None) })
         }
 
+        fn agent_run_phase_facets<'a>(
+            &'a self,
+            query: &'a AgentRunQuery,
+        ) -> BoxFuture<'a, Result<std::collections::BTreeMap<String, u64>, StoreError>> {
+            Box::pin(async move {
+                let records = self
+                    .records
+                    .lock()
+                    .map_err(|_| StoreError::InvalidRunQuery)?;
+                let mut facets = std::collections::BTreeMap::new();
+                for record in
+                    records.iter().filter(|record| {
+                        query.owner_user_id.as_ref().is_none_or(|owner| {
+                            record.owner_user_id.as_deref() == Some(owner.as_str())
+                        }) && query
+                            .workflow
+                            .as_ref()
+                            .is_none_or(|workflow| &record.workflow == workflow)
+                            && query.runtime_uid.as_ref().is_none_or(|runtime_uid| {
+                                record.runtime_uid.as_deref() == Some(runtime_uid.as_str())
+                            })
+                            && query
+                                .user_envelope_instance_id
+                                .as_ref()
+                                .is_none_or(|instance_id| {
+                                    record.user_envelope_instance_id.as_deref()
+                                        == Some(instance_id.as_str())
+                                })
+                    })
+                {
+                    let phase = serde_json::to_value(record.phase)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .ok_or(StoreError::InvalidRunQuery)?;
+                    *facets.entry(phase).or_insert(0) += 1;
+                }
+                Ok(facets)
+            })
+        }
+
+        fn cancel_agent_run<'a>(
+            &'a self,
+            task_uid: Uuid,
+            owner_user_id: &'a str,
+        ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
+            Box::pin(async move {
+                let mut records = self
+                    .records
+                    .lock()
+                    .map_err(|_| StoreError::InvalidRunQuery)?;
+                let Some(record) = records.iter_mut().find(|record| {
+                    record.task_uid == task_uid
+                        && record.owner_user_id.as_deref() == Some(owner_user_id)
+                }) else {
+                    return Ok(None);
+                };
+                record.finalize_requested = true;
+                if matches!(
+                    record.phase,
+                    TaskPhase::Submitted | TaskPhase::Parked | TaskPhase::Queued
+                ) {
+                    record.phase = TaskPhase::Cancelled;
+                }
+                Ok(Some(record.clone()))
+            })
+        }
+
         fn agent_run_timeline<'a>(
             &'a self,
             task_uid: Uuid,
@@ -755,7 +1272,7 @@ mod tests {
             task_uid: Uuid,
             owner_user_id: Option<&'a str>,
             stream: AgentRunLogStream,
-        ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>> {
+        ) -> BoxFuture<'a, Result<Option<AgentRunExecutionLog>, StoreError>> {
             Box::pin(async move {
                 let visible = self
                     .records
@@ -775,7 +1292,11 @@ mod tests {
                     .lock()
                     .map_err(|_| StoreError::InvalidRunQuery)?
                     .get(&(task_uid, stream))
-                    .cloned())
+                    .cloned()
+                    .map(|content| AgentRunExecutionLog {
+                        content,
+                        complete: true,
+                    }))
             })
         }
     }
@@ -787,6 +1308,7 @@ mod tests {
             acting_user: Some("alice@example.com".to_owned()),
             owner: "alice@example.com".to_owned(),
             owner_user_id: Some(owner_user_id.to_owned()),
+            owner_display_email: Some("alice@example.com".to_owned()),
             workflow: "repository-review@1".to_owned(),
             workflow_name: Some("repository-review".to_owned()),
             workflow_version: Some(1),
@@ -835,6 +1357,7 @@ mod tests {
                 observed_at: "2026-08-17T00:00:00.000000Z".to_owned(),
             }),
             history_partial: false,
+            direct_task_evidence: None,
         }
     }
 
@@ -1026,8 +1549,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_runs_requires_browser_admin_and_returns_only_opaque_owner_identity()
-    -> Result<(), String> {
+    async fn all_runs_requires_browser_admin_and_returns_owner_display_email() -> Result<(), String>
+    {
         let owner = "usr_0123456789abcdef0123456789abcdef";
         let ledger = FakeLedger::default();
         ledger.records.lock().map_err(|_| "lock records")?.push(run(
@@ -1066,7 +1589,8 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|error| format!("parse admin all-runs response: {error}"))?;
         assert_eq!(value["runs"][0]["ownerUserId"], owner);
-        assert!(!value.to_string().contains("alice@example.com"));
+        assert_eq!(value["runs"][0]["ownerDisplayEmail"], "alice@example.com");
+        assert_eq!(value["facets"]["phase"]["succeeded"], 1);
         assert_eq!(
             ledger.queries.lock().map_err(|_| "lock queries")?[0]
                 .owner_user_id
@@ -1137,8 +1661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_execution_logs_are_owner_scoped_plain_text_and_not_cached()
-    -> Result<(), String> {
+    async fn execution_logs_are_owner_scoped_typed_and_incremental() -> Result<(), String> {
         let owner = "usr_0123456789abcdef0123456789abcdef";
         let other_owner = "usr_abcdefabcdefabcdefabcdefabcdefab";
         let own_task = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
@@ -1172,24 +1695,16 @@ mod tests {
             .await
             .map_err(|error| format!("execute stdout request: {error}"))?;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE),
-            Some(&HeaderValue::from_static("text/plain; charset=utf-8"))
-        );
-        assert_eq!(
-            response.headers().get(header::CACHE_CONTROL),
-            Some(&HeaderValue::from_static("no-store"))
-        );
-        assert_eq!(
-            response.headers().get("x-content-type-options"),
-            Some(&HeaderValue::from_static("nosniff"))
-        );
-        assert_eq!(
-            to_bytes(response.into_body(), 1024)
-                .await
-                .map_err(|error| format!("read stdout response: {error}"))?,
-            "completed\n"
-        );
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .map_err(|error| format!("read stdout response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode stdout response: {error}"))?;
+        assert_eq!(body["stream"], "stdout");
+        assert_eq!(body["content"], "completed\n");
+        assert_eq!(body["sizeBytes"], 10);
+        assert_eq!(body["complete"], true);
+        assert_eq!(body["truncated"], false);
 
         let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
         let hidden = protected_router(ledger, service)
@@ -1248,12 +1763,14 @@ mod tests {
             .await
             .map_err(|error| format!("execute admin stderr request: {error}"))?;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            to_bytes(response.into_body(), 1024)
-                .await
-                .map_err(|error| format!("read failed stderr response: {error}"))?,
-            "agent failed\n"
-        );
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .map_err(|error| format!("read failed stderr response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode failed stderr response: {error}"))?;
+        assert_eq!(body["stream"], "stderr");
+        assert_eq!(body["content"], "agent failed\n");
+        assert_eq!(body["complete"], true);
         Ok(())
     }
 }

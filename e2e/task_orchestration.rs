@@ -36,16 +36,18 @@ use steward_ports::{
     SandboxTaskRuntime, TaskAttemptId,
 };
 use steward_store::{
-    EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, PgStore,
-    StoreError, TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest,
-    WorkflowPublication,
+    AgentRunLogStream, EnvelopeRequestReservationRequest, EnvelopeRequestStatus,
+    EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication, PgStore, StoreError,
+    TaskActivationObservation, TaskExecutionObservation, TaskExecutionTransition,
+    TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest, WorkflowPublication,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
     CanonicalAuthorityBinding, DisposableExecutionBinding, Duration, Email,
     ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef, OrganizationId,
     OrganizationIdentityPolicy, Phase, Principal, RunnerRequirements, RuntimeOwnership,
-    RuntimeRefs, TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding, TaskPhase, ToolGrant,
+    RuntimeRefs, SpendSummary, TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding,
+    TaskPhase, ToolGrant,
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -439,6 +441,478 @@ async fn internal_authority_provisions_and_recovers_cleanup_without_a_service_en
             vec!["runtime-uid-a".to_owned()]
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn multiple_named_envelope_templates_coexist_for_one_role_and_pin_requests_independently()
+-> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let store = PgStore::new(
+        PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await?,
+    );
+    store.migrate().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let role = format!("engineer-{suffix}");
+    let email = Email(format!("alice-{suffix}@example.com"));
+    let identity = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("template-subject-{suffix}"),
+                "example.com",
+                email.as_str(),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let envelope = Envelope {
+        revision: 1,
+        spec: EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "example".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: "25.00".to_owned(),
+                single_run_limit: Some("5.00".to_owned()),
+                currency: "USD".to_owned(),
+            },
+            ttl: Duration("1h".to_owned()),
+            runner: RunnerRequirements::default(),
+        },
+    };
+    let template_ids = [format!("develop-{suffix}"), format!("review-{suffix}")];
+    for (template_id, display_name) in template_ids.iter().zip(["Develop", "Review"]) {
+        store
+            .insert_envelope_template_revision(EnvelopeTemplatePublication {
+                template_id,
+                display_name,
+                member_roles: std::slice::from_ref(&role),
+                ceiling: &envelope,
+                auto_provision_threshold: Some(&envelope),
+                authored_by: "test-bootstrap",
+            })
+            .await?;
+    }
+
+    let eligible = store
+        .available_envelope_templates(std::slice::from_ref(&role))
+        .await?;
+    assert_eq!(
+        eligible
+            .iter()
+            .map(|template| template.template_id.as_str())
+            .collect::<Vec<_>>(),
+        template_ids.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    let mut request_ids = Vec::new();
+    for (index, template_id) in template_ids.iter().enumerate() {
+        let request = store
+            .reserve_envelope_request(EnvelopeRequestReservationRequest {
+                owner_user_id: &identity.user_id,
+                template_id,
+                template_revision: envelope.revision,
+                requested_envelope: &envelope,
+                idempotency_key: &format!("template-request-{suffix}-{index}"),
+                actor: identity.user_id.as_str(),
+            })
+            .await?
+            .record;
+        assert_eq!(request.template_id, *template_id);
+        request_ids.push(request.id);
+    }
+    assert_ne!(request_ids[0], request_ids[1]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
+-> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool.clone());
+    store.migrate().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let email = Email(format!("alice-{suffix}@example.com"));
+    let identity = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("escalation-subject-{suffix}"),
+                "example.com",
+                email.as_str(),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let template_id = format!("develop-{suffix}");
+    let envelope = Envelope {
+        revision: 1,
+        spec: EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "example".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: "100.00".to_owned(),
+                single_run_limit: Some("10.00".to_owned()),
+                currency: "USD".to_owned(),
+            },
+            ttl: Duration("1h".to_owned()),
+            runner: RunnerRequirements::default(),
+        },
+    };
+    store
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &template_id,
+            display_name: "Develop",
+            member_roles: std::slice::from_ref(&template_id),
+            ceiling: &envelope,
+            auto_provision_threshold: Some(&envelope),
+            authored_by: "test-bootstrap",
+        })
+        .await?;
+    let request = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &identity.user_id,
+            template_id: &template_id,
+            template_revision: envelope.revision,
+            requested_envelope: &envelope,
+            idempotency_key: &format!("envelope-{suffix}"),
+            actor: identity.user_id.as_str(),
+        })
+        .await?
+        .record;
+    let approval_id = Uuid::new_v4();
+    let envelope_instance_id = format!("env_{}", request.id.simple());
+    let envelope_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&envelope)?)
+    );
+    store
+        .append_envelope_request_status(
+            request.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: Some(approval_id),
+                envelope_instance_id: Some(&envelope_instance_id),
+                envelope_digest: Some(&envelope_digest),
+                reason: None,
+                rationale: Some("bounded test approval"),
+                evidence_url: None,
+                expires_at: None,
+                approved_envelope: Some(&envelope),
+                actor: "test-bootstrap",
+            },
+        )
+        .await?;
+    let workflow = format!("escalation-{suffix}");
+    let workflow_digest = format!("sha256:{:x}", Sha256::digest(workflow.as_bytes()));
+    store
+        .publish_initial_workflow(WorkflowPublication {
+            name: &workflow,
+            display_name: "Escalation test",
+            agent: "example-agent@1",
+            prompt: "Exercise cumulative spend escalation.",
+            content_digest: &workflow_digest,
+            published_by: "test-bootstrap",
+        })
+        .await?;
+    let service = format!("escalation-{suffix}");
+    let spec = AgentRuntimeSpec {
+        principal: Principal::Service {
+            name: service.clone(),
+            acting_user: Some(email.clone()),
+        },
+        owner: email.clone(),
+        canonical_authority: Some(CanonicalAuthorityBinding::new(
+            identity.user_id.clone(),
+            Some(identity.user_id.clone()),
+        )?),
+        agent_type: AgentType {
+            name: "example-agent@1".to_owned(),
+        },
+        llms: envelope.spec.llms.clone(),
+        tools: envelope.spec.tools.clone(),
+        budget: envelope.spec.budget.clone(),
+        ttl: envelope.spec.ttl.clone(),
+        runner: envelope.spec.runner.clone(),
+        bindings: None,
+    };
+    let execution_binding = disposable_execution_binding()?;
+    let task_uid = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let runtime_name = format!("task-{}", operation_id.simple());
+    let candidate_digest = digest(serde_json::to_value(&spec))?;
+    let inert_digest = manifest_digest_with_binding(
+        task_uid,
+        operation_id,
+        &runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let active_digest = manifest_digest_with_binding(
+        task_uid,
+        operation_id,
+        &runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    let agent_command = ["example-agent".to_owned(), "run".to_owned()];
+    let admission_decision = AdmissionDecision::Admit;
+    let reservation = store
+        .reserve_task(&TaskReservationRequest {
+            task_uid,
+            operation_id,
+            idempotency_key: &format!("escalation-task-{suffix}"),
+            submitter_service: &service,
+            acting_user: Some(email.as_str()),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: email.as_str(),
+            owner_user_id: identity.user_id.as_str(),
+            workflow: &workflow,
+            workflow_name: Some(&workflow),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &agent_command,
+            execution_binding: Some(&execution_binding),
+            direct_task_evidence: None,
+            user_envelope_snapshot: Some(&envelope),
+            candidate_digest: &candidate_digest,
+            admission_decision: &admission_decision,
+            inert_manifest_digest: &inert_digest,
+            active_manifest_digest: &active_digest,
+        })
+        .await?;
+    store
+        .put_task_inputs(
+            task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"live execution input",
+        )
+        .await?;
+    store
+        .request_task_execution(task_uid, &service, identity.user_id.as_str())
+        .await?;
+    store
+        .authorize_task_runtime_creation(
+            task_uid,
+            reservation.operation.generation,
+            "test-controller",
+        )
+        .await?;
+    let operation = store
+        .task_runtime_operation(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    let runtime_uid = format!("runtime-{suffix}");
+    store
+        .record_task_runtime_observed(
+            task_uid,
+            operation.generation,
+            &runtime_uid,
+            "1",
+            "test-controller",
+        )
+        .await?;
+    let operation = store
+        .task_runtime_operation(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    store
+        .decide_task_runtime_authority_v3(task_uid, operation.generation, "test-controller")
+        .await?;
+    let operation = store
+        .task_runtime_operation(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    store
+        .decide_task_runtime_authority_v3(task_uid, operation.generation, "test-controller")
+        .await?;
+    let operation = store
+        .task_runtime_operation(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    store
+        .record_task_activation_observed(
+            task_uid,
+            operation.generation,
+            &TaskActivationObservation {
+                runtime_uid: &runtime_uid,
+                resource_version: "2",
+                active_manifest_digest: &active_digest,
+                provider_set_ready: true,
+            },
+            "test-controller",
+        )
+        .await?;
+    let attempt = store
+        .claim_task_execution_attempt(
+            task_uid,
+            &format!("sha256:{}", "a".repeat(64)),
+            &format!("sha256:{}", "b".repeat(64)),
+            "test-controller",
+        )
+        .await?;
+    let attempt = match attempt {
+        TaskExecutionTransition::Created(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "live-log execution attempt was not created: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    let attempt = match store
+        .authorize_task_execution_start(
+            attempt.attempt_id,
+            attempt.generation,
+            "test-controller",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Applied(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "live-log execution start was not authorized: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    store
+        .record_task_execution_observation(
+            attempt.attempt_id,
+            attempt.generation,
+            TaskExecutionObservation::Running {
+                adapter_observation_id: "live-attempt",
+                execution_stdout: Some(b"live stdout"),
+                execution_stderr: Some(b"live stderr"),
+            },
+            "test-controller",
+        )
+        .await?;
+    let live_log = store
+        .agent_run_execution_log(
+            task_uid,
+            Some(identity.user_id.as_str()),
+            AgentRunLogStream::Stdout,
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("live execution log was not projected"))?;
+    assert_eq!(live_log.content, b"live stdout");
+    assert!(
+        !live_log.complete,
+        "a running transcript must remain pollable"
+    );
+    store
+        .record_spend_observation(
+            &runtime_uid,
+            1,
+            "immutable-runtime-spec",
+            &SpendSummary {
+                observed_amount: "100.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            true,
+        )
+        .await?;
+
+    let escalation = store
+        .admin_escalations()
+        .await?
+        .into_iter()
+        .find(|record| record.runtime_uid == runtime_uid)
+        .ok_or_else(|| io::Error::other("spend escalation was not projected"))?;
+    assert_eq!(escalation.envelope_instance_id, envelope_instance_id);
+    assert_eq!(escalation.limit, "100.00");
+    let grant = store
+        .record_escalation_top_up(
+            escalation.escalation_id,
+            "25.00",
+            "2999-01-01T00:00:00Z",
+            "finish the bounded task",
+            "test-admin",
+        )
+        .await?;
+    assert_eq!(grant.base_limit, "100.00");
+    assert_eq!(grant.target_limit, "125.00");
+    assert_eq!(
+        store
+            .active_envelope_instance_spend_top_up(&envelope_instance_id)
+            .await?,
+        Some("25.00".to_owned())
+    );
+    let usage = store.envelope_usage(&envelope_instance_id).await?;
+    assert_eq!(usage.observed_amount, Some("100.00".to_owned()));
+    assert_eq!(usage.active_top_up_amount, Some("25.00".to_owned()));
+    let retry = store
+        .record_escalation_top_up(
+            escalation.escalation_id,
+            "25.0",
+            "2999-01-01T00:00:00Z",
+            "finish the bounded task",
+            "test-admin",
+        )
+        .await?;
+    assert_eq!(
+        retry.id, grant.id,
+        "retries must return the one append-only grant"
+    );
+    assert_eq!(
+        store
+            .record_escalation_top_up(
+                escalation.escalation_id,
+                "30.00",
+                "2999-01-01T00:00:00Z",
+                "different authority",
+                "test-admin",
+            )
+            .await,
+        Err(StoreError::CumulativeEscalationConflict)
+    );
+    let decided = store
+        .cumulative_escalation(escalation.escalation_id)
+        .await?
+        .ok_or_else(|| io::Error::other("decided escalation was not projected"))?;
+    assert_eq!(decided.grant_id, Some(grant.id));
+    assert_eq!(decided.limit, "125.00");
+    assert_eq!(decided.grant_active, Some(true));
     Ok(())
 }
 

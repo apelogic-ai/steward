@@ -2,7 +2,7 @@
 
 use std::hash::Hash;
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -10,10 +10,12 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use steward_admission::{AdmissionDecision, Envelope, evaluate, validate_envelope};
+use steward_admission::{
+    AdmissionDecision, Envelope, add_budget_amount, evaluate, validate_envelope,
+};
 use steward_store::{
     EnvelopeRequestRecord, EnvelopeRequestReservationRequest, EnvelopeRequestStatusEventRecord,
-    EnvelopeRequestStatusUpdate, PgStore, StoreError, WorkflowRevisionRecord,
+    EnvelopeRequestStatusUpdate, EnvelopeUsageRecord, PgStore, StoreError, WorkflowRevisionRecord,
 };
 use steward_types::{
     AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email, ModelRef, Principal,
@@ -26,8 +28,9 @@ use crate::browser_auth::{
     protect_browser_routes,
 };
 use crate::{
-    BoxFuture, GithubActionsEnvelopeSelection, VersionedGithubActionsWorkflowContext,
-    render_versioned_github_actions_workflow, reviewed_steward_run_release_v2,
+    AgentRunAvailability, AgentRunDataStatus, BoxFuture, GithubActionsEnvelopeSelection,
+    VersionedGithubActionsWorkflowContext, render_versioned_github_actions_workflow,
+    reviewed_steward_run_release_v2,
 };
 
 pub const ENVELOPE_REQUESTS_API_VERSION: &str = "steward.envelope-requests/v1";
@@ -70,7 +73,7 @@ pub struct AvailableEnvelopeTemplate {
     pub auto_provision_threshold: Option<Envelope>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvelopeRequestStatus {
     Pending,
@@ -103,6 +106,32 @@ pub struct UserEnvelopeRequest {
     pub created_at: String,
     pub status_at: String,
     pub history: Vec<EnvelopeRequestHistoryEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<EnvelopeUsageView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvelopeUsagePeriod {
+    pub start: String,
+    pub end: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvelopeSpendUsage {
+    pub observed: String,
+    pub limit: String,
+    pub currency: String,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvelopeUsageView {
+    pub period: EnvelopeUsagePeriod,
+    pub spend: Option<EnvelopeSpendUsage>,
+    pub availability: AgentRunDataStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -177,6 +206,15 @@ pub(crate) struct EnvelopeTemplatesResponse {
 pub(crate) struct EnvelopeRequestsResponse {
     api_version: &'static str,
     requests: Vec<UserEnvelopeRequest>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct EnvelopeRequestsQuery {
+    status: Option<EnvelopeRequestStatus>,
+    cursor: Option<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -215,15 +253,18 @@ pub(crate) struct PublishedWorkflowOption {
     version: i64,
     display_name: String,
     agent: String,
+    sample: bool,
 }
 
 impl From<WorkflowRevisionRecord> for PublishedWorkflowOption {
     fn from(record: WorkflowRevisionRecord) -> Self {
+        let sample = record.name == "repo-summary";
         Self {
             name: record.name,
             version: record.version,
             display_name: record.display_name,
             agent: record.agent,
+            sample,
         }
     }
 }
@@ -264,6 +305,29 @@ pub struct PgEnvelopeRequestBroker {
 impl PgEnvelopeRequestBroker {
     pub fn new(store: PgStore) -> Self {
         Self { store }
+    }
+
+    async fn attach_usage(
+        &self,
+        mut request: UserEnvelopeRequest,
+    ) -> Result<UserEnvelopeRequest, EnvelopeRequestBrokerError> {
+        if request.status != EnvelopeRequestStatus::Provisioned {
+            return Ok(request);
+        }
+        let Some(instance_id) = request.envelope_instance_id.as_deref() else {
+            return Err(EnvelopeRequestBrokerError::Unavailable);
+        };
+        let usage = self
+            .store
+            .envelope_usage(instance_id)
+            .await
+            .map_err(map_store_broker_error)?;
+        let authority = request
+            .approved_envelope
+            .as_ref()
+            .unwrap_or(&request.requested_envelope);
+        request.usage = Some(envelope_usage_view(usage, authority));
+        Ok(request)
     }
 }
 
@@ -330,11 +394,16 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
         session: &'a UserEnvelopeSession<BrowserSessionBinding>,
     ) -> BoxFuture<'a, Result<Vec<UserEnvelopeRequest>, EnvelopeRequestBrokerError>> {
         Box::pin(async move {
-            self.store
+            let records = self
+                .store
                 .envelope_requests(&session.subject.canonical_user_id)
                 .await
-                .map(|records| records.into_iter().map(user_envelope_request).collect())
-                .map_err(map_store_broker_error)
+                .map_err(map_store_broker_error)?;
+            let mut requests = Vec::with_capacity(records.len());
+            for record in records {
+                requests.push(self.attach_usage(user_envelope_request(record)).await?);
+            }
+            Ok(requests)
         })
     }
 
@@ -362,7 +431,7 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                 .into_iter()
                 .map(envelope_request_history_event)
                 .collect();
-            Ok(Some(request))
+            Ok(Some(self.attach_usage(request).await?))
         })
     }
 
@@ -405,12 +474,12 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                         evidence_url: None,
                         expires_at: None,
                         approved_envelope: Some(request.requested_envelope),
-                        actor: session.subject.canonical_user_id.as_str(),
+                        actor: "system:auto",
                     },
                 )
                 .await
                 .map_err(map_store_broker_error)?;
-            Ok(user_envelope_request(provisioned))
+            self.attach_usage(user_envelope_request(provisioned)).await
         })
     }
 
@@ -465,6 +534,76 @@ fn user_envelope_request(record: EnvelopeRequestRecord) -> UserEnvelopeRequest {
         created_at: record.created_at,
         status_at: record.status_at,
         history: Vec::new(),
+        usage: None,
+    }
+}
+
+fn envelope_usage_view(usage: EnvelopeUsageRecord, authority: &Envelope) -> EnvelopeUsageView {
+    let expected_currency = authority.spec.budget.currency.clone();
+    let effective_limit = usage.active_top_up_amount.as_deref().map_or_else(
+        || Some(authority.spec.budget.monthly_limit.clone()),
+        |amount| add_budget_amount(&authority.spec.budget.monthly_limit, amount).ok(),
+    );
+    let currency_valid = usage.currency_count <= 1
+        && usage
+            .currency
+            .as_deref()
+            .is_none_or(|currency| currency == expected_currency);
+    let availability = if effective_limit.is_none() {
+        AgentRunDataStatus {
+            availability: AgentRunAvailability::Unavailable,
+            source: "envelope_instance_grants".to_owned(),
+            observed_at: usage.observed_at.clone(),
+            reason: Some("active spend grant is invalid".to_owned()),
+        }
+    } else if !currency_valid {
+        AgentRunDataStatus {
+            availability: AgentRunAvailability::Unavailable,
+            source: "spend_observations".to_owned(),
+            observed_at: usage.observed_at.clone(),
+            reason: Some("inconsistent spend currencies".to_owned()),
+        }
+    } else if usage.observed_runtime_count == 0 {
+        AgentRunDataStatus {
+            availability: AgentRunAvailability::Unavailable,
+            source: "spend_observations".to_owned(),
+            observed_at: None,
+            reason: Some("no current-period spend observation is available".to_owned()),
+        }
+    } else if usage.observed_runtime_count < usage.runtime_count {
+        AgentRunDataStatus {
+            availability: AgentRunAvailability::Partial,
+            source: "spend_observations".to_owned(),
+            observed_at: usage.observed_at.clone(),
+            reason: Some(
+                "one or more bound runtimes have no current-period observation".to_owned(),
+            ),
+        }
+    } else {
+        AgentRunDataStatus {
+            availability: AgentRunAvailability::Available,
+            source: "spend_observations".to_owned(),
+            observed_at: usage.observed_at.clone(),
+            reason: None,
+        }
+    };
+    let spend = currency_valid
+        .then(|| {
+            Some(EnvelopeSpendUsage {
+                observed: usage.observed_amount?,
+                limit: effective_limit?,
+                currency: expected_currency,
+                observed_at: usage.observed_at?,
+            })
+        })
+        .flatten();
+    EnvelopeUsageView {
+        period: EnvelopeUsagePeriod {
+            start: usage.period_start,
+            end: usage.period_end,
+        },
+        spend,
+        availability,
     }
 }
 
@@ -689,6 +828,7 @@ where
 #[utoipa::path(
     get,
     path = "/app/api/v1/envelope-requests",
+    params(EnvelopeRequestsQuery),
     responses(
         (status = 200, body = EnvelopeRequestsResponse),
         (status = 401, description = "Browser session is absent or invalid"),
@@ -699,6 +839,7 @@ where
 pub(crate) async fn list_requests<P, B>(
     session: Option<Extension<UserEnvelopeSession<B>>>,
     State(state): State<UserEnvelopeState<P>>,
+    Query(query): Query<EnvelopeRequestsQuery>,
 ) -> Response
 where
     P: EnvelopeRequestBroker<B>,
@@ -708,11 +849,29 @@ where
         return StatusCode::UNAUTHORIZED.into_response();
     };
     match state.broker.list(&session).await {
-        Ok(requests) => Json(EnvelopeRequestsResponse {
-            api_version: ENVELOPE_REQUESTS_API_VERSION,
-            requests,
-        })
-        .into_response(),
+        Ok(mut requests) => {
+            if let Some(status) = query.status {
+                requests.retain(|request| request.status == status);
+            }
+            if let Some(cursor) = query.cursor {
+                let Ok(cursor) = Uuid::parse_str(&cursor) else {
+                    return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+                };
+                let Some(position) = requests.iter().position(|request| request.id == cursor)
+                else {
+                    return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+                };
+                requests = requests.into_iter().skip(position + 1).collect();
+            }
+            let next_cursor = (requests.len() > 50).then(|| requests[49].id.to_string());
+            requests.truncate(50);
+            Json(EnvelopeRequestsResponse {
+                api_version: ENVELOPE_REQUESTS_API_VERSION,
+                requests,
+                next_cursor,
+            })
+            .into_response()
+        }
         Err(error) => broker_error_response(error),
     }
 }
@@ -974,7 +1133,7 @@ mod tests {
     use super::{
         AvailableEnvelopeTemplate, EnvelopeRequestBroker, EnvelopeRequestBrokerError,
         EnvelopeRequestStatus, UserEnvelopeMutationProof, UserEnvelopeRequest, UserEnvelopeSession,
-        UserEnvelopeSubject, ValidatedEnvelopeRequest, inner_router,
+        UserEnvelopeSubject, ValidatedEnvelopeRequest, envelope_usage_view, inner_router,
     };
     use crate::BoxFuture;
     use crate::connections::{
@@ -982,7 +1141,7 @@ mod tests {
         ProviderConnectionBroker, ProviderConnectionStatus,
     };
     use steward_admission::{Envelope, EnvelopeSpec};
-    use steward_store::WorkflowRevisionRecord;
+    use steward_store::{EnvelopeUsageRecord, WorkflowRevisionRecord};
     use steward_types::{CanonicalUserId, Email};
     use uuid::Uuid;
 
@@ -1047,6 +1206,7 @@ mod tests {
                     created_at: "2026-08-17T00:00:00Z".to_owned(),
                     status_at: "2026-08-17T00:00:00Z".to_owned(),
                     history: Vec::new(),
+                    usage: None,
                 }))
             })
         }
@@ -1090,6 +1250,7 @@ mod tests {
                     created_at: "2026-08-17T00:00:00Z".to_owned(),
                     status_at: "2026-08-17T00:00:00Z".to_owned(),
                     history: Vec::new(),
+                    usage: None,
                 })
             })
         }
@@ -1179,6 +1340,36 @@ mod tests {
             .map_err(|error| format!("serialize template: {error}"))?;
         assert!(value.get("ceiling").is_some());
         assert!(value.get("githubConnection").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_usage_limit_includes_active_instance_top_ups() -> Result<(), String> {
+        let authority = template()
+            .auto_provision_threshold
+            .ok_or_else(|| "missing approved envelope".to_owned())?;
+        let usage = envelope_usage_view(
+            EnvelopeUsageRecord {
+                period_start: "2026-09-01T00:00:00.000000Z".to_owned(),
+                period_end: "2026-10-01T00:00:00.000000Z".to_owned(),
+                runtime_count: 1,
+                observed_runtime_count: 1,
+                observed_amount: Some("51.00".to_owned()),
+                currency: Some("USD".to_owned()),
+                currency_count: 1,
+                observed_at: Some("2026-09-24T00:00:00.000000Z".to_owned()),
+                active_top_up_amount: Some("25.00".to_owned()),
+            },
+            &authority,
+        );
+        assert_eq!(
+            usage.spend.map(|spend| spend.limit),
+            Some("75.00".to_owned())
+        );
+        assert_eq!(
+            usage.availability.availability,
+            crate::AgentRunAvailability::Available
+        );
         Ok(())
     }
 
@@ -1416,6 +1607,7 @@ mod tests {
                         created_at: "2026-08-17T00:00:00Z".to_owned(),
                         status_at: "2026-08-17T00:00:00Z".to_owned(),
                         history: Vec::new(),
+                        usage: None,
                     })
                 })
             }

@@ -4,6 +4,73 @@ export type ClientOptions = {
     baseUrl: `${string}://${string}` | (string & {});
 };
 
+export type AdminRequestDecision = {
+    decisionKey?: string | null;
+    evidenceUrl?: string | null;
+    expiresAt?: string | null;
+    rationale?: string | null;
+};
+
+export type AdminRequestHistoryEvent = {
+    actor: string;
+    at: string;
+    reason?: string | null;
+    state: AdminRequestState;
+};
+
+export type AdminRequestKind = 'ceiling_exceeded' | 'cumulative_exhausted' | 'within_ceiling';
+
+export type AdminRequestRequester = {
+    displayEmail: string;
+    userId: string;
+};
+
+export type AdminRequestResponse = {
+    apiVersion: string;
+    request: AdminRequestView;
+};
+
+export type AdminRequestSource = 'envelope_request' | 'runtime_exception' | 'escalation';
+
+export type AdminRequestState = 'requested' | 'escalated' | 'auto_approved' | 'approved' | 'rejected' | 'expired';
+
+export type AdminRequestTemplate = {
+    displayName: string;
+    id: string;
+    revision: number;
+};
+
+export type AdminRequestView = {
+    createdAt: string;
+    decision?: null | AdminRequestDecision;
+    deltas: Array<DirectAdmissionDelta>;
+    escalation?: null | EscalationView;
+    history: Array<AdminRequestHistoryEvent>;
+    id: string;
+    kind: AdminRequestKind;
+    requestedEnvelope?: null | BrowserEnvelope;
+    requester: AdminRequestRequester;
+    source: AdminRequestSource;
+    state: AdminRequestState;
+    stateActor: string;
+    stateAt: string;
+    template: AdminRequestTemplate;
+    templateEnvelope?: null | BrowserEnvelope;
+};
+
+export type AdminRequestsResponse = {
+    apiVersion: string;
+    nextCursor?: string | null;
+    requests: Array<AdminRequestView>;
+};
+
+export type AdminRequestsSummaryResponse = {
+    apiVersion: string;
+    escalated: number;
+    needsAction: number;
+    requested: number;
+};
+
 export type AgentRunAvailability = 'available' | 'partial' | 'unavailable';
 
 export type AgentRunDataStatus = {
@@ -37,6 +104,12 @@ export type AgentRunTimelineEventView = {
     at: string;
     kind: 'finalized';
     provenance: AgentRunTimelineProvenanceView;
+} | {
+    at: string;
+    details: unknown;
+    kind: 'stage';
+    provenance: AgentRunTimelineProvenanceView;
+    stage: string;
 };
 
 export type AgentRunTimelineProvenanceView = 'recorded' | 'backfilled';
@@ -102,11 +175,13 @@ export type AgentType = {
 
 export type AllRunsResponse = {
     apiVersion: string;
+    facets: BrowserRunFacets;
     nextCursor?: string | null;
     runs: Array<AllRunsView>;
 };
 
 export type AllRunsView = BrowserRunView & {
+    ownerDisplayEmail?: string | null;
     /**
      * Opaque canonical identifier only; display email and acting-user identities stay server-side.
      */
@@ -146,6 +221,12 @@ export type AvailableEnvelopeTemplate = {
     displayName: string;
     id: string;
     revision: number;
+};
+
+export type AvailableProviderConnection = {
+    displayName: string;
+    enabled: boolean;
+    provider: string;
 };
 
 export type BindingRef = string;
@@ -255,15 +336,52 @@ export type BrowserEnvelopeTemplateResponse = {
     memberRoles: Array<string>;
 };
 
+export type BrowserExecutionLogResponse = {
+    complete: boolean;
+    content: string;
+    sizeBytes: number;
+    stream: string;
+    truncated: boolean;
+};
+
 export type BrowserMutationRequest = {
     [key: string]: never;
 };
 
+export type BrowserPreferencesView = {
+    apiVersion: string;
+    onboardingDismissed: boolean;
+    revision: number;
+    theme?: null | BrowserTheme;
+};
+
 export type BrowserRole = 'user' | 'admin';
+
+export type BrowserRunFacets = {
+    phase: {
+        [key: string]: number;
+    };
+};
 
 export type BrowserRunResponse = {
     apiVersion: string;
     run: BrowserRunView;
+};
+
+export type BrowserRunStage = {
+    displayName: string;
+    id: string;
+    state: BrowserRunStageState;
+    steps: Array<BrowserRunStep>;
+};
+
+export type BrowserRunStageState = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+
+export type BrowserRunStep = {
+    displayName: string;
+    id: string;
+    logStreams: Array<string>;
+    state: BrowserRunStageState;
 };
 
 export type BrowserRunTimelineEvent = {
@@ -276,12 +394,30 @@ export type BrowserRunTimelineEvent = {
 } | {
     at: string;
     kind: 'finalized';
+} | {
+    at: string;
+    details: unknown;
+    kind: 'stage';
+    stage: string;
 };
 
 export type BrowserRunTimelineResponse = {
     apiVersion: string;
     events: Array<BrowserRunTimelineEvent>;
     taskUid: string;
+};
+
+export type BrowserRunTrigger = {
+    actor: string;
+    callerWorkflow: string;
+    event: string;
+    provider: string;
+    ref: string;
+    repository: string;
+    runAttempt: number;
+    runId: string;
+    runUrl: string;
+    sha: string;
 };
 
 export type BrowserRunView = {
@@ -294,7 +430,9 @@ export type BrowserRunView = {
     phase: TaskPhase;
     runtimeOwnership: RuntimeOwnership;
     runtimeUid?: string | null;
+    stages: Array<BrowserRunStage>;
     taskUid: string;
+    trigger?: null | BrowserRunTrigger;
     updatedAt: string;
     userEnvelopeDigest?: string | null;
     userEnvelopeInstanceId?: string | null;
@@ -304,6 +442,8 @@ export type BrowserRunView = {
     workflowName?: string | null;
     workflowVersion?: number | null;
 };
+
+export type BrowserTheme = 'light' | 'dark' | 'system';
 
 export type Budget = {
     currency: string;
@@ -380,6 +520,12 @@ export type ConnectionStatusResponse = {
     apiVersion: string;
     provider: string;
     status: ProviderConnectionStatus;
+};
+
+export type ConnectionsCollectionResponse = {
+    apiVersion: string;
+    available: Array<AvailableProviderConnection>;
+    connections: Array<ProviderConnectionView>;
 };
 
 export type ContentDigest = string;
@@ -518,12 +664,66 @@ export type EnvelopeRequestStatus = 'pending' | 'approved' | 'rejected' | 'provi
 
 export type EnvelopeRequestsResponse = {
     apiVersion: string;
+    nextCursor?: string | null;
     requests: Array<UserEnvelopeRequest>;
+};
+
+export type EnvelopeSpendUsage = {
+    currency: string;
+    limit: string;
+    observed: string;
+    observedAt: string;
 };
 
 export type EnvelopeTemplatesResponse = {
     apiVersion: string;
     templates: Array<AvailableEnvelopeTemplate>;
+};
+
+export type EnvelopeUsagePeriod = {
+    end: string;
+    start: string;
+};
+
+export type EnvelopeUsageView = {
+    availability: AgentRunDataStatus;
+    period: EnvelopeUsagePeriod;
+    spend?: null | EnvelopeSpendUsage;
+};
+
+export type EscalationDenyRequest = {
+    rationale: string;
+};
+
+export type EscalationDimension = 'llm_spend' | 'runtime_minutes';
+
+export type EscalationMeter = {
+    dimension: EscalationDimension;
+    exhausted: boolean;
+    limit: string;
+    observedAt: string;
+    unit: string;
+    used: string;
+};
+
+export type EscalationPeriod = {
+    end: string;
+    start: string;
+};
+
+export type EscalationTopUpRequest = {
+    amount: string;
+    dimension: EscalationDimension;
+    rationale: string;
+    validUntil: string;
+};
+
+export type EscalationView = {
+    blockedTaskUid: string;
+    envelopeInstanceId: string;
+    meters: Array<EscalationMeter>;
+    parkedAt: string;
+    period: EscalationPeriod;
 };
 
 export type ExactGitCommit = string;
@@ -575,6 +775,7 @@ export type ModelRequirement = {
 
 export type MyRunsResponse = {
     apiVersion: string;
+    facets: BrowserRunFacets;
     nextCursor?: string | null;
     runs: Array<BrowserRunView>;
 };
@@ -605,6 +806,12 @@ export type ProviderConnectionStatus = {
     scopesRequired: Array<string>;
 };
 
+export type ProviderConnectionView = {
+    displayName: string;
+    provider: string;
+    status: ProviderConnectionStatus;
+};
+
 export type PublishWorkflowRequest = {
     agent: string;
     displayName: string;
@@ -622,6 +829,7 @@ export type PublishedWorkflowOption = {
     agent: string;
     displayName: string;
     name: string;
+    sample: boolean;
     version: number;
 };
 
@@ -641,6 +849,15 @@ export type RenderGithubActionsWorkflowBody = {
 };
 
 export type RepositoryUrl = string;
+
+export type RerunRequest = {
+    idempotencyKey: string;
+};
+
+export type RerunResponse = {
+    apiVersion: string;
+    taskUid: string;
+};
 
 export type ResolvedSource = {
     commit: ExactGitCommit;
@@ -794,6 +1011,11 @@ export type TriggerRepository = {
     ownerId: StableProviderId;
 };
 
+export type UpdateBrowserPreferences = {
+    onboardingDismissed?: boolean | null;
+    theme?: null | BrowserTheme;
+};
+
 export type UserEnvelopeRequest = {
     approvalId?: string | null;
     approvedEnvelope?: null | BrowserEnvelope;
@@ -810,6 +1032,7 @@ export type UserEnvelopeRequest = {
     statusTemplateRevision: number;
     templateId: string;
     templateRevision: number;
+    usage?: null | EnvelopeUsageView;
 };
 
 export type Uuid = string;
@@ -931,7 +1154,12 @@ export type AllRunExecutionLogData = {
          */
         stream: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Zero-based byte offset
+         */
+        after?: number;
+    };
     url: '/admin/api/v1/all-runs/{task_uid}/logs/{stream}';
 };
 
@@ -955,11 +1183,10 @@ export type AllRunExecutionLogErrors = {
 };
 
 export type AllRunExecutionLogResponses = {
-    /**
-     * Bounded execution log
-     */
-    200: unknown;
+    200: BrowserExecutionLogResponse;
 };
+
+export type AllRunExecutionLogResponse = AllRunExecutionLogResponses[keyof AllRunExecutionLogResponses];
 
 export type AllRunTimelineData = {
     body?: never;
@@ -1529,6 +1756,195 @@ export type AuthorAdminEnvelopeTemplateResponses = {
 
 export type AuthorAdminEnvelopeTemplateResponse = AuthorAdminEnvelopeTemplateResponses[keyof AuthorAdminEnvelopeTemplateResponses];
 
+export type DenyAdminEscalationData = {
+    body: EscalationDenyRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        escalation_id: number;
+    };
+    query?: never;
+    url: '/admin/api/v1/escalations/{escalation_id}/deny';
+};
+
+export type DenyAdminEscalationErrors = {
+    /**
+     * Denial rationale is invalid
+     */
+    400: unknown;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role or mutation proof is invalid
+     */
+    403: unknown;
+    /**
+     * Escalation was not found
+     */
+    404: unknown;
+    /**
+     * Escalation was already decided differently
+     */
+    409: unknown;
+    /**
+     * Escalation authority is unavailable
+     */
+    503: unknown;
+};
+
+export type DenyAdminEscalationResponses = {
+    200: AdminRequestResponse;
+};
+
+export type DenyAdminEscalationResponse = DenyAdminEscalationResponses[keyof DenyAdminEscalationResponses];
+
+export type TopUpAdminEscalationData = {
+    body: EscalationTopUpRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        escalation_id: number;
+    };
+    query?: never;
+    url: '/admin/api/v1/escalations/{escalation_id}/top-up';
+};
+
+export type TopUpAdminEscalationErrors = {
+    /**
+     * Top-up is invalid or runtime-minutes enforcement is unavailable
+     */
+    400: unknown;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role or mutation proof is invalid
+     */
+    403: unknown;
+    /**
+     * Escalation or bound runtime was not found
+     */
+    404: unknown;
+    /**
+     * Escalation was already decided differently
+     */
+    409: unknown;
+    /**
+     * Escalation authority is unavailable
+     */
+    503: unknown;
+};
+
+export type TopUpAdminEscalationResponses = {
+    200: AdminRequestResponse;
+};
+
+export type TopUpAdminEscalationResponse = TopUpAdminEscalationResponses[keyof TopUpAdminEscalationResponses];
+
+export type ListAdminRequestsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        state?: string;
+        kind?: string;
+        cursor?: string;
+        limit?: number;
+    };
+    url: '/admin/api/v1/requests';
+};
+
+export type ListAdminRequestsErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Filter, cursor, or limit is invalid
+     */
+    422: unknown;
+    /**
+     * Request read model is unavailable
+     */
+    503: unknown;
+};
+
+export type ListAdminRequestsResponses = {
+    200: AdminRequestsResponse;
+};
+
+export type ListAdminRequestsResponse = ListAdminRequestsResponses[keyof ListAdminRequestsResponses];
+
+export type GetAdminRequestsSummaryData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/requests/summary';
+};
+
+export type GetAdminRequestsSummaryErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Request read model is unavailable
+     */
+    503: unknown;
+};
+
+export type GetAdminRequestsSummaryResponses = {
+    200: AdminRequestsSummaryResponse;
+};
+
+export type GetAdminRequestsSummaryResponse = GetAdminRequestsSummaryResponses[keyof GetAdminRequestsSummaryResponses];
+
+export type GetAdminRequestData = {
+    body?: never;
+    path: {
+        request_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/requests/{request_id}';
+};
+
+export type GetAdminRequestErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Request was not found
+     */
+    404: unknown;
+    /**
+     * Request read model is unavailable
+     */
+    503: unknown;
+};
+
+export type GetAdminRequestResponses = {
+    200: AdminRequestResponse;
+};
+
+export type GetAdminRequestResponse = GetAdminRequestResponses[keyof GetAdminRequestResponses];
+
 export type AgentRunsContractData = {
     body?: never;
     path?: never;
@@ -1831,10 +2247,117 @@ export type GetAdminWorkflowVersionResponses = {
 
 export type GetAdminWorkflowVersionResponse = GetAdminWorkflowVersionResponses[keyof GetAdminWorkflowVersionResponses];
 
-export type ListRequestsData = {
+export type ListProviderConnectionsData = {
     body?: never;
     path?: never;
     query?: never;
+    url: '/app/api/v1/connections';
+};
+
+export type ListProviderConnectionsErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Connection broker is unavailable
+     */
+    503: unknown;
+};
+
+export type ListProviderConnectionsResponses = {
+    200: ConnectionsCollectionResponse;
+};
+
+export type ListProviderConnectionsResponse = ListProviderConnectionsResponses[keyof ListProviderConnectionsResponses];
+
+export type DisconnectProviderConnectionData = {
+    body: DisconnectConnectionRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        provider: string;
+    };
+    query?: never;
+    url: '/app/api/v1/connections/{provider}/disconnect';
+};
+
+export type DisconnectProviderConnectionErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Provider is unavailable
+     */
+    404: unknown;
+    409: ConnectionOperationErrorResponse;
+    /**
+     * Connection broker is unavailable
+     */
+    503: unknown;
+};
+
+export type DisconnectProviderConnectionError = DisconnectProviderConnectionErrors[keyof DisconnectProviderConnectionErrors];
+
+export type DisconnectProviderConnectionResponses = {
+    /**
+     * Connection was disconnected
+     */
+    204: void;
+};
+
+export type DisconnectProviderConnectionResponse = DisconnectProviderConnectionResponses[keyof DisconnectProviderConnectionResponses];
+
+export type StartProviderConnectionData = {
+    body: BrowserMutationRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        provider: string;
+    };
+    query?: never;
+    url: '/app/api/v1/connections/{provider}/start';
+};
+
+export type StartProviderConnectionErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Provider is unavailable
+     */
+    404: unknown;
+    /**
+     * Connection broker is unavailable
+     */
+    503: unknown;
+};
+
+export type StartProviderConnectionResponses = {
+    200: StartConnectionResponse;
+};
+
+export type StartProviderConnectionResponse = StartProviderConnectionResponses[keyof StartProviderConnectionResponses];
+
+export type ListRequestsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        status?: EnvelopeRequestStatus;
+        cursor?: string;
+    };
     url: '/app/api/v1/envelope-requests';
 };
 
@@ -1997,6 +2520,65 @@ export type ListTemplatesResponses = {
 
 export type ListTemplatesResponse = ListTemplatesResponses[keyof ListTemplatesResponses];
 
+export type GetBrowserPreferencesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/app/api/v1/preferences';
+};
+
+export type GetBrowserPreferencesErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Preferences are unavailable
+     */
+    503: unknown;
+};
+
+export type GetBrowserPreferencesResponses = {
+    200: BrowserPreferencesView;
+};
+
+export type GetBrowserPreferencesResponse = GetBrowserPreferencesResponses[keyof GetBrowserPreferencesResponses];
+
+export type UpdateBrowserPreferencesData = {
+    body: UpdateBrowserPreferences;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path?: never;
+    query?: never;
+    url: '/app/api/v1/preferences';
+};
+
+export type UpdateBrowserPreferencesErrors = {
+    /**
+     * At least one preference must be supplied
+     */
+    400: unknown;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Preferences are unavailable
+     */
+    503: unknown;
+};
+
+export type UpdateBrowserPreferencesResponses = {
+    200: BrowserPreferencesView;
+};
+
+export type UpdateBrowserPreferencesResponse = UpdateBrowserPreferencesResponses[keyof UpdateBrowserPreferencesResponses];
+
 export type MyRunsData = {
     body?: never;
     path?: never;
@@ -2062,6 +2644,43 @@ export type MyRunResponses = {
 
 export type MyRunResponse = MyRunResponses[keyof MyRunResponses];
 
+export type CancelMyRunData = {
+    body?: never;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/cancel';
+};
+
+export type CancelMyRunErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Run was not found in the user's scope
+     */
+    404: unknown;
+    /**
+     * Run cancellation is unavailable
+     */
+    503: unknown;
+};
+
+export type CancelMyRunResponses = {
+    200: BrowserRunResponse;
+};
+
+export type CancelMyRunResponse = CancelMyRunResponses[keyof CancelMyRunResponses];
+
 export type MyRunExecutionLogData = {
     body?: never;
     path: {
@@ -2071,7 +2690,12 @@ export type MyRunExecutionLogData = {
          */
         stream: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Zero-based byte offset
+         */
+        after?: number;
+    };
     url: '/app/api/v1/runs/{task_uid}/logs/{stream}';
 };
 
@@ -2091,11 +2715,59 @@ export type MyRunExecutionLogErrors = {
 };
 
 export type MyRunExecutionLogResponses = {
-    /**
-     * Bounded execution log
-     */
-    200: unknown;
+    200: BrowserExecutionLogResponse;
 };
+
+export type MyRunExecutionLogResponse = MyRunExecutionLogResponses[keyof MyRunExecutionLogResponses];
+
+export type RerunMyRunData = {
+    body: RerunRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/rerun';
+};
+
+export type RerunMyRunErrors = {
+    /**
+     * Idempotency key is invalid
+     */
+    400: unknown;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Run was not found in the user's scope
+     */
+    404: unknown;
+    /**
+     * The original envelope is no longer active or GitHub provider dispatch is required
+     */
+    409: unknown;
+    /**
+     * Run submission is unavailable
+     */
+    503: unknown;
+};
+
+export type RerunMyRunResponses = {
+    /**
+     * Idempotent replay
+     */
+    200: RerunResponse;
+    201: RerunResponse;
+};
+
+export type RerunMyRunResponse = RerunMyRunResponses[keyof RerunMyRunResponses];
 
 export type MyRunTimelineData = {
     body?: never;

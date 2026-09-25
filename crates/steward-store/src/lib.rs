@@ -7,7 +7,7 @@ use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec,
-    envelope_is_within, evaluate,
+    add_budget_amount, envelope_is_within, evaluate,
 };
 use steward_types::direct_package::{DirectTaskBindingEvidence, MAX_EXECUTION_STREAM_BYTES};
 use steward_types::{
@@ -1465,6 +1465,478 @@ impl PgStore {
         .transpose()
     }
 
+    /// Return the current cumulative-spend escalation per exhausted runtime. A durable grant or
+    /// denial remains attached so the browser queue can show both pending and decided history.
+    pub async fn admin_escalations(&self) -> Result<Vec<CumulativeEscalationRecord>, StoreError> {
+        sqlx::query(CUMULATIVE_ESCALATION_SELECT)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .map(cumulative_escalation_record)
+            .collect()
+    }
+
+    pub async fn cumulative_escalation(
+        &self,
+        escalation_id: i64,
+    ) -> Result<Option<CumulativeEscalationRecord>, StoreError> {
+        let statement = format!("{CUMULATIVE_ESCALATION_SELECT} AND exhaustions.id = $1");
+        sqlx::query(&statement)
+            .bind(escalation_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?
+            .map(cumulative_escalation_record)
+            .transpose()
+    }
+
+    pub async fn record_escalation_top_up(
+        &self,
+        escalation_id: i64,
+        amount: &str,
+        valid_until: &str,
+        rationale: &str,
+        granted_by: &str,
+    ) -> Result<EnvelopeInstanceGrantRecord, StoreError> {
+        if rationale.trim().is_empty() || granted_by.trim().is_empty() {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        let amount =
+            add_budget_amount("0", amount).map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+        if !amount
+            .bytes()
+            .any(|byte| byte.is_ascii_digit() && byte != b'0')
+        {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let row = sqlx::query(
+            "SELECT exhaustions.id, exhaustions.currency, tasks.task_uid, \
+                    tasks.user_envelope_instance_id, tasks.runtime_spec \
+             FROM inference_exhaustions exhaustions \
+             JOIN task_submissions tasks ON tasks.task_uid = ( \
+                 SELECT candidate.task_uid FROM task_submissions candidate \
+                 LEFT JOIN task_runtime_operations orchestration \
+                   ON orchestration.task_uid = candidate.task_uid \
+                 WHERE COALESCE(orchestration.runtime_uid, candidate.runtime_uid) = exhaustions.runtime_uid \
+                   AND candidate.user_envelope_instance_id IS NOT NULL \
+                 ORDER BY candidate.created_at DESC, candidate.task_uid DESC LIMIT 1) \
+             WHERE exhaustions.id = $1 FOR UPDATE OF exhaustions",
+        )
+        .bind(escalation_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::CumulativeEscalationNotFound)?;
+        let currency: String = row.try_get("currency").map_err(database_error)?;
+        if currency != "USD"
+            || sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM cumulative_escalation_denials WHERE escalation_id = $1)",
+            )
+            .bind(escalation_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?
+        {
+            return Err(StoreError::CumulativeEscalationConflict);
+        }
+        let task_uid: Uuid = row.try_get("task_uid").map_err(database_error)?;
+        let envelope_instance_id: String = row
+            .try_get("user_envelope_instance_id")
+            .map_err(database_error)?;
+        if let Some(grant) = sqlx::query(
+            "SELECT id, amount::text AS amount, base_limit::text AS base_limit, \
+                    target_limit::text AS target_limit, \
+                    to_char(valid_until AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS valid_until, \
+                    rationale, granted_by \
+             FROM envelope_instance_grants WHERE escalation_id = $1",
+        )
+        .bind(escalation_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        {
+            let same_request = sqlx::query_scalar::<_, bool>(
+                "SELECT amount = $2::numeric AND valid_until = $3::timestamptz \
+                    AND rationale = $4 AND granted_by = $5 \
+                 FROM envelope_instance_grants WHERE escalation_id = $1",
+            )
+            .bind(escalation_id)
+            .bind(&amount)
+            .bind(valid_until)
+            .bind(rationale)
+            .bind(granted_by)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(grant_expiry_error)?;
+            if !same_request {
+                return Err(StoreError::CumulativeEscalationConflict);
+            }
+            let record = envelope_instance_grant_record(&grant)?;
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(record);
+        }
+        let future =
+            sqlx::query_scalar::<_, bool>("SELECT ($1::text)::timestamptz > clock_timestamp()")
+                .bind(valid_until)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(grant_expiry_error)?;
+        if !future {
+            return Err(StoreError::InvalidGrantExpiry);
+        }
+        let runtime_spec = row
+            .try_get::<Json<AgentRuntimeSpec>, _>("runtime_spec")
+            .map_err(database_error)?
+            .0;
+        let active_top_up = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(sum(amount), 0)::text \
+             FROM envelope_instance_grants \
+             WHERE envelope_instance_id = $1 AND dimension = 'llm_spend' \
+               AND valid_until > clock_timestamp()",
+        )
+        .bind(&envelope_instance_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let base_limit = add_budget_amount(&runtime_spec.budget.monthly_limit, &active_top_up)
+            .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+        let target_limit = add_budget_amount(&base_limit, &amount)
+            .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+        let inserted = sqlx::query(
+            "INSERT INTO envelope_instance_grants \
+             (id, escalation_id, envelope_instance_id, task_uid, dimension, amount, \
+              base_limit, target_limit, unit, valid_until, rationale, granted_by) \
+             VALUES ($1, $2, $3, $4, 'llm_spend', $5::numeric, $6::numeric, $7::numeric, \
+                     'USD', $8::timestamptz, $9, $10) \
+             ON CONFLICT (escalation_id) DO NOTHING",
+        )
+        .bind(Uuid::new_v4())
+        .bind(escalation_id)
+        .bind(&envelope_instance_id)
+        .bind(task_uid)
+        .bind(&amount)
+        .bind(&base_limit)
+        .bind(&target_limit)
+        .bind(valid_until)
+        .bind(rationale)
+        .bind(granted_by)
+        .execute(&mut *transaction)
+        .await
+        .map_err(grant_expiry_error)?
+        .rows_affected()
+            == 1;
+        if !inserted {
+            let matches = sqlx::query_scalar::<_, bool>(
+                "SELECT amount = $2::numeric AND valid_until = $3::timestamptz \
+                    AND rationale = $4 AND granted_by = $5 \
+                 FROM envelope_instance_grants WHERE escalation_id = $1",
+            )
+            .bind(escalation_id)
+            .bind(&amount)
+            .bind(valid_until)
+            .bind(rationale)
+            .bind(granted_by)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if !matches {
+                return Err(StoreError::CumulativeEscalationConflict);
+            }
+        }
+        let grant = sqlx::query(
+            "SELECT id, amount::text AS amount, base_limit::text AS base_limit, \
+                    target_limit::text AS target_limit, \
+                    to_char(valid_until AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS valid_until, \
+                    rationale, granted_by \
+             FROM envelope_instance_grants WHERE escalation_id = $1",
+        )
+        .bind(escalation_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let record = envelope_instance_grant_record(&grant)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(record)
+    }
+
+    /// Sum active append-only spend grants for one provisioned User Envelope instance.
+    pub async fn active_envelope_instance_spend_top_up(
+        &self,
+        envelope_instance_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let amount = sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(sum(amount), 0)::text \
+             FROM envelope_instance_grants \
+             WHERE envelope_instance_id = $1 AND dimension = 'llm_spend' \
+               AND valid_until > clock_timestamp()",
+        )
+        .bind(envelope_instance_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok((amount != "0").then_some(amount))
+    }
+
+    pub async fn deny_cumulative_escalation(
+        &self,
+        escalation_id: i64,
+        rationale: &str,
+        denied_by: &str,
+    ) -> Result<(), StoreError> {
+        if rationale.trim().is_empty() || denied_by.trim().is_empty() {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        let escalation = self
+            .cumulative_escalation(escalation_id)
+            .await?
+            .ok_or(StoreError::CumulativeEscalationNotFound)?;
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        if sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM inference_exhaustions WHERE id = $1 FOR UPDATE",
+        )
+        .bind(escalation_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .is_none()
+        {
+            return Err(StoreError::CumulativeEscalationNotFound);
+        }
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM envelope_instance_grants WHERE escalation_id = $1)",
+        )
+        .bind(escalation_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        {
+            return Err(StoreError::CumulativeEscalationConflict);
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO cumulative_escalation_denials \
+             (escalation_id, envelope_instance_id, task_uid, rationale, denied_by) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (escalation_id) DO NOTHING",
+        )
+        .bind(escalation_id)
+        .bind(&escalation.envelope_instance_id)
+        .bind(escalation.blocked_task_uid)
+        .bind(rationale)
+        .bind(denied_by)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .rows_affected()
+            == 1;
+        if !inserted {
+            let matches = sqlx::query_scalar::<_, bool>(
+                "SELECT envelope_instance_id = $2 AND task_uid = $3 \
+                    AND rationale = $4 AND denied_by = $5 \
+                 FROM cumulative_escalation_denials WHERE escalation_id = $1",
+            )
+            .bind(escalation_id)
+            .bind(&escalation.envelope_instance_id)
+            .bind(escalation.blocked_task_uid)
+            .bind(rationale)
+            .bind(denied_by)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if !matches {
+                return Err(StoreError::CumulativeEscalationConflict);
+            }
+        }
+        let task =
+            task_in_transaction_for_update(&mut transaction, escalation.blocked_task_uid).await?;
+        if matches!(task.orchestration_version, 2 | 3) {
+            task_runtime_operation_in_transaction_for_update(&mut transaction, task.task_uid)
+                .await?;
+            fence_task_execution_for_cleanup(&mut transaction, task.task_uid).await?;
+        }
+        sqlx::query(
+            "UPDATE task_submissions SET finalize_requested = true, cancel_requested = true, \
+                 phase = CASE WHEN phase IN ('submitted', 'parked', 'queued') THEN 'cancelled' ELSE phase END, \
+                 failure_reason = COALESCE(failure_reason, 'cumulative authority escalation denied'), \
+                 updated_at = now() WHERE task_uid = $1",
+        )
+        .bind(task.task_uid)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)
+    }
+
+    /// Aggregate the latest current-period spend observation for each runtime bound to one
+    /// provisioned User Envelope instance. Missing runtime observations remain visible through
+    /// the observed/total counts so callers never present a guessed total as complete.
+    pub async fn envelope_usage(
+        &self,
+        envelope_instance_id: &str,
+    ) -> Result<EnvelopeUsageRecord, StoreError> {
+        if envelope_instance_id.trim().is_empty() {
+            return Err(StoreError::InvalidEnvelopeRequest);
+        }
+        let row = sqlx::query(
+            "WITH period AS ( \
+                 SELECT date_trunc('month', now()) AS starts_at, \
+                        date_trunc('month', now()) + interval '1 month' AS ends_at \
+             ), runtimes AS ( \
+                 SELECT DISTINCT COALESCE(orchestration.runtime_uid, tasks.runtime_uid) AS runtime_uid \
+                 FROM task_submissions tasks \
+                 LEFT JOIN task_runtime_operations orchestration \
+                    ON orchestration.task_uid = tasks.task_uid, period \
+                 WHERE tasks.user_envelope_instance_id = $1 \
+                   AND tasks.created_at >= period.starts_at \
+                   AND tasks.created_at < period.ends_at \
+                   AND COALESCE(orchestration.runtime_uid, tasks.runtime_uid) IS NOT NULL \
+             ), latest AS ( \
+                 SELECT DISTINCT ON (observations.runtime_uid) \
+                        observations.runtime_uid, observations.observed_amount, \
+                        observations.currency, observations.at \
+                 FROM spend_observations observations \
+                 JOIN runtimes ON runtimes.runtime_uid = observations.runtime_uid \
+                 CROSS JOIN period \
+                 WHERE observations.at >= period.starts_at \
+                   AND observations.at < period.ends_at \
+                 ORDER BY observations.runtime_uid, observations.at DESC, observations.id DESC \
+             ) \
+             SELECT to_char(period.starts_at AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS period_start, \
+                    to_char(period.ends_at AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS period_end, \
+                    (SELECT count(*) FROM runtimes)::bigint AS runtime_count, \
+                    count(latest.runtime_uid)::bigint AS observed_runtime_count, \
+                    CASE WHEN count(latest.runtime_uid) = 0 THEN NULL \
+                         ELSE sum(latest.observed_amount)::text END AS observed_amount, \
+                    CASE WHEN count(DISTINCT latest.currency) = 1 THEN min(latest.currency) \
+                         ELSE NULL END AS currency, \
+                    count(DISTINCT latest.currency)::bigint AS currency_count, \
+                    CASE WHEN max(latest.at) IS NULL THEN NULL ELSE \
+                         to_char(max(latest.at) AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS observed_at, \
+                    (SELECT sum(grants.amount)::text \
+                     FROM envelope_instance_grants grants \
+                     WHERE grants.envelope_instance_id = $1 \
+                       AND grants.dimension = 'llm_spend' \
+                       AND grants.valid_until > clock_timestamp()) AS active_top_up_amount \
+             FROM period LEFT JOIN latest ON true \
+             GROUP BY period.starts_at, period.ends_at",
+        )
+        .bind(envelope_instance_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(EnvelopeUsageRecord {
+            period_start: row.try_get("period_start").map_err(database_error)?,
+            period_end: row.try_get("period_end").map_err(database_error)?,
+            runtime_count: row.try_get("runtime_count").map_err(database_error)?,
+            observed_runtime_count: row
+                .try_get("observed_runtime_count")
+                .map_err(database_error)?,
+            observed_amount: row.try_get("observed_amount").map_err(database_error)?,
+            currency: row.try_get("currency").map_err(database_error)?,
+            currency_count: row.try_get("currency_count").map_err(database_error)?,
+            observed_at: row.try_get("observed_at").map_err(database_error)?,
+            active_top_up_amount: row
+                .try_get("active_top_up_amount")
+                .map_err(database_error)?,
+        })
+    }
+
+    pub async fn browser_preferences(
+        &self,
+        user_id: &CanonicalUserId,
+    ) -> Result<BrowserPreferencesRecord, StoreError> {
+        Ok(sqlx::query(
+            "SELECT revision, onboarding_dismissed, theme \
+             FROM browser_preference_revisions \
+             WHERE user_id = $1 ORDER BY revision DESC LIMIT 1",
+        )
+        .bind(user_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .map(|row| {
+            Ok(BrowserPreferencesRecord {
+                revision: row.try_get("revision").map_err(database_error)?,
+                onboarding_dismissed: row
+                    .try_get("onboarding_dismissed")
+                    .map_err(database_error)?,
+                theme: row.try_get("theme").map_err(database_error)?,
+            })
+        })
+        .transpose()?
+        .unwrap_or(BrowserPreferencesRecord {
+            revision: 0,
+            onboarding_dismissed: false,
+            theme: None,
+        }))
+    }
+
+    pub async fn write_browser_preferences(
+        &self,
+        user_id: &CanonicalUserId,
+        onboarding_dismissed: Option<bool>,
+        theme: Option<Option<&str>>,
+        actor: &str,
+    ) -> Result<BrowserPreferencesRecord, StoreError> {
+        if actor.trim().is_empty()
+            || theme
+                .flatten()
+                .is_some_and(|theme| !matches!(theme, "light" | "dark" | "system"))
+        {
+            return Err(StoreError::InvalidBrowserPreferences);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(user_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let current = sqlx::query(
+            "SELECT revision, onboarding_dismissed, theme \
+             FROM browser_preference_revisions \
+             WHERE user_id = $1 ORDER BY revision DESC LIMIT 1",
+        )
+        .bind(user_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let (revision, current_dismissed, current_theme) =
+            current.map_or(Ok::<_, StoreError>((0_i64, false, None)), |row| {
+                Ok((
+                    row.try_get("revision").map_err(database_error)?,
+                    row.try_get("onboarding_dismissed")
+                        .map_err(database_error)?,
+                    row.try_get::<Option<String>, _>("theme")
+                        .map_err(database_error)?,
+                ))
+            })?;
+        let next = BrowserPreferencesRecord {
+            revision: revision + 1,
+            onboarding_dismissed: onboarding_dismissed.unwrap_or(current_dismissed),
+            theme: theme
+                .map(|theme| theme.map(str::to_owned))
+                .unwrap_or(current_theme),
+        };
+        sqlx::query(
+            "INSERT INTO browser_preference_revisions \
+             (user_id, revision, onboarding_dismissed, theme, actor) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(user_id.as_str())
+        .bind(next.revision)
+        .bind(next.onboarding_dismissed)
+        .bind(&next.theme)
+        .bind(actor)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(next)
+    }
+
     pub async fn agent_runs(&self, query: &AgentRunQuery) -> Result<AgentRunPage, StoreError> {
         if query.limit == 0 || query.limit > 100 {
             return Err(StoreError::InvalidRunQuery);
@@ -1574,6 +2046,56 @@ impl PgStore {
         })
     }
 
+    /// Count phases for the current run filters while deliberately excluding the phase filter
+    /// and pagination cursor, so the browser can render stable facet chips.
+    pub async fn agent_run_phase_facets(
+        &self,
+        query: &AgentRunQuery,
+    ) -> Result<std::collections::BTreeMap<String, u64>, StoreError> {
+        let mut statement = QueryBuilder::<Postgres>::new(
+            "SELECT tasks.phase, count(*)::bigint AS count \
+             FROM task_submissions tasks \
+             LEFT JOIN task_runtime_operations orchestration \
+               ON orchestration.task_uid = tasks.task_uid \
+             WHERE NOT EXISTS (SELECT 1 FROM connection_operations operations \
+                 WHERE operations.task_uid = tasks.task_uid)",
+        );
+        if let Some(workflow) = query.workflow.as_deref() {
+            statement.push(" AND tasks.workflow = ");
+            statement.push_bind(workflow);
+        }
+        if let Some(owner_user_id) = query.owner_user_id.as_deref() {
+            statement.push(" AND tasks.owner_user_id = ");
+            statement.push_bind(owner_user_id);
+        }
+        if let Some(runtime_uid) = query.runtime_uid.as_deref() {
+            statement.push(" AND COALESCE(orchestration.runtime_uid, tasks.runtime_uid) = ");
+            statement.push_bind(runtime_uid);
+        }
+        if let Some(instance_id) = query.user_envelope_instance_id.as_deref() {
+            statement.push(" AND tasks.user_envelope_instance_id = ");
+            statement.push_bind(instance_id);
+        }
+        if let Some(task_uid) = query.task_uid {
+            statement.push(" AND tasks.task_uid = ");
+            statement.push_bind(task_uid);
+        }
+        statement.push(" GROUP BY tasks.phase ORDER BY tasks.phase");
+        statement
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .map(|row| {
+                let phase = row.try_get::<String, _>("phase").map_err(database_error)?;
+                let count = row.try_get::<i64, _>("count").map_err(database_error)?;
+                let count = u64::try_from(count).map_err(|_| StoreError::InvalidRunQuery)?;
+                Ok((phase, count))
+            })
+            .collect()
+    }
+
     pub async fn agent_run(&self, task_uid: Uuid) -> Result<Option<AgentRunRecord>, StoreError> {
         let mut statement = QueryBuilder::<Postgres>::new(AGENT_RUN_SELECT);
         statement.push(
@@ -1590,6 +2112,82 @@ impl PgStore {
             .transpose()
     }
 
+    /// Request cancellation for one browser-owned run without accepting a caller-selected
+    /// submitter identity. The existing Task finalization transition remains authoritative.
+    pub async fn cancel_agent_run(
+        &self,
+        task_uid: Uuid,
+        owner_user_id: &str,
+    ) -> Result<Option<AgentRunRecord>, StoreError> {
+        let Some(record) = self.agent_run(task_uid).await? else {
+            return Ok(None);
+        };
+        if record.owner_user_id.as_deref() != Some(owner_user_id) {
+            return Ok(None);
+        }
+        self.request_task_finalization(task_uid, &record.submitter_service, owner_user_id)
+            .await?;
+        self.agent_run(task_uid).await
+    }
+
+    pub async fn rerun_source(
+        &self,
+        task_uid: Uuid,
+        owner_user_id: &str,
+    ) -> Result<Option<TaskRecord>, StoreError> {
+        self.task(task_uid).await.map(|record| {
+            record.filter(|record| {
+                record.owner_user_id.as_deref() == Some(owner_user_id)
+                    && record.identity_binding_state == "bound"
+                    && record.user_envelope_instance_id.is_some()
+                    && record.user_envelope_snapshot.is_some()
+            })
+        })
+    }
+
+    pub async fn activate_rerun(
+        &self,
+        source_task_uid: Uuid,
+        rerun_task_uid: Uuid,
+    ) -> Result<TaskRecord, StoreError> {
+        let source = self
+            .task(source_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?;
+        let rerun = self
+            .task(rerun_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?;
+        let owner_user_id = rerun
+            .owner_user_id
+            .as_deref()
+            .ok_or(StoreError::InvalidTaskIdentityBinding)?;
+        if source.owner_user_id != rerun.owner_user_id
+            || source.workflow_name != rerun.workflow_name
+            || source.workflow_version != rerun.workflow_version
+            || source.workflow_digest != rerun.workflow_digest
+        {
+            return Err(StoreError::TaskIdempotencyConflict);
+        }
+        if let Some(archive) = source.input_archive.as_deref() {
+            self.put_task_inputs(
+                rerun_task_uid,
+                &rerun.submitter_service,
+                owner_user_id,
+                archive,
+            )
+            .await?;
+        }
+        if source.execute_requested {
+            self.request_task_execution(rerun_task_uid, &rerun.submitter_service, owner_user_id)
+                .await
+        } else {
+            self.task(rerun_task_uid)
+                .await?
+                .ok_or(StoreError::TaskNotFound)
+        }
+    }
+
     /// Return one explicitly enabled, bounded execution stream in the same scope as Runs.
     /// `None` owner scope is reserved for the browser-administrator read path.
     pub async fn agent_run_execution_log(
@@ -1597,22 +2195,30 @@ impl PgStore {
         task_uid: Uuid,
         owner_user_id: Option<&str>,
         stream: AgentRunLogStream,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
+    ) -> Result<Option<AgentRunExecutionLog>, StoreError> {
         let mut statement = QueryBuilder::<Postgres>::new("SELECT ");
         statement.push(match stream {
-            AgentRunLogStream::Stdout => "attempts.execution_stdout",
-            AgentRunLogStream::Stderr => "attempts.execution_stderr",
+            AgentRunLogStream::Stdout => {
+                "COALESCE(attempts.execution_stdout, attempts.live_execution_stdout) AS content"
+            }
+            AgentRunLogStream::Stderr => {
+                "COALESCE(attempts.execution_stderr, attempts.live_execution_stderr) AS content"
+            }
         });
         statement.push(
-            " FROM task_execution_attempts attempts \
-             JOIN task_submissions tasks ON tasks.task_uid = attempts.task_uid \
+            ", tasks.phase \
+             FROM task_submissions tasks \
+             LEFT JOIN LATERAL ( \
+                 SELECT candidate.execution_stdout, candidate.execution_stderr, \
+                        candidate.live_execution_stdout, candidate.live_execution_stderr \
+                 FROM task_execution_attempts candidate \
+                 WHERE candidate.task_uid = tasks.task_uid \
+             ) attempts ON true \
              WHERE tasks.task_uid = ",
         );
         statement.push_bind(task_uid);
         statement.push(
-            " AND tasks.phase IN ('succeeded', 'failed') \
-              AND attempts.state IN ('succeeded', 'failed') \
-              AND NOT EXISTS (SELECT 1 FROM connection_operations operations \
+            " AND NOT EXISTS (SELECT 1 FROM connection_operations operations \
                   WHERE operations.task_uid = tasks.task_uid)",
         );
         if let Some(owner_user_id) = owner_user_id {
@@ -1620,11 +2226,28 @@ impl PgStore {
             statement.push_bind(owner_user_id);
         }
         statement
-            .build_query_scalar::<Option<Vec<u8>>>()
+            .build()
             .fetch_optional(&self.pool)
             .await
             .map_err(database_error)
-            .map(Option::flatten)
+            .and_then(|row| {
+                row.map(|row| {
+                    let phase = task_phase_from_row(&row, "phase")?;
+                    Ok(AgentRunExecutionLog {
+                        content: row
+                            .try_get::<Option<Vec<u8>>, _>("content")
+                            .map_err(database_error)?
+                            .unwrap_or_default(),
+                        complete: matches!(
+                            phase,
+                            steward_types::TaskPhase::Succeeded
+                                | steward_types::TaskPhase::Failed
+                                | steward_types::TaskPhase::Cancelled
+                        ),
+                    })
+                })
+                .transpose()
+            })
     }
 
     pub async fn agent_run_timeline(
@@ -1645,11 +2268,15 @@ impl PgStore {
             return Ok(None);
         }
         sqlx::query(
-            "SELECT event_kind, phase, provenance, \
+            "SELECT event_kind, phase, provenance, details, \
                     to_char(at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS at \
-             FROM task_lifecycle_events \
-             WHERE task_uid = $1 \
-             ORDER BY at, id",
+             FROM ( \
+                 SELECT event_kind, phase, provenance, NULL::jsonb AS details, at, 0 AS source_order, id \
+                 FROM task_lifecycle_events WHERE task_uid = $1 \
+                 UNION ALL \
+                 SELECT event_kind, NULL AS phase, 'recorded' AS provenance, details, at, 1 AS source_order, id \
+                 FROM task_stage_events WHERE task_uid = $1 \
+             ) events ORDER BY at, source_order, id",
         )
         .bind(task_uid)
         .fetch_all(&self.pool)
@@ -1965,6 +2592,50 @@ impl PgStore {
                             .0,
                     },
                     created_at: row.try_get("created_at").map_err(database_error)?,
+                })
+            })
+            .collect()
+    }
+
+    /// List every User Envelope request for the administrator request read model.
+    pub async fn admin_envelope_requests(
+        &self,
+    ) -> Result<Vec<AdminEnvelopeRequestRecord>, StoreError> {
+        let statement = format!(
+            "SELECT records.*, users.display_email AS owner_display_email, \
+                    templates.display_name AS template_display_name, \
+                    templates.spec AS template_spec \
+             FROM ({ENVELOPE_REQUEST_COLUMNS}) records \
+             JOIN canonical_users users ON users.user_id = records.owner_user_id \
+             JOIN envelope_template_revisions templates \
+               ON templates.template_id = records.template_id \
+              AND templates.revision = records.template_revision \
+             ORDER BY records.created_at DESC, records.id DESC"
+        );
+        sqlx::query(&statement)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .map(|row| {
+                let owner_display_email =
+                    row.try_get("owner_display_email").map_err(database_error)?;
+                let template_display_name = row
+                    .try_get("template_display_name")
+                    .map_err(database_error)?;
+                let template_revision = row.try_get("template_revision").map_err(database_error)?;
+                let template_envelope = Envelope {
+                    revision: template_revision,
+                    spec: row
+                        .try_get::<Json<EnvelopeSpec>, _>("template_spec")
+                        .map_err(database_error)?
+                        .0,
+                };
+                Ok(AdminEnvelopeRequestRecord {
+                    request: envelope_request_record(row)?,
+                    owner_display_email,
+                    template_display_name,
+                    template_envelope,
                 })
             })
             .collect()
@@ -2682,6 +3353,75 @@ impl PgStore {
                 })
             })
             .collect()
+    }
+
+    /// List every runtime-exception approval for the administrator request read model.
+    pub async fn admin_approvals(&self) -> Result<Vec<AdminApprovalRecord>, StoreError> {
+        sqlx::query(
+            "SELECT approvals.id AS approval_id, approvals.runtime_uid, approvals.state, \
+                    approvals.decision_key, approvals.evidence_url, approvals.rationale, \
+                    admission_decisions.deltas, admission_decisions.proposed_spec, \
+                    admission_decisions.envelope_rev, admission_decisions.member_role, \
+                    envelopes.spec AS template_spec, \
+                    COALESCE(tasks.owner_user_id, admission_decisions.actor) AS requester_user_id, \
+                    COALESCE(users.display_email, admission_decisions.actor) AS requester_display_email, \
+                    to_char(admission_decisions.at AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+                    to_char(COALESCE(approvals.decided_at, admission_decisions.at) AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS state_at, \
+                    COALESCE(approvals.decided_by, admission_decisions.actor) AS state_actor \
+             FROM approvals \
+             JOIN admission_decisions \
+               ON admission_decisions.id = approvals.admission_decision_id \
+             JOIN envelopes ON envelopes.scope_kind = 'member_role' \
+               AND envelopes.scope_ref = admission_decisions.member_role \
+               AND envelopes.revision = admission_decisions.envelope_rev \
+             LEFT JOIN task_submissions tasks \
+               ON tasks.task_uid = admission_decisions.task_uid \
+             LEFT JOIN canonical_users users ON users.user_id = tasks.owner_user_id \
+             ORDER BY admission_decisions.at DESC, approvals.id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|row| {
+            Ok(AdminApprovalRecord {
+                approval_id: row.try_get("approval_id").map_err(database_error)?,
+                runtime_uid: row.try_get("runtime_uid").map_err(database_error)?,
+                state: row.try_get("state").map_err(database_error)?,
+                decision_key: row.try_get("decision_key").map_err(database_error)?,
+                evidence_url: row.try_get("evidence_url").map_err(database_error)?,
+                rationale: row.try_get("rationale").map_err(database_error)?,
+                deltas: row
+                    .try_get::<Json<Vec<AdmissionDelta>>, _>("deltas")
+                    .map_err(database_error)?
+                    .0,
+                proposed_spec: row
+                    .try_get::<Json<AgentRuntimeSpec>, _>("proposed_spec")
+                    .map_err(database_error)?
+                    .0,
+                envelope_revision: row.try_get("envelope_rev").map_err(database_error)?,
+                member_role: row.try_get("member_role").map_err(database_error)?,
+                template_envelope: Envelope {
+                    revision: row.try_get("envelope_rev").map_err(database_error)?,
+                    spec: row
+                        .try_get::<Json<EnvelopeSpec>, _>("template_spec")
+                        .map_err(database_error)?
+                        .0,
+                },
+                requester_user_id: row
+                    .try_get("requester_user_id")
+                    .map_err(database_error)?,
+                requester_display_email: row
+                    .try_get("requester_display_email")
+                    .map_err(database_error)?,
+                created_at: row.try_get("created_at").map_err(database_error)?,
+                state_at: row.try_get("state_at").map_err(database_error)?,
+                state_actor: row.try_get("state_actor").map_err(database_error)?,
+            })
+        })
+        .collect()
     }
 
     /// Resolve the only valid transitions for a parked create that encounters
@@ -5376,9 +6116,6 @@ impl PgStore {
         match observation {
             TaskExecutionObservation::Accepted {
                 adapter_observation_id,
-            }
-            | TaskExecutionObservation::Running {
-                adapter_observation_id,
             } => {
                 sqlx::query(
                     "UPDATE task_execution_attempts \
@@ -5391,6 +6128,39 @@ impl PgStore {
                 .bind(attempt_id)
                 .bind(expected_generation)
                 .bind(adapter_observation_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+                sqlx::query(
+                    "UPDATE task_submissions SET phase = 'running', updated_at = now() \
+                     WHERE task_uid = $1 AND phase = 'queued' AND NOT finalize_requested \
+                       AND NOT cancel_requested",
+                )
+                .bind(current.task_uid)
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+            }
+            TaskExecutionObservation::Running {
+                adapter_observation_id,
+                execution_stdout,
+                execution_stderr,
+            } => {
+                sqlx::query(
+                    "UPDATE task_execution_attempts \
+                     SET state = 'running', generation = generation + 1, \
+                         adapter_observation_id = $3, \
+                         live_execution_stdout = $4, live_execution_stderr = $5, \
+                         started_at = COALESCE(started_at, now()), \
+                         retry_at = NULL, last_error_code = NULL, updated_at = now() \
+                     WHERE attempt_id = $1 AND generation = $2 \
+                       AND state IN ('start_pending', 'running')",
+                )
+                .bind(attempt_id)
+                .bind(expected_generation)
+                .bind(adapter_observation_id)
+                .bind(execution_stdout)
+                .bind(execution_stderr)
                 .execute(&mut *transaction)
                 .await
                 .map_err(database_error)?;
@@ -6941,6 +7711,12 @@ pub enum AgentRunLogStream {
     Stderr,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRunExecutionLog {
+    pub content: Vec<u8>,
+    pub complete: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentRunPage {
     pub records: Vec<AgentRunRecord>,
@@ -6954,6 +7730,7 @@ pub struct AgentRunRecord {
     pub acting_user: Option<String>,
     pub owner: String,
     pub owner_user_id: Option<String>,
+    pub owner_display_email: Option<String>,
     pub workflow: String,
     pub workflow_name: Option<String>,
     pub workflow_version: Option<i64>,
@@ -6974,6 +7751,7 @@ pub struct AgentRunRecord {
     pub updated_at: String,
     pub spend: Option<AgentRunSpend>,
     pub history_partial: bool,
+    pub direct_task_evidence: Option<DirectTaskBindingEvidence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6984,11 +7762,15 @@ pub struct AgentRunSpend {
     pub observed_at: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentRunTimelineKind {
     Phase(steward_types::TaskPhase),
     FinalizationRequested,
     Finalized,
+    Stage {
+        event_kind: String,
+        details: serde_json::Value,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7064,6 +7846,26 @@ pub struct EnvelopeRequestStatusEventRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvelopeUsageRecord {
+    pub period_start: String,
+    pub period_end: String,
+    pub runtime_count: i64,
+    pub observed_runtime_count: i64,
+    pub observed_amount: Option<String>,
+    pub currency: Option<String>,
+    pub currency_count: i64,
+    pub observed_at: Option<String>,
+    pub active_top_up_amount: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserPreferencesRecord {
+    pub revision: i64,
+    pub onboarding_dismissed: bool,
+    pub theme: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnvelopeRequestDecisionReference {
     pub decision_key: String,
     pub evidence_url: String,
@@ -7093,6 +7895,14 @@ pub struct PendingEnvelopeRequest {
     pub requested_envelope: Envelope,
     pub template_envelope: Envelope,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminEnvelopeRequestRecord {
+    pub request: EnvelopeRequestRecord,
+    pub owner_display_email: String,
+    pub template_display_name: String,
+    pub template_envelope: Envelope,
 }
 
 pub struct EnvelopeRequestStatusUpdate<'a> {
@@ -7803,6 +8613,8 @@ pub enum TaskExecutionObservation<'a> {
     },
     Running {
         adapter_observation_id: &'a str,
+        execution_stdout: Option<&'a [u8]>,
+        execution_stderr: Option<&'a [u8]>,
     },
     Succeeded {
         adapter_observation_id: &'a str,
@@ -7828,10 +8640,15 @@ impl TaskExecutionObservation<'_> {
         match self {
             Self::Accepted {
                 adapter_observation_id,
-            }
-            | Self::Running {
-                adapter_observation_id,
             } => !adapter_observation_id.is_empty(),
+            Self::Running {
+                adapter_observation_id,
+                execution_stdout,
+                execution_stderr,
+            } => {
+                !adapter_observation_id.is_empty()
+                    && execution_logs_are_valid(execution_stdout, execution_stderr)
+            }
             Self::Succeeded {
                 adapter_observation_id,
                 result_digest,
@@ -8245,6 +9062,69 @@ pub struct PendingApproval {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct AdminApprovalRecord {
+    pub approval_id: Uuid,
+    pub runtime_uid: String,
+    pub state: String,
+    pub decision_key: Option<String>,
+    pub evidence_url: Option<String>,
+    pub rationale: Option<String>,
+    pub deltas: Vec<AdmissionDelta>,
+    pub proposed_spec: AgentRuntimeSpec,
+    pub envelope_revision: i64,
+    pub member_role: String,
+    pub template_envelope: Envelope,
+    pub requester_user_id: String,
+    pub requester_display_email: String,
+    pub created_at: String,
+    pub state_at: String,
+    pub state_actor: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CumulativeEscalationRecord {
+    pub escalation_id: i64,
+    pub runtime_uid: String,
+    pub runtime_namespace: String,
+    pub runtime_name: String,
+    pub envelope_instance_id: String,
+    pub blocked_task_uid: Uuid,
+    pub requester_user_id: String,
+    pub requester_display_email: String,
+    pub template_id: String,
+    pub template_display_name: String,
+    pub template_revision: i64,
+    pub period_start: String,
+    pub period_end: String,
+    pub observed_amount: String,
+    pub limit: String,
+    pub currency: String,
+    pub observed_at: String,
+    pub parked_at: String,
+    pub grant_id: Option<Uuid>,
+    pub grant_active: Option<bool>,
+    pub grant_amount: Option<String>,
+    pub grant_base_limit: Option<String>,
+    pub grant_target_limit: Option<String>,
+    pub grant_valid_until: Option<String>,
+    pub grant_rationale: Option<String>,
+    pub denial_rationale: Option<String>,
+    pub decision_at: Option<String>,
+    pub decision_actor: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvelopeInstanceGrantRecord {
+    pub id: Uuid,
+    pub amount: String,
+    pub base_limit: String,
+    pub target_limit: String,
+    pub valid_until: String,
+    pub rationale: String,
+    pub granted_by: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ApprovalCandidate {
     pub approval_id: Uuid,
     pub runtime_uid: String,
@@ -8337,6 +9217,7 @@ pub enum StoreError {
     InvalidBrowserRbacActor,
     InvalidBrowserRbacAssignment,
     InvalidBrowserRbacRecord,
+    InvalidBrowserPreferences,
     ApprovalNotFound,
     ApprovalNotPending,
     MissingDecisionReference,
@@ -8359,6 +9240,9 @@ pub enum StoreError {
     InvalidConnectionOperation,
     InvalidRunQuery,
     InvalidRunCursor,
+    CumulativeEscalationNotFound,
+    CumulativeEscalationConflict,
+    InvalidCumulativeEscalation,
     EnvelopeRequestNotFound,
     EnvelopeRequestIdempotencyConflict,
     EnvelopeRequestTemplateStale,
@@ -8425,6 +9309,9 @@ impl fmt::Display for StoreError {
             }
             Self::InvalidBrowserRbacRecord => {
                 write!(formatter, "browser RBAC record is invalid")
+            }
+            Self::InvalidBrowserPreferences => {
+                write!(formatter, "browser preferences are invalid")
             }
             Self::WorkflowNotFound => write!(formatter, "Workflow revision does not exist"),
             Self::WorkflowAlreadyExists => write!(formatter, "Workflow already exists"),
@@ -8495,6 +9382,18 @@ impl fmt::Display for StoreError {
             }
             Self::InvalidRunQuery => write!(formatter, "agent-run query is invalid"),
             Self::InvalidRunCursor => write!(formatter, "agent-run cursor is invalid"),
+            Self::CumulativeEscalationNotFound => {
+                write!(formatter, "cumulative escalation does not exist")
+            }
+            Self::CumulativeEscalationConflict => {
+                write!(
+                    formatter,
+                    "cumulative escalation was already decided differently"
+                )
+            }
+            Self::InvalidCumulativeEscalation => {
+                write!(formatter, "cumulative escalation request is invalid")
+            }
             Self::EnvelopeRequestNotFound => write!(formatter, "envelope request does not exist"),
             Self::EnvelopeRequestIdempotencyConflict => {
                 write!(
@@ -9587,13 +10486,131 @@ fn parse_task_runtime_ownership(value: &str) -> Result<TaskRuntimeOwnership, Sto
     }
 }
 
+const CUMULATIVE_ESCALATION_SELECT: &str = "SELECT exhaustions.id AS escalation_id, \
+            exhaustions.runtime_uid, tasks.runtime_namespace, tasks.runtime_name, \
+            tasks.user_envelope_instance_id AS envelope_instance_id, tasks.task_uid, \
+            tasks.owner_user_id AS requester_user_id, users.display_email AS requester_display_email, \
+            requests.template_id, templates.display_name AS template_display_name, \
+            requests.template_revision, \
+            to_char(date_trunc('month', exhaustions.at) AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS period_start, \
+            to_char((date_trunc('month', exhaustions.at) + interval '1 month') AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS period_end, \
+            exhaustions.observed_amount::text AS observed_amount, \
+            (((tasks.runtime_spec->'budget'->>'monthlyLimit')::numeric + \
+                COALESCE(instance_grants.active_amount, 0))::text) AS limit, exhaustions.currency, \
+            to_char(exhaustions.at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS observed_at, \
+            to_char(exhaustions.at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS parked_at, \
+            grants.id AS grant_id, \
+            CASE WHEN grants.id IS NULL THEN NULL \
+                 ELSE grants.valid_until > clock_timestamp() END AS grant_active, \
+            grants.amount::text AS grant_amount, \
+            grants.base_limit::text AS grant_base_limit, \
+            grants.target_limit::text AS grant_target_limit, \
+            CASE WHEN grants.valid_until IS NULL THEN NULL ELSE \
+                to_char(grants.valid_until AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS grant_valid_until, \
+            grants.rationale AS grant_rationale, denials.rationale AS denial_rationale, \
+            CASE WHEN COALESCE(grants.at, denials.at) IS NULL THEN NULL ELSE \
+                to_char(COALESCE(grants.at, denials.at) AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END AS decision_at, \
+            COALESCE(grants.granted_by, denials.denied_by) AS decision_actor \
+     FROM (SELECT DISTINCT ON (runtime_uid) * FROM inference_exhaustions \
+           ORDER BY runtime_uid, at DESC, id DESC) exhaustions \
+     JOIN LATERAL ( \
+         SELECT candidate.* FROM task_submissions candidate \
+         LEFT JOIN task_runtime_operations orchestration \
+           ON orchestration.task_uid = candidate.task_uid \
+         WHERE COALESCE(orchestration.runtime_uid, candidate.runtime_uid) = exhaustions.runtime_uid \
+           AND candidate.user_envelope_instance_id IS NOT NULL \
+         ORDER BY candidate.created_at DESC, candidate.task_uid DESC LIMIT 1 \
+     ) tasks ON true \
+     LEFT JOIN LATERAL ( \
+         SELECT sum(instance_grant.amount) AS active_amount \
+         FROM envelope_instance_grants instance_grant \
+         WHERE instance_grant.envelope_instance_id = tasks.user_envelope_instance_id \
+           AND instance_grant.dimension = 'llm_spend' \
+           AND instance_grant.valid_until > clock_timestamp() \
+     ) instance_grants ON true \
+     JOIN canonical_users users ON users.user_id = tasks.owner_user_id \
+     JOIN LATERAL ( \
+         SELECT events.request_id FROM envelope_request_events events \
+         WHERE events.envelope_instance_id = tasks.user_envelope_instance_id \
+         ORDER BY events.id DESC LIMIT 1 \
+     ) envelope_binding ON true \
+     JOIN envelope_requests requests ON requests.id = envelope_binding.request_id \
+     JOIN envelope_template_revisions templates \
+       ON templates.template_id = requests.template_id \
+      AND templates.revision = requests.template_revision \
+     LEFT JOIN envelope_instance_grants grants ON grants.escalation_id = exhaustions.id \
+     LEFT JOIN cumulative_escalation_denials denials ON denials.escalation_id = exhaustions.id \
+     WHERE tasks.user_envelope_instance_id IS NOT NULL";
+
+fn cumulative_escalation_record(
+    row: sqlx::postgres::PgRow,
+) -> Result<CumulativeEscalationRecord, StoreError> {
+    Ok(CumulativeEscalationRecord {
+        escalation_id: row.try_get("escalation_id").map_err(database_error)?,
+        runtime_uid: row.try_get("runtime_uid").map_err(database_error)?,
+        runtime_namespace: row.try_get("runtime_namespace").map_err(database_error)?,
+        runtime_name: row.try_get("runtime_name").map_err(database_error)?,
+        envelope_instance_id: row
+            .try_get("envelope_instance_id")
+            .map_err(database_error)?,
+        blocked_task_uid: row.try_get("task_uid").map_err(database_error)?,
+        requester_user_id: row.try_get("requester_user_id").map_err(database_error)?,
+        requester_display_email: row
+            .try_get("requester_display_email")
+            .map_err(database_error)?,
+        template_id: row.try_get("template_id").map_err(database_error)?,
+        template_display_name: row
+            .try_get("template_display_name")
+            .map_err(database_error)?,
+        template_revision: row.try_get("template_revision").map_err(database_error)?,
+        period_start: row.try_get("period_start").map_err(database_error)?,
+        period_end: row.try_get("period_end").map_err(database_error)?,
+        observed_amount: row.try_get("observed_amount").map_err(database_error)?,
+        limit: row.try_get("limit").map_err(database_error)?,
+        currency: row.try_get("currency").map_err(database_error)?,
+        observed_at: row.try_get("observed_at").map_err(database_error)?,
+        parked_at: row.try_get("parked_at").map_err(database_error)?,
+        grant_id: row.try_get("grant_id").map_err(database_error)?,
+        grant_active: row.try_get("grant_active").map_err(database_error)?,
+        grant_amount: row.try_get("grant_amount").map_err(database_error)?,
+        grant_base_limit: row.try_get("grant_base_limit").map_err(database_error)?,
+        grant_target_limit: row.try_get("grant_target_limit").map_err(database_error)?,
+        grant_valid_until: row.try_get("grant_valid_until").map_err(database_error)?,
+        grant_rationale: row.try_get("grant_rationale").map_err(database_error)?,
+        denial_rationale: row.try_get("denial_rationale").map_err(database_error)?,
+        decision_at: row.try_get("decision_at").map_err(database_error)?,
+        decision_actor: row.try_get("decision_actor").map_err(database_error)?,
+    })
+}
+
+fn envelope_instance_grant_record(
+    row: &sqlx::postgres::PgRow,
+) -> Result<EnvelopeInstanceGrantRecord, StoreError> {
+    Ok(EnvelopeInstanceGrantRecord {
+        id: row.try_get("id").map_err(database_error)?,
+        amount: row.try_get("amount").map_err(database_error)?,
+        base_limit: row.try_get("base_limit").map_err(database_error)?,
+        target_limit: row.try_get("target_limit").map_err(database_error)?,
+        valid_until: row.try_get("valid_until").map_err(database_error)?,
+        rationale: row.try_get("rationale").map_err(database_error)?,
+        granted_by: row.try_get("granted_by").map_err(database_error)?,
+    })
+}
+
 const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, tasks.acting_user, tasks.owner, tasks.owner_user_id, \
+            users.display_email AS owner_display_email, \
             tasks.workflow, tasks.workflow_name, tasks.workflow_version, tasks.workflow_digest, \
             tasks.user_envelope_instance_id, tasks.user_envelope_revision, tasks.user_envelope_digest, \
             tasks.coding_agent_runtime, COALESCE(orchestration.runtime_uid, tasks.runtime_uid) AS runtime_uid, \
             tasks.runtime_ownership, tasks.phase, tasks.runtime_spec, \
             tasks.envelope_revision, tasks.finalize_requested, tasks.finalized, \
-            tasks.failure_reason, \
+            tasks.failure_reason, tasks.direct_task_evidence, \
             to_char(tasks.created_at AT TIME ZONE 'UTC', \
                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
             to_char(tasks.updated_at AT TIME ZONE 'UTC', \
@@ -9605,6 +10622,7 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
                   AND history.provenance = 'backfilled' \
             ) AS history_partial \
      FROM task_submissions tasks \
+     LEFT JOIN canonical_users users ON users.user_id = tasks.owner_user_id \
      LEFT JOIN task_runtime_operations orchestration \
        ON orchestration.task_uid = tasks.task_uid \
      LEFT JOIN LATERAL ( \
@@ -9688,6 +10706,7 @@ fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreE
         acting_user: row.try_get("acting_user").map_err(database_error)?,
         owner: row.try_get("owner").map_err(database_error)?,
         owner_user_id: row.try_get("owner_user_id").map_err(database_error)?,
+        owner_display_email: row.try_get("owner_display_email").map_err(database_error)?,
         workflow: row.try_get("workflow").map_err(database_error)?,
         workflow_name: row.try_get("workflow_name").map_err(database_error)?,
         workflow_version: row.try_get("workflow_version").map_err(database_error)?,
@@ -9719,20 +10738,33 @@ fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreE
         updated_at: row.try_get("updated_at").map_err(database_error)?,
         spend,
         history_partial: row.try_get("history_partial").map_err(database_error)?,
+        direct_task_evidence: row
+            .try_get::<Option<Json<DirectTaskBindingEvidence>>, _>("direct_task_evidence")
+            .map_err(database_error)?
+            .map(|value| value.0),
     })
 }
 
 fn agent_run_timeline_event(
     row: sqlx::postgres::PgRow,
 ) -> Result<AgentRunTimelineEvent, StoreError> {
-    let kind = match row
+    let event_kind = row
         .try_get::<String, _>("event_kind")
-        .map_err(database_error)?
-        .as_str()
-    {
+        .map_err(database_error)?;
+    let kind = match event_kind.as_str() {
         "phase" => AgentRunTimelineKind::Phase(task_phase_from_row(&row, "phase")?),
         "finalization_requested" => AgentRunTimelineKind::FinalizationRequested,
         "finalized" => AgentRunTimelineKind::Finalized,
+        "admitted" | "runtime_bound" | "execution_started" | "execution_ended" => {
+            AgentRunTimelineKind::Stage {
+                event_kind,
+                details: row
+                    .try_get::<Option<Json<serde_json::Value>>, _>("details")
+                    .map_err(database_error)?
+                    .map(|value| value.0)
+                    .unwrap_or_else(|| serde_json::json!({})),
+            }
+        }
         _ => return Err(StoreError::InvalidTaskTransition),
     };
     let provenance = match row
@@ -9951,11 +10983,10 @@ fn envelope_scope_kind(spec: &AgentRuntimeSpec) -> Result<EnvelopeScopeKind, Sto
 }
 
 fn grant_expiry_error(error: sqlx::Error) -> StoreError {
-    if error
-        .as_database_error()
-        .and_then(|error| error.code())
-        .as_deref()
-        == Some("22007")
+    let db_error = error.as_database_error();
+    if db_error.and_then(|error| error.code()).as_deref() == Some("22007")
+        || db_error.and_then(|error| error.constraint())
+            == Some("envelope_instance_grants_future_expiry")
     {
         StoreError::InvalidGrantExpiry
     } else {

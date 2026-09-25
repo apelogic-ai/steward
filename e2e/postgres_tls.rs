@@ -491,6 +491,13 @@ async fn seed_v0123_upgrade_fixture(store: &PgStore) -> Result<(), Box<dyn Error
     .bind(&workflow_digest)
     .execute(store.pool())
     .await?;
+    sqlx::query(
+        "INSERT INTO envelopes (scope_kind, scope_ref, revision, spec, authored_by) \
+         VALUES ('member_role', 'engineer', 7, $1, 'upgrade-admin')",
+    )
+    .bind(&approved_envelope["spec"])
+    .execute(store.pool())
+    .await?;
     let envelope_request_id = "00000000-0000-0000-0000-000000000100";
     sqlx::query(
         "INSERT INTO envelope_requests \
@@ -592,6 +599,26 @@ async fn seed_v0123_upgrade_fixture(store: &PgStore) -> Result<(), Box<dyn Error
 }
 
 async fn assert_v02_upgrade_result(store: &PgStore) -> Result<(), Box<dyn Error>> {
+    let migrated_template = sqlx::query_as::<_, (String, Vec<String>, i64)>(
+        "SELECT display_name, member_roles, revision \
+         FROM envelope_template_revisions \
+         WHERE template_id = 'engineer' AND revision = 7",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        migrated_template,
+        ("engineer".to_owned(), vec!["engineer".to_owned()], 7),
+        "the role-keyed template history must migrate without changing request identity"
+    );
+    let preserved_request = sqlx::query_as::<_, (String, i64)>(
+        "SELECT template_id, template_revision FROM envelope_requests \
+         WHERE idempotency_key = 'upgrade-envelope'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(preserved_request, ("engineer".to_owned(), 7));
+
     let user = sqlx::query_as::<
         _,
         (

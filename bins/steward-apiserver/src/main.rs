@@ -568,6 +568,10 @@ fn browser_application_router(
             auth.clone(),
         ))
         .merge(agent_runs_ui::protected_router(store.clone(), auth.clone()))
+        .merge(steward_apiserver::preferences::protected_router(
+            store.clone(),
+            auth.clone(),
+        ))
         .merge(browser_admin::protected_router(
             runtimes.clone(),
             store.clone(),

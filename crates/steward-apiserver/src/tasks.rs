@@ -3079,7 +3079,7 @@ async fn status_response<L: TaskSubmissionLedger>(
     }
 }
 
-fn stable_task_runtime_name(operation_id: Uuid) -> String {
+pub(crate) fn stable_task_runtime_name(operation_id: Uuid) -> String {
     format!("task-{}", operation_id.simple())
 }
 
