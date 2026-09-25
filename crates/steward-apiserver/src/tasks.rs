@@ -846,6 +846,15 @@ fn validate_identity_task_claims(
             .groups
             .as_ref()
             .is_some_and(|groups| groups.len() <= 16);
+    let compatibility_identity_absent =
+        claims.email.is_none() && claims.email_verified.is_none() && claims.groups.is_none();
+    let compatibility_identity_complete = claims.email_verified == Some(true)
+        && claims.email.as_deref().is_some_and(valid_email)
+        && claims
+            .groups
+            .as_ref()
+            .is_some_and(|groups| groups.len() <= 16)
+        && compatibility_task_identity_from_claims(claims).is_ok();
     let valid_federated_identity = claims.identity_contract == FEDERATED_TASK_CONTRACT
         && valid_github_actions_subject(&claims.sub)
         && claims.canonical_user_id.is_none()
@@ -857,13 +866,7 @@ fn validate_identity_task_claims(
             .display_name
             .as_deref()
             .is_none_or(|value| bounded_display_metadata(value, 256))
-        && claims
-            .groups
-            .as_ref()
-            .is_none_or(|groups| groups.len() <= 16)
-        && claims.email.as_deref().is_none_or(valid_email)
-        && claims.email.is_some() == claims.email_verified.is_some()
-        && claims.email_verified.is_none_or(|verified| verified);
+        && (compatibility_identity_absent || compatibility_identity_complete);
     if claims.iss != issuer
         || !audience_matches
         || (!valid_legacy_identity && !valid_federated_identity)
@@ -904,6 +907,19 @@ fn task_identity_from_identity_claims(
     task_identity_from_kubernetes_user(&user).map(|mut identity| {
         identity.source_provenance = source_provenance;
         identity
+    })
+}
+
+fn compatibility_task_identity_from_claims(
+    claims: &IdentityTaskClaims,
+) -> Result<TaskIdentity, TaskAuthenticationError> {
+    if claims.email_verified != Some(true) {
+        return Err(TaskAuthenticationError::InvalidCredentials);
+    }
+    task_identity_from_kubernetes_user(&UserInfo {
+        username: claims.email.clone(),
+        groups: claims.groups.clone(),
+        ..UserInfo::default()
     })
 }
 
@@ -3448,8 +3464,8 @@ mod workflow_request_tests {
 mod identity_task_authentication_tests {
     use super::{
         IdentityTaskClaims, MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS, TaskAuthenticationError,
-        task_identity_from_identity_claims, valid_identity_issuer, validate_identity_task_jwks,
-        verify_identity_task_token,
+        compatibility_task_identity_from_claims, task_identity_from_identity_claims,
+        valid_identity_issuer, validate_identity_task_jwks, verify_identity_task_token,
     };
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -3490,6 +3506,12 @@ mod identity_task_authentication_tests {
         nbf: u64,
         jti: &'a str,
         identity_contract: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        email: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        email_verified: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        groups: Option<Vec<&'a str>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         canonical_user_id: Option<&'a str>,
     }
@@ -3533,10 +3555,10 @@ mod identity_task_authentication_tests {
                 iat: now,
                 nbf: now.saturating_sub(1),
                 jti: "identity-task-test-jti",
-                email: "leo@apelogic.ai",
+                email: "alice@example.com",
                 email_verified: true,
                 groups: vec![
-                    "agents.apelogic.ai/acting-user:leo@apelogic.ai",
+                    "agents.apelogic.ai/acting-user:alice@example.com",
                     "agents.apelogic.ai/canonical-user:usr_528fc0fed6cf400abb93a3f327d9a809",
                     "agents.apelogic.ai/service-principal:steward-run",
                 ],
@@ -3567,6 +3589,9 @@ mod identity_task_authentication_tests {
             nbf: now.saturating_sub(1),
             jti: "federated-task-test-jti",
             identity_contract: "steward-task-v3",
+            email: None,
+            email_verified: None,
+            groups: None,
             canonical_user_id: None,
         }
     }
@@ -3593,6 +3618,9 @@ mod identity_task_authentication_tests {
                 nbf: now.saturating_sub(1),
                 jti: "caller-identity-injection",
                 identity_contract: "steward-task-v3",
+                email: None,
+                email_verified: None,
+                groups: None,
                 canonical_user_id: Some("usr_0123456789abcdef0123456789abcdef"),
             },
             &key,
@@ -3675,6 +3703,58 @@ mod identity_task_authentication_tests {
     }
 
     #[test]
+    fn federated_task_contract_rejects_partial_compatibility_identity_claims() -> Result<(), String>
+    {
+        let (key, jwks) = key_material()?;
+        let now = jsonwebtoken::get_current_timestamp();
+
+        let mut email_only = federated_claims(now);
+        email_only.email = Some("alice@example.com");
+        email_only.email_verified = Some(true);
+        let mut groups_only = federated_claims(now);
+        groups_only.groups = Some(vec![
+            "agents.apelogic.ai/acting-user:alice@example.com",
+            "agents.apelogic.ai/canonical-user:usr_528fc0fed6cf400abb93a3f327d9a809",
+            "agents.apelogic.ai/service-principal:steward-run",
+        ]);
+
+        for claims in [email_only, groups_only] {
+            let assertion = federated_token_with(&key, KID, claims)?;
+            assert!(matches!(
+                verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE),
+                Err(TaskAuthenticationError::InvalidCredentials)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn federated_task_contract_accepts_only_complete_v2_compatibility_identity()
+    -> Result<(), String> {
+        let (key, jwks) = key_material()?;
+        let now = jsonwebtoken::get_current_timestamp();
+        let mut compatibility = federated_claims(now);
+        compatibility.email = Some("alice@example.com");
+        compatibility.email_verified = Some(true);
+        compatibility.groups = Some(vec![
+            "agents.apelogic.ai/acting-user:alice@example.com",
+            "agents.apelogic.ai/canonical-user:usr_528fc0fed6cf400abb93a3f327d9a809",
+            "agents.apelogic.ai/service-principal:steward-run",
+        ]);
+        let assertion = federated_token_with(&key, KID, compatibility)?;
+        let claims = verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE)
+            .map_err(|error| format!("complete compatibility identity rejected: {error:?}"))?;
+        let identity = compatibility_task_identity_from_claims(&claims)
+            .map_err(|error| format!("complete compatibility identity did not map: {error:?}"))?;
+        assert_eq!(identity.owner.as_str(), "alice@example.com");
+        assert_eq!(
+            identity.canonical_user_id.as_str(),
+            "usr_528fc0fed6cf400abb93a3f327d9a809"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn task_identity_issuer_requires_a_canonical_credential_free_https_url() {
         assert!(valid_identity_issuer("https://identity.example.test"));
         for invalid in [
@@ -3704,7 +3784,7 @@ mod identity_task_authentication_tests {
         let identity = task_identity_from_identity_claims(claims)
             .map_err(|error| format!("valid ratified Identity groups rejected: {error:?}"))?;
         assert_eq!(identity.service, "steward-run");
-        assert_eq!(identity.owner.0, "leo@apelogic.ai");
+        assert_eq!(identity.owner.0, "alice@example.com");
         assert_eq!(
             identity.canonical_user_id.as_str(),
             "usr_528fc0fed6cf400abb93a3f327d9a809"
