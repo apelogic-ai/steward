@@ -18,10 +18,8 @@ versionProbe:
 ```
 
 Install the provider-profile bundle from the same Steward release and record the rendered profile
-IDs and digests in the binding. The release gate executes
-[`scripts/codex-reference-runtime-conformance.sh`](../../scripts/codex-reference-runtime-conformance.sh)
-against the published image and that exact bundle. It verifies the platform, non-root runtime user,
-CLI version, native executable, and both released profile allowlists.
+IDs and digests in the binding. The release builds the image for `linux/amd64`, verifies its pinned
+CLI version during the build, scans it, and publishes its immutable digest, SBOM, and provenance.
 
 ## Mirror the exact manifest
 
@@ -53,14 +51,6 @@ docker buildx build \
   --push .
 ```
 
-Run the same conformance contract against the resulting immutable digest and the verified provider
-bundle from a `linux/amd64` host with Docker and the pinned Kubernetes tools before activation:
-
-```sh
-scripts/codex-reference-runtime-conformance.sh \
-  --image registry.example.test/agents/codex@sha256:<private-digest> \
-  --provider-profile-bundle steward-runtime-providers-0.2.5.tar.gz
-```
-
-A private image that passes this contract is compatible with `codex-v1`; it is independently built
-and operated. The released reference digest remains the reproducible Steward-tested artifact.
+Verify a private image's platform, non-root user, CLI version, and provider-profile compatibility
+before activation. It is independently built and operated; the released reference digest remains
+the reproducible Steward artifact.
