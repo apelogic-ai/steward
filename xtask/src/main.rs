@@ -1826,9 +1826,14 @@ mod tests {
     }
 
     #[test]
-    fn release_candidate_fails_closed_on_critical_component_images() -> Result<(), String> {
+    fn release_candidates_fail_closed_on_critical_component_images() -> Result<(), String> {
         let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let codex_candidate = workflow
+            .split("  codex-reference-runtime:")
+            .nth(1)
+            .and_then(|jobs| jobs.split("\n  release-candidate:").next())
+            .ok_or_else(|| "isolated Codex reference runtime CI job is required".to_owned())?;
         let release_candidate = workflow
             .split("  release-candidate:")
             .nth(1)
@@ -1849,26 +1854,35 @@ mod tests {
             "trivy-config: security/codex-reference-runtime.trivy.yaml",
         ] {
             assert!(
-                release_candidate.contains(required),
-                "release-candidate CI must validate the Codex reference runtime with {required}"
+                codex_candidate.contains(required),
+                "isolated Codex reference runtime CI must validate with {required}"
             );
         }
         assert_eq!(
             release_candidate
                 .matches("aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8")
                 .count(),
-            5,
-            "release-candidate CI must use the pinned Trivy action for every component image"
+            4,
+            "release-candidate CI must use the pinned Trivy action for every Steward component image"
         );
         assert_eq!(
             release_candidate.matches("exit-code: \"1\"").count(),
-            5,
+            4,
             "every release-candidate image scan must fail closed"
         );
         assert_eq!(
             release_candidate.matches("severity: CRITICAL").count(),
-            5,
+            4,
             "every release-candidate image scan must enforce CRITICAL findings"
+        );
+        assert!(
+            workflow.contains("      - codex-reference-runtime"),
+            "the pinned aggregate must require the isolated Codex runtime lane"
+        );
+        assert!(
+            workflow
+                .contains("CODEX_REFERENCE_RUNTIME: ${{ needs.codex-reference-runtime.result }}"),
+            "the pinned aggregate must inspect the isolated Codex runtime result"
         );
 
         Ok(())
