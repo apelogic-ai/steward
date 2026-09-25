@@ -80,7 +80,7 @@ export function OnboardingView() {
         const steps = [
           ["Connect GitHub", connected, "Authorize GitHub from Connections."],
           ["Provision an envelope", provisioned, "Choose any eligible named envelope template."],
-          ["Add the generated workflow", workflowReady, "Render the sample Workflow from the envelope detail and commit it to GitHub."],
+          ["Add the generated workflow", workflowReady, "Choose a published Workflow, render its GitHub Actions file from the envelope detail, and commit it to GitHub."],
           ["Run the test workflow", firstRun, "Run it from GitHub with gh workflow run or the Actions UI."],
           ["Inspect the governed run", firstRun, "Return here to inspect stages, logs, provenance, and spend."],
         ] as const;

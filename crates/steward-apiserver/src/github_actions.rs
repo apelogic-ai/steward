@@ -651,10 +651,10 @@ mod tests {
             ".github/workflows/steward-repository-review.yml"
         );
         let differently_named = render_versioned_github_actions_workflow(
-            "repo-summary@1",
+            "dependency-audit@1",
             &VersionedGithubActionsWorkflowContext {
                 envelope: envelope(),
-                workflow_name: "repo-summary".to_owned(),
+                workflow_name: "dependency-audit".to_owned(),
                 workflow_version: 1,
                 workflow_digest:
                     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -664,7 +664,7 @@ mod tests {
         )?;
         assert_eq!(
             differently_named.suggested_path,
-            ".github/workflows/steward-repo-summary.yml"
+            ".github/workflows/steward-dependency-audit.yml"
         );
         assert!(generated.yaml.contains("  workflow_dispatch:"));
         assert!(

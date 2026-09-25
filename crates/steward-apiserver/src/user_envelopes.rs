@@ -26,7 +26,6 @@ use crate::browser_auth::{
     BrowserAuthService, BrowserMutationProof, BrowserSessionBinding, BrowserSessionContext,
     protect_browser_routes,
 };
-use crate::workflows::SAMPLE_WORKFLOW_NAME;
 use crate::{
     AgentRunAvailability, AgentRunDataStatus, BoxFuture, GithubActionsEnvelopeSelection,
     VersionedGithubActionsWorkflowContext, render_versioned_github_actions_workflow,
@@ -257,18 +256,15 @@ pub(crate) struct PublishedWorkflowOption {
     version: i64,
     display_name: String,
     agent: String,
-    sample: bool,
 }
 
 impl From<WorkflowRevisionRecord> for PublishedWorkflowOption {
     fn from(record: WorkflowRevisionRecord) -> Self {
-        let sample = record.name == SAMPLE_WORKFLOW_NAME;
         Self {
             name: record.name,
             version: record.version,
             display_name: record.display_name,
             agent: record.agent,
-            sample,
         }
     }
 }
@@ -1272,21 +1268,27 @@ mod tests {
     }
 
     #[test]
-    fn reserved_repository_summary_is_advertised_as_the_sample_workflow() {
+    fn workflow_names_do_not_imply_hidden_sample_metadata() -> Result<(), String> {
         let option = PublishedWorkflowOption::from(WorkflowRevisionRecord {
-            name: "repo-summary".to_owned(),
+            name: "dependency-audit".to_owned(),
             version: 1,
-            display_name: "Repository summary".to_owned(),
+            display_name: "Dependency audit".to_owned(),
             agent: "example-agent@1.0.0".to_owned(),
-            prompt: "Summarize the repository.".to_owned(),
+            prompt: "Audit the repository dependencies.".to_owned(),
             content_digest:
                 "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
-            published_by: "system:sample-workflow".to_owned(),
+            published_by: "usr_abcdef0123456789abcdef0123456789".to_owned(),
             published_at: "2026-09-24T00:00:00.000000Z".to_owned(),
         });
 
-        assert!(option.sample);
-        assert_eq!(option.name, "repo-summary");
+        let value = serde_json::to_value(option)
+            .map_err(|error| format!("serialize published Workflow option: {error}"))?;
+        assert_eq!(value["name"], "dependency-audit");
+        assert!(
+            value.get("sample").is_none(),
+            "an ordinary user-controlled Workflow name must not imply system provenance"
+        );
+        Ok(())
     }
 
     fn template() -> AvailableEnvelopeTemplate {

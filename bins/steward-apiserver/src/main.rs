@@ -141,8 +141,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         decisions.clone(),
         workflow_agents,
         task_orchestration_mode,
-    )
-    .await?;
+    )?;
     let app = router(
         runtimes.clone(),
         store.clone(),
@@ -522,7 +521,7 @@ fn install_rustls_crypto_provider() -> Result<(), io::Error> {
     }
 }
 
-async fn browser_application_router(
+fn browser_application_router(
     store: PgStore,
     runtimes: KubeRuntimeRepository,
     decisions: JiraAdapter,
@@ -563,10 +562,6 @@ async fn browser_application_router(
     .map_err(io::Error::other)?;
     let connections =
         governed_connections_configuration(&origin, store.clone(), task_orchestration_mode)?;
-    let stable_bridge = stable_bridge_configuration()?;
-    workflows::ensure_sample_workflow(&store, &workflow_agents)
-        .await
-        .map_err(|error| io::Error::other(format!("sample Workflow bootstrap failed: {error}")))?;
     let app = browser_auth::browser_auth_router(auth.clone())
         .merge(user_envelopes::protected_router(
             user_envelopes::PgEnvelopeRequestBroker::new(store.clone()),
@@ -602,7 +597,7 @@ async fn browser_application_router(
             .merge(connections::protected_router(broker, auth.clone())),
         None => app.merge(agent_runs_ui::protected_router(store.clone(), auth.clone())),
     };
-    let app = match stable_bridge {
+    let app = match stable_bridge_configuration()? {
         Some((service, verifier)) => app.merge(stable_runtime_bridge::protected_router(
             store, runtimes, verifier, auth, service,
         )),

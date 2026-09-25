@@ -854,7 +854,6 @@ export type PublishedWorkflowOption = {
     agent: string;
     displayName: string;
     name: string;
-    sample: boolean;
     version: number;
 };
 

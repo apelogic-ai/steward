@@ -112,11 +112,12 @@ remains the authority for exact deltas and Envelope revisions.
 provider catalog. GitHub is enabled; unavailable providers remain explicit and
 disabled. Provider `start` and `disconnect` mutations are browser-session and
 CSRF scoped. The onboarding aggregate composes connection, Envelope, workflow,
-and run evidence; dismissal is a server-side preference. When browser surfaces
-are enabled and at least one execution binding is advertised, Steward seeds the
-reserved immutable `repo-summary@1` read-only sample against a deployment-owned
-agent. The renderer returns a deterministic suggested path, but callers may use
-any valid GitHub workflow filename. The workflow step is complete when a run's
+and run evidence; dismissal is a server-side preference. The checklist guides
+the user to choose any published Workflow, render its GitHub Actions file, and
+commit and run it themselves. Steward does not seed or publish a Workflow for
+the user, reserve Workflow names, or infer semantics from a Workflow name. The
+renderer returns a deterministic suggested path, but callers may use any valid
+GitHub workflow filename. The workflow step is complete when a run's
 immutable Workflow name and version match the rendered Workflow reference, or
 when the user explicitly acknowledges that the rendered file was added.
 
