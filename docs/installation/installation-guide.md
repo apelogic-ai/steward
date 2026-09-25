@@ -124,7 +124,7 @@ Do not reuse one credential for these unrelated boundaries:
 
 | Integration | Required when | Owner, minimum authority, and verification |
 |---|---|---|
-| GitHub Actions OIDC → identity exchange → `steward-run` | Governed submission from Actions | Runner operator grants `id-token: write`; the exchange trusts `https://token.actions.githubusercontent.com`, repository/ref policy, and audience `steward-task-api`. The exchanged short-lived identity must carry the exact Task identity groups and pass TokenReview. This is not a GitHub OAuth App. Install the independent runner and exchange from [steward-run#41](https://github.com/apelogic-ai/steward-run/issues/41) and [github-oidc-exchange#38](https://github.com/apelogic-ai/github-oidc-exchange/issues/38); they are not subcharts. Verify issuer, audience, HTTPS CA, and one denied wrong-repository/ref request before submission. |
+| GitHub Actions OIDC → Identity → `steward-run` | Governed submission from Actions | Runner operator grants `id-token: write`; Identity trusts `https://token.actions.githubusercontent.com` and enforces repository/ref policy. Steward either uses the existing TokenReview path or verifies Identity's short-lived ES256 Task token directly when `taskIdentity.enabled=true`. The direct path keeps `steward-task-v2` by default; opt-in v3 uses the stable numeric GitHub actor subject. This is not a GitHub OAuth App. Verify issuer, audience, HTTPS CA, discovery metadata when configured, and one denied wrong-repository/ref request before submission. |
 | ARC GitHub App | Only an ARC-based runner installation | Runner-platform owner supplies the App ID, installation ID, and key with the minimum ARC repository/organization permissions. Steward neither reads nor creates this credential. Verify runner registration and job pickup in that product's handoff. |
 | Read-only GitHub source App | `githubSource.enabled=true` direct packages | Steward source operator supplies the configured App ID and PEM Secret; install it only on approved repositories with read-only Contents. Verify resolution of one exact allowed commit and denial of an unbound repository. |
 | Google OAuth/OIDC client | `browserAuth.enabled=true` | Browser-identity owner supplies the client ID/Secret, allowed workspace/organization, and the exact HTTPS callback derived from `browserAuth.google.origin`. Verify login, callback, wrong-domain denial, and logout. |
@@ -154,7 +154,7 @@ system. The default names can be overridden under `secrets`, `tls`,
 | `secrets.openshellClient.name` (`steward-openshell-client`) in release namespace | `Opaque`; configured CA, client certificate, and private-key keys (`ca.crt`, `tls.crt`, `tls.key`) | OpenShell/customer PKI creates; controller mounts. | Governed mode only. Rotate as an mTLS bundle and reprove server-name/CA validation. |
 | `secrets.mint.name` (`steward-mint`) in release namespace | `Opaque`; configured `signing-key`, `introspection-credential` | Customer key authority creates; Mint mounts. The signing key is exactly 32 raw bytes; newline-terminated or hex text is invalid. | Governed mode only. Coordinate JWKS/key rollover and introspection credential overlap with consumers. |
 | `workloadExchangeTrust.name` (`steward-workload-exchange-ca`) in release namespace | Public `ConfigMap` by default (or explicitly selected `Secret`); `workloadExchangeTrust.caCertificate` (`ca.crt`) | Workload-exchange PKI creates; controller mounts. | Governed mode only; rotate with exchange TLS and reprove trust. |
-| `taskIdentity.publicJwksConfigMap.name` in release namespace | Public `ConfigMap`; configured JWKS key | External Identity operator creates; API reads. | Only `taskIdentity.enabled=true`; rotate with issuer overlap and reprove issuer/audience/signature. |
+| `taskIdentity.publicJwksConfigMap.name` in release namespace | Public `ConfigMap`; configured JWKS key | External Identity operator creates; API reads. | Only `taskIdentity.enabled=true`; rotate with issuer overlap and reprove issuer/audience/signature. `federatedSubjects.enabled=true` additionally requires the exact public Steward origin in `taskIdentity.resource`. |
 | `browserAuth.google.clientSecret.name` in release namespace | `Opaque`; configured `clientSecret.key` | Identity-provider operator creates; API reads. | Only `browserAuth.enabled=true`; rotate with provider, restart API, and retest the exact HTTPS callback/origin. |
 | `githubSource.privateKeySecret.name` in release namespace | `Opaque`; configured private-key key containing the GitHub App PEM | GitHub App owner creates; API mounts read-only. | Only `githubSource.enabled=true`; App needs read-only Contents and installation only on approved repositories. Rotate the App key and retest exact Git-object resolution. |
 | `web.ingress.tlsSecretName` in release namespace | `kubernetes.io/tls`; `tls.crt`, `tls.key` | Customer edge PKI creates; Ingress controller reads. | Only legacy `web.ingress.enabled=true`; gateway-owned TLS stays outside this chart. |
@@ -532,6 +532,14 @@ enable and verify the human browser path before performing them.
    user has exactly one active provisioned User Envelope with the intended
    revision and authority. Never pre-create or select a User Envelope through
    Helm values.
+6. **Federated-subject association, only when v3 is enabled.** Submit one valid
+   `steward-task-v3` credential. Steward records the exact issuer/subject and
+   returns `task_identity_unassociated` without creating a Task. An authorized
+   browser administrator inspects `/admin/api/v1/federated-subjects`, associates
+   that observation with the intended existing canonical user using its current
+   revision, and verifies the audit endpoint. Login, display name, and email are
+   never association keys. Association grants no authority; the user still needs
+   the active provisioned User Envelope from step 5.
 
 Record the canonical IDs, immutable revisions, decision evidence, and operator
 actors through the product's supported administration surfaces without placing
@@ -548,7 +556,7 @@ Do not hand off merely because `helm template` or `helm lint` passed.
    --context "$CLUSTER_CONTEXT" -n steward rollout status deployment/steward-apiserver`
    and the same command for `deployment/steward-controller` complete.
    The database operator confirms the embedded migration table is at the
-   migration packaged in the exact release (currently `0039`) using an
+   migration packaged in the exact release (currently `0040`) using an
    approved database session that does not expose the URI or row contents.
 2. The `agentruntimes.agents.apelogic.ai` CRD is Established, and the
    `steward-agentruntime` validating webhook has `failurePolicy: Fail`, the
@@ -594,7 +602,10 @@ startup; they must use the same database and must not start across incompatible
 schema revisions. In particular, migration 0031 fails closed if older state
 has overlapping unknown/live attempts. The staged execution-binding rollout
 has its own [upgrade sequence](upgrade-execution-bindings.md); do not skip its
-drain and staged phases. Run `helm template` and the preflight/key-presence
+drain and staged phases. Enabling `steward-task-v3` has a separate
+[federated identity migration and rollback sequence](federated-task-identity-upgrade.md);
+apply migration 0040 while v3 remains disabled, then activate discovery and
+subject observation. Run `helm template` and the preflight/key-presence
 checks with the new immutable handoff before `helm upgrade --atomic --wait`.
 Then repeat the delivery tests, including model-free/core or governed Tasks as
 appropriate. A Helm rollback cannot reverse SQL migrations or restore external

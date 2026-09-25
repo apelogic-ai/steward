@@ -14,6 +14,13 @@ that immutable authority snapshot. Product-owned Connection operations use
 fixed internal authorities, while the deployment capability catalog describes
 available models and tools without granting authority.
 
+Task authentication keeps `steward-task-v2` as the default. Deployments may
+opt into `steward-task-v3`, where Steward observes the exact verified Identity
+issuer plus stable GitHub actor subject, and an administrator associates that
+subject with an existing canonical user. Observation alone grants no Task or
+Envelope authority. See the [Task submission API](docs/task-submission-api.md)
+and [federated identity upgrade guide](docs/installation/federated-task-identity-upgrade.md).
+
 Steward is available under the [MIT License](LICENSE). Checked-in upstream
 patches retain their [third-party notices](THIRD_PARTY_NOTICES.md).
 
@@ -33,7 +40,7 @@ records the limits of this tested matrix.
 | If you want to know | Read |
 |---|---|
 | Prerequisites, installation, secrets, post-install checks, and delivery tests | [Installation guide](docs/installation/installation-guide.md) |
-| Install order across Steward, `steward-run`, and the identity exchange | [Platform deployment order](docs/installation/platform-deployment-order.md) |
+| Install order across Steward, `steward-run`, and Identity | [Platform deployment order](docs/installation/platform-deployment-order.md) |
 | Generate and validate Helm/Flux deployment values | [Platform preflight](docs/installation/platform-preflight.md) |
 | All chart values and optional integrations | [Helm chart reference](charts/steward/README.md) |
 | Documentation authority, status, and navigation | [Documentation index](docs/README.md) |
@@ -42,6 +49,7 @@ records the limits of this tested matrix.
 | Post-M1 contracts that remain unresolved | [Deferred-contract register](docs/v2/deferred-implementation-contracts.md) |
 | Implemented v0.2 Task lifecycle and identity contract | [Task submission API](docs/task-submission-api.md) |
 | Upgrade and rollback boundary from v0.1.23 | [v0.2 upgrade guide](docs/installation/upgrade-v0.2.0.md) |
+| Enable or roll back federated Task identity | [Federated Task identity upgrade](docs/installation/federated-task-identity-upgrade.md) |
 | Release history and security-relevant changes | [Changelog](CHANGELOG.md) |
 | Canonical browser / Task person identity | [Canonical user identity](docs/canonical-user-identity-v1.md) |
 | Understand the Task API and worker contract | [Task deployment](config/task/README.md) |

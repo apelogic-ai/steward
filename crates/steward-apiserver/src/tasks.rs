@@ -29,9 +29,9 @@ use steward_ports::{
     TaskExecutionAdapter, TaskExecutionPlanRequest,
 };
 use steward_store::{
-    EnvelopeRequestRecord, PgStore, StoreError, TaskOrchestrationMode, TaskRecord,
-    TaskReservationRequest, TaskRuntimeOperationRecord, TaskRuntimeOwnership,
-    WorkflowRevisionRecord,
+    EnvelopeRequestRecord, FederatedSubjectObservation, FederatedSubjectRecord, PgStore,
+    StoreError, TaskOrchestrationMode, TaskRecord, TaskReservationRequest,
+    TaskRuntimeOperationRecord, TaskRuntimeOwnership, WorkflowRevisionRecord,
 };
 use steward_types::direct_package::{
     BoundedText, ClosureEntry, ClosureEntryKind, ContentDigest, DirectAdmissionDelta,
@@ -42,13 +42,14 @@ use steward_types::direct_package::{
     StableProviderId, TASK_BINDING_EVIDENCE_SCHEMA, TriggerRepository, canonical_json_bytes,
 };
 use steward_types::{
-    AgentRuntimeSpec, CanonicalAuthorityBinding, CanonicalUserId, Email, ModelRef, Principal,
-    RuntimeOwnership, TaskExecutionBinding, TaskPhase, ToolGrant,
+    AgentRuntimeSpec, CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId, Email,
+    ModelRef, Principal, RuntimeOwnership, TaskExecutionBinding, TaskPhase, ToolGrant,
 };
 use uuid::Uuid;
 
 use crate::WorkflowReference;
 use crate::execution_bindings::ExecutionBindingCatalog;
+use crate::task_auth::{FEDERATED_TASK_TOKEN_CONTRACT, LEGACY_TASK_TOKEN_CONTRACT};
 use crate::{
     AdmissionLedger, ApiError, BoxFuture, KubernetesTokenReviewAudience,
     authenticated_token_review_user, spec_digest, token_review_request,
@@ -59,7 +60,8 @@ const ACTING_USER_GROUP_PREFIX: &str = "agents.apelogic.ai/acting-user:";
 const TASK_OWNER_GROUP_PREFIX: &str = "agents.apelogic.ai/task-owner:";
 const CANONICAL_USER_GROUP_PREFIX: &str = "agents.apelogic.ai/canonical-user:";
 const VERSIONED_WORKFLOW_NAMESPACE: &str = "steward-workflows";
-const IDENTITY_TASK_CONTRACT: &str = "steward-task-v2";
+const IDENTITY_TASK_CONTRACT: &str = LEGACY_TASK_TOKEN_CONTRACT;
+const FEDERATED_TASK_CONTRACT: &str = FEDERATED_TASK_TOKEN_CONTRACT;
 const MAX_IDENTITY_TASK_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_IDENTITY_JWKS_BYTES: usize = 128 * 1024;
 const MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS: u64 = 300;
@@ -480,6 +482,8 @@ fn resolve_versioned_task_plan(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskAuthenticationError {
     InvalidCredentials,
+    Unassociated { issuer: String, subject: String },
+    Disabled { issuer: String, subject: String },
     Unavailable,
 }
 
@@ -559,7 +563,77 @@ pub struct IdentityTaskIdentityResolver {
     jwks: JwkSet,
     issuer: String,
     audience: String,
-    canonical_identities: PgStore,
+    canonical_identities: Arc<dyn IdentityTaskStore>,
+    federated_subjects_enabled: bool,
+}
+
+trait IdentityTaskStore: Send + Sync {
+    fn resolve_canonical_principal<'a>(
+        &'a self,
+        user_id: &'a CanonicalUserId,
+        current_verified_email: &'a Email,
+    ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>>;
+
+    fn seed_federated_subject_association<'a>(
+        &'a self,
+        observation: FederatedSubjectObservation<'a>,
+        canonical_user_id: &'a CanonicalUserId,
+        actor: &'a str,
+    ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>>;
+
+    fn observe_federated_subject<'a>(
+        &'a self,
+        observation: FederatedSubjectObservation<'a>,
+    ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>>;
+
+    fn resolve_federated_subject<'a>(
+        &'a self,
+        issuer: &'a str,
+        subject: &'a str,
+    ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>>;
+}
+
+impl IdentityTaskStore for PgStore {
+    fn resolve_canonical_principal<'a>(
+        &'a self,
+        user_id: &'a CanonicalUserId,
+        current_verified_email: &'a Email,
+    ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>> {
+        Box::pin(PgStore::resolve_canonical_principal(
+            self,
+            user_id,
+            current_verified_email,
+        ))
+    }
+
+    fn seed_federated_subject_association<'a>(
+        &'a self,
+        observation: FederatedSubjectObservation<'a>,
+        canonical_user_id: &'a CanonicalUserId,
+        actor: &'a str,
+    ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>> {
+        Box::pin(PgStore::seed_federated_subject_association(
+            self,
+            observation,
+            canonical_user_id,
+            actor,
+        ))
+    }
+
+    fn observe_federated_subject<'a>(
+        &'a self,
+        observation: FederatedSubjectObservation<'a>,
+    ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>> {
+        Box::pin(PgStore::observe_federated_subject(self, observation))
+    }
+
+    fn resolve_federated_subject<'a>(
+        &'a self,
+        issuer: &'a str,
+        subject: &'a str,
+    ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>> {
+        Box::pin(PgStore::resolve_federated_subject(self, issuer, subject))
+    }
 }
 
 #[derive(Clone)]
@@ -586,6 +660,7 @@ impl ConfiguredTaskIdentityResolver {
         audience: String,
         jwks_file: &FilePath,
         canonical_identities: PgStore,
+        federated_subjects_enabled: bool,
     ) -> Result<Self, TaskAuthenticationError> {
         Ok(Self::Identity(
             IdentityTaskIdentityResolver::from_jwks_file(
@@ -593,6 +668,7 @@ impl ConfiguredTaskIdentityResolver {
                 audience,
                 jwks_file,
                 canonical_identities,
+                federated_subjects_enabled,
             )?,
         ))
     }
@@ -644,9 +720,18 @@ struct IdentityTaskClaims {
     iat: u64,
     nbf: u64,
     jti: String,
-    email: String,
-    email_verified: bool,
-    groups: Vec<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    email_verified: Option<bool>,
+    #[serde(default)]
+    groups: Option<Vec<String>>,
+    #[serde(default)]
+    actor_login: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    canonical_user_id: Option<String>,
     identity_contract: String,
     #[serde(default)]
     source_provenance: Option<SourceProvenance>,
@@ -658,6 +743,7 @@ impl IdentityTaskIdentityResolver {
         audience: String,
         jwks_file: &FilePath,
         canonical_identities: PgStore,
+        federated_subjects_enabled: bool,
     ) -> Result<Self, TaskAuthenticationError> {
         if !valid_identity_issuer(&issuer) || !bounded_non_whitespace(&audience, 256) {
             return Err(TaskAuthenticationError::InvalidCredentials);
@@ -674,7 +760,8 @@ impl IdentityTaskIdentityResolver {
             jwks,
             issuer,
             audience,
-            canonical_identities,
+            canonical_identities: Arc::new(canonical_identities),
+            federated_subjects_enabled,
         })
     }
 }
@@ -686,9 +773,12 @@ impl IdentityTaskIdentityResolver {
     ) -> Result<UserInfo, TaskAuthenticationError> {
         let claims =
             verify_identity_task_token(assertion, &self.jwks, &self.issuer, &self.audience)?;
+        if claims.identity_contract != IDENTITY_TASK_CONTRACT {
+            return Err(TaskAuthenticationError::InvalidCredentials);
+        }
         Ok(UserInfo {
-            username: Some(claims.email),
-            groups: Some(claims.groups),
+            username: claims.email,
+            groups: claims.groups,
             ..UserInfo::default()
         })
     }
@@ -703,16 +793,134 @@ impl TaskIdentityResolver for IdentityTaskIdentityResolver {
         Box::pin(async move {
             let claims =
                 verify_identity_task_token(assertion, &self.jwks, &self.issuer, &self.audience)?;
-            let identity = task_identity_from_identity_claims(claims)?;
-            self.canonical_identities
-                .resolve_canonical_principal(&identity.canonical_user_id, &identity.owner)
-                .await
-                .map_err(|error| match error {
-                    StoreError::Database(_) => TaskAuthenticationError::Unavailable,
-                    _ => TaskAuthenticationError::InvalidCredentials,
-                })?;
-            Ok(identity)
+            match claims.identity_contract.as_str() {
+                IDENTITY_TASK_CONTRACT => {
+                    let identity = task_identity_from_identity_claims(claims.clone())?;
+                    self.canonical_identities
+                        .resolve_canonical_principal(&identity.canonical_user_id, &identity.owner)
+                        .await
+                        .map_err(map_canonical_identity_error)?;
+                    if self.federated_subjects_enabled {
+                        // v2 remains authoritative on its existing verified canonical-user
+                        // claims. Transition seeding is deliberately best-effort: a disabled or
+                        // conflicting v3 association, or an unavailable observation store, must
+                        // not add a new authentication or admission condition to v2.
+                        if let Err(error) = self
+                            .canonical_identities
+                            .seed_federated_subject_association(
+                                FederatedSubjectObservation {
+                                    issuer: &claims.iss,
+                                    subject: &claims.sub,
+                                    actor_login: None,
+                                    display_name: None,
+                                },
+                                &identity.canonical_user_id,
+                                "task-auth-v2",
+                            )
+                            .await
+                        {
+                            eprintln!(
+                                "best-effort v2 federated-subject seeding failed: category={}",
+                                v2_seed_failure_category(&error)
+                            );
+                        }
+                    }
+                    Ok(identity)
+                }
+                FEDERATED_TASK_CONTRACT if self.federated_subjects_enabled => {
+                    let observation = FederatedSubjectObservation {
+                        issuer: &claims.iss,
+                        subject: &claims.sub,
+                        actor_login: claims.actor_login.as_deref(),
+                        display_name: claims.display_name.as_deref(),
+                    };
+                    let principal = if claims.email.is_some() {
+                        let compatibility = compatibility_task_identity_from_claims(&claims)?;
+                        let principal = self
+                            .canonical_identities
+                            .resolve_canonical_principal(
+                                &compatibility.canonical_user_id,
+                                &compatibility.owner,
+                            )
+                            .await
+                            .map_err(map_canonical_identity_error)?;
+                        self.canonical_identities
+                            .seed_federated_subject_association(
+                                observation,
+                                &principal.user_id,
+                                "task-auth-v2-compatibility",
+                            )
+                            .await
+                            .map_err(|error| {
+                                map_federated_subject_error(error, &claims.iss, &claims.sub)
+                            })?;
+                        principal
+                    } else {
+                        self.canonical_identities
+                            .observe_federated_subject(observation)
+                            .await
+                            .map_err(|error| {
+                                map_federated_subject_error(error, &claims.iss, &claims.sub)
+                            })?;
+                        self.canonical_identities
+                            .resolve_federated_subject(&claims.iss, &claims.sub)
+                            .await
+                            .map_err(|error| {
+                                map_federated_subject_error(error, &claims.iss, &claims.sub)
+                            })?
+                    };
+                    Ok(TaskIdentity {
+                        service: "steward-run".to_owned(),
+                        acting_user: Some(principal.display_email.clone()),
+                        owner: principal.display_email,
+                        canonical_user_id: principal.user_id,
+                        source_provenance: claims.source_provenance,
+                    })
+                }
+                _ => Err(TaskAuthenticationError::InvalidCredentials),
+            }
         })
+    }
+}
+
+fn v2_seed_failure_category(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::FederatedSubjectDisabled => "disabled",
+        StoreError::FederatedSubjectConflict => "conflict",
+        StoreError::Database(_) => "unavailable",
+        _ => "rejected",
+    }
+}
+
+fn map_canonical_identity_error(error: StoreError) -> TaskAuthenticationError {
+    match error {
+        StoreError::Database(_) | StoreError::InvalidFederatedSubjectRecord => {
+            TaskAuthenticationError::Unavailable
+        }
+        _ => TaskAuthenticationError::InvalidCredentials,
+    }
+}
+
+fn map_federated_subject_error(
+    error: StoreError,
+    issuer: &str,
+    subject: &str,
+) -> TaskAuthenticationError {
+    match error {
+        StoreError::FederatedSubjectNotFound | StoreError::FederatedSubjectUnassociated => {
+            TaskAuthenticationError::Unassociated {
+                issuer: issuer.to_owned(),
+                subject: subject.to_owned(),
+            }
+        }
+        StoreError::FederatedSubjectDisabled => TaskAuthenticationError::Disabled {
+            issuer: issuer.to_owned(),
+            subject: subject.to_owned(),
+        },
+        StoreError::Database(_) | StoreError::InvalidFederatedSubjectRecord => {
+            TaskAuthenticationError::Unavailable
+        }
+        _ => TaskAuthenticationError::InvalidCredentials,
     }
 }
 
@@ -821,11 +1029,37 @@ fn validate_identity_task_claims(
             values.len() == 1 && values.first() == Some(&audience.to_owned())
         }
     };
+    let valid_legacy_identity = claims.identity_contract == IDENTITY_TASK_CONTRACT
+        && claims.email_verified == Some(true)
+        && claims.email.as_deref().is_some_and(valid_email)
+        && claims
+            .groups
+            .as_ref()
+            .is_some_and(|groups| groups.len() <= 16);
+    let compatibility_identity_absent =
+        claims.email.is_none() && claims.email_verified.is_none() && claims.groups.is_none();
+    let compatibility_identity_complete = claims.email_verified == Some(true)
+        && claims.email.as_deref().is_some_and(valid_email)
+        && claims
+            .groups
+            .as_ref()
+            .is_some_and(|groups| groups.len() <= 16)
+        && compatibility_task_identity_from_claims(claims).is_ok();
+    let valid_federated_identity = claims.identity_contract == FEDERATED_TASK_CONTRACT
+        && valid_github_actions_subject(&claims.sub)
+        && claims.canonical_user_id.is_none()
+        && claims
+            .actor_login
+            .as_deref()
+            .is_none_or(|value| bounded_display_metadata(value, 128))
+        && claims
+            .display_name
+            .as_deref()
+            .is_none_or(|value| bounded_display_metadata(value, 256))
+        && (compatibility_identity_absent || compatibility_identity_complete);
     if claims.iss != issuer
         || !audience_matches
-        || claims.identity_contract != IDENTITY_TASK_CONTRACT
-        || !claims.email_verified
-        || !valid_email(&claims.email)
+        || (!valid_legacy_identity && !valid_federated_identity)
         || !bounded_non_whitespace(&claims.sub, 255)
         || !bounded_non_whitespace(&claims.jti, 128)
         || claims.exp.saturating_add(IDENTITY_CLOCK_SKEW_SECONDS) <= now
@@ -835,7 +1069,6 @@ fn validate_identity_task_claims(
                 .iat
                 .saturating_add(MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS)
         || claims.nbf > now.saturating_add(IDENTITY_CLOCK_SKEW_SECONDS)
-        || claims.groups.len() > 16
     {
         return Err(TaskAuthenticationError::InvalidCredentials);
     }
@@ -852,10 +1085,13 @@ fn validate_identity_task_claims(
 fn task_identity_from_identity_claims(
     claims: IdentityTaskClaims,
 ) -> Result<TaskIdentity, TaskAuthenticationError> {
+    if claims.identity_contract != IDENTITY_TASK_CONTRACT {
+        return Err(TaskAuthenticationError::InvalidCredentials);
+    }
     let source_provenance = claims.source_provenance;
     let user = UserInfo {
-        username: Some(claims.email),
-        groups: Some(claims.groups),
+        username: claims.email,
+        groups: claims.groups,
         ..UserInfo::default()
     };
     task_identity_from_kubernetes_user(&user).map(|mut identity| {
@@ -864,12 +1100,44 @@ fn task_identity_from_identity_claims(
     })
 }
 
+fn compatibility_task_identity_from_claims(
+    claims: &IdentityTaskClaims,
+) -> Result<TaskIdentity, TaskAuthenticationError> {
+    if claims.email_verified != Some(true) {
+        return Err(TaskAuthenticationError::InvalidCredentials);
+    }
+    task_identity_from_kubernetes_user(&UserInfo {
+        username: claims.email.clone(),
+        groups: claims.groups.clone(),
+        ..UserInfo::default()
+    })
+}
+
 fn valid_identity_issuer(value: &str) -> bool {
     value.starts_with("https://") && value.len() <= 2_048 && !value.chars().any(char::is_whitespace)
 }
 
+fn valid_github_actions_subject(value: &str) -> bool {
+    value
+        .strip_prefix("github-actions:actor:")
+        .is_some_and(|actor_id| {
+            !actor_id.is_empty()
+                && actor_id.len() <= 20
+                && actor_id.bytes().all(|byte| byte.is_ascii_digit())
+                && actor_id != "0"
+                && !actor_id.starts_with('0')
+        })
+}
+
 fn bounded_non_whitespace(value: &str, maximum: usize) -> bool {
     !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_whitespace)
+}
+
+fn bounded_display_metadata(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
 }
 
 #[cfg(test)]
@@ -1231,6 +1499,15 @@ pub enum TaskAdmissionDelta {
 #[serde(rename_all = "camelCase")]
 pub struct TaskErrorResponse {
     pub error: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FederatedTaskIdentityErrorResponse {
+    pub error: String,
+    pub issuer: String,
+    pub subject: String,
+    pub message: String,
 }
 
 #[derive(utoipa::ToSchema)]
@@ -2624,6 +2901,12 @@ async fn resolve_task_identity<I: TaskIdentityResolver>(
         .await
         .map_err(|error| match error {
             TaskAuthenticationError::InvalidCredentials => ApiError::TaskAuthentication,
+            TaskAuthenticationError::Unassociated { issuer, subject } => {
+                ApiError::TaskIdentityUnassociated { issuer, subject }
+            }
+            TaskAuthenticationError::Disabled { issuer, subject } => {
+                ApiError::TaskIdentityDisabled { issuer, subject }
+            }
             TaskAuthenticationError::Unavailable => ApiError::TaskAuthenticationUnavailable,
         })
 }
@@ -3370,8 +3653,11 @@ mod workflow_request_tests {
 #[cfg(test)]
 mod identity_task_authentication_tests {
     use super::{
-        IdentityTaskClaims, TaskAuthenticationError, task_identity_from_identity_claims,
-        validate_identity_task_jwks, verify_identity_task_token,
+        BoxFuture, IDENTITY_CLOCK_SKEW_SECONDS, IdentityTaskClaims, IdentityTaskIdentityResolver,
+        IdentityTaskStore, MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS, TaskAuthenticationError,
+        TaskIdentityResolver, compatibility_task_identity_from_claims,
+        task_identity_from_identity_claims, valid_identity_issuer, validate_identity_task_jwks,
+        verify_identity_task_token,
     };
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -3382,6 +3668,9 @@ mod identity_task_authentication_tests {
     use p256::pkcs8::EncodePrivateKey;
     use rand_core::OsRng;
     use serde::Serialize;
+    use std::sync::Arc;
+    use steward_store::{FederatedSubjectObservation, FederatedSubjectRecord, StoreError};
+    use steward_types::{CanonicalPrincipal, CanonicalUserId, Email, OrganizationId};
 
     const ISSUER: &str = "https://identity.localhost:18444";
     const AUDIENCE: &str = "steward-task-api";
@@ -3400,6 +3689,80 @@ mod identity_task_authentication_tests {
         email_verified: bool,
         groups: Vec<&'a str>,
         identity_contract: &'a str,
+    }
+
+    #[derive(Serialize)]
+    struct FederatedClaims<'a> {
+        iss: &'a str,
+        sub: &'a str,
+        aud: Vec<&'a str>,
+        exp: u64,
+        iat: u64,
+        nbf: u64,
+        jti: &'a str,
+        identity_contract: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        email: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        email_verified: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        groups: Option<Vec<&'a str>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        canonical_user_id: Option<&'a str>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum SeedFailure {
+        Disabled,
+        Conflict,
+        Unavailable,
+    }
+
+    struct V2SeedFailureStore {
+        principal: CanonicalPrincipal,
+        seed_failure: SeedFailure,
+    }
+
+    impl IdentityTaskStore for V2SeedFailureStore {
+        fn resolve_canonical_principal<'a>(
+            &'a self,
+            _user_id: &'a CanonicalUserId,
+            _current_verified_email: &'a Email,
+        ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>> {
+            Box::pin(async move { Ok(self.principal.clone()) })
+        }
+
+        fn seed_federated_subject_association<'a>(
+            &'a self,
+            _observation: FederatedSubjectObservation<'a>,
+            _canonical_user_id: &'a CanonicalUserId,
+            _actor: &'a str,
+        ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>> {
+            Box::pin(async move {
+                Err(match self.seed_failure {
+                    SeedFailure::Disabled => StoreError::FederatedSubjectDisabled,
+                    SeedFailure::Conflict => StoreError::FederatedSubjectConflict,
+                    SeedFailure::Unavailable => {
+                        StoreError::Database("synthetic availability failure".to_owned())
+                    }
+                })
+            })
+        }
+
+        fn observe_federated_subject<'a>(
+            &'a self,
+            _observation: FederatedSubjectObservation<'a>,
+        ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>> {
+            Box::pin(async { Err(StoreError::FederatedSubjectNotFound) })
+        }
+
+        fn resolve_federated_subject<'a>(
+            &'a self,
+            _issuer: &'a str,
+            _subject: &'a str,
+        ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>> {
+            Box::pin(async { Err(StoreError::FederatedSubjectNotFound) })
+        }
     }
 
     fn key_material() -> Result<(EncodingKey, JwkSet), String> {
@@ -3441,10 +3804,10 @@ mod identity_task_authentication_tests {
                 iat: now,
                 nbf: now.saturating_sub(1),
                 jti: "identity-task-test-jti",
-                email: "leo@apelogic.ai",
+                email: "alice@example.com",
                 email_verified: true,
                 groups: vec![
-                    "agents.apelogic.ai/acting-user:leo@apelogic.ai",
+                    "agents.apelogic.ai/acting-user:alice@example.com",
                     "agents.apelogic.ai/canonical-user:usr_528fc0fed6cf400abb93a3f327d9a809",
                     "agents.apelogic.ai/service-principal:steward-run",
                 ],
@@ -3453,6 +3816,257 @@ mod identity_task_authentication_tests {
             key,
         )
         .map_err(|error| format!("sign Identity task token: {error}"))
+    }
+
+    fn federated_token_with<'a>(
+        key: &EncodingKey,
+        kid: &str,
+        claims: FederatedClaims<'a>,
+    ) -> Result<String, String> {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(kid.to_owned());
+        encode(&header, &claims, key).map_err(|error| format!("sign federated task token: {error}"))
+    }
+
+    fn federated_claims(now: u64) -> FederatedClaims<'static> {
+        FederatedClaims {
+            iss: ISSUER,
+            sub: "github-actions:actor:16106037",
+            aud: vec![AUDIENCE],
+            exp: now + 60,
+            iat: now,
+            nbf: now.saturating_sub(1),
+            jti: "federated-task-test-jti",
+            identity_contract: "steward-task-v3",
+            email: None,
+            email_verified: None,
+            groups: None,
+            canonical_user_id: None,
+        }
+    }
+
+    fn federated_token(key: &EncodingKey) -> Result<String, String> {
+        let now = jsonwebtoken::get_current_timestamp();
+        federated_token_with(key, KID, federated_claims(now))
+    }
+
+    #[tokio::test]
+    async fn v2_resolver_keeps_authentication_authoritative_when_transition_seeding_fails()
+    -> Result<(), String> {
+        let (key, jwks) = key_material()?;
+        let assertion = token(&key, ISSUER, AUDIENCE, "steward-task-v2")?;
+        let principal = CanonicalPrincipal::new(
+            CanonicalUserId::parse("usr_528fc0fed6cf400abb93a3f327d9a809")?,
+            OrganizationId::parse("org_example")?,
+            Email::parse("alice@example.com")?,
+        )?;
+
+        for seed_failure in [
+            SeedFailure::Disabled,
+            SeedFailure::Conflict,
+            SeedFailure::Unavailable,
+        ] {
+            let resolver = IdentityTaskIdentityResolver {
+                jwks: jwks.clone(),
+                issuer: ISSUER.to_owned(),
+                audience: AUDIENCE.to_owned(),
+                canonical_identities: Arc::new(V2SeedFailureStore {
+                    principal: principal.clone(),
+                    seed_failure,
+                }),
+                federated_subjects_enabled: true,
+            };
+
+            let identity = resolver.resolve(&assertion).await.map_err(|error| {
+                format!("v2 authentication was rejected by best-effort seeding: {error:?}")
+            })?;
+            assert_eq!(identity.owner.as_str(), "alice@example.com");
+            assert_eq!(
+                identity.canonical_user_id.as_str(),
+                "usr_528fc0fed6cf400abb93a3f327d9a809"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn federated_task_contract_rejects_caller_supplied_canonical_identity() -> Result<(), String> {
+        let (key, jwks) = key_material()?;
+        let now = jsonwebtoken::get_current_timestamp();
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(KID.to_owned());
+        let assertion = encode(
+            &header,
+            &FederatedClaims {
+                iss: ISSUER,
+                sub: "github-actions:actor:16106037",
+                aud: vec![AUDIENCE],
+                exp: now + 60,
+                iat: now,
+                nbf: now.saturating_sub(1),
+                jti: "caller-identity-injection",
+                identity_contract: "steward-task-v3",
+                email: None,
+                email_verified: None,
+                groups: None,
+                canonical_user_id: Some("usr_0123456789abcdef0123456789abcdef"),
+            },
+            &key,
+        )
+        .map_err(|error| format!("sign injected identity token: {error}"))?;
+        assert!(matches!(
+            verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE),
+            Err(TaskAuthenticationError::InvalidCredentials)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn federated_task_contract_fails_closed_on_subject_key_signature_and_time() -> Result<(), String>
+    {
+        let (key, jwks) = key_material()?;
+        let (other_key, _) = key_material()?;
+        let now = jsonwebtoken::get_current_timestamp();
+
+        let invalid_subjects = [
+            "",
+            "github-actions:actor:0",
+            "github-actions:actor:016106037",
+            "github-actions:actor:alice",
+            "github-actions:login:16106037",
+        ];
+        for subject in invalid_subjects {
+            let mut claims = federated_claims(now);
+            claims.sub = subject;
+            let assertion = federated_token_with(&key, KID, claims)?;
+            assert!(matches!(
+                verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE),
+                Err(TaskAuthenticationError::InvalidCredentials)
+            ));
+        }
+
+        let wrong_kid = federated_token_with(&key, "unknown-key", federated_claims(now))?;
+        let wrong_signature = federated_token_with(&other_key, KID, federated_claims(now))?;
+        let mut expired_claims = federated_claims(now);
+        expired_claims.exp = now.saturating_sub(61);
+        let expired = federated_token_with(&key, KID, expired_claims)?;
+        let mut future_claims = federated_claims(now);
+        future_claims.nbf = now + IDENTITY_CLOCK_SKEW_SECONDS + 60;
+        let future = federated_token_with(&key, KID, future_claims)?;
+        let mut over_age_claims = federated_claims(now);
+        over_age_claims.iat = now.saturating_sub(MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS + 1);
+        let over_age = federated_token_with(&key, KID, over_age_claims)?;
+        for (case, assertion) in [
+            ("unknown key ID", wrong_kid),
+            ("wrong signature", wrong_signature),
+            ("expired", expired),
+            ("not yet valid", future),
+            ("over maximum age", over_age),
+        ] {
+            assert!(
+                matches!(
+                    verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE),
+                    Err(TaskAuthenticationError::InvalidCredentials)
+                ),
+                "accepted {case} federated task credential"
+            );
+        }
+
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some(KID.to_owned());
+        let wrong_algorithm = encode(
+            &header,
+            &federated_claims(now),
+            &EncodingKey::from_secret(b"obviously-fake-test-key"),
+        )
+        .map_err(|error| format!("sign wrong-algorithm token: {error}"))?;
+        assert!(matches!(
+            verify_identity_task_token(&wrong_algorithm, &jwks, ISSUER, AUDIENCE),
+            Err(TaskAuthenticationError::InvalidCredentials)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn federated_task_contract_accepts_stable_subject_without_v2_identity_claims()
+    -> Result<(), String> {
+        let (key, jwks) = key_material()?;
+        let assertion = federated_token(&key)?;
+        let claims = verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE)
+            .map_err(|error| format!("valid federated task credential rejected: {error:?}"))?;
+        assert_eq!(claims.sub, "github-actions:actor:16106037");
+        assert_eq!(claims.identity_contract, "steward-task-v3");
+        Ok(())
+    }
+
+    #[test]
+    fn federated_task_contract_rejects_partial_compatibility_identity_claims() -> Result<(), String>
+    {
+        let (key, jwks) = key_material()?;
+        let now = jsonwebtoken::get_current_timestamp();
+
+        let mut email_only = federated_claims(now);
+        email_only.email = Some("alice@example.com");
+        email_only.email_verified = Some(true);
+        let mut groups_only = federated_claims(now);
+        groups_only.groups = Some(vec![
+            "agents.apelogic.ai/acting-user:alice@example.com",
+            "agents.apelogic.ai/canonical-user:usr_528fc0fed6cf400abb93a3f327d9a809",
+            "agents.apelogic.ai/service-principal:steward-run",
+        ]);
+
+        for claims in [email_only, groups_only] {
+            let assertion = federated_token_with(&key, KID, claims)?;
+            assert!(matches!(
+                verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE),
+                Err(TaskAuthenticationError::InvalidCredentials)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn federated_task_contract_accepts_only_complete_v2_compatibility_identity()
+    -> Result<(), String> {
+        let (key, jwks) = key_material()?;
+        let now = jsonwebtoken::get_current_timestamp();
+        let mut compatibility = federated_claims(now);
+        compatibility.email = Some("alice@example.com");
+        compatibility.email_verified = Some(true);
+        compatibility.groups = Some(vec![
+            "agents.apelogic.ai/acting-user:alice@example.com",
+            "agents.apelogic.ai/canonical-user:usr_528fc0fed6cf400abb93a3f327d9a809",
+            "agents.apelogic.ai/service-principal:steward-run",
+        ]);
+        let assertion = federated_token_with(&key, KID, compatibility)?;
+        let claims = verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE)
+            .map_err(|error| format!("complete compatibility identity rejected: {error:?}"))?;
+        let identity = compatibility_task_identity_from_claims(&claims)
+            .map_err(|error| format!("complete compatibility identity did not map: {error:?}"))?;
+        assert_eq!(identity.owner.as_str(), "alice@example.com");
+        assert_eq!(
+            identity.canonical_user_id.as_str(),
+            "usr_528fc0fed6cf400abb93a3f327d9a809"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_task_identity_issuer_retains_the_v2_configuration_contract() {
+        assert!(valid_identity_issuer("https://identity.example.test"));
+        assert!(valid_identity_issuer("https://identity.example.test/"));
+        assert!(valid_identity_issuer(
+            "https://identity.example.test/tenant/"
+        ));
+        for invalid in [
+            "http://identity.example.test",
+            "https://identity.example.test/a b",
+        ] {
+            assert!(
+                !valid_identity_issuer(invalid),
+                "accepted invalid issuer {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -3468,7 +4082,7 @@ mod identity_task_authentication_tests {
         let identity = task_identity_from_identity_claims(claims)
             .map_err(|error| format!("valid ratified Identity groups rejected: {error:?}"))?;
         assert_eq!(identity.service, "steward-run");
-        assert_eq!(identity.owner.0, "leo@apelogic.ai");
+        assert_eq!(identity.owner.0, "alice@example.com");
         assert_eq!(
             identity.canonical_user_id.as_str(),
             "usr_528fc0fed6cf400abb93a3f327d9a809"

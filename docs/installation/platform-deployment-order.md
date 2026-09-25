@@ -146,15 +146,17 @@ object inventory row. The complete Steward-side procedure is:
      --from-file=jwks.json=identity-task-jwks.json
    ```
 
-3. Set the four values together. The chart schema accepts either a fully empty
-   block or a fully populated one; a partially filled block fails before
-   installation:
+3. Set the v2 values together. This preserves the existing direct Identity
+   token contract and does not publish discovery metadata:
 
    ```yaml
    taskIdentity:
      enabled: true
      issuer: https://identity.example.test
      audience: steward-task-api
+     resource: ""
+     federatedSubjects:
+       enabled: false
      publicJwksConfigMap:
        name: steward-task-identity-jwks
        key: jwks.json
@@ -165,15 +167,34 @@ object inventory row. The complete Steward-side procedure is:
    consumer contract fixes it at `steward-task-api`, and a caller cannot select
    it.
 
+   To opt into v3, set the exact public Steward origin and enable federated
+   subjects in the same rollout:
+
+   ```yaml
+   taskIdentity:
+     enabled: true
+     issuer: https://identity.example.test
+     audience: steward-task-api
+     resource: https://steward.example.test
+     federatedSubjects:
+       enabled: true
+     publicJwksConfigMap:
+       name: steward-task-identity-jwks
+       key: jwks.json
+   ```
+
 4. Verify the rendered apiserver carries `STEWARD_IDENTITY_TASK_ISSUER`,
-   `STEWARD_IDENTITY_TASK_AUDIENCE`, and the read-only projection at
-   `/run/identity-task/jwks.json` before installing.
+   `STEWARD_IDENTITY_TASK_AUDIENCE`,
+   `STEWARD_FEDERATED_TASK_IDENTITY_ENABLED`, and the read-only projection at
+   `/run/identity-task/jwks.json` before installing. A v3 render also carries
+   `STEWARD_TASK_AUTH_RESOURCE`.
 
 Steward then accepts a submission token only when it is ES256 from that JWKS,
-carries the exact issuer and audience, declares `identity_contract` exactly
-`steward-task-v2`, presents a bounded single-use `jti`, and is current within
-the two-minute lifetime and clock-skew allowance. A verified token is
-authentication only; authority comes from Step 5.
+carries the exact issuer and audience, declares an enabled
+`identity_contract`, presents a bounded `jti`, and is current within the token
+age and clock-skew allowance. The default accepts only `steward-task-v2`; the
+opt-in accepts v2 and `steward-task-v3`. A verified token is authentication
+only; authority comes from Step 5.
 
 Steward's Mint publishes its own separate JWKS at
 `<mint-issuer>/.well-known/jwks.json` using EdDSA. It is unrelated to this
@@ -201,9 +222,9 @@ Envelope with the intended revision and authority. The capability catalog
 advertises models and tools but grants no authority, and an empty catalog
 cannot narrow an Envelope that already admits a Task.
 
-## Step 6: enroll the Identity policy
+## Step 6: enroll v2 identity or associate a v3 subject
 
-Identity policy admits exact observed values, not patterns. Using the claims
+For v2, Identity policy admits exact observed values, not patterns. Using the claims
 observed from Step 3 and the canonical identity from Step 5, enroll the exact
 subject, numeric repository and owner identifiers, allowed event and ref, and
 the reviewed actor mapping to that verified email and canonical user ID.
@@ -228,6 +249,16 @@ Envelope fails closed even though every signature check passed.
 Finish this step when one real assertion exchanges successfully, a replay of
 the same assertion is denied, and a wrong repository, ref, actor, and audience
 are each denied with a fresh assertion.
+
+For v3, Identity issues the stable subject
+`github-actions:actor:<numeric-actor-id>` and need not stamp email or Steward
+canonical-user groups. The first valid submission records the subject and
+returns `task_identity_unassociated` without creating a Task. An authorized
+Steward browser administrator then inspects the observed subject, associates
+it with the canonical user from Step 5 using `expectedRevision`, and verifies
+the append-only audit endpoint. Never use actor login, display name, or email
+similarity as association proof. A complete valid v2 compatibility identity
+may seed only that same verified issuer/subject association.
 
 ## Step 7: accept authentication and admission in core mode
 

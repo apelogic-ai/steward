@@ -62,6 +62,7 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | [`installation/codex-reference-runtime.md`](installation/codex-reference-runtime.md) | **Current release contract** | Supported Codex reference image, immutable binding, mirroring, rebuild, and conformance procedure. |
 | [`installation/execution-bindings.md`](installation/execution-bindings.md) | **Current implementation** | Deployment-neutral coding-agent catalog, validation, Helm installation, and lifecycle behavior. |
 | [`installation/upgrade-execution-bindings.md`](installation/upgrade-execution-bindings.md) | **Current implementation** | Upgrade from implicit coding-agent behavior to explicit deployment bindings. |
+| [`installation/federated-task-identity-upgrade.md`](installation/federated-task-identity-upgrade.md) | **Current release contract** | Additive v3 Task identity migration, activation, verification, and rollback. |
 | [`installation/upgrade-v0.2.0.md`](installation/upgrade-v0.2.0.md) | **Current release contract** | v0.1.23 preconditions, migration result, and rollback boundary. |
 | [`task-submission-api.md`](task-submission-api.md) | **Current implementation** | Implemented v0.2 Task API and User-Envelope-only authority. |
 
@@ -95,7 +96,7 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 
 | Location | Status | Purpose |
 |---|---|---|
-| [`installation/platform-deployment-order.md`](installation/platform-deployment-order.md) | **Reference** | Installation order across Steward, `steward-run`, and `github-oidc-exchange`, and the Steward-side task-identity wiring that joins them. |
+| [`installation/platform-deployment-order.md`](installation/platform-deployment-order.md) | **Reference** | Installation order across Steward, `steward-run`, and Identity, including v2 and opt-in v3 task identity. |
 | [`upstream/openshell-upstream-strategy.md`](upstream/openshell-upstream-strategy.md) | **Reference** | Versioned upstream findings and engagement record. |
 | [`upstream/pr-1970-review-comment.md`](upstream/pr-1970-review-comment.md) | **Historical, superseded** | Withdrawn upstream review draft. |
 | [`upstream/rfc-0011-review-comment.md`](upstream/rfc-0011-review-comment.md) | **Historical reference** | Retained upstream review text. |

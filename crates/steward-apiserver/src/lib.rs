@@ -10,6 +10,7 @@ mod github_actions;
 pub mod google_oidc;
 pub mod governed_connections;
 pub mod stable_runtime_bridge;
+pub mod task_auth;
 mod tasks;
 pub mod user_envelopes;
 pub mod workflows;
@@ -30,11 +31,11 @@ pub use github_actions::{
 };
 
 pub use tasks::{
-    ConfiguredTaskIdentityResolver, KubernetesTaskIdentityResolver,
-    MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, TaskAdmissionDelta, TaskApiConfig, TaskArchive,
-    TaskAuthenticationError, TaskCreateRequest, TaskErrorResponse, TaskIdentity,
-    TaskIdentityResolver, TaskStatusResponse, TaskSubmissionLedger, TaskSubmissionRequest,
-    task_router,
+    ConfiguredTaskIdentityResolver, FederatedTaskIdentityErrorResponse,
+    KubernetesTaskIdentityResolver, MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, TaskAdmissionDelta,
+    TaskApiConfig, TaskArchive, TaskAuthenticationError, TaskCreateRequest, TaskErrorResponse,
+    TaskIdentity, TaskIdentityResolver, TaskStatusResponse, TaskSubmissionLedger,
+    TaskSubmissionRequest, task_router,
 };
 pub use workflows::{WorkflowReference, WorkflowReferenceError};
 
@@ -214,6 +215,10 @@ impl RequestAuthenticator for IdentityOrKubernetesTokenAuthenticator {
                         TaskAuthenticationError::InvalidCredentials => {
                             AuthenticationError::InvalidCredentials
                         }
+                        TaskAuthenticationError::Unassociated { .. }
+                        | TaskAuthenticationError::Disabled { .. } => {
+                            AuthenticationError::InvalidCredentials
+                        }
                         TaskAuthenticationError::Unavailable => AuthenticationError::Unavailable,
                     })
                     .and_then(|user| caller_from_kubernetes_user(&user, &self.admin_group)),
@@ -357,6 +362,12 @@ pub struct GrantRevocationRequest {
         browser_admin::reject_envelope_request,
         browser_admin::approve,
         browser_admin::file_decision,
+        browser_admin::list_federated_subjects,
+        browser_admin::get_federated_subject,
+        browser_admin::get_federated_subject_audit,
+        browser_admin::associate_federated_subject,
+        browser_admin::replace_federated_subject,
+        browser_admin::disable_federated_subject,
         agent_runs_contract,
         agent_run_contract,
         agent_run_timeline_contract
@@ -370,9 +381,17 @@ pub struct GrantRevocationRequest {
         TaskAdmissionDelta,
         TaskArchive,
         TaskErrorResponse,
+        FederatedTaskIdentityErrorResponse,
         browser_auth::BrowserRole,
         browser_auth::SessionPrincipalResponse,
         browser_auth::SessionResponse,
+        browser_admin::BrowserFederatedSubjectView,
+        browser_admin::BrowserFederatedSubjectAuditView,
+        browser_admin::BrowserFederatedSubjectResponse,
+        browser_admin::BrowserFederatedSubjectListResponse,
+        browser_admin::BrowserFederatedSubjectAuditResponse,
+        browser_admin::AssociateFederatedSubjectBody,
+        browser_admin::DisableFederatedSubjectBody,
         AgentRunAvailability,
         AgentRunDataStatus,
         AgentRunSpendView,
@@ -473,6 +492,7 @@ pub async fn budget_increase_contract() {}
         (status = 202, description = "A new direct-package or versioned Workflow Task is accepted for controller-owned runtime creation; runtimeUid is null until controller binding", body = TaskStatusResponse, content_type = "application/json"),
         (status = 400, description = "Submission JSON is malformed", body = String, content_type = "text/plain"),
         (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 403, description = "Federated subject is unassociated or disabled", body = FederatedTaskIdentityErrorResponse, content_type = "application/json"),
         (status = 404, description = "Selected workflow does not exist", body = TaskErrorResponse, content_type = "application/json"),
         (status = 409, description = "Idempotency key conflicts with an existing Task", body = TaskErrorResponse, content_type = "application/json"),
         (status = 415, description = "Content-Type is not application/json", body = String, content_type = "text/plain"),
@@ -788,6 +808,8 @@ pub enum ApiError {
     Conflict(String),
     NoActiveGrants,
     TaskAuthentication,
+    TaskIdentityUnassociated { issuer: String, subject: String },
+    TaskIdentityDisabled { issuer: String, subject: String },
     TaskAuthenticationUnavailable,
     TaskSourceUnauthorized(String),
     TaskWorkflowNotFound,
@@ -1970,23 +1992,57 @@ where
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        match &self {
+            Self::TaskIdentityUnassociated { issuer, subject } => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "task_identity_unassociated",
+                        "issuer": issuer,
+                        "subject": subject,
+                        "message": "The authenticated federated subject is not associated with a Steward user. Ask a Steward administrator to associate it.",
+                    })),
+                )
+                    .into_response();
+            }
+            Self::TaskIdentityDisabled { issuer, subject } => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "task_identity_disabled",
+                        "issuer": issuer,
+                        "subject": subject,
+                        "message": "The authenticated federated subject is disabled. Ask a Steward administrator to review it.",
+                    })),
+                )
+                    .into_response();
+            }
+            _ => {}
+        }
         let status = match &self {
             Self::RuntimeCreate(RuntimeCreateError::Kubernetes { status, .. }) => {
                 StatusCode::from_u16(*status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
             }
             Self::PrincipalMismatch => StatusCode::FORBIDDEN,
             Self::TaskAuthentication => StatusCode::UNAUTHORIZED,
+            Self::TaskIdentityUnassociated { .. } | Self::TaskIdentityDisabled { .. } => {
+                StatusCode::FORBIDDEN
+            }
             Self::TaskSourceUnauthorized(_) => StatusCode::FORBIDDEN,
             Self::TaskAuthenticationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::TaskWorkflowNotFound
             | Self::Store(
                 StoreError::TaskNotFound
                 | StoreError::CanonicalIdentityNotFound
+                | StoreError::FederatedSubjectNotFound
                 | StoreError::EnvelopeRequestNotFound
                 | StoreError::WorkflowNotFound
                 | StoreError::ConnectionOperationNotFound,
             ) => StatusCode::NOT_FOUND,
             Self::Store(StoreError::CanonicalIdentityInactive) => StatusCode::FORBIDDEN,
+            Self::Store(
+                StoreError::FederatedSubjectUnassociated | StoreError::FederatedSubjectDisabled,
+            ) => StatusCode::FORBIDDEN,
             Self::TaskNotReady | Self::TaskRuntimeContractUnavailable(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -2015,6 +2071,7 @@ impl IntoResponse for ApiError {
                 | StoreError::CanonicalIdentityStale
                 | StoreError::CanonicalIdentityAmbiguousEmail
                 | StoreError::CanonicalIdentityConflict
+                | StoreError::FederatedSubjectConflict
                 | StoreError::ConnectionOperationConflict
                 | StoreError::ConnectionOAuthFlowPending,
             ) => StatusCode::CONFLICT,
@@ -2026,6 +2083,7 @@ impl IntoResponse for ApiError {
                 | StoreError::InvalidBrowserRbacActor
                 | StoreError::InvalidBrowserRbacAssignment
                 | StoreError::InvalidBrowserRbacRecord
+                | StoreError::InvalidFederatedSubject
                 | StoreError::InvalidTaskIdentityBinding
                 | StoreError::InvalidEnvelopeRequest
                 | StoreError::InvalidWorkflow
@@ -2036,7 +2094,11 @@ impl IntoResponse for ApiError {
             }
             Self::RuntimeCreate(RuntimeCreateError::Unavailable(_))
             | Self::Runtime(_)
-            | Self::Store(StoreError::Database(_) | StoreError::DecisionFilingClaimLost)
+            | Self::Store(
+                StoreError::Database(_)
+                | StoreError::DecisionFilingClaimLost
+                | StoreError::InvalidFederatedSubjectRecord,
+            )
             | Self::DecisionChannel(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
         (
@@ -3320,6 +3382,16 @@ mod tests {
                         .map_err(|_| TaskAuthenticationError::InvalidCredentials)?,
                         source_provenance: None,
                     }),
+                    "unassociated-federated-assertion" => {
+                        Err(TaskAuthenticationError::Unassociated {
+                            issuer: "https://identity.example.test".to_owned(),
+                            subject: "github-actions:actor:16106037".to_owned(),
+                        })
+                    }
+                    "disabled-federated-assertion" => Err(TaskAuthenticationError::Disabled {
+                        issuer: "https://identity.example.test".to_owned(),
+                        subject: "github-actions:actor:16106037".to_owned(),
+                    }),
                     _ => Err(TaskAuthenticationError::InvalidCredentials),
                 }
             })
@@ -3970,6 +4042,27 @@ mod tests {
                 "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1file/post",
                 "200",
             ),
+            ("/paths/~1admin~1api~1v1~1federated-subjects/get", "200"),
+            (
+                "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}/get",
+                "200",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1audit/get",
+                "200",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1associate/post",
+                "200",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1replace/post",
+                "200",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1disable/post",
+                "200",
+            ),
         ];
         for (pointer, success_status) in operations {
             let operation = document
@@ -4014,6 +4107,9 @@ mod tests {
             "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1reject/post",
             "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1approve/post",
             "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1file/post",
+            "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1associate/post",
+            "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1replace/post",
+            "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1disable/post",
         ] {
             let operation = document
                 .pointer(pointer)
@@ -8715,6 +8811,103 @@ mod tests {
             FakeTaskIdentityResolver,
             task_api_config()?.with_git_hosting_plane(git),
         ))
+    }
+
+    #[tokio::test]
+    async fn unassociated_federated_subject_returns_stable_actionable_error() -> Result<(), String>
+    {
+        let ledger = versioned_task_ledger()?;
+        let git = direct_git_fixture(direct_manifest()?, direct_definition_no_skills()?, None)?;
+        let response = direct_test_app(ledger.clone(), git)?
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer unassociated-federated-assertion")
+                    .header("idempotency-key", "unassociated-federated-subject")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build unassociated-subject request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit unassociated-subject request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read unassociated-subject response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("decode unassociated-subject response: {error}"))?,
+            serde_json::json!({
+                "error": "task_identity_unassociated",
+                "issuer": "https://identity.example.test",
+                "subject": "github-actions:actor:16106037",
+                "message": "The authenticated federated subject is not associated with a Steward user. Ask a Steward administrator to associate it.",
+            })
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .is_empty(),
+            "an unassociated subject must receive no Task authority"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_federated_subject_returns_stable_actionable_error() -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let git = direct_git_fixture(direct_manifest()?, direct_definition_no_skills()?, None)?;
+        let response = direct_test_app(ledger.clone(), git)?
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer disabled-federated-assertion")
+                    .header("idempotency-key", "disabled-federated-subject")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build disabled-subject request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit disabled-subject request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read disabled-subject response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("decode disabled-subject response: {error}"))?,
+            serde_json::json!({
+                "error": "task_identity_disabled",
+                "issuer": "https://identity.example.test",
+                "subject": "github-actions:actor:16106037",
+                "message": "The authenticated federated subject is disabled. Ask a Steward administrator to review it.",
+            })
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .is_empty(),
+            "a disabled subject must receive no Task authority"
+        );
+        Ok(())
     }
 
     fn direct_source_bindings_json(source_repository_id: &str) -> String {

@@ -122,6 +122,114 @@ pub struct BrowserRbacAssignmentChange<'a> {
     pub actor: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FederatedSubjectState {
+    Observed,
+    Associated,
+    Disabled,
+}
+
+impl FederatedSubjectState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::Associated => "associated",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "observed" => Ok(Self::Observed),
+            "associated" => Ok(Self::Associated),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(StoreError::InvalidFederatedSubjectRecord),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FederatedSubjectRecord {
+    pub subject_id: Uuid,
+    pub issuer: String,
+    pub subject: String,
+    pub state: FederatedSubjectState,
+    pub canonical_user_id: Option<CanonicalUserId>,
+    pub actor_login: Option<String>,
+    pub display_name: Option<String>,
+    pub revision: i64,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FederatedSubjectAuditAction {
+    Observed,
+    V2Seeded,
+    Associated,
+    Replaced,
+    Disabled,
+}
+
+impl FederatedSubjectAuditAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::V2Seeded => "v2_seeded",
+            Self::Associated => "associated",
+            Self::Replaced => "replaced",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "observed" => Ok(Self::Observed),
+            "v2_seeded" => Ok(Self::V2Seeded),
+            "associated" => Ok(Self::Associated),
+            "replaced" => Ok(Self::Replaced),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(StoreError::InvalidFederatedSubjectRecord),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FederatedSubjectAuditRecord {
+    pub event_id: Uuid,
+    pub subject_id: Uuid,
+    pub action: FederatedSubjectAuditAction,
+    pub actor: String,
+    pub previous_canonical_user_id: Option<CanonicalUserId>,
+    pub canonical_user_id: Option<CanonicalUserId>,
+    pub previous_revision: i64,
+    pub revision: i64,
+    pub reason: Option<String>,
+    pub created_at: String,
+}
+
+pub struct FederatedSubjectObservation<'a> {
+    pub issuer: &'a str,
+    pub subject: &'a str,
+    pub actor_login: Option<&'a str>,
+    pub display_name: Option<&'a str>,
+}
+
+pub struct FederatedSubjectAssociation<'a> {
+    pub subject_id: Uuid,
+    pub expected_revision: i64,
+    pub canonical_user_id: &'a CanonicalUserId,
+    pub actor: &'a str,
+}
+
+pub struct FederatedSubjectDisable<'a> {
+    pub subject_id: Uuid,
+    pub expected_revision: i64,
+    pub actor: &'a str,
+    pub reason: Option<&'a str>,
+}
+
 fn is_valid_member_role(member_role: &str) -> bool {
     let bytes = member_role.as_bytes();
     !bytes.is_empty()
@@ -170,6 +278,17 @@ mod migration_tests {
                 .iter()
                 .any(|migration| migration.version == 36),
             "migration 36 was applied in existing databases and must remain embedded"
+        );
+    }
+
+    #[test]
+    fn federated_subject_migration_is_embedded_additively() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 40 && migration.description.contains("federated subject")
+            }),
+            "migration 40 must remain embedded and describe its additive federated-subject boundary"
         );
     }
 }
@@ -796,6 +915,448 @@ impl PgStore {
         .await
         .map_err(database_error)?;
         transaction.commit().await.map_err(database_error)
+    }
+
+    pub async fn observe_federated_subject(
+        &self,
+        observation: FederatedSubjectObservation<'_>,
+    ) -> Result<FederatedSubjectRecord, StoreError> {
+        if !valid_federated_subject_observation(&observation) {
+            return Err(StoreError::InvalidFederatedSubject);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let record =
+            Self::observe_federated_subject_in_transaction(&mut transaction, &observation).await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(record)
+    }
+
+    async fn observe_federated_subject_in_transaction(
+        transaction: &mut sqlx::Transaction<'_, Postgres>,
+        observation: &FederatedSubjectObservation<'_>,
+    ) -> Result<FederatedSubjectRecord, StoreError> {
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(\
+                hashtextextended($1::text || chr(31) || $2::text, 0)\
+             )",
+        )
+        .bind(observation.issuer)
+        .bind(observation.subject)
+        .execute(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+        let existing = sqlx::query_scalar::<_, Uuid>(
+            "SELECT subject_id FROM federated_subjects \
+             WHERE issuer = $1 AND subject = $2 FOR UPDATE",
+        )
+        .bind(observation.issuer)
+        .bind(observation.subject)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+        let row = if let Some(subject_id) = existing {
+            sqlx::query(
+                "UPDATE federated_subjects \
+                 SET actor_login = COALESCE($2, actor_login), \
+                     display_name = COALESCE($3, display_name), \
+                     last_seen_at = now() \
+                 WHERE subject_id = $1 \
+                 RETURNING subject_id, issuer, subject, state, canonical_user_id, \
+                           actor_login, display_name, revision, \
+                           to_char(first_seen_at AT TIME ZONE 'UTC', \
+                                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                           to_char(last_seen_at AT TIME ZONE 'UTC', \
+                                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                           to_char(updated_at AT TIME ZONE 'UTC', \
+                                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
+            )
+            .bind(subject_id)
+            .bind(observation.actor_login)
+            .bind(observation.display_name)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(database_error)?
+        } else {
+            let subject_id = Uuid::new_v4();
+            let row = sqlx::query(
+                "INSERT INTO federated_subjects \
+                 (subject_id, issuer, subject, actor_login, display_name) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 RETURNING subject_id, issuer, subject, state, canonical_user_id, \
+                           actor_login, display_name, revision, \
+                           to_char(first_seen_at AT TIME ZONE 'UTC', \
+                                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                           to_char(last_seen_at AT TIME ZONE 'UTC', \
+                                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                           to_char(updated_at AT TIME ZONE 'UTC', \
+                                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
+            )
+            .bind(subject_id)
+            .bind(observation.issuer)
+            .bind(observation.subject)
+            .bind(observation.actor_login)
+            .bind(observation.display_name)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(database_error)?;
+            sqlx::query(
+                "INSERT INTO federated_subject_audit \
+                 (event_id, subject_id, action, actor, previous_revision, revision) \
+                 VALUES ($1, $2, 'observed', 'task-auth', 0, 1)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(subject_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(database_error)?;
+            row
+        };
+        federated_subject_record(row)
+    }
+
+    pub async fn seed_federated_subject_association(
+        &self,
+        observation: FederatedSubjectObservation<'_>,
+        canonical_user_id: &CanonicalUserId,
+        actor: &str,
+    ) -> Result<FederatedSubjectRecord, StoreError> {
+        if !valid_federated_subject_observation(&observation)
+            || !valid_federated_subject_actor(actor)
+        {
+            return Err(StoreError::InvalidFederatedSubject);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        ensure_active_canonical_user(&mut transaction, canonical_user_id).await?;
+        let observed =
+            Self::observe_federated_subject_in_transaction(&mut transaction, &observation).await?;
+        let record = match observed.state {
+            FederatedSubjectState::Observed => {
+                transition_federated_subject_association(
+                    &mut transaction,
+                    &observed,
+                    canonical_user_id,
+                    FederatedSubjectAuditAction::V2Seeded,
+                    actor,
+                )
+                .await?
+            }
+            FederatedSubjectState::Associated
+                if observed.canonical_user_id.as_ref() == Some(canonical_user_id) =>
+            {
+                observed
+            }
+            FederatedSubjectState::Associated => {
+                return Err(StoreError::FederatedSubjectConflict);
+            }
+            FederatedSubjectState::Disabled => return Err(StoreError::FederatedSubjectDisabled),
+        };
+        transaction.commit().await.map_err(database_error)?;
+        Ok(record)
+    }
+
+    pub async fn federated_subject(
+        &self,
+        subject_id: Uuid,
+    ) -> Result<FederatedSubjectRecord, StoreError> {
+        let row = sqlx::query(
+            "SELECT subject_id, issuer, subject, state, canonical_user_id, \
+                    actor_login, display_name, revision, \
+                    to_char(first_seen_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                    to_char(last_seen_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                    to_char(updated_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
+             FROM federated_subjects WHERE subject_id = $1",
+        )
+        .bind(subject_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::FederatedSubjectNotFound)?;
+        federated_subject_record(row)
+    }
+
+    pub async fn federated_subject_by_external_identity(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<FederatedSubjectRecord>, StoreError> {
+        if !valid_federated_subject_observation(&FederatedSubjectObservation {
+            issuer,
+            subject,
+            actor_login: None,
+            display_name: None,
+        }) {
+            return Err(StoreError::InvalidFederatedSubject);
+        }
+        sqlx::query(
+            "SELECT subject_id, issuer, subject, state, canonical_user_id, \
+                    actor_login, display_name, revision, \
+                    to_char(first_seen_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                    to_char(last_seen_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                    to_char(updated_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
+             FROM federated_subjects WHERE issuer = $1 AND subject = $2",
+        )
+        .bind(issuer)
+        .bind(subject)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .map(federated_subject_record)
+        .transpose()
+    }
+
+    pub async fn list_federated_subjects(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<FederatedSubjectRecord>, StoreError> {
+        if !(1..=200).contains(&limit) {
+            return Err(StoreError::InvalidFederatedSubject);
+        }
+        let rows = sqlx::query(
+            "SELECT subject_id, issuer, subject, state, canonical_user_id, \
+                    actor_login, display_name, revision, \
+                    to_char(first_seen_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                    to_char(last_seen_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                    to_char(updated_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
+             FROM federated_subjects \
+             ORDER BY last_seen_at DESC, subject_id \
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.into_iter().map(federated_subject_record).collect()
+    }
+
+    pub async fn federated_subject_audit(
+        &self,
+        subject_id: Uuid,
+    ) -> Result<Vec<FederatedSubjectAuditRecord>, StoreError> {
+        if !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM federated_subjects WHERE subject_id = $1)",
+        )
+        .bind(subject_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?
+        {
+            return Err(StoreError::FederatedSubjectNotFound);
+        }
+        let rows = sqlx::query(
+            "SELECT event_id, subject_id, action, actor, previous_canonical_user_id, \
+                    canonical_user_id, previous_revision, revision, reason, \
+                    to_char(created_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at \
+             FROM federated_subject_audit \
+             WHERE subject_id = $1 \
+             ORDER BY revision, created_at, event_id",
+        )
+        .bind(subject_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.into_iter()
+            .map(federated_subject_audit_record)
+            .collect()
+    }
+
+    pub async fn associate_federated_subject(
+        &self,
+        association: FederatedSubjectAssociation<'_>,
+    ) -> Result<FederatedSubjectRecord, StoreError> {
+        self.change_federated_subject_association(
+            association,
+            FederatedSubjectAuditAction::Associated,
+            false,
+        )
+        .await
+    }
+
+    pub async fn replace_federated_subject_association(
+        &self,
+        association: FederatedSubjectAssociation<'_>,
+    ) -> Result<FederatedSubjectRecord, StoreError> {
+        self.change_federated_subject_association(
+            association,
+            FederatedSubjectAuditAction::Replaced,
+            true,
+        )
+        .await
+    }
+
+    async fn change_federated_subject_association(
+        &self,
+        association: FederatedSubjectAssociation<'_>,
+        action: FederatedSubjectAuditAction,
+        replace: bool,
+    ) -> Result<FederatedSubjectRecord, StoreError> {
+        if association.expected_revision <= 0 || !valid_federated_subject_actor(association.actor) {
+            return Err(StoreError::InvalidFederatedSubject);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        ensure_active_canonical_user(&mut transaction, association.canonical_user_id).await?;
+        let current = locked_federated_subject(&mut transaction, association.subject_id).await?;
+        if current.state == FederatedSubjectState::Disabled {
+            return Err(StoreError::FederatedSubjectDisabled);
+        }
+        if current.state == FederatedSubjectState::Associated
+            && current.canonical_user_id.as_ref() == Some(association.canonical_user_id)
+        {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(current);
+        }
+        if current.revision != association.expected_revision
+            || (replace && current.state != FederatedSubjectState::Associated)
+            || (!replace && current.state != FederatedSubjectState::Observed)
+        {
+            return Err(StoreError::FederatedSubjectConflict);
+        }
+        let record = transition_federated_subject_association(
+            &mut transaction,
+            &current,
+            association.canonical_user_id,
+            action,
+            association.actor,
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(record)
+    }
+
+    pub async fn disable_federated_subject(
+        &self,
+        change: FederatedSubjectDisable<'_>,
+    ) -> Result<FederatedSubjectRecord, StoreError> {
+        if change.expected_revision <= 0
+            || !valid_federated_subject_actor(change.actor)
+            || !valid_federated_subject_reason(change.reason)
+        {
+            return Err(StoreError::InvalidFederatedSubject);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let current = locked_federated_subject(&mut transaction, change.subject_id).await?;
+        if current.state == FederatedSubjectState::Disabled {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(current);
+        }
+        if current.revision != change.expected_revision {
+            return Err(StoreError::FederatedSubjectConflict);
+        }
+        let next_revision = current
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::FederatedSubjectConflict)?;
+        let row = sqlx::query(
+            "UPDATE federated_subjects \
+             SET state = 'disabled', revision = $2, updated_at = now() \
+             WHERE subject_id = $1 AND revision = $3 \
+             RETURNING subject_id, issuer, subject, state, canonical_user_id, \
+                       actor_login, display_name, revision, \
+                       to_char(first_seen_at AT TIME ZONE 'UTC', \
+                               'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                       to_char(last_seen_at AT TIME ZONE 'UTC', \
+                               'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                       to_char(updated_at AT TIME ZONE 'UTC', \
+                               'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
+        )
+        .bind(current.subject_id)
+        .bind(next_revision)
+        .bind(current.revision)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::FederatedSubjectConflict)?;
+        sqlx::query(
+            "INSERT INTO federated_subject_audit \
+             (event_id, subject_id, action, actor, previous_canonical_user_id, \
+              canonical_user_id, previous_revision, revision, reason) \
+             VALUES ($1, $2, 'disabled', $3, $4, $4, $5, $6, $7)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(current.subject_id)
+        .bind(change.actor)
+        .bind(
+            current
+                .canonical_user_id
+                .as_ref()
+                .map(CanonicalUserId::as_str),
+        )
+        .bind(current.revision)
+        .bind(next_revision)
+        .bind(change.reason)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let record = federated_subject_record(row)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(record)
+    }
+
+    pub async fn resolve_federated_subject(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<CanonicalPrincipal, StoreError> {
+        let row = sqlx::query(
+            "SELECT federated_subjects.state, federated_subjects.canonical_user_id, \
+                    canonical_users.organization_id, canonical_users.display_email, \
+                    canonical_users.state AS canonical_user_state \
+             FROM federated_subjects \
+             LEFT JOIN canonical_users \
+               ON canonical_users.user_id = federated_subjects.canonical_user_id \
+             WHERE federated_subjects.issuer = $1 AND federated_subjects.subject = $2",
+        )
+        .bind(issuer)
+        .bind(subject)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::FederatedSubjectNotFound)?;
+        match FederatedSubjectState::parse(
+            &row.try_get::<String, _>("state").map_err(database_error)?,
+        )? {
+            FederatedSubjectState::Observed => Err(StoreError::FederatedSubjectUnassociated),
+            FederatedSubjectState::Disabled => Err(StoreError::FederatedSubjectDisabled),
+            FederatedSubjectState::Associated => {
+                let user_state: String = row
+                    .try_get("canonical_user_state")
+                    .map_err(database_error)?;
+                if user_state != "active" {
+                    return Err(StoreError::CanonicalIdentityInactive);
+                }
+                let user_id = row
+                    .try_get::<String, _>("canonical_user_id")
+                    .map_err(database_error)
+                    .and_then(|value| {
+                        CanonicalUserId::parse(value)
+                            .map_err(|_| StoreError::InvalidFederatedSubjectRecord)
+                    })?;
+                let organization_id = row
+                    .try_get::<String, _>("organization_id")
+                    .map_err(database_error)
+                    .and_then(|value| {
+                        OrganizationId::parse(value)
+                            .map_err(|_| StoreError::InvalidFederatedSubjectRecord)
+                    })?;
+                let display_email = row
+                    .try_get::<String, _>("display_email")
+                    .map_err(database_error)
+                    .and_then(|value| {
+                        Email::parse(value).map_err(|_| StoreError::InvalidFederatedSubjectRecord)
+                    })?;
+                CanonicalPrincipal::new(user_id, organization_id, display_email)
+                    .map_err(|_| StoreError::InvalidFederatedSubjectRecord)
+            }
+        }
     }
 
     pub async fn record_spend_observation(
@@ -7461,6 +8022,12 @@ pub enum StoreError {
     CanonicalIdentityConflict,
     CanonicalIdentityInvalidActor,
     CanonicalIdentityInvalidRecord,
+    FederatedSubjectNotFound,
+    FederatedSubjectUnassociated,
+    FederatedSubjectDisabled,
+    FederatedSubjectConflict,
+    InvalidFederatedSubject,
+    InvalidFederatedSubjectRecord,
     InvalidBrowserRbacActor,
     InvalidBrowserRbacAssignment,
     InvalidBrowserRbacRecord,
@@ -7527,6 +8094,21 @@ impl fmt::Display for StoreError {
             }
             Self::CanonicalIdentityInvalidRecord => {
                 write!(formatter, "canonical identity record is invalid")
+            }
+            Self::FederatedSubjectNotFound => write!(formatter, "federated subject not found"),
+            Self::FederatedSubjectUnassociated => {
+                write!(formatter, "federated subject is not associated")
+            }
+            Self::FederatedSubjectDisabled => write!(formatter, "federated subject is disabled"),
+            Self::FederatedSubjectConflict => {
+                write!(
+                    formatter,
+                    "federated subject transition conflicts with current state"
+                )
+            }
+            Self::InvalidFederatedSubject => write!(formatter, "federated subject is invalid"),
+            Self::InvalidFederatedSubjectRecord => {
+                write!(formatter, "federated subject record is invalid")
             }
             Self::InvalidBrowserRbacActor => {
                 write!(formatter, "browser RBAC actor is required")
@@ -7624,6 +8206,200 @@ impl fmt::Display for StoreError {
 }
 
 impl Error for StoreError {}
+
+async fn ensure_active_canonical_user(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    user_id: &CanonicalUserId,
+) -> Result<(), StoreError> {
+    let state = sqlx::query_scalar::<_, String>(
+        "SELECT state FROM canonical_users WHERE user_id = $1 FOR SHARE",
+    )
+    .bind(user_id.as_str())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?
+    .ok_or(StoreError::CanonicalIdentityNotFound)?;
+    if state != "active" {
+        return Err(StoreError::CanonicalIdentityInactive);
+    }
+    Ok(())
+}
+
+async fn locked_federated_subject(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    subject_id: Uuid,
+) -> Result<FederatedSubjectRecord, StoreError> {
+    let row = sqlx::query(
+        "SELECT subject_id, issuer, subject, state, canonical_user_id, \
+                actor_login, display_name, revision, \
+                to_char(first_seen_at AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                to_char(last_seen_at AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                to_char(updated_at AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
+         FROM federated_subjects WHERE subject_id = $1 FOR UPDATE",
+    )
+    .bind(subject_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?
+    .ok_or(StoreError::FederatedSubjectNotFound)?;
+    federated_subject_record(row)
+}
+
+async fn transition_federated_subject_association(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    current: &FederatedSubjectRecord,
+    canonical_user_id: &CanonicalUserId,
+    action: FederatedSubjectAuditAction,
+    actor: &str,
+) -> Result<FederatedSubjectRecord, StoreError> {
+    let next_revision = current
+        .revision
+        .checked_add(1)
+        .ok_or(StoreError::FederatedSubjectConflict)?;
+    let row = sqlx::query(
+        "UPDATE federated_subjects \
+         SET state = 'associated', canonical_user_id = $2, revision = $3, updated_at = now() \
+         WHERE subject_id = $1 AND revision = $4 \
+         RETURNING subject_id, issuer, subject, state, canonical_user_id, \
+                   actor_login, display_name, revision, \
+                   to_char(first_seen_at AT TIME ZONE 'UTC', \
+                           'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                   to_char(last_seen_at AT TIME ZONE 'UTC', \
+                           'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                   to_char(updated_at AT TIME ZONE 'UTC', \
+                           'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
+    )
+    .bind(current.subject_id)
+    .bind(canonical_user_id.as_str())
+    .bind(next_revision)
+    .bind(current.revision)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?
+    .ok_or(StoreError::FederatedSubjectConflict)?;
+    sqlx::query(
+        "INSERT INTO federated_subject_audit \
+         (event_id, subject_id, action, actor, previous_canonical_user_id, \
+          canonical_user_id, previous_revision, revision) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(current.subject_id)
+    .bind(action.as_str())
+    .bind(actor)
+    .bind(
+        current
+            .canonical_user_id
+            .as_ref()
+            .map(CanonicalUserId::as_str),
+    )
+    .bind(canonical_user_id.as_str())
+    .bind(current.revision)
+    .bind(next_revision)
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    federated_subject_record(row)
+}
+
+fn valid_federated_subject_observation(observation: &FederatedSubjectObservation<'_>) -> bool {
+    let bounded_exact = |value: &str, maximum: usize| {
+        !value.is_empty()
+            && value.len() <= maximum
+            && value.trim() == value
+            && !value.chars().any(char::is_control)
+    };
+    bounded_exact(observation.issuer, 2_048)
+        && !observation.issuer.chars().any(char::is_whitespace)
+        && bounded_exact(observation.subject, 255)
+        && !observation.subject.chars().any(char::is_whitespace)
+        && observation
+            .actor_login
+            .is_none_or(|value| bounded_exact(value, 128))
+        && observation
+            .display_name
+            .is_none_or(|value| bounded_exact(value, 256))
+}
+
+fn valid_federated_subject_actor(actor: &str) -> bool {
+    !actor.is_empty()
+        && actor.len() <= 255
+        && actor.trim() == actor
+        && !actor.chars().any(char::is_control)
+}
+
+fn valid_federated_subject_reason(reason: Option<&str>) -> bool {
+    reason.is_none_or(|value| {
+        !value.is_empty()
+            && value.len() <= 2_000
+            && value.trim() == value
+            && !value.chars().any(char::is_control)
+    })
+}
+
+fn optional_canonical_user_id(
+    value: Option<String>,
+) -> Result<Option<CanonicalUserId>, StoreError> {
+    value
+        .map(|value| {
+            CanonicalUserId::parse(value).map_err(|_| StoreError::InvalidFederatedSubjectRecord)
+        })
+        .transpose()
+}
+
+fn federated_subject_record(
+    row: sqlx::postgres::PgRow,
+) -> Result<FederatedSubjectRecord, StoreError> {
+    let state =
+        FederatedSubjectState::parse(&row.try_get::<String, _>("state").map_err(database_error)?)?;
+    let canonical_user_id =
+        optional_canonical_user_id(row.try_get("canonical_user_id").map_err(database_error)?)?;
+    if (state == FederatedSubjectState::Observed && canonical_user_id.is_some())
+        || (state == FederatedSubjectState::Associated && canonical_user_id.is_none())
+    {
+        return Err(StoreError::InvalidFederatedSubjectRecord);
+    }
+    Ok(FederatedSubjectRecord {
+        subject_id: row.try_get("subject_id").map_err(database_error)?,
+        issuer: row.try_get("issuer").map_err(database_error)?,
+        subject: row.try_get("subject").map_err(database_error)?,
+        state,
+        canonical_user_id,
+        actor_login: row.try_get("actor_login").map_err(database_error)?,
+        display_name: row.try_get("display_name").map_err(database_error)?,
+        revision: row.try_get("revision").map_err(database_error)?,
+        first_seen_at: row.try_get("first_seen_at").map_err(database_error)?,
+        last_seen_at: row.try_get("last_seen_at").map_err(database_error)?,
+        updated_at: row.try_get("updated_at").map_err(database_error)?,
+    })
+}
+
+fn federated_subject_audit_record(
+    row: sqlx::postgres::PgRow,
+) -> Result<FederatedSubjectAuditRecord, StoreError> {
+    Ok(FederatedSubjectAuditRecord {
+        event_id: row.try_get("event_id").map_err(database_error)?,
+        subject_id: row.try_get("subject_id").map_err(database_error)?,
+        action: FederatedSubjectAuditAction::parse(
+            &row.try_get::<String, _>("action").map_err(database_error)?,
+        )?,
+        actor: row.try_get("actor").map_err(database_error)?,
+        previous_canonical_user_id: optional_canonical_user_id(
+            row.try_get("previous_canonical_user_id")
+                .map_err(database_error)?,
+        )?,
+        canonical_user_id: optional_canonical_user_id(
+            row.try_get("canonical_user_id").map_err(database_error)?,
+        )?,
+        previous_revision: row.try_get("previous_revision").map_err(database_error)?,
+        revision: row.try_get("revision").map_err(database_error)?,
+        reason: row.try_get("reason").map_err(database_error)?,
+        created_at: row.try_get("created_at").map_err(database_error)?,
+    })
+}
 
 fn database_error(error: sqlx::Error) -> StoreError {
     StoreError::Database(error.to_string())

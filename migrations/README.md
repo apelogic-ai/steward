@@ -67,3 +67,10 @@ or the existing code-owned internal authority pins. The upgrade resumes unfinish
 v0.1.23 Tasks only when that authority is recoverable exactly and aborts rather
 than guessing for unfinished legacy work. Terminal version 1/2 history remains
 readable.
+
+Migration 0040 adds the federated-subject observation, association, disable,
+and append-only audit ledgers. It does not update or synthesize canonical users,
+Tasks, runs, runtimes, Envelopes, or historical identity. The new
+`steward-task-v3` writer remains disabled by default; older binaries ignore the
+additive tables during a rolling upgrade. After v3 observations are written,
+rollback requires disabling v3 first and preserving migration 0040 data.

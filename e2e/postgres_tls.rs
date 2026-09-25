@@ -5,7 +5,11 @@ use std::io;
 
 use sqlx::migrate::Migrator;
 use sqlx::postgres::PgPoolOptions;
-use steward_store::PgStore;
+use steward_store::{
+    FederatedSubjectAssociation, FederatedSubjectAuditAction, FederatedSubjectDisable,
+    FederatedSubjectObservation, FederatedSubjectState, PgStore, StoreError,
+};
+use steward_types::CanonicalUserId;
 
 fn migration_set(maximum_version: Option<i64>) -> Migrator {
     let embedded = sqlx::migrate!("../migrations");
@@ -106,7 +110,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
     )
     .execute(store.pool())
     .await?;
-    migration_set(None)
+    migration_set(Some(39))
         .run(store.pool())
         .await
         .map_err(|error| {
@@ -116,6 +120,28 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         })?;
 
     assert_v02_upgrade_result(&store).await?;
+    let historical_before_federated_identity = historical_task_identity_snapshot(&store).await?;
+    migration_set(None)
+        .run(store.pool())
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Steward federated-subject migration must complete over the required TLS session: {error}"
+            ))
+        })?;
+    assert_eq!(
+        historical_task_identity_snapshot(&store).await?,
+        historical_before_federated_identity,
+        "migration 0040 must not update, backfill, or reinterpret historical Tasks, runs, or canonical identities"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*)::bigint FROM federated_subjects")
+            .fetch_one(store.pool())
+            .await?,
+        0,
+        "migration 0040 must not synthesize federated subjects from historical identity data"
+    );
+    verify_federated_subject_lifecycle(&store).await?;
 
     let tls_active =
         sqlx::query_scalar::<_, bool>("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
@@ -218,6 +244,210 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         "new Task writers must use the User-Envelope-only orchestration contract: {new_writer_constraint}"
     );
 
+    Ok(())
+}
+
+async fn historical_task_identity_snapshot(
+    store: &PgStore,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    Ok(sqlx::query_scalar(
+        "SELECT jsonb_build_object(\
+             'tasks', (\
+                 SELECT jsonb_agg(to_jsonb(task_row) ORDER BY task_row.task_uid) \
+                 FROM task_submissions task_row\
+             ), \
+             'runs', (\
+                 SELECT jsonb_agg(to_jsonb(event_row) ORDER BY event_row.id) \
+                 FROM task_lifecycle_events event_row\
+             ), \
+             'canonicalUsers', (\
+                 SELECT jsonb_agg(to_jsonb(user_row) ORDER BY user_row.user_id) \
+                 FROM canonical_users user_row\
+             )\
+         )",
+    )
+    .fetch_one(store.pool())
+    .await?)
+}
+
+async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<dyn Error>> {
+    let observation = || FederatedSubjectObservation {
+        issuer: "https://identity.example.test",
+        subject: "github-actions:actor:16106037",
+        actor_login: Some("alice-gh"),
+        display_name: Some("Alice"),
+    };
+    let (first, second) = tokio::join!(
+        store.observe_federated_subject(observation()),
+        store.observe_federated_subject(observation()),
+    );
+    let first = first?;
+    let second = second?;
+    assert_eq!(first.subject_id, second.subject_id);
+    assert_eq!(first.state, FederatedSubjectState::Observed);
+    assert_eq!(first.revision, 1);
+    assert_eq!(
+        store
+            .federated_subject_audit(first.subject_id)
+            .await?
+            .iter()
+            .map(|event| event.action)
+            .collect::<Vec<_>>(),
+        [FederatedSubjectAuditAction::Observed],
+        "concurrent first observation must converge on one subject and one audit fact"
+    );
+    assert!(matches!(
+        store
+            .resolve_federated_subject(&first.issuer, &first.subject)
+            .await,
+        Err(StoreError::FederatedSubjectUnassociated)
+    ));
+
+    let alice =
+        CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef").map_err(io::Error::other)?;
+    let (seeded_first, seeded_second) = tokio::join!(
+        store.seed_federated_subject_association(observation(), &alice, "steward-task-v2"),
+        store.seed_federated_subject_association(observation(), &alice, "steward-task-v2"),
+    );
+    let seeded_first = seeded_first?;
+    let seeded_second = seeded_second?;
+    assert_eq!(seeded_first.subject_id, seeded_second.subject_id);
+    assert_eq!(seeded_first.state, seeded_second.state);
+    assert_eq!(
+        seeded_first.canonical_user_id,
+        seeded_second.canonical_user_id
+    );
+    assert_eq!(seeded_first.revision, seeded_second.revision);
+    assert_eq!(seeded_first.state, FederatedSubjectState::Associated);
+    assert_eq!(seeded_first.canonical_user_id.as_ref(), Some(&alice));
+    assert_eq!(seeded_first.revision, 2);
+    assert_eq!(
+        store
+            .federated_subject_audit(first.subject_id)
+            .await?
+            .iter()
+            .map(|event| event.action)
+            .collect::<Vec<_>>(),
+        [
+            FederatedSubjectAuditAction::Observed,
+            FederatedSubjectAuditAction::V2Seeded,
+        ],
+        "concurrent v2 seeding must create exactly one association fact"
+    );
+    let resolved = store
+        .resolve_federated_subject(&first.issuer, &first.subject)
+        .await?;
+    assert_eq!(resolved.user_id, alice);
+    assert_eq!(resolved.display_email.as_str(), "alice@example.com");
+
+    let bob =
+        CanonicalUserId::parse("usr_abcdef0123456789abcdef0123456789").map_err(io::Error::other)?;
+    sqlx::query(
+        "INSERT INTO canonical_users (user_id, organization_id, display_email) \
+         VALUES ($1, 'org_example', 'bob@example.org')",
+    )
+    .bind(bob.as_str())
+    .execute(store.pool())
+    .await?;
+    let replaced = store
+        .replace_federated_subject_association(FederatedSubjectAssociation {
+            subject_id: first.subject_id,
+            expected_revision: 2,
+            canonical_user_id: &bob,
+            actor: "usr_0123456789abcdef0123456789abcdef",
+        })
+        .await?;
+    assert_eq!(replaced.canonical_user_id.as_ref(), Some(&bob));
+    assert_eq!(replaced.revision, 3);
+    sqlx::query(
+        "UPDATE canonical_users SET display_email = 'bob.updated@example.org' WHERE user_id = $1",
+    )
+    .bind(bob.as_str())
+    .execute(store.pool())
+    .await?;
+    assert_eq!(
+        store
+            .resolve_federated_subject(&first.issuer, &first.subject)
+            .await?
+            .display_email
+            .as_str(),
+        "bob.updated@example.org",
+        "federated resolution must use the canonical store's current display identity"
+    );
+    assert!(matches!(
+        store
+            .replace_federated_subject_association(FederatedSubjectAssociation {
+                subject_id: first.subject_id,
+                expected_revision: 2,
+                canonical_user_id: &alice,
+                actor: "usr_0123456789abcdef0123456789abcdef",
+            })
+            .await,
+        Err(StoreError::FederatedSubjectConflict)
+    ));
+    let disabled = store
+        .disable_federated_subject(FederatedSubjectDisable {
+            subject_id: first.subject_id,
+            expected_revision: 3,
+            actor: "usr_0123456789abcdef0123456789abcdef",
+            reason: Some("access revoked"),
+        })
+        .await?;
+    assert_eq!(disabled.state, FederatedSubjectState::Disabled);
+    assert_eq!(disabled.revision, 4);
+    assert!(matches!(
+        store
+            .resolve_federated_subject(&first.issuer, &first.subject)
+            .await,
+        Err(StoreError::FederatedSubjectDisabled)
+    ));
+    assert!(matches!(
+        store
+            .seed_federated_subject_association(observation(), &bob, "steward-task-v2")
+            .await,
+        Err(StoreError::FederatedSubjectDisabled)
+    ));
+
+    let similarity = store
+        .observe_federated_subject(FederatedSubjectObservation {
+            issuer: "https://identity.example.test",
+            subject: "github-actions:actor:27182818",
+            actor_login: Some("alice"),
+            display_name: Some("alice@example.com"),
+        })
+        .await?;
+    assert_eq!(similarity.state, FederatedSubjectState::Observed);
+    assert!(similarity.canonical_user_id.is_none());
+    assert!(matches!(
+        store
+            .resolve_federated_subject(&similarity.issuer, &similarity.subject)
+            .await,
+        Err(StoreError::FederatedSubjectUnassociated)
+    ));
+    let exact_lookup = store
+        .federated_subject_by_external_identity(&similarity.issuer, &similarity.subject)
+        .await?
+        .ok_or_else(|| io::Error::other("exact federated-subject lookup returned no record"))?;
+    assert_eq!(exact_lookup.subject_id, similarity.subject_id);
+    assert!(
+        store
+            .federated_subject_by_external_identity(
+                &similarity.issuer,
+                "github-actions:actor:31415926"
+            )
+            .await?
+            .is_none(),
+        "exact lookup must not infer a subject from display metadata or a similar key"
+    );
+
+    assert!(
+        sqlx::query("UPDATE federated_subject_audit SET actor = 'tampered' WHERE subject_id = $1",)
+            .bind(first.subject_id)
+            .execute(store.pool())
+            .await
+            .is_err(),
+        "federated-subject audit must reject mutation"
+    );
     Ok(())
 }
 

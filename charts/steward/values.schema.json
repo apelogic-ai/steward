@@ -300,11 +300,18 @@
     "taskIdentity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "issuer", "audience", "publicJwksConfigMap"],
+      "required": ["enabled", "issuer", "audience", "resource", "federatedSubjects", "publicJwksConfigMap"],
       "properties": {
         "enabled": {"type": "boolean"},
         "issuer": {"type": "string"},
         "audience": {"type": "string"},
+        "resource": {"type": "string"},
+        "federatedSubjects": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": {"enabled": {"type": "boolean"}}
+        },
         "publicJwksConfigMap": {
           "type": "object",
           "additionalProperties": false,
@@ -318,6 +325,8 @@
             "enabled": {"const": false},
             "issuer": {"const": ""},
             "audience": {"const": ""},
+            "resource": {"const": ""},
+            "federatedSubjects": {"properties": {"enabled": {"const": false}}},
             "publicJwksConfigMap": {
               "properties": {"name": {"const": ""}, "key": {"const": ""}}
             }
@@ -328,10 +337,24 @@
             "enabled": {"const": true},
             "issuer": {"type": "string", "pattern": "^https://[^/?#]+(?:/[^?#]*)?$"},
             "audience": {"$ref": "#/definitions/nonempty"},
+            "resource": {"type": "string", "pattern": "^$|^https://[^/?#]+$"},
             "publicJwksConfigMap": {
               "properties": {"name": {"$ref": "#/definitions/nonempty"}, "key": {"$ref": "#/definitions/nonempty"}}
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "federatedSubjects": {
+                    "properties": {"enabled": {"const": true}},
+                    "required": ["enabled"]
+                  }
+                }
+              },
+              "then": {"properties": {"resource": {"type": "string", "pattern": "^https://[^/?#]+$"}}}
+            }
+          ]
         }
       ]
     },

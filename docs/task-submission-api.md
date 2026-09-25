@@ -65,6 +65,83 @@ archive accepted from the sandbox is also **64 MiB (67,108,864 bytes)**. An over
 
 ## Production identity boundary
 
+Steward has two deployment-selected Task authentication modes; a request cannot
+select between them.
+
+When `taskIdentity.enabled=true`, Steward verifies short-lived ES256 JWTs from
+the configured Identity JWKS directly. The unauthenticated
+`GET /.well-known/oauth-protected-resource` response identifies the exact
+Steward resource origin, the trusted Identity issuer in
+`authorization_servers`, bearer-header transport, and the accepted contracts
+in `steward_task_token_contracts`. Successful metadata is cacheable for 300
+seconds. An unconfigured document returns `503`, `Cache-Control: no-store`,
+`Retry-After: 30`, and `task_auth.discovery_unavailable`.
+
+`steward-task-v2` remains accepted and is the only advertised contract by
+default. It retains the existing verified email and exact service, acting/owner,
+and canonical-user group semantics below. When federated subjects are enabled,
+Steward makes a best-effort attempt to seed an association for the same verified
+`(iss, sub)` and already-resolved canonical user. A conflicting or disabled
+federated-subject record, or a seeding-store failure, does not change v2
+authentication or admission; it only prevents that transition convenience.
+
+`steward-task-v3` is accepted only when
+`taskIdentity.federatedSubjects.enabled=true`. It keeps the exact issuer,
+ES256 signature, `kid`, single exact audience, `exp`, `nbf`, maximum token age,
+bounded `jti`, and signed source-provenance checks. Its human key is the exact
+verified pair:
+
+```text
+(iss, github-actions:actor:<positive numeric actor ID>)
+```
+
+The first valid submission records that subject and bounded signed display
+metadata atomically, but returns `403 task_identity_unassociated` and creates no
+Task. Login, display name, and email similarity never associate a subject. An
+administrator must associate the observation with an existing active canonical
+user, or a complete trusted v2 compatibility identity may seed that exact
+association. Disabled subjects return `403 task_identity_disabled`.
+
+For v3, Steward reads the current display email from its canonical-user store
+and server-authors service `steward-run`, acting user, owner, and canonical user
+ID. Caller-supplied canonical identity is invalid. Association is authentication
+state, not authority: normal direct-package source binding and unique active
+User Envelope selection still run before reservation, and the admitted Envelope
+snapshot remains the Task's immutable authority evidence.
+
+Administrator operations use the existing browser administrator session and
+CSRF boundary:
+
+```text
+GET  /admin/api/v1/federated-subjects
+GET  /admin/api/v1/federated-subjects/{subject_id}
+GET  /admin/api/v1/federated-subjects/{subject_id}/audit
+POST /admin/api/v1/federated-subjects/{subject_id}/associate
+POST /admin/api/v1/federated-subjects/{subject_id}/replace
+POST /admin/api/v1/federated-subjects/{subject_id}/disable
+```
+
+The collection endpoint returns the 200 most recently seen subjects. An
+administrator can retrieve any older exact identity with
+`?issuer=<exact-issuer>&subject=<exact-subject>`; both parameters are required
+together and matching remains exact.
+
+Association and replacement bodies contain `expectedRevision` and
+`canonicalUserId`; disable contains `expectedRevision` and optional `reason`.
+Stale or conflicting revisions return `409`. These operations never create or
+approve a User Envelope.
+
+```json
+{"expectedRevision":1,"canonicalUserId":"usr_0123456789abcdef0123456789abcdef"}
+```
+
+```json
+{"expectedRevision":2,"reason":"credential ownership changed"}
+```
+
+When `taskIdentity.enabled=false`, the existing Kubernetes TokenReview mode
+below remains active.
+
 The GitHub token and the Steward token are different credentials. A GitHub Actions job requests
 its GitHub OIDC token with the audience configured by the production exchange service. That
 service validates GitHub's issuer and repository/workflow claims, resolves the actor to a
@@ -108,7 +185,7 @@ present. Its acting ID equals the owner ID for delegated person work and is abse
 work. This value is server-authored and immutable; legacy runtimes without it are not silently
 adopted.
 
-There is **no component in this repository** that validates GitHub's OIDC issuer,
+For Kubernetes TokenReview mode, there is **no component in this repository** that validates GitHub's OIDC issuer,
 authorizes repository/workflow claims, resolves the GitHub actor to the reviewed canonical user
 and current corporate display email, and
 issues the exchanged token and TokenReview attributes above. The E2E `TestTaskIdentities`

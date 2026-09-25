@@ -119,6 +119,11 @@ export type ApprovalRequest = {
     rationale: string;
 };
 
+export type AssociateFederatedSubjectBody = {
+    canonicalUserId: CanonicalUserId;
+    expectedRevision: number;
+};
+
 export type AuthorityRequirements = {
     budget: BudgetRequirement;
     llms: Array<ModelRequirement>;
@@ -223,6 +228,48 @@ export type BrowserEnvelopeTemplateResponse = {
     apiVersion: string;
     envelope: BrowserEnvelope;
     memberRole: string;
+};
+
+export type BrowserFederatedSubjectAuditResponse = {
+    apiVersion: string;
+    events: Array<BrowserFederatedSubjectAuditView>;
+};
+
+export type BrowserFederatedSubjectAuditView = {
+    action: string;
+    actor: string;
+    canonicalUserId?: null | CanonicalUserId;
+    createdAt: string;
+    eventId: string;
+    previousCanonicalUserId?: null | CanonicalUserId;
+    previousRevision: number;
+    reason?: string | null;
+    revision: number;
+    subjectId: string;
+};
+
+export type BrowserFederatedSubjectListResponse = {
+    apiVersion: string;
+    federatedSubjects: Array<BrowserFederatedSubjectView>;
+};
+
+export type BrowserFederatedSubjectResponse = {
+    apiVersion: string;
+    federatedSubject: BrowserFederatedSubjectView;
+};
+
+export type BrowserFederatedSubjectView = {
+    actorLogin?: string | null;
+    canonicalUserId?: null | CanonicalUserId;
+    displayName?: string | null;
+    firstSeenAt: string;
+    issuer: string;
+    lastSeenAt: string;
+    revision: number;
+    state: string;
+    subject: string;
+    subjectId: string;
+    updatedAt: string;
 };
 
 export type BrowserMutationRequest = {
@@ -438,6 +485,11 @@ export type DirectTaskSubmission = {
     invocationPath: RelativePath;
 };
 
+export type DisableFederatedSubjectBody = {
+    expectedRevision: number;
+    reason?: string | null;
+};
+
 export type DisconnectConnectionRequest = {
     confirm: boolean;
 };
@@ -479,6 +531,13 @@ export type ExecutionBindingAdvertisement = {
 };
 
 export type ExecutionLogMode = 'off' | 'full';
+
+export type FederatedTaskIdentityErrorResponse = {
+    error: string;
+    issuer: string;
+    message: string;
+    subject: string;
+};
 
 export type GeneratedGithubActionsWorkflow = {
     contentType: string;
@@ -1385,6 +1444,250 @@ export type AuthorAdminEnvelopeTemplateResponses = {
 
 export type AuthorAdminEnvelopeTemplateResponse = AuthorAdminEnvelopeTemplateResponses[keyof AuthorAdminEnvelopeTemplateResponses];
 
+export type ListAdminFederatedSubjectsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Exact trusted token issuer. Must be supplied together with `subject`.
+         */
+        issuer?: string;
+        /**
+         * Exact authenticated subject. Must be supplied together with `issuer`.
+         */
+        subject?: string;
+    };
+    url: '/admin/api/v1/federated-subjects';
+};
+
+export type ListAdminFederatedSubjectsErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Exact lookup parameters are incomplete or invalid
+     */
+    422: unknown;
+    /**
+     * Federated subjects are unavailable
+     */
+    503: unknown;
+};
+
+export type ListAdminFederatedSubjectsResponses = {
+    200: BrowserFederatedSubjectListResponse;
+};
+
+export type ListAdminFederatedSubjectsResponse = ListAdminFederatedSubjectsResponses[keyof ListAdminFederatedSubjectsResponses];
+
+export type GetAdminFederatedSubjectData = {
+    body?: never;
+    path: {
+        subject_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/federated-subjects/{subject_id}';
+};
+
+export type GetAdminFederatedSubjectErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Federated subject was not found
+     */
+    404: unknown;
+    /**
+     * Federated subject is unavailable
+     */
+    503: unknown;
+};
+
+export type GetAdminFederatedSubjectResponses = {
+    200: BrowserFederatedSubjectResponse;
+};
+
+export type GetAdminFederatedSubjectResponse = GetAdminFederatedSubjectResponses[keyof GetAdminFederatedSubjectResponses];
+
+export type AssociateAdminFederatedSubjectData = {
+    body: AssociateFederatedSubjectBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        subject_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/federated-subjects/{subject_id}/associate';
+};
+
+export type AssociateAdminFederatedSubjectErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Federated subject or canonical user was not found
+     */
+    404: unknown;
+    /**
+     * Subject state or revision conflicts
+     */
+    409: unknown;
+    /**
+     * Association request is invalid
+     */
+    422: unknown;
+    /**
+     * Federated subject is unavailable
+     */
+    503: unknown;
+};
+
+export type AssociateAdminFederatedSubjectResponses = {
+    200: BrowserFederatedSubjectResponse;
+};
+
+export type AssociateAdminFederatedSubjectResponse = AssociateAdminFederatedSubjectResponses[keyof AssociateAdminFederatedSubjectResponses];
+
+export type GetAdminFederatedSubjectAuditData = {
+    body?: never;
+    path: {
+        subject_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/federated-subjects/{subject_id}/audit';
+};
+
+export type GetAdminFederatedSubjectAuditErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Federated subject was not found
+     */
+    404: unknown;
+    /**
+     * Federated-subject audit is unavailable
+     */
+    503: unknown;
+};
+
+export type GetAdminFederatedSubjectAuditResponses = {
+    200: BrowserFederatedSubjectAuditResponse;
+};
+
+export type GetAdminFederatedSubjectAuditResponse = GetAdminFederatedSubjectAuditResponses[keyof GetAdminFederatedSubjectAuditResponses];
+
+export type DisableAdminFederatedSubjectData = {
+    body: DisableFederatedSubjectBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        subject_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/federated-subjects/{subject_id}/disable';
+};
+
+export type DisableAdminFederatedSubjectErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Federated subject was not found
+     */
+    404: unknown;
+    /**
+     * Subject revision conflicts
+     */
+    409: unknown;
+    /**
+     * Disable request is invalid
+     */
+    422: unknown;
+    /**
+     * Federated subject is unavailable
+     */
+    503: unknown;
+};
+
+export type DisableAdminFederatedSubjectResponses = {
+    200: BrowserFederatedSubjectResponse;
+};
+
+export type DisableAdminFederatedSubjectResponse = DisableAdminFederatedSubjectResponses[keyof DisableAdminFederatedSubjectResponses];
+
+export type ReplaceAdminFederatedSubjectAssociationData = {
+    body: AssociateFederatedSubjectBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        subject_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/federated-subjects/{subject_id}/replace';
+};
+
+export type ReplaceAdminFederatedSubjectAssociationErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Federated subject or canonical user was not found
+     */
+    404: unknown;
+    /**
+     * Subject state or revision conflicts
+     */
+    409: unknown;
+    /**
+     * Replacement request is invalid
+     */
+    422: unknown;
+    /**
+     * Federated subject is unavailable
+     */
+    503: unknown;
+};
+
+export type ReplaceAdminFederatedSubjectAssociationResponses = {
+    200: BrowserFederatedSubjectResponse;
+};
+
+export type ReplaceAdminFederatedSubjectAssociationResponse = ReplaceAdminFederatedSubjectAssociationResponses[keyof ReplaceAdminFederatedSubjectAssociationResponses];
+
 export type AgentRunsContractData = {
     body?: never;
     path?: never;
@@ -2113,6 +2416,10 @@ export type TaskSubmissionContractErrors = {
      * Identity assertion is invalid
      */
     401: TaskErrorResponse;
+    /**
+     * Federated subject is unassociated or disabled
+     */
+    403: FederatedTaskIdentityErrorResponse;
     /**
      * Selected workflow does not exist
      */
