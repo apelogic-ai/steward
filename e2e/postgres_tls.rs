@@ -303,8 +303,8 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
         Err(StoreError::FederatedSubjectUnassociated)
     ));
 
-    let alice = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
-        .map_err(io::Error::other)?;
+    let alice =
+        CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef").map_err(io::Error::other)?;
     let (seeded_first, seeded_second) = tokio::join!(
         store.seed_federated_subject_association(observation(), &alice, "steward-task-v2"),
         store.seed_federated_subject_association(observation(), &alice, "steward-task-v2"),
@@ -340,8 +340,8 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
     assert_eq!(resolved.user_id, alice);
     assert_eq!(resolved.display_email.as_str(), "alice@example.com");
 
-    let bob = CanonicalUserId::parse("usr_abcdef0123456789abcdef0123456789")
-        .map_err(io::Error::other)?;
+    let bob =
+        CanonicalUserId::parse("usr_abcdef0123456789abcdef0123456789").map_err(io::Error::other)?;
     sqlx::query(
         "INSERT INTO canonical_users (user_id, organization_id, display_email) \
          VALUES ($1, 'org_example', 'bob@example.org')",
@@ -359,10 +359,12 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
         .await?;
     assert_eq!(replaced.canonical_user_id.as_ref(), Some(&bob));
     assert_eq!(replaced.revision, 3);
-    sqlx::query("UPDATE canonical_users SET display_email = 'bob.updated@example.org' WHERE user_id = $1")
-        .bind(bob.as_str())
-        .execute(store.pool())
-        .await?;
+    sqlx::query(
+        "UPDATE canonical_users SET display_email = 'bob.updated@example.org' WHERE user_id = $1",
+    )
+    .bind(bob.as_str())
+    .execute(store.pool())
+    .await?;
     assert_eq!(
         store
             .resolve_federated_subject(&first.issuer, &first.subject)
@@ -424,13 +426,11 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
     ));
 
     assert!(
-        sqlx::query(
-            "UPDATE federated_subject_audit SET actor = 'tampered' WHERE subject_id = $1",
-        )
-        .bind(first.subject_id)
-        .execute(store.pool())
-        .await
-        .is_err(),
+        sqlx::query("UPDATE federated_subject_audit SET actor = 'tampered' WHERE subject_id = $1",)
+            .bind(first.subject_id)
+            .execute(store.pool())
+            .await
+            .is_err(),
         "federated-subject audit must reject mutation"
     );
     Ok(())
