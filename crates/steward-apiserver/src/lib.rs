@@ -2021,11 +2021,15 @@ impl IntoResponse for ApiError {
             | Self::Store(
                 StoreError::TaskNotFound
                 | StoreError::CanonicalIdentityNotFound
+                | StoreError::FederatedSubjectNotFound
                 | StoreError::EnvelopeRequestNotFound
                 | StoreError::WorkflowNotFound
                 | StoreError::ConnectionOperationNotFound,
             ) => StatusCode::NOT_FOUND,
             Self::Store(StoreError::CanonicalIdentityInactive) => StatusCode::FORBIDDEN,
+            Self::Store(
+                StoreError::FederatedSubjectUnassociated | StoreError::FederatedSubjectDisabled,
+            ) => StatusCode::FORBIDDEN,
             Self::TaskNotReady | Self::TaskRuntimeContractUnavailable(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -2054,6 +2058,7 @@ impl IntoResponse for ApiError {
                 | StoreError::CanonicalIdentityStale
                 | StoreError::CanonicalIdentityAmbiguousEmail
                 | StoreError::CanonicalIdentityConflict
+                | StoreError::FederatedSubjectConflict
                 | StoreError::ConnectionOperationConflict
                 | StoreError::ConnectionOAuthFlowPending,
             ) => StatusCode::CONFLICT,
@@ -2065,6 +2070,7 @@ impl IntoResponse for ApiError {
                 | StoreError::InvalidBrowserRbacActor
                 | StoreError::InvalidBrowserRbacAssignment
                 | StoreError::InvalidBrowserRbacRecord
+                | StoreError::InvalidFederatedSubject
                 | StoreError::InvalidTaskIdentityBinding
                 | StoreError::InvalidEnvelopeRequest
                 | StoreError::InvalidWorkflow
@@ -2075,7 +2081,11 @@ impl IntoResponse for ApiError {
             }
             Self::RuntimeCreate(RuntimeCreateError::Unavailable(_))
             | Self::Runtime(_)
-            | Self::Store(StoreError::Database(_) | StoreError::DecisionFilingClaimLost)
+            | Self::Store(
+                StoreError::Database(_)
+                | StoreError::DecisionFilingClaimLost
+                | StoreError::InvalidFederatedSubjectRecord,
+            )
             | Self::DecisionChannel(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
         (
