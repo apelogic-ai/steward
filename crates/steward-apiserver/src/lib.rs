@@ -10,6 +10,7 @@ mod github_actions;
 pub mod google_oidc;
 pub mod governed_connections;
 pub mod stable_runtime_bridge;
+pub mod task_auth;
 mod tasks;
 pub mod user_envelopes;
 pub mod workflows;

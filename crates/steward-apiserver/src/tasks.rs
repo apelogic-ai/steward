@@ -49,6 +49,10 @@ use uuid::Uuid;
 
 use crate::WorkflowReference;
 use crate::execution_bindings::ExecutionBindingCatalog;
+use crate::task_auth::{
+    FEDERATED_TASK_TOKEN_CONTRACT, LEGACY_TASK_TOKEN_CONTRACT,
+    valid_authorization_server_url,
+};
 use crate::{
     AdmissionLedger, ApiError, BoxFuture, KubernetesTokenReviewAudience,
     authenticated_token_review_user, spec_digest, token_review_request,
@@ -59,8 +63,8 @@ const ACTING_USER_GROUP_PREFIX: &str = "agents.apelogic.ai/acting-user:";
 const TASK_OWNER_GROUP_PREFIX: &str = "agents.apelogic.ai/task-owner:";
 const CANONICAL_USER_GROUP_PREFIX: &str = "agents.apelogic.ai/canonical-user:";
 const VERSIONED_WORKFLOW_NAMESPACE: &str = "steward-workflows";
-const IDENTITY_TASK_CONTRACT: &str = "steward-task-v2";
-const FEDERATED_TASK_CONTRACT: &str = "steward-task-v3";
+const IDENTITY_TASK_CONTRACT: &str = LEGACY_TASK_TOKEN_CONTRACT;
+const FEDERATED_TASK_CONTRACT: &str = FEDERATED_TASK_TOKEN_CONTRACT;
 const MAX_IDENTITY_TASK_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_IDENTITY_JWKS_BYTES: usize = 128 * 1024;
 const MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS: u64 = 300;
@@ -891,23 +895,7 @@ fn task_identity_from_identity_claims(
 }
 
 fn valid_identity_issuer(value: &str) -> bool {
-    if value.is_empty()
-        || value.len() > 2_048
-        || value.trim() != value
-        || value.ends_with('/')
-        || value.chars().any(char::is_whitespace)
-    {
-        return false;
-    }
-    reqwest::Url::parse(value).is_ok_and(|url| {
-        url.scheme() == "https"
-            && url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && url.as_str().trim_end_matches('/') == value
-    })
+    valid_authorization_server_url(value)
 }
 
 fn valid_github_actions_subject(value: &str) -> bool {

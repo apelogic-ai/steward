@@ -20,6 +20,9 @@ use steward_apiserver::{
     browser_auth, connections, google_oidc, governed_connections, router, stable_runtime_bridge,
     task_router, user_envelopes, workflows,
 };
+use steward_apiserver::task_auth::{
+    TaskAuthDiscoveryConfig, task_auth_discovery_router,
+};
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
     TaskOrchestrationMode,
@@ -81,8 +84,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         admin_group.clone(),
         token_review_audience.clone(),
     );
-    let task_identities =
+    let configured_task_identity =
         configured_task_identity_resolver(client.clone(), token_review_audience, store.clone())?;
+    let task_identities = configured_task_identity.resolver;
     let authenticator = IdentityOrKubernetesTokenAuthenticator::new(
         kubernetes_authenticator,
         task_identities.clone(),
@@ -146,6 +150,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         authenticator,
         decisions.clone(),
     )
+    .merge(task_auth_discovery_router(
+        configured_task_identity.discovery,
+    ))
     .merge(task_router(
         store.clone(),
         task_identities,
@@ -425,22 +432,46 @@ fn read_execution_binding_catalog(path: &str) -> Result<String, io::Error> {
     })
 }
 
+struct ConfiguredTaskIdentity {
+    resolver: ConfiguredTaskIdentityResolver,
+    discovery: Option<TaskAuthDiscoveryConfig>,
+}
+
 fn configured_task_identity_resolver(
     client: kube::Client,
     kubernetes_audience: KubernetesTokenReviewAudience,
     store: PgStore,
-) -> Result<ConfiguredTaskIdentityResolver, io::Error> {
+) -> Result<ConfiguredTaskIdentity, io::Error> {
     let values = [
         env::var("STEWARD_IDENTITY_TASK_ISSUER").ok(),
         env::var("STEWARD_IDENTITY_TASK_AUDIENCE").ok(),
         env::var("STEWARD_IDENTITY_TASK_JWKS_FILE").ok(),
     ];
+    let resource = optional_unicode_environment("STEWARD_TASK_AUTH_RESOURCE")?;
+    let federated_subjects_enabled = match env::var("STEWARD_FEDERATED_TASK_IDENTITY_ENABLED") {
+        Ok(value) if value == "true" => true,
+        Ok(value) if value == "false" => false,
+        Err(env::VarError::NotPresent) => false,
+        _ => {
+            return Err(io::Error::other(
+                "STEWARD_FEDERATED_TASK_IDENTITY_ENABLED must be true or false",
+            ));
+        }
+    };
     if values.iter().all(Option::is_none) {
-        return Ok(ConfiguredTaskIdentityResolver::kubernetes(
-            client,
-            kubernetes_audience,
-            store,
-        ));
+        if resource.is_some() || federated_subjects_enabled {
+            return Err(io::Error::other(
+                "task auth discovery and federated identity require Identity task authentication",
+            ));
+        }
+        return Ok(ConfiguredTaskIdentity {
+            resolver: ConfiguredTaskIdentityResolver::kubernetes(
+                client,
+                kubernetes_audience,
+                store,
+            ),
+            discovery: None,
+        });
     }
     let [issuer, audience, jwks_file] = values;
     let required = |value: Option<String>| {
@@ -450,13 +481,34 @@ fn configured_task_identity_resolver(
                 io::Error::other("Identity task authentication configuration must be complete")
             })
     };
-    ConfiguredTaskIdentityResolver::identity_from_jwks_file(
-        required(issuer)?,
+    let issuer = required(issuer)?;
+    let discovery = match resource {
+        Some(resource) => Some(
+            TaskAuthDiscoveryConfig::new(
+                resource,
+                issuer.clone(),
+                federated_subjects_enabled,
+            )
+            .map_err(io::Error::other)?,
+        ),
+        None if federated_subjects_enabled => {
+            return Err(io::Error::other(
+                "federated task identity requires STEWARD_TASK_AUTH_RESOURCE",
+            ));
+        }
+        None => None,
+    };
+    let resolver = ConfiguredTaskIdentityResolver::identity_from_jwks_file(
+        issuer,
         required(audience)?,
         std::path::Path::new(&required(jwks_file)?),
         store,
     )
-    .map_err(|_| io::Error::other("Identity task authentication configuration is invalid"))
+    .map_err(|_| io::Error::other("Identity task authentication configuration is invalid"))?;
+    Ok(ConfiguredTaskIdentity {
+        resolver,
+        discovery,
+    })
 }
 
 fn install_rustls_crypto_provider() -> Result<(), io::Error> {
