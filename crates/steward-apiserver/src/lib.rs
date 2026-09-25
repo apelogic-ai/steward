@@ -1339,6 +1339,16 @@ pub trait AgentRunLedger: Clone + Send + Sync + 'static {
         Box::pin(async { Ok(None) })
     }
 
+    fn github_rerun_task<'a>(
+        &'a self,
+        _owner_user_id: &'a str,
+        _repository: &'a str,
+        _run_id: &'a str,
+        _after_attempt: u32,
+    ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn reserve_rerun<'a>(
         &'a self,
         _request: TaskReservationRequest<'a>,
@@ -1414,6 +1424,18 @@ impl AgentRunLedger for PgStore {
         Box::pin(async move {
             PgStore::task_by_idempotency(self, submitter_service, owner_user_id, idempotency_key)
                 .await
+        })
+    }
+
+    fn github_rerun_task<'a>(
+        &'a self,
+        owner_user_id: &'a str,
+        repository: &'a str,
+        run_id: &'a str,
+        after_attempt: u32,
+    ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
+        Box::pin(async move {
+            PgStore::github_rerun_task(self, owner_user_id, repository, run_id, after_attempt).await
         })
     }
 
@@ -4420,15 +4442,15 @@ mod tests {
             ("/paths/~1admin~1api~1v1~1envelope-templates/get", "200"),
             ("/paths/~1admin~1api~1v1~1capabilities/get", "200"),
             (
-                "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/get",
+                "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/get",
                 "200",
             ),
             (
-                "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/post",
+                "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/post",
                 "201",
             ),
             (
-                "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/put",
+                "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/put",
                 "201",
             ),
             ("/paths/~1admin~1api~1v1~1approvals/get", "200"),
@@ -4528,8 +4550,8 @@ mod tests {
             "/paths/~1app~1api~1v1~1preferences/put",
             "/paths/~1admin~1api~1v1~1connections~1github~1start/post",
             "/paths/~1admin~1api~1v1~1connections~1github~1disconnect/post",
-            "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/post",
-            "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/put",
+            "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/post",
+            "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/put",
             "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1approve/post",
             "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1reject/post",
             "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1file/post",
@@ -4610,6 +4632,33 @@ mod tests {
         let admin_decisions = FakeDecisionChannel::default();
         let (admin_auth, admin_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let legacy_approval_app = browser_admin::protected_router(
+            runtime_repository.clone(),
+            ledger(),
+            FakeDecisionChannel::default(),
+            browser_capability_catalog(),
+            admin_auth.clone(),
+        );
+        let legacy_approval = legacy_approval_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build legacy empty envelope approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute legacy empty envelope approval: {error}"))?;
+        assert_eq!(
+            legacy_approval.status(),
+            StatusCode::OK,
+            "a pre-redesign client can still approve an unfiled request with an empty object"
+        );
         let admin_app = browser_admin::protected_router(
             runtime_repository,
             admin_ledger.clone(),
@@ -4654,6 +4703,11 @@ mod tests {
         assert_eq!(
             templates.pointer("/templates/0/memberRoles/0"),
             Some(&serde_json::json!("engineer"))
+        );
+        assert_eq!(
+            templates.pointer("/templates/0/memberRole"),
+            Some(&serde_json::json!("engineer")),
+            "the legacy singular role remains available during the catalog migration"
         );
         assert_eq!(
             templates.pointer("/templates/0/envelope/revision"),
@@ -4967,7 +5021,7 @@ mod tests {
                     .header("sec-fetch-site", "same-origin")
                     .header("x-steward-csrf", &csrf)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"rationale":"retry is ignored"}"#))
+                    .body(Body::from("{}"))
                     .map_err(|error| format!("build repeated envelope approval: {error}"))?,
             )
             .await

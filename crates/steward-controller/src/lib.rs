@@ -1031,6 +1031,10 @@ fn internal_task_authority_snapshot(
             steward_admission::internal_authorities::steward_connections_v2::envelope(),
             steward_admission::internal_authorities::steward_connections_v2::AUTHORITY_DIGEST,
         ),
+        Some(3) => (
+            steward_admission::internal_authorities::steward_connections_v3::envelope(),
+            steward_admission::internal_authorities::steward_connections_v3::AUTHORITY_DIGEST,
+        ),
         _ => {
             return Err(TaskControllerError::InvalidState(
                 "unknown internal authority version".to_owned(),
@@ -2332,6 +2336,11 @@ fn connection_authority_matches(operation: &ConnectionOperationRecord) -> bool {
                 steward_admission::internal_authorities::steward_connections_v2::AUTHORITY_DIGEST,
                 "0.4.9"
             )
+            | (
+                3,
+                steward_admission::internal_authorities::steward_connections_v3::AUTHORITY_DIGEST,
+                "0.4.9"
+            )
     )
 }
 
@@ -2377,11 +2386,11 @@ fn connection_operation_runtime_matches(
         .namespace
         .as_deref()
         .ok_or(ReconcileError::MissingNamespace)?;
-    let expected_action = operation.operation_kind.as_str();
     let expected_bridge_operation = match operation.operation_kind {
         ConnectionOperationKind::Status => "github.status",
         ConnectionOperationKind::Start => "github.start",
         ConnectionOperationKind::Disconnect => "github.disconnect",
+        ConnectionOperationKind::Rerun => "github.rerun",
     };
     let expected_command = [
         steward_connections_v1::BRIDGE_BINARY,
@@ -2390,7 +2399,10 @@ fn connection_operation_runtime_matches(
         "--input",
         steward_connections_v1::INPUT_FILE,
     ];
-    let expected_grant = steward_connections_v1::provider_control_grant(expected_action)
+    let expected_grant =
+        steward_admission::internal_authorities::steward_connections_v3::operation_grant(
+            operation.operation_kind.as_str(),
+        )
         .ok_or_else(|| {
             ReconcileError::Authority(
                 "connection operation has an unsupported provider-control action".to_owned(),
@@ -2412,6 +2424,7 @@ fn connection_operation_runtime_matches(
     let authority = match operation.authority_version {
         1 => steward_connections_v1::envelope(),
         2 => steward_admission::internal_authorities::steward_connections_v2::envelope(),
+        3 => steward_admission::internal_authorities::steward_connections_v3::envelope(),
         _ => return Ok(false),
     };
     let fixed_limits_match = runtime.spec.budget == authority.spec.budget

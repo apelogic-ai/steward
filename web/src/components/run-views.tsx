@@ -43,6 +43,36 @@ function isTerminalPhase(phase: string): boolean {
   return phase === "failed" || phase === "succeeded" || phase === "cancelled";
 }
 
+type RerunAttempt = {
+  data?: { retryAfterMs?: number; taskUid?: string };
+  response?: { ok: boolean; status: number };
+};
+
+type RerunOutcome = { taskUid: string } | { failure: MutationFailureState };
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+export async function pollRerun(
+  attempt: () => Promise<RerunAttempt>,
+  pause: (milliseconds: number) => Promise<void> = wait,
+  maxAttempts = 60,
+): Promise<RerunOutcome> {
+  for (let index = 0; index < maxAttempts; index += 1) {
+    const result = await attempt();
+    if (result.response?.ok && result.data?.taskUid) return { taskUid: result.data.taskUid };
+    if (result.response?.status !== 202) {
+      return { failure: classifyMutationFailure(result.response?.status) };
+    }
+    if (index + 1 < maxAttempts) {
+      const retryAfterMs = Math.min(Math.max(result.data?.retryAfterMs ?? 1_000, 250), 5_000);
+      await pause(retryAfterMs);
+    }
+  }
+  return { failure: "unavailable" };
+}
+
 function TerminalPhaseLogs({ admin, taskUid }: Readonly<{ admin: boolean; taskUid: string }>) {
   const runPath = `${admin ? "/admin/runs" : "/runs"}/${encodeURIComponent(taskUid)}`;
   return (
@@ -177,9 +207,10 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
           {!admin ? <div className="flex flex-wrap gap-3 border-t pt-5"><button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={rerunState === "working"} onClick={async () => {
             if (session.status !== "authenticated") return;
             setRerunState("working");
-            const result = await rerunMyRun({ body: { idempotencyKey: crypto.randomUUID() }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { task_uid: taskUid } });
-            if (result.data && result.response?.ok) router.push(`/runs/${result.data.taskUid}`);
-            else setRerunState(classifyMutationFailure(result.response?.status));
+            const idempotencyKey = crypto.randomUUID();
+            const outcome = await pollRerun(() => rerunMyRun({ body: { idempotencyKey }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { task_uid: taskUid } }));
+            if ("taskUid" in outcome) router.push(`/runs/${outcome.taskUid}`);
+            else setRerunState(outcome.failure);
           }} type="button">{rerunState === "working" ? "Starting…" : "Re-run"}</button>{rerunState !== "idle" && rerunState !== "working" ? <p className="self-center text-sm text-red-800" role="alert">The run could not be re-run ({rerunState}).</p> : null}</div> : null}
           {!admin && !isTerminalPhase(run.phase) ? (
             <div className="space-y-2 border-t pt-5">

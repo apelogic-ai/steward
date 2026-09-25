@@ -81,3 +81,9 @@ instance-scoped grants, and denial decisions. Runtime usage is derived from
 at observation time and every interval clipped to the current UTC month. The same
 migration adds a stable UUID public identifier to existing spend exhaustions so
 the unified escalation API does not expose an internal sequence key.
+
+Migration 0048 adds the governed GitHub workflow re-run operation. It admits the
+immutable Steward connections authority v3, whose only additional grant is
+`github/actions_run_trigger/write`, while preserving existing v1/v2 operation
+rows. The operation kind remains database-allowlisted and invokes only MCP-GW's
+`actions_run_trigger.rerun_workflow_run` method.

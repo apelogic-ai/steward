@@ -195,6 +195,29 @@ where
     ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GithubWorkflowRerunRequest {
+    pub owner: String,
+    pub repository: String,
+    pub run_id: u64,
+    pub idempotency_key: String,
+}
+
+/// Governed GitHub Actions mutation used by the browser Runs surface.
+///
+/// The implementation receives the opaque browser binding so the same canonical HOP-1 subject
+/// used for connection consent is used for the tool call. It never exposes provider credentials.
+pub trait GithubWorkflowRerunBroker<B>: Clone + Send + Sync + 'static
+where
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    fn rerun<'a>(
+        &'a self,
+        session: &'a ConnectionSession<B>,
+        request: &'a GithubWorkflowRerunRequest,
+    ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>>;
+}
+
 #[derive(Clone)]
 pub(crate) struct ConnectionsState<P> {
     broker: P,

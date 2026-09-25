@@ -93,14 +93,23 @@ at most 64 KiB per read. A live OpenShell transcript is readable before the
 Task becomes terminal; terminal captured output remains readable afterward.
 The owner/admin scope of the parent route applies unchanged.
 
+For compatibility with the original endpoint, a request that omits `after`
+receives the complete captured stream as `text/plain; charset=utf-8`. Both
+representations are `no-store` and `nosniff`; new clients use the bounded JSON
+representation with an explicit byte offset.
+
 ### Cancel and re-run
 
 `POST /app/api/v1/runs/{taskUid}/cancel` transitions the caller's eligible Task
 to `cancelled`. `POST /app/api/v1/runs/{taskUid}/rerun` takes an idempotency key
 and creates a fresh Task against the same active Envelope instance for a
-versioned Steward workflow. Direct GitHub Tasks return `409` until Steward can
-perform a governed upstream workflow dispatch; cloning the Task and copying old
-provenance is forbidden.
+versioned Steward workflow. For a direct GitHub Task, it invokes GitHub's re-run
+operation through the caller's governed connection with the exact
+`github/actions_run_trigger/write` authority. Steward returns `202` while it
+waits for a Task whose validated provenance has the same repository and GitHub
+run ID and a higher attempt; browser retries reuse the same idempotency key.
+This works for any valid workflow filename. Cloning the Task, copying old
+provenance, or treating an idempotency key as provenance is forbidden.
 
 ## Availability model
 

@@ -5,9 +5,9 @@ import { useRouter } from "next/navigation";
 import { useCallback, useState, type FormEvent } from "react";
 
 import {
-  authorAdminEnvelopeTemplate,
   getAdminCapabilities,
   getAdminEnvelopeTemplate,
+  putAdminEnvelopeTemplate,
   type BrowserEnvelope,
   type BrowserEnvelopeTemplateResponse,
   type CapabilityCatalog,
@@ -105,6 +105,7 @@ function normalizeEnvelopeTemplateResponse(value: unknown, templateId: string): 
       apiVersion: "steward.browser-admin/v1",
       id: templateId,
       displayName: displayName(templateId),
+      memberRole: templateId,
       memberRoles: [templateId],
       envelope: value.envelope,
     };
@@ -122,6 +123,7 @@ function normalizeEnvelopeTemplateResponse(value: unknown, templateId: string): 
     apiVersion: "steward.browser-admin/v1",
     id: templateId,
     displayName: typeof template.displayName === "string" ? template.displayName : displayName(templateId),
+    memberRole: templateId,
     memberRoles: Array.isArray(template.memberRoles) && template.memberRoles.every((role) => typeof role === "string")
       ? template.memberRoles
       : [templateId],
@@ -294,7 +296,7 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
   const load = useCallback(() => getAdminEnvelopeTemplate({
     cache: "no-store",
     credentials: "same-origin",
-    path: { template_id: memberRole },
+    path: { member_role: memberRole },
   }), [memberRole]);
   const state = useApiResource<BrowserEnvelopeTemplateResponse>(load);
   const loadCapabilities = useCallback(() => getAdminCapabilities({
@@ -474,7 +476,7 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, member
       },
     };
     setStatus("saving");
-    const result = await authorAdminEnvelopeTemplate({
+    const result = await putAdminEnvelopeTemplate({
       body: {
         displayName: name.trim(),
         memberRoles: selectedRoles,
@@ -483,7 +485,7 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, member
       cache: "no-store",
       credentials: "same-origin",
       headers: { "X-Steward-CSRF": csrf },
-      path: { template_id: templateId },
+      path: { member_role: templateId },
     });
     if (result.data && result.response?.status === 201) {
       setCurrentRevision(result.data.envelope.revision);

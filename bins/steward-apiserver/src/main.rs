@@ -572,7 +572,6 @@ async fn browser_application_router(
             user_envelopes::PgEnvelopeRequestBroker::new(store.clone()),
             auth.clone(),
         ))
-        .merge(agent_runs_ui::protected_router(store.clone(), auth.clone()))
         .merge(steward_apiserver::preferences::protected_router(
             store.clone(),
             auth.clone(),
@@ -594,8 +593,14 @@ async fn browser_application_router(
             workflow_agents,
         ));
     let app = match connections {
-        Some(broker) => app.merge(connections::protected_router(broker, auth.clone())),
-        None => app,
+        Some(broker) => app
+            .merge(agent_runs_ui::protected_router_with_github_reruns(
+                store.clone(),
+                broker.clone(),
+                auth.clone(),
+            ))
+            .merge(connections::protected_router(broker, auth.clone())),
+        None => app.merge(agent_runs_ui::protected_router(store.clone(), auth.clone())),
     };
     let app = match stable_bridge {
         Some((service, verifier)) => app.merge(stable_runtime_bridge::protected_router(

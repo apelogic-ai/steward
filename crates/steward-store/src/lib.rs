@@ -2624,6 +2624,41 @@ impl PgStore {
         })
     }
 
+    /// Resolve the first later GitHub attempt for the same immutable workflow run identity.
+    /// GitHub re-runs retain the run ID and increment `run_attempt`; this avoids correlating by
+    /// filename, timestamps, or a caller-controlled idempotency string.
+    pub async fn github_rerun_task(
+        &self,
+        owner_user_id: &str,
+        repository: &str,
+        run_id: &str,
+        after_attempt: u32,
+    ) -> Result<Option<TaskRecord>, StoreError> {
+        let task_uid = sqlx::query_scalar::<_, Uuid>(
+            "SELECT task_uid FROM task_submissions \
+             WHERE owner_user_id = $1 \
+               AND direct_task_evidence IS NOT NULL \
+               AND direct_task_evidence #>> '{sourceProvenance,repository,name}' = $2 \
+               AND direct_task_evidence #>> '{sourceProvenance,run,id}' = $3 \
+               AND direct_task_evidence #>> '{sourceProvenance,run,attempt}' ~ '^[0-9]+$' \
+               AND (direct_task_evidence #>> '{sourceProvenance,run,attempt}')::numeric > $4 \
+             ORDER BY (direct_task_evidence #>> '{sourceProvenance,run,attempt}')::numeric, \
+                      created_at, task_uid \
+             LIMIT 1",
+        )
+        .bind(owner_user_id)
+        .bind(repository)
+        .bind(run_id)
+        .bind(i64::from(after_attempt))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        match task_uid {
+            Some(task_uid) => self.task(task_uid).await,
+            None => Ok(None),
+        }
+    }
+
     pub async fn activate_rerun(
         &self,
         source_task_uid: Uuid,
@@ -7220,7 +7255,7 @@ impl PgStore {
         let active_mutation = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM connection_operations \
              WHERE canonical_user_id = $1 AND provider = 'github' \
-               AND operation_kind IN ('start', 'disconnect') \
+               AND operation_kind IN ('start', 'disconnect', 'rerun') \
                AND operation_state IN ('queued', 'provisioning', 'running') \
                AND finalization_state = 'not_requested')",
         )
@@ -7345,6 +7380,27 @@ impl PgStore {
                 .await
                 .map_err(database_error)?
             }
+            ConnectionOperationKind::Rerun => sqlx::query(
+                "SELECT operations.*, \
+                        to_char(operations.flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
+                        to_char(operations.response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
+                        tasks.phase AS task_phase, COALESCE((SELECT runtime_uid FROM task_runtime_operations runtime_operation WHERE runtime_operation.task_uid = tasks.task_uid), tasks.runtime_uid) AS runtime_uid, \
+                        tasks.output_archive, tasks.finalize_requested, tasks.finalized \
+                 FROM connection_operations operations \
+                 JOIN task_submissions tasks ON tasks.task_uid = operations.task_uid \
+                 WHERE operations.canonical_user_id = $1 AND operations.provider = 'github' \
+                   AND operations.operation_kind = 'rerun' \
+                   AND operations.idempotency_identity = $2 \
+                   AND (operations.operation_state IN ('queued', 'provisioning', 'running') \
+                     OR (operations.operation_state = 'succeeded' \
+                        AND operations.result_expires_at > now())) \
+                 ORDER BY operations.created_at DESC LIMIT 1",
+            )
+            .bind(request.task.owner_user_id)
+            .bind(request.idempotency_identity)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?,
         };
         if let Some(row) = reusable {
             let record = connection_operation_record(row)?;
@@ -7971,7 +8027,7 @@ impl PgStore {
                  cached_status = CASE WHEN operation_kind = 'status' THEN $2 ELSE cached_status END, \
                  cache_expires_at = CASE WHEN operation_kind = 'status' \
                      THEN now() + make_interval(secs => $5) ELSE NULL END, \
-                 result_expires_at = CASE WHEN operation_kind = 'disconnect' \
+                 result_expires_at = CASE WHEN operation_kind IN ('disconnect', 'rerun') \
                      THEN now() + make_interval(secs => $6) ELSE result_expires_at END, \
                  oauth_phase = CASE WHEN operation_kind = 'start' THEN 'pending' ELSE oauth_phase END, \
                  authorization_url = $3, authorization_url_digest = $4, \
@@ -8686,7 +8742,10 @@ fn validate_connection_operation_request(
     validate_task_identity_binding(&request.task)?;
     validate_task_version_pins(&request.task)?;
     validate_task_runtime_binding(&request.task)?;
-    let expected_action = request.operation_kind.as_str();
+    let (expected_resource, expected_action) = match request.operation_kind {
+        ConnectionOperationKind::Rerun => ("actions_run_trigger", "write"),
+        _ => ("provider-control", request.operation_kind.as_str()),
+    };
     let [tool] = request.task.runtime_spec.tools.as_slice() else {
         return Err(StoreError::InvalidConnectionOperation);
     };
@@ -8697,6 +8756,7 @@ fn validate_connection_operation_request(
             ConnectionOperationKind::Status => "github.status",
             ConnectionOperationKind::Start => "github.start",
             ConnectionOperationKind::Disconnect => "github.disconnect",
+            ConnectionOperationKind::Rerun => "github.rerun",
         },
         "--input",
         "request.json",
@@ -8723,6 +8783,10 @@ fn validate_connection_operation_request(
                 2,
                 steward_admission::internal_authorities::steward_connections_v2::AUTHORITY_DIGEST,
                 "0.4.9"
+            ) | (
+                3,
+                steward_admission::internal_authorities::steward_connections_v3::AUTHORITY_DIGEST,
+                "0.4.9"
             )
         )
         || request.response_deadline_seconds <= 0
@@ -8735,7 +8799,7 @@ fn validate_connection_operation_request(
         || request.task.runtime_spec.agent_type.name != "connections-bridge"
         || !request.task.runtime_spec.llms.is_empty()
         || tool.provider != "github"
-        || tool.resource != "provider-control"
+        || tool.resource != expected_resource
         || tool.action != expected_action
         || request
             .task
@@ -9499,6 +9563,7 @@ pub enum ConnectionOperationKind {
     Status,
     Start,
     Disconnect,
+    Rerun,
 }
 
 impl ConnectionOperationKind {
@@ -9507,6 +9572,7 @@ impl ConnectionOperationKind {
             Self::Status => "status",
             Self::Start => "start",
             Self::Disconnect => "disconnect",
+            Self::Rerun => "rerun",
         }
     }
 }
@@ -10333,6 +10399,7 @@ fn connection_operation_kind_from_text(value: &str) -> Result<ConnectionOperatio
         "status" => Ok(ConnectionOperationKind::Status),
         "start" => Ok(ConnectionOperationKind::Start),
         "disconnect" => Ok(ConnectionOperationKind::Disconnect),
+        "rerun" => Ok(ConnectionOperationKind::Rerun),
         _ => Err(StoreError::InvalidConnectionOperation),
     }
 }

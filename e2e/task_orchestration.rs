@@ -2417,6 +2417,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             operation_runtime_name: &runtime_name,
             inert_manifest_digest: &duplicate_inert_digest,
             active_manifest_digest: &duplicate_active_digest,
+            direct_task_evidence: None,
         },
     )
     .await?;
@@ -2451,6 +2452,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             operation_runtime_name: "task-corrupted-projection",
             inert_manifest_digest: &rejected_inert_digest,
             active_manifest_digest: &rejected_active_digest,
+            direct_task_evidence: None,
         },
     )
     .await?;
@@ -2462,6 +2464,80 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             Err(StoreError::InvalidTaskTransition)
         ),
         "an inconsistent persisted Task/runtime projection must fail closed"
+    );
+
+    let mut github_candidates = Vec::new();
+    for (attempt, run_id) in [(3_u32, "900001"), (2_u32, "900001"), (4_u32, "other-run")] {
+        let candidate_task_uid = Uuid::new_v4();
+        let candidate_operation_id = Uuid::new_v4();
+        let candidate_runtime_name = format!("task-{}", candidate_operation_id.simple());
+        let candidate_inert_digest = manifest_digest_with_binding(
+            candidate_task_uid,
+            candidate_operation_id,
+            &candidate_runtime_name,
+            &inert_spec(&spec, &envelope),
+            "inert",
+            Some(&execution_binding),
+        )?;
+        let candidate_active_digest = manifest_digest_with_binding(
+            candidate_task_uid,
+            candidate_operation_id,
+            &candidate_runtime_name,
+            &spec,
+            "active",
+            Some(&execution_binding),
+        )?;
+        let evidence = direct_task_evidence_fixture(
+            candidate_task_uid,
+            attempt,
+            run_id,
+            envelope.revision,
+            &envelope_digest,
+        )?;
+        insert_task_projection_fixture(
+            &pool,
+            TaskProjectionFixture {
+                source_task_uid: task_uid,
+                task_uid: candidate_task_uid,
+                operation_id: candidate_operation_id,
+                idempotency_key: &format!("github-rerun-{run_id}-{attempt}-{suffix}"),
+                task_runtime_name: &candidate_runtime_name,
+                operation_runtime_name: &candidate_runtime_name,
+                inert_manifest_digest: &candidate_inert_digest,
+                active_manifest_digest: &candidate_active_digest,
+                direct_task_evidence: Some(&evidence),
+            },
+        )
+        .await?;
+        github_candidates.push((attempt, run_id, candidate_task_uid));
+    }
+    let attempt_two = store
+        .github_rerun_task(identity.user_id.as_str(), "example-org/caller", "900001", 1)
+        .await?
+        .ok_or_else(|| io::Error::other("GitHub attempt two was not correlated"))?;
+    assert_eq!(attempt_two.task_uid, github_candidates[1].2);
+    let attempt_three = store
+        .github_rerun_task(identity.user_id.as_str(), "example-org/caller", "900001", 2)
+        .await?
+        .ok_or_else(|| io::Error::other("GitHub attempt three was not correlated"))?;
+    assert_eq!(attempt_three.task_uid, github_candidates[0].2);
+    assert!(
+        store
+            .github_rerun_task(identity.user_id.as_str(), "example-org/caller", "900001", 3)
+            .await?
+            .is_none()
+    );
+    assert!(
+        store
+            .github_rerun_task(
+                "usr_abcdefabcdefabcdefabcdefabcdefab",
+                "example-org/caller",
+                "900001",
+                1,
+            )
+            .await?
+            .is_none(),
+        "a later attempt owned by another canonical user must remain invisible"
     );
     assert_eq!(reservation.record.task_uid, task_uid);
     Ok(())
@@ -2512,6 +2588,7 @@ struct TaskProjectionFixture<'a> {
     operation_runtime_name: &'a str,
     inert_manifest_digest: &'a str,
     active_manifest_digest: &'a str,
+    direct_task_evidence: Option<&'a serde_json::Value>,
 }
 
 async fn insert_task_projection_fixture(
@@ -2530,11 +2607,14 @@ async fn insert_task_projection_fixture(
           orchestration_version, orchestration_operation_id, candidate_digest, \
           service_envelope_digest, original_admission_decision, original_admission_deltas) \
          SELECT $1, $2, submitter_service, acting_user, acting_user_id, owner, owner_user_id, \
-                identity_binding_state, workflow, workflow_name, workflow_version, workflow_digest, \
+                identity_binding_state, workflow, \
+                CASE WHEN $6::jsonb IS NULL THEN workflow_name ELSE NULL END, \
+                CASE WHEN $6::jsonb IS NULL THEN workflow_version ELSE NULL END, \
+                CASE WHEN $6::jsonb IS NULL THEN workflow_digest ELSE NULL END, \
                 user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
                 authority_kind, user_envelope_snapshot, coding_agent_runtime, NULL, \
                 runtime_namespace, $3, runtime_ownership, 'submitted', runtime_spec, agent_command, \
-                execution_binding, direct_task_evidence, envelope_revision, orchestration_version, \
+                execution_binding, COALESCE($6::jsonb, direct_task_evidence), envelope_revision, orchestration_version, \
                 $4, candidate_digest, service_envelope_digest, original_admission_decision, \
                 original_admission_deltas \
          FROM task_submissions WHERE task_uid = $5",
@@ -2544,6 +2624,7 @@ async fn insert_task_projection_fixture(
     .bind(fixture.task_runtime_name)
     .bind(fixture.operation_id)
     .bind(fixture.source_task_uid)
+    .bind(fixture.direct_task_evidence)
     .execute(&mut *transaction)
     .await?
     .rows_affected();
@@ -2565,6 +2646,24 @@ async fn insert_task_projection_fixture(
     .await?;
     transaction.commit().await?;
     Ok(())
+}
+
+fn direct_task_evidence_fixture(
+    task_uid: Uuid,
+    attempt: u32,
+    run_id: &str,
+    envelope_revision: i64,
+    envelope_digest: &str,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut evidence: serde_json::Value = serde_json::from_str(include_str!(
+        "../docs/contracts/task/v2/fixtures/positive/task-binding-evidence.json"
+    ))?;
+    evidence["taskUid"] = json!(task_uid);
+    evidence["sourceProvenance"]["run"]["id"] = json!(run_id);
+    evidence["sourceProvenance"]["run"]["attempt"] = json!(attempt);
+    evidence["envelope"]["revision"] = json!(envelope_revision);
+    evidence["envelope"]["digest"] = json!(format!("steward:{envelope_digest}"));
+    Ok(evidence)
 }
 
 async fn operation(

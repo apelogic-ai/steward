@@ -12,6 +12,7 @@ const nextBinary = path.join(repository, "node_modules", "next", "dist", "bin", 
 const STARTUP_TIMEOUT_MS = 30_000;
 const envelopeId = "00000000-0000-0000-0000-000000000001";
 const taskUid = "00000000-0000-0000-0000-000000000002";
+const rerunTaskUid = "00000000-0000-0000-0000-000000000006";
 const approvalId = "00000000-0000-0000-0000-000000000003";
 let web;
 let origin;
@@ -287,6 +288,8 @@ async function startWeb() {
 
   let mutationFailures = {};
   let mutationSink;
+  let rerunFixtures = [];
+  let rerunFixtureIndex = 0;
   const proxy = createServer(async (request, response) => {
     try {
       const requestUrl = new URL(request.url ?? "/", nextOrigin);
@@ -306,6 +309,7 @@ async function startWeb() {
         || requestUrl.pathname === "/app/api/v1/connections/github/disconnect"
         || requestUrl.pathname === "/admin/api/v1/connections/github/start"
         || requestUrl.pathname === "/admin/api/v1/connections/github/disconnect"
+        || requestUrl.pathname.endsWith("/rerun")
         || requestUrl.pathname === "/admin/auth/logout"
       ));
       if (browserMutation) {
@@ -321,6 +325,13 @@ async function startWeb() {
         if (failureStatus) {
           response.writeHead(failureStatus, { "content-type": "application/json", "cache-control": "no-store" });
           response.end("{}");
+          return;
+        }
+        if (requestUrl.pathname.endsWith("/rerun")) {
+          const fixture = rerunFixtures[Math.min(rerunFixtureIndex, rerunFixtures.length - 1)];
+          rerunFixtureIndex += 1;
+          response.writeHead(fixture?.status ?? 503, { "content-type": "application/json", "cache-control": "no-store" });
+          response.end(JSON.stringify(fixture?.body ?? {}));
           return;
         }
         if (requestUrl.pathname.startsWith("/admin/api/v1/envelope-templates/")) {
@@ -438,6 +449,10 @@ async function startWeb() {
     output: () => output,
     useMutationFailures: (failures) => { mutationFailures = failures; },
     useMutationSink: (sink) => { mutationSink = sink; },
+    useRerunFixtures: (fixtures) => {
+      rerunFixtures = fixtures;
+      rerunFixtureIndex = 0;
+    },
   };
 }
 
@@ -488,6 +503,9 @@ async function guardedPage(browser, {
     stderr: { body: "agent stderr\n", status: 200 },
   },
   mutationFailures = {},
+  rerunResponses = [
+    { status: 201, body: { apiVersion: "steward.browser-runs/v1", taskUid: rerunTaskUid } },
+  ],
   runPhase = "succeeded",
   capabilityCatalogModels = capabilityCatalog.models,
   capabilityCatalogTools = capabilityCatalog.tools,
@@ -500,6 +518,7 @@ async function guardedPage(browser, {
   const mutations = [];
   web.useMutationFailures(mutationFailures);
   web.useMutationSink(mutations);
+  web.useRerunFixtures(rerunResponses);
   await context.addInitScript(() => {
     const allowedPreference = (key) => typeof key === "string" && (
       key.startsWith("steward.ui.envelope-accordion.")
@@ -577,9 +596,12 @@ async function guardedPage(browser, {
     await json(route, { apiVersion: "steward.envelope-requests/v1", request: envelopeRequest });
   });
   await context.route(`${origin}/app/api/v1/runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [run], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } }));
-  await context.route(`${origin}/app/api/v1/runs/**`, (route) => route.request().url().endsWith("/timeline")
-    ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
-    : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...run, phase: runPhase } }));
+  await context.route(`${origin}/app/api/v1/runs/**`, (route) => {
+    if (route.request().url().endsWith("/rerun")) return route.continue();
+    return route.request().url().endsWith("/timeline")
+      ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
+      : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...run, phase: runPhase } });
+  });
   await context.route(`${origin}/app/api/v1/runs/${taskUid}/logs/*`, async (route) => {
     const stream = new URL(route.request().url()).pathname.split("/").at(-1);
     executionLogRequests.push(route.request());
@@ -1118,6 +1140,29 @@ test("Run detail displays the exact pinned Workflow and User Envelope revision",
     await expect(developer.page.getByText("repository-review@1", { exact: true }).last()).toBeVisible();
     const envelopeRevision = developer.page.getByText("User envelope revision", { exact: true }).locator("..");
     await expect(envelopeRevision).toContainText("4");
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("GitHub re-run polls with one idempotency key until the new Task is correlated", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    rerunResponses: [
+      { status: 202, body: { apiVersion: "steward.browser-runs/v1", state: "pending", retryAfterMs: 1 } },
+      { status: 201, body: { apiVersion: "steward.browser-runs/v1", taskUid: rerunTaskUid } },
+    ],
+  });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await developer.page.getByRole("button", { name: "Re-run" }).click();
+    await expect(developer.page.getByRole("button", { name: "Starting…" })).toBeDisabled();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${rerunTaskUid}`);
+
+    const reruns = developer.mutations.filter((mutation) => mutation.path.endsWith("/rerun"));
+    expect(reruns).toHaveLength(2);
+    for (const mutation of reruns) expectMutationProof(mutation);
+    expect(reruns[0].body.idempotencyKey).toBeTruthy();
+    expect(reruns[1].body.idempotencyKey).toBe(reruns[0].body.idempotencyKey);
   } finally {
     await closeGuardedPage(developer);
   }

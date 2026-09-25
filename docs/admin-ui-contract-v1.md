@@ -69,6 +69,9 @@ actor. Manual approvals retain rationale, evidence URL, expiry, and the exact
 canonical administrator actor. Filing an external decision first acquires a
 short-lived per-request lease, so concurrent browser retries cannot create two
 external decisions. The completed reference and status history are append-only.
+The approval route continues to accept the legacy empty object only for an
+unfiled request with no new decision metadata. A rationale is mandatory whenever
+evidence or expiry metadata is supplied or an external decision has been filed.
 
 ### Envelopes
 
@@ -77,6 +80,10 @@ request APIs. Templates have immutable IDs, administrator-authored display
 names, one or more eligible member roles, and append-only revisions. More than
 one active template may target the same role; an Envelope request pins the
 chosen template ID and revision.
+
+Template responses retain `memberRole`, set to the first eligible role, as a
+compatibility alias. Catalog-aware clients use the authoritative `memberRoles`
+array.
 
 Provisioned Envelope requests may include current-period spend usage. Usage is
 the sum of the latest observation for each runtime bound to that Envelope
@@ -125,9 +132,13 @@ submission, four bounded stages (admission, runtime provisioning, agent
 execution, and finalization), and one execution step with stdout/stderr streams.
 The separate log endpoint supports bounded byte-offset reads while a Task is
 running and marks whether the stream is complete. Cancel is owner scoped.
-Re-run creates a fresh Task only for a versioned Steward workflow; a
-GitHub-triggered run fails closed until a governed provider dispatch can create
-a new upstream run without inventing provenance.
+Re-run creates a fresh Task for a versioned Steward workflow. For a direct
+GitHub Task, Steward invokes only the governed MCP-GW
+`actions_run_trigger.rerun_workflow_run` operation through the caller's GitHub
+connection, then correlates the new Task by exact repository and GitHub run ID
+with a higher run attempt. A `202` response is polled with the same browser
+idempotency key until that Task exists. Correlation does not depend on the
+suggested or actual workflow filename and never copies old provenance.
 
 ### Federated Task subjects
 

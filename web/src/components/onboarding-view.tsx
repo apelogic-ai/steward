@@ -27,13 +27,18 @@ type OnboardingData = {
 };
 
 export function workflowSetupDone(
-  runs: Array<{ workflowName?: string | null; workflowVersion?: number | null }>,
+  runs: Array<{
+    trigger?: { provider?: string | null } | null;
+    workflowName?: string | null;
+    workflowVersion?: number | null;
+  }>,
   acknowledged: boolean,
   renderedWorkflow: string | null,
 ) {
   if (acknowledged) return true;
   if (!renderedWorkflow) return false;
-  return runs.some((run) => `${run.workflowName}@${run.workflowVersion}` === renderedWorkflow);
+  return runs.some((run) => run.trigger?.provider === "github"
+    && `${run.workflowName}@${run.workflowVersion}` === renderedWorkflow);
 }
 
 export function OnboardingView() {

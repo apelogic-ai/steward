@@ -197,7 +197,10 @@ export type ApprovalRequest = {
 export type ApproveEnvelopeRequestBody = {
     evidenceUrl?: string | null;
     expiresAt?: string | null;
-    rationale: string;
+    /**
+     * Omitted only by legacy clients that approve without decision metadata.
+     */
+    rationale?: string | null;
 };
 
 export type AuthorEnvelopeTemplateBody = {
@@ -320,6 +323,10 @@ export type BrowserEnvelopeTemplateListItem = {
     displayName: string;
     envelope: BrowserEnvelope;
     id: string;
+    /**
+     * Compatibility alias for clients written before templates could target multiple roles.
+     */
+    memberRole: string;
     memberRoles: Array<string>;
 };
 
@@ -334,6 +341,10 @@ export type BrowserEnvelopeTemplateResponse = {
     displayName: string;
     envelope: BrowserEnvelope;
     id: string;
+    /**
+     * Compatibility alias for clients written before templates could target multiple roles.
+     */
+    memberRole: string;
     memberRoles: Array<string>;
 };
 
@@ -863,6 +874,12 @@ export type RenderGithubActionsWorkflowBody = {
 };
 
 export type RepositoryUrl = string;
+
+export type RerunPendingResponse = {
+    apiVersion: string;
+    retryAfterMs: number;
+    state: string;
+};
 
 export type RerunRequest = {
     idempotencyKey: string;
@@ -1657,10 +1674,10 @@ export type ListAdminEnvelopeTemplatesResponse = ListAdminEnvelopeTemplatesRespo
 export type GetAdminEnvelopeTemplateData = {
     body?: never;
     path: {
-        template_id: string;
+        member_role: string;
     };
     query?: never;
-    url: '/admin/api/v1/envelope-templates/{template_id}';
+    url: '/admin/api/v1/envelope-templates/{member_role}';
 };
 
 export type GetAdminEnvelopeTemplateErrors = {
@@ -1688,19 +1705,19 @@ export type GetAdminEnvelopeTemplateResponses = {
 
 export type GetAdminEnvelopeTemplateResponse = GetAdminEnvelopeTemplateResponses[keyof GetAdminEnvelopeTemplateResponses];
 
-export type AuthorLegacyAdminEnvelopeTemplateData = {
+export type AuthorAdminEnvelopeTemplateData = {
     body: BrowserEnvelope;
     headers: {
         'X-Steward-CSRF': string;
     };
     path: {
-        template_id: string;
+        member_role: string;
     };
     query?: never;
-    url: '/admin/api/v1/envelope-templates/{template_id}';
+    url: '/admin/api/v1/envelope-templates/{member_role}';
 };
 
-export type AuthorLegacyAdminEnvelopeTemplateErrors = {
+export type AuthorAdminEnvelopeTemplateErrors = {
     /**
      * Browser session is absent or invalid
      */
@@ -1723,25 +1740,25 @@ export type AuthorLegacyAdminEnvelopeTemplateErrors = {
     503: unknown;
 };
 
-export type AuthorLegacyAdminEnvelopeTemplateResponses = {
+export type AuthorAdminEnvelopeTemplateResponses = {
     201: BrowserEnvelopeTemplateResponse;
 };
 
-export type AuthorLegacyAdminEnvelopeTemplateResponse = AuthorLegacyAdminEnvelopeTemplateResponses[keyof AuthorLegacyAdminEnvelopeTemplateResponses];
+export type AuthorAdminEnvelopeTemplateResponse = AuthorAdminEnvelopeTemplateResponses[keyof AuthorAdminEnvelopeTemplateResponses];
 
-export type AuthorAdminEnvelopeTemplateData = {
+export type PutAdminEnvelopeTemplateData = {
     body: AuthorEnvelopeTemplateBody;
     headers: {
         'X-Steward-CSRF': string;
     };
     path: {
-        template_id: string;
+        member_role: string;
     };
     query?: never;
-    url: '/admin/api/v1/envelope-templates/{template_id}';
+    url: '/admin/api/v1/envelope-templates/{member_role}';
 };
 
-export type AuthorAdminEnvelopeTemplateErrors = {
+export type PutAdminEnvelopeTemplateErrors = {
     /**
      * Browser session is absent or invalid
      */
@@ -1764,11 +1781,11 @@ export type AuthorAdminEnvelopeTemplateErrors = {
     503: unknown;
 };
 
-export type AuthorAdminEnvelopeTemplateResponses = {
+export type PutAdminEnvelopeTemplateResponses = {
     201: BrowserEnvelopeTemplateResponse;
 };
 
-export type AuthorAdminEnvelopeTemplateResponse = AuthorAdminEnvelopeTemplateResponses[keyof AuthorAdminEnvelopeTemplateResponses];
+export type PutAdminEnvelopeTemplateResponse = PutAdminEnvelopeTemplateResponses[keyof PutAdminEnvelopeTemplateResponses];
 
 export type DenyAdminEscalationData = {
     body: EscalationDenyRequest;
@@ -2764,7 +2781,7 @@ export type RerunMyRunErrors = {
      */
     404: unknown;
     /**
-     * The original envelope is no longer active or GitHub provider dispatch is required
+     * The original envelope is no longer active or GitHub connection authorization is pending
      */
     409: unknown;
     /**
@@ -2779,6 +2796,10 @@ export type RerunMyRunResponses = {
      */
     200: RerunResponse;
     201: RerunResponse;
+    /**
+     * GitHub accepted the rerun and Steward is awaiting the correlated Task
+     */
+    202: RerunPendingResponse;
 };
 
 export type RerunMyRunResponse = RerunMyRunResponses[keyof RerunMyRunResponses];

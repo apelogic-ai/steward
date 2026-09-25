@@ -400,6 +400,8 @@ pub(crate) struct BrowserEnvelopeTemplateResponse {
     api_version: &'static str,
     id: String,
     display_name: String,
+    /// Compatibility alias for clients written before templates could target multiple roles.
+    member_role: String,
     member_roles: Vec<String>,
     envelope: BrowserEnvelope,
     auto_provision_threshold: Option<BrowserEnvelope>,
@@ -410,6 +412,8 @@ pub(crate) struct BrowserEnvelopeTemplateResponse {
 pub(crate) struct BrowserEnvelopeTemplateListItem {
     id: String,
     display_name: String,
+    /// Compatibility alias for clients written before templates could target multiple roles.
+    member_role: String,
     member_roles: Vec<String>,
     envelope: BrowserEnvelope,
     auto_provision_threshold: Option<BrowserEnvelope>,
@@ -433,9 +437,11 @@ pub(crate) struct AuthorEnvelopeTemplateBody {
 
 impl From<EnvelopeTemplateRevisionRecord> for BrowserEnvelopeTemplateListItem {
     fn from(template: EnvelopeTemplateRevisionRecord) -> Self {
+        let member_role = template.member_roles.first().cloned().unwrap_or_default();
         Self {
             id: template.template_id,
             display_name: template.display_name,
+            member_role,
             member_roles: template.member_roles,
             envelope: template.ceiling.into(),
             auto_provision_threshold: template.auto_provision_threshold.map(Into::into),
@@ -444,10 +450,12 @@ impl From<EnvelopeTemplateRevisionRecord> for BrowserEnvelopeTemplateListItem {
 }
 
 fn template_response(template: EnvelopeTemplateRevisionRecord) -> BrowserEnvelopeTemplateResponse {
+    let member_role = template.member_roles.first().cloned().unwrap_or_default();
     BrowserEnvelopeTemplateResponse {
         api_version: BROWSER_ADMIN_API_VERSION,
         id: template.template_id,
         display_name: template.display_name,
+        member_role,
         member_roles: template.member_roles,
         envelope: template.ceiling.into(),
         auto_provision_threshold: template.auto_provision_threshold.map(Into::into),
@@ -589,7 +597,8 @@ pub(crate) struct RejectEnvelopeRequestBody {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ApproveEnvelopeRequestBody {
-    rationale: String,
+    /// Omitted only by legacy clients that approve without decision metadata.
+    rationale: Option<String>,
     evidence_url: Option<String>,
     expires_at: Option<String>,
 }
@@ -907,10 +916,13 @@ where
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
-    let rationale = body.rationale.trim();
-    if rationale.is_empty() || rationale.len() > 2_000 {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
-    }
+    let rationale = match body.rationale.as_deref() {
+        Some(value) if !value.trim().is_empty() && value.trim().len() <= 2_000 => {
+            Some(value.trim())
+        }
+        Some(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+        None => None,
+    };
     let request = match state.ledger.envelope_request_for_admin(request_id).await {
         Ok(Some(request)) => request,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -929,6 +941,15 @@ where
         .as_deref()
         .or(request.evidence_url.as_deref());
     if evidence_url.is_some_and(|value| !valid_https_url(value)) {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    if request.status == EnvelopeRequestStatus::Pending
+        && rationale.is_none()
+        && (body.evidence_url.is_some()
+            || body.expires_at.is_some()
+            || request.decision_key.is_some()
+            || request.evidence_url.is_some())
+    {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
     let instance_id = envelope_instance_id(request.id);
@@ -950,7 +971,7 @@ where
                 envelope_instance_id: Some(&instance_id),
                 envelope_digest: Some(&digest),
                 reason: None,
-                rationale: Some(rationale),
+                rationale,
                 evidence_url,
                 expires_at: body.expires_at.as_deref(),
                 approved_envelope: Some(&request.requested_envelope),
@@ -960,7 +981,8 @@ where
         .await
     {
         Ok(request) => {
-            if let (Some(key), Some(evidence_url)) = (decision_key, evidence_url)
+            if let (Some(key), Some(evidence_url), Some(rationale)) =
+                (decision_key, evidence_url, rationale)
                 && let Err(error) = state
                     .decisions
                     .record_resolution(&steward_ports::DecisionResolution {
@@ -1516,8 +1538,8 @@ where
 #[utoipa::path(
     get,
     operation_id = "getAdminEnvelopeTemplate",
-    path = "/admin/api/v1/envelope-templates/{template_id}",
-    params(("template_id" = String, Path)),
+    path = "/admin/api/v1/envelope-templates/{member_role}",
+    params(("member_role" = String, Path)),
     responses(
         (status = 200, body = BrowserEnvelopeTemplateResponse),
         (status = 401, description = "Browser session is absent or invalid"),
@@ -1546,10 +1568,10 @@ where
 
 #[utoipa::path(
     put,
-    operation_id = "authorAdminEnvelopeTemplate",
-    path = "/admin/api/v1/envelope-templates/{template_id}",
+    operation_id = "putAdminEnvelopeTemplate",
+    path = "/admin/api/v1/envelope-templates/{member_role}",
     params(
-        ("template_id" = String, Path),
+        ("member_role" = String, Path),
         ("X-Steward-CSRF" = String, Header)
     ),
     request_body = AuthorEnvelopeTemplateBody,
@@ -1621,18 +1643,22 @@ where
         })
         .await
     {
-        Ok(()) => (
-            StatusCode::CREATED,
-            Json(BrowserEnvelopeTemplateResponse {
-                api_version: BROWSER_ADMIN_API_VERSION,
-                id: template_id,
-                display_name: body.display_name,
-                member_roles: body.member_roles,
-                envelope: envelope.into(),
-                auto_provision_threshold: auto_provision_threshold.map(Into::into),
-            }),
-        )
-            .into_response(),
+        Ok(()) => {
+            let member_role = body.member_roles.first().cloned().unwrap_or_default();
+            (
+                StatusCode::CREATED,
+                Json(BrowserEnvelopeTemplateResponse {
+                    api_version: BROWSER_ADMIN_API_VERSION,
+                    id: template_id,
+                    display_name: body.display_name,
+                    member_role,
+                    member_roles: body.member_roles,
+                    envelope: envelope.into(),
+                    auto_provision_threshold: auto_provision_threshold.map(Into::into),
+                }),
+            )
+                .into_response()
+        }
         Err(StoreError::EnvelopeRevisionNotIncreasing) => StatusCode::CONFLICT.into_response(),
         Err(StoreError::InvalidEnvelopeTemplate) => {
             StatusCode::UNPROCESSABLE_ENTITY.into_response()
@@ -1643,10 +1669,10 @@ where
 
 #[utoipa::path(
     post,
-    operation_id = "authorLegacyAdminEnvelopeTemplate",
-    path = "/admin/api/v1/envelope-templates/{template_id}",
+    operation_id = "authorAdminEnvelopeTemplate",
+    path = "/admin/api/v1/envelope-templates/{member_role}",
     params(
-        ("template_id" = String, Path),
+        ("member_role" = String, Path),
         ("X-Steward-CSRF" = String, Header)
     ),
     request_body = BrowserEnvelope,

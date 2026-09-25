@@ -101,6 +101,50 @@ pub mod internal_authorities {
             envelope
         }
     }
+
+    pub mod steward_connections_v3 {
+        use super::{Envelope, steward_connections_v1, steward_connections_v2};
+        use steward_types::ToolGrant;
+
+        pub const AUTHORITY_ID: &str = steward_connections_v1::AUTHORITY_ID;
+        pub const AUTHORITY_VERSION: i64 = 3;
+        pub const AUTHORITY_DIGEST: &str =
+            "sha256:d5878c6ae538174c5e0c32ac6aa4617f4ac8e6787b1495b08bd5af9e48f7fbe3";
+        pub const SERVICE: &str = steward_connections_v1::SERVICE;
+        pub const AGENT_TYPE: &str = steward_connections_v1::AGENT_TYPE;
+        pub const BRIDGE_BINARY: &str = steward_connections_v1::BRIDGE_BINARY;
+        pub const INPUT_FILE: &str = steward_connections_v1::INPUT_FILE;
+        pub const OUTPUT_FILE: &str = steward_connections_v1::OUTPUT_FILE;
+        pub const RESPONSE_DEADLINE_SECONDS: i64 =
+            steward_connections_v1::RESPONSE_DEADLINE_SECONDS;
+        pub const MCP_GW_VERSION: &str = steward_connections_v2::MCP_GW_VERSION;
+        pub const OAUTH_STATE_LIFETIME_SECONDS: i64 =
+            steward_connections_v1::OAUTH_STATE_LIFETIME_SECONDS;
+        pub const OAUTH_CLOCK_SKEW_SECONDS: i64 = steward_connections_v1::OAUTH_CLOCK_SKEW_SECONDS;
+
+        pub fn operation_grant(operation: &str) -> Option<ToolGrant> {
+            if operation == "rerun" {
+                Some(ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "actions_run_trigger".to_owned(),
+                    action: "write".to_owned(),
+                })
+            } else {
+                steward_connections_v1::provider_control_grant(operation)
+            }
+        }
+
+        pub fn envelope() -> Envelope {
+            let mut envelope = steward_connections_v2::envelope();
+            envelope.revision = AUTHORITY_VERSION;
+            envelope.spec.tools.push(ToolGrant {
+                provider: "github".to_owned(),
+                resource: "actions_run_trigger".to_owned(),
+                action: "write".to_owned(),
+            });
+            envelope
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
