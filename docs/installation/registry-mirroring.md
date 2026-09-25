@@ -31,13 +31,13 @@ missing and extra entries are rejected.
 {
   "schemaVersion": "steward.registry-mappings/v1",
   "artifacts": {
-    "chart": "registry.example.test/team-a/charts/steward:0.2.3",
-    "images.apiserver": "registry.example.test/team-a/steward:0.2.3-apiserver",
-    "images.bridge": "registry.example.test/team-a/steward:0.2.3-bridge",
-    "images.controller": "registry.example.test/team-a/steward:0.2.3-controller",
-    "images.mint": "registry.example.test/team-a/steward:0.2.3-mint",
-    "images.web": "registry.example.test/team-a/steward:0.2.3-web",
-    "referenceRuntimes.codex": "registry.example.test/team-a/steward-codex-runtime:0.140.0-steward-0.2.3"
+    "chart": "registry.example.test/team-a/charts/steward:0.2.4",
+    "images.apiserver": "registry.example.test/team-a/steward:0.2.4-apiserver",
+    "images.bridge": "registry.example.test/team-a/steward:0.2.4-bridge",
+    "images.controller": "registry.example.test/team-a/steward:0.2.4-controller",
+    "images.mint": "registry.example.test/team-a/steward:0.2.4-mint",
+    "images.web": "registry.example.test/team-a/steward:0.2.4-web",
+    "referenceRuntimes.codex": "registry.example.test/team-a/steward-codex-runtime:0.140.0-steward-0.2.4"
   }
 }
 ```

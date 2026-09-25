@@ -20,7 +20,7 @@ if [[ -z "${marker_lines}" && "${version_lines}" == 0.1.17 ]]; then
 fi
 
 if [[ "${marker_lines}" == steward.customer-install/v1 ]]; then
-  if [[ "${version_lines}" == 0.2.3 ]] \
+  if [[ "${version_lines}" == 0.2.4 ]] \
     || [[ "${version_lines}" =~ ^0\.1\.([0-9]+)$ && ${BASH_REMATCH[1]} -ge 18 ]]; then
     printf '%s\n' customer-v1
     exit 0
