@@ -56,8 +56,10 @@ it does not create a canonical user, User Envelope, Task, role, or authority.
 Administrator association names one existing active canonical user and is
 revision-checked and append-only audited. Replacement and disable are equally
 explicit. Actor login, display name, and email are metadata and are never lookup
-or matching keys. A valid v2 token may seed only its same issuer/subject and its
-already verified canonical-user binding.
+or matching keys. Steward may best-effort seed a valid v2 token's same
+issuer/subject and already verified canonical-user binding. Seeding failure,
+conflict, or a disabled federated subject never changes otherwise-valid v2
+authentication or admission.
 
 After association, Steward resolves the canonical user's current display email
 from the canonical store and server-authors the v3 service, acting user, owner,

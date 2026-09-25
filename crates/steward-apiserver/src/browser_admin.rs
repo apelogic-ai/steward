@@ -1,6 +1,6 @@
 //! Browser-session administrator APIs backed by Steward's existing authority paths.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -116,6 +116,16 @@ pub(crate) struct BrowserFederatedSubjectResponse {
 pub(crate) struct BrowserFederatedSubjectListResponse {
     api_version: &'static str,
     federated_subjects: Vec<BrowserFederatedSubjectView>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, utoipa::IntoParams)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct FederatedSubjectListQuery {
+    /// Exact trusted token issuer. Must be supplied together with `subject`.
+    issuer: Option<String>,
+    /// Exact authenticated subject. Must be supplied together with `issuer`.
+    subject: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -710,10 +720,12 @@ pub fn protected_federated_subject_router(
     get,
     operation_id = "listAdminFederatedSubjects",
     path = "/admin/api/v1/federated-subjects",
+    params(FederatedSubjectListQuery),
     responses(
         (status = 200, body = BrowserFederatedSubjectListResponse),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Administrator role is required"),
+        (status = 422, description = "Exact lookup parameters are incomplete or invalid"),
         (status = 503, description = "Federated subjects are unavailable")
     ),
     security(("browserSession" = []))
@@ -721,8 +733,18 @@ pub fn protected_federated_subject_router(
 pub(crate) async fn list_federated_subjects(
     Extension(_authority): Extension<BrowserAdminAuthority>,
     State(state): State<FederatedSubjectAdminState>,
+    Query(query): Query<FederatedSubjectListQuery>,
 ) -> Response {
-    match state.store.list_federated_subjects(200).await {
+    let subjects = match (query.issuer.as_deref(), query.subject.as_deref()) {
+        (None, None) => state.store.list_federated_subjects(200).await,
+        (Some(issuer), Some(subject)) => state
+            .store
+            .federated_subject_by_external_identity(issuer, subject)
+            .await
+            .map(|record| record.into_iter().collect()),
+        _ => Err(StoreError::InvalidFederatedSubject),
+    };
+    match subjects {
         Ok(subjects) => Json(BrowserFederatedSubjectListResponse {
             api_version: BROWSER_ADMIN_API_VERSION,
             federated_subjects: subjects.into_iter().map(Into::into).collect(),

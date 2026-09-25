@@ -23,8 +23,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Changed
 
 - Valid v2 credentials may idempotently seed only their same verified
-  issuer/subject and already-resolved canonical user, providing a non-breaking
-  transition to v3. V2 verification and admission otherwise remain unchanged.
+  issuer/subject and already-resolved canonical user as a best-effort transition
+  to v3. Seeding failure, conflict, or disablement never changes v2
+  authentication or admission.
 - Rollback now requires disabling v3 before returning to a v2-only binary and
   preserving migration 0040 data; the federated identity upgrade guide records
   the backup, activation, verification, and rollback sequence.

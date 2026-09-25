@@ -424,6 +424,21 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
             .await,
         Err(StoreError::FederatedSubjectUnassociated)
     ));
+    let exact_lookup = store
+        .federated_subject_by_external_identity(&similarity.issuer, &similarity.subject)
+        .await?
+        .ok_or_else(|| io::Error::other("exact federated-subject lookup returned no record"))?;
+    assert_eq!(exact_lookup.subject_id, similarity.subject_id);
+    assert!(
+        store
+            .federated_subject_by_external_identity(
+                &similarity.issuer,
+                "github-actions:actor:31415926"
+            )
+            .await?
+            .is_none(),
+        "exact lookup must not infer a subject from display metadata or a similar key"
+    );
 
     assert!(
         sqlx::query("UPDATE federated_subject_audit SET actor = 'tampered' WHERE subject_id = $1",)

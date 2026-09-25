@@ -104,10 +104,6 @@ fn discovery_unavailable() -> Response {
         .into_response()
 }
 
-pub(crate) fn valid_authorization_server_url(value: &str) -> bool {
-    validate_authorization_server_url(value, false).is_ok()
-}
-
 fn validate_resource_url(value: &str, allow_loopback_http: bool) -> Result<(), String> {
     let url = validate_url(value, allow_loopback_http, "task auth resource")?;
     if url.path() != "/" {

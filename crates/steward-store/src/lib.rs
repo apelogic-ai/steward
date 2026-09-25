@@ -1077,6 +1077,39 @@ impl PgStore {
         federated_subject_record(row)
     }
 
+    pub async fn federated_subject_by_external_identity(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<FederatedSubjectRecord>, StoreError> {
+        if !valid_federated_subject_observation(&FederatedSubjectObservation {
+            issuer,
+            subject,
+            actor_login: None,
+            display_name: None,
+        }) {
+            return Err(StoreError::InvalidFederatedSubject);
+        }
+        sqlx::query(
+            "SELECT subject_id, issuer, subject, state, canonical_user_id, \
+                    actor_login, display_name, revision, \
+                    to_char(first_seen_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                    to_char(last_seen_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                    to_char(updated_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
+             FROM federated_subjects WHERE issuer = $1 AND subject = $2",
+        )
+        .bind(issuer)
+        .bind(subject)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .map(federated_subject_record)
+        .transpose()
+    }
+
     pub async fn list_federated_subjects(
         &self,
         limit: i64,

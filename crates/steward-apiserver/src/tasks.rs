@@ -49,9 +49,7 @@ use uuid::Uuid;
 
 use crate::WorkflowReference;
 use crate::execution_bindings::ExecutionBindingCatalog;
-use crate::task_auth::{
-    FEDERATED_TASK_TOKEN_CONTRACT, LEGACY_TASK_TOKEN_CONTRACT, valid_authorization_server_url,
-};
+use crate::task_auth::{FEDERATED_TASK_TOKEN_CONTRACT, LEGACY_TASK_TOKEN_CONTRACT};
 use crate::{
     AdmissionLedger, ApiError, BoxFuture, KubernetesTokenReviewAudience,
     authenticated_token_review_user, spec_digest, token_review_request,
@@ -734,7 +732,12 @@ impl TaskIdentityResolver for IdentityTaskIdentityResolver {
                         .await
                         .map_err(map_canonical_identity_error)?;
                     if self.federated_subjects_enabled {
-                        self.canonical_identities
+                        // v2 remains authoritative on its existing verified canonical-user
+                        // claims. Transition seeding is deliberately best-effort: a disabled or
+                        // conflicting v3 association, or an unavailable observation store, must
+                        // not add a new authentication or admission condition to v2.
+                        let _ = self
+                            .canonical_identities
                             .seed_federated_subject_association(
                                 FederatedSubjectObservation {
                                     issuer: &claims.iss,
@@ -745,10 +748,7 @@ impl TaskIdentityResolver for IdentityTaskIdentityResolver {
                                 &identity.canonical_user_id,
                                 "task-auth-v2",
                             )
-                            .await
-                            .map_err(|error| {
-                                map_federated_subject_error(error, &claims.iss, &claims.sub)
-                            })?;
+                            .await;
                     }
                     Ok(identity)
                 }
@@ -1030,7 +1030,7 @@ fn compatibility_task_identity_from_claims(
 }
 
 fn valid_identity_issuer(value: &str) -> bool {
-    valid_authorization_server_url(value)
+    value.starts_with("https://") && value.len() <= 2_048 && !value.chars().any(char::is_whitespace)
 }
 
 fn valid_github_actions_subject(value: &str) -> bool {
@@ -3861,14 +3861,15 @@ mod identity_task_authentication_tests {
     }
 
     #[test]
-    fn task_identity_issuer_requires_a_canonical_credential_free_https_url() {
+    fn legacy_task_identity_issuer_retains_the_v2_configuration_contract() {
         assert!(valid_identity_issuer("https://identity.example.test"));
+        assert!(valid_identity_issuer("https://identity.example.test/"));
+        assert!(valid_identity_issuer(
+            "https://identity.example.test/tenant/"
+        ));
         for invalid in [
             "http://identity.example.test",
-            "https://alice@identity.example.test",
-            "https://identity.example.test?mode=test",
-            "https://identity.example.test#fragment",
-            "https://identity.example.test/../issuer",
+            "https://identity.example.test/a b",
         ] {
             assert!(
                 !valid_identity_issuer(invalid),

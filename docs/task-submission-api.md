@@ -80,9 +80,10 @@ seconds. An unconfigured document returns `503`, `Cache-Control: no-store`,
 `steward-task-v2` remains accepted and is the only advertised contract by
 default. It retains the existing verified email and exact service, acting/owner,
 and canonical-user group semantics below. When federated subjects are enabled,
-a valid v2 token may idempotently seed an association for its same verified
-`(iss, sub)` and already-resolved canonical user; it may not replace a different
-association or revive a disabled subject.
+Steward makes a best-effort attempt to seed an association for the same verified
+`(iss, sub)` and already-resolved canonical user. A conflicting or disabled
+federated-subject record, or a seeding-store failure, does not change v2
+authentication or admission; it only prevents that transition convenience.
 
 `steward-task-v3` is accepted only when
 `taskIdentity.federatedSubjects.enabled=true`. It keeps the exact issuer,
@@ -119,6 +120,11 @@ POST /admin/api/v1/federated-subjects/{subject_id}/associate
 POST /admin/api/v1/federated-subjects/{subject_id}/replace
 POST /admin/api/v1/federated-subjects/{subject_id}/disable
 ```
+
+The collection endpoint returns the 200 most recently seen subjects. An
+administrator can retrieve any older exact identity with
+`?issuer=<exact-issuer>&subject=<exact-subject>`; both parameters are required
+together and matching remains exact.
 
 Association and replacement bodies contain `expectedRevision` and
 `canonicalUserId`; disable contains `expectedRevision` and optional `reason`.
