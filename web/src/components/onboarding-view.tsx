@@ -17,7 +17,7 @@ import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspac
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
-import { ONBOARDING_WORKFLOW_PATH_KEY } from "@/workflows/contracts";
+import { ONBOARDING_WORKFLOW_REFERENCE_KEY } from "@/workflows/contracts";
 
 type OnboardingData = {
   connections: ConnectionsCollectionResponse;
@@ -27,25 +27,21 @@ type OnboardingData = {
 };
 
 export function workflowSetupDone(
-  runs: Array<{ trigger?: null | { callerWorkflow: string } }>,
+  runs: Array<{ workflowName?: string | null; workflowVersion?: number | null }>,
   acknowledged: boolean,
-  suggestedPath: string | null,
+  renderedWorkflow: string | null,
 ) {
   if (acknowledged) return true;
-  if (!suggestedPath) return false;
-  return runs.some((run) => {
-    const workflowRef = run.trigger?.callerWorkflow.split("@", 1)[0];
-    const pathStart = workflowRef?.indexOf("/.github/workflows/") ?? -1;
-    return pathStart >= 0 && workflowRef?.slice(pathStart + 1) === suggestedPath;
-  });
+  if (!renderedWorkflow) return false;
+  return runs.some((run) => `${run.workflowName}@${run.workflowVersion}` === renderedWorkflow);
 }
 
 export function OnboardingView() {
   const session = useSession();
   const [workflowAcknowledged, setWorkflowAcknowledged] = useState(false);
-  const suggestedWorkflowPath = useSyncExternalStore(
+  const renderedWorkflow = useSyncExternalStore(
     () => () => undefined,
-    () => localStorage.getItem(ONBOARDING_WORKFLOW_PATH_KEY),
+    () => localStorage.getItem(ONBOARDING_WORKFLOW_REFERENCE_KEY),
     () => null,
   );
   const [dismissal, setDismissal] = useState<"idle" | "working" | "done" | MutationFailureState>("idle");
@@ -74,7 +70,7 @@ export function OnboardingView() {
       <ResourceBoundary state={state}>{(data) => {
         const connected = data.connections.connections.some((connection) => connection.status.phase === "connected");
         const provisioned = data.envelopes.requests.some((request) => request.status === "provisioned");
-        const workflowReady = workflowSetupDone(data.runs.runs, workflowAcknowledged, suggestedWorkflowPath);
+        const workflowReady = workflowSetupDone(data.runs.runs, workflowAcknowledged, renderedWorkflow);
         const firstRun = data.runs.runs.length > 0;
         const steps = [
           ["Connect GitHub", connected, "Authorize GitHub from Connections."],

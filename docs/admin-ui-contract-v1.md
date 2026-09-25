@@ -99,8 +99,9 @@ CSRF scoped. The onboarding aggregate composes connection, Envelope, workflow,
 and run evidence; dismissal is a server-side preference. When browser surfaces
 are enabled and at least one execution binding is advertised, Steward seeds the
 reserved immutable `repo-summary@1` read-only sample against a deployment-owned
-agent. The renderer returns a deterministic suggested path. The workflow step
-is complete when a run's caller-workflow provenance matches that stored path or
+agent. The renderer returns a deterministic suggested path, but callers may use
+any valid GitHub workflow filename. The workflow step is complete when a run's
+immutable Workflow name and version match the rendered Workflow reference, or
 when the user explicitly acknowledges that the rendered file was added.
 
 ### Fleet and runs
