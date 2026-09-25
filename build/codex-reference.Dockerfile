@@ -20,8 +20,8 @@ RUN curl --fail --silent --show-error --location \
     && mv "${native_root}/bin/codex" "${native_root}/codex/codex" \
     && ln -s ../codex/codex "${native_root}/bin/codex" \
     && test "$(/usr/bin/codex --version)" = "codex-cli 0.140.0" \
-    && test "$(node --print \"require('/usr/lib/node_modules/tar/package.json').version\")" = "7.5.22" \
-    && test "$(node --print \"require('/usr/lib/node_modules/npm/node_modules/tar/package.json').version\")" = "7.5.22" \
+    && test "$(node --print 'require("/usr/lib/node_modules/tar/package.json").version')" = "7.5.22" \
+    && test "$(node --print 'require("/usr/lib/node_modules/npm/node_modules/tar/package.json").version')" = "7.5.22" \
     && test -x /usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex/codex
 
 USER sandbox

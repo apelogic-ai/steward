@@ -1535,6 +1535,8 @@ mod tests {
             "LINUX_LIBC_DEV_SHA256=937db1a88a4fa2ea97fd4eab89f2cd9d077290f6a26bcd27b1a6d24fa3d706b6",
             "tar@7.5.22",
             "/usr/lib/node_modules/npm/node_modules/tar/package.json",
+            "node --print 'require(\"/usr/lib/node_modules/tar/package.json\").version'",
+            "node --print 'require(\"/usr/lib/node_modules/npm/node_modules/tar/package.json\").version'",
         ] {
             assert!(
                 container.contains(required),
