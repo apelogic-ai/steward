@@ -875,7 +875,7 @@ where
     params(
         ("task_uid" = String, Path, format = "uuid"),
         ("stream" = String, Path, description = "Exact execution stream: stdout or stderr"),
-        ("after" = Option<usize>, Query, description = "Zero-based byte offset")
+        ("after" = usize, Query, description = "Required by generated clients for the typed JSON response; legacy callers may omit it for text/plain")
     ),
     responses(
         (status = 200, content(
@@ -917,7 +917,7 @@ where
     params(
         ("task_uid" = String, Path, format = "uuid"),
         ("stream" = String, Path, description = "Exact execution stream: stdout or stderr"),
-        ("after" = Option<usize>, Query, description = "Zero-based byte offset")
+        ("after" = usize, Query, description = "Required by generated clients for the typed JSON response; legacy callers may omit it for text/plain")
     ),
     responses(
         (status = 200, content(

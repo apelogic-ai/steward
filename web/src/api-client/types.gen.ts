@@ -1185,11 +1185,11 @@ export type AllRunExecutionLogData = {
          */
         stream: string;
     };
-    query?: {
+    query: {
         /**
-         * Zero-based byte offset
+         * Required by generated clients for the typed JSON response; legacy callers may omit it for text/plain
          */
-        after?: number;
+        after: number;
     };
     url: '/admin/api/v1/all-runs/{task_uid}/logs/{stream}';
 };
@@ -2721,11 +2721,11 @@ export type MyRunExecutionLogData = {
          */
         stream: string;
     };
-    query?: {
+    query: {
         /**
-         * Zero-based byte offset
+         * Required by generated clients for the typed JSON response; legacy callers may omit it for text/plain
          */
-        after?: number;
+        after: number;
     };
     url: '/app/api/v1/runs/{task_uid}/logs/{stream}';
 };

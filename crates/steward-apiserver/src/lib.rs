@@ -4574,6 +4574,38 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn generated_log_clients_require_an_offset_for_the_typed_json_contract() -> Result<(), String> {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        for pointer in [
+            "/paths/~1app~1api~1v1~1runs~1{task_uid}~1logs~1{stream}/get",
+            "/paths/~1admin~1api~1v1~1all-runs~1{task_uid}~1logs~1{stream}/get",
+        ] {
+            let parameters = document
+                .pointer(&format!("{pointer}/parameters"))
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| format!("execution-log parameters are absent at {pointer}"))?;
+            let after = parameters
+                .iter()
+                .find(|parameter| {
+                    parameter
+                        .pointer("/name")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("after")
+                })
+                .ok_or_else(|| format!("execution-log offset is absent at {pointer}"))?;
+            assert_eq!(
+                after
+                    .pointer("/required")
+                    .and_then(serde_json::Value::as_bool),
+                Some(true),
+                "generated clients must always send after so their typed response is JSON"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn browser_admin_routes_require_cookie_admin_and_exact_mutation_proof_and_audit_canonical_actor()
     -> Result<(), String> {
