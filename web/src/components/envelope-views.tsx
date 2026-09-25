@@ -27,6 +27,11 @@ import { useSession } from "@/session/session-context";
 import { listPublishedWorkflows, renderWorkflowForEnvelope, type PublishedWorkflowListResponse } from "@/workflows/api";
 import { workflowReference } from "@/workflows/contracts";
 
+function dateTime(value: string): string {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.valueOf()) ? value : parsed.toLocaleString();
+}
+
 function EnvelopeSummary({ envelope }: Readonly<{ envelope: BrowserEnvelope }>) {
   return <DefinitionList items={[
     ["Monthly limit", `${envelope.spec.budget.monthlyLimit} ${envelope.spec.budget.currency}`],
@@ -57,6 +62,7 @@ export function EnvelopesView() {
 }
 
 function EnvelopeCard({ request }: Readonly<{ request: UserEnvelopeRequest }>) {
+  const usage = request.usage?.spend;
   return (
     <li className="rounded-panel border bg-panel p-5 shadow-sm">
       <div className="flex items-start justify-between gap-4">
@@ -64,6 +70,7 @@ function EnvelopeCard({ request }: Readonly<{ request: UserEnvelopeRequest }>) {
         <StatusBadge value={request.status} />
       </div>
       <div className="mt-5"><EnvelopeSummary envelope={request.approvedEnvelope ?? request.requestedEnvelope} /></div>
+      {request.usage ? <p className="mt-4 text-sm text-muted-ink">This month: {usage ? `${usage.observed} / ${usage.limit} ${usage.currency}` : request.usage.availability.reason ?? "Usage unavailable"}</p> : null}
       <Link className="mt-5 inline-flex min-h-11 items-center text-sm font-semibold text-brand hover:text-brand-strong" href={`/envelopes/${request.id}`}>View envelope →</Link>
     </li>
   );
@@ -201,14 +208,26 @@ export function EnvelopeDetailView({ requestId }: Readonly<{ requestId: string }
 }
 
 function EnvelopeDetail({ request }: Readonly<{ request: UserEnvelopeRequest }>) {
+  const usage = request.usage?.spend;
   return (
     <div className="space-y-5">
       <article className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
         <div className="flex flex-wrap justify-between gap-3"><div><h2 className="text-xl font-semibold">{request.templateId}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.id}</p></div><StatusBadge value={request.status} /></div>
         <EnvelopeSummary envelope={request.approvedEnvelope ?? request.requestedEnvelope} />
+        {request.usage ? <DefinitionList items={[
+          ["Period", `${dateTime(request.usage.period.start)} – ${dateTime(request.usage.period.end)}`],
+          ["Spend", usage ? `${usage.observed} / ${usage.limit} ${usage.currency}` : request.usage.availability.reason ?? "Unavailable"],
+          ["Observed", usage ? dateTime(usage.observedAt) : "Not reported"],
+        ]} /> : null}
         {request.reason ? <p className="rounded-md bg-notice p-4 text-sm"><strong>Server reason:</strong> {request.reason}</p> : null}
         {request.envelopeInstanceId ? <PrimaryLink href={`/envelopes/${request.id}/runs`}>View recent runs</PrimaryLink> : null}
       </article>
+      <section className="space-y-3 rounded-panel border bg-panel p-6 shadow-sm">
+        <h2 className="text-xl font-semibold">Status history</h2>
+        {request.history.length ? <ol className="space-y-3">{request.history.map((event, index) => (
+          <li className="rounded-md border p-3" key={`${event.at}-${index}`}><div className="flex items-center justify-between gap-3"><StatusBadge value={event.status} /><time className="text-xs text-muted-ink">{dateTime(event.at)}</time></div><p className="mt-2 text-sm">Actor: {event.actor}</p>{event.reason ? <p className="mt-1 text-sm text-muted-ink">{event.reason}</p> : null}</li>
+        ))}</ol> : <EmptyState title="No history" />}
+      </section>
       {request.status === "provisioned" ? <WorkflowGenerator requestId={request.id} /> : <EmptyState title="Workflow not available"><p>A governed GitHub Actions workflow can be rendered only after this request is provisioned.</p></EmptyState>}
     </div>
   );

@@ -13,6 +13,7 @@ function run(overrides: Partial<BrowserRunView>): BrowserRunView {
     finalized: true,
     phase: "succeeded",
     runtimeOwnership: "provisioned",
+    stages: [],
     taskUid: "task-default",
     updatedAt: "2026-08-25T20:00:00Z",
     workflow: "test-wf@3",
