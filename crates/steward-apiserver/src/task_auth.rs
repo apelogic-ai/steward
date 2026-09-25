@@ -190,6 +190,13 @@ mod tests {
         assert_eq!(
             response
                 .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            response
+                .headers()
                 .get(header::CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
             Some("public, max-age=300")
@@ -197,6 +204,10 @@ mod tests {
         let body = to_bytes(response.into_body(), 8 * 1024)
             .await
             .map_err(|error| error.to_string())?;
+        assert!(
+            body.len() < 8 * 1024,
+            "discovery response must remain bounded"
+        );
         let body: serde_json::Value =
             serde_json::from_slice(&body).map_err(|error| error.to_string())?;
         assert_eq!(body["resource"], "https://steward.example.test");
@@ -226,9 +237,23 @@ mod tests {
         assert_eq!(
             response
                 .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            response
+                .headers()
                 .get(header::CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
             Some("no-store")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("30")
         );
         let body = to_bytes(response.into_body(), 8 * 1024)
             .await
@@ -241,14 +266,45 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn discovery_default_advertises_only_the_legacy_contract() -> Result<(), String> {
+        let config = TaskAuthDiscoveryConfig::new(
+            "https://steward.example.test".to_owned(),
+            "https://identity.example.test".to_owned(),
+            false,
+        )?;
+        let response = task_auth_discovery_router(Some(config))
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/oauth-protected-resource")
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+        assert_eq!(
+            body["steward_task_token_contracts"],
+            serde_json::json!(["steward-task-v2"])
+        );
+        Ok(())
+    }
+
     #[test]
     fn discovery_configuration_rejects_ambiguous_urls_and_limits_http_to_tests() {
         for resource in [
             "http://steward.example.test",
             "https://alice@steward.example.test",
             "https://steward.example.test/api",
+            "https://steward.example.test/",
             "https://steward.example.test?mode=test",
             "https://steward.example.test#fragment",
+            &format!("https://{}.example.test", "a".repeat(2_048)),
         ] {
             assert!(
                 TaskAuthDiscoveryConfig::new(
@@ -258,6 +314,23 @@ mod tests {
                 )
                 .is_err(),
                 "accepted invalid resource {resource}"
+            );
+        }
+        for authorization_server in [
+            "http://identity.example.test",
+            "https://alice@identity.example.test",
+            "https://identity.example.test/",
+            "https://identity.example.test?mode=test",
+            "https://identity.example.test#fragment",
+        ] {
+            assert!(
+                TaskAuthDiscoveryConfig::new(
+                    "https://steward.example.test".to_owned(),
+                    authorization_server.to_owned(),
+                    true,
+                )
+                .is_err(),
+                "accepted invalid authorization server {authorization_server}"
             );
         }
         assert!(
