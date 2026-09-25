@@ -1500,9 +1500,19 @@ mod tests {
     }
 
     #[test]
-    fn codex_reference_runtime_is_a_released_artifact() -> Result<(), String> {
+    fn codex_reference_runtime_is_a_released_conformant_artifact() -> Result<(), String> {
         let container = fs::read_to_string(root().join("build/codex-reference.Dockerfile"))
             .map_err(|error| format!("Codex reference runtime build is required: {error}"))?;
+        let conformance =
+            fs::read_to_string(root().join("scripts/codex-reference-runtime-conformance.sh"))
+                .map_err(|error| {
+                    format!("Codex reference runtime conformance is required: {error}")
+                })?;
+        let openshell_conformance =
+            fs::read_to_string(root().join("scripts/codex-reference-runtime-openshell-inside.sh"))
+                .map_err(|error| format!("Codex OpenShell conformance is required: {error}"))?;
+        let openshell_testbed = fs::read_to_string(root().join("scripts/openshell-testbed.sh"))
+            .map_err(|error| format!("OpenShell testbed is required: {error}"))?;
         let vulnerability_exceptions =
             fs::read_to_string(root().join("security/codex-reference-runtime.openvex.json"))
                 .map_err(|error| format!("Codex reference runtime VEX is required: {error}"))?;
@@ -1511,6 +1521,8 @@ mod tests {
                 .map_err(|error| format!("Codex reference runtime VEX must be JSON: {error}"))?;
         let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
             .map_err(|error| format!("release workflow is required: {error}"))?;
+        let ci_workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("CI workflow is required: {error}"))?;
         let documentation =
             fs::read_to_string(root().join("docs/installation/codex-reference-runtime.md"))
                 .map_err(|error| {
@@ -1561,6 +1573,55 @@ mod tests {
             );
         }
         for required in [
+            "STEWARD_OPEN_SHELL_RELEASE=v0.0.98",
+            "STEWARD_OPENSHELL_SUPERVISOR_TOPOLOGY=sidecar",
+            "STEWARD_OPENSHELL_PROCESS_BINARY_AWARE_NETWORK_POLICY=true",
+            "scripts/openshell-testbed.sh",
+            "scripts/codex-reference-runtime-openshell-inside.sh",
+        ] {
+            assert!(
+                conformance.contains(required),
+                "Codex reference runtime conformance must execute {required}"
+            );
+        }
+        for required in [
+            "provider profile import --global",
+            "--provider steward-litellm",
+            "--provider steward-mcp-gw",
+            "/usr/bin/codex --version",
+            "codex-cli 0.140.0",
+            "print_failure_diagnostics",
+            "openshell.ai/managed-by=openshell",
+            "--tail=80",
+        ] {
+            assert!(
+                openshell_conformance.contains(required),
+                "Codex OpenShell conformance must prove {required}"
+            );
+        }
+        for required in [
+            "STEWARD_OPENSHELL_SUPERVISOR_TOPOLOGY",
+            "supervisor.topology=${OPEN_SHELL_SUPERVISOR_TOPOLOGY}",
+            "STEWARD_OPENSHELL_PROCESS_BINARY_AWARE_NETWORK_POLICY",
+            "supervisor.sidecar.processBinaryAwareNetworkPolicy=${OPEN_SHELL_PROCESS_BINARY_AWARE_NETWORK_POLICY}",
+        ] {
+            assert!(
+                openshell_testbed.contains(required),
+                "OpenShell testbed must project {required}"
+            );
+        }
+        for required in [
+            "codex-cli 0.140.0",
+            "provider-profile-bundle/v1.2.0/profiles/steward-litellm.json",
+            "provider-profile-bundle/v1.2.0/profiles/steward-mcp-gw.json",
+            "requiredBinaries",
+        ] {
+            assert!(
+                conformance.contains(required),
+                "Codex reference runtime conformance must prove {required}"
+            );
+        }
+        for required in [
             "publish-codex-reference-runtime:",
             "build/codex-reference.Dockerfile",
             "provenance: mode=max",
@@ -1568,6 +1629,8 @@ mod tests {
             "trivy-config: security/codex-reference-runtime.trivy.yaml",
             "release-codex-reference-runtime",
             "codex-reference-runtime.digest",
+            "codex-reference-runtime-conformance:",
+            "scripts/codex-reference-runtime-conformance.sh",
             "referenceRuntimes:",
             "agentRef: \"codex@0.140.0\"",
             "platform: \"linux/amd64\"",
@@ -1577,10 +1640,42 @@ mod tests {
                 "release workflow must include {required}"
             );
         }
+        let conformance_job = workflow
+            .split_once("  codex-reference-runtime-conformance:")
+            .and_then(|(_, remainder)| remainder.split_once("\n  openshell-x86-conformance:"))
+            .map(|(job, _)| job)
+            .ok_or_else(|| "Codex reference runtime conformance job is required".to_string())?;
+        for required in [
+            "uses: ./.github/actions/setup-tools",
+            "kubernetes-tools: \"true\"",
+        ] {
+            assert!(
+                conformance_job.contains(required),
+                "Codex reference runtime conformance job must include {required}"
+            );
+        }
+        let candidate_job = ci_workflow
+            .split_once("  codex-reference-runtime:")
+            .and_then(|(_, remainder)| remainder.split_once("\n  release-candidate:"))
+            .map(|(job, _)| job)
+            .ok_or_else(|| "Codex reference runtime PR job is required".to_string())?;
+        for required in [
+            "kubernetes-tools: \"true\"",
+            "cargo build --locked --release --package xtask --bin steward-provider-profile",
+            "scripts/package-provider-profile-bundle.sh",
+            "STEWARD_ALLOW_LOCAL_CODEX_IMAGE=1",
+            "scripts/codex-reference-runtime-conformance.sh",
+        ] {
+            assert!(
+                candidate_job.contains(required),
+                "Codex reference runtime PR job must run live conformance with {required}"
+            );
+        }
         for required in [
             "codex@0.140.0",
             "docker buildx imagetools create",
             "build/codex-reference.Dockerfile",
+            "scripts/codex-reference-runtime-conformance.sh",
         ] {
             assert!(
                 documentation.contains(required),

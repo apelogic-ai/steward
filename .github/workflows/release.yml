@@ -330,6 +330,52 @@ jobs:
             dist/provider-profile-bundle.digest
           if-no-files-found: error
 
+  codex-reference-runtime-conformance:
+    needs: [publish-codex-reference-runtime, publish-provider-profile-bundle]
+    name: release / Codex reference runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install pinned Kubernetes tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+
+      - name: Download Codex runtime evidence
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: release-codex-reference-runtime
+          path: dist
+
+      - name: Download provider-profile evidence
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: release-provider-profile-bundle
+          path: dist
+
+      - name: Verify Codex runtime and released provider-profile compatibility
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          scripts/codex-reference-runtime-conformance.sh \
+            --image "ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime@$(cat dist/codex-reference-runtime.digest)" \
+            --provider-profile-bundle "dist/steward-runtime-providers-${version}.tar.gz"
+
   publish-platform-preflight-bundle:
     needs: validate
     runs-on: ubuntu-latest
@@ -562,13 +608,14 @@ jobs:
           bash scripts/customer-core-install-e2e.sh
 
   release:
-    needs: [publish-images, publish-provider-profile-bundle, publish-codex-reference-runtime, publish-platform-preflight-bundle, registry-mirror-conformance, openshell-x86-conformance, publish-chart, released-artifact-acceptance]
+    needs: [publish-images, publish-provider-profile-bundle, publish-codex-reference-runtime, codex-reference-runtime-conformance, publish-platform-preflight-bundle, registry-mirror-conformance, openshell-x86-conformance, publish-chart, released-artifact-acceptance]
     if: >-
       ${{
         always() &&
         needs.publish-images.result == 'success' &&
         needs.publish-provider-profile-bundle.result == 'success' &&
         needs.publish-codex-reference-runtime.result == 'success' &&
+        needs.codex-reference-runtime-conformance.result == 'success' &&
         needs.publish-platform-preflight-bundle.result == 'success' &&
         needs.registry-mirror-conformance.result == 'success' &&
         needs.openshell-x86-conformance.result == 'success' &&
@@ -749,7 +796,7 @@ jobs:
             printf 'The provider-profile release bundle now includes a standalone linux/amd64 validator and installer with deterministic output and machine-readable evidence.\n\n'
             printf 'The release includes a daemonless ORAS mirror for the OCI chart, component images, and reference runtimes, with explicit planning, collision-safe resume, target digest verification, and a deterministic credential-free deployment lock.\n\n'
             printf 'The release includes one attested compatibility manifest with exact Steward, companion-product, OpenShell, agent-sandbox, SPIRE, MCP-GW, and LiteLLM coordinates and contracts.\n\n'
-            printf 'The release includes a supported linux/amd64 Codex 0.140.0 reference runtime, with its immutable digest, SBOM, provenance, and vulnerability report.\n\n'
+            printf 'The release includes a supported linux/amd64 Codex 0.140.0 reference runtime, with its immutable digest, SBOM, provenance, and provider-profile conformance evidence.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
             printf 'Before migration 0039, terminalize and finalize every unfinished legacy Task that lacks a complete User Envelope or internal-authority pin. Use Identity v0.5.0 with policy contract github-oidc-exchange.apelogic.io/v5, remove Service Envelope bootstrap configuration, and configure the non-authoritative capability catalog.\n\n'
             printf 'Rollback from v0.2.5 to v0.2.1 requires no database rollback because this patch adds no migration. The v0.1.23 rollback boundary remains unchanged; see docs/installation/upgrade-v0.2.0.md.\n\n'

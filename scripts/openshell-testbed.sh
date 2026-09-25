@@ -7,6 +7,28 @@ if [[ ! "${OPEN_SHELL_RELEASE}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "STEWARD_OPEN_SHELL_RELEASE must be a semantic release tag" >&2
   exit 2
 fi
+OPEN_SHELL_SUPERVISOR_TOPOLOGY="${STEWARD_OPENSHELL_SUPERVISOR_TOPOLOGY:-}"
+case "${OPEN_SHELL_SUPERVISOR_TOPOLOGY}" in
+  "" | combined | sidecar) ;;
+  *)
+    echo "STEWARD_OPENSHELL_SUPERVISOR_TOPOLOGY must be combined or sidecar" >&2
+    exit 2
+    ;;
+esac
+OPEN_SHELL_PROCESS_BINARY_AWARE_NETWORK_POLICY="${STEWARD_OPENSHELL_PROCESS_BINARY_AWARE_NETWORK_POLICY:-}"
+case "${OPEN_SHELL_PROCESS_BINARY_AWARE_NETWORK_POLICY}" in
+  "" | true | false) ;;
+  *)
+    echo "STEWARD_OPENSHELL_PROCESS_BINARY_AWARE_NETWORK_POLICY must be true or false" >&2
+    exit 2
+    ;;
+esac
+if [[ -n "${OPEN_SHELL_PROCESS_BINARY_AWARE_NETWORK_POLICY}" \
+  && "${OPEN_SHELL_SUPERVISOR_TOPOLOGY}" != "sidecar" ]]
+then
+  echo "STEWARD_OPENSHELL_PROCESS_BINARY_AWARE_NETWORK_POLICY requires sidecar topology" >&2
+  exit 2
+fi
 OPEN_SHELL_HELM_VERSION="${OPEN_SHELL_RELEASE#v}"
 RUN_ID="${STEWARD_RUN_ID:-$(date -u +%Y%m%d%H%M%S)-$$}"
 if [[ ! "${RUN_ID}" =~ ^[a-z0-9-]+$ ]]; then
@@ -294,6 +316,16 @@ env \
   --wait \
   --timeout 10m
 openshell_helm_args+=(--values "${ROOT}/config/openshell/provider-token-grants.yaml")
+if [[ -n "${OPEN_SHELL_SUPERVISOR_TOPOLOGY}" ]]; then
+  openshell_helm_args+=(
+    --set-string "supervisor.topology=${OPEN_SHELL_SUPERVISOR_TOPOLOGY}"
+  )
+fi
+if [[ -n "${OPEN_SHELL_PROCESS_BINARY_AWARE_NETWORK_POLICY}" ]]; then
+  openshell_helm_args+=(
+    --set "supervisor.sidecar.processBinaryAwareNetworkPolicy=${OPEN_SHELL_PROCESS_BINARY_AWARE_NETWORK_POLICY}"
+  )
+fi
 openshell_helm_args+=(
   --set-string server.defaultRuntimeClassName=
   --set server.auth.allowUnauthenticatedUsers=false

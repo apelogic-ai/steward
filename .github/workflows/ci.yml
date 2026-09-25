@@ -187,7 +187,7 @@ jobs:
   codex-reference-runtime:
     name: release / Codex reference runtime
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -205,6 +205,36 @@ jobs:
           format: table
           exit-code: "1"
           severity: CRITICAL
+
+      - name: Install pinned Kubernetes tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Build standalone provider-profile installer
+        run: cargo build --locked --release --package xtask --bin steward-provider-profile
+
+      - name: Package candidate provider profiles
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          scripts/package-provider-profile-bundle.sh \
+            --version 0.0.0 \
+            --installer target/release/steward-provider-profile \
+            --installer-os linux \
+            --installer-architecture amd64 \
+            --output dist
+
+      - name: Verify candidate runtime and provider-profile compatibility
+        run: |
+          set -euo pipefail
+          STEWARD_ALLOW_LOCAL_CODEX_IMAGE=1 \
+          scripts/codex-reference-runtime-conformance.sh \
+            --image steward-codex-runtime:release-validation \
+            --provider-profile-bundle dist/steward-runtime-providers-0.0.0.tar.gz
 
   release-candidate:
     name: release / chart and images
