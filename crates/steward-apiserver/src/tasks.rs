@@ -60,6 +60,7 @@ const TASK_OWNER_GROUP_PREFIX: &str = "agents.apelogic.ai/task-owner:";
 const CANONICAL_USER_GROUP_PREFIX: &str = "agents.apelogic.ai/canonical-user:";
 const VERSIONED_WORKFLOW_NAMESPACE: &str = "steward-workflows";
 const IDENTITY_TASK_CONTRACT: &str = "steward-task-v2";
+const FEDERATED_TASK_CONTRACT: &str = "steward-task-v3";
 const MAX_IDENTITY_TASK_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_IDENTITY_JWKS_BYTES: usize = 128 * 1024;
 const MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS: u64 = 300;
@@ -644,9 +645,12 @@ struct IdentityTaskClaims {
     iat: u64,
     nbf: u64,
     jti: String,
-    email: String,
-    email_verified: bool,
-    groups: Vec<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    email_verified: Option<bool>,
+    #[serde(default)]
+    groups: Option<Vec<String>>,
     identity_contract: String,
     #[serde(default)]
     source_provenance: Option<SourceProvenance>,
@@ -686,9 +690,12 @@ impl IdentityTaskIdentityResolver {
     ) -> Result<UserInfo, TaskAuthenticationError> {
         let claims =
             verify_identity_task_token(assertion, &self.jwks, &self.issuer, &self.audience)?;
+        if claims.identity_contract != IDENTITY_TASK_CONTRACT {
+            return Err(TaskAuthenticationError::InvalidCredentials);
+        }
         Ok(UserInfo {
-            username: Some(claims.email),
-            groups: Some(claims.groups),
+            username: claims.email,
+            groups: claims.groups,
             ..UserInfo::default()
         })
     }
@@ -821,11 +828,28 @@ fn validate_identity_task_claims(
             values.len() == 1 && values.first() == Some(&audience.to_owned())
         }
     };
+    let valid_legacy_identity = claims.identity_contract == IDENTITY_TASK_CONTRACT
+        && claims.email_verified == Some(true)
+        && claims.email.as_deref().is_some_and(valid_email)
+        && claims
+            .groups
+            .as_ref()
+            .is_some_and(|groups| groups.len() <= 16);
+    let valid_federated_identity = claims.identity_contract == FEDERATED_TASK_CONTRACT
+        && valid_github_actions_subject(&claims.sub)
+        && claims
+            .groups
+            .as_ref()
+            .is_none_or(|groups| groups.len() <= 16)
+        && claims
+            .email
+            .as_deref()
+            .is_none_or(valid_email)
+        && claims.email.is_some() == claims.email_verified.is_some()
+        && claims.email_verified.is_none_or(|verified| verified);
     if claims.iss != issuer
         || !audience_matches
-        || claims.identity_contract != IDENTITY_TASK_CONTRACT
-        || !claims.email_verified
-        || !valid_email(&claims.email)
+        || (!valid_legacy_identity && !valid_federated_identity)
         || !bounded_non_whitespace(&claims.sub, 255)
         || !bounded_non_whitespace(&claims.jti, 128)
         || claims.exp.saturating_add(IDENTITY_CLOCK_SKEW_SECONDS) <= now
@@ -835,7 +859,6 @@ fn validate_identity_task_claims(
                 .iat
                 .saturating_add(MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS)
         || claims.nbf > now.saturating_add(IDENTITY_CLOCK_SKEW_SECONDS)
-        || claims.groups.len() > 16
     {
         return Err(TaskAuthenticationError::InvalidCredentials);
     }
@@ -852,10 +875,13 @@ fn validate_identity_task_claims(
 fn task_identity_from_identity_claims(
     claims: IdentityTaskClaims,
 ) -> Result<TaskIdentity, TaskAuthenticationError> {
+    if claims.identity_contract != IDENTITY_TASK_CONTRACT {
+        return Err(TaskAuthenticationError::InvalidCredentials);
+    }
     let source_provenance = claims.source_provenance;
     let user = UserInfo {
-        username: Some(claims.email),
-        groups: Some(claims.groups),
+        username: claims.email,
+        groups: claims.groups,
         ..UserInfo::default()
     };
     task_identity_from_kubernetes_user(&user).map(|mut identity| {
@@ -865,7 +891,35 @@ fn task_identity_from_identity_claims(
 }
 
 fn valid_identity_issuer(value: &str) -> bool {
-    value.starts_with("https://") && value.len() <= 2_048 && !value.chars().any(char::is_whitespace)
+    if value.is_empty()
+        || value.len() > 2_048
+        || value.trim() != value
+        || value.ends_with('/')
+        || value.chars().any(char::is_whitespace)
+    {
+        return false;
+    }
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.as_str().trim_end_matches('/') == value
+    })
+}
+
+fn valid_github_actions_subject(value: &str) -> bool {
+    value
+        .strip_prefix("github-actions:actor:")
+        .is_some_and(|actor_id| {
+            !actor_id.is_empty()
+                && actor_id.len() <= 20
+                && actor_id.bytes().all(|byte| byte.is_ascii_digit())
+                && actor_id != "0"
+                && !actor_id.starts_with('0')
+        })
 }
 
 fn bounded_non_whitespace(value: &str, maximum: usize) -> bool {
@@ -3371,7 +3425,7 @@ mod workflow_request_tests {
 mod identity_task_authentication_tests {
     use super::{
         IdentityTaskClaims, TaskAuthenticationError, task_identity_from_identity_claims,
-        validate_identity_task_jwks, verify_identity_task_token,
+        valid_identity_issuer, validate_identity_task_jwks, verify_identity_task_token,
     };
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -3399,6 +3453,18 @@ mod identity_task_authentication_tests {
         email: &'a str,
         email_verified: bool,
         groups: Vec<&'a str>,
+        identity_contract: &'a str,
+    }
+
+    #[derive(Serialize)]
+    struct FederatedClaims<'a> {
+        iss: &'a str,
+        sub: &'a str,
+        aud: Vec<&'a str>,
+        exp: u64,
+        iat: u64,
+        nbf: u64,
+        jti: &'a str,
         identity_contract: &'a str,
     }
 
@@ -3453,6 +3519,53 @@ mod identity_task_authentication_tests {
             key,
         )
         .map_err(|error| format!("sign Identity task token: {error}"))
+    }
+
+    fn federated_token(key: &EncodingKey) -> Result<String, String> {
+        let now = jsonwebtoken::get_current_timestamp();
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(KID.to_owned());
+        encode(
+            &header,
+            &FederatedClaims {
+                iss: ISSUER,
+                sub: "github-actions:actor:16106037",
+                aud: vec![AUDIENCE],
+                exp: now + 60,
+                iat: now,
+                nbf: now.saturating_sub(1),
+                jti: "federated-task-test-jti",
+                identity_contract: "steward-task-v3",
+            },
+            key,
+        )
+        .map_err(|error| format!("sign federated task token: {error}"))
+    }
+
+    #[test]
+    fn federated_task_contract_accepts_stable_subject_without_v2_identity_claims()
+    -> Result<(), String> {
+        let (key, jwks) = key_material()?;
+        let assertion = federated_token(&key)?;
+        let claims = verify_identity_task_token(&assertion, &jwks, ISSUER, AUDIENCE)
+            .map_err(|error| format!("valid federated task credential rejected: {error:?}"))?;
+        assert_eq!(claims.sub, "github-actions:actor:16106037");
+        assert_eq!(claims.identity_contract, "steward-task-v3");
+        Ok(())
+    }
+
+    #[test]
+    fn task_identity_issuer_requires_a_canonical_credential_free_https_url() {
+        assert!(valid_identity_issuer("https://identity.example.test"));
+        for invalid in [
+            "http://identity.example.test",
+            "https://alice@identity.example.test",
+            "https://identity.example.test?mode=test",
+            "https://identity.example.test#fragment",
+            "https://identity.example.test/../issuer",
+        ] {
+            assert!(!valid_identity_issuer(invalid), "accepted invalid issuer {invalid}");
+        }
     }
 
     #[test]
