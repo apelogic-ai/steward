@@ -473,7 +473,7 @@ that allowlist remain inaccessible to both service accounts.
   (`/steward/mint` by default).
 
 Both the apiserver and controller apply the embedded append-only Postgres
-migration set on startup (currently through migration `0040`). They must
+migration set on startup (currently through migration `0049`). They must
 receive the same database URL. Review the
 [installation upgrade and backup procedure](../../docs/installation/installation-guide.md#upgrade-rollback-backup-and-removal)
 before upgrading; a Helm rollback does not reverse database migrations.

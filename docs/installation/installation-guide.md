@@ -556,7 +556,7 @@ Do not hand off merely because `helm template` or `helm lint` passed.
    --context "$CLUSTER_CONTEXT" -n steward rollout status deployment/steward-apiserver`
    and the same command for `deployment/steward-controller` complete.
    The database operator confirms the embedded migration table is at the
-   migration packaged in the exact release (currently `0040`) using an
+   migration packaged in the exact release (currently `0049`) using an
    approved database session that does not expose the URI or row contents.
 2. The `agentruntimes.agents.apelogic.ai` CRD is Established, and the
    `steward-agentruntime` validating webhook has `failurePolicy: Fail`, the

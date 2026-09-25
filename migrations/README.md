@@ -75,14 +75,14 @@ Tasks, runs, runtimes, Envelopes, or historical identity. The new
 additive tables during a rolling upgrade. After v3 observations are written,
 rollback requires disabling v3 first and preserving migration 0040 data.
 
-Migration 0047 adds append-only runtime-minute observations, exhaustion records,
+Migration 0048 adds append-only runtime-minute observations, exhaustion records,
 instance-scoped grants, and denial decisions. Runtime usage is derived from
 `task_lifecycle_events` running-to-terminal intervals, with a running Task clipped
 at observation time and every interval clipped to the current UTC month. The same
 migration adds a stable UUID public identifier to existing spend exhaustions so
 the unified escalation API does not expose an internal sequence key.
 
-Migration 0048 adds the governed GitHub workflow re-run operation. It admits the
+Migration 0049 adds the governed GitHub workflow re-run operation. It admits the
 immutable Steward connections authority v3, whose only additional grant is
 `github/actions_run_trigger/write`, while preserving existing v1/v2 operation
 rows. The operation kind remains database-allowlisted and invokes only MCP-GW's
