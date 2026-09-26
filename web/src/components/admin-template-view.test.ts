@@ -12,6 +12,7 @@ describe("first envelope template", () => {
         tools: [],
         ttl: "15m",
         runner: { platforms: ["linux"] },
+        runtimeMinutesLimit: "60",
       },
     });
   });

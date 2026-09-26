@@ -19,6 +19,10 @@ use crate::browser_auth::{
 use crate::{ApiError, BoxFuture};
 
 const BROWSER_WORKFLOW_API_VERSION: &str = "steward.workflows/v1";
+pub(crate) const SAMPLE_WORKFLOW_NAME: &str = "repo-summary";
+pub(crate) const SAMPLE_WORKFLOW_DISPLAY_NAME: &str = "Repository summary";
+pub(crate) const SAMPLE_WORKFLOW_PROMPT: &str = "Summarize the repository structure, its primary components, and the most important developer entry points. Do not modify repository contents.";
+pub(crate) const SAMPLE_WORKFLOW_ACTOR: &str = "system:sample-workflow";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowReference {
@@ -75,7 +79,8 @@ impl PublishWorkflowRequest {
         &self,
         allowed_agents: &BTreeSet<String>,
     ) -> Result<(), PublishWorkflowError> {
-        if !valid_workflow_name(&self.name)
+        if self.name == SAMPLE_WORKFLOW_NAME
+            || !valid_workflow_name(&self.name)
             || self.display_name.trim().is_empty()
             || !allowed_agents.contains(&self.agent)
             || self.prompt.trim().is_empty()
@@ -203,6 +208,74 @@ impl WorkflowRepository for PgStore {
         publication: WorkflowPublication<'a>,
     ) -> BoxFuture<'a, Result<WorkflowRevisionRecord, StoreError>> {
         Box::pin(async move { PgStore::publish_next_workflow(self, publication).await })
+    }
+}
+
+/// Ensure the browser onboarding catalog contains one executable, deployment-bound sample.
+///
+/// The logical agent is chosen deterministically from the deployment-owned execution catalog.
+/// The reserved sample identity is immutable: an existing conflicting revision fails closed
+/// instead of being reinterpreted as Steward's sample.
+pub async fn ensure_sample_workflow<L>(
+    repository: &L,
+    agents: &[ExecutionBindingAdvertisement],
+) -> Result<Option<WorkflowRevisionRecord>, StoreError>
+where
+    L: WorkflowRepository,
+{
+    if let Some(existing) = repository
+        .workflow_revision(SAMPLE_WORKFLOW_NAME, 1)
+        .await?
+    {
+        return sample_workflow_record(existing, agents).map(Some);
+    }
+    if agents.is_empty() {
+        return Ok(None);
+    }
+    let agent = agents
+        .iter()
+        .map(|agent| agent.agent_ref.as_str())
+        .min()
+        .ok_or(StoreError::InvalidWorkflow)?;
+    let digest = workflow_content_digest(agent, SAMPLE_WORKFLOW_PROMPT);
+    let publication = WorkflowPublication {
+        name: SAMPLE_WORKFLOW_NAME,
+        display_name: SAMPLE_WORKFLOW_DISPLAY_NAME,
+        agent,
+        prompt: SAMPLE_WORKFLOW_PROMPT,
+        content_digest: &digest,
+        published_by: SAMPLE_WORKFLOW_ACTOR,
+    };
+    match repository.publish_initial_workflow(publication).await {
+        Ok(record) => sample_workflow_record(record, agents).map(Some),
+        Err(StoreError::WorkflowAlreadyExists) => repository
+            .workflow_revision(SAMPLE_WORKFLOW_NAME, 1)
+            .await?
+            .ok_or(StoreError::WorkflowNotFound)
+            .and_then(|record| sample_workflow_record(record, agents))
+            .map(Some),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn is_onboarding_sample_workflow(record: &WorkflowRevisionRecord) -> bool {
+    record.name == SAMPLE_WORKFLOW_NAME
+        && record.version == 1
+        && record.display_name == SAMPLE_WORKFLOW_DISPLAY_NAME
+        && record.prompt == SAMPLE_WORKFLOW_PROMPT
+        && record.content_digest == workflow_content_digest(&record.agent, SAMPLE_WORKFLOW_PROMPT)
+        && record.published_by == SAMPLE_WORKFLOW_ACTOR
+}
+
+fn sample_workflow_record(
+    record: WorkflowRevisionRecord,
+    agents: &[ExecutionBindingAdvertisement],
+) -> Result<WorkflowRevisionRecord, StoreError> {
+    let advertised = agents.iter().any(|agent| agent.agent_ref == record.agent);
+    if advertised && is_onboarding_sample_workflow(&record) {
+        Ok(record)
+    } else {
+        Err(StoreError::InvalidWorkflow)
     }
 }
 
@@ -426,7 +499,7 @@ where
     }
 }
 
-fn workflow_content_digest(agent: &str, prompt: &str) -> String {
+pub(crate) fn workflow_content_digest(agent: &str, prompt: &str) -> String {
     let mut hasher = Sha256::new();
     for value in [agent, prompt] {
         hasher.update(value.len().to_be_bytes());
@@ -452,7 +525,8 @@ mod tests {
 
     use super::{
         PublishWorkflowError, PublishWorkflowRequest, WorkflowReference, WorkflowReferenceError,
-        WorkflowRepository, protected_admin_router_with_agents,
+        WorkflowRepository, ensure_sample_workflow, is_onboarding_sample_workflow,
+        protected_admin_router_with_agents,
     };
     use crate::BoxFuture;
     use crate::ExecutionBindingAdvertisement;
@@ -704,6 +778,55 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn sample_workflow_is_seeded_once_with_a_deployment_agent() -> Result<(), String> {
+        let repository = FakeWorkflowRepository::default();
+        let agents = vec![
+            advertised_agent(TEST_AGENT_TWO, "Example Agent 2"),
+            advertised_agent(TEST_AGENT, "Example Agent 1"),
+        ];
+
+        let first = ensure_sample_workflow(&repository, &agents)
+            .await
+            .map_err(|error| format!("seed sample workflow: {error}"))?
+            .ok_or_else(|| "configured agents should produce a sample workflow".to_owned())?;
+        let second = ensure_sample_workflow(&repository, &agents)
+            .await
+            .map_err(|error| format!("reconcile sample workflow: {error}"))?
+            .ok_or_else(|| "the sample workflow should remain available".to_owned())?;
+
+        assert_eq!(first, second);
+        assert!(is_onboarding_sample_workflow(&first));
+        assert_eq!(first.name, "repo-summary");
+        assert_eq!(first.version, 1);
+        assert_eq!(first.agent, TEST_AGENT);
+        assert_eq!(
+            repository
+                .records
+                .lock()
+                .map_err(|_| "lock Workflow records".to_owned())?
+                .len(),
+            1,
+            "startup reconciliation must not append duplicate sample revisions"
+        );
+
+        let mut expanded_agents = agents;
+        expanded_agents.push(advertised_agent("aaa-agent@1", "Earlier Agent"));
+        assert_eq!(
+            ensure_sample_workflow(&repository, &expanded_agents)
+                .await
+                .map_err(|error| format!("reconcile expanded agent catalog: {error}"))?,
+            Some(first),
+            "adding a lexically earlier agent must not reinterpret immutable sample revision 1"
+        );
+        assert_eq!(
+            ensure_sample_workflow(&repository, &[]).await,
+            Err(StoreError::InvalidWorkflow),
+            "removing every advertised binding must not leave an unexecutable sample available"
+        );
+        Ok(())
+    }
+
     fn browser_cookie(response: &axum::response::Response, name: &str) -> Result<String, String> {
         response
             .headers()
@@ -917,6 +1040,53 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         assert_eq!(forbidden_update.status(), StatusCode::METHOD_NOT_ALLOWED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_cannot_publish_or_supersede_the_reserved_sample() -> Result<(), String> {
+        let origin = "http://127.0.0.1:33107";
+        let repository = FakeWorkflowRepository::default();
+        let (auth, cookie, csrf) = signed_in_admin(origin).await?;
+        let app = protected_admin_router_with_agents(
+            repository,
+            auth,
+            vec![advertised_agent(TEST_AGENT, "Example Agent 1")],
+        );
+
+        let create = app
+            .clone()
+            .oneshot(mutation_request(
+                "/admin/api/v1/workflows",
+                origin,
+                &cookie,
+                &csrf,
+                serde_json::json!({
+                    "name": "repo-summary",
+                    "displayName": "Replacement summary",
+                    "agent": TEST_AGENT,
+                    "prompt": "Replace the sample."
+                }),
+            )?)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(create.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let supersede = app
+            .oneshot(mutation_request(
+                "/admin/api/v1/workflows/repo-summary/versions",
+                origin,
+                &cookie,
+                &csrf,
+                serde_json::json!({
+                    "displayName": "Replacement summary",
+                    "agent": TEST_AGENT,
+                    "prompt": "Supersede the sample."
+                }),
+            )?)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(supersede.status(), StatusCode::UNPROCESSABLE_ENTITY);
         Ok(())
     }
 

@@ -67,7 +67,7 @@
     "connectionsBridge": {"mcpGatewayOrigin": "https://mcp.example.test", "mcpGatewayAuthorityContract": "steward.connections.github/v2"},
     "binding": {"agentRef": "codex@0.140.0", "displayName": "Codex 0.140.0", "adapter": "codex-v1", "runtimeName": "codex", "executable": "/usr/bin/codex", "expectedVersion": "codex-cli 0.140.0", "toolsProfile": "steward-mcp-gw", "inferenceProfile": "steward-litellm"}
   },
-  "capabilityCatalog": {"schemaVersion": "steward.capability-catalog/v1", "models": [{"provider": "litellm", "model": "gpt-5.4"}], "tools": [{"provider": "github", "resource": "actions_get", "action": "read"}]},
+  "capabilityCatalog": {"schemaVersion": "steward.capability-catalog/v2", "models": [{"provider": "litellm", "model": "gpt-5.4"}], "tools": [{"provider": "github", "resource": "actions_get", "action": "read", "accessClass": "read"}], "catalogs": [{"provider": "github", "catalogId": "github-tools", "version": "1.6.0", "available": true}]},
   "networkPolicy": {"kubeApiCidrs": ["192.0.2.10/32"], "postgresCidrs": ["192.0.2.20/32"]},
   "browserAuth": {"clientId": "example.apps.example.com", "workspaceDomain": "example.com", "organizationId": "example-org", "clientSecretName": "steward-browser-auth", "clientSecretKey": "client-secret", "egressCidrs": ["192.0.2.0/24"]},
   "apiTlsSecretName": "steward-apiserver-tls",

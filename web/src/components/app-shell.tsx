@@ -4,10 +4,12 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 
+import { getAdminRequestsSummary } from "@/api-client";
 import { authStartPath } from "@/session/auth-redirect";
 import { useSession, type SessionState } from "@/session/session-context";
 
 const developerNavigation = [
+  { href: "/get-started", label: "Get started" },
   { href: "/envelopes", label: "Envelopes" },
   { href: "/runs", label: "Runs" },
   { href: "/connections", label: "Connections" },
@@ -232,6 +234,16 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
   const navigation = adminMode ? adminNavigation : developerNavigation;
   const workspaceAuthorized = session.status === "authenticated"
     && (!adminMode || session.value.role === "admin");
+  const [needsAction, setNeedsAction] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!adminMode || !workspaceAuthorized) return;
+    let active = true;
+    void getAdminRequestsSummary({ cache: "no-store", credentials: "same-origin" }).then((result) => {
+      if (active && result.data && result.response?.ok) setNeedsAction(result.data.needsAction);
+    });
+    return () => { active = false; };
+  }, [adminMode, workspaceAuthorized]);
 
   return (
     <div className="min-h-screen">
@@ -259,7 +271,7 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
                   href={href}
                   key={href}
                 >
-                  {label}
+                  {label}{href === "/admin/approvals" && needsAction ? <span className="ms-2 rounded-full bg-brand px-2 py-0.5 text-xs text-white">{needsAction}</span> : null}
                 </Link>
               ))}
             </nav>

@@ -2,6 +2,8 @@
 
 Status: active browser and API boundary.
 
+Applies to Steward 0.2.6.
+
 ## Presentation ownership
 
 The Next.js application under `web/` is Steward's only browser presentation
@@ -56,25 +58,103 @@ opt-in.
 
 ### Approvals
 
-The Next.js `/admin/approvals` page consumes
-`GET /admin/api/v1/approvals` and the versioned decision APIs. Approval
-evidence remains bound to the authenticated actor and exact runtime UID. The
-browser must not infer state transitions from database shape.
+The Next.js `/admin/approvals` page consumes the unified, cursor-paginated
+`GET /admin/api/v1/requests` read model, its exact-ID detail route, and
+`GET /admin/api/v1/requests/summary`. The queue combines Envelope requests,
+runtime exceptions, and cumulative spend or runtime-minute escalations without flattening their
+source-specific decision routes. Structured `DirectAdmissionDelta` values are
+the only source for rendering requested changes; the browser must not parse the
+legacy runtime-exception `counterexample` string.
+
+Automatic Envelope provisioning is recorded with `system:auto` as the status
+actor. Manual approvals retain rationale, evidence URL, expiry, and the exact
+canonical administrator actor. Filing an external decision first acquires a
+short-lived per-request lease, so concurrent browser retries cannot create two
+external decisions. The completed reference and status history are append-only.
+The approval route continues to accept the legacy empty object only for an
+unfiled within-ceiling request with no new decision metadata. A rationale is
+mandatory for every ceiling-exceeded approval, whenever evidence or expiry
+metadata is supplied, and whenever an external decision has been filed.
 
 ### Envelopes
 
 The Next.js envelope administration pages consume versioned JSON template and
-request APIs. Admission remains the authority for exact counterexamples and
-envelope revisions. Presentation must not claim that OpenShell, MCP-GW, or
-LiteLLM updates are observed until the API represents their reconciliation
-state.
+request APIs. Templates have immutable IDs, administrator-authored display
+names, one or more eligible member roles, and append-only revisions. More than
+one active template may target the same role; an Envelope request pins the
+chosen template ID and revision.
+
+Template responses retain `memberRole`, set to the first eligible role, as a
+compatibility alias. Catalog-aware clients use the authoritative `memberRoles`
+array.
+
+Provisioned Envelope requests may include current-period spend usage. Usage is
+the sum of the latest observation for each runtime bound to that Envelope
+instance, plus active instance-scoped top-up grants in the effective limit. An
+`available`, `partial`, or `unavailable` status is authoritative; presentation
+must never guess a missing value. Request detail includes append-only status
+history.
+
+An Envelope revision may also constrain cumulative runtime minutes for each
+provisioned instance. This authority is stored in the immutable Envelope snapshot,
+not added to the AgentRuntime CRD. Steward derives current-period usage from
+append-only Task running-to-terminal lifecycle intervals, records observations and
+exhaustions append-only, and suspends execution when the effective limit is
+exhausted. Administrator top-ups are instance-scoped append-only grants; a
+successful grant must raise the effective limit above the recorded usage before
+the controller can resume the parked Task. Denial cancels the parked Task.
+
+Capability metadata supplies tool access class and provider catalog
+availability. The browser must not infer either from display text. Unsupported
+models are omitted rather than rendered as guessed disabled options. Admission
+remains the authority for exact deltas and Envelope revisions.
+
+### Connections and onboarding
+
+`GET /app/api/v1/connections` returns connected providers and the available
+provider catalog. GitHub is enabled; unavailable providers remain explicit and
+disabled. Provider `start` and `disconnect` mutations are browser-session and
+CSRF scoped. The onboarding aggregate composes connection, Envelope, workflow,
+and run evidence; dismissal and the explicit "I added the workflow"
+acknowledgement are server-side preferences. When browser surfaces are enabled
+and at least one execution binding is advertised, Steward publishes the
+reserved immutable `repo-summary@1` sample once against the first binding in
+lexical order. An existing revision under that name must match the complete
+system-authored identity and digest or startup fails closed. Administrator
+publication cannot use the reserved name, and removing its pinned execution
+binding also fails browser startup rather than advertising an unexecutable
+sample. The renderer
+returns a deterministic suggested path, but callers may use any valid GitHub
+workflow filename. Steps four and five follow all result pages and complete only
+after a GitHub-triggered run pins that sample revision and one of the user's
+provisioned Envelope instances. Steward does not dispatch the run; it is
+launched from GitHub with `gh workflow run` or the Actions UI.
 
 ### Fleet and runs
 
-Kubernetes `AgentRuntime.status` remains the current lifecycle source of
-truth. PostgreSQL holds append-only history and observations, not current
-phase. Browser run views consume the versioned run and timeline APIs and must
-preserve provenance and data-availability distinctions.
+PostgreSQL Task state is the browser run source of truth. User routes are
+exact-owner scoped; administrator `all-runs` routes use browser administrator
+authority and may expose the owner's display email. List responses include
+phase facets computed from the current filter with the phase predicate removed.
+
+Run detail exposes validated GitHub source provenance when it was captured at
+submission, four bounded stages (admission, runtime provisioning, agent
+execution, and finalization), and one execution step with stdout/stderr streams.
+Stage IDs and timeline stage-event payloads are closed enums; admitted events
+carry the pinned Envelope revision/digest, runtime-bound events carry the
+runtime UID/ownership, and execution-ended events carry a typed terminal exit
+category.
+The separate log endpoint supports bounded byte-offset reads while a Task is
+running and marks whether the stream is complete. Cancel is owner scoped and
+returns `409` after a run is terminal. Administrator run detail is read-only and
+does not render cancel or re-run controls.
+Re-run creates a fresh Task for a versioned Steward workflow. For a direct
+GitHub Task, Steward invokes only the governed MCP-GW
+`actions_run_trigger.rerun_workflow_run` operation through the caller's GitHub
+connection, then correlates the new Task by exact repository and GitHub run ID
+with a higher run attempt. A `202` response is polled with the same browser
+idempotency key until that Task exists. Correlation does not depend on the
+suggested or actual workflow filename and never copies old provenance.
 
 ### Federated Task subjects
 

@@ -2,7 +2,13 @@
 
 import { useCallback, useState } from "react";
 
-import { connectionStatus, disconnectConnection, startConnection, type ConnectionStatusResponse } from "@/api-client";
+import {
+  disconnectProviderConnection,
+  listProviderConnections,
+  startProviderConnection,
+  type ConnectionsCollectionResponse,
+  type ProviderConnectionView,
+} from "@/api-client";
 import { connectionHealth } from "@/components/connection-health";
 import { DefinitionList, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
@@ -13,9 +19,9 @@ export function ConnectionsView() {
   const [generation, setGeneration] = useState(0);
   const load = useCallback(() => {
     void generation;
-    return connectionStatus({ cache: "no-store", credentials: "same-origin" });
+    return listProviderConnections({ cache: "no-store", credentials: "same-origin" });
   }, [generation]);
-  const state = useApiResource<ConnectionStatusResponse>(load);
+  const state = useApiResource<ConnectionsCollectionResponse>(load);
   if (state.status === "forbidden" || state.status === "not-found") {
     return (
       <section aria-labelledby="page-title" className="space-y-6">
@@ -27,14 +33,19 @@ export function ConnectionsView() {
   return (
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader description="View real provider status and initiate server-owned OAuth actions." title="Connections" />
-      <GithubConnection connection={state.status === "ready" ? state.value : undefined} metadataState={state.status} refresh={() => setGeneration((value) => value + 1)} />
+      {state.status === "ready" ? state.value.connections.map((connection) => (
+        <ProviderConnection connection={connection} key={connection.provider} refresh={() => setGeneration((value) => value + 1)} />
+      )) : <ProviderConnection metadataState={state.status} refresh={() => setGeneration((value) => value + 1)} />}
+      {state.status === "ready" && state.value.available.some((provider) => !provider.enabled) ? (
+        <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold" disabled type="button">+ Add connection</button>
+      ) : null}
     </section>
   );
 }
 
-function GithubConnection({ connection, metadataState, refresh }: Readonly<{
-  connection?: ConnectionStatusResponse;
-  metadataState: "loading" | "ready" | "unavailable" | "error";
+function ProviderConnection({ connection, metadataState = "ready", refresh }: Readonly<{
+  connection?: ProviderConnectionView;
+  metadataState?: "loading" | "ready" | "unavailable" | "error";
   refresh: () => void;
 }>) {
   const session = useSession();
@@ -56,11 +67,12 @@ function GithubConnection({ connection, metadataState, refresh }: Readonly<{
   async function connect() {
     if (session.status !== "authenticated") return;
     setAction("working");
-    const result = await startConnection({
+    const result = await startProviderConnection({
       body: {},
       cache: "no-store",
       credentials: "same-origin",
       headers: { "X-Steward-CSRF": session.value.csrf },
+      path: { provider: connection?.provider ?? "github" },
     });
     if (result.data?.authorizationUrl && result.response?.ok) {
       window.location.assign(result.data.authorizationUrl);
@@ -72,7 +84,7 @@ function GithubConnection({ connection, metadataState, refresh }: Readonly<{
   async function disconnect() {
     if (session.status !== "authenticated" || !confirmDisconnect) return;
     setAction("working");
-    const result = await disconnectConnection({ body: { confirm: true }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf } });
+    const result = await disconnectProviderConnection({ body: { confirm: true }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { provider: connection?.provider ?? "github" } });
     if (result.response?.status === 204) {
       setConfirmDisconnect(false);
       setAction("idle");
@@ -88,7 +100,7 @@ function GithubConnection({ connection, metadataState, refresh }: Readonly<{
 
   return (
     <article className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
-      <div className="flex items-center justify-between gap-4"><div><h2 className="text-xl font-semibold">GitHub</h2><p className="mt-1 text-sm text-muted-ink">User-bound repository access</p></div><StatusBadge value={badge} /></div>
+      <div className="flex items-center justify-between gap-4"><div><h2 className="text-xl font-semibold">{connection?.displayName ?? "GitHub"}</h2><p className="mt-1 text-sm text-muted-ink">User-bound provider access</p></div><StatusBadge value={badge} /></div>
       <DefinitionList items={[
         ["Account", status?.accountEmail ?? "Not reported"],
         ["Required scopes", status ? status.scopesRequired.join(", ") || "None" : "Not reported"],

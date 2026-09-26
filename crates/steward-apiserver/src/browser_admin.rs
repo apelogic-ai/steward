@@ -6,12 +6,18 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
-use steward_admission::{AdmissionDecision, Envelope, validate_envelope};
-use steward_store::{
-    EnvelopeRequestRecord, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
-    FederatedSubjectAssociation, FederatedSubjectAuditRecord, FederatedSubjectDisable,
-    FederatedSubjectRecord, PendingApproval, PendingEnvelopeRequest, PgStore, StoreError,
+use steward_admission::{
+    AdmissionDecision, AdmissionDelta, Envelope, add_budget_amount, envelope_is_within,
+    validate_envelope,
 };
+use steward_store::{
+    AdminApprovalRecord, AdminEnvelopeRequestRecord, CumulativeEscalationRecord,
+    EnvelopeRequestRecord, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
+    EnvelopeTemplatePublication, EnvelopeTemplateRevisionRecord, FederatedSubjectAssociation,
+    FederatedSubjectAuditRecord, FederatedSubjectDisable, FederatedSubjectRecord, PendingApproval,
+    PendingEnvelopeRequest, PgStore, StoreError,
+};
+use steward_types::direct_package::DirectAdmissionDelta;
 use steward_types::{AgentRuntimeSpec, CanonicalUserId, ModelRef, ToolGrant};
 use uuid::Uuid;
 
@@ -19,7 +25,9 @@ use crate::browser_auth::{
     BrowserAdminAuthority, BrowserAuthService, BrowserMutationProof, BrowserMutationRequest,
     protect_browser_admin_routes,
 };
-use crate::user_envelopes::{BrowserEnvelope, envelope_content_digest, envelope_instance_id};
+use crate::user_envelopes::{
+    BrowserEnvelope, BrowserEnvelopeSpec, envelope_content_digest, envelope_instance_id,
+};
 use crate::{
     AdminContext, AdmissionLedger, ApiError, ApprovalRequest, DecisionChannel, RuntimeRepository,
     approve_parked_request, file_decision_reference,
@@ -29,6 +37,41 @@ const BROWSER_ADMIN_API_VERSION: &str = "steward.browser-admin/v1";
 pub const MAX_CAPABILITY_CATALOG_BYTES: usize = 256 * 1024;
 const MAX_CAPABILITY_MODELS: usize = 256;
 const MAX_CAPABILITY_TOOLS: usize = 1024;
+const MAX_CAPABILITY_CATALOGS: usize = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolAccessClass {
+    Read,
+    Write,
+    Destructive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityTool {
+    pub provider: String,
+    pub resource: String,
+    pub action: String,
+    pub access_class: ToolAccessClass,
+}
+
+impl CapabilityTool {
+    fn grants(&self, requested: &ToolGrant) -> bool {
+        self.provider == requested.provider
+            && self.resource == requested.resource
+            && self.action == requested.action
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityProviderCatalog {
+    pub provider: String,
+    pub catalog_id: String,
+    pub version: String,
+    pub available: bool,
+}
 
 #[derive(Clone)]
 pub(crate) struct FederatedSubjectAdminState {
@@ -162,7 +205,8 @@ pub(crate) struct BrowserAdminState<R, L, D> {
 pub struct CapabilityCatalog {
     pub schema_version: String,
     pub models: Vec<ModelRef>,
-    pub tools: Vec<ToolGrant>,
+    pub tools: Vec<CapabilityTool>,
+    pub catalogs: Vec<CapabilityProviderCatalog>,
 }
 
 impl CapabilityCatalog {
@@ -177,12 +221,15 @@ impl CapabilityCatalog {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != "steward.capability-catalog/v1" {
+        if self.schema_version != "steward.capability-catalog/v2" {
             return Err(
-                "capability catalog schemaVersion must be steward.capability-catalog/v1".to_owned(),
+                "capability catalog schemaVersion must be steward.capability-catalog/v2".to_owned(),
             );
         }
-        if self.models.len() > MAX_CAPABILITY_MODELS || self.tools.len() > MAX_CAPABILITY_TOOLS {
+        if self.models.len() > MAX_CAPABILITY_MODELS
+            || self.tools.len() > MAX_CAPABILITY_TOOLS
+            || self.catalogs.len() > MAX_CAPABILITY_CATALOGS
+        {
             return Err("capability catalog exceeds its bounded model or tool count".to_owned());
         }
         let valid = |value: &str| {
@@ -198,6 +245,9 @@ impl CapabilityCatalog {
             || self.tools.iter().any(|tool| {
                 !valid(&tool.provider) || !valid(&tool.resource) || !valid(&tool.action)
             })
+            || self.catalogs.iter().any(|catalog| {
+                !valid(&catalog.provider) || !valid(&catalog.catalog_id) || !valid(&catalog.version)
+            })
         {
             return Err(
                 "capability catalog entries must contain bounded exact identifiers".to_owned(),
@@ -205,6 +255,7 @@ impl CapabilityCatalog {
         }
         let mut model_keys = std::collections::BTreeSet::new();
         let mut tool_keys = std::collections::BTreeSet::new();
+        let mut catalog_keys = std::collections::BTreeSet::new();
         if self
             .models
             .iter()
@@ -213,6 +264,10 @@ impl CapabilityCatalog {
                 .tools
                 .iter()
                 .any(|tool| !tool_keys.insert((&tool.provider, &tool.resource, &tool.action)))
+            || self
+                .catalogs
+                .iter()
+                .any(|catalog| !catalog_keys.insert((&catalog.provider, &catalog.catalog_id)))
         {
             return Err("capability catalog entries must be unique".to_owned());
         }
@@ -223,22 +278,29 @@ impl CapabilityCatalog {
 #[cfg(test)]
 mod capability_catalog_tests {
     use super::{
-        CapabilityCatalog, MAX_CAPABILITY_CATALOG_BYTES, MAX_CAPABILITY_MODELS,
-        MAX_CAPABILITY_TOOLS,
+        CapabilityCatalog, CapabilityProviderCatalog, CapabilityTool, MAX_CAPABILITY_CATALOG_BYTES,
+        MAX_CAPABILITY_MODELS, MAX_CAPABILITY_TOOLS, ToolAccessClass,
     };
-    use steward_types::{ModelRef, ToolGrant};
+    use steward_types::ModelRef;
 
     fn catalog() -> CapabilityCatalog {
         CapabilityCatalog {
-            schema_version: "steward.capability-catalog/v1".to_owned(),
+            schema_version: "steward.capability-catalog/v2".to_owned(),
             models: vec![ModelRef {
                 provider: "provider-a".to_owned(),
                 model: "model-a".to_owned(),
             }],
-            tools: vec![ToolGrant {
+            tools: vec![CapabilityTool {
                 provider: "github".to_owned(),
                 resource: "actions_get".to_owned(),
                 action: "read".to_owned(),
+                access_class: ToolAccessClass::Read,
+            }],
+            catalogs: vec![CapabilityProviderCatalog {
+                provider: "github".to_owned(),
+                catalog_id: "github-tools".to_owned(),
+                version: "1.6.0".to_owned(),
+                available: true,
             }],
         }
     }
@@ -258,7 +320,7 @@ mod capability_catalog_tests {
 
     #[test]
     fn rejects_unknown_fields_duplicates_and_malformed_identifiers() {
-        let unknown = r#"{"schemaVersion":"steward.capability-catalog/v1","models":[],"tools":[],"budget":{}}"#;
+        let unknown = r#"{"schemaVersion":"steward.capability-catalog/v2","models":[],"tools":[],"catalogs":[],"budget":{}}"#;
         assert!(CapabilityCatalog::from_json(unknown).is_err());
 
         let mut duplicate = catalog();
@@ -286,13 +348,49 @@ mod capability_catalog_tests {
 
         let mut too_many_tools = catalog();
         too_many_tools.tools = (0..=MAX_CAPABILITY_TOOLS)
-            .map(|index| ToolGrant {
+            .map(|index| CapabilityTool {
                 provider: "github".to_owned(),
                 resource: format!("resource-{index}"),
                 action: "read".to_owned(),
+                access_class: ToolAccessClass::Read,
             })
             .collect();
         assert!(too_many_tools.validate().is_err());
+    }
+
+    #[test]
+    fn capability_catalog_requires_access_classes_and_provider_availability() -> Result<(), String>
+    {
+        let value = r#"{
+          "schemaVersion":"steward.capability-catalog/v2",
+          "models":[{"provider":"provider-a","model":"model-a"}],
+          "tools":[{
+            "provider":"github",
+            "resource":"actions_get",
+            "action":"read",
+            "accessClass":"read"
+          }],
+          "catalogs":[{
+            "provider":"github",
+            "catalogId":"github-tools",
+            "version":"1.6.0",
+            "available":true
+          }]
+        }"#;
+        let parsed = CapabilityCatalog::from_json(value).map_err(|error| {
+            format!("the v2 catalog should carry presentation metadata from the backend: {error}")
+        })?;
+        let serialized = serde_json::to_value(parsed)
+            .map_err(|error| format!("failed to serialize capability catalog: {error}"))?;
+        assert_eq!(
+            serialized.pointer("/tools/0/accessClass"),
+            Some(&serde_json::json!("read"))
+        );
+        assert_eq!(
+            serialized.pointer("/catalogs/0/version"),
+            Some(&serde_json::json!("1.6.0"))
+        );
+        Ok(())
     }
 }
 
@@ -300,15 +398,25 @@ mod capability_catalog_tests {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BrowserEnvelopeTemplateResponse {
     api_version: &'static str,
+    id: String,
+    display_name: String,
+    /// Compatibility alias for clients written before templates could target multiple roles.
     member_role: String,
+    member_roles: Vec<String>,
     envelope: BrowserEnvelope,
+    auto_provision_threshold: Option<BrowserEnvelope>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BrowserEnvelopeTemplateListItem {
+    id: String,
+    display_name: String,
+    /// Compatibility alias for clients written before templates could target multiple roles.
     member_role: String,
+    member_roles: Vec<String>,
     envelope: BrowserEnvelope,
+    auto_provision_threshold: Option<BrowserEnvelope>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -316,6 +424,42 @@ pub(crate) struct BrowserEnvelopeTemplateListItem {
 pub(crate) struct BrowserEnvelopeTemplateListResponse {
     api_version: &'static str,
     templates: Vec<BrowserEnvelopeTemplateListItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AuthorEnvelopeTemplateBody {
+    display_name: String,
+    member_roles: Vec<String>,
+    envelope: BrowserEnvelope,
+    auto_provision_threshold: Option<BrowserEnvelope>,
+}
+
+impl From<EnvelopeTemplateRevisionRecord> for BrowserEnvelopeTemplateListItem {
+    fn from(template: EnvelopeTemplateRevisionRecord) -> Self {
+        let member_role = template.member_roles.first().cloned().unwrap_or_default();
+        Self {
+            id: template.template_id,
+            display_name: template.display_name,
+            member_role,
+            member_roles: template.member_roles,
+            envelope: template.ceiling.into(),
+            auto_provision_threshold: template.auto_provision_threshold.map(Into::into),
+        }
+    }
+}
+
+fn template_response(template: EnvelopeTemplateRevisionRecord) -> BrowserEnvelopeTemplateResponse {
+    let member_role = template.member_roles.first().cloned().unwrap_or_default();
+    BrowserEnvelopeTemplateResponse {
+        api_version: BROWSER_ADMIN_API_VERSION,
+        id: template.template_id,
+        display_name: template.display_name,
+        member_role,
+        member_roles: template.member_roles,
+        envelope: template.ceiling.into(),
+        auto_provision_threshold: template.auto_provision_threshold.map(Into::into),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -396,6 +540,10 @@ pub(crate) struct BrowserEnvelopeRequestDecisionView {
     envelope_instance_id: Option<String>,
     envelope_digest: Option<String>,
     reason: Option<String>,
+    rationale: Option<String>,
+    evidence_url: Option<String>,
+    decision_key: Option<String>,
+    expires_at: Option<String>,
     acted_by: String,
     status_at: String,
 }
@@ -413,6 +561,10 @@ impl From<EnvelopeRequestRecord> for BrowserEnvelopeRequestDecisionView {
             envelope_instance_id: request.envelope_instance_id,
             envelope_digest: request.envelope_digest,
             reason: request.reason,
+            rationale: request.rationale,
+            evidence_url: request.evidence_url,
+            decision_key: request.decision_key,
+            expires_at: request.expires_at,
             acted_by: request.status_actor,
             status_at: request.status_at,
         }
@@ -426,10 +578,30 @@ pub(crate) struct BrowserEnvelopeRequestDecisionResponse {
     request: BrowserEnvelopeRequestDecisionView,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserEnvelopeRequestDecisionReferenceResponse {
+    api_version: &'static str,
+    #[schema(value_type = String, format = "uuid")]
+    request_id: Uuid,
+    decision_key: String,
+    evidence_url: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RejectEnvelopeRequestBody {
     reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ApproveEnvelopeRequestBody {
+    /// Required for ceiling-exceeded requests and whenever decision metadata is supplied.
+    /// Legacy clients may omit it only for an unfiled within-ceiling request.
+    rationale: Option<String>,
+    evidence_url: Option<String>,
+    expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -438,6 +610,185 @@ pub(crate) struct BrowserApprovalsResponse {
     api_version: &'static str,
     approvals: Vec<BrowserApprovalView>,
     envelope_requests: Vec<BrowserEnvelopeRequestView>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AdminRequestKind {
+    CeilingExceeded,
+    CumulativeExhausted,
+    WithinCeiling,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AdminRequestSource {
+    EnvelopeRequest,
+    RuntimeException,
+    Escalation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AdminRequestState {
+    Requested,
+    Escalated,
+    AutoApproved,
+    Approved,
+    Rejected,
+    Expired,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AdminRequestStateFilter {
+    All,
+    NeedsAction,
+    Requested,
+    Escalated,
+    AutoApproved,
+    Approved,
+    Rejected,
+    Expired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminRequestRequester {
+    user_id: String,
+    display_email: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminRequestTemplate {
+    id: String,
+    display_name: String,
+    revision: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminRequestDecision {
+    rationale: Option<String>,
+    evidence_url: Option<String>,
+    decision_key: Option<String>,
+    expires_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminRequestHistoryEvent {
+    state: AdminRequestState,
+    at: String,
+    actor: String,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EscalationDimension {
+    LlmSpend,
+    RuntimeMinutes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EscalationPeriod {
+    start: String,
+    end: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EscalationMeter {
+    dimension: EscalationDimension,
+    used: String,
+    limit: String,
+    unit: String,
+    observed_at: String,
+    exhausted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EscalationView {
+    envelope_instance_id: String,
+    period: EscalationPeriod,
+    meters: Vec<EscalationMeter>,
+    #[schema(value_type = String, format = "uuid")]
+    blocked_task_uid: Uuid,
+    parked_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct EscalationTopUpRequest {
+    dimension: EscalationDimension,
+    amount: String,
+    valid_until: String,
+    rationale: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EscalationDenyRequest {
+    rationale: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminRequestView {
+    id: String,
+    kind: AdminRequestKind,
+    source: AdminRequestSource,
+    state: AdminRequestState,
+    requester: AdminRequestRequester,
+    template: AdminRequestTemplate,
+    created_at: String,
+    state_at: String,
+    state_actor: String,
+    #[schema(value_type = Vec<DirectAdmissionDelta>)]
+    deltas: Vec<AdmissionDelta>,
+    requested_envelope: Option<BrowserEnvelope>,
+    template_envelope: Option<BrowserEnvelope>,
+    escalation: Option<EscalationView>,
+    decision: Option<AdminRequestDecision>,
+    history: Vec<AdminRequestHistoryEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminRequestsResponse {
+    api_version: &'static str,
+    requests: Vec<AdminRequestView>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminRequestResponse {
+    api_version: &'static str,
+    request: AdminRequestView,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminRequestsSummaryResponse {
+    api_version: &'static str,
+    needs_action: usize,
+    escalated: usize,
+    requested: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AdminRequestsQuery {
+    state: Option<AdminRequestStateFilter>,
+    kind: Option<AdminRequestKind>,
+    cursor: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -467,14 +818,28 @@ where
             get(list_envelope_templates::<R, L, D>),
         )
         .route(
-            "/admin/api/v1/envelope-templates/{member_role}",
-            get(get_envelope_template::<R, L, D>).post(author_envelope_template::<R, L, D>),
+            "/admin/api/v1/envelope-templates/{template_id}",
+            get(get_envelope_template::<R, L, D>)
+                .post(author_legacy_envelope_template::<R, L, D>)
+                .put(author_envelope_template::<R, L, D>),
         )
         .route(
             "/admin/api/v1/capabilities",
             get(get_capabilities::<R, L, D>),
         )
         .route("/admin/api/v1/approvals", get(list_approvals::<R, L, D>))
+        .route(
+            "/admin/api/v1/requests",
+            get(list_admin_requests::<R, L, D>),
+        )
+        .route(
+            "/admin/api/v1/requests/summary",
+            get(admin_requests_summary::<R, L, D>),
+        )
+        .route(
+            "/admin/api/v1/requests/{request_id}",
+            get(get_admin_request::<R, L, D>),
+        )
         .route(
             "/admin/api/v1/envelope-requests/{request_id}/approve",
             post(approve_envelope_request::<R, L, D>),
@@ -484,12 +849,24 @@ where
             post(reject_envelope_request::<R, L, D>),
         )
         .route(
+            "/admin/api/v1/envelope-requests/{request_id}/file",
+            post(file_envelope_request::<R, L, D>),
+        )
+        .route(
             "/admin/api/v1/approvals/{approval_id}/approve",
             post(approve::<R, L, D>),
         )
         .route(
             "/admin/api/v1/approvals/{approval_id}/file",
             post(file_decision::<R, L, D>),
+        )
+        .route(
+            "/admin/api/v1/escalations/{escalation_id}/top-up",
+            post(top_up_escalation::<R, L, D>),
+        )
+        .route(
+            "/admin/api/v1/escalations/{escalation_id}/deny",
+            post(deny_escalation::<R, L, D>),
         )
         .with_state(BrowserAdminState {
             runtimes,
@@ -530,13 +907,14 @@ where
         ("request_id" = String, Path),
         ("X-Steward-CSRF" = String, Header)
     ),
-    request_body = BrowserMutationRequest,
+    request_body = ApproveEnvelopeRequestBody,
     responses(
         (status = 200, body = BrowserEnvelopeRequestDecisionResponse),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
         (status = 404, description = "Envelope request was not found"),
         (status = 409, description = "Envelope request or template revision is stale or already decided differently"),
+        (status = 422, description = "Approval rationale or decision metadata is invalid"),
         (status = 503, description = "Envelope request authority is unavailable")
     ),
     security(("browserSession" = []))
@@ -546,18 +924,69 @@ pub(crate) async fn approve_envelope_request<R, L, D>(
     Extension(_proof): Extension<BrowserMutationProof>,
     State(state): State<BrowserAdminState<R, L, D>>,
     Path(request_id): Path<Uuid>,
-    Json(_request): Json<BrowserMutationRequest>,
+    Json(body): Json<ApproveEnvelopeRequestBody>,
 ) -> Response
 where
     R: RuntimeRepository,
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
+    let rationale = match body.rationale.as_deref() {
+        Some(value) if !value.trim().is_empty() && value.trim().len() <= 2_000 => {
+            Some(value.trim())
+        }
+        Some(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+        None => None,
+    };
     let request = match state.ledger.envelope_request_for_admin(request_id).await {
         Ok(Some(request)) => request,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return ApiError::Store(error).into_response(),
     };
+    if request.status == EnvelopeRequestStatus::Pending && rationale.is_none() {
+        let template = match state
+            .ledger
+            .latest_envelope_template(&request.template_id)
+            .await
+        {
+            Ok(Some(template)) if template.ceiling.revision == request.template_revision => {
+                template
+            }
+            Ok(_) => return StatusCode::CONFLICT.into_response(),
+            Err(error) => return ApiError::Store(error).into_response(),
+        };
+        match envelope_is_within(&request.requested_envelope, &template.ceiling) {
+            Ok(AdmissionDecision::Admit) => {}
+            Ok(AdmissionDecision::Reject { .. }) => {
+                return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+            }
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
+    if body
+        .evidence_url
+        .as_ref()
+        .zip(request.evidence_url.as_ref())
+        .is_some_and(|(provided, filed)| provided != filed)
+    {
+        return StatusCode::CONFLICT.into_response();
+    }
+    let evidence_url = body
+        .evidence_url
+        .as_deref()
+        .or(request.evidence_url.as_deref());
+    if evidence_url.is_some_and(|value| !valid_https_url(value)) {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    if request.status == EnvelopeRequestStatus::Pending
+        && rationale.is_none()
+        && (body.evidence_url.is_some()
+            || body.expires_at.is_some()
+            || request.decision_key.is_some()
+            || request.evidence_url.is_some())
+    {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
     let instance_id = envelope_instance_id(request.id);
     let digest = match envelope_content_digest(&request.requested_envelope) {
         Ok(digest) => digest,
@@ -565,6 +994,7 @@ where
     };
     let approval_id = request.approval_id.unwrap_or_else(Uuid::new_v4);
     let actor = authority.principal().canonical_user_id.as_str();
+    let decision_key = request.decision_key.clone();
     match state
         .ledger
         .append_envelope_request_status(
@@ -576,19 +1006,49 @@ where
                 envelope_instance_id: Some(&instance_id),
                 envelope_digest: Some(&digest),
                 reason: None,
+                rationale,
+                evidence_url,
+                expires_at: body.expires_at.as_deref(),
                 approved_envelope: Some(&request.requested_envelope),
                 actor,
             },
         )
         .await
     {
-        Ok(request) => Json(BrowserEnvelopeRequestDecisionResponse {
-            api_version: BROWSER_ADMIN_API_VERSION,
-            request: request.into(),
-        })
-        .into_response(),
+        Ok(request) => {
+            if let (Some(key), Some(evidence_url), Some(rationale)) =
+                (decision_key, evidence_url, rationale)
+                && let Err(error) = state
+                    .decisions
+                    .record_resolution(&steward_ports::DecisionResolution {
+                        request_id: request_id.to_string(),
+                        key,
+                        decided_by: actor.to_owned(),
+                        rationale: rationale.to_owned(),
+                        evidence_url: evidence_url.to_owned(),
+                    })
+                    .await
+            {
+                return ApiError::DecisionChannel(format!("{error:?}")).into_response();
+            }
+            Json(BrowserEnvelopeRequestDecisionResponse {
+                api_version: BROWSER_ADMIN_API_VERSION,
+                request: request.into(),
+            })
+            .into_response()
+        }
         Err(error) => ApiError::Store(error).into_response(),
     }
+}
+
+fn valid_https_url(value: &str) -> bool {
+    value.len() <= 2_048
+        && reqwest::Url::parse(value).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
 }
 
 #[utoipa::path(
@@ -643,6 +1103,9 @@ where
                 envelope_instance_id: None,
                 envelope_digest: None,
                 reason,
+                rationale: None,
+                evidence_url: None,
+                expires_at: None,
                 approved_envelope: None,
                 actor,
             },
@@ -657,6 +1120,155 @@ where
         Err(StoreError::EnvelopeRequestNotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => ApiError::Store(error).into_response(),
     }
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "fileAdminEnvelopeRequest",
+    path = "/admin/api/v1/envelope-requests/{request_id}/file",
+    params(
+        ("request_id" = String, Path, format = "uuid"),
+        ("X-Steward-CSRF" = String, Header)
+    ),
+    request_body = BrowserMutationRequest,
+    responses(
+        (status = 200, body = BrowserEnvelopeRequestDecisionReferenceResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Envelope request was not found"),
+        (status = 409, description = "Envelope request is no longer governed by the current template revision"),
+        (status = 422, description = "Envelope request does not exceed its template ceiling"),
+        (status = 503, description = "Envelope request or decision channel is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn file_envelope_request<R, L, D>(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+    Extension(_proof): Extension<BrowserMutationProof>,
+    State(state): State<BrowserAdminState<R, L, D>>,
+    Path(request_id): Path<Uuid>,
+    Json(_request): Json<BrowserMutationRequest>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    match state
+        .ledger
+        .envelope_request_decision_reference(request_id)
+        .await
+    {
+        Ok(Some(reference)) => {
+            return Json(BrowserEnvelopeRequestDecisionReferenceResponse {
+                api_version: BROWSER_ADMIN_API_VERSION,
+                request_id,
+                decision_key: reference.decision_key,
+                evidence_url: reference.evidence_url,
+            })
+            .into_response();
+        }
+        Ok(None) => {}
+        Err(error) => return ApiError::Store(error).into_response(),
+    }
+    let request = match state.ledger.envelope_request_for_admin(request_id).await {
+        Ok(Some(request)) => request,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return ApiError::Store(error).into_response(),
+    };
+    let template = match state
+        .ledger
+        .latest_envelope_template(&request.template_id)
+        .await
+    {
+        Ok(Some(template)) if template.ceiling.revision == request.template_revision => template,
+        Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return ApiError::Store(error).into_response(),
+    };
+    let counterexample =
+        match steward_admission::envelope_is_within(&request.requested_envelope, &template.ceiling)
+        {
+            Ok(AdmissionDecision::Reject { deltas }) => AdmissionDecision::Reject { deltas }
+                .counterexample()
+                .unwrap_or_else(|| "Envelope request exceeds its template ceiling".to_owned()),
+            Ok(AdmissionDecision::Admit) => {
+                return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+            }
+            Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+        };
+    let actor = authority.principal().canonical_user_id.as_str();
+    let token = match state
+        .ledger
+        .claim_envelope_request_decision_filing(request_id, actor)
+        .await
+    {
+        Ok(token) => token,
+        Err(StoreError::DecisionReferenceMismatch) => {
+            return match state
+                .ledger
+                .envelope_request_decision_reference(request_id)
+                .await
+            {
+                Ok(Some(reference)) => Json(BrowserEnvelopeRequestDecisionReferenceResponse {
+                    api_version: BROWSER_ADMIN_API_VERSION,
+                    request_id,
+                    decision_key: reference.decision_key,
+                    evidence_url: reference.evidence_url,
+                })
+                .into_response(),
+                Ok(None) => StatusCode::CONFLICT.into_response(),
+                Err(error) => ApiError::Store(error).into_response(),
+            };
+        }
+        Err(StoreError::DecisionFilingInProgress) => {
+            return StatusCode::CONFLICT.into_response();
+        }
+        Err(error) => return ApiError::Store(error).into_response(),
+    };
+    let reference = match state
+        .decisions
+        .request(&steward_ports::DecisionRequest {
+            request_id: request_id.to_string(),
+            runtime_uid: format!("envelope-request/{request_id}"),
+            actor: request.owner_user_id.as_str().to_owned(),
+            member_role: request.template_id.clone(),
+            counterexample,
+        })
+        .await
+    {
+        Ok(reference) => reference,
+        Err(error) => {
+            if let Err(release_error) = state
+                .ledger
+                .release_envelope_request_decision_filing(request_id, token)
+                .await
+            {
+                return ApiError::Store(release_error).into_response();
+            }
+            return ApiError::DecisionChannel(format!("{error:?}")).into_response();
+        }
+    };
+    if let Err(error) = state
+        .ledger
+        .complete_envelope_request_decision_filing(
+            request_id,
+            token,
+            &reference.key,
+            &reference.evidence_url,
+            actor,
+        )
+        .await
+    {
+        return ApiError::Store(error).into_response();
+    }
+    Json(BrowserEnvelopeRequestDecisionReferenceResponse {
+        api_version: BROWSER_ADMIN_API_VERSION,
+        request_id,
+        decision_key: reference.key,
+        evidence_url: reference.evidence_url,
+    })
+    .into_response()
 }
 
 /// Mount the administrator data plane behind the shared opaque browser-session boundary.
@@ -948,16 +1560,10 @@ where
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
-    match state.ledger.latest_envelopes().await {
+    match state.ledger.latest_envelope_templates().await {
         Ok(templates) => Json(BrowserEnvelopeTemplateListResponse {
             api_version: BROWSER_ADMIN_API_VERSION,
-            templates: templates
-                .into_iter()
-                .map(|(member_role, envelope)| BrowserEnvelopeTemplateListItem {
-                    member_role,
-                    envelope: envelope.into(),
-                })
-                .collect(),
+            templates: templates.into_iter().map(Into::into).collect(),
         })
         .into_response(),
         Err(error) => ApiError::Store(error).into_response(),
@@ -967,8 +1573,8 @@ where
 #[utoipa::path(
     get,
     operation_id = "getAdminEnvelopeTemplate",
-    path = "/admin/api/v1/envelope-templates/{member_role}",
-    params(("member_role" = String, Path)),
+    path = "/admin/api/v1/envelope-templates/{template_id}",
+    params(("template_id" = String, Path)),
     responses(
         (status = 200, body = BrowserEnvelopeTemplateResponse),
         (status = 401, description = "Browser session is absent or invalid"),
@@ -981,34 +1587,29 @@ where
 pub(crate) async fn get_envelope_template<R, L, D>(
     Extension(_authority): Extension<BrowserAdminAuthority>,
     State(state): State<BrowserAdminState<R, L, D>>,
-    Path(member_role): Path<String>,
+    Path(template_id): Path<String>,
 ) -> Response
 where
     R: RuntimeRepository,
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
-    match state.ledger.latest_envelope(&member_role).await {
-        Ok(Some(envelope)) => Json(BrowserEnvelopeTemplateResponse {
-            api_version: BROWSER_ADMIN_API_VERSION,
-            member_role,
-            envelope: envelope.into(),
-        })
-        .into_response(),
+    match state.ledger.latest_envelope_template(&template_id).await {
+        Ok(Some(template)) => Json(template_response(template)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => ApiError::Store(error).into_response(),
     }
 }
 
 #[utoipa::path(
-    post,
-    operation_id = "authorAdminEnvelopeTemplate",
-    path = "/admin/api/v1/envelope-templates/{member_role}",
+    put,
+    operation_id = "putAdminEnvelopeTemplate",
+    path = "/admin/api/v1/envelope-templates/{template_id}",
     params(
-        ("member_role" = String, Path),
+        ("template_id" = String, Path),
         ("X-Steward-CSRF" = String, Header)
     ),
-    request_body = BrowserEnvelope,
+    request_body = AuthorEnvelopeTemplateBody,
     responses(
         (status = 201, body = BrowserEnvelopeTemplateResponse),
         (status = 401, description = "Browser session is absent or invalid"),
@@ -1023,24 +1624,27 @@ pub(crate) async fn author_envelope_template<R, L, D>(
     Extension(authority): Extension<BrowserAdminAuthority>,
     Extension(_proof): Extension<BrowserMutationProof>,
     State(state): State<BrowserAdminState<R, L, D>>,
-    Path(member_role): Path<String>,
-    Json(browser_envelope): Json<BrowserEnvelope>,
+    Path(template_id): Path<String>,
+    Json(body): Json<AuthorEnvelopeTemplateBody>,
 ) -> Response
 where
     R: RuntimeRepository,
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
-    let envelope: Envelope = browser_envelope.into();
-    if member_role.is_empty()
-        || envelope.revision <= 0
-        || envelope.spec.llms.is_empty()
-        || validate_envelope(&envelope).is_err()
-    {
+    let envelope: Envelope = body.envelope.into();
+    let auto_provision_threshold = body.auto_provision_threshold.map(Into::into);
+    if !valid_template_authoring(
+        &template_id,
+        &body.display_name,
+        &body.member_roles,
+        &envelope,
+        auto_provision_threshold.as_ref(),
+    ) {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    match state.ledger.latest_envelope(&member_role).await {
-        Ok(Some(current)) if envelope.revision <= current.revision => {
+    match state.ledger.latest_envelope_template(&template_id).await {
+        Ok(Some(current)) if envelope.revision <= current.ceiling.revision => {
             return StatusCode::CONFLICT.into_response();
         }
         Ok(_) => {}
@@ -1052,35 +1656,134 @@ where
             .llms
             .iter()
             .any(|model| !state.capabilities.models.contains(model))
-        || envelope
-            .spec
-            .tools
-            .iter()
-            .any(|tool| !state.capabilities.tools.contains(tool))
+        || envelope.spec.tools.iter().any(|tool| {
+            !state
+                .capabilities
+                .tools
+                .iter()
+                .any(|available| available.grants(tool))
+        })
     {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
     match state
         .ledger
-        .insert_envelope(
-            &member_role,
-            &envelope,
-            authority.principal().canonical_user_id.as_str(),
-        )
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &template_id,
+            display_name: &body.display_name,
+            member_roles: &body.member_roles,
+            ceiling: &envelope,
+            auto_provision_threshold: auto_provision_threshold.as_ref(),
+            authored_by: authority.principal().canonical_user_id.as_str(),
+        })
         .await
     {
-        Ok(()) => (
-            StatusCode::CREATED,
-            Json(BrowserEnvelopeTemplateResponse {
-                api_version: BROWSER_ADMIN_API_VERSION,
-                member_role,
-                envelope: envelope.into(),
-            }),
-        )
-            .into_response(),
+        Ok(()) => {
+            let member_role = body.member_roles.first().cloned().unwrap_or_default();
+            (
+                StatusCode::CREATED,
+                Json(BrowserEnvelopeTemplateResponse {
+                    api_version: BROWSER_ADMIN_API_VERSION,
+                    id: template_id,
+                    display_name: body.display_name,
+                    member_role,
+                    member_roles: body.member_roles,
+                    envelope: envelope.into(),
+                    auto_provision_threshold: auto_provision_threshold.map(Into::into),
+                }),
+            )
+                .into_response()
+        }
         Err(StoreError::EnvelopeRevisionNotIncreasing) => StatusCode::CONFLICT.into_response(),
+        Err(StoreError::InvalidEnvelopeTemplate) => {
+            StatusCode::UNPROCESSABLE_ENTITY.into_response()
+        }
         Err(error) => ApiError::Store(error).into_response(),
     }
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "authorAdminEnvelopeTemplate",
+    path = "/admin/api/v1/envelope-templates/{template_id}",
+    params(
+        ("template_id" = String, Path),
+        ("X-Steward-CSRF" = String, Header)
+    ),
+    request_body = BrowserEnvelope,
+    responses(
+        (status = 201, body = BrowserEnvelopeTemplateResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 409, description = "Envelope revision is not newer than the current revision"),
+        (status = 422, description = "Template identifier, envelope, or deployed capability selection is invalid"),
+        (status = 503, description = "Envelope templates are unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn author_legacy_envelope_template<R, L, D>(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+    Extension(_proof): Extension<BrowserMutationProof>,
+    State(state): State<BrowserAdminState<R, L, D>>,
+    Path(template_id): Path<String>,
+    Json(browser_envelope): Json<BrowserEnvelope>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    let body = AuthorEnvelopeTemplateBody {
+        display_name: template_id.clone(),
+        member_roles: vec![template_id.clone()],
+        envelope: browser_envelope,
+        auto_provision_threshold: None,
+    };
+    author_envelope_template::<R, L, D>(
+        Extension(authority),
+        Extension(_proof),
+        State(state),
+        Path(template_id),
+        Json(body),
+    )
+    .await
+}
+
+fn valid_template_authoring(
+    template_id: &str,
+    display_name: &str,
+    member_roles: &[String],
+    envelope: &Envelope,
+    auto_provision_threshold: Option<&Envelope>,
+) -> bool {
+    let valid_identifier = |value: &str| {
+        let bytes = value.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= 128
+            && bytes[0].is_ascii_alphanumeric()
+            && bytes.iter().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
+            })
+    };
+    valid_identifier(template_id)
+        && !display_name.is_empty()
+        && display_name.trim() == display_name
+        && display_name.chars().count() <= 128
+        && !member_roles.is_empty()
+        && member_roles.len() <= 64
+        && member_roles.iter().all(|role| valid_identifier(role))
+        && member_roles.windows(2).all(|roles| roles[0] < roles[1])
+        && envelope.revision > 0
+        && !envelope.spec.llms.is_empty()
+        && validate_envelope(envelope).is_ok()
+        && auto_provision_threshold.is_none_or(|threshold| {
+            threshold.revision == envelope.revision
+                && validate_envelope(threshold).is_ok()
+                && matches!(
+                    steward_admission::envelope_is_within(threshold, envelope),
+                    Ok(AdmissionDecision::Admit)
+                )
+        })
 }
 
 #[utoipa::path(
@@ -1117,6 +1820,648 @@ where
         .into_response(),
         Err(error) => ApiError::Store(error).into_response(),
     }
+}
+
+fn envelope_request_state(status: EnvelopeRequestStatus, automatic: bool) -> AdminRequestState {
+    match status {
+        EnvelopeRequestStatus::Pending => AdminRequestState::Requested,
+        EnvelopeRequestStatus::Approved => AdminRequestState::Approved,
+        EnvelopeRequestStatus::Provisioned if automatic => AdminRequestState::AutoApproved,
+        EnvelopeRequestStatus::Provisioned => AdminRequestState::Approved,
+        EnvelopeRequestStatus::Rejected => AdminRequestState::Rejected,
+        EnvelopeRequestStatus::Stale | EnvelopeRequestStatus::Conflict => {
+            AdminRequestState::Expired
+        }
+    }
+}
+
+fn decision(
+    rationale: Option<String>,
+    evidence_url: Option<String>,
+    decision_key: Option<String>,
+    expires_at: Option<String>,
+) -> Option<AdminRequestDecision> {
+    (rationale.is_some()
+        || evidence_url.is_some()
+        || decision_key.is_some()
+        || expires_at.is_some())
+    .then_some(AdminRequestDecision {
+        rationale,
+        evidence_url,
+        decision_key,
+        expires_at,
+    })
+}
+
+fn envelope_admin_request(record: AdminEnvelopeRequestRecord) -> AdminRequestView {
+    let automatic = record.request.status == EnvelopeRequestStatus::Provisioned
+        && record.request.status_actor == "system:auto";
+    let deltas = match envelope_is_within(
+        &record.request.requested_envelope,
+        &record.template_envelope,
+    ) {
+        Ok(AdmissionDecision::Reject { deltas }) => deltas,
+        Ok(AdmissionDecision::Admit) | Err(_) => Vec::new(),
+    };
+    let state = envelope_request_state(record.request.status, automatic);
+    let state_actor = if automatic {
+        "system:auto".to_owned()
+    } else {
+        record.request.status_actor.clone()
+    };
+    AdminRequestView {
+        id: record.request.id.to_string(),
+        kind: if deltas.is_empty() {
+            AdminRequestKind::WithinCeiling
+        } else {
+            AdminRequestKind::CeilingExceeded
+        },
+        source: AdminRequestSource::EnvelopeRequest,
+        state,
+        requester: AdminRequestRequester {
+            user_id: record.request.owner_user_id.as_str().to_owned(),
+            display_email: record.owner_display_email,
+        },
+        template: AdminRequestTemplate {
+            id: record.request.template_id,
+            display_name: record.template_display_name,
+            revision: record.request.template_revision,
+        },
+        created_at: record.request.created_at.clone(),
+        state_at: record.request.status_at.clone(),
+        state_actor: state_actor.clone(),
+        deltas,
+        requested_envelope: Some(record.request.requested_envelope.into()),
+        template_envelope: Some(record.template_envelope.into()),
+        escalation: None,
+        decision: decision(
+            record.request.rationale,
+            record.request.evidence_url,
+            record.request.decision_key,
+            record.request.expires_at,
+        ),
+        history: vec![AdminRequestHistoryEvent {
+            state,
+            at: record.request.status_at,
+            actor: state_actor,
+            reason: record.request.reason,
+        }],
+    }
+}
+
+fn approval_admin_request(record: AdminApprovalRecord) -> AdminRequestView {
+    let state = match record.state.as_str() {
+        "approved" => AdminRequestState::Approved,
+        "rejected" => AdminRequestState::Rejected,
+        _ => AdminRequestState::Escalated,
+    };
+    let history = if state == AdminRequestState::Escalated {
+        vec![AdminRequestHistoryEvent {
+            state,
+            at: record.state_at.clone(),
+            actor: record.state_actor.clone(),
+            reason: None,
+        }]
+    } else {
+        vec![
+            AdminRequestHistoryEvent {
+                state: AdminRequestState::Escalated,
+                at: record.created_at.clone(),
+                actor: record.requester_user_id.clone(),
+                reason: None,
+            },
+            AdminRequestHistoryEvent {
+                state,
+                at: record.state_at.clone(),
+                actor: record.state_actor.clone(),
+                reason: None,
+            },
+        ]
+    };
+    let requested = BrowserEnvelope {
+        revision: record.envelope_revision,
+        spec: BrowserEnvelopeSpec {
+            llms: record.proposed_spec.llms,
+            tools: record.proposed_spec.tools,
+            budget: record.proposed_spec.budget,
+            runtime_minutes_limit: None,
+            ttl: record.proposed_spec.ttl,
+            runner: record.proposed_spec.runner,
+        },
+    };
+    AdminRequestView {
+        id: record.approval_id.to_string(),
+        kind: AdminRequestKind::CeilingExceeded,
+        source: AdminRequestSource::RuntimeException,
+        state,
+        requester: AdminRequestRequester {
+            user_id: record.requester_user_id,
+            display_email: record.requester_display_email,
+        },
+        template: AdminRequestTemplate {
+            id: record.member_role.clone(),
+            display_name: record.member_role,
+            revision: record.envelope_revision,
+        },
+        created_at: record.created_at,
+        state_at: record.state_at.clone(),
+        state_actor: record.state_actor.clone(),
+        deltas: record.deltas,
+        requested_envelope: Some(requested),
+        template_envelope: Some(record.template_envelope.into()),
+        escalation: None,
+        decision: decision(
+            record.rationale,
+            record.evidence_url,
+            record.decision_key,
+            record.expires_at,
+        ),
+        history,
+    }
+}
+
+fn escalation_admin_request(record: CumulativeEscalationRecord) -> AdminRequestView {
+    let state = if record.grant_id.is_some() && record.grant_active == Some(false) {
+        AdminRequestState::Expired
+    } else if record.grant_id.is_some() {
+        AdminRequestState::Approved
+    } else if record.denial_rationale.is_some() {
+        AdminRequestState::Rejected
+    } else {
+        AdminRequestState::Escalated
+    };
+    let state_at = record
+        .decision_at
+        .clone()
+        .unwrap_or_else(|| record.parked_at.clone());
+    let state_actor = record
+        .decision_actor
+        .clone()
+        .unwrap_or_else(|| "system:meter".to_owned());
+    let history = if state == AdminRequestState::Expired {
+        vec![
+            AdminRequestHistoryEvent {
+                state: AdminRequestState::Approved,
+                at: state_at.clone(),
+                actor: state_actor.clone(),
+                reason: None,
+            },
+            AdminRequestHistoryEvent {
+                state,
+                at: record
+                    .grant_valid_until
+                    .clone()
+                    .unwrap_or_else(|| state_at.clone()),
+                actor: "system:expiry".to_owned(),
+                reason: None,
+            },
+        ]
+    } else {
+        vec![AdminRequestHistoryEvent {
+            state,
+            at: state_at.clone(),
+            actor: state_actor.clone(),
+            reason: None,
+        }]
+    };
+    AdminRequestView {
+        id: record.escalation_id.to_string(),
+        kind: AdminRequestKind::CumulativeExhausted,
+        source: AdminRequestSource::Escalation,
+        state,
+        requester: AdminRequestRequester {
+            user_id: record.requester_user_id,
+            display_email: record.requester_display_email,
+        },
+        template: AdminRequestTemplate {
+            id: record.template_id,
+            display_name: record.template_display_name,
+            revision: record.template_revision,
+        },
+        created_at: record.parked_at.clone(),
+        state_at: state_at.clone(),
+        state_actor: state_actor.clone(),
+        deltas: Vec::new(),
+        requested_envelope: None,
+        template_envelope: None,
+        escalation: Some(EscalationView {
+            envelope_instance_id: record.envelope_instance_id,
+            period: EscalationPeriod {
+                start: record.period_start,
+                end: record.period_end,
+            },
+            meters: vec![EscalationMeter {
+                dimension: if record.dimension == "runtime_minutes" {
+                    EscalationDimension::RuntimeMinutes
+                } else {
+                    EscalationDimension::LlmSpend
+                },
+                used: record.observed_amount,
+                limit: record.limit,
+                unit: record.currency,
+                observed_at: record.observed_at,
+                exhausted: true,
+            }],
+            blocked_task_uid: record.blocked_task_uid,
+            parked_at: record.parked_at,
+        }),
+        decision: record
+            .grant_rationale
+            .or(record.denial_rationale)
+            .map(|rationale| AdminRequestDecision {
+                rationale: Some(rationale),
+                evidence_url: None,
+                decision_key: None,
+                expires_at: record.grant_valid_until,
+            }),
+        history,
+    }
+}
+
+async fn admin_request_views<L>(ledger: &L) -> Result<Vec<AdminRequestView>, StoreError>
+where
+    L: AdmissionLedger,
+{
+    let mut requests = ledger
+        .admin_envelope_requests()
+        .await?
+        .into_iter()
+        .map(envelope_admin_request)
+        .collect::<Vec<_>>();
+    requests.extend(
+        ledger
+            .admin_approvals()
+            .await?
+            .into_iter()
+            .map(approval_admin_request),
+    );
+    requests.extend(
+        ledger
+            .admin_escalations()
+            .await?
+            .into_iter()
+            .map(escalation_admin_request),
+    );
+    requests.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok(requests)
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "topUpAdminEscalation",
+    path = "/admin/api/v1/escalations/{escalation_id}/top-up",
+    params(
+        ("escalation_id" = String, Path, format = "uuid"),
+        ("X-Steward-CSRF" = String, Header)
+    ),
+    request_body = EscalationTopUpRequest,
+    responses(
+        (status = 200, body = AdminRequestResponse),
+        (status = 400, description = "Top-up is invalid or runtime-minutes enforcement is unavailable"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role or mutation proof is invalid"),
+        (status = 404, description = "Escalation or bound runtime was not found"),
+        (status = 409, description = "Escalation was already decided differently"),
+        (status = 503, description = "Escalation authority is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn top_up_escalation<R, L, D>(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+    proof: Option<Extension<BrowserMutationProof>>,
+    State(state): State<BrowserAdminState<R, L, D>>,
+    Path(escalation_id): Path<Uuid>,
+    Json(request): Json<EscalationTopUpRequest>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    if proof.is_none() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if request.rationale.trim().is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(escalation) = (match state.ledger.cumulative_escalation(escalation_id).await {
+        Ok(escalation) => escalation,
+        Err(error) => return ApiError::Store(error).into_response(),
+    }) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let expected_dimension = if escalation.dimension == "runtime_minutes" {
+        EscalationDimension::RuntimeMinutes
+    } else {
+        EscalationDimension::LlmSpend
+    };
+    if request.dimension != expected_dimension {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if state
+        .runtimes
+        .get_bound(
+            &escalation.runtime_namespace,
+            &escalation.runtime_name,
+            &escalation.runtime_uid,
+        )
+        .await
+        .is_err()
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let amount = match add_budget_amount("0", &request.amount) {
+        Ok(amount)
+            if amount
+                .bytes()
+                .any(|byte| byte.is_ascii_digit() && byte != b'0') =>
+        {
+            amount
+        }
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let actor = authority.principal().canonical_user_id.as_str();
+    if let Err(error) = state
+        .ledger
+        .record_escalation_top_up(
+            escalation_id,
+            &amount,
+            &request.valid_until,
+            &request.rationale,
+            actor,
+        )
+        .await
+    {
+        return ApiError::Store(error).into_response();
+    }
+    match state.ledger.cumulative_escalation(escalation_id).await {
+        Ok(Some(record)) => Json(AdminRequestResponse {
+            api_version: BROWSER_ADMIN_API_VERSION,
+            request: escalation_admin_request(record),
+        })
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => ApiError::Store(error).into_response(),
+    }
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "denyAdminEscalation",
+    path = "/admin/api/v1/escalations/{escalation_id}/deny",
+    params(
+        ("escalation_id" = String, Path, format = "uuid"),
+        ("X-Steward-CSRF" = String, Header)
+    ),
+    request_body = EscalationDenyRequest,
+    responses(
+        (status = 200, body = AdminRequestResponse),
+        (status = 400, description = "Denial rationale is invalid"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role or mutation proof is invalid"),
+        (status = 404, description = "Escalation was not found"),
+        (status = 409, description = "Escalation was already decided differently"),
+        (status = 503, description = "Escalation authority is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn deny_escalation<R, L, D>(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+    proof: Option<Extension<BrowserMutationProof>>,
+    State(state): State<BrowserAdminState<R, L, D>>,
+    Path(escalation_id): Path<Uuid>,
+    Json(request): Json<EscalationDenyRequest>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    if proof.is_none() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if request.rationale.trim().is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Err(error) = state
+        .ledger
+        .deny_cumulative_escalation(
+            escalation_id,
+            &request.rationale,
+            authority.principal().canonical_user_id.as_str(),
+        )
+        .await
+    {
+        return ApiError::Store(error).into_response();
+    }
+    match state.ledger.cumulative_escalation(escalation_id).await {
+        Ok(Some(record)) => Json(AdminRequestResponse {
+            api_version: BROWSER_ADMIN_API_VERSION,
+            request: escalation_admin_request(record),
+        })
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => ApiError::Store(error).into_response(),
+    }
+}
+
+fn state_filter_matches(filter: AdminRequestStateFilter, state: AdminRequestState) -> bool {
+    match filter {
+        AdminRequestStateFilter::All => true,
+        AdminRequestStateFilter::NeedsAction => matches!(
+            state,
+            AdminRequestState::Requested | AdminRequestState::Escalated
+        ),
+        AdminRequestStateFilter::Requested => state == AdminRequestState::Requested,
+        AdminRequestStateFilter::Escalated => state == AdminRequestState::Escalated,
+        AdminRequestStateFilter::AutoApproved => state == AdminRequestState::AutoApproved,
+        AdminRequestStateFilter::Approved => state == AdminRequestState::Approved,
+        AdminRequestStateFilter::Rejected => state == AdminRequestState::Rejected,
+        AdminRequestStateFilter::Expired => state == AdminRequestState::Expired,
+    }
+}
+
+fn admin_request_cursor(request: &AdminRequestView) -> String {
+    format!("{}|{}", request.created_at, request.id)
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "listAdminRequests",
+    path = "/admin/api/v1/requests",
+    params(AdminRequestsQuery),
+    responses(
+        (status = 200, body = AdminRequestsResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role is required"),
+        (status = 422, description = "Filter, cursor, or limit is invalid"),
+        (status = 503, description = "Request read model is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn list_admin_requests<R, L, D>(
+    Extension(_authority): Extension<BrowserAdminAuthority>,
+    State(state): State<BrowserAdminState<R, L, D>>,
+    query: Result<Query<AdminRequestsQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    let Ok(Query(query)) = query else {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    };
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let mut requests = match admin_request_views(&state.ledger).await {
+        Ok(requests) => requests,
+        Err(error) => return ApiError::Store(error).into_response(),
+    };
+    if let Some(filter) = query.state {
+        requests.retain(|request| state_filter_matches(filter, request.state));
+    }
+    if let Some(filter) = query.kind {
+        requests.retain(|request| request.kind == filter);
+    }
+    let start = if let Some(cursor) = query.cursor.as_deref() {
+        let Some(position) = requests
+            .iter()
+            .position(|request| admin_request_cursor(request) == cursor)
+        else {
+            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        };
+        position + 1
+    } else {
+        0
+    };
+    let page = requests
+        .into_iter()
+        .skip(start)
+        .take(limit + 1)
+        .collect::<Vec<_>>();
+    let has_more = page.len() > limit;
+    let requests = page.into_iter().take(limit).collect::<Vec<_>>();
+    let next_cursor = has_more
+        .then(|| requests.last().map(admin_request_cursor))
+        .flatten();
+    Json(AdminRequestsResponse {
+        api_version: BROWSER_ADMIN_API_VERSION,
+        requests,
+        next_cursor,
+    })
+    .into_response()
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "getAdminRequest",
+    path = "/admin/api/v1/requests/{request_id}",
+    params(("request_id" = String, Path)),
+    responses(
+        (status = 200, body = AdminRequestResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role is required"),
+        (status = 404, description = "Request was not found"),
+        (status = 503, description = "Request read model is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn get_admin_request<R, L, D>(
+    Extension(_authority): Extension<BrowserAdminAuthority>,
+    State(state): State<BrowserAdminState<R, L, D>>,
+    Path(request_id): Path<String>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    let mut request = match admin_request_views(&state.ledger).await {
+        Ok(requests) => requests
+            .into_iter()
+            .find(|request| request.id == request_id),
+        Err(error) => return ApiError::Store(error).into_response(),
+    };
+    let Some(mut request) = request.take() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if request.source == AdminRequestSource::EnvelopeRequest {
+        let Ok(id) = Uuid::parse_str(&request_id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let automatic = request.state == AdminRequestState::AutoApproved;
+        request.history = match state.ledger.envelope_request_history(id).await {
+            Ok(history) => history
+                .into_iter()
+                .map(|event| AdminRequestHistoryEvent {
+                    state: envelope_request_state(event.status, automatic),
+                    at: event.at,
+                    actor: if automatic && event.status == EnvelopeRequestStatus::Provisioned {
+                        "system:auto".to_owned()
+                    } else {
+                        event.actor
+                    },
+                    reason: event.reason,
+                })
+                .collect(),
+            Err(error) => return ApiError::Store(error).into_response(),
+        };
+    }
+    Json(AdminRequestResponse {
+        api_version: BROWSER_ADMIN_API_VERSION,
+        request,
+    })
+    .into_response()
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "getAdminRequestsSummary",
+    path = "/admin/api/v1/requests/summary",
+    responses(
+        (status = 200, body = AdminRequestsSummaryResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role is required"),
+        (status = 503, description = "Request read model is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn admin_requests_summary<R, L, D>(
+    Extension(_authority): Extension<BrowserAdminAuthority>,
+    State(state): State<BrowserAdminState<R, L, D>>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    let requests = match admin_request_views(&state.ledger).await {
+        Ok(requests) => requests,
+        Err(error) => return ApiError::Store(error).into_response(),
+    };
+    let escalated = requests
+        .iter()
+        .filter(|request| request.state == AdminRequestState::Escalated)
+        .count();
+    let requested = requests
+        .iter()
+        .filter(|request| request.state == AdminRequestState::Requested)
+        .count();
+    Json(AdminRequestsSummaryResponse {
+        api_version: BROWSER_ADMIN_API_VERSION,
+        needs_action: escalated + requested,
+        escalated,
+        requested,
+    })
+    .into_response()
 }
 
 #[utoipa::path(
@@ -1210,5 +2555,84 @@ where
         })
         .into_response(),
         Err(error) => error.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod request_projection_tests {
+    use steward_admission::{Envelope, EnvelopeSpec};
+    use steward_store::AdminApprovalRecord;
+    use steward_types::{
+        AgentRuntimeSpec, AgentType, Budget, Duration, Email, Principal, RunnerRequirements,
+    };
+    use uuid::Uuid;
+
+    use super::approval_admin_request;
+
+    #[test]
+    fn runtime_approval_decision_preserves_grant_expiry() -> Result<(), String> {
+        let budget = Budget {
+            monthly_limit: "100.00".to_owned(),
+            single_run_limit: Some("10.00".to_owned()),
+            currency: "USD".to_owned(),
+        };
+        let expires_at = "2999-01-01T00:00:00.000000Z";
+        let request = approval_admin_request(AdminApprovalRecord {
+            approval_id: Uuid::nil(),
+            runtime_uid: "runtime-a".to_owned(),
+            state: "approved".to_owned(),
+            decision_key: Some("PROJ-123".to_owned()),
+            evidence_url: Some("https://jira.example.com/browse/PROJ-123".to_owned()),
+            rationale: Some("bounded exception".to_owned()),
+            expires_at: Some(expires_at.to_owned()),
+            deltas: Vec::new(),
+            proposed_spec: AgentRuntimeSpec {
+                principal: Principal::User {
+                    acting_user: Email::parse("alice@example.com")?,
+                },
+                owner: Email::parse("alice@example.com")?,
+                canonical_authority: None,
+                agent_type: AgentType {
+                    name: "codex".to_owned(),
+                },
+                llms: Vec::new(),
+                tools: Vec::new(),
+                budget: budget.clone(),
+                ttl: Duration("1h".to_owned()),
+                runner: RunnerRequirements::default(),
+                bindings: None,
+            },
+            envelope_revision: 1,
+            member_role: "engineer".to_owned(),
+            template_envelope: Envelope {
+                revision: 1,
+                spec: EnvelopeSpec {
+                    llms: Vec::new(),
+                    tools: Vec::new(),
+                    budget,
+                    runtime_minutes_limit: None,
+                    ttl: Duration("1h".to_owned()),
+                    runner: RunnerRequirements::default(),
+                },
+            },
+            requester_user_id: "usr_0123456789abcdef0123456789abcdef".to_owned(),
+            requester_display_email: "alice@example.com".to_owned(),
+            created_at: "2026-08-24T17:05:00.000000Z".to_owned(),
+            state_at: "2026-08-24T17:06:00.000000Z".to_owned(),
+            state_actor: "admin".to_owned(),
+        });
+
+        assert_eq!(request.history.len(), 2);
+        assert_eq!(
+            request.history[0].state,
+            super::AdminRequestState::Escalated
+        );
+        assert_eq!(request.history[0].at, "2026-08-24T17:05:00.000000Z");
+        assert_eq!(request.history[1].state, super::AdminRequestState::Approved);
+        assert_eq!(
+            request.decision.and_then(|decision| decision.expires_at),
+            Some(expires_at.to_owned())
+        );
+        Ok(())
     }
 }

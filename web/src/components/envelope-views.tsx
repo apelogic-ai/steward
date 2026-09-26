@@ -27,12 +27,20 @@ import { useSession } from "@/session/session-context";
 import { listPublishedWorkflows, renderWorkflowForEnvelope, type PublishedWorkflowListResponse } from "@/workflows/api";
 import { workflowReference } from "@/workflows/contracts";
 
+function dateTime(value: string): string {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.valueOf()) ? value : parsed.toLocaleString();
+}
+
 function EnvelopeSummary({ envelope }: Readonly<{ envelope: BrowserEnvelope }>) {
   return <DefinitionList items={[
     ["Monthly limit", `${envelope.spec.budget.monthlyLimit} ${envelope.spec.budget.currency}`],
     ["Single-run limit", envelope.spec.budget.singleRunLimit
       ? `${envelope.spec.budget.singleRunLimit} ${envelope.spec.budget.currency}`
       : "Not set"],
+    ["Runtime minutes", envelope.spec.runtimeMinutesLimit
+      ? `${envelope.spec.runtimeMinutesLimit} min / month`
+      : "Unlimited"],
     ["TTL", envelope.spec.ttl],
     ["Models", envelope.spec.llms.length ? envelope.spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ") : "None"],
     ["Tools", envelope.spec.tools.length ? envelope.spec.tools.map((tool) => `${tool.provider}:${tool.resource}:${tool.action}`).join(", ") : "None"],
@@ -57,6 +65,7 @@ export function EnvelopesView() {
 }
 
 function EnvelopeCard({ request }: Readonly<{ request: UserEnvelopeRequest }>) {
+  const usage = request.usage?.spend;
   return (
     <li className="rounded-panel border bg-panel p-5 shadow-sm">
       <div className="flex items-start justify-between gap-4">
@@ -64,6 +73,7 @@ function EnvelopeCard({ request }: Readonly<{ request: UserEnvelopeRequest }>) {
         <StatusBadge value={request.status} />
       </div>
       <div className="mt-5"><EnvelopeSummary envelope={request.approvedEnvelope ?? request.requestedEnvelope} /></div>
+      {request.usage ? <p className="mt-4 text-sm text-muted-ink">This month: {usage ? `${usage.observed} / ${usage.limit} ${usage.currency}` : request.usage.availability.reason ?? "Usage unavailable"}</p> : null}
       <Link className="mt-5 inline-flex min-h-11 items-center text-sm font-semibold text-brand hover:text-brand-strong" href={`/envelopes/${request.id}`}>View envelope →</Link>
     </li>
   );
@@ -105,6 +115,7 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
   const [templateId, setTemplateId] = useState(templates[0]?.id ?? "");
   const template = templates.find((item) => item.id === templateId) ?? templates[0];
   const [budget, setBudget] = useState(template.ceiling.spec.budget.monthlyLimit);
+  const [runtimeMinutes, setRuntimeMinutes] = useState(template.ceiling.spec.runtimeMinutesLimit ?? "");
   const [ttl, setTtl] = useState(template.ceiling.spec.ttl);
   const [models, setModels] = useState(() => new Set(template.ceiling.spec.llms.map((item) => `${item.provider}\u0000${item.model}`)));
   const [tools, setTools] = useState(() => new Set(template.ceiling.spec.tools.map((item) => `${item.provider}\u0000${item.resource}\u0000${item.action}`)));
@@ -115,6 +126,7 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
     if (!next) return;
     setTemplateId(id);
     setBudget(next.ceiling.spec.budget.monthlyLimit);
+    setRuntimeMinutes(next.ceiling.spec.runtimeMinutesLimit ?? "");
     setTtl(next.ceiling.spec.ttl);
     setModels(new Set(next.ceiling.spec.llms.map((item) => `${item.provider}\u0000${item.model}`)));
     setTools(new Set(next.ceiling.spec.tools.map((item) => `${item.provider}\u0000${item.resource}\u0000${item.action}`)));
@@ -139,6 +151,7 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
               monthlyLimit: budget,
               singleRunLimit: template.ceiling.spec.budget.singleRunLimit,
             },
+            ...(runtimeMinutes.trim() ? { runtimeMinutesLimit: runtimeMinutes.trim() } : {}),
             ttl,
             llms: template.ceiling.spec.llms.filter((item) => models.has(`${item.provider}\u0000${item.model}`)),
             tools: template.ceiling.spec.tools.filter((item) => tools.has(`${item.provider}\u0000${item.resource}\u0000${item.action}`)),
@@ -163,13 +176,16 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
           {templates.map((item) => <option key={item.id} value={item.id}>{item.displayName} · revision {item.revision}</option>)}
         </select>
       </label>
-      <div className="grid gap-4 sm:grid-cols-2">
+      <div className="grid gap-4 sm:grid-cols-3">
         <label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})
           <input className="min-h-11 rounded-md border px-3 font-normal" inputMode="decimal" onChange={(event) => setBudget(event.target.value)} required value={budget} />
         </label>
         <label className="grid gap-2 text-sm font-semibold">Time to live
           <input className="min-h-11 rounded-md border px-3 font-normal" onChange={(event) => setTtl(event.target.value)} required value={ttl} />
         </label>
+        {template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month
+          <input className="min-h-11 rounded-md border px-3 font-normal" inputMode="decimal" onChange={(event) => setRuntimeMinutes(event.target.value)} required value={runtimeMinutes} />
+        </label> : null}
       </div>
       <Accordion preferenceKey={`steward.ui.envelope-accordion.${template.id}.models`} title="Models">
         <div className="space-y-3">{template.ceiling.spec.llms.map((item) => {
@@ -201,14 +217,26 @@ export function EnvelopeDetailView({ requestId }: Readonly<{ requestId: string }
 }
 
 function EnvelopeDetail({ request }: Readonly<{ request: UserEnvelopeRequest }>) {
+  const usage = request.usage?.spend;
   return (
     <div className="space-y-5">
       <article className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
         <div className="flex flex-wrap justify-between gap-3"><div><h2 className="text-xl font-semibold">{request.templateId}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.id}</p></div><StatusBadge value={request.status} /></div>
         <EnvelopeSummary envelope={request.approvedEnvelope ?? request.requestedEnvelope} />
+        {request.usage ? <DefinitionList items={[
+          ["Period", `${dateTime(request.usage.period.start)} – ${dateTime(request.usage.period.end)}`],
+          ["Spend", usage ? `${usage.observed} / ${usage.limit} ${usage.currency}` : request.usage.availability.reason ?? "Unavailable"],
+          ["Observed", usage ? dateTime(usage.observedAt) : "Not reported"],
+        ]} /> : null}
         {request.reason ? <p className="rounded-md bg-notice p-4 text-sm"><strong>Server reason:</strong> {request.reason}</p> : null}
         {request.envelopeInstanceId ? <PrimaryLink href={`/envelopes/${request.id}/runs`}>View recent runs</PrimaryLink> : null}
       </article>
+      <section className="space-y-3 rounded-panel border bg-panel p-6 shadow-sm">
+        <h2 className="text-xl font-semibold">Status history</h2>
+        {request.history.length ? <ol className="space-y-3">{request.history.map((event, index) => (
+          <li className="rounded-md border p-3" key={`${event.at}-${index}`}><div className="flex items-center justify-between gap-3"><StatusBadge value={event.status} /><time className="text-xs text-muted-ink">{dateTime(event.at)}</time></div><p className="mt-2 text-sm">Actor: {event.actor}</p>{event.reason ? <p className="mt-1 text-sm text-muted-ink">{event.reason}</p> : null}</li>
+        ))}</ol> : <EmptyState title="No history" />}
+      </section>
       {request.status === "provisioned" ? <WorkflowGenerator requestId={request.id} /> : <EmptyState title="Workflow not available"><p>A governed GitHub Actions workflow can be rendered only after this request is provisioned.</p></EmptyState>}
     </div>
   );
@@ -228,7 +256,10 @@ function WorkflowGenerator({ requestId }: Readonly<{ requestId: string }>) {
     if (!selected) { setStatus("rejected"); return; }
     setStatus("loading");
     const result = await renderWorkflowForEnvelope(session.value.csrf, requestId, selected);
-    if (result.data && result.response?.ok) { setWorkflow(result.data); setStatus("idle"); } else setStatus(classifyMutationFailure(result.response?.status));
+    if (result.data && result.response?.ok) {
+      setWorkflow(result.data);
+      setStatus("idle");
+    } else setStatus(classifyMutationFailure(result.response?.status));
   }
   return (
     <section className="space-y-4 rounded-panel border bg-panel p-6 shadow-sm" aria-labelledby="workflow-title">
@@ -240,7 +271,7 @@ function WorkflowGenerator({ requestId }: Readonly<{ requestId: string }>) {
         </form>
       )}</ResourceBoundary>
       {status !== "idle" && status !== "loading" ? <p role="alert" className="text-sm text-red-800">{{ conflict: "The envelope changed before the workflow could be rendered. Reload before retrying.", rejected: "Rust rejected the workflow inputs.", forbidden: "The Rust authorization boundary rejected workflow rendering.", unavailable: "The authoritative workflow service is unavailable.", error: "The workflow response could not be accepted." }[status]}</p> : null}
-      {workflow ? <div className="space-y-2"><p className="text-xs text-muted-ink">SHA-256: <span className="break-all font-mono">{workflow.workflow.sha256}</span></p><textarea aria-label="Generated workflow" className="min-h-80 w-full rounded-md border bg-canvas p-4 font-mono text-xs" readOnly value={workflow.workflow.yaml} /></div> : null}
+      {workflow ? <div className="space-y-2"><p className="text-xs text-muted-ink">Suggested path: <span className="break-all font-mono">{workflow.workflow.suggestedPath}</span></p><p className="text-xs text-muted-ink">SHA-256: <span className="break-all font-mono">{workflow.workflow.sha256}</span></p><textarea aria-label="Generated workflow" className="min-h-80 w-full rounded-md border bg-canvas p-4 font-mono text-xs" readOnly value={workflow.workflow.yaml} /></div> : null}
     </section>
   );
 }

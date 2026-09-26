@@ -1,22 +1,27 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback } from "react";
+import { useRouter } from "next/navigation";
+import { useCallback, useState } from "react";
 
 import {
   allRun,
   allRuns,
   allRunTimeline,
+  cancelMyRun,
   myRun,
   myRuns,
   myRunTimeline,
+  rerunMyRun,
   type AllRunsResponse,
   type BrowserRunResponse,
   type BrowserRunTimelineResponse,
   type BrowserRunView,
   type MyRunsResponse,
 } from "@/api-client";
+import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
+import { useSession } from "@/session/session-context";
 import { DefinitionList, EmptyState, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 
 function dateTime(value: string): string {
@@ -35,7 +40,37 @@ function runtimeLabel(value: string | null | undefined): string {
 }
 
 function isTerminalPhase(phase: string): boolean {
-  return phase === "failed" || phase === "succeeded";
+  return phase === "failed" || phase === "succeeded" || phase === "cancelled";
+}
+
+type RerunAttempt = {
+  data?: { retryAfterMs?: number; taskUid?: string };
+  response?: { ok: boolean; status: number };
+};
+
+type RerunOutcome = { taskUid: string } | { failure: MutationFailureState };
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+export async function pollRerun(
+  attempt: () => Promise<RerunAttempt>,
+  pause: (milliseconds: number) => Promise<void> = wait,
+  maxAttempts = 60,
+): Promise<RerunOutcome> {
+  for (let index = 0; index < maxAttempts; index += 1) {
+    const result = await attempt();
+    if (result.response?.ok && result.data?.taskUid) return { taskUid: result.data.taskUid };
+    if (result.response?.status !== 202) {
+      return { failure: classifyMutationFailure(result.response?.status) };
+    }
+    if (index + 1 < maxAttempts) {
+      const retryAfterMs = Math.min(Math.max(result.data?.retryAfterMs ?? 1_000, 250), 5_000);
+      await pause(retryAfterMs);
+    }
+  }
+  return { failure: "unavailable" };
 }
 
 function TerminalPhaseLogs({ admin, taskUid }: Readonly<{ admin: boolean; taskUid: string }>) {
@@ -93,12 +128,25 @@ export function RunsView({ admin = false }: Readonly<{ admin?: boolean }>) {
         description={admin ? "Inspect the administrator-authorized run view." : "Track governed execution using the authoritative run record."}
         title={admin ? "All runs" : "Runs"}
       />
-      <ResourceBoundary state={state}>{(data) => <RunCards admin={admin} runs={data.runs} />}</ResourceBoundary>
+      <ResourceBoundary state={state}>{(data) => (
+        <div className="space-y-5">
+          <ul aria-label="Run phase counts" className="flex flex-wrap gap-2">
+            {Object.entries(data.facets.phase).map(([phase, count]) => (
+              <li className="rounded-full border bg-panel px-3 py-1 text-sm" key={phase}>{phase}: {count}</li>
+            ))}
+          </ul>
+          <RunCards admin={admin} runs={data.runs} />
+        </div>
+      )}</ResourceBoundary>
     </section>
   );
 }
 
 export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boolean; taskUid: string }>) {
+  const router = useRouter();
+  const session = useSession();
+  const [cancelState, setCancelState] = useState<"idle" | "working" | "cancelled" | MutationFailureState>("idle");
+  const [rerunState, setRerunState] = useState<"idle" | "working" | MutationFailureState>("idle");
   const loadRun = useCallback(() => admin
     ? allRun({ cache: "no-store", credentials: "same-origin", path: { task_uid: taskUid } })
     : myRun({ cache: "no-store", credentials: "same-origin", path: { task_uid: taskUid } }), [admin, taskUid]);
@@ -114,26 +162,67 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
         const pinnedWorkflow = run.workflowName && run.workflowVersion
           ? `${run.workflowName}@${run.workflowVersion}`
           : run.workflow;
+        const detailItems: Array<[string, string | number]> = [
+          ["Workflow version", pinnedWorkflow],
+          ["Coding agent", run.codingAgentRuntime],
+          ["Runtime UID", run.runtimeUid ?? "Not assigned"],
+          ["Ownership", run.runtimeOwnership],
+          ["User envelope instance", run.userEnvelopeInstanceId ?? "Not reported"],
+          ["User envelope revision", run.userEnvelopeRevision ?? "Not reported"],
+          ["User envelope digest", run.userEnvelopeDigest ?? "Not reported"],
+          ["Created", dateTime(run.createdAt)],
+          ["Updated", dateTime(run.updatedAt)],
+          ["Observed spend", run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "Not reported"],
+          ["Error category", run.errorCategory ?? "None reported"],
+          ["Finalized", run.finalized ? "Yes" : run.finalizationRequested ? "Requested" : "No"],
+        ];
+        if (admin && "ownerDisplayEmail" in run) detailItems.push(["Owner", String(run.ownerDisplayEmail ?? "Not reported")]);
         return (
         <article className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div><h2 className="text-xl font-semibold">{run.workflow}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{run.taskUid}</p></div>
             <StatusBadge value={run.phase} />
           </div>
-          <DefinitionList items={[
-            ["Workflow version", pinnedWorkflow],
-            ["Coding agent", run.codingAgentRuntime],
-            ["Runtime UID", run.runtimeUid ?? "Not assigned"],
-            ["Ownership", run.runtimeOwnership],
-            ["User envelope instance", run.userEnvelopeInstanceId ?? "Not reported"],
-            ["User envelope revision", run.userEnvelopeRevision ?? "Not reported"],
-            ["User envelope digest", run.userEnvelopeDigest ?? "Not reported"],
-            ["Created", dateTime(run.createdAt)],
-            ["Updated", dateTime(run.updatedAt)],
-            ["Observed spend", run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "Not reported"],
-            ["Error category", run.errorCategory ?? "None reported"],
-            ["Finalized", run.finalized ? "Yes" : run.finalizationRequested ? "Requested" : "No"],
-          ]} />
+          <DefinitionList items={detailItems} />
+          {run.trigger ? (
+            <section className="space-y-3 border-t pt-5">
+              <h3 className="font-semibold">Triggered by GitHub</h3>
+              <DefinitionList items={[
+                ["Repository", run.trigger.repository],
+                ["Event", run.trigger.event],
+                ["Actor", run.trigger.actor],
+                ["Ref", run.trigger.ref],
+                ["Commit", run.trigger.sha],
+                ["Workflow", run.trigger.callerWorkflow],
+              ]} />
+              <a className="text-sm font-semibold text-brand hover:text-brand-strong" href={run.trigger.runUrl} rel="noreferrer" target="_blank">Open GitHub run ↗</a>
+            </section>
+          ) : null}
+          <section className="space-y-3 border-t pt-5">
+            <h3 className="font-semibold">Stages</h3>
+            <ol className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              {run.stages.map((stage) => <li className="rounded-md border p-3" key={stage.id}><p className="text-sm font-semibold">{stage.displayName}</p><StatusBadge value={stage.state} />{stage.steps.map((step) => <div className="mt-3 border-t pt-3" key={step.id}><p className="text-sm">{step.displayName}</p><div className="mt-2 flex flex-wrap gap-2">{step.logStreams.map((stream) => <a className="text-xs font-semibold text-brand" href={`${admin ? "/admin/runs" : "/runs"}/${encodeURIComponent(taskUid)}/logs/${stream}`} key={stream}>{stream}</a>)}</div></div>)}</li>)}
+            </ol>
+          </section>
+          {!admin ? <div className="flex flex-wrap gap-3 border-t pt-5"><button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={rerunState === "working"} onClick={async () => {
+            if (session.status !== "authenticated") return;
+            setRerunState("working");
+            const idempotencyKey = crypto.randomUUID();
+            const outcome = await pollRerun(() => rerunMyRun({ body: { idempotencyKey }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { task_uid: taskUid } }));
+            if ("taskUid" in outcome) router.push(`/runs/${outcome.taskUid}`);
+            else setRerunState(outcome.failure);
+          }} type="button">{rerunState === "working" ? "Starting…" : "Re-run"}</button>{rerunState !== "idle" && rerunState !== "working" ? <p className="self-center text-sm text-red-800" role="alert">The run could not be re-run ({rerunState}).</p> : null}</div> : null}
+          {!admin && !isTerminalPhase(run.phase) ? (
+            <div className="space-y-2 border-t pt-5">
+              <button className="min-h-11 rounded-md border border-red-700 px-4 py-2 text-sm font-semibold text-red-800 disabled:opacity-50" disabled={cancelState === "working" || cancelState === "cancelled"} onClick={async () => {
+                if (session.status !== "authenticated") return;
+                setCancelState("working");
+                const result = await cancelMyRun({ cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { task_uid: taskUid } });
+                setCancelState(result.data && result.response?.ok ? "cancelled" : classifyMutationFailure(result.response?.status));
+              }} type="button">{cancelState === "working" ? "Cancelling…" : cancelState === "cancelled" ? "Cancellation requested" : "Cancel run"}</button>
+              {cancelState !== "idle" && cancelState !== "working" && cancelState !== "cancelled" ? <p className="text-sm text-red-800" role="alert">The run could not be cancelled ({cancelState}).</p> : null}
+            </div>
+          ) : null}
         </article>
       );}}</ResourceBoundary>
       <div className="space-y-3">

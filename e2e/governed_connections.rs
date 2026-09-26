@@ -8,6 +8,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use kube::Client;
+use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::Uuid;
 use sqlx::{PgPool, Row};
@@ -17,7 +18,7 @@ use steward_adapter_openshell::{
 use steward_admission::{AdmissionDecision, Envelope, EnvelopeSpec, evaluate, validate_envelope};
 use steward_apiserver::connections::{
     ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionSubject,
-    ProviderConnectionBroker,
+    GithubWorkflowRerunBroker, GithubWorkflowRerunRequest, ProviderConnectionBroker,
 };
 use steward_apiserver::governed_connections::{
     ConnectionExecutionBindings, ConnectionOperationReconciler, GovernedConnectionsBroker,
@@ -386,6 +387,7 @@ impl Harness {
                     single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: None,
                 ttl: StewardDuration("1h".to_owned()),
                 runner: RunnerRequirements::default(),
             },
@@ -1017,6 +1019,26 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     .await?;
     assert!(continuation_redacted);
 
+    let reauthorization_count = harness.operation_count(&alice_id, "start").await?;
+    let reauthorization = connection_result(broker.start(&alice).await)?;
+    assert_ne!(
+        reauthorization.authorization_url.as_str(),
+        started.authorization_url.as_str(),
+        "MCP-GW 0.4.9 must issue a new state-bound flow when start is called while connected"
+    );
+    let reauthorization_operation = harness
+        .latest_operation(&alice_id, "start", reauthorization_count)
+        .await?;
+    harness
+        .wait_operation_finalized(reauthorization_operation, Duration::from_secs(90))
+        .await?;
+    harness.callback(oauth_state(reauthorization.authorization_url.as_str())?)?;
+    assert_eq!(
+        connection_result(broker.status(&alice).await)?.phase,
+        ConnectionPhase::Connected,
+        "connected-state start must complete as reauthorization without an intervening disconnect"
+    );
+
     harness.wait_tool_contains(
         ALICE_NAMESPACE,
         ALICE_RUNTIME,
@@ -1041,6 +1063,64 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
         "Running",
         Duration::from_secs(5),
     )?;
+
+    let rerun_count = harness.operation_count(&alice_id, "rerun").await?;
+    let rerun_request = GithubWorkflowRerunRequest {
+        owner: "example-org".to_owned(),
+        repository: "example-repo".to_owned(),
+        run_id: 12_345,
+        idempotency_key: "governed-rerun-example-12345".to_owned(),
+    };
+    let rerun_result = GithubWorkflowRerunBroker::rerun(&broker, &alice, &rerun_request).await;
+    let rerun_operation = harness
+        .latest_operation(&alice_id, "rerun", rerun_count)
+        .await?;
+    if let Err(error) = rerun_result {
+        let diagnostic: (String, Option<String>, String, Option<String>) = sqlx::query_as(
+            "SELECT operations.operation_state, operations.failure_category, tasks.phase, tasks.failure_reason \
+             FROM connection_operations operations \
+             JOIN task_submissions tasks ON tasks.task_uid = operations.task_uid \
+             WHERE operations.operation_id = $1",
+        )
+        .bind(rerun_operation)
+        .fetch_one(&harness.database)
+        .await?;
+        return Err(io::Error::other(format!(
+            "GitHub rerun broker failed with {error:?}; operation_state={}, failure_category={:?}, task_phase={}, task_failure_reason={:?}",
+            diagnostic.0, diagnostic.1, diagnostic.2, diagnostic.3
+        ))
+        .into());
+    }
+    harness
+        .wait_operation_finalized(rerun_operation, Duration::from_secs(90))
+        .await?;
+    let rerun_row = sqlx::query(
+        "SELECT authority_version, authority_digest, idempotency_identity, result \
+         FROM connection_operations WHERE operation_id = $1",
+    )
+    .bind(rerun_operation)
+    .fetch_one(&harness.database)
+    .await?;
+    assert_eq!(rerun_row.try_get::<i64, _>("authority_version")?, 3);
+    assert_eq!(
+        rerun_row.try_get::<String, _>("authority_digest")?,
+        steward_admission::internal_authorities::steward_connections_v3::AUTHORITY_DIGEST
+    );
+    assert_eq!(
+        rerun_row.try_get::<String, _>("idempotency_identity")?,
+        rerun_request.idempotency_key
+    );
+    assert_eq!(
+        rerun_row.try_get::<serde_json::Value, _>("result")?,
+        json!({"dispatched": true}),
+        "Steward must persist only its bounded result, never the provider response"
+    );
+    connection_result(GithubWorkflowRerunBroker::rerun(&broker, &alice, &rerun_request).await)?;
+    assert_eq!(
+        harness.operation_count(&alice_id, "rerun").await?,
+        rerun_count + 1,
+        "the same browser idempotency identity must reuse one governed mutation"
+    );
 
     connection_result(broker.disconnect(&alice).await)?;
     let enforcement = harness.wait_tool_contains(

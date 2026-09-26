@@ -3079,7 +3079,7 @@ async fn status_response<L: TaskSubmissionLedger>(
     }
 }
 
-fn stable_task_runtime_name(operation_id: Uuid) -> String {
+pub(crate) fn stable_task_runtime_name(operation_id: Uuid) -> String {
     format!("task-{}", operation_id.simple())
 }
 
@@ -3382,6 +3382,7 @@ mod workflow_request_tests {
                     single_run_limit: Some("1.00".to_owned()),
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: None,
                 ttl: Duration("15m".to_owned()),
                 runner: RunnerRequirements::default(),
             },
@@ -3398,6 +3399,10 @@ mod workflow_request_tests {
             envelope_instance_id: Some("env_instance_01".to_owned()),
             envelope_digest: Some("envelope-digest".to_owned()),
             reason: None,
+            rationale: None,
+            evidence_url: None,
+            decision_key: None,
+            expires_at: None,
             status_actor: owner_user_id.to_owned(),
             status_template_revision: 2,
             created_at: "2026-08-24T00:00:00.000000Z".to_owned(),

@@ -246,6 +246,10 @@ pub enum SandboxTaskObservation {
     Running {
         adapter_observation_id: String,
     },
+    RunningWithTranscript {
+        adapter_observation_id: String,
+        transcript: SandboxTaskTranscript,
+    },
     Succeeded {
         adapter_observation_id: String,
         output: SandboxTaskOutput,

@@ -24,7 +24,7 @@ user Task.
 | `STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE` | Required and non-empty. |
 | `STEWARD_TASK_EXECUTION_BINDINGS_FILE` | Preferred read-only `steward.execution-bindings/v1` catalog. Missing or empty means no coding agents are available. |
 | `STEWARD_TASK_EXECUTION_BINDINGS_JSON` | Optional inline equivalent for non-Helm integration environments. Configuring both forms fails startup. |
-| `STEWARD_CAPABILITY_CATALOG_FILE` | Read-only `steward.capability-catalog/v1` document used by browser administration. Required when browser administration is enabled. |
+| `STEWARD_CAPABILITY_CATALOG_FILE` | Read-only `steward.capability-catalog/v2` document used by browser administration. Required when browser administration is enabled. |
 | `STEWARD_CAPABILITY_CATALOG_JSON` | Optional inline equivalent for non-Helm integration environments. Configuring both forms fails startup. |
 | `STEWARD_EXECUTION_ENABLED` | `false` for core-only installation with orchestration staged; `true` after governed dependencies and execution bindings are ready. |
 | `STEWARD_TASK_INFERENCE_ENDPOINT` | Required with governed execution. Exact OpenAI-compatible Responses API endpoint used by the Codex adapter. |
@@ -45,7 +45,7 @@ immutable checksum-named ConfigMap. It contains only model and tool identities:
 config:
   apiserver:
     capabilityCatalog:
-      schemaVersion: steward.capability-catalog/v1
+      schemaVersion: steward.capability-catalog/v2
       models:
         - provider: openai
           model: gpt-5.4
@@ -53,9 +53,16 @@ config:
         - provider: github
           resource: actions_get
           action: read
+          accessClass: read
+      catalogs:
+        - provider: github
+          catalogId: github-tools
+          version: 1.6.0
+          available: true
 ```
 
-It contains no budget, TTL, user, template, Envelope, or admission fields. Changing it changes
+Access classes and provider availability are descriptive UI metadata. It contains no budget,
+TTL, user, template, Envelope, or admission fields. Changing it changes
 what the editor can offer; it does not change an existing template, User Envelope, Task, or
 admission decision.
 

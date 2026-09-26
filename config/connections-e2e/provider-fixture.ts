@@ -61,6 +61,26 @@ Bun.serve({
                   additionalProperties: false,
                 },
               },
+              {
+                name: "actions_run_trigger",
+                description: "Exercise the governed GitHub Actions mutation boundary.",
+                annotations: {
+                  readOnlyHint: false,
+                  destructiveHint: true,
+                  idempotentHint: false,
+                },
+                inputSchema: {
+                  type: "object",
+                  properties: {
+                    method: { type: "string" },
+                    owner: { type: "string" },
+                    repo: { type: "string" },
+                    run_id: { type: "number" },
+                  },
+                  required: ["method", "owner", "repo"],
+                  additionalProperties: false,
+                },
+              },
             ],
           });
         }
@@ -71,6 +91,33 @@ Bun.serve({
         ) {
           return rpcResult(id, {
             content: [{ type: "text", text: "governed fixture file contents" }],
+          });
+        }
+        if (
+          payload.method === "tools/call" &&
+          isRecord(payload.params) &&
+          payload.params.name === "actions_run_trigger" &&
+          isRecord(payload.params.arguments)
+        ) {
+          const args = payload.params.arguments;
+          const exactKeys = Object.keys(args).sort().join(",") === "method,owner,repo,run_id";
+          if (
+            exactKeys &&
+            args.method === "rerun_workflow_run" &&
+            args.owner === "example-org" &&
+            args.repo === "example-repo" &&
+            args.run_id === 12345
+          ) {
+            return rpcResult(id, {
+              content: [{ type: "text", text: "provider detail that Steward must discard" }],
+              structuredContent: { accepted: true },
+              isError: false,
+            });
+          }
+          return rpcResult(id, {
+            content: [{ type: "text", text: "invalid rerun fixture request" }],
+            structuredContent: { error: "invalid_rerun_fixture_request" },
+            isError: true,
           });
         }
         return Response.json(
@@ -98,7 +145,8 @@ function rpcResult(id: string | number | null, result: unknown): Response {
 }
 
 function jsonRpcId(value: unknown): string | number | null {
-  return typeof value === "string" || typeof value === "number" || value === null ? value : null;
+  if (typeof value === "string" || typeof value === "number") return value;
+  return null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

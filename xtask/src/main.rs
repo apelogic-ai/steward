@@ -2038,7 +2038,7 @@ mod tests {
                 .map_err(|error| format!("Task production configuration is required: {error}"))?;
             for required in [
                 "exactly one active, provisioned User Envelope",
-                "steward.capability-catalog/v1",
+                "steward.capability-catalog/v2",
                 "grants no Task authority",
             ] {
                 assert!(

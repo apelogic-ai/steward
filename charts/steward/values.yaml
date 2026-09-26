@@ -155,9 +155,10 @@ config:
     kubernetesTokenReviewAudience: https://kubernetes.default.svc
     # Deployment availability only. This catalog grants no Task or user authority.
     capabilityCatalog:
-      schemaVersion: steward.capability-catalog/v1
+      schemaVersion: steward.capability-catalog/v2
       models: []
       tools: []
+      catalogs: []
     # Keep staged for the first binary rollout; activate only after every controller is upgraded.
     executionBindingsMode: staged
     # Deployment-owned catalog. An empty list advertises no coding agents and creates no fallback.

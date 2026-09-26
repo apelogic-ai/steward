@@ -115,12 +115,13 @@
     "browserAuth": {"type": "object"},
     "capabilityCatalog": {
       "type": "object",
-      "required": ["schemaVersion", "models", "tools"],
+      "required": ["schemaVersion", "models", "tools", "catalogs"],
       "additionalProperties": false,
       "properties": {
-        "schemaVersion": {"const": "steward.capability-catalog/v1"},
+        "schemaVersion": {"const": "steward.capability-catalog/v2"},
         "models": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/capabilityModel"}},
-        "tools": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/capabilityTool"}}
+        "tools": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/capabilityTool"}},
+        "catalogs": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/capabilityProviderCatalog"}}
       },
       "anyOf": [
         {"properties": {"models": {"minItems": 1}}},
@@ -153,12 +154,24 @@
     },
     "capabilityTool": {
       "type": "object",
-      "required": ["provider", "resource", "action"],
+      "required": ["provider", "resource", "action", "accessClass"],
       "additionalProperties": false,
       "properties": {
         "provider": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
         "resource": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
-        "action": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"}
+        "action": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
+        "accessClass": {"type": "string", "enum": ["read", "write", "destructive"]}
+      }
+    },
+    "capabilityProviderCatalog": {
+      "type": "object",
+      "required": ["provider", "catalogId", "version", "available"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
+        "catalogId": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
+        "available": {"type": "boolean"}
       }
     },
     "image": {

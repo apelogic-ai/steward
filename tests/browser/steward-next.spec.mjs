@@ -12,6 +12,7 @@ const nextBinary = path.join(repository, "node_modules", "next", "dist", "bin", 
 const STARTUP_TIMEOUT_MS = 30_000;
 const envelopeId = "00000000-0000-0000-0000-000000000001";
 const taskUid = "00000000-0000-0000-0000-000000000002";
+const rerunTaskUid = "00000000-0000-0000-0000-000000000006";
 const approvalId = "00000000-0000-0000-0000-000000000003";
 let web;
 let origin;
@@ -75,18 +76,19 @@ const adminEnvelope = {
 };
 
 const capabilityCatalog = {
-  schemaVersion: "steward.capability-catalog/v1",
+  schemaVersion: "steward.capability-catalog/v2",
   models: [
     { provider: "provider-a", model: "model-a" },
     { provider: "provider-b", model: "model-b" },
   ],
-  tools: envelope.spec.tools,
+  tools: envelope.spec.tools.map((tool) => ({ ...tool, accessClass: "read" })),
+  catalogs: [{ provider: "github", catalogId: "github-tools", version: "1.6.0", available: true }],
 };
 
 const githubReadTools = [
   "actions_get", "actions_list", "get_job_logs", "get_file_contents", "list_commits",
   "get_commit", "get_release", "list_releases", "get_workflow", "list_workflows",
-].map((resource) => ({ provider: "github", resource, action: "read" }));
+].map((resource) => ({ provider: "github", resource, action: "read", accessClass: "read" }));
 
 const envelopeRequest = {
   id: envelopeId,
@@ -101,6 +103,7 @@ const envelopeRequest = {
   reason: null,
   createdAt: "2026-08-24T17:00:00Z",
   statusAt: "2026-08-24T17:01:00Z",
+  history: [{ status: "provisioned", at: "2026-08-24T17:01:00Z", actor: "system:auto", reason: null }],
 };
 
 const pendingEnvelopeRequest = {
@@ -133,6 +136,52 @@ const run = {
   updatedAt: "2026-08-24T17:03:00Z",
   observedSpend: { observedAmount: "1.25", currency: "USD", exhausted: false },
   errorCategory: null,
+  stages: [
+    { id: "admission", displayName: "Admission", state: "succeeded", steps: [] },
+    { id: "provision_runtime", displayName: "Provision runtime", state: "succeeded", steps: [] },
+    { id: "agent_execution", displayName: "Agent execution", state: "succeeded", steps: [{ id: "execution", displayName: "Execution", state: "succeeded", logStreams: ["stdout", "stderr"] }] },
+    { id: "finalize", displayName: "Finalize", state: "succeeded", steps: [] },
+  ],
+};
+
+const runFacets = {
+  submitted: 0,
+  queued: 0,
+  running: 0,
+  parked: 0,
+  succeeded: 1,
+  failed: 0,
+  cancelled: 0,
+};
+
+const unifiedEnvelopeRequest = {
+  id: pendingEnvelopeRequest.requestId,
+  kind: "ceiling_exceeded",
+  source: "envelope_request",
+  state: "requested",
+  requester: { userId: pendingEnvelopeRequest.ownerUserId, displayEmail: pendingEnvelopeRequest.ownerDisplayEmail },
+  template: { id: pendingEnvelopeRequest.templateId, displayName: "Developer", revision: pendingEnvelopeRequest.templateRevision },
+  createdAt: pendingEnvelopeRequest.createdAt,
+  stateAt: pendingEnvelopeRequest.createdAt,
+  stateActor: pendingEnvelopeRequest.ownerUserId,
+  deltas: [{ dimension: "budget", requested: "40.00", ceiling: "25.00", currency: "USD" }],
+  requestedEnvelope: pendingEnvelopeRequest.requestedEnvelope,
+  templateEnvelope: pendingEnvelopeRequest.templateEnvelope,
+  history: [{ state: "requested", at: pendingEnvelopeRequest.createdAt, actor: pendingEnvelopeRequest.ownerUserId, reason: null }],
+};
+
+const unifiedRuntimeApproval = {
+  id: approvalId,
+  kind: "ceiling_exceeded",
+  source: "runtime_exception",
+  state: "requested",
+  requester: { userId: developerSession.principal.userId, displayEmail: "alice@example.com" },
+  template: { id: "analyst", displayName: "Analyst", revision: 4 },
+  createdAt: "2026-08-24T17:05:00Z",
+  stateAt: "2026-08-24T17:05:00Z",
+  stateActor: developerSession.principal.userId,
+  deltas: [{ dimension: "budget", requested: "40.00", ceiling: "25.00", currency: "USD" }],
+  history: [{ state: "requested", at: "2026-08-24T17:05:00Z", actor: developerSession.principal.userId, reason: null }],
 };
 
 const workflowRevision = {
@@ -184,7 +233,7 @@ const presentationRoutes = [
   { path: "/admin/workflows/repository-review/new-version", heading: "New repository-review version", activeNavigation: "Workflows" },
   { path: "/admin/runs", heading: "All runs", activeNavigation: "Runs" },
   { path: `/admin/runs/${taskUid}`, heading: "Run detail", activeNavigation: "Runs" },
-  { path: "/admin/approvals", heading: "Pending approvals", activeNavigation: "Approvals" },
+  { path: "/admin/approvals", heading: "Requests", activeNavigation: "Approvals" },
   { path: "/admin/settings", heading: "Settings", activeNavigation: "Settings" },
 ];
 
@@ -239,10 +288,14 @@ async function startWeb() {
 
   let mutationFailures = {};
   let mutationSink;
+  let rerunFixtures = [];
+  let rerunFixtureIndex = 0;
   const proxy = createServer(async (request, response) => {
     try {
       const requestUrl = new URL(request.url ?? "/", nextOrigin);
-      const browserMutation = request.method === "POST" && (
+      const templateMutation = request.method === "PUT"
+        && requestUrl.pathname.startsWith("/admin/api/v1/envelope-templates/");
+      const browserMutation = templateMutation || (request.method === "POST" && (
         requestUrl.pathname === "/app/api/v1/envelope-requests"
         || requestUrl.pathname.endsWith("/github-actions-workflow")
         || requestUrl.pathname.startsWith("/admin/api/v1/envelope-templates/")
@@ -252,10 +305,13 @@ async function startWeb() {
         || requestUrl.pathname === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/reject`
         || requestUrl.pathname === `/admin/api/v1/approvals/${approvalId}/approve`
         || requestUrl.pathname === `/admin/api/v1/approvals/${approvalId}/file`
+        || requestUrl.pathname === "/app/api/v1/connections/github/start"
+        || requestUrl.pathname === "/app/api/v1/connections/github/disconnect"
         || requestUrl.pathname === "/admin/api/v1/connections/github/start"
         || requestUrl.pathname === "/admin/api/v1/connections/github/disconnect"
+        || requestUrl.pathname.endsWith("/rerun")
         || requestUrl.pathname === "/admin/auth/logout"
-      );
+      ));
       if (browserMutation) {
         const chunks = [];
         for await (const chunk of request) chunks.push(chunk);
@@ -271,10 +327,25 @@ async function startWeb() {
           response.end("{}");
           return;
         }
+        if (requestUrl.pathname.endsWith("/rerun")) {
+          const fixture = rerunFixtures[Math.min(rerunFixtureIndex, rerunFixtures.length - 1)];
+          rerunFixtureIndex += 1;
+          response.writeHead(fixture?.status ?? 503, { "content-type": "application/json", "cache-control": "no-store" });
+          response.end(JSON.stringify(fixture?.body ?? {}));
+          return;
+        }
         if (requestUrl.pathname.startsWith("/admin/api/v1/envelope-templates/")) {
-          const memberRole = decodeURIComponent(requestUrl.pathname.split("/").at(-1) ?? "");
+          const templateId = decodeURIComponent(requestUrl.pathname.split("/").at(-1) ?? "");
+          const submitted = JSON.parse(rawBody);
           response.writeHead(201, { "content-type": "application/json", "cache-control": "no-store" });
-          response.end(JSON.stringify({ apiVersion: "steward.browser-admin/v1", memberRole, envelope: JSON.parse(rawBody) }));
+          response.end(JSON.stringify({
+            apiVersion: "steward.browser-admin/v1",
+            id: templateId,
+            displayName: submitted.displayName,
+            memberRoles: submitted.memberRoles,
+            envelope: submitted.envelope,
+            autoProvisionThreshold: submitted.autoProvisionThreshold ?? null,
+          }));
           return;
         }
         if (requestUrl.pathname === "/admin/api/v1/workflows" || requestUrl.pathname.endsWith("/versions")) {
@@ -293,7 +364,7 @@ async function startWeb() {
         }
         if (requestUrl.pathname.endsWith("/github-actions-workflow")) {
           response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-          response.end(JSON.stringify({ apiVersion: "steward.envelope-requests/v1", workflow: { schemaVersion: "v2", contentType: "application/yaml", sha256: "abc123", yaml: ["name: Steward governed run", "on:", "  workflow_dispatch:", "jobs:", "  governed:", "    with:", "      workflow: repository-review@1", ""].join("\n") } }));
+          response.end(JSON.stringify({ apiVersion: "steward.envelope-requests/v1", workflow: { schemaVersion: "v2", contentType: "application/yaml", suggestedPath: ".github/workflows/steward-repository-review.yml", sha256: "abc123", yaml: ["name: Steward governed run", "on:", "  workflow_dispatch:", "jobs:", "  governed:", "    with:", "      workflow: repository-review@1", ""].join("\n") } }));
           return;
         }
         if (requestUrl.pathname.startsWith("/admin/api/v1/envelope-requests/")) {
@@ -378,6 +449,10 @@ async function startWeb() {
     output: () => output,
     useMutationFailures: (failures) => { mutationFailures = failures; },
     useMutationSink: (sink) => { mutationSink = sink; },
+    useRerunFixtures: (fixtures) => {
+      rerunFixtures = fixtures;
+      rerunFixtureIndex = 0;
+    },
   };
 }
 
@@ -427,7 +502,12 @@ async function guardedPage(browser, {
     stdout: { body: "agent stdout\n", status: 200 },
     stderr: { body: "agent stderr\n", status: 200 },
   },
+  includeSampleWorkflow = false,
+  onboardingPagination = false,
   mutationFailures = {},
+  rerunResponses = [
+    { status: 201, body: { apiVersion: "steward.browser-runs/v1", taskUid: rerunTaskUid } },
+  ],
   runPhase = "succeeded",
   capabilityCatalogModels = capabilityCatalog.models,
   capabilityCatalogTools = capabilityCatalog.tools,
@@ -440,8 +520,10 @@ async function guardedPage(browser, {
   const mutations = [];
   web.useMutationFailures(mutationFailures);
   web.useMutationSink(mutations);
+  web.useRerunFixtures(rerunResponses);
   await context.addInitScript(() => {
-    const allowedPreference = (key) => typeof key === "string" && key.startsWith("steward.ui.envelope-accordion.");
+    const allowedPreference = (key) => typeof key === "string"
+      && key.startsWith("steward.ui.envelope-accordion.");
     for (const method of ["getItem", "removeItem", "setItem"]) {
       const original = Storage.prototype[method];
       Object.defineProperty(Storage.prototype, method, {
@@ -492,16 +574,37 @@ async function guardedPage(browser, {
   }));
   await context.route(`${origin}/app/api/v1/workflows`, (route) => json(route, {
     apiVersion: "steward.workflows/v1",
-    workflows: emptyCollections ? [] : [{
-      agent: workflowRevision.agent,
-      displayName: workflowRevision.displayName,
-      name: workflowRevision.name,
-      version: workflowRevision.version,
-    }],
+    workflows: emptyCollections ? [] : [
+      {
+        agent: workflowRevision.agent,
+        displayName: workflowRevision.displayName,
+        name: workflowRevision.name,
+        sample: false,
+        version: workflowRevision.version,
+      },
+      ...(includeSampleWorkflow ? [{
+        agent: workflowRevision.agent,
+        displayName: "Repository summary",
+        name: "repo-summary",
+        sample: true,
+        version: 1,
+      }] : []),
+    ],
   }));
-  await context.route(`${origin}/app/api/v1/envelope-requests`, async (route) => {
+  await context.route(`${origin}/app/api/v1/envelope-requests*`, async (route) => {
     if (route.request().method() === "POST") {
       await route.continue();
+      return;
+    }
+    if (onboardingPagination) {
+      const cursor = new URL(route.request().url()).searchParams.get("cursor");
+      await json(route, cursor
+        ? { apiVersion: "steward.envelope-requests/v1", requests: [envelopeRequest], nextCursor: null }
+        : {
+            apiVersion: "steward.envelope-requests/v1",
+            requests: [{ ...envelopeRequest, id: "00000000-0000-0000-0000-000000000006", envelopeInstanceId: "runtime-example-6" }],
+            nextCursor: "00000000-0000-0000-0000-000000000006",
+          });
       return;
     }
     await json(route, { apiVersion: "steward.envelope-requests/v1", requests: emptyCollections ? [] : [envelopeRequest] });
@@ -513,22 +616,44 @@ async function guardedPage(browser, {
     }
     await json(route, { apiVersion: "steward.envelope-requests/v1", request: envelopeRequest });
   });
-  await context.route(`${origin}/app/api/v1/runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [run], nextCursor: null }));
-  await context.route(`${origin}/app/api/v1/runs/**`, (route) => route.request().url().endsWith("/timeline")
-    ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
-    : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...run, phase: runPhase } }));
+  await context.route(`${origin}/app/api/v1/runs*`, (route) => {
+    if (onboardingPagination) {
+      const cursor = new URL(route.request().url()).searchParams.get("cursor");
+      return json(route, {
+        apiVersion: "steward.browser-runs/v1",
+        runs: cursor ? [{
+          ...run,
+          taskUid: "00000000-0000-0000-0000-000000000007",
+          workflow: "repo-summary@1",
+          workflowName: "repo-summary",
+          workflowVersion: 1,
+          trigger: { provider: "github", repository: "https://github.com/example-org/sample" },
+        }] : [run],
+        nextCursor: cursor ? null : taskUid,
+        facets: { phase: runFacets },
+      });
+    }
+    return json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [run], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } });
+  });
+  await context.route(`${origin}/app/api/v1/runs/**`, (route) => {
+    if (route.request().url().endsWith("/rerun")) return route.continue();
+    return route.request().url().endsWith("/timeline")
+      ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
+      : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...run, phase: runPhase } });
+  });
   await context.route(`${origin}/app/api/v1/runs/${taskUid}/logs/*`, async (route) => {
     const stream = new URL(route.request().url()).pathname.split("/").at(-1);
     executionLogRequests.push(route.request());
     const fixture = executionLogs[stream];
+    const content = fixture?.body ?? "";
     await route.fulfill({
       status: fixture?.status ?? 404,
-      contentType: "text/plain; charset=utf-8",
-      body: fixture?.body ?? "",
+      contentType: "application/json",
+      body: fixture?.status === 200 ? JSON.stringify({ stream, content, truncated: false, sizeBytes: Buffer.byteLength(content), complete: true }) : "",
       headers: { "cache-control": "no-store" },
     });
   });
-  await context.route(`${origin}/admin/api/v1/all-runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [{ ...run, ownerUserId: developerSession.principal.userId }], nextCursor: null }));
+  await context.route(`${origin}/admin/api/v1/all-runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [{ ...run, ownerUserId: developerSession.principal.userId, ownerDisplayEmail: developerSession.principal.displayEmail }], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } }));
   await context.route(`${origin}/admin/api/v1/all-runs/**`, (route) => route.request().url().endsWith("/timeline")
     ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
     : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...run, phase: runPhase } }));
@@ -536,15 +661,16 @@ async function guardedPage(browser, {
     const stream = new URL(route.request().url()).pathname.split("/").at(-1);
     executionLogRequests.push(route.request());
     const fixture = executionLogs[stream];
+    const content = fixture?.body ?? "";
     await route.fulfill({
       status: fixture?.status ?? 404,
-      contentType: "text/plain; charset=utf-8",
-      body: fixture?.body ?? "",
+      contentType: "application/json",
+      body: fixture?.status === 200 ? JSON.stringify({ stream, content, truncated: false, sizeBytes: Buffer.byteLength(content), complete: true }) : "",
       headers: { "cache-control": "no-store" },
     });
   });
   await context.route(`${origin}/admin/api/v1/envelope-templates/**`, async (route) => {
-    if (route.request().method() === "POST") {
+    if (route.request().method() === "POST" || route.request().method() === "PUT") {
       await route.continue();
       return;
     }
@@ -553,7 +679,7 @@ async function guardedPage(browser, {
       ? { apiVersion: "steward.browser-admin/v1", memberRole }
       : legacyAdminTemplate
         ? { apiVersion: "steward.admin/v1", template: { id: memberRole, revision: 4, envelope } }
-        : { apiVersion: "steward.browser-admin/v1", memberRole, envelope: {
+        : { apiVersion: "steward.browser-admin/v1", id: memberRole, displayName: `${memberRole.charAt(0).toUpperCase()}${memberRole.slice(1)}`, memberRoles: [memberRole], envelope: {
           ...adminEnvelope,
           spec: { ...adminEnvelope.spec, llms: adminTemplateModels, tools: adminTemplateTools },
         } });
@@ -561,15 +687,16 @@ async function guardedPage(browser, {
   await context.route(`${origin}/admin/api/v1/envelope-templates`, (route) => json(route, {
     apiVersion: "steward.browser-admin/v1",
     templates: emptyCollections ? [] : [
-      { memberRole: "analyst", envelope: adminEnvelope },
-      { memberRole: "developer", envelope },
+      { id: "analyst", displayName: "Analyst", memberRoles: ["analyst"], envelope: adminEnvelope, autoProvisionThreshold: null },
+      { id: "developer", displayName: "Developer", memberRoles: ["developer"], envelope, autoProvisionThreshold: null },
     ],
   }));
   await context.route(`${origin}/admin/api/v1/capabilities`, (route) => capabilityCatalogStatus === 200
     ? json(route, {
-      schemaVersion: "steward.capability-catalog/v1",
+      schemaVersion: "steward.capability-catalog/v2",
       models: capabilityCatalogModels,
       tools: capabilityCatalogTools,
+      catalogs: capabilityCatalog.catalogs,
     })
     : route.fulfill({ status: capabilityCatalogStatus, body: "" }));
   await context.route(`${origin}/admin/api/v1/workflows`, async (route) => {
@@ -595,6 +722,17 @@ async function guardedPage(browser, {
     approvals: emptyCollections ? [] : [approval],
     envelopeRequests: emptyCollections ? [] : [pendingEnvelopeRequest],
   }));
+  await context.route(`${origin}/admin/api/v1/requests*`, (route) => json(route, {
+    apiVersion: "steward.browser-admin/v1",
+    requests: emptyCollections ? [] : [unifiedEnvelopeRequest, unifiedRuntimeApproval],
+    nextCursor: null,
+  }));
+  await context.route(`${origin}/admin/api/v1/requests/summary`, (route) => json(route, {
+    apiVersion: "steward.browser-admin/v1",
+    needsAction: emptyCollections ? 0 : 2,
+    escalated: 0,
+    requested: emptyCollections ? 0 : 2,
+  }));
   await context.route(`${origin}/admin/api/v1/approvals/**`, (route) => route.continue());
   await context.route(`${origin}/admin/api/v1/connections/github`, (route) => json(route, {
     apiVersion: "steward.connections/v1",
@@ -604,6 +742,40 @@ async function guardedPage(browser, {
       : { phase: connectionPhase, accountEmail: null, scopesRequired: ["repo"], scopesGranted: [], scopesMissing: ["repo"], expiresAt: null },
   }));
   await context.route(`${origin}/admin/api/v1/connections/github/*`, (route) => route.continue());
+  await context.route(`${origin}/app/api/v1/connections`, (route) => json(route, {
+    apiVersion: "steward.connections/v1",
+    connections: [{
+      provider: "github",
+      displayName: "GitHub",
+      status: connectionPhase === "connected"
+        ? { phase: "connected", accountEmail: "alice@example.com", scopesRequired: ["repo"], scopesGranted: ["repo"], scopesMissing: [], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null }
+        : { phase: connectionPhase, accountEmail: null, scopesRequired: ["repo"], scopesGranted: [], scopesMissing: ["repo"], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
+    }],
+    available: [{ provider: "github", displayName: "GitHub", enabled: true }],
+  }));
+  let browserPreferences = {
+    apiVersion: ["steward", "preferences/v1"].join("."),
+    onboardingDismissed: false,
+    revision: 0,
+    theme: null,
+    workflowAcknowledged: false,
+  };
+  await context.route(`${origin}/app/api/v1/preferences`, async (route) => {
+    if (route.request().method() === "PUT") {
+      const body = route.request().postDataJSON();
+      mutations.push({
+        path: "/app/api/v1/preferences",
+        headers: route.request().headers(),
+        body,
+      });
+      browserPreferences = {
+        ...browserPreferences,
+        ...body,
+        revision: browserPreferences.revision + 1,
+      };
+    }
+    await json(route, browserPreferences);
+  });
   const page = await context.newPage();
   const consoleErrors = [];
   const crossOriginRequests = [];
@@ -891,7 +1063,10 @@ test("every presentation route remains navigable at a narrow viewport", async ({
       await test.step(route.path, async () => {
         await session.page.goto(`${origin}${route.path}`);
         await expect(session.page.getByRole("heading", { name: route.heading, exact: true }).first()).toBeVisible();
-        await expect(session.page.getByRole("link", { name: route.activeNavigation, exact: true })).toHaveAttribute("aria-current", "page");
+        const activeLink = route.activeNavigation === "Approvals"
+          ? session.page.getByRole("link", { name: /^Approvals/ })
+          : session.page.getByRole("link", { name: route.activeNavigation, exact: true });
+        await expect(activeLink).toHaveAttribute("aria-current", "page");
         const dimensions = await session.page.evaluate(() => ({
           clientWidth: document.documentElement.clientWidth,
           scrollWidth: document.documentElement.scrollWidth,
@@ -963,7 +1138,7 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await expect(developer.page.getByLabel("Time to live")).toHaveValue("4h");
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
-    const provisioned = developer.page.getByText("provisioned", { exact: true });
+    const provisioned = developer.page.getByRole("article").getByText("provisioned", { exact: true });
     await expect(provisioned).toHaveCSS("background-color", "rgb(18, 53, 36)");
     await expect(provisioned).toHaveCSS("border-color", "rgb(47, 128, 85)");
     await expect(provisioned).toHaveCSS("color", "rgb(134, 239, 172)");
@@ -1018,6 +1193,58 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
   }
 });
 
+test("onboarding persists workflow acknowledgement and ignores unrelated runs", async ({ browser }) => {
+  const developer = await guardedPage(browser, { includeSampleWorkflow: true });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    const workflowStep = developer.page.getByRole("listitem").filter({ hasText: "3. Add the generated workflow" });
+    const runStep = developer.page.getByRole("listitem").filter({ hasText: "4. Run the test workflow" });
+    await expect(workflowStep.getByText("pending", { exact: true })).toBeVisible();
+    await expect(runStep.getByText("pending", { exact: true })).toBeVisible();
+
+    await developer.page.getByRole("button", { name: "I added the sample workflow" }).click();
+    await expect(workflowStep.getByText("done", { exact: true })).toBeVisible();
+    const acknowledgement = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/preferences");
+    expect(acknowledgement, "expected the durable preference mutation").toBeTruthy();
+    expect(acknowledgement.headers["x-steward-csrf"]).toBe("test-csrf");
+    expect(acknowledgement.headers["content-type"]).toContain("application/json");
+    expect(acknowledgement.headers.origin).toBe(origin);
+    expect(acknowledgement.body).toEqual({ workflowAcknowledged: true });
+
+    await developer.page.reload();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "3. Add the generated workflow" }).getByText("done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "4. Run the test workflow" }).getByText("pending", { exact: true })).toBeVisible();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("onboarding cannot acknowledge an absent sample", async ({ browser }) => {
+  const developer = await guardedPage(browser);
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    await expect(developer.page.getByText("The deployment has no executable onboarding sample.")).toBeVisible();
+    await expect(developer.page.getByRole("button", { name: "I added the sample workflow" })).toHaveCount(0);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("onboarding follows paginated envelope and run evidence", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    includeSampleWorkflow: true,
+    onboardingPagination: true,
+  });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "2. Provision an envelope" }).getByText("done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "4. Run the test workflow" }).getByText("done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "5. Inspect the governed run" }).getByText("done", { exact: true })).toBeVisible();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("Run detail displays the exact pinned Workflow and User Envelope revision", async ({ browser }) => {
   const developer = await guardedPage(browser);
   try {
@@ -1027,6 +1254,29 @@ test("Run detail displays the exact pinned Workflow and User Envelope revision",
     await expect(developer.page.getByText("repository-review@1", { exact: true }).last()).toBeVisible();
     const envelopeRevision = developer.page.getByText("User envelope revision", { exact: true }).locator("..");
     await expect(envelopeRevision).toContainText("4");
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("GitHub re-run polls with one idempotency key until the new Task is correlated", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    rerunResponses: [
+      { status: 202, body: { apiVersion: "steward.browser-runs/v1", state: "pending", retryAfterMs: 1 } },
+      { status: 201, body: { apiVersion: "steward.browser-runs/v1", taskUid: rerunTaskUid } },
+    ],
+  });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await developer.page.getByRole("button", { name: "Re-run" }).click();
+    await expect(developer.page.getByRole("button", { name: "Starting…" })).toBeDisabled();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${rerunTaskUid}`);
+
+    const reruns = developer.mutations.filter((mutation) => mutation.path.endsWith("/rerun"));
+    expect(reruns).toHaveLength(2);
+    for (const mutation of reruns) expectMutationProof(mutation);
+    expect(reruns[0].body.idempotencyKey).toBeTruthy();
+    expect(reruns[1].body.idempotencyKey).toBe(reruns[0].body.idempotencyKey);
   } finally {
     await closeGuardedPage(developer);
   }
@@ -1070,7 +1320,7 @@ test("failed run phases expose stdout and stderr as escaped sensitive output", a
     ]);
     for (const request of developer.executionLogRequests) {
       expect(new URL(request.url()).origin).toBe(origin);
-      expect(request.headers().accept).toBe("text/plain");
+      expect(request.headers().accept).toBe("application/json");
       expect(request.headers().cookie).toContain("execution-log-session=present");
     }
   } finally {
@@ -1200,19 +1450,21 @@ test("administrator templates and approvals use typed browser authority", async 
     await expect(administrator.page.getByText("Current revision 5")).toBeVisible();
     const templateMutation = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst");
     expectMutationProof(templateMutation);
-    expect(templateMutation.body.revision).toBe(5);
-    expect(templateMutation.body.spec.budget).toEqual({
+    expect(templateMutation.body.displayName).toBe("Analyst");
+    expect(templateMutation.body.memberRoles).toEqual(["analyst"]);
+    expect(templateMutation.body.envelope.revision).toBe(5);
+    expect(templateMutation.body.envelope.spec.budget).toEqual({
       currency: "USD",
       monthlyLimit: "30.00",
       singleRunLimit: "3.00",
     });
-    expect(templateMutation.body.spec.llms).toEqual(capabilityCatalog.models);
+    expect(templateMutation.body.envelope.spec.llms).toEqual(capabilityCatalog.models);
     await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("reviewer");
     await administrator.page.getByRole("button", { name: "Save as new" }).click();
     await expect.poll(() => administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/reviewer")).toBe(true);
     const copiedTemplate = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/reviewer");
     expectMutationProof(copiedTemplate);
-    expect(copiedTemplate.body.revision).toBe(1);
+    expect(copiedTemplate.body.envelope.revision).toBe(1);
 
     await administrator.page.goto(`${origin}/admin/envelopes/templates/new`);
     await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText(["provider-a/model-a"]);
@@ -1222,30 +1474,31 @@ test("administrator templates and approvals use typed browser authority", async 
     ]);
 
     await administrator.page.goto(`${origin}/admin/approvals`);
-    await expect(administrator.page.getByRole("heading", { name: "Pending approvals" })).toBeVisible();
+    await expect(administrator.page.getByRole("heading", { name: "Requests" })).toBeVisible();
     const envelopeRequestCard = administrator.page.getByRole("listitem").filter({
-      has: administrator.page.getByRole("heading", { name: "User envelope request" }),
+      has: administrator.page.getByText(pendingEnvelopeRequest.requestId, { exact: true }),
     });
     await expect(envelopeRequestCard).toBeVisible();
     await expect(envelopeRequestCard.getByText("alice@example.com")).toBeVisible();
-    await expect(envelopeRequestCard.getByText("developer", { exact: true })).toBeVisible();
-    await expect(envelopeRequestCard.getByRole("heading", { name: "Requested authority" })).toBeVisible();
-    await expect(envelopeRequestCard.getByRole("heading", { name: "Governing template" })).toBeVisible();
+    await expect(envelopeRequestCard.getByText("envelope_request", { exact: true })).toBeVisible();
+    await expect(envelopeRequestCard.getByRole("heading", { name: "Requested changes" })).toBeVisible();
     await expect(envelopeRequestCard.getByRole("button", { name: "Reject request" })).toBeVisible();
-    await envelopeRequestCard.getByRole("button", { name: "Approve request" }).click();
-    await expect(envelopeRequestCard.getByText("The exact requested envelope was provisioned.")).toBeVisible();
-    await expect(envelopeRequestCard.getByText("env_00000000000000000000000000000004")).toBeVisible();
+    await envelopeRequestCard.getByLabel("Rationale", { exact: true }).fill("Approved for the requested bounded envelope.");
+    await envelopeRequestCard.getByRole("button", { name: "Approve", exact: true }).click();
+    await expect(envelopeRequestCard.getByText("Approval applied through the governed Rust admission path.")).toBeVisible();
     const envelopeApprovalMutation = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/approve`);
     expectMutationProof(envelopeApprovalMutation);
-    expect(envelopeApprovalMutation.body).toEqual({});
-    await expect(administrator.page.getByText("runtime-example-2")).toBeVisible();
-    await administrator.page.getByRole("button", { name: "File decision reference" }).click();
-    await expect(administrator.page.getByText("Decision reference filed through the server-owned channel.")).toBeVisible();
-    expectMutationProof(administrator.mutations.find((mutation) => mutation.path.endsWith("/file")));
-    await administrator.page.getByLabel("Rationale").fill("Approved for one bounded investigation.");
-    await administrator.page.getByLabel("Expires at (RFC 3339)").fill("2026-08-25T17:00:00Z");
-    await administrator.page.getByRole("button", { name: "Approve exception" }).click();
-    await expect(administrator.page.getByText("Approval applied through the governed Rust admission path.")).toBeVisible();
+    expect(envelopeApprovalMutation.body.rationale).toBe("Approved for the requested bounded envelope.");
+    const runtimeApprovalCard = administrator.page.getByRole("listitem").filter({
+      has: administrator.page.getByText(approvalId, { exact: true }),
+    });
+    await runtimeApprovalCard.getByRole("button", { name: "File decision reference" }).click();
+    await expect(runtimeApprovalCard.getByText("Decision reference filed through the server-owned channel.")).toBeVisible();
+    expectMutationProof(administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/approvals/${approvalId}/file`));
+    await runtimeApprovalCard.getByLabel("Rationale", { exact: true }).fill("Approved for one bounded investigation.");
+    await runtimeApprovalCard.getByLabel("Expires at (RFC 3339)").fill("2026-08-25T17:00:00Z");
+    await runtimeApprovalCard.getByRole("button", { name: "Approve", exact: true }).click();
+    await expect(runtimeApprovalCard.getByText("Approval applied through the governed Rust admission path.")).toBeVisible();
     const approvalMutation = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/approvals/${approvalId}/approve`);
     expectMutationProof(approvalMutation);
     expect(approvalMutation.body.evidenceUrl).toBe("https://example.com/decisions/PROJ-123");
@@ -1291,16 +1544,16 @@ test("administrator can revise and copy a ten-grant template listed in the capab
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer")).toBeTruthy();
     const revised = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer");
     expectMutationProof(revised);
-    expect(revised.body.revision).toBe(adminEnvelope.revision + 1);
-    expect(revised.body.spec.tools).toEqual(githubReadTools);
+    expect(revised.body.envelope.revision).toBe(adminEnvelope.revision + 1);
+    expect(revised.body.envelope.spec.tools).toEqual(githubReadTools.map(({ accessClass: _accessClass, ...tool }) => tool));
 
     await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("engineer");
     await administrator.page.getByRole("button", { name: "Save as new" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/engineer")).toBeTruthy();
     const copied = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/engineer");
     expectMutationProof(copied);
-    expect(copied.body.revision).toBe(1);
-    expect(copied.body.spec.tools).toEqual(githubReadTools);
+    expect(copied.body.envelope.revision).toBe(1);
+    expect(copied.body.envelope.spec.tools).toEqual(githubReadTools.map(({ accessClass: _accessClass, ...tool }) => tool));
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1325,7 +1578,9 @@ test("administrator can replace a template tool absent from the capability catal
     await tools.getByRole("button", { name: "Add tool" }).click();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
-    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.spec.tools).toEqual([replacement]);
+    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.tools).toEqual([
+      { provider: replacement.provider, resource: replacement.resource, action: replacement.action },
+    ]);
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1346,7 +1601,7 @@ test("administrator template tool controls offer no fallback when the capability
     await expect(tools.getByText("No tools are listed in the deployment capability catalog.")).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
-    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.spec.tools).toEqual([]);
+    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.tools).toEqual([]);
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1390,8 +1645,8 @@ test("administrator can replace a template model absent from the capability cata
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     const mutation = administrator.mutations.find((entry) => entry.path === "/admin/api/v1/envelope-templates/analyst");
-    expect(mutation.body.spec.llms).toEqual([{ provider: "anthropic", model: "claude-sonnet-4" }]);
-    expect(mutation.body.revision).toBe(adminEnvelope.revision + 1);
+    expect(mutation.body.envelope.spec.llms).toEqual([{ provider: "anthropic", model: "claude-sonnet-4" }]);
+    expect(mutation.body.envelope.revision).toBe(adminEnvelope.revision + 1);
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1419,7 +1674,7 @@ test("administrator template model identity does not collide across provider and
     await expect(models.getByRole("listitem")).toHaveCount(1);
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
-    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.spec.llms).toEqual([second]);
+    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.llms).toEqual([second]);
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1437,7 +1692,7 @@ test("administrator template model identity does not collide across provider and
     await expect(models.getByRole("listitem")).toHaveCount(1);
     await stale.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => stale.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
-    expect(stale.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.spec.llms).toEqual([second]);
+    expect(stale.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.llms).toEqual([second]);
   } finally {
     await closeGuardedPage(stale);
   }
@@ -1464,12 +1719,11 @@ test("administrator can reject a pending envelope request with an optional reaso
   try {
     await administrator.page.goto(`${origin}/admin/approvals`);
     const envelopeRequestCard = administrator.page.getByRole("listitem").filter({
-      has: administrator.page.getByRole("heading", { name: "User envelope request" }),
+      has: administrator.page.getByText(pendingEnvelopeRequest.requestId, { exact: true }),
     });
     await envelopeRequestCard.getByLabel("Rejection reason (optional)").fill("Authority is not appropriate for this user.");
     await envelopeRequestCard.getByRole("button", { name: "Reject request" }).click();
-    await expect(envelopeRequestCard.getByText("The envelope request was rejected without creating an envelope.")).toBeVisible();
-    await expect(envelopeRequestCard.getByText("Not created")).toBeVisible();
+    await expect(envelopeRequestCard.getByText("The envelope request was rejected through the governed Rust admission path.")).toBeVisible();
     const rejection = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/reject`);
     expectMutationProof(rejection);
     expect(rejection.body).toEqual({ reason: "Authority is not appropriate for this user." });
@@ -1553,7 +1807,7 @@ test("connection action keeps a Rust authorization denial explicit", async ({ br
   const developer = await guardedPage(browser, {
     connectionPhase: "disconnected",
     expectedHttpStatuses: [403],
-    mutationFailures: { "/admin/api/v1/connections/github/start": 403 },
+    mutationFailures: { "/app/api/v1/connections/github/start": 403 },
   });
   try {
     await developer.page.goto(`${origin}/connections`);

@@ -2,7 +2,7 @@
 
 use std::hash::Hash;
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -10,14 +10,15 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use steward_admission::{AdmissionDecision, Envelope, evaluate, validate_envelope};
+use steward_admission::{
+    AdmissionDecision, Envelope, add_budget_amount, envelope_is_within, validate_envelope,
+};
 use steward_store::{
-    EnvelopeRequestRecord, EnvelopeRequestReservationRequest, EnvelopeRequestStatusUpdate, PgStore,
-    StoreError, WorkflowRevisionRecord,
+    EnvelopeRequestRecord, EnvelopeRequestReservationRequest, EnvelopeRequestStatusEventRecord,
+    EnvelopeRequestStatusUpdate, EnvelopeUsageRecord, PgStore, StoreError, WorkflowRevisionRecord,
 };
 use steward_types::{
-    AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email, ModelRef, Principal,
-    RunnerRequirements, ToolGrant,
+    Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
 };
 use uuid::Uuid;
 
@@ -26,8 +27,9 @@ use crate::browser_auth::{
     protect_browser_routes,
 };
 use crate::{
-    BoxFuture, GithubActionsEnvelopeSelection, VersionedGithubActionsWorkflowContext,
-    render_versioned_github_actions_workflow, reviewed_steward_run_release_v2,
+    AgentRunAvailability, AgentRunDataStatus, BoxFuture, GithubActionsEnvelopeSelection,
+    VersionedGithubActionsWorkflowContext, render_versioned_github_actions_workflow,
+    reviewed_steward_run_release_v2,
 };
 
 pub const ENVELOPE_REQUESTS_API_VERSION: &str = "steward.envelope-requests/v1";
@@ -70,7 +72,7 @@ pub struct AvailableEnvelopeTemplate {
     pub auto_provision_threshold: Option<Envelope>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvelopeRequestStatus {
     Pending,
@@ -102,6 +104,45 @@ pub struct UserEnvelopeRequest {
     pub status_template_revision: i64,
     pub created_at: String,
     pub status_at: String,
+    pub history: Vec<EnvelopeRequestHistoryEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<EnvelopeUsageView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvelopeUsagePeriod {
+    pub start: String,
+    pub end: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvelopeSpendUsage {
+    pub observed: String,
+    pub limit: String,
+    pub currency: String,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvelopeUsageView {
+    pub period: EnvelopeUsagePeriod,
+    pub spend: Option<EnvelopeSpendUsage>,
+    pub availability: AgentRunDataStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvelopeRequestHistoryEvent {
+    pub status: EnvelopeRequestStatus,
+    pub at: String,
+    pub actor: String,
+    pub reason: Option<String>,
+    pub rationale: Option<String>,
+    pub evidence_url: Option<String>,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -117,6 +158,8 @@ pub struct BrowserEnvelopeSpec {
     pub llms: Vec<ModelRef>,
     pub tools: Vec<ToolGrant>,
     pub budget: Budget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_minutes_limit: Option<String>,
     pub ttl: Duration,
     #[serde(default)]
     pub runner: RunnerRequirements,
@@ -130,6 +173,7 @@ impl From<Envelope> for BrowserEnvelope {
                 llms: envelope.spec.llms,
                 tools: envelope.spec.tools,
                 budget: envelope.spec.budget,
+                runtime_minutes_limit: envelope.spec.runtime_minutes_limit,
                 ttl: envelope.spec.ttl,
                 runner: envelope.spec.runner,
             },
@@ -145,6 +189,7 @@ impl From<BrowserEnvelope> for Envelope {
                 llms: envelope.spec.llms,
                 tools: envelope.spec.tools,
                 budget: envelope.spec.budget,
+                runtime_minutes_limit: envelope.spec.runtime_minutes_limit,
                 ttl: envelope.spec.ttl,
                 runner: envelope.spec.runner,
             },
@@ -164,6 +209,16 @@ pub(crate) struct EnvelopeTemplatesResponse {
 pub(crate) struct EnvelopeRequestsResponse {
     api_version: &'static str,
     requests: Vec<UserEnvelopeRequest>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct EnvelopeRequestsQuery {
+    status: Option<EnvelopeRequestStatus>,
+    cursor: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -202,15 +257,18 @@ pub(crate) struct PublishedWorkflowOption {
     version: i64,
     display_name: String,
     agent: String,
+    sample: bool,
 }
 
 impl From<WorkflowRevisionRecord> for PublishedWorkflowOption {
     fn from(record: WorkflowRevisionRecord) -> Self {
+        let sample = crate::workflows::is_onboarding_sample_workflow(&record);
         Self {
             name: record.name,
             version: record.version,
             display_name: record.display_name,
             agent: record.agent,
+            sample,
         }
     }
 }
@@ -252,6 +310,29 @@ impl PgEnvelopeRequestBroker {
     pub fn new(store: PgStore) -> Self {
         Self { store }
     }
+
+    async fn attach_usage(
+        &self,
+        mut request: UserEnvelopeRequest,
+    ) -> Result<UserEnvelopeRequest, EnvelopeRequestBrokerError> {
+        if request.status != EnvelopeRequestStatus::Provisioned {
+            return Ok(request);
+        }
+        let Some(instance_id) = request.envelope_instance_id.as_deref() else {
+            return Err(EnvelopeRequestBrokerError::Unavailable);
+        };
+        let usage = self
+            .store
+            .envelope_usage(instance_id)
+            .await
+            .map_err(map_store_broker_error)?;
+        let authority = request
+            .approved_envelope
+            .as_ref()
+            .unwrap_or(&request.requested_envelope);
+        request.usage = Some(envelope_usage_view(usage, authority));
+        Ok(request)
+    }
 }
 
 impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
@@ -260,25 +341,22 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
         session: &'a UserEnvelopeSession<BrowserSessionBinding>,
     ) -> BoxFuture<'a, Result<Vec<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>> {
         Box::pin(async move {
-            let mut templates = Vec::new();
-            for member_role in &session.subject.member_roles {
-                if let Some(ceiling) = self
-                    .store
-                    .latest_envelope(member_role)
-                    .await
-                    .map_err(map_store_broker_error)?
-                {
-                    templates.push(AvailableEnvelopeTemplate {
-                        id: member_role.clone(),
-                        display_name: member_role.clone(),
-                        revision: ceiling.revision,
-                        auto_provision_threshold: Some(ceiling.clone()),
-                        ceiling,
-                    });
-                }
-            }
-            templates.sort_by(|left, right| left.id.cmp(&right.id));
-            Ok(templates)
+            self.store
+                .available_envelope_templates(&session.subject.member_roles)
+                .await
+                .map(|templates| {
+                    templates
+                        .into_iter()
+                        .map(|template| AvailableEnvelopeTemplate {
+                            id: template.template_id,
+                            display_name: template.display_name,
+                            revision: template.ceiling.revision,
+                            ceiling: template.ceiling,
+                            auto_provision_threshold: template.auto_provision_threshold,
+                        })
+                        .collect()
+                })
+                .map_err(map_store_broker_error)
         })
     }
 
@@ -289,31 +367,28 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
         revision: i64,
     ) -> BoxFuture<'a, Result<Option<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>> {
         Box::pin(async move {
-            if !session
-                .subject
-                .member_roles
-                .iter()
-                .any(|member_role| member_role == template_id)
-            {
-                return Ok(None);
-            }
-            let Some(ceiling) = self
+            let Some(template) = self
                 .store
-                .latest_envelope(template_id)
+                .latest_envelope_template(template_id)
                 .await
                 .map_err(map_store_broker_error)?
             else {
                 return Ok(None);
             };
-            if ceiling.revision != revision {
+            if template.ceiling.revision != revision
+                || !template
+                    .member_roles
+                    .iter()
+                    .any(|role| session.subject.member_roles.contains(role))
+            {
                 return Ok(None);
             }
             Ok(Some(AvailableEnvelopeTemplate {
-                id: template_id.to_owned(),
-                display_name: template_id.to_owned(),
+                id: template.template_id,
+                display_name: template.display_name,
                 revision,
-                auto_provision_threshold: Some(ceiling.clone()),
-                ceiling,
+                ceiling: template.ceiling,
+                auto_provision_threshold: template.auto_provision_threshold,
             }))
         })
     }
@@ -323,11 +398,16 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
         session: &'a UserEnvelopeSession<BrowserSessionBinding>,
     ) -> BoxFuture<'a, Result<Vec<UserEnvelopeRequest>, EnvelopeRequestBrokerError>> {
         Box::pin(async move {
-            self.store
+            let records = self
+                .store
                 .envelope_requests(&session.subject.canonical_user_id)
                 .await
-                .map(|records| records.into_iter().map(user_envelope_request).collect())
-                .map_err(map_store_broker_error)
+                .map_err(map_store_broker_error)?;
+            let mut requests = Vec::with_capacity(records.len());
+            for record in records {
+                requests.push(self.attach_usage(user_envelope_request(record)).await?);
+            }
+            Ok(requests)
         })
     }
 
@@ -337,11 +417,25 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
         request_id: Uuid,
     ) -> BoxFuture<'a, Result<Option<UserEnvelopeRequest>, EnvelopeRequestBrokerError>> {
         Box::pin(async move {
-            self.store
+            let record = self
+                .store
                 .envelope_request(&session.subject.canonical_user_id, request_id)
                 .await
-                .map(|record| record.map(user_envelope_request))
-                .map_err(map_store_broker_error)
+                .map_err(map_store_broker_error)?;
+            let Some(record) = record else {
+                return Ok(None);
+            };
+            let history = self
+                .store
+                .envelope_request_history(request_id)
+                .await
+                .map_err(map_store_broker_error)?;
+            let mut request = user_envelope_request(record);
+            request.history = history
+                .into_iter()
+                .map(envelope_request_history_event)
+                .collect();
+            Ok(Some(self.attach_usage(request).await?))
         })
     }
 
@@ -380,13 +474,16 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                         envelope_instance_id: Some(&instance_id),
                         envelope_digest: Some(&digest),
                         reason: None,
+                        rationale: None,
+                        evidence_url: None,
+                        expires_at: None,
                         approved_envelope: Some(request.requested_envelope),
-                        actor: session.subject.canonical_user_id.as_str(),
+                        actor: "system:auto",
                     },
                 )
                 .await
                 .map_err(map_store_broker_error)?;
-            Ok(user_envelope_request(provisioned))
+            self.attach_usage(user_envelope_request(provisioned)).await
         })
     }
 
@@ -440,6 +537,98 @@ fn user_envelope_request(record: EnvelopeRequestRecord) -> UserEnvelopeRequest {
         status_template_revision: record.status_template_revision,
         created_at: record.created_at,
         status_at: record.status_at,
+        history: Vec::new(),
+        usage: None,
+    }
+}
+
+fn envelope_usage_view(usage: EnvelopeUsageRecord, authority: &Envelope) -> EnvelopeUsageView {
+    let expected_currency = authority.spec.budget.currency.clone();
+    let effective_limit = usage.active_top_up_amount.as_deref().map_or_else(
+        || Some(authority.spec.budget.monthly_limit.clone()),
+        |amount| add_budget_amount(&authority.spec.budget.monthly_limit, amount).ok(),
+    );
+    let currency_valid = usage.currency_count <= 1
+        && usage
+            .currency
+            .as_deref()
+            .is_none_or(|currency| currency == expected_currency);
+    let availability = if effective_limit.is_none() {
+        AgentRunDataStatus {
+            availability: AgentRunAvailability::Unavailable,
+            source: "envelope_instance_grants".to_owned(),
+            observed_at: usage.observed_at.clone(),
+            reason: Some("active spend grant is invalid".to_owned()),
+        }
+    } else if !currency_valid {
+        AgentRunDataStatus {
+            availability: AgentRunAvailability::Unavailable,
+            source: "spend_observations".to_owned(),
+            observed_at: usage.observed_at.clone(),
+            reason: Some("inconsistent spend currencies".to_owned()),
+        }
+    } else if usage.observed_runtime_count == 0 {
+        AgentRunDataStatus {
+            availability: AgentRunAvailability::Unavailable,
+            source: "spend_observations".to_owned(),
+            observed_at: None,
+            reason: Some("no current-period spend observation is available".to_owned()),
+        }
+    } else if usage.observed_runtime_count < usage.runtime_count {
+        AgentRunDataStatus {
+            availability: AgentRunAvailability::Partial,
+            source: "spend_observations".to_owned(),
+            observed_at: usage.observed_at.clone(),
+            reason: Some(
+                "one or more bound runtimes have no current-period observation".to_owned(),
+            ),
+        }
+    } else {
+        AgentRunDataStatus {
+            availability: AgentRunAvailability::Available,
+            source: "spend_observations".to_owned(),
+            observed_at: usage.observed_at.clone(),
+            reason: None,
+        }
+    };
+    let spend = currency_valid
+        .then(|| {
+            Some(EnvelopeSpendUsage {
+                observed: usage.observed_amount?,
+                limit: effective_limit?,
+                currency: expected_currency,
+                observed_at: usage.observed_at?,
+            })
+        })
+        .flatten();
+    EnvelopeUsageView {
+        period: EnvelopeUsagePeriod {
+            start: usage.period_start,
+            end: usage.period_end,
+        },
+        spend,
+        availability,
+    }
+}
+
+fn envelope_request_history_event(
+    event: EnvelopeRequestStatusEventRecord,
+) -> EnvelopeRequestHistoryEvent {
+    EnvelopeRequestHistoryEvent {
+        status: match event.status {
+            steward_store::EnvelopeRequestStatus::Pending => EnvelopeRequestStatus::Pending,
+            steward_store::EnvelopeRequestStatus::Approved => EnvelopeRequestStatus::Approved,
+            steward_store::EnvelopeRequestStatus::Rejected => EnvelopeRequestStatus::Rejected,
+            steward_store::EnvelopeRequestStatus::Provisioned => EnvelopeRequestStatus::Provisioned,
+            steward_store::EnvelopeRequestStatus::Stale => EnvelopeRequestStatus::Stale,
+            steward_store::EnvelopeRequestStatus::Conflict => EnvelopeRequestStatus::Conflict,
+        },
+        at: event.at,
+        actor: event.actor,
+        reason: event.reason,
+        rationale: event.rationale,
+        evidence_url: event.evidence_url,
+        expires_at: event.expires_at,
     }
 }
 
@@ -643,9 +832,11 @@ where
 #[utoipa::path(
     get,
     path = "/app/api/v1/envelope-requests",
+    params(EnvelopeRequestsQuery),
     responses(
         (status = 200, body = EnvelopeRequestsResponse),
         (status = 401, description = "Browser session is absent or invalid"),
+        (status = 422, description = "Cursor or limit is invalid"),
         (status = 503, description = "Envelope requests are unavailable")
     ),
     security(("browserSession" = []))
@@ -653,6 +844,7 @@ where
 pub(crate) async fn list_requests<P, B>(
     session: Option<Extension<UserEnvelopeSession<B>>>,
     State(state): State<UserEnvelopeState<P>>,
+    query: Result<Query<EnvelopeRequestsQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response
 where
     P: EnvelopeRequestBroker<B>,
@@ -661,12 +853,37 @@ where
     let Some(Extension(session)) = session else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    let Ok(Query(query)) = query else {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    };
     match state.broker.list(&session).await {
-        Ok(requests) => Json(EnvelopeRequestsResponse {
-            api_version: ENVELOPE_REQUESTS_API_VERSION,
-            requests,
-        })
-        .into_response(),
+        Ok(mut requests) => {
+            if let Some(status) = query.status {
+                requests.retain(|request| request.status == status);
+            }
+            if let Some(cursor) = query.cursor {
+                let Ok(cursor) = Uuid::parse_str(&cursor) else {
+                    return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+                };
+                let Some(position) = requests.iter().position(|request| request.id == cursor)
+                else {
+                    return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+                };
+                requests = requests.into_iter().skip(position + 1).collect();
+            }
+            let limit = query.limit.unwrap_or(50);
+            if !(1..=100).contains(&limit) {
+                return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+            }
+            let next_cursor = (requests.len() > limit).then(|| requests[limit - 1].id.to_string());
+            requests.truncate(limit);
+            Json(EnvelopeRequestsResponse {
+                api_version: ENVELOPE_REQUESTS_API_VERSION,
+                requests,
+                next_cursor,
+            })
+            .into_response()
+        }
         Err(error) => broker_error_response(error),
     }
 }
@@ -760,12 +977,10 @@ where
     {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    let request_spec = envelope_as_user_runtime(&requested_envelope, &session.subject);
-    let inside_ceiling = matches!(
-        evaluate(&request_spec, &template.ceiling),
+    let auto_provision = matches!(
+        envelope_is_within(&requested_envelope, &template.ceiling),
         Ok(AdmissionDecision::Admit)
     );
-    let auto_provision = inside_ceiling;
     match state
         .broker
         .create(
@@ -886,28 +1101,6 @@ fn github_actions_envelope(
     })
 }
 
-fn envelope_as_user_runtime(
-    envelope: &Envelope,
-    subject: &UserEnvelopeSubject,
-) -> AgentRuntimeSpec {
-    AgentRuntimeSpec {
-        principal: Principal::User {
-            acting_user: subject.display_email.clone(),
-        },
-        owner: subject.display_email.clone(),
-        canonical_authority: None,
-        agent_type: AgentType {
-            name: "user-envelope-request".to_owned(),
-        },
-        llms: envelope.spec.llms.clone(),
-        tools: envelope.spec.tools.clone(),
-        budget: envelope.spec.budget.clone(),
-        ttl: envelope.spec.ttl.clone(),
-        runner: envelope.spec.runner.clone(),
-        bindings: None,
-    }
-}
-
 fn broker_error_response(error: EnvelopeRequestBrokerError) -> Response {
     match error {
         EnvelopeRequestBrokerError::NotFound => StatusCode::NOT_FOUND.into_response(),
@@ -927,8 +1120,9 @@ mod tests {
 
     use super::{
         AvailableEnvelopeTemplate, EnvelopeRequestBroker, EnvelopeRequestBrokerError,
-        EnvelopeRequestStatus, UserEnvelopeMutationProof, UserEnvelopeRequest, UserEnvelopeSession,
-        UserEnvelopeSubject, ValidatedEnvelopeRequest, inner_router,
+        EnvelopeRequestStatus, PublishedWorkflowOption, UserEnvelopeMutationProof,
+        UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject, ValidatedEnvelopeRequest,
+        envelope_usage_view, inner_router,
     };
     use crate::BoxFuture;
     use crate::connections::{
@@ -936,7 +1130,7 @@ mod tests {
         ProviderConnectionBroker, ProviderConnectionStatus,
     };
     use steward_admission::{Envelope, EnvelopeSpec};
-    use steward_store::WorkflowRevisionRecord;
+    use steward_store::{EnvelopeUsageRecord, WorkflowRevisionRecord};
     use steward_types::{CanonicalUserId, Email};
     use uuid::Uuid;
 
@@ -1000,6 +1194,8 @@ mod tests {
                     status_template_revision: 3,
                     created_at: "2026-08-17T00:00:00Z".to_owned(),
                     status_at: "2026-08-17T00:00:00Z".to_owned(),
+                    history: Vec::new(),
+                    usage: None,
                 }))
             })
         }
@@ -1042,6 +1238,8 @@ mod tests {
                     status_template_revision: template_revision,
                     created_at: "2026-08-17T00:00:00Z".to_owned(),
                     status_at: "2026-08-17T00:00:00Z".to_owned(),
+                    history: Vec::new(),
+                    usage: None,
                 })
             })
         }
@@ -1081,6 +1279,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn onboarding_sample_metadata_is_explicit_and_version_pinned() -> Result<(), String> {
+        let sample_agent = "example-agent@1.0.0";
+        let sample = PublishedWorkflowOption::from(WorkflowRevisionRecord {
+            name: crate::workflows::SAMPLE_WORKFLOW_NAME.to_owned(),
+            version: 1,
+            display_name: crate::workflows::SAMPLE_WORKFLOW_DISPLAY_NAME.to_owned(),
+            agent: sample_agent.to_owned(),
+            prompt: crate::workflows::SAMPLE_WORKFLOW_PROMPT.to_owned(),
+            content_digest: crate::workflows::workflow_content_digest(
+                sample_agent,
+                crate::workflows::SAMPLE_WORKFLOW_PROMPT,
+            ),
+            published_by: crate::workflows::SAMPLE_WORKFLOW_ACTOR.to_owned(),
+            published_at: "2026-09-24T00:00:00.000000Z".to_owned(),
+        });
+        let impostor = PublishedWorkflowOption::from(WorkflowRevisionRecord {
+            name: crate::workflows::SAMPLE_WORKFLOW_NAME.to_owned(),
+            version: 1,
+            display_name: crate::workflows::SAMPLE_WORKFLOW_DISPLAY_NAME.to_owned(),
+            agent: sample_agent.to_owned(),
+            prompt: crate::workflows::SAMPLE_WORKFLOW_PROMPT.to_owned(),
+            content_digest:
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+            published_by: "usr_abcdef0123456789abcdef0123456789".to_owned(),
+            published_at: "2026-09-24T00:00:00.000000Z".to_owned(),
+        });
+
+        let sample = serde_json::to_value(sample)
+            .map_err(|error| format!("serialize published Workflow option: {error}"))?;
+        let impostor = serde_json::to_value(impostor)
+            .map_err(|error| format!("serialize impostor Workflow option: {error}"))?;
+        assert_eq!(sample["sample"], true);
+        assert_eq!(impostor["sample"], false);
+        Ok(())
+    }
+
     fn template() -> AvailableEnvelopeTemplate {
         let ceiling = Envelope {
             revision: 3,
@@ -1099,6 +1334,7 @@ mod tests {
                     single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: Some("120".to_owned()),
                 ttl: Duration("72h".to_owned()),
                 runner: steward_types::RunnerRequirements::default(),
             },
@@ -1135,6 +1371,36 @@ mod tests {
     }
 
     #[test]
+    fn envelope_usage_limit_includes_active_instance_top_ups() -> Result<(), String> {
+        let authority = template()
+            .auto_provision_threshold
+            .ok_or_else(|| "missing approved envelope".to_owned())?;
+        let usage = envelope_usage_view(
+            EnvelopeUsageRecord {
+                period_start: "2026-09-01T00:00:00.000000Z".to_owned(),
+                period_end: "2026-10-01T00:00:00.000000Z".to_owned(),
+                runtime_count: 1,
+                observed_runtime_count: 1,
+                observed_amount: Some("51.00".to_owned()),
+                currency: Some("USD".to_owned()),
+                currency_count: 1,
+                observed_at: Some("2026-09-24T00:00:00.000000Z".to_owned()),
+                active_top_up_amount: Some("25.00".to_owned()),
+            },
+            &authority,
+        );
+        assert_eq!(
+            usage.spend.map(|spend| spend.limit),
+            Some("75.00".to_owned())
+        );
+        assert_eq!(
+            usage.availability.availability,
+            crate::AgentRunAvailability::Available
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tool_provider_does_not_select_a_credential_mode_at_the_envelope_boundary()
     -> Result<(), String> {
         let mut template = template();
@@ -1159,6 +1425,39 @@ mod tests {
             },
             binding: (),
         })
+    }
+
+    #[tokio::test]
+    async fn envelope_request_limits_are_bounded_and_malformed_values_are_unprocessable()
+    -> Result<(), String> {
+        let app = inner_router(TestBroker::default());
+        for query in ["limit=abc", "limit=0", "limit=101"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/app/api/v1/envelope-requests?{query}"))
+                        .extension(session()?)
+                        .body(Body::empty())
+                        .map_err(|error| format!("build list request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("list envelope requests: {error}"))?;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/envelope-requests?limit=100")
+                    .extension(session()?)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build valid list request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("list envelope requests: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1367,6 +1666,8 @@ mod tests {
                         status_template_revision: 3,
                         created_at: "2026-08-17T00:00:00Z".to_owned(),
                         status_at: "2026-08-17T00:00:00Z".to_owned(),
+                        history: Vec::new(),
+                        usage: None,
                     })
                 })
             }
@@ -1408,6 +1709,41 @@ mod tests {
             serde_json::to_value(review_only.ceiling)
                 .map_err(|error| format!("serialize expected approved envelope: {error}"))?
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_minutes_above_the_template_ceiling_enter_review() -> Result<(), String> {
+        let broker = TestBroker::default();
+        let mut requested = template().ceiling;
+        requested.spec.runtime_minutes_limit = Some("180".to_owned());
+        let response = inner_router(broker)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "templateId": "engineer",
+                            "templateRevision": 3,
+                            "requestedEnvelope": requested,
+                            "idempotencyKey": "runtime-minutes-review",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit request: {error}"))?;
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read response: {error}"))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|error| format!("parse response: {error}"))?;
+        assert_eq!(value["request"]["status"], "pending");
         Ok(())
     }
 

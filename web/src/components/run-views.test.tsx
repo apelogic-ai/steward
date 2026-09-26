@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { BrowserRunView } from "@/api-client";
 
-import { RunCards } from "./run-views";
+import { pollRerun, RunCards } from "./run-views";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -13,6 +13,7 @@ function run(overrides: Partial<BrowserRunView>): BrowserRunView {
     finalized: true,
     phase: "succeeded",
     runtimeOwnership: "provisioned",
+    stages: [],
     taskUid: "task-default",
     updatedAt: "2026-08-25T20:00:00Z",
     workflow: "test-wf@3",
@@ -39,5 +40,51 @@ describe("run cards", () => {
     expect(html).not.toContain("newruntime-0000");
     expect(html).not.toContain("oldruntime-0000");
     expect(html).not.toContain("uppercase");
+  });
+});
+
+describe("GitHub reruns", () => {
+  test("polls a pending rerun with one idempotent request until its task is correlated", async () => {
+    const attempts = [
+      { data: { retryAfterMs: 750 }, response: { ok: true, status: 202 } },
+      { data: { taskUid: "task-rerun" }, response: { ok: true, status: 201 } },
+    ];
+    const waits: number[] = [];
+    let calls = 0;
+
+    const outcome = await pollRerun(
+      async () => {
+        const result = attempts[calls];
+        calls += 1;
+        if (!result) throw new Error("unexpected poll");
+        return result;
+      },
+      async (milliseconds) => { waits.push(milliseconds); },
+    );
+
+    expect(outcome).toEqual({ taskUid: "task-rerun" });
+    expect(calls).toBe(2);
+    expect(waits).toEqual([750]);
+  });
+
+  test("stops polling on a terminal mutation failure", async () => {
+    const outcome = await pollRerun(
+      async () => ({ response: { ok: false, status: 409 } }),
+      async () => { throw new Error("must not wait"); },
+    );
+
+    expect(outcome).toEqual({ failure: "conflict" });
+  });
+
+  test("bounds server-controlled retry delays and times out as unavailable", async () => {
+    const waits: number[] = [];
+    const outcome = await pollRerun(
+      async () => ({ data: { retryAfterMs: 60_000 }, response: { ok: true, status: 202 } }),
+      async (milliseconds) => { waits.push(milliseconds); },
+      2,
+    );
+
+    expect(outcome).toEqual({ failure: "unavailable" });
+    expect(waits).toEqual([5_000]);
   });
 });

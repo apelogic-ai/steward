@@ -350,6 +350,7 @@ spec:
             - { name: PORT, value: "8080" }
             - { name: TOKEN_STORE_DSN, value: postgres://steward@postgres.steward-system.svc.cluster.local:5432/steward }
             - { name: GITHUB_MCP_UPSTREAM_URL, value: http://provider-fixture.steward-system.svc.cluster.local:8090/github-mcp }
+            - { name: GITHUB_MCP_GOVERNANCE_CATALOG, value: github-mcp-server@1.6.0/all }
             - { name: GITHUB_OAUTH_CLIENT_ID, value: obviously-fake-client }
             - { name: GITHUB_OAUTH_CLIENT_SECRET, value: obviously-fake-client-secret }
             - { name: GITHUB_OAUTH_REDIRECT_URI, value: http://mcp-gw.steward-system.svc.cluster.local:8080/oauth/github/callback }

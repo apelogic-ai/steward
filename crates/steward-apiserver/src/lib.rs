@@ -9,6 +9,7 @@ mod execution_bindings;
 mod github_actions;
 pub mod google_oidc;
 pub mod governed_connections;
+pub mod preferences;
 pub mod stable_runtime_bridge;
 pub mod task_auth;
 mod tasks;
@@ -67,11 +68,15 @@ pub use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
 };
 use steward_store::{
-    AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent, AgentRunTimelineKind,
+    AdminApprovalRecord, AdminEnvelopeRequestRecord, AgentRunExecutionLog, AgentRunPage,
+    AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent, AgentRunTimelineKind,
     AgentRunTimelineProvenance, ApprovalCandidate, ApproveAdmission, ApprovedAdmission,
-    DecisionFiling, DecisionFilingClaim, EnvelopeRequestRecord, EnvelopeRequestStatusUpdate,
+    CumulativeEscalationRecord, DecisionFiling, DecisionFilingClaim, EnvelopeInstanceGrantRecord,
+    EnvelopeRequestDecisionReference, EnvelopeRequestRecord, EnvelopeRequestStatusEventRecord,
+    EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication, EnvelopeTemplateRevisionRecord,
     GrantApplication, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval,
     PendingEnvelopeRequest, PgStore, StoreError, TaskAdmissionLookup, TaskAdmissionRecord,
+    TaskRecord, TaskReservation, TaskReservationRequest,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, ModelRef,
@@ -344,6 +349,8 @@ pub struct GrantRevocationRequest {
         workflows::publish_next_workflow,
         agent_runs_ui::my_runs,
         agent_runs_ui::my_run,
+        agent_runs_ui::cancel_my_run,
+        agent_runs_ui::rerun_my_run,
         agent_runs_ui::my_run_timeline,
         agent_runs_ui::my_run_execution_log,
         agent_runs_ui::all_runs,
@@ -353,13 +360,23 @@ pub struct GrantRevocationRequest {
         connections::connection_status,
         connections::start_connection,
         connections::disconnect_connection,
+        connections::list_connections,
+        connections::start_provider_connection,
+        connections::disconnect_provider_connection,
+        preferences::get_preferences,
+        preferences::update_preferences,
         browser_admin::get_envelope_template,
         browser_admin::get_capabilities,
         browser_admin::list_envelope_templates,
         browser_admin::author_envelope_template,
+        browser_admin::author_legacy_envelope_template,
         browser_admin::list_approvals,
+        browser_admin::list_admin_requests,
+        browser_admin::get_admin_request,
+        browser_admin::admin_requests_summary,
         browser_admin::approve_envelope_request,
         browser_admin::reject_envelope_request,
+        browser_admin::file_envelope_request,
         browser_admin::approve,
         browser_admin::file_decision,
         browser_admin::list_federated_subjects,
@@ -368,6 +385,8 @@ pub struct GrantRevocationRequest {
         browser_admin::associate_federated_subject,
         browser_admin::replace_federated_subject,
         browser_admin::disable_federated_subject,
+        browser_admin::top_up_escalation,
+        browser_admin::deny_escalation,
         agent_runs_contract,
         agent_run_contract,
         agent_run_timeline_contract
@@ -392,6 +411,7 @@ pub struct GrantRevocationRequest {
         browser_admin::BrowserFederatedSubjectAuditResponse,
         browser_admin::AssociateFederatedSubjectBody,
         browser_admin::DisableFederatedSubjectBody,
+        browser_admin::AdminRequestStateFilter,
         AgentRunAvailability,
         AgentRunDataStatus,
         AgentRunSpendView,
@@ -775,6 +795,12 @@ pub enum AgentRunTimelineEventView {
         provenance: AgentRunTimelineProvenanceView,
         at: String,
     },
+    Stage {
+        stage: String,
+        details: serde_json::Value,
+        provenance: AgentRunTimelineProvenanceView,
+        at: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -1060,6 +1086,20 @@ impl RuntimeRepository for KubeRuntimeRepository {
 }
 
 pub trait AdmissionLedger: Clone + Send + Sync + 'static {
+    fn insert_envelope_template_revision<'a>(
+        &'a self,
+        publication: EnvelopeTemplatePublication<'a>,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    fn latest_envelope_template<'a>(
+        &'a self,
+        template_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<EnvelopeTemplateRevisionRecord>, StoreError>>;
+
+    fn latest_envelope_templates(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<EnvelopeTemplateRevisionRecord>, StoreError>>;
+
     fn insert_envelope<'a>(
         &'a self,
         member_role: &'a str,
@@ -1090,10 +1130,94 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         &self,
     ) -> BoxFuture<'_, Result<Vec<PendingEnvelopeRequest>, StoreError>>;
 
+    fn admin_approvals(&self) -> BoxFuture<'_, Result<Vec<AdminApprovalRecord>, StoreError>>;
+
+    fn admin_envelope_requests(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<AdminEnvelopeRequestRecord>, StoreError>>;
+
+    fn admin_escalations(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<CumulativeEscalationRecord>, StoreError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn cumulative_escalation(
+        &self,
+        _escalation_id: Uuid,
+    ) -> BoxFuture<'_, Result<Option<CumulativeEscalationRecord>, StoreError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn record_escalation_top_up<'a>(
+        &'a self,
+        _escalation_id: Uuid,
+        _amount: &'a str,
+        _valid_until: &'a str,
+        _rationale: &'a str,
+        _granted_by: &'a str,
+    ) -> BoxFuture<'a, Result<EnvelopeInstanceGrantRecord, StoreError>> {
+        Box::pin(async { Err(StoreError::CumulativeEscalationNotFound) })
+    }
+
+    fn deny_cumulative_escalation<'a>(
+        &'a self,
+        _escalation_id: Uuid,
+        _rationale: &'a str,
+        _denied_by: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async { Err(StoreError::CumulativeEscalationNotFound) })
+    }
+
     fn envelope_request_for_admin(
         &self,
         request_id: Uuid,
     ) -> BoxFuture<'_, Result<Option<EnvelopeRequestRecord>, StoreError>>;
+
+    fn envelope_request_history(
+        &self,
+        request_id: Uuid,
+    ) -> BoxFuture<'_, Result<Vec<EnvelopeRequestStatusEventRecord>, StoreError>>;
+
+    fn envelope_request_decision_reference(
+        &self,
+        request_id: Uuid,
+    ) -> BoxFuture<'_, Result<Option<EnvelopeRequestDecisionReference>, StoreError>>;
+
+    fn claim_envelope_request_decision_filing<'a>(
+        &'a self,
+        _request_id: Uuid,
+        _claimed_by: &'a str,
+    ) -> BoxFuture<'a, Result<Uuid, StoreError>> {
+        Box::pin(async { Err(StoreError::DecisionFilingInProgress) })
+    }
+
+    fn complete_envelope_request_decision_filing<'a>(
+        &'a self,
+        _request_id: Uuid,
+        _token: Uuid,
+        _decision_key: &'a str,
+        _evidence_url: &'a str,
+        _filed_by: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async { Err(StoreError::DecisionFilingClaimLost) })
+    }
+
+    fn release_envelope_request_decision_filing(
+        &self,
+        _request_id: Uuid,
+        _token: Uuid,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        Box::pin(async { Err(StoreError::DecisionFilingClaimLost) })
+    }
+
+    fn link_envelope_request_decision_reference<'a>(
+        &'a self,
+        request_id: Uuid,
+        decision_key: &'a str,
+        evidence_url: &'a str,
+        filed_by: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     fn append_envelope_request_status<'a>(
         &'a self,
@@ -1188,6 +1312,59 @@ pub trait AgentRunLedger: Clone + Send + Sync + 'static {
         task_uid: Uuid,
     ) -> BoxFuture<'_, Result<Option<AgentRunRecord>, StoreError>>;
 
+    fn agent_run_phase_facets<'a>(
+        &'a self,
+        query: &'a AgentRunQuery,
+    ) -> BoxFuture<'a, Result<std::collections::BTreeMap<String, u64>, StoreError>>;
+
+    fn cancel_agent_run<'a>(
+        &'a self,
+        task_uid: Uuid,
+        owner_user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>>;
+
+    fn rerun_source<'a>(
+        &'a self,
+        _task_uid: Uuid,
+        _owner_user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn rerun_by_idempotency<'a>(
+        &'a self,
+        _submitter_service: &'a str,
+        _owner_user_id: &'a str,
+        _idempotency_key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn github_rerun_task<'a>(
+        &'a self,
+        _owner_user_id: &'a str,
+        _repository: &'a str,
+        _run_id: &'a str,
+        _after_attempt: u32,
+    ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn reserve_rerun<'a>(
+        &'a self,
+        _request: TaskReservationRequest<'a>,
+    ) -> BoxFuture<'a, Result<TaskReservation, StoreError>> {
+        Box::pin(async { Err(StoreError::TaskNotFound) })
+    }
+
+    fn activate_rerun(
+        &self,
+        _source_task_uid: Uuid,
+        _rerun_task_uid: Uuid,
+    ) -> BoxFuture<'_, Result<TaskRecord, StoreError>> {
+        Box::pin(async { Err(StoreError::TaskNotFound) })
+    }
+
     fn agent_run_timeline(
         &self,
         task_uid: Uuid,
@@ -1198,7 +1375,7 @@ pub trait AgentRunLedger: Clone + Send + Sync + 'static {
         task_uid: Uuid,
         owner_user_id: Option<&'a str>,
         stream: steward_store::AgentRunLogStream,
-    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>>;
+    ) -> BoxFuture<'a, Result<Option<AgentRunExecutionLog>, StoreError>>;
 }
 
 impl AgentRunLedger for PgStore {
@@ -1216,6 +1393,70 @@ impl AgentRunLedger for PgStore {
         Box::pin(async move { PgStore::agent_run(self, task_uid).await })
     }
 
+    fn agent_run_phase_facets<'a>(
+        &'a self,
+        query: &'a AgentRunQuery,
+    ) -> BoxFuture<'a, Result<std::collections::BTreeMap<String, u64>, StoreError>> {
+        Box::pin(async move { PgStore::agent_run_phase_facets(self, query).await })
+    }
+
+    fn cancel_agent_run<'a>(
+        &'a self,
+        task_uid: Uuid,
+        owner_user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
+        Box::pin(async move { PgStore::cancel_agent_run(self, task_uid, owner_user_id).await })
+    }
+
+    fn rerun_source<'a>(
+        &'a self,
+        task_uid: Uuid,
+        owner_user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
+        Box::pin(async move { PgStore::rerun_source(self, task_uid, owner_user_id).await })
+    }
+
+    fn rerun_by_idempotency<'a>(
+        &'a self,
+        submitter_service: &'a str,
+        owner_user_id: &'a str,
+        idempotency_key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
+        Box::pin(async move {
+            PgStore::task_by_idempotency(self, submitter_service, owner_user_id, idempotency_key)
+                .await
+        })
+    }
+
+    fn github_rerun_task<'a>(
+        &'a self,
+        owner_user_id: &'a str,
+        repository: &'a str,
+        run_id: &'a str,
+        after_attempt: u32,
+    ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
+        Box::pin(async move {
+            PgStore::github_rerun_task(self, owner_user_id, repository, run_id, after_attempt).await
+        })
+    }
+
+    fn reserve_rerun<'a>(
+        &'a self,
+        request: TaskReservationRequest<'a>,
+    ) -> BoxFuture<'a, Result<TaskReservation, StoreError>> {
+        Box::pin(async move { PgStore::reserve_task(self, &request).await })
+    }
+
+    fn activate_rerun(
+        &self,
+        source_task_uid: Uuid,
+        rerun_task_uid: Uuid,
+    ) -> BoxFuture<'_, Result<TaskRecord, StoreError>> {
+        Box::pin(
+            async move { PgStore::activate_rerun(self, source_task_uid, rerun_task_uid).await },
+        )
+    }
+
     fn agent_run_timeline(
         &self,
         task_uid: Uuid,
@@ -1228,7 +1469,7 @@ impl AgentRunLedger for PgStore {
         task_uid: Uuid,
         owner_user_id: Option<&'a str>,
         stream: steward_store::AgentRunLogStream,
-    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>> {
+    ) -> BoxFuture<'a, Result<Option<AgentRunExecutionLog>, StoreError>> {
         Box::pin(async move {
             PgStore::agent_run_execution_log(self, task_uid, owner_user_id, stream).await
         })
@@ -1236,6 +1477,26 @@ impl AgentRunLedger for PgStore {
 }
 
 impl AdmissionLedger for PgStore {
+    fn insert_envelope_template_revision<'a>(
+        &'a self,
+        publication: EnvelopeTemplatePublication<'a>,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move { PgStore::insert_envelope_template_revision(self, publication).await })
+    }
+
+    fn latest_envelope_template<'a>(
+        &'a self,
+        template_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<EnvelopeTemplateRevisionRecord>, StoreError>> {
+        Box::pin(async move { PgStore::latest_envelope_template(self, template_id).await })
+    }
+
+    fn latest_envelope_templates(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<EnvelopeTemplateRevisionRecord>, StoreError>> {
+        Box::pin(async move { PgStore::latest_envelope_templates(self).await })
+    }
+
     fn insert_envelope<'a>(
         &'a self,
         member_role: &'a str,
@@ -1282,11 +1543,142 @@ impl AdmissionLedger for PgStore {
         Box::pin(async move { PgStore::pending_envelope_requests(self).await })
     }
 
+    fn admin_approvals(&self) -> BoxFuture<'_, Result<Vec<AdminApprovalRecord>, StoreError>> {
+        Box::pin(async move { PgStore::admin_approvals(self).await })
+    }
+
+    fn admin_envelope_requests(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<AdminEnvelopeRequestRecord>, StoreError>> {
+        Box::pin(async move { PgStore::admin_envelope_requests(self).await })
+    }
+
+    fn admin_escalations(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<CumulativeEscalationRecord>, StoreError>> {
+        Box::pin(async move { PgStore::admin_escalations(self).await })
+    }
+
+    fn cumulative_escalation(
+        &self,
+        escalation_id: Uuid,
+    ) -> BoxFuture<'_, Result<Option<CumulativeEscalationRecord>, StoreError>> {
+        Box::pin(async move { PgStore::cumulative_escalation(self, escalation_id).await })
+    }
+
+    fn record_escalation_top_up<'a>(
+        &'a self,
+        escalation_id: Uuid,
+        amount: &'a str,
+        valid_until: &'a str,
+        rationale: &'a str,
+        granted_by: &'a str,
+    ) -> BoxFuture<'a, Result<EnvelopeInstanceGrantRecord, StoreError>> {
+        Box::pin(async move {
+            PgStore::record_escalation_top_up(
+                self,
+                escalation_id,
+                amount,
+                valid_until,
+                rationale,
+                granted_by,
+            )
+            .await
+        })
+    }
+
+    fn deny_cumulative_escalation<'a>(
+        &'a self,
+        escalation_id: Uuid,
+        rationale: &'a str,
+        denied_by: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            PgStore::deny_cumulative_escalation(self, escalation_id, rationale, denied_by).await
+        })
+    }
+
     fn envelope_request_for_admin(
         &self,
         request_id: Uuid,
     ) -> BoxFuture<'_, Result<Option<EnvelopeRequestRecord>, StoreError>> {
         Box::pin(async move { PgStore::envelope_request_for_admin(self, request_id).await })
+    }
+
+    fn envelope_request_history(
+        &self,
+        request_id: Uuid,
+    ) -> BoxFuture<'_, Result<Vec<EnvelopeRequestStatusEventRecord>, StoreError>> {
+        Box::pin(async move { PgStore::envelope_request_history(self, request_id).await })
+    }
+
+    fn envelope_request_decision_reference(
+        &self,
+        request_id: Uuid,
+    ) -> BoxFuture<'_, Result<Option<EnvelopeRequestDecisionReference>, StoreError>> {
+        Box::pin(
+            async move { PgStore::envelope_request_decision_reference(self, request_id).await },
+        )
+    }
+
+    fn claim_envelope_request_decision_filing<'a>(
+        &'a self,
+        request_id: Uuid,
+        claimed_by: &'a str,
+    ) -> BoxFuture<'a, Result<Uuid, StoreError>> {
+        Box::pin(async move {
+            PgStore::claim_envelope_request_decision_filing(self, request_id, claimed_by).await
+        })
+    }
+
+    fn complete_envelope_request_decision_filing<'a>(
+        &'a self,
+        request_id: Uuid,
+        token: Uuid,
+        decision_key: &'a str,
+        evidence_url: &'a str,
+        filed_by: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            PgStore::complete_envelope_request_decision_filing(
+                self,
+                request_id,
+                token,
+                decision_key,
+                evidence_url,
+                filed_by,
+            )
+            .await
+        })
+    }
+
+    fn release_envelope_request_decision_filing(
+        &self,
+        request_id: Uuid,
+        token: Uuid,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        Box::pin(async move {
+            PgStore::release_envelope_request_decision_filing(self, request_id, token).await
+        })
+    }
+
+    fn link_envelope_request_decision_reference<'a>(
+        &'a self,
+        request_id: Uuid,
+        decision_key: &'a str,
+        evidence_url: &'a str,
+        filed_by: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            PgStore::link_envelope_request_decision_reference(
+                self,
+                request_id,
+                decision_key,
+                evidence_url,
+                filed_by,
+            )
+            .await
+        })
     }
 
     fn append_envelope_request_status<'a>(
@@ -1709,6 +2101,15 @@ fn agent_run_timeline_view(event: AgentRunTimelineEvent) -> AgentRunTimelineEven
             provenance,
             at: event.at,
         },
+        AgentRunTimelineKind::Stage {
+            event_kind,
+            details,
+        } => AgentRunTimelineEventView::Stage {
+            stage: event_kind,
+            details,
+            provenance,
+            at: event.at,
+        },
     }
 }
 
@@ -2037,7 +2438,8 @@ impl IntoResponse for ApiError {
                 | StoreError::FederatedSubjectNotFound
                 | StoreError::EnvelopeRequestNotFound
                 | StoreError::WorkflowNotFound
-                | StoreError::ConnectionOperationNotFound,
+                | StoreError::ConnectionOperationNotFound
+                | StoreError::CumulativeEscalationNotFound,
             ) => StatusCode::NOT_FOUND,
             Self::Store(StoreError::CanonicalIdentityInactive) => StatusCode::FORBIDDEN,
             Self::Store(
@@ -2073,7 +2475,8 @@ impl IntoResponse for ApiError {
                 | StoreError::CanonicalIdentityConflict
                 | StoreError::FederatedSubjectConflict
                 | StoreError::ConnectionOperationConflict
-                | StoreError::ConnectionOAuthFlowPending,
+                | StoreError::ConnectionOAuthFlowPending
+                | StoreError::CumulativeEscalationConflict,
             ) => StatusCode::CONFLICT,
             Self::Store(
                 StoreError::InvalidGrantExpiry
@@ -2085,7 +2488,10 @@ impl IntoResponse for ApiError {
                 | StoreError::InvalidBrowserRbacRecord
                 | StoreError::InvalidFederatedSubject
                 | StoreError::InvalidTaskIdentityBinding
+                | StoreError::InvalidEnvelopeTemplate
                 | StoreError::InvalidEnvelopeRequest
+                | StoreError::InvalidBrowserPreferences
+                | StoreError::InvalidCumulativeEscalation
                 | StoreError::InvalidWorkflow
                 | StoreError::InvalidConnectionOperation,
             ) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -2990,10 +3396,13 @@ mod tests {
         TaskExecutionPlan, TaskExecutionPlanRequest,
     };
     use steward_store::{
-        AdmissionApprovalState, AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunSpend,
+        AdminApprovalRecord, AdminEnvelopeRequestRecord, AdmissionApprovalState,
+        AgentRunExecutionLog, AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunSpend,
         AgentRunTimelineEvent, AgentRunTimelineKind, AgentRunTimelineProvenance, ApprovalCandidate,
-        ApproveAdmission, ApprovedAdmission, DecisionFiling, DecisionFilingClaim,
-        EnvelopeRequestRecord, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
+        ApproveAdmission, ApprovedAdmission, CumulativeEscalationRecord, DecisionFiling,
+        DecisionFilingClaim, EnvelopeInstanceGrantRecord, EnvelopeRequestDecisionReference,
+        EnvelopeRequestRecord, EnvelopeRequestStatus, EnvelopeRequestStatusEventRecord,
+        EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication, EnvelopeTemplateRevisionRecord,
         GrantApplication, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval,
         PendingEnvelopeRequest, StoreError, TaskAdmissionLookup, TaskAdmissionRecord,
         TaskOrchestrationState, TaskRecord, TaskReservation, TaskReservationRequest,
@@ -3996,10 +4405,26 @@ mod tests {
             ),
             ("/paths/~1app~1api~1v1~1runs/get", "200"),
             ("/paths/~1app~1api~1v1~1runs~1{task_uid}/get", "200"),
+            ("/paths/~1app~1api~1v1~1runs~1{task_uid}~1rerun/post", "201"),
+            (
+                "/paths/~1app~1api~1v1~1runs~1{task_uid}~1cancel/post",
+                "200",
+            ),
             (
                 "/paths/~1app~1api~1v1~1runs~1{task_uid}~1timeline/get",
                 "200",
             ),
+            ("/paths/~1app~1api~1v1~1connections/get", "200"),
+            (
+                "/paths/~1app~1api~1v1~1connections~1{provider}~1start/post",
+                "200",
+            ),
+            (
+                "/paths/~1app~1api~1v1~1connections~1{provider}~1disconnect/post",
+                "204",
+            ),
+            ("/paths/~1app~1api~1v1~1preferences/get", "200"),
+            ("/paths/~1app~1api~1v1~1preferences/put", "200"),
             ("/paths/~1admin~1api~1v1~1all-runs/get", "200"),
             ("/paths/~1admin~1api~1v1~1all-runs~1{task_uid}/get", "200"),
             (
@@ -4018,20 +4443,39 @@ mod tests {
             ("/paths/~1admin~1api~1v1~1envelope-templates/get", "200"),
             ("/paths/~1admin~1api~1v1~1capabilities/get", "200"),
             (
-                "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/get",
+                "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/get",
                 "200",
             ),
             (
-                "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/post",
+                "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/post",
+                "201",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/put",
                 "201",
             ),
             ("/paths/~1admin~1api~1v1~1approvals/get", "200"),
+            ("/paths/~1admin~1api~1v1~1requests/get", "200"),
+            ("/paths/~1admin~1api~1v1~1requests~1summary/get", "200"),
+            ("/paths/~1admin~1api~1v1~1requests~1{request_id}/get", "200"),
             (
                 "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1approve/post",
                 "200",
             ),
             (
                 "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1reject/post",
+                "200",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1file/post",
+                "200",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1escalations~1{escalation_id}~1top-up/post",
+                "200",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1escalations~1{escalation_id}~1deny/post",
                 "200",
             ),
             (
@@ -4100,11 +4544,20 @@ mod tests {
         for pointer in [
             "/paths/~1app~1api~1v1~1envelope-requests/post",
             "/paths/~1app~1api~1v1~1envelope-requests~1{request_id}~1github-actions-workflow/post",
+            "/paths/~1app~1api~1v1~1runs~1{task_uid}~1rerun/post",
+            "/paths/~1app~1api~1v1~1runs~1{task_uid}~1cancel/post",
+            "/paths/~1app~1api~1v1~1connections~1{provider}~1start/post",
+            "/paths/~1app~1api~1v1~1connections~1{provider}~1disconnect/post",
+            "/paths/~1app~1api~1v1~1preferences/put",
             "/paths/~1admin~1api~1v1~1connections~1github~1start/post",
             "/paths/~1admin~1api~1v1~1connections~1github~1disconnect/post",
-            "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/post",
+            "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/post",
+            "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/put",
             "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1approve/post",
             "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1reject/post",
+            "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1file/post",
+            "/paths/~1admin~1api~1v1~1escalations~1{escalation_id}~1top-up/post",
+            "/paths/~1admin~1api~1v1~1escalations~1{escalation_id}~1deny/post",
             "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1approve/post",
             "/paths/~1admin~1api~1v1~1approvals~1{approval_id}~1file/post",
             "/paths/~1admin~1api~1v1~1federated-subjects~1{subject_id}~1associate/post",
@@ -4117,6 +4570,38 @@ mod tests {
             assert!(
                 operation.pointer("/responses/403").is_some(),
                 "browser mutation at {pointer} is missing its CSRF/origin rejection"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn generated_log_clients_require_an_offset_for_the_typed_json_contract() -> Result<(), String> {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        for pointer in [
+            "/paths/~1app~1api~1v1~1runs~1{task_uid}~1logs~1{stream}/get",
+            "/paths/~1admin~1api~1v1~1all-runs~1{task_uid}~1logs~1{stream}/get",
+        ] {
+            let parameters = document
+                .pointer(&format!("{pointer}/parameters"))
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| format!("execution-log parameters are absent at {pointer}"))?;
+            let after = parameters
+                .iter()
+                .find(|parameter| {
+                    parameter
+                        .pointer("/name")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("after")
+                })
+                .ok_or_else(|| format!("execution-log offset is absent at {pointer}"))?;
+            assert_eq!(
+                after
+                    .pointer("/required")
+                    .and_then(serde_json::Value::as_bool),
+                Some(true),
+                "generated clients must always send after so their typed response is JSON"
             );
         }
         Ok(())
@@ -4162,20 +4647,55 @@ mod tests {
                     .header("sec-fetch-site", "same-origin")
                     .header("x-steward-csrf", "not-an-admin-proof")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::from(
+                        r#"{"rationale":"approved for repository review","evidenceUrl":"https://jira.example.com/browse/PROJ-123","expiresAt":"2999-01-01T00:00:00Z"}"#,
+                    ))
                     .map_err(|error| format!("build user envelope approval: {error}"))?,
             )
             .await
             .map_err(|error| format!("execute user envelope approval: {error}"))?;
         assert_eq!(forbidden_envelope_approval.status(), StatusCode::FORBIDDEN);
 
-        let admin_ledger = ledger();
+        let mut admin_ledger = ledger();
+        admin_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .spec
+            .budget
+            .monthly_limit = "250.00".to_owned();
+        let admin_decisions = FakeDecisionChannel::default();
         let (admin_auth, admin_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let legacy_approval_app = browser_admin::protected_router(
+            runtime_repository.clone(),
+            ledger(),
+            FakeDecisionChannel::default(),
+            browser_capability_catalog(),
+            admin_auth.clone(),
+        );
+        let legacy_approval = legacy_approval_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build legacy empty envelope approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute legacy empty envelope approval: {error}"))?;
+        assert_eq!(
+            legacy_approval.status(),
+            StatusCode::OK,
+            "a pre-redesign client can still approve an unfiled request with an empty object"
+        );
         let admin_app = browser_admin::protected_router(
             runtime_repository,
             admin_ledger.clone(),
-            FakeDecisionChannel::default(),
+            admin_decisions.clone(),
             browser_capability_catalog(),
             admin_auth,
         );
@@ -4210,8 +4730,17 @@ mod tests {
         let templates = serde_json::from_slice::<serde_json::Value>(&templates_body)
             .map_err(|error| format!("decode admin template list response: {error}"))?;
         assert_eq!(
-            templates.pointer("/templates/0/memberRole"),
+            templates.pointer("/templates/0/id"),
             Some(&serde_json::json!("engineer"))
+        );
+        assert_eq!(
+            templates.pointer("/templates/0/memberRoles/0"),
+            Some(&serde_json::json!("engineer"))
+        );
+        assert_eq!(
+            templates.pointer("/templates/0/memberRole"),
+            Some(&serde_json::json!("engineer")),
+            "the legacy singular role remains available during the catalog migration"
         );
         assert_eq!(
             templates.pointer("/templates/0/envelope/revision"),
@@ -4237,7 +4766,7 @@ mod tests {
             .map_err(|error| format!("decode admin capabilities response: {error}"))?;
         assert_eq!(
             capabilities.pointer("/schemaVersion"),
-            Some(&serde_json::json!("steward.capability-catalog/v1"))
+            Some(&serde_json::json!("steward.capability-catalog/v2"))
         );
         assert_eq!(
             capabilities.pointer("/models/0"),
@@ -4296,7 +4825,104 @@ mod tests {
             "the one administrator queue must publish pending user envelope requests"
         );
 
-        let approved_request = admin_app
+        let requests = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/requests?state=needs_action&kind=ceiling_exceeded&limit=10")
+                    .header(header::COOKIE, &admin_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build unified request queue request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute unified request queue request: {error}"))?;
+        assert_eq!(requests.status(), StatusCode::OK);
+        let requests_body = to_bytes(requests.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read unified request queue response: {error}"))?;
+        let requests: serde_json::Value = serde_json::from_slice(&requests_body)
+            .map_err(|error| format!("decode unified request queue response: {error}"))?;
+        assert_eq!(
+            requests.pointer("/requests/0/id"),
+            Some(&serde_json::json!("00000000-0000-0000-0000-000000000004"))
+        );
+        assert_eq!(
+            requests.pointer("/requests/0/deltas/0/dimension"),
+            Some(&serde_json::json!("budget")),
+            "the queue must expose structured authority deltas"
+        );
+
+        let first_page = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/requests?state=needs_action&limit=1")
+                    .header(header::COOKIE, &admin_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build first request queue page: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute first request queue page: {error}"))?;
+        assert_eq!(first_page.status(), StatusCode::OK);
+        let first_page: serde_json::Value = serde_json::from_slice(
+            &to_bytes(first_page.into_body(), 1024 * 1024)
+                .await
+                .map_err(|error| format!("read first request queue page: {error}"))?,
+        )
+        .map_err(|error| format!("decode first request queue page: {error}"))?;
+        let cursor = first_page["nextCursor"]
+            .as_str()
+            .ok_or_else(|| "first request queue page did not return a cursor".to_owned())?;
+        let second_page = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/api/v1/requests?state=needs_action&limit=1&cursor={}",
+                        cursor.replace('|', "%7C")
+                    ))
+                    .header(header::COOKIE, &admin_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build second request queue page: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute second request queue page: {error}"))?;
+        assert_eq!(second_page.status(), StatusCode::OK);
+        let second_page: serde_json::Value = serde_json::from_slice(
+            &to_bytes(second_page.into_body(), 1024 * 1024)
+                .await
+                .map_err(|error| format!("read second request queue page: {error}"))?,
+        )
+        .map_err(|error| format!("decode second request queue page: {error}"))?;
+        assert_ne!(
+            first_page.pointer("/requests/0/id"),
+            second_page.pointer("/requests/0/id"),
+            "cursor pagination must not repeat the boundary request"
+        );
+
+        let request_detail = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/requests/00000000-0000-0000-0000-000000000004")
+                    .header(header::COOKIE, &admin_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build unified request detail request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute unified request detail request: {error}"))?;
+        assert_eq!(request_detail.status(), StatusCode::OK);
+        let request_detail_body = to_bytes(request_detail.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read unified request detail response: {error}"))?;
+        let request_detail: serde_json::Value = serde_json::from_slice(&request_detail_body)
+            .map_err(|error| format!("decode unified request detail response: {error}"))?;
+        assert_eq!(
+            request_detail.pointer("/request/history/0/state"),
+            Some(&serde_json::json!("requested"))
+        );
+
+        let missing_rationale = admin_app
             .clone()
             .oneshot(
                 Request::builder()
@@ -4308,6 +4934,89 @@ mod tests {
                     .header("x-steward-csrf", &csrf)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from("{}"))
+                    .map_err(|error| format!("build rationale-free envelope approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute rationale-free envelope approval: {error}"))?;
+        assert_eq!(missing_rationale.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let request_summary = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/requests/summary")
+                    .header(header::COOKIE, &admin_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build request summary request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute request summary request: {error}"))?;
+        assert_eq!(request_summary.status(), StatusCode::OK);
+        let request_summary_body = to_bytes(request_summary.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read request summary response: {error}"))?;
+        let request_summary: serde_json::Value = serde_json::from_slice(&request_summary_body)
+            .map_err(|error| format!("decode request summary response: {error}"))?;
+        assert_eq!(
+            request_summary.pointer("/needsAction"),
+            Some(&serde_json::json!(3))
+        );
+        assert_eq!(
+            request_summary.pointer("/requested"),
+            Some(&serde_json::json!(3))
+        );
+
+        let filed_request = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(
+                        "/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/file",
+                    )
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build envelope filing request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute envelope filing request: {error}"))?;
+        assert_eq!(filed_request.status(), StatusCode::OK);
+        let filed_body = to_bytes(filed_request.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read envelope filing response: {error}"))?;
+        let filed: serde_json::Value = serde_json::from_slice(&filed_body)
+            .map_err(|error| format!("decode envelope filing response: {error}"))?;
+        assert_eq!(
+            filed.pointer("/decisionKey"),
+            Some(&serde_json::json!("PROJ-123"))
+        );
+        assert_eq!(
+            admin_decisions
+                .requests
+                .lock()
+                .map_err(|_| "lock envelope filing requests")?
+                .len(),
+            1
+        );
+
+        let approved_request = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"rationale":"approved for repository review","expiresAt":"2999-01-01T00:00:00Z"}"#,
+                    ))
                     .map_err(|error| format!("build envelope approval request: {error}"))?,
             )
             .await
@@ -4336,6 +5045,20 @@ mod tests {
             approved.pointer("/request/actedBy"),
             Some(&serde_json::json!("usr_abcdef0123456789abcdef0123456789")),
             "the envelope transition must audit the canonical administrator"
+        );
+        assert_eq!(
+            approved.pointer("/request/rationale"),
+            Some(&serde_json::json!("approved for repository review"))
+        );
+        assert_eq!(
+            approved.pointer("/request/evidenceUrl"),
+            Some(&serde_json::json!(
+                "https://jira.example.com/browse/PROJ-123"
+            ))
+        );
+        assert_eq!(
+            approved.pointer("/request/decisionKey"),
+            Some(&serde_json::json!("PROJ-123"))
         );
 
         let repeated_approval = admin_app
@@ -4448,7 +5171,7 @@ mod tests {
                     .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000006/approve")
                     .header(header::COOKIE, &admin_cookie)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::from(r#"{"rationale":"approve current template"}"#))
                     .map_err(|error| format!("build unproved envelope approval: {error}"))?,
             )
             .await
@@ -4506,7 +5229,7 @@ mod tests {
                     .header("sec-fetch-site", "same-origin")
                     .header("x-steward-csrf", &csrf)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::from(r#"{"rationale":"approve current template"}"#))
                     .map_err(|error| format!("build stale envelope approval: {error}"))?,
             )
             .await
@@ -4531,6 +5254,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_admin_spend_top_up_is_csrf_protected_instance_scoped_and_retry_safe()
+    -> Result<(), String> {
+        let origin = "http://127.0.0.1:33002";
+        let ledger = ledger();
+        let escalation_id = Uuid::from_u128(41);
+        let top_up_path = format!("/admin/api/v1/escalations/{escalation_id}/top-up");
+        ledger
+            .cumulative_escalations
+            .lock()
+            .map_err(|_| "lock fake escalation")?
+            .push(pending_cumulative_escalation(escalation_id));
+        let runtime_repository = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let (auth, cookie, csrf) = signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let app = browser_admin::protected_router(
+            runtime_repository.clone(),
+            ledger.clone(),
+            FakeDecisionChannel::default(),
+            browser_capability_catalog(),
+            auth,
+        );
+        let body = r#"{"dimension":"llm_spend","amount":"25.00","validUntil":"2999-01-01T00:00:00Z","rationale":"finish the bounded task"}"#;
+
+        let missing_proof = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&top_up_path)
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .map_err(|error| format!("build unproved escalation top-up: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute unproved escalation top-up: {error}"))?;
+        assert_eq!(missing_proof.status(), StatusCode::FORBIDDEN);
+
+        for attempt in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(&top_up_path)
+                        .header(header::COOKIE, &cookie)
+                        .header(header::ORIGIN, origin)
+                        .header("sec-fetch-site", "same-origin")
+                        .header("x-steward-csrf", &csrf)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .map_err(|error| format!("build escalation top-up {attempt}: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("execute escalation top-up {attempt}: {error}"))?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response_body = to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .map_err(|error| format!("read escalation top-up {attempt}: {error}"))?;
+            let response: serde_json::Value = serde_json::from_slice(&response_body)
+                .map_err(|error| format!("decode escalation top-up {attempt}: {error}"))?;
+            assert_eq!(
+                response.pointer("/request/state"),
+                Some(&serde_json::json!("approved"))
+            );
+            assert_eq!(
+                response.pointer("/request/decision/rationale"),
+                Some(&serde_json::json!("finish the bounded task"))
+            );
+        }
+
+        assert_eq!(
+            runtime_repository
+                .runtime
+                .lock()
+                .map_err(|_| "lock topped-up runtime")?
+                .spec
+                .budget
+                .monthly_limit,
+            "100.00",
+            "an instance grant must not rewrite the task-owned immutable runtime manifest"
+        );
+        let grants = ledger
+            .envelope_instance_grants
+            .lock()
+            .map_err(|_| "lock escalation grants")?;
+        assert_eq!(grants.len(), 1, "the grant authority must be append-only");
+        assert_eq!(grants[0].1.base_limit, "100.00");
+        assert_eq!(grants[0].1.target_limit, "125.00");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn browser_admin_template_authoring_uses_the_descriptive_capability_catalog()
     -> Result<(), String> {
         let origin = "http://127.0.0.1:33002";
@@ -4548,12 +5365,18 @@ mod tests {
             ledger.clone(),
             FakeDecisionChannel::default(),
             browser_admin::CapabilityCatalog {
-                schema_version: "steward.capability-catalog/v1".to_owned(),
+                schema_version: "steward.capability-catalog/v2".to_owned(),
                 models: vec![ModelRef {
                     provider: "provider-b".to_owned(),
                     model: "model-b".to_owned(),
                 }],
-                tools: vec![tool.clone()],
+                tools: vec![browser_admin::CapabilityTool {
+                    provider: tool.provider.clone(),
+                    resource: tool.resource.clone(),
+                    action: tool.action.clone(),
+                    access_class: browser_admin::ToolAccessClass::Read,
+                }],
+                catalogs: Vec::new(),
             },
             auth,
         );
@@ -4680,6 +5503,98 @@ mod tests {
                 .len(),
             1,
             "an empty model selection cannot write a new template revision"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_admin_can_author_a_named_template_for_an_existing_member_role()
+    -> Result<(), String> {
+        let origin = "http://127.0.0.1:33002";
+        let ledger = ledger();
+        let (auth, cookie, csrf) = signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let app = browser_admin::protected_router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger,
+            FakeDecisionChannel::default(),
+            browser_capability_catalog(),
+            auth,
+        );
+        let envelope = Envelope {
+            revision: 1,
+            spec: EnvelopeSpec {
+                llms: vec![ModelRef {
+                    provider: "provider-a".to_owned(),
+                    model: "model-a".to_owned(),
+                }],
+                tools: Vec::new(),
+                budget: Budget {
+                    monthly_limit: "50.00".to_owned(),
+                    single_run_limit: None,
+                    currency: "USD".to_owned(),
+                },
+                runtime_minutes_limit: None,
+                ttl: Duration("8h".to_owned()),
+                runner: steward_types::RunnerRequirements::default(),
+            },
+        };
+        let body = serde_json::json!({
+            "displayName": "Repository review",
+            "memberRoles": ["engineer"],
+            "envelope": envelope,
+        });
+
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/api/v1/envelope-templates/review")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .map_err(|error| format!("build named template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("author named template: {error}"))?;
+        assert_eq!(
+            created.status(),
+            StatusCode::CREATED,
+            "a second template must be independently authorable for the engineer role"
+        );
+        let templates = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/envelope-templates")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build template list request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("list named templates: {error}"))?;
+        assert_eq!(templates.status(), StatusCode::OK);
+        let body = to_bytes(templates.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read template list: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode template list: {error}"))?;
+        assert_eq!(
+            body.pointer("/templates/1/id"),
+            Some(&serde_json::json!("review"))
+        );
+        assert_eq!(
+            body.pointer("/templates/1/displayName"),
+            Some(&serde_json::json!("Repository review"))
+        );
+        assert_eq!(
+            body.pointer("/templates/1/memberRoles/0"),
+            Some(&serde_json::json!("engineer")),
+            "multiple stable template IDs must be eligible for the same role"
         );
         Ok(())
     }
@@ -5417,11 +6332,13 @@ mod tests {
     struct FakeLedger {
         envelope: Arc<Mutex<Envelope>>,
         envelope_authors: Arc<Mutex<Vec<(String, String, Envelope)>>>,
+        envelope_templates: Arc<Mutex<Vec<EnvelopeTemplateRevisionRecord>>>,
         grants: Vec<AdmissionDelta>,
         parked: ParkedRows,
         pending_envelope_requests: Vec<PendingEnvelopeRequest>,
         decision_references: DecisionReferences,
         decision_filing_claim: Arc<Mutex<Option<Uuid>>>,
+        envelope_request_decision_filing_claim: Arc<Mutex<Option<(Uuid, Uuid)>>>,
         revoke_rows: u64,
         reversion: Option<GrantReversion>,
         application: Arc<Mutex<Option<GrantReversion>>>,
@@ -5436,6 +6353,8 @@ mod tests {
         agent_runs: Arc<Mutex<Vec<AgentRunRecord>>>,
         agent_run_events: AgentRunEvents,
         source_repository_bindings: SourceRepositoryBindings,
+        cumulative_escalations: Arc<Mutex<Vec<CumulativeEscalationRecord>>>,
+        envelope_instance_grants: Arc<Mutex<Vec<(Uuid, EnvelopeInstanceGrantRecord)>>>,
     }
 
     #[derive(Clone)]
@@ -5506,6 +6425,88 @@ mod tests {
     }
 
     impl AdmissionLedger for FakeLedger {
+        fn insert_envelope_template_revision<'a>(
+            &'a self,
+            publication: EnvelopeTemplatePublication<'a>,
+        ) -> BoxFuture<'a, Result<(), StoreError>> {
+            Box::pin(async move {
+                let mut templates = self.envelope_templates.lock().map_err(|_| {
+                    StoreError::Database("fake envelope-template lock was poisoned".to_owned())
+                })?;
+                if templates.iter().any(|template| {
+                    template.template_id == publication.template_id
+                        && template.ceiling.revision >= publication.ceiling.revision
+                }) {
+                    return Err(StoreError::EnvelopeRevisionNotIncreasing);
+                }
+                self.envelope_authors
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake envelope-template author lock was poisoned".to_owned(),
+                        )
+                    })?
+                    .push((
+                        publication.template_id.to_owned(),
+                        publication.authored_by.to_owned(),
+                        publication.ceiling.clone(),
+                    ));
+                templates.push(EnvelopeTemplateRevisionRecord {
+                    template_id: publication.template_id.to_owned(),
+                    display_name: publication.display_name.to_owned(),
+                    member_roles: publication.member_roles.to_vec(),
+                    ceiling: publication.ceiling.clone(),
+                    auto_provision_threshold: publication.auto_provision_threshold.cloned(),
+                });
+                Ok(())
+            })
+        }
+
+        fn latest_envelope_template<'a>(
+            &'a self,
+            template_id: &'a str,
+        ) -> BoxFuture<'a, Result<Option<EnvelopeTemplateRevisionRecord>, StoreError>> {
+            Box::pin(async move {
+                self.envelope_templates
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database("fake envelope-template lock was poisoned".to_owned())
+                    })
+                    .map(|templates| {
+                        templates
+                            .iter()
+                            .filter(|template| template.template_id == template_id)
+                            .max_by_key(|template| template.ceiling.revision)
+                            .cloned()
+                    })
+            })
+        }
+
+        fn latest_envelope_templates(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<EnvelopeTemplateRevisionRecord>, StoreError>> {
+            Box::pin(async move {
+                let templates = self.envelope_templates.lock().map_err(|_| {
+                    StoreError::Database("fake envelope-template lock was poisoned".to_owned())
+                })?;
+                let mut latest = Vec::<EnvelopeTemplateRevisionRecord>::new();
+                for template in templates.iter() {
+                    if let Some(current) = latest
+                        .iter_mut()
+                        .find(|current| current.template_id == template.template_id)
+                    {
+                        if template.ceiling.revision > current.ceiling.revision {
+                            *current = template.clone();
+                        }
+                    } else {
+                        latest.push(template.clone());
+                    }
+                }
+                latest.sort_by(|left, right| left.template_id.cmp(&right.template_id));
+                Ok(latest)
+            })
+        }
+
         fn insert_envelope<'a>(
             &'a self,
             member_role: &'a str,
@@ -5697,21 +6698,243 @@ mod tests {
             Box::pin(async { Ok(self.pending_envelope_requests.clone()) })
         }
 
-        fn envelope_request_for_admin(
-            &self,
-            request_id: Uuid,
-        ) -> BoxFuture<'_, Result<Option<EnvelopeRequestRecord>, StoreError>> {
+        fn admin_approvals(&self) -> BoxFuture<'_, Result<Vec<AdminApprovalRecord>, StoreError>> {
             Box::pin(async move {
-                if let Some(record) = self
+                let template_envelope = self
+                    .envelope
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database("fake envelope lock was poisoned".to_owned())
+                    })?
+                    .clone();
+                Ok(self
+                    .pending_approvals()
+                    .await?
+                    .into_iter()
+                    .map(|approval| AdminApprovalRecord {
+                        approval_id: approval.approval_id,
+                        runtime_uid: approval.runtime_uid,
+                        state: "pending".to_owned(),
+                        decision_key: approval.decision_key,
+                        evidence_url: approval.evidence_url,
+                        rationale: None,
+                        expires_at: None,
+                        deltas: approval.deltas,
+                        proposed_spec: approval.proposed_spec,
+                        envelope_revision: approval.envelope_revision,
+                        member_role: approval.member_role,
+                        template_envelope: template_envelope.clone(),
+                        requester_user_id: "usr_0123456789abcdef0123456789abcdef".to_owned(),
+                        requester_display_email: approval.actor.clone(),
+                        created_at: "2026-08-24T17:05:00.000000Z".to_owned(),
+                        state_at: "2026-08-24T17:05:00.000000Z".to_owned(),
+                        state_actor: approval.actor,
+                    })
+                    .collect())
+            })
+        }
+
+        fn admin_envelope_requests(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<AdminEnvelopeRequestRecord>, StoreError>> {
+            Box::pin(async move {
+                let mut records = Vec::new();
+                for pending in &self.pending_envelope_requests {
+                    let Some(request) = self.envelope_request_for_admin(pending.request_id).await?
+                    else {
+                        continue;
+                    };
+                    records.push(AdminEnvelopeRequestRecord {
+                        request,
+                        owner_display_email: pending.owner_display_email.clone(),
+                        template_display_name: pending.template_id.clone(),
+                        template_envelope: pending.template_envelope.clone(),
+                    });
+                }
+                let stored_requests = self
                     .user_envelopes
                     .lock()
                     .map_err(|_| {
                         StoreError::Database("fake envelope lock was poisoned".to_owned())
                     })?
+                    .clone();
+                for request in stored_requests {
+                    if records
+                        .iter()
+                        .any(|existing| existing.request.id == request.id)
+                    {
+                        continue;
+                    }
+                    records.push(AdminEnvelopeRequestRecord {
+                        request: request.clone(),
+                        owner_display_email: "alice@example.com".to_owned(),
+                        template_display_name: request.template_id.clone(),
+                        template_envelope: request.requested_envelope.clone(),
+                    });
+                }
+                Ok(records)
+            })
+        }
+
+        fn admin_escalations(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<CumulativeEscalationRecord>, StoreError>> {
+            Box::pin(async move {
+                self.cumulative_escalations
+                    .lock()
+                    .map(|records| records.clone())
+                    .map_err(|_| {
+                        StoreError::Database("fake escalation lock was poisoned".to_owned())
+                    })
+            })
+        }
+
+        fn cumulative_escalation(
+            &self,
+            escalation_id: Uuid,
+        ) -> BoxFuture<'_, Result<Option<CumulativeEscalationRecord>, StoreError>> {
+            Box::pin(async move {
+                self.cumulative_escalations
+                    .lock()
+                    .map(|records| {
+                        records
+                            .iter()
+                            .find(|record| record.escalation_id == escalation_id)
+                            .cloned()
+                    })
+                    .map_err(|_| {
+                        StoreError::Database("fake escalation lock was poisoned".to_owned())
+                    })
+            })
+        }
+
+        fn record_escalation_top_up<'a>(
+            &'a self,
+            escalation_id: Uuid,
+            amount: &'a str,
+            valid_until: &'a str,
+            rationale: &'a str,
+            granted_by: &'a str,
+        ) -> BoxFuture<'a, Result<EnvelopeInstanceGrantRecord, StoreError>> {
+            Box::pin(async move {
+                let amount = steward_admission::add_budget_amount("0", amount)
+                    .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+                let mut grants = self.envelope_instance_grants.lock().map_err(|_| {
+                    StoreError::Database("fake escalation-grant lock was poisoned".to_owned())
+                })?;
+                if let Some((_, existing)) = grants
                     .iter()
-                    .find(|record| record.id == request_id)
-                    .cloned()
+                    .find(|(existing_id, _)| *existing_id == escalation_id)
                 {
+                    return if existing.amount == amount
+                        && existing.valid_until == valid_until
+                        && existing.rationale == rationale
+                        && existing.granted_by == granted_by
+                    {
+                        Ok(existing.clone())
+                    } else {
+                        Err(StoreError::CumulativeEscalationConflict)
+                    };
+                }
+                let mut escalations = self.cumulative_escalations.lock().map_err(|_| {
+                    StoreError::Database("fake escalation lock was poisoned".to_owned())
+                })?;
+                let escalation = escalations
+                    .iter_mut()
+                    .find(|record| record.escalation_id == escalation_id)
+                    .ok_or(StoreError::CumulativeEscalationNotFound)?;
+                if escalation.denial_rationale.is_some() {
+                    return Err(StoreError::CumulativeEscalationConflict);
+                }
+                let base_limit =
+                    grants
+                        .iter()
+                        .try_fold(escalation.limit.clone(), |limit, (_, grant)| {
+                            steward_admission::add_budget_amount(&limit, &grant.amount)
+                                .map_err(|_| StoreError::InvalidCumulativeEscalation)
+                        })?;
+                let target_limit = steward_admission::add_budget_amount(&base_limit, &amount)
+                    .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+                let record = EnvelopeInstanceGrantRecord {
+                    id: Uuid::new_v4(),
+                    amount,
+                    base_limit,
+                    target_limit,
+                    valid_until: valid_until.to_owned(),
+                    rationale: rationale.to_owned(),
+                    granted_by: granted_by.to_owned(),
+                };
+                escalation.grant_id = Some(record.id);
+                escalation.grant_active = Some(true);
+                escalation.grant_amount = Some(record.amount.clone());
+                escalation.grant_base_limit = Some(record.base_limit.clone());
+                escalation.grant_target_limit = Some(record.target_limit.clone());
+                escalation.grant_valid_until = Some(record.valid_until.clone());
+                escalation.grant_rationale = Some(record.rationale.clone());
+                escalation.decision_at = Some("2026-08-24T17:07:00.000000Z".to_owned());
+                escalation.decision_actor = Some(record.granted_by.clone());
+                grants.push((escalation_id, record.clone()));
+                Ok(record)
+            })
+        }
+
+        fn deny_cumulative_escalation<'a>(
+            &'a self,
+            escalation_id: Uuid,
+            rationale: &'a str,
+            denied_by: &'a str,
+        ) -> BoxFuture<'a, Result<(), StoreError>> {
+            Box::pin(async move {
+                let mut escalations = self.cumulative_escalations.lock().map_err(|_| {
+                    StoreError::Database("fake escalation lock was poisoned".to_owned())
+                })?;
+                let escalation = escalations
+                    .iter_mut()
+                    .find(|record| record.escalation_id == escalation_id)
+                    .ok_or(StoreError::CumulativeEscalationNotFound)?;
+                if escalation.grant_id.is_some() {
+                    return Err(StoreError::CumulativeEscalationConflict);
+                }
+                if let Some(existing) = escalation.denial_rationale.as_deref() {
+                    return if existing == rationale
+                        && escalation.decision_actor.as_deref() == Some(denied_by)
+                    {
+                        Ok(())
+                    } else {
+                        Err(StoreError::CumulativeEscalationConflict)
+                    };
+                }
+                escalation.denial_rationale = Some(rationale.to_owned());
+                escalation.decision_at = Some("2026-08-24T17:07:00.000000Z".to_owned());
+                escalation.decision_actor = Some(denied_by.to_owned());
+                Ok(())
+            })
+        }
+
+        fn envelope_request_for_admin(
+            &self,
+            request_id: Uuid,
+        ) -> BoxFuture<'_, Result<Option<EnvelopeRequestRecord>, StoreError>> {
+            Box::pin(async move {
+                let stored = {
+                    self.user_envelopes
+                        .lock()
+                        .map_err(|_| {
+                            StoreError::Database("fake envelope lock was poisoned".to_owned())
+                        })?
+                        .iter()
+                        .find(|record| record.id == request_id)
+                        .cloned()
+                };
+                if let Some(mut record) = stored {
+                    if let Some(reference) =
+                        self.envelope_request_decision_reference(request_id).await?
+                    {
+                        record.decision_key = Some(reference.decision_key);
+                        if record.evidence_url.is_none() {
+                            record.evidence_url = Some(reference.evidence_url);
+                        }
+                    }
                     return Ok(Some(record));
                 }
                 let Some(pending) = self
@@ -5721,6 +6944,7 @@ mod tests {
                 else {
                     return Ok(None);
                 };
+                let reference = self.envelope_request_decision_reference(request_id).await?;
                 Ok(Some(EnvelopeRequestRecord {
                     id: pending.request_id,
                     owner_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
@@ -5734,11 +6958,170 @@ mod tests {
                     envelope_instance_id: None,
                     envelope_digest: None,
                     reason: None,
+                    rationale: None,
+                    evidence_url: reference
+                        .as_ref()
+                        .map(|reference| reference.evidence_url.clone()),
+                    decision_key: reference.map(|reference| reference.decision_key),
+                    expires_at: None,
                     status_actor: "usr_0123456789abcdef0123456789abcdef".to_owned(),
                     status_template_revision: pending.template_revision,
                     created_at: pending.created_at.clone(),
                     status_at: pending.created_at.clone(),
                 }))
+            })
+        }
+
+        fn envelope_request_history(
+            &self,
+            request_id: Uuid,
+        ) -> BoxFuture<'_, Result<Vec<EnvelopeRequestStatusEventRecord>, StoreError>> {
+            Box::pin(async move {
+                Ok(self
+                    .envelope_request_for_admin(request_id)
+                    .await?
+                    .map(|request| {
+                        vec![EnvelopeRequestStatusEventRecord {
+                            status: request.status,
+                            at: request.status_at,
+                            actor: request.status_actor,
+                            reason: request.reason,
+                            rationale: request.rationale,
+                            evidence_url: request.evidence_url,
+                            expires_at: request.expires_at,
+                        }]
+                    })
+                    .unwrap_or_default())
+            })
+        }
+
+        fn envelope_request_decision_reference(
+            &self,
+            request_id: Uuid,
+        ) -> BoxFuture<'_, Result<Option<EnvelopeRequestDecisionReference>, StoreError>> {
+            Box::pin(async move {
+                self.decision_references
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database("fake decision-reference lock was poisoned".to_owned())
+                    })
+                    .map(|references| {
+                        references.iter().find(|(id, _, _)| *id == request_id).map(
+                            |(_, key, url)| EnvelopeRequestDecisionReference {
+                                decision_key: key.clone(),
+                                evidence_url: url.clone(),
+                            },
+                        )
+                    })
+            })
+        }
+
+        fn claim_envelope_request_decision_filing<'a>(
+            &'a self,
+            request_id: Uuid,
+            _claimed_by: &'a str,
+        ) -> BoxFuture<'a, Result<Uuid, StoreError>> {
+            Box::pin(async move {
+                if self
+                    .envelope_request_decision_reference(request_id)
+                    .await?
+                    .is_some()
+                {
+                    return Err(StoreError::DecisionReferenceMismatch);
+                }
+                let mut claim =
+                    self.envelope_request_decision_filing_claim
+                        .lock()
+                        .map_err(|_| {
+                            StoreError::Database(
+                                "fake envelope-request filing claim lock was poisoned".to_owned(),
+                            )
+                        })?;
+                if claim.is_some() {
+                    return Err(StoreError::DecisionFilingInProgress);
+                }
+                let token = Uuid::new_v4();
+                *claim = Some((request_id, token));
+                Ok(token)
+            })
+        }
+
+        fn complete_envelope_request_decision_filing<'a>(
+            &'a self,
+            request_id: Uuid,
+            token: Uuid,
+            decision_key: &'a str,
+            evidence_url: &'a str,
+            _filed_by: &'a str,
+        ) -> BoxFuture<'a, Result<(), StoreError>> {
+            Box::pin(async move {
+                let mut claim =
+                    self.envelope_request_decision_filing_claim
+                        .lock()
+                        .map_err(|_| {
+                            StoreError::Database(
+                                "fake envelope-request filing claim lock was poisoned".to_owned(),
+                            )
+                        })?;
+                if *claim != Some((request_id, token)) {
+                    return Err(StoreError::DecisionFilingClaimLost);
+                }
+                self.decision_references
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake envelope-request decision-reference lock was poisoned".to_owned(),
+                        )
+                    })?
+                    .push((request_id, decision_key.to_owned(), evidence_url.to_owned()));
+                *claim = None;
+                Ok(())
+            })
+        }
+
+        fn release_envelope_request_decision_filing(
+            &self,
+            request_id: Uuid,
+            token: Uuid,
+        ) -> BoxFuture<'_, Result<(), StoreError>> {
+            Box::pin(async move {
+                let mut claim =
+                    self.envelope_request_decision_filing_claim
+                        .lock()
+                        .map_err(|_| {
+                            StoreError::Database(
+                                "fake envelope-request filing claim lock was poisoned".to_owned(),
+                            )
+                        })?;
+                if *claim == Some((request_id, token)) {
+                    *claim = None;
+                }
+                Ok(())
+            })
+        }
+
+        fn link_envelope_request_decision_reference<'a>(
+            &'a self,
+            request_id: Uuid,
+            decision_key: &'a str,
+            evidence_url: &'a str,
+            _filed_by: &'a str,
+        ) -> BoxFuture<'a, Result<(), StoreError>> {
+            Box::pin(async move {
+                let mut references = self.decision_references.lock().map_err(|_| {
+                    StoreError::Database("fake decision-reference lock was poisoned".to_owned())
+                })?;
+                if let Some((_, existing_key, existing_url)) =
+                    references.iter().find(|(id, _, _)| *id == request_id)
+                {
+                    return if existing_key == decision_key && existing_url == evidence_url {
+                        Ok(())
+                    } else {
+                        Err(StoreError::DecisionReferenceMismatch)
+                    };
+                }
+                references.push((request_id, decision_key.to_owned(), evidence_url.to_owned()));
+                Ok(())
             })
         }
 
@@ -5756,10 +7139,11 @@ mod tests {
                     return Ok(current);
                 }
                 if update.to == EnvelopeRequestStatus::Provisioned {
-                    let template = self.envelope.lock().map_err(|_| {
-                        StoreError::Database("fake envelope lock was poisoned".to_owned())
-                    })?;
-                    if template.revision != current.template_revision {
+                    let template_revision = self
+                        .latest_envelope_template(&current.template_id)
+                        .await?
+                        .map(|template| template.ceiling.revision);
+                    if template_revision != Some(current.template_revision) {
                         return Err(StoreError::EnvelopeRequestTemplateStale);
                     }
                     if update.approved_envelope != Some(&current.requested_envelope) {
@@ -5775,6 +7159,9 @@ mod tests {
                 decided.envelope_instance_id = update.envelope_instance_id.map(str::to_owned);
                 decided.envelope_digest = update.envelope_digest.map(str::to_owned);
                 decided.reason = update.reason.map(str::to_owned);
+                decided.rationale = update.rationale.map(str::to_owned);
+                decided.evidence_url = update.evidence_url.map(str::to_owned);
+                decided.expires_at = update.expires_at.map(str::to_owned);
                 decided.approved_envelope = update.approved_envelope.cloned();
                 decided.status_actor = update.actor.to_owned();
                 decided.status_template_revision = decided.template_revision;
@@ -6147,6 +7534,71 @@ mod tests {
             })
         }
 
+        fn agent_run_phase_facets<'a>(
+            &'a self,
+            query: &'a AgentRunQuery,
+        ) -> BoxFuture<'a, Result<std::collections::BTreeMap<String, u64>, StoreError>> {
+            Box::pin(async move {
+                let records = self.agent_runs.lock().map_err(|_| {
+                    StoreError::Database("fake agent-run lock was poisoned".to_owned())
+                })?;
+                let mut facets = std::collections::BTreeMap::new();
+                for record in
+                    records.iter().filter(|record| {
+                        query.owner_user_id.as_ref().is_none_or(|owner| {
+                            record.owner_user_id.as_deref() == Some(owner.as_str())
+                        }) && query
+                            .workflow
+                            .as_ref()
+                            .is_none_or(|workflow| &record.workflow == workflow)
+                            && query.runtime_uid.as_ref().is_none_or(|runtime_uid| {
+                                record.runtime_uid.as_deref() == Some(runtime_uid.as_str())
+                            })
+                            && query
+                                .user_envelope_instance_id
+                                .as_ref()
+                                .is_none_or(|instance_id| {
+                                    record.user_envelope_instance_id.as_deref()
+                                        == Some(instance_id.as_str())
+                                })
+                    })
+                {
+                    let phase = serde_json::to_value(record.phase)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .ok_or(StoreError::InvalidRunQuery)?;
+                    *facets.entry(phase).or_insert(0) += 1;
+                }
+                Ok(facets)
+            })
+        }
+
+        fn cancel_agent_run<'a>(
+            &'a self,
+            task_uid: Uuid,
+            owner_user_id: &'a str,
+        ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
+            Box::pin(async move {
+                let mut records = self.agent_runs.lock().map_err(|_| {
+                    StoreError::Database("fake agent-run lock was poisoned".to_owned())
+                })?;
+                let Some(record) = records.iter_mut().find(|record| {
+                    record.task_uid == task_uid
+                        && record.owner_user_id.as_deref() == Some(owner_user_id)
+                }) else {
+                    return Ok(None);
+                };
+                record.finalize_requested = true;
+                if matches!(
+                    record.phase,
+                    TaskPhase::Submitted | TaskPhase::Parked | TaskPhase::Queued
+                ) {
+                    record.phase = TaskPhase::Cancelled;
+                }
+                Ok(Some(record.clone()))
+            })
+        }
+
         fn agent_run_timeline(
             &self,
             task_uid: Uuid,
@@ -6171,7 +7623,7 @@ mod tests {
             _task_uid: Uuid,
             _owner_user_id: Option<&'a str>,
             _stream: steward_store::AgentRunLogStream,
-        ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>> {
+        ) -> BoxFuture<'a, Result<Option<AgentRunExecutionLog>, StoreError>> {
             Box::pin(async { Ok(None) })
         }
     }
@@ -6593,6 +8045,7 @@ mod tests {
                     single_run_limit: None,
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: None,
                 ttl: Duration("24h".to_owned()),
                 runner: steward_types::RunnerRequirements::default(),
             },
@@ -6600,6 +8053,47 @@ mod tests {
         FakeLedger {
             envelope: Arc::new(Mutex::new(envelope)),
             envelope_authors: Arc::new(Mutex::new(Vec::new())),
+            envelope_templates: Arc::new(Mutex::new(vec![EnvelopeTemplateRevisionRecord {
+                template_id: "engineer".to_owned(),
+                display_name: "engineer".to_owned(),
+                member_roles: vec!["engineer".to_owned()],
+                ceiling: Envelope {
+                    revision: 3,
+                    spec: EnvelopeSpec {
+                        llms: vec![ModelRef {
+                            provider: "provider-a".to_owned(),
+                            model: "model-a".to_owned(),
+                        }],
+                        tools: Vec::new(),
+                        budget: Budget {
+                            monthly_limit: "200.00".to_owned(),
+                            single_run_limit: None,
+                            currency: "USD".to_owned(),
+                        },
+                        runtime_minutes_limit: None,
+                        ttl: Duration("24h".to_owned()),
+                        runner: steward_types::RunnerRequirements::default(),
+                    },
+                },
+                auto_provision_threshold: Some(Envelope {
+                    revision: 3,
+                    spec: EnvelopeSpec {
+                        llms: vec![ModelRef {
+                            provider: "provider-a".to_owned(),
+                            model: "model-a".to_owned(),
+                        }],
+                        tools: Vec::new(),
+                        budget: Budget {
+                            monthly_limit: "200.00".to_owned(),
+                            single_run_limit: None,
+                            currency: "USD".to_owned(),
+                        },
+                        runtime_minutes_limit: None,
+                        ttl: Duration("24h".to_owned()),
+                        runner: steward_types::RunnerRequirements::default(),
+                    },
+                }),
+            }])),
             grants: Vec::new(),
             parked: Arc::new(Mutex::new(Vec::new())),
             pending_envelope_requests: vec![
@@ -6609,6 +8103,7 @@ mod tests {
             ],
             decision_references: Arc::new(Mutex::new(Vec::new())),
             decision_filing_claim: Arc::new(Mutex::new(None)),
+            envelope_request_decision_filing_claim: Arc::new(Mutex::new(None)),
             revoke_rows: 0,
             reversion: None,
             application: Arc::new(Mutex::new(None)),
@@ -6623,17 +8118,20 @@ mod tests {
             agent_runs: Arc::new(Mutex::new(Vec::new())),
             agent_run_events: Arc::new(Mutex::new(Vec::new())),
             source_repository_bindings: Arc::new(Mutex::new(Vec::new())),
+            cumulative_escalations: Arc::new(Mutex::new(Vec::new())),
+            envelope_instance_grants: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn browser_capability_catalog() -> browser_admin::CapabilityCatalog {
         browser_admin::CapabilityCatalog {
-            schema_version: "steward.capability-catalog/v1".to_owned(),
+            schema_version: "steward.capability-catalog/v2".to_owned(),
             models: vec![ModelRef {
                 provider: "provider-a".to_owned(),
                 model: "model-a".to_owned(),
             }],
             tools: Vec::new(),
+            catalogs: Vec::new(),
         }
     }
 
@@ -6656,6 +8154,7 @@ mod tests {
                         single_run_limit: None,
                         currency: "USD".to_owned(),
                     },
+                    runtime_minutes_limit: None,
                     ttl: Duration("24h".to_owned()),
                     runner: steward_types::RunnerRequirements::default(),
                 },
@@ -6673,11 +8172,46 @@ mod tests {
                         single_run_limit: None,
                         currency: "USD".to_owned(),
                     },
+                    runtime_minutes_limit: None,
                     ttl: Duration("24h".to_owned()),
                     runner: steward_types::RunnerRequirements::default(),
                 },
             },
             created_at: "2026-08-24T17:05:00.000000Z".to_owned(),
+        }
+    }
+
+    fn pending_cumulative_escalation(escalation_id: Uuid) -> CumulativeEscalationRecord {
+        CumulativeEscalationRecord {
+            escalation_id,
+            dimension: "llm_spend".to_owned(),
+            runtime_uid: "runtime-uid-a".to_owned(),
+            runtime_namespace: "team-a".to_owned(),
+            runtime_name: "runtime-a".to_owned(),
+            envelope_instance_id: "env-instance-a".to_owned(),
+            blocked_task_uid: Uuid::from_u128(700),
+            requester_user_id: "usr_0123456789abcdef0123456789abcdef".to_owned(),
+            requester_display_email: "alice@example.com".to_owned(),
+            template_id: "develop".to_owned(),
+            template_display_name: "Develop".to_owned(),
+            template_revision: 3,
+            period_start: "2026-08-01T00:00:00.000000Z".to_owned(),
+            period_end: "2026-09-01T00:00:00.000000Z".to_owned(),
+            observed_amount: "100.00".to_owned(),
+            limit: "100.00".to_owned(),
+            currency: "USD".to_owned(),
+            observed_at: "2026-08-24T17:05:00.000000Z".to_owned(),
+            parked_at: "2026-08-24T17:05:00.000000Z".to_owned(),
+            grant_id: None,
+            grant_active: None,
+            grant_amount: None,
+            grant_base_limit: None,
+            grant_target_limit: None,
+            grant_valid_until: None,
+            grant_rationale: None,
+            denial_rationale: None,
+            decision_at: None,
+            decision_actor: None,
         }
     }
 
@@ -6710,6 +8244,7 @@ mod tests {
                     single_run_limit: Some("5.00".to_owned()),
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: None,
                 ttl: Duration("4h".to_owned()),
                 runner: steward_types::RunnerRequirements {
                     platforms: vec![steward_types::RunnerPlatform::Linux],
@@ -6735,6 +8270,10 @@ mod tests {
                 envelope_instance_id: Some("envelope-instance-1".to_owned()),
                 envelope_digest: Some(format!("sha256:{}", "b".repeat(64))),
                 reason: None,
+                rationale: None,
+                evidence_url: None,
+                decision_key: None,
+                expires_at: None,
                 status_actor: "usr_0123456789abcdef0123456789abcdef".to_owned(),
                 status_template_revision: 4,
                 created_at: "2026-08-24T17:01:00.000000Z".to_owned(),
@@ -6756,6 +8295,7 @@ mod tests {
                     single_run_limit: Some("20.00".to_owned()),
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: None,
                 ttl: Duration("24h".to_owned()),
                 runner: steward_types::RunnerRequirements {
                     platforms: vec![steward_types::RunnerPlatform::Linux],
@@ -9272,9 +10812,10 @@ mod tests {
             ledger.clone(),
             FakeDecisionChannel::default(),
             browser_admin::CapabilityCatalog {
-                schema_version: "steward.capability-catalog/v1".to_owned(),
+                schema_version: "steward.capability-catalog/v2".to_owned(),
                 models: Vec::new(),
                 tools: Vec::new(),
+                catalogs: Vec::new(),
             },
             admin_auth,
         );
@@ -10444,6 +11985,7 @@ mod tests {
             acting_user: Some("alice@example.com".to_owned()),
             owner: "alice@example.com".to_owned(),
             owner_user_id: Some("usr_0123456789abcdef0123456789abcdef".to_owned()),
+            owner_display_email: Some("alice@example.com".to_owned()),
             workflow: "code-review".to_owned(),
             workflow_name: None,
             workflow_version: None,
@@ -10496,6 +12038,7 @@ mod tests {
                 observed_at: "2026-08-12T12:00:30.000000Z".to_owned(),
             }),
             history_partial: false,
+            direct_task_evidence: None,
         }
     }
 
