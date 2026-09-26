@@ -296,7 +296,7 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
   const load = useCallback(() => getAdminEnvelopeTemplate({
     cache: "no-store",
     credentials: "same-origin",
-    path: { member_role: memberRole },
+    path: { template_id: memberRole },
   }), [memberRole]);
   const state = useApiResource<BrowserEnvelopeTemplateResponse>(load);
   const loadCapabilities = useCallback(() => getAdminCapabilities({
@@ -485,7 +485,7 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, member
       cache: "no-store",
       credentials: "same-origin",
       headers: { "X-Steward-CSRF": csrf },
-      path: { member_role: templateId },
+      path: { template_id: templateId },
     });
     if (result.data && result.response?.status === 201) {
       setCurrentRevision(result.data.envelope.revision);

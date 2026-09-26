@@ -218,6 +218,7 @@ pub(crate) struct EnvelopeRequestsResponse {
 pub(crate) struct EnvelopeRequestsQuery {
     status: Option<EnvelopeRequestStatus>,
     cursor: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -256,15 +257,18 @@ pub(crate) struct PublishedWorkflowOption {
     version: i64,
     display_name: String,
     agent: String,
+    sample: bool,
 }
 
 impl From<WorkflowRevisionRecord> for PublishedWorkflowOption {
     fn from(record: WorkflowRevisionRecord) -> Self {
+        let sample = crate::workflows::is_onboarding_sample_workflow(&record);
         Self {
             name: record.name,
             version: record.version,
             display_name: record.display_name,
             agent: record.agent,
+            sample,
         }
     }
 }
@@ -832,6 +836,7 @@ where
     responses(
         (status = 200, body = EnvelopeRequestsResponse),
         (status = 401, description = "Browser session is absent or invalid"),
+        (status = 422, description = "Cursor or limit is invalid"),
         (status = 503, description = "Envelope requests are unavailable")
     ),
     security(("browserSession" = []))
@@ -839,7 +844,7 @@ where
 pub(crate) async fn list_requests<P, B>(
     session: Option<Extension<UserEnvelopeSession<B>>>,
     State(state): State<UserEnvelopeState<P>>,
-    Query(query): Query<EnvelopeRequestsQuery>,
+    query: Result<Query<EnvelopeRequestsQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response
 where
     P: EnvelopeRequestBroker<B>,
@@ -847,6 +852,9 @@ where
 {
     let Some(Extension(session)) = session else {
         return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Ok(Query(query)) = query else {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     };
     match state.broker.list(&session).await {
         Ok(mut requests) => {
@@ -863,8 +871,12 @@ where
                 };
                 requests = requests.into_iter().skip(position + 1).collect();
             }
-            let next_cursor = (requests.len() > 50).then(|| requests[49].id.to_string());
-            requests.truncate(50);
+            let limit = query.limit.unwrap_or(50);
+            if !(1..=100).contains(&limit) {
+                return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+            }
+            let next_cursor = (requests.len() > limit).then(|| requests[limit - 1].id.to_string());
+            requests.truncate(limit);
             Json(EnvelopeRequestsResponse {
                 api_version: ENVELOPE_REQUESTS_API_VERSION,
                 requests,
@@ -1268,26 +1280,39 @@ mod tests {
     }
 
     #[test]
-    fn workflow_names_do_not_imply_hidden_sample_metadata() -> Result<(), String> {
-        let option = PublishedWorkflowOption::from(WorkflowRevisionRecord {
-            name: "dependency-audit".to_owned(),
+    fn onboarding_sample_metadata_is_explicit_and_version_pinned() -> Result<(), String> {
+        let sample_agent = "example-agent@1.0.0";
+        let sample = PublishedWorkflowOption::from(WorkflowRevisionRecord {
+            name: crate::workflows::SAMPLE_WORKFLOW_NAME.to_owned(),
             version: 1,
-            display_name: "Dependency audit".to_owned(),
-            agent: "example-agent@1.0.0".to_owned(),
-            prompt: "Audit the repository dependencies.".to_owned(),
+            display_name: crate::workflows::SAMPLE_WORKFLOW_DISPLAY_NAME.to_owned(),
+            agent: sample_agent.to_owned(),
+            prompt: crate::workflows::SAMPLE_WORKFLOW_PROMPT.to_owned(),
+            content_digest: crate::workflows::workflow_content_digest(
+                sample_agent,
+                crate::workflows::SAMPLE_WORKFLOW_PROMPT,
+            ),
+            published_by: crate::workflows::SAMPLE_WORKFLOW_ACTOR.to_owned(),
+            published_at: "2026-09-24T00:00:00.000000Z".to_owned(),
+        });
+        let impostor = PublishedWorkflowOption::from(WorkflowRevisionRecord {
+            name: crate::workflows::SAMPLE_WORKFLOW_NAME.to_owned(),
+            version: 1,
+            display_name: crate::workflows::SAMPLE_WORKFLOW_DISPLAY_NAME.to_owned(),
+            agent: sample_agent.to_owned(),
+            prompt: crate::workflows::SAMPLE_WORKFLOW_PROMPT.to_owned(),
             content_digest:
-                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             published_by: "usr_abcdef0123456789abcdef0123456789".to_owned(),
             published_at: "2026-09-24T00:00:00.000000Z".to_owned(),
         });
 
-        let value = serde_json::to_value(option)
+        let sample = serde_json::to_value(sample)
             .map_err(|error| format!("serialize published Workflow option: {error}"))?;
-        assert_eq!(value["name"], "dependency-audit");
-        assert!(
-            value.get("sample").is_none(),
-            "an ordinary user-controlled Workflow name must not imply system provenance"
-        );
+        let impostor = serde_json::to_value(impostor)
+            .map_err(|error| format!("serialize impostor Workflow option: {error}"))?;
+        assert_eq!(sample["sample"], true);
+        assert_eq!(impostor["sample"], false);
         Ok(())
     }
 
@@ -1400,6 +1425,39 @@ mod tests {
             },
             binding: (),
         })
+    }
+
+    #[tokio::test]
+    async fn envelope_request_limits_are_bounded_and_malformed_values_are_unprocessable()
+    -> Result<(), String> {
+        let app = inner_router(TestBroker::default());
+        for query in ["limit=abc", "limit=0", "limit=101"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/app/api/v1/envelope-requests?{query}"))
+                        .extension(session()?)
+                        .body(Body::empty())
+                        .map_err(|error| format!("build list request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("list envelope requests: {error}"))?;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/envelope-requests?limit=100")
+                    .extension(session()?)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build valid list request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("list envelope requests: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
     }
 
     #[tokio::test]

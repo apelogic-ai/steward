@@ -163,10 +163,27 @@ pub(crate) enum BrowserRunStageState {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BrowserRunExitCategory {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BrowserRunStageId {
+    Admission,
+    ProvisionRuntime,
+    AgentExecution,
+    Finalize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BrowserRunStage {
-    id: &'static str,
+    id: BrowserRunStageId,
     display_name: &'static str,
     state: BrowserRunStageState,
     steps: Vec<BrowserRunStep>,
@@ -268,12 +285,23 @@ pub(crate) struct RerunResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RerunPendingResponse {
     api_version: &'static str,
-    state: &'static str,
+    state: RerunPendingState,
     retry_after_ms: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RerunPendingState {
+    Pending,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+#[schema(rename_all = "camelCase")]
 pub(crate) enum BrowserRunTimelineEvent {
     Phase {
         phase: TaskPhase,
@@ -285,11 +313,47 @@ pub(crate) enum BrowserRunTimelineEvent {
     Finalized {
         at: String,
     },
-    Stage {
-        stage: String,
-        details: serde_json::Value,
+    Admitted {
+        #[schema(rename = "envelopeRevision")]
+        envelope_revision: Option<i64>,
+        #[schema(rename = "envelopeDigest")]
+        envelope_digest: Option<String>,
         at: String,
     },
+    RuntimeBound {
+        #[schema(rename = "runtimeUid")]
+        runtime_uid: String,
+        ownership: RuntimeOwnership,
+        at: String,
+    },
+    ExecutionStarted {
+        at: String,
+    },
+    ExecutionEnded {
+        #[schema(rename = "exitCategory")]
+        exit_category: BrowserRunExitCategory,
+        at: String,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdmittedStageDetails {
+    envelope_revision: Option<i64>,
+    envelope_digest: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeBoundStageDetails {
+    runtime_uid: String,
+    ownership: RuntimeOwnership,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecutionEndedStageDetails {
+    exit_category: BrowserRunExitCategory,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -584,6 +648,7 @@ where
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
         (status = 404, description = "Run was not found in the user's scope"),
+        (status = 409, description = "Run has already reached a terminal phase"),
         (status = 503, description = "Run cancellation is unavailable")
     ),
     security(("browserSession" = []))
@@ -611,6 +676,7 @@ where
         })
         .into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(StoreError::InvalidTaskTransition) => StatusCode::CONFLICT.into_response(),
         Err(_) => browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
@@ -727,7 +793,7 @@ where
                 StatusCode::ACCEPTED,
                 Json(RerunPendingResponse {
                     api_version: BROWSER_AGENT_RUNS_API_VERSION,
-                    state: "pending",
+                    state: RerunPendingState::Pending,
                     retry_after_ms: 1_000,
                 }),
             )
@@ -1117,11 +1183,15 @@ where
             Ok(Some(events)) => Json(BrowserRunTimelineResponse {
                 api_version: BROWSER_AGENT_RUNS_API_VERSION,
                 task_uid,
-                events: events
+                events: match events
                     .into_iter()
                     .rev()
                     .map(browser_timeline_event)
-                    .collect(),
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(events) => events,
+                    Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+                },
             })
             .into_response(),
             Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -1264,19 +1334,19 @@ fn browser_run_stages(
     };
     vec![
         BrowserRunStage {
-            id: "admission",
+            id: BrowserRunStageId::Admission,
             display_name: "Admission",
             state: BrowserRunStageState::Succeeded,
             steps: Vec::new(),
         },
         BrowserRunStage {
-            id: "provision_runtime",
+            id: BrowserRunStageId::ProvisionRuntime,
             display_name: "Provision runtime",
             state: provision_state,
             steps: Vec::new(),
         },
         BrowserRunStage {
-            id: "agent_execution",
+            id: BrowserRunStageId::AgentExecution,
             display_name: "Agent execution",
             state: execution_state,
             steps: vec![BrowserRunStep {
@@ -1287,7 +1357,7 @@ fn browser_run_stages(
             }],
         },
         BrowserRunStage {
-            id: "finalize",
+            id: BrowserRunStageId::Finalize,
             display_name: "Finalize",
             state: finalize_state,
             steps: Vec::new(),
@@ -1295,8 +1365,10 @@ fn browser_run_stages(
     ]
 }
 
-fn browser_timeline_event(event: AgentRunTimelineEvent) -> BrowserRunTimelineEvent {
-    match event.kind {
+fn browser_timeline_event(
+    event: AgentRunTimelineEvent,
+) -> Result<BrowserRunTimelineEvent, StoreError> {
+    Ok(match event.kind {
         AgentRunTimelineKind::Phase(phase) => BrowserRunTimelineEvent::Phase {
             phase,
             at: event.at,
@@ -1308,12 +1380,37 @@ fn browser_timeline_event(event: AgentRunTimelineEvent) -> BrowserRunTimelineEve
         AgentRunTimelineKind::Stage {
             event_kind,
             details,
-        } => BrowserRunTimelineEvent::Stage {
-            stage: event_kind,
-            details,
-            at: event.at,
+        } => match event_kind.as_str() {
+            "admitted" => {
+                let details = serde_json::from_value::<AdmittedStageDetails>(details)
+                    .map_err(|_| StoreError::InvalidTaskTransition)?;
+                BrowserRunTimelineEvent::Admitted {
+                    envelope_revision: details.envelope_revision,
+                    envelope_digest: details.envelope_digest,
+                    at: event.at,
+                }
+            }
+            "runtime_bound" => {
+                let details = serde_json::from_value::<RuntimeBoundStageDetails>(details)
+                    .map_err(|_| StoreError::InvalidTaskTransition)?;
+                BrowserRunTimelineEvent::RuntimeBound {
+                    runtime_uid: details.runtime_uid,
+                    ownership: details.ownership,
+                    at: event.at,
+                }
+            }
+            "execution_started" => BrowserRunTimelineEvent::ExecutionStarted { at: event.at },
+            "execution_ended" => {
+                let details = serde_json::from_value::<ExecutionEndedStageDetails>(details)
+                    .map_err(|_| StoreError::InvalidTaskTransition)?;
+                BrowserRunTimelineEvent::ExecutionEnded {
+                    exit_category: details.exit_category,
+                    at: event.at,
+                }
+            }
+            _ => return Err(StoreError::InvalidTaskTransition),
         },
-    }
+    })
 }
 
 fn browser_runs_error(status: StatusCode) -> Response {
@@ -1457,6 +1554,12 @@ mod tests {
                 }) else {
                     return Ok(None);
                 };
+                if matches!(
+                    record.phase,
+                    TaskPhase::Succeeded | TaskPhase::Failed | TaskPhase::Cancelled
+                ) {
+                    return Err(StoreError::InvalidTaskTransition);
+                }
                 record.finalize_requested = true;
                 if matches!(
                     record.phase,
@@ -1523,6 +1626,17 @@ mod tests {
                     .any(|record| record.task_uid == task_uid);
                 Ok(known.then(|| {
                     vec![
+                        AgentRunTimelineEvent {
+                            kind: AgentRunTimelineKind::Stage {
+                                event_kind: "admitted".to_owned(),
+                                details: serde_json::json!({
+                                    "envelopeRevision": 4,
+                                    "envelopeDigest": format!("sha256:{}", "b".repeat(64)),
+                                }),
+                            },
+                            provenance: steward_store::AgentRunTimelineProvenance::Recorded,
+                            at: "2026-08-16T23:59:00.000000Z".to_owned(),
+                        },
                         AgentRunTimelineEvent {
                             kind: AgentRunTimelineKind::Phase(TaskPhase::Running),
                             provenance: steward_store::AgentRunTimelineProvenance::Recorded,
@@ -2034,6 +2148,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|error| format!("parse scoped timeline response: {error}"))?;
         assert_eq!(value["events"][0]["kind"], "finalized");
+        assert_eq!(value["events"][2]["kind"], "admitted");
+        assert_eq!(value["events"][2]["envelopeRevision"], 4);
+        assert!(value["events"][2].get("details").is_none());
         assert_eq!(
             ledger.queries.lock().map_err(|_| "lock queries")?[1]
                 .owner_user_id
@@ -2044,6 +2161,38 @@ mod tests {
             ledger.queries.lock().map_err(|_| "lock queries")?[1].task_uid,
             Some(own_task)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_terminal_run_is_a_conflict() -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .push(run(task_uid, owner));
+        let (service, session_cookie, csrf) =
+            signed_in_cookie_and_csrf(LocalFakeIdentity::User).await?;
+        let response = protected_router(ledger, service)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/app/api/v1/runs/{task_uid}/cancel"))
+                    .header(header::COOKIE, session_cookie)
+                    .header(header::ORIGIN, "http://127.0.0.1:33001")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build cancel request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute cancel request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         Ok(())
     }
 

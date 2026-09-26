@@ -34,6 +34,8 @@ export type AdminRequestSource = 'envelope_request' | 'runtime_exception' | 'esc
 
 export type AdminRequestState = 'requested' | 'escalated' | 'auto_approved' | 'approved' | 'rejected' | 'expired';
 
+export type AdminRequestStateFilter = 'all' | 'needs_action' | 'requested' | 'escalated' | 'auto_approved' | 'approved' | 'rejected' | 'expired';
+
 export type AdminRequestTemplate = {
     displayName: string;
     id: string;
@@ -198,7 +200,8 @@ export type ApproveEnvelopeRequestBody = {
     evidenceUrl?: string | null;
     expiresAt?: string | null;
     /**
-     * Omitted only by legacy clients that approve without decision metadata.
+     * Required for ceiling-exceeded requests and whenever decision metadata is supplied.
+     * Legacy clients may omit it only for an unfiled within-ceiling request.
      */
     rationale?: string | null;
 };
@@ -412,9 +415,12 @@ export type BrowserPreferencesView = {
     onboardingDismissed: boolean;
     revision: number;
     theme?: null | BrowserTheme;
+    workflowAcknowledged: boolean;
 };
 
 export type BrowserRole = 'user' | 'admin';
+
+export type BrowserRunExitCategory = 'succeeded' | 'failed' | 'cancelled';
 
 export type BrowserRunFacets = {
     phase: BrowserRunPhaseFacets;
@@ -437,10 +443,12 @@ export type BrowserRunResponse = {
 
 export type BrowserRunStage = {
     displayName: string;
-    id: string;
+    id: BrowserRunStageId;
     state: BrowserRunStageState;
     steps: Array<BrowserRunStep>;
 };
+
+export type BrowserRunStageId = 'admission' | 'provision_runtime' | 'agent_execution' | 'finalize';
 
 export type BrowserRunStageState = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
@@ -463,9 +471,21 @@ export type BrowserRunTimelineEvent = {
     kind: 'finalized';
 } | {
     at: string;
-    details: unknown;
-    kind: 'stage';
-    stage: string;
+    envelopeDigest?: string | null;
+    envelopeRevision?: number | null;
+    kind: 'admitted';
+} | {
+    at: string;
+    kind: 'runtimeBound';
+    ownership: RuntimeOwnership;
+    runtimeUid: string;
+} | {
+    at: string;
+    kind: 'executionStarted';
+} | {
+    at: string;
+    exitCategory: BrowserRunExitCategory;
+    kind: 'executionEnded';
 };
 
 export type BrowserRunTimelineResponse = {
@@ -913,6 +933,7 @@ export type PublishedWorkflowOption = {
     agent: string;
     displayName: string;
     name: string;
+    sample: boolean;
     version: number;
 };
 
@@ -936,8 +957,10 @@ export type RepositoryUrl = string;
 export type RerunPendingResponse = {
     apiVersion: string;
     retryAfterMs: number;
-    state: string;
+    state: RerunPendingState;
 };
+
+export type RerunPendingState = 'pending';
 
 export type RerunRequest = {
     idempotencyKey: string;
@@ -1103,6 +1126,7 @@ export type TriggerRepository = {
 export type UpdateBrowserPreferences = {
     onboardingDismissed?: boolean | null;
     theme?: null | BrowserTheme;
+    workflowAcknowledged?: boolean | null;
 };
 
 export type UserEnvelopeRequest = {
@@ -1600,6 +1624,10 @@ export type ApproveAdminEnvelopeRequestErrors = {
      */
     409: unknown;
     /**
+     * Approval rationale or decision metadata is invalid
+     */
+    422: unknown;
+    /**
      * Envelope request authority is unavailable
      */
     503: unknown;
@@ -1732,10 +1760,10 @@ export type ListAdminEnvelopeTemplatesResponse = ListAdminEnvelopeTemplatesRespo
 export type GetAdminEnvelopeTemplateData = {
     body?: never;
     path: {
-        member_role: string;
+        template_id: string;
     };
     query?: never;
-    url: '/admin/api/v1/envelope-templates/{member_role}';
+    url: '/admin/api/v1/envelope-templates/{template_id}';
 };
 
 export type GetAdminEnvelopeTemplateErrors = {
@@ -1769,10 +1797,10 @@ export type AuthorAdminEnvelopeTemplateData = {
         'X-Steward-CSRF': string;
     };
     path: {
-        member_role: string;
+        template_id: string;
     };
     query?: never;
-    url: '/admin/api/v1/envelope-templates/{member_role}';
+    url: '/admin/api/v1/envelope-templates/{template_id}';
 };
 
 export type AuthorAdminEnvelopeTemplateErrors = {
@@ -1810,10 +1838,10 @@ export type PutAdminEnvelopeTemplateData = {
         'X-Steward-CSRF': string;
     };
     path: {
-        member_role: string;
+        template_id: string;
     };
     query?: never;
-    url: '/admin/api/v1/envelope-templates/{member_role}';
+    url: '/admin/api/v1/envelope-templates/{template_id}';
 };
 
 export type PutAdminEnvelopeTemplateErrors = {
@@ -2183,8 +2211,8 @@ export type ListAdminRequestsData = {
     body?: never;
     path?: never;
     query?: {
-        state?: string;
-        kind?: string;
+        state?: AdminRequestStateFilter;
+        kind?: AdminRequestKind;
         cursor?: string;
         limit?: number;
     };
@@ -2690,6 +2718,7 @@ export type ListRequestsData = {
     query?: {
         status?: EnvelopeRequestStatus;
         cursor?: string;
+        limit?: number;
     };
     url: '/app/api/v1/envelope-requests';
 };
@@ -2699,6 +2728,10 @@ export type ListRequestsErrors = {
      * Browser session is absent or invalid
      */
     401: unknown;
+    /**
+     * Cursor or limit is invalid
+     */
+    422: unknown;
     /**
      * Envelope requests are unavailable
      */
@@ -3002,6 +3035,10 @@ export type CancelMyRunErrors = {
      * Run was not found in the user's scope
      */
     404: unknown;
+    /**
+     * Run has already reached a terminal phase
+     */
+    409: unknown;
     /**
      * Run cancellation is unavailable
      */

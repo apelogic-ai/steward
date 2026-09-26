@@ -87,3 +87,7 @@ immutable Steward connections authority v3, whose only additional grant is
 `github/actions_run_trigger/write`, while preserving existing v1/v2 operation
 rows. The operation kind remains database-allowlisted and invokes only MCP-GW's
 `actions_run_trigger.rerun_workflow_run` method.
+
+Migration 0050 adds the durable onboarding workflow acknowledgement to each
+append-only browser preference revision. Existing revisions default to not
+acknowledged; later preference writes carry the current value forward.

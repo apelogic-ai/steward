@@ -45,6 +45,7 @@ impl BrowserTheme {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateBrowserPreferences {
     onboarding_dismissed: Option<bool>,
+    workflow_acknowledged: Option<bool>,
     theme: Option<BrowserTheme>,
 }
 
@@ -54,6 +55,7 @@ pub struct BrowserPreferencesView {
     api_version: &'static str,
     revision: i64,
     onboarding_dismissed: bool,
+    workflow_acknowledged: bool,
     theme: Option<BrowserTheme>,
 }
 
@@ -68,6 +70,7 @@ fn view(record: BrowserPreferencesRecord) -> Result<BrowserPreferencesView, Stor
         api_version: PREFERENCES_API_VERSION,
         revision: record.revision,
         onboarding_dismissed: record.onboarding_dismissed,
+        workflow_acknowledged: record.workflow_acknowledged,
         theme,
     })
 }
@@ -139,13 +142,17 @@ pub(crate) async fn update_preferences(
     if proof.is_none() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if request.onboarding_dismissed.is_none() && request.theme.is_none() {
+    if request.onboarding_dismissed.is_none()
+        && request.workflow_acknowledged.is_none()
+        && request.theme.is_none()
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
     match store
         .write_browser_preferences(
             &session.principal.canonical_user_id,
             request.onboarding_dismissed,
+            request.workflow_acknowledged,
             request.theme.map(|theme| Some(theme.as_str())),
             session.principal.canonical_user_id.as_str(),
         )

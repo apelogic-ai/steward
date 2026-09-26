@@ -597,7 +597,8 @@ pub(crate) struct RejectEnvelopeRequestBody {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ApproveEnvelopeRequestBody {
-    /// Omitted only by legacy clients that approve without decision metadata.
+    /// Required for ceiling-exceeded requests and whenever decision metadata is supplied.
+    /// Legacy clients may omit it only for an unfiled within-ceiling request.
     rationale: Option<String>,
     evidence_url: Option<String>,
     expires_at: Option<String>,
@@ -611,7 +612,7 @@ pub(crate) struct BrowserApprovalsResponse {
     envelope_requests: Vec<BrowserEnvelopeRequestView>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AdminRequestKind {
     CeilingExceeded,
@@ -630,6 +631,19 @@ pub(crate) enum AdminRequestSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AdminRequestState {
+    Requested,
+    Escalated,
+    AutoApproved,
+    Approved,
+    Rejected,
+    Expired,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AdminRequestStateFilter {
+    All,
+    NeedsAction,
     Requested,
     Escalated,
     AutoApproved,
@@ -771,8 +785,8 @@ pub(crate) struct AdminRequestsSummaryResponse {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AdminRequestsQuery {
-    state: Option<String>,
-    kind: Option<String>,
+    state: Option<AdminRequestStateFilter>,
+    kind: Option<AdminRequestKind>,
     cursor: Option<String>,
     limit: Option<usize>,
 }
@@ -900,6 +914,7 @@ where
         (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
         (status = 404, description = "Envelope request was not found"),
         (status = 409, description = "Envelope request or template revision is stale or already decided differently"),
+        (status = 422, description = "Approval rationale or decision metadata is invalid"),
         (status = 503, description = "Envelope request authority is unavailable")
     ),
     security(("browserSession" = []))
@@ -928,6 +943,26 @@ where
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return ApiError::Store(error).into_response(),
     };
+    if request.status == EnvelopeRequestStatus::Pending && rationale.is_none() {
+        let template = match state
+            .ledger
+            .latest_envelope_template(&request.template_id)
+            .await
+        {
+            Ok(Some(template)) if template.ceiling.revision == request.template_revision => {
+                template
+            }
+            Ok(_) => return StatusCode::CONFLICT.into_response(),
+            Err(error) => return ApiError::Store(error).into_response(),
+        };
+        match envelope_is_within(&request.requested_envelope, &template.ceiling) {
+            Ok(AdmissionDecision::Admit) => {}
+            Ok(AdmissionDecision::Reject { .. }) => {
+                return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+            }
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
     if body
         .evidence_url
         .as_ref()
@@ -1538,8 +1573,8 @@ where
 #[utoipa::path(
     get,
     operation_id = "getAdminEnvelopeTemplate",
-    path = "/admin/api/v1/envelope-templates/{member_role}",
-    params(("member_role" = String, Path)),
+    path = "/admin/api/v1/envelope-templates/{template_id}",
+    params(("template_id" = String, Path)),
     responses(
         (status = 200, body = BrowserEnvelopeTemplateResponse),
         (status = 401, description = "Browser session is absent or invalid"),
@@ -1569,9 +1604,9 @@ where
 #[utoipa::path(
     put,
     operation_id = "putAdminEnvelopeTemplate",
-    path = "/admin/api/v1/envelope-templates/{member_role}",
+    path = "/admin/api/v1/envelope-templates/{template_id}",
     params(
-        ("member_role" = String, Path),
+        ("template_id" = String, Path),
         ("X-Steward-CSRF" = String, Header)
     ),
     request_body = AuthorEnvelopeTemplateBody,
@@ -1670,9 +1705,9 @@ where
 #[utoipa::path(
     post,
     operation_id = "authorAdminEnvelopeTemplate",
-    path = "/admin/api/v1/envelope-templates/{member_role}",
+    path = "/admin/api/v1/envelope-templates/{template_id}",
     params(
-        ("member_role" = String, Path),
+        ("template_id" = String, Path),
         ("X-Steward-CSRF" = String, Header)
     ),
     request_body = BrowserEnvelope,
@@ -2235,30 +2270,20 @@ where
     }
 }
 
-fn state_filter_matches(filter: &str, state: AdminRequestState) -> Option<bool> {
-    Some(match filter {
-        "all" => true,
-        "needs_action" => matches!(
+fn state_filter_matches(filter: AdminRequestStateFilter, state: AdminRequestState) -> bool {
+    match filter {
+        AdminRequestStateFilter::All => true,
+        AdminRequestStateFilter::NeedsAction => matches!(
             state,
             AdminRequestState::Requested | AdminRequestState::Escalated
         ),
-        "requested" => state == AdminRequestState::Requested,
-        "escalated" => state == AdminRequestState::Escalated,
-        "auto_approved" => state == AdminRequestState::AutoApproved,
-        "approved" => state == AdminRequestState::Approved,
-        "rejected" => state == AdminRequestState::Rejected,
-        "expired" => state == AdminRequestState::Expired,
-        _ => return None,
-    })
-}
-
-fn kind_filter_matches(filter: &str, kind: AdminRequestKind) -> Option<bool> {
-    Some(match filter {
-        "ceiling_exceeded" => kind == AdminRequestKind::CeilingExceeded,
-        "cumulative_exhausted" => kind == AdminRequestKind::CumulativeExhausted,
-        "within_ceiling" => kind == AdminRequestKind::WithinCeiling,
-        _ => return None,
-    })
+        AdminRequestStateFilter::Requested => state == AdminRequestState::Requested,
+        AdminRequestStateFilter::Escalated => state == AdminRequestState::Escalated,
+        AdminRequestStateFilter::AutoApproved => state == AdminRequestState::AutoApproved,
+        AdminRequestStateFilter::Approved => state == AdminRequestState::Approved,
+        AdminRequestStateFilter::Rejected => state == AdminRequestState::Rejected,
+        AdminRequestStateFilter::Expired => state == AdminRequestState::Expired,
+    }
 }
 
 fn admin_request_cursor(request: &AdminRequestView) -> String {
@@ -2282,13 +2307,16 @@ fn admin_request_cursor(request: &AdminRequestView) -> String {
 pub(crate) async fn list_admin_requests<R, L, D>(
     Extension(_authority): Extension<BrowserAdminAuthority>,
     State(state): State<BrowserAdminState<R, L, D>>,
-    Query(query): Query<AdminRequestsQuery>,
+    query: Result<Query<AdminRequestsQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response
 where
     R: RuntimeRepository,
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
+    let Ok(Query(query)) = query else {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    };
     let limit = query.limit.unwrap_or(50);
     if !(1..=100).contains(&limit) {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
@@ -2297,17 +2325,11 @@ where
         Ok(requests) => requests,
         Err(error) => return ApiError::Store(error).into_response(),
     };
-    if let Some(filter) = query.state.as_deref() {
-        if state_filter_matches(filter, AdminRequestState::Requested).is_none() {
-            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
-        }
-        requests.retain(|request| state_filter_matches(filter, request.state) == Some(true));
+    if let Some(filter) = query.state {
+        requests.retain(|request| state_filter_matches(filter, request.state));
     }
-    if let Some(filter) = query.kind.as_deref() {
-        if kind_filter_matches(filter, AdminRequestKind::WithinCeiling).is_none() {
-            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
-        }
-        requests.retain(|request| kind_filter_matches(filter, request.kind) == Some(true));
+    if let Some(filter) = query.kind {
+        requests.retain(|request| request.kind == filter);
     }
     let start = if let Some(cursor) = query.cursor.as_deref() {
         let Some(position) = requests

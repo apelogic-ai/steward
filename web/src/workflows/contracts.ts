@@ -5,8 +5,6 @@ export type PublishedWorkflow = {
   version: number;
 };
 
-export const ONBOARDING_WORKFLOW_REFERENCE_KEY = "steward.ui.onboarding.workflow-reference";
-
 export function workflowReference(workflow: PublishedWorkflow): string {
   return `${workflow.name}@${workflow.version}`;
 }

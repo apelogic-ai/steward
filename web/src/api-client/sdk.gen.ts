@@ -202,7 +202,7 @@ export const getAdminEnvelopeTemplate = <ThrowOnError extends boolean = false>(o
             name: '__Host-steward-session',
             type: 'apiKey'
         }],
-    url: '/admin/api/v1/envelope-templates/{member_role}',
+    url: '/admin/api/v1/envelope-templates/{template_id}',
     ...options
 });
 
@@ -212,7 +212,7 @@ export const authorAdminEnvelopeTemplate = <ThrowOnError extends boolean = false
             name: '__Host-steward-session',
             type: 'apiKey'
         }],
-    url: '/admin/api/v1/envelope-templates/{member_role}',
+    url: '/admin/api/v1/envelope-templates/{template_id}',
     ...options,
     headers: {
         'Content-Type': 'application/json',
@@ -226,7 +226,7 @@ export const putAdminEnvelopeTemplate = <ThrowOnError extends boolean = false>(o
             name: '__Host-steward-session',
             type: 'apiKey'
         }],
-    url: '/admin/api/v1/envelope-templates/{member_role}',
+    url: '/admin/api/v1/envelope-templates/{template_id}',
     ...options,
     headers: {
         'Content-Type': 'application/json',

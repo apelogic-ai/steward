@@ -5,6 +5,8 @@ contract for the Agent Runs dashboard. It deliberately distinguishes
 recorded facts from desired configuration and from data Steward does not
 persist. The browser must never fill an unavailable field from a heuristic.
 
+Applies to Steward 0.2.6.
+
 ## Authority and privacy boundary
 
 User operations are below `/app/api/v1/runs`; reads are restricted to the exact
@@ -83,7 +85,10 @@ shape as the list and never resolves an external run in place of the Task UUID.
 The corresponding `/timeline` routes return lifecycle events in `(at, id)`
 order. Events include phase/finalization changes and bounded structured stage
 events such as `admitted`, `runtimeBound`, `executionStarted`, and
-`executionEnded`. Consumers must not invent missing transitions.
+`executionEnded`. Their payloads are typed: admission carries the pinned
+Envelope revision and digest, runtime binding carries runtime UID and ownership,
+and execution end carries a terminal exit category. Consumers must not invent
+missing transitions.
 
 ### Execution logs
 
@@ -101,7 +106,9 @@ representation with an explicit byte offset.
 ### Cancel and re-run
 
 `POST /app/api/v1/runs/{taskUid}/cancel` transitions the caller's eligible Task
-to `cancelled`. `POST /app/api/v1/runs/{taskUid}/rerun` takes an idempotency key
+to `cancelled` and returns `409` if the Task is already terminal. Administrator
+run detail is read-only and exposes neither mutation. `POST
+/app/api/v1/runs/{taskUid}/rerun` takes an idempotency key
 and creates a fresh Task against the same active Envelope instance for a
 versioned Steward workflow. For a direct GitHub Task, it invokes GitHub's re-run
 operation through the caller's governed connection with the exact

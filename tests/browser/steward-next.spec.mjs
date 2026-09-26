@@ -138,8 +138,8 @@ const run = {
   errorCategory: null,
   stages: [
     { id: "admission", displayName: "Admission", state: "succeeded", steps: [] },
-    { id: "provision-runtime", displayName: "Provision runtime", state: "succeeded", steps: [] },
-    { id: "agent-execution", displayName: "Agent execution", state: "succeeded", steps: [{ id: "execution", displayName: "Execution", state: "succeeded", logStreams: ["stdout", "stderr"] }] },
+    { id: "provision_runtime", displayName: "Provision runtime", state: "succeeded", steps: [] },
+    { id: "agent_execution", displayName: "Agent execution", state: "succeeded", steps: [{ id: "execution", displayName: "Execution", state: "succeeded", logStreams: ["stdout", "stderr"] }] },
     { id: "finalize", displayName: "Finalize", state: "succeeded", steps: [] },
   ],
 };
@@ -502,6 +502,8 @@ async function guardedPage(browser, {
     stdout: { body: "agent stdout\n", status: 200 },
     stderr: { body: "agent stderr\n", status: 200 },
   },
+  includeSampleWorkflow = false,
+  onboardingPagination = false,
   mutationFailures = {},
   rerunResponses = [
     { status: 201, body: { apiVersion: "steward.browser-runs/v1", taskUid: rerunTaskUid } },
@@ -520,10 +522,8 @@ async function guardedPage(browser, {
   web.useMutationSink(mutations);
   web.useRerunFixtures(rerunResponses);
   await context.addInitScript(() => {
-    const allowedPreference = (key) => typeof key === "string" && (
-      key.startsWith("steward.ui.envelope-accordion.")
-      || key === "steward.ui.onboarding.workflow-reference"
-    );
+    const allowedPreference = (key) => typeof key === "string"
+      && key.startsWith("steward.ui.envelope-accordion.");
     for (const method of ["getItem", "removeItem", "setItem"]) {
       const original = Storage.prototype[method];
       Object.defineProperty(Storage.prototype, method, {
@@ -574,16 +574,37 @@ async function guardedPage(browser, {
   }));
   await context.route(`${origin}/app/api/v1/workflows`, (route) => json(route, {
     apiVersion: "steward.workflows/v1",
-    workflows: emptyCollections ? [] : [{
-      agent: workflowRevision.agent,
-      displayName: workflowRevision.displayName,
-      name: workflowRevision.name,
-      version: workflowRevision.version,
-    }],
+    workflows: emptyCollections ? [] : [
+      {
+        agent: workflowRevision.agent,
+        displayName: workflowRevision.displayName,
+        name: workflowRevision.name,
+        sample: false,
+        version: workflowRevision.version,
+      },
+      ...(includeSampleWorkflow ? [{
+        agent: workflowRevision.agent,
+        displayName: "Repository summary",
+        name: "repo-summary",
+        sample: true,
+        version: 1,
+      }] : []),
+    ],
   }));
-  await context.route(`${origin}/app/api/v1/envelope-requests`, async (route) => {
+  await context.route(`${origin}/app/api/v1/envelope-requests*`, async (route) => {
     if (route.request().method() === "POST") {
       await route.continue();
+      return;
+    }
+    if (onboardingPagination) {
+      const cursor = new URL(route.request().url()).searchParams.get("cursor");
+      await json(route, cursor
+        ? { apiVersion: "steward.envelope-requests/v1", requests: [envelopeRequest], nextCursor: null }
+        : {
+            apiVersion: "steward.envelope-requests/v1",
+            requests: [{ ...envelopeRequest, id: "00000000-0000-0000-0000-000000000006", envelopeInstanceId: "runtime-example-6" }],
+            nextCursor: "00000000-0000-0000-0000-000000000006",
+          });
       return;
     }
     await json(route, { apiVersion: "steward.envelope-requests/v1", requests: emptyCollections ? [] : [envelopeRequest] });
@@ -595,7 +616,25 @@ async function guardedPage(browser, {
     }
     await json(route, { apiVersion: "steward.envelope-requests/v1", request: envelopeRequest });
   });
-  await context.route(`${origin}/app/api/v1/runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [run], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } }));
+  await context.route(`${origin}/app/api/v1/runs*`, (route) => {
+    if (onboardingPagination) {
+      const cursor = new URL(route.request().url()).searchParams.get("cursor");
+      return json(route, {
+        apiVersion: "steward.browser-runs/v1",
+        runs: cursor ? [{
+          ...run,
+          taskUid: "00000000-0000-0000-0000-000000000007",
+          workflow: "repo-summary@1",
+          workflowName: "repo-summary",
+          workflowVersion: 1,
+          trigger: { provider: "github", repository: "https://github.com/example-org/sample" },
+        }] : [run],
+        nextCursor: cursor ? null : taskUid,
+        facets: { phase: runFacets },
+      });
+    }
+    return json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [run], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } });
+  });
   await context.route(`${origin}/app/api/v1/runs/**`, (route) => {
     if (route.request().url().endsWith("/rerun")) return route.continue();
     return route.request().url().endsWith("/timeline")
@@ -714,6 +753,29 @@ async function guardedPage(browser, {
     }],
     available: [{ provider: "github", displayName: "GitHub", enabled: true }],
   }));
+  let browserPreferences = {
+    apiVersion: ["steward", "preferences/v1"].join("."),
+    onboardingDismissed: false,
+    revision: 0,
+    theme: null,
+    workflowAcknowledged: false,
+  };
+  await context.route(`${origin}/app/api/v1/preferences`, async (route) => {
+    if (route.request().method() === "PUT") {
+      const body = route.request().postDataJSON();
+      mutations.push({
+        path: "/app/api/v1/preferences",
+        headers: route.request().headers(),
+        body,
+      });
+      browserPreferences = {
+        ...browserPreferences,
+        ...body,
+        revision: browserPreferences.revision + 1,
+      };
+    }
+    await json(route, browserPreferences);
+  });
   const page = await context.newPage();
   const consoleErrors = [];
   const crossOriginRequests = [];
@@ -1128,6 +1190,58 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await expect(administrator.page.getByRole("heading", { name: "Timeline" })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
+  }
+});
+
+test("onboarding persists workflow acknowledgement and ignores unrelated runs", async ({ browser }) => {
+  const developer = await guardedPage(browser, { includeSampleWorkflow: true });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    const workflowStep = developer.page.getByRole("listitem").filter({ hasText: "3. Add the generated workflow" });
+    const runStep = developer.page.getByRole("listitem").filter({ hasText: "4. Run the test workflow" });
+    await expect(workflowStep.getByText("pending", { exact: true })).toBeVisible();
+    await expect(runStep.getByText("pending", { exact: true })).toBeVisible();
+
+    await developer.page.getByRole("button", { name: "I added the sample workflow" }).click();
+    await expect(workflowStep.getByText("done", { exact: true })).toBeVisible();
+    const acknowledgement = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/preferences");
+    expect(acknowledgement, "expected the durable preference mutation").toBeTruthy();
+    expect(acknowledgement.headers["x-steward-csrf"]).toBe("test-csrf");
+    expect(acknowledgement.headers["content-type"]).toContain("application/json");
+    expect(acknowledgement.headers.origin).toBe(origin);
+    expect(acknowledgement.body).toEqual({ workflowAcknowledged: true });
+
+    await developer.page.reload();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "3. Add the generated workflow" }).getByText("done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "4. Run the test workflow" }).getByText("pending", { exact: true })).toBeVisible();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("onboarding cannot acknowledge an absent sample", async ({ browser }) => {
+  const developer = await guardedPage(browser);
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    await expect(developer.page.getByText("The deployment has no executable onboarding sample.")).toBeVisible();
+    await expect(developer.page.getByRole("button", { name: "I added the sample workflow" })).toHaveCount(0);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("onboarding follows paginated envelope and run evidence", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    includeSampleWorkflow: true,
+    onboardingPagination: true,
+  });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "2. Provision an envelope" }).getByText("done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "4. Run the test workflow" }).getByText("done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "5. Inspect the governed run" }).getByText("done", { exact: true })).toBeVisible();
+  } finally {
+    await closeGuardedPage(developer);
   }
 });
 

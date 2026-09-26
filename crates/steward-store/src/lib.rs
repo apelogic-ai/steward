@@ -2328,7 +2328,7 @@ impl PgStore {
         user_id: &CanonicalUserId,
     ) -> Result<BrowserPreferencesRecord, StoreError> {
         Ok(sqlx::query(
-            "SELECT revision, onboarding_dismissed, theme \
+            "SELECT revision, onboarding_dismissed, workflow_acknowledged, theme \
              FROM browser_preference_revisions \
              WHERE user_id = $1 ORDER BY revision DESC LIMIT 1",
         )
@@ -2342,6 +2342,9 @@ impl PgStore {
                 onboarding_dismissed: row
                     .try_get("onboarding_dismissed")
                     .map_err(database_error)?,
+                workflow_acknowledged: row
+                    .try_get("workflow_acknowledged")
+                    .map_err(database_error)?,
                 theme: row.try_get("theme").map_err(database_error)?,
             })
         })
@@ -2349,6 +2352,7 @@ impl PgStore {
         .unwrap_or(BrowserPreferencesRecord {
             revision: 0,
             onboarding_dismissed: false,
+            workflow_acknowledged: false,
             theme: None,
         }))
     }
@@ -2357,6 +2361,7 @@ impl PgStore {
         &self,
         user_id: &CanonicalUserId,
         onboarding_dismissed: Option<bool>,
+        workflow_acknowledged: Option<bool>,
         theme: Option<Option<&str>>,
         actor: &str,
     ) -> Result<BrowserPreferencesRecord, StoreError> {
@@ -2374,7 +2379,7 @@ impl PgStore {
             .await
             .map_err(database_error)?;
         let current = sqlx::query(
-            "SELECT revision, onboarding_dismissed, theme \
+            "SELECT revision, onboarding_dismissed, workflow_acknowledged, theme \
              FROM browser_preference_revisions \
              WHERE user_id = $1 ORDER BY revision DESC LIMIT 1",
         )
@@ -2382,11 +2387,13 @@ impl PgStore {
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
-        let (revision, current_dismissed, current_theme) =
-            current.map_or(Ok::<_, StoreError>((0_i64, false, None)), |row| {
+        let (revision, current_dismissed, current_workflow_acknowledged, current_theme) =
+            current.map_or(Ok::<_, StoreError>((0_i64, false, false, None)), |row| {
                 Ok((
                     row.try_get("revision").map_err(database_error)?,
                     row.try_get("onboarding_dismissed")
+                        .map_err(database_error)?,
+                    row.try_get("workflow_acknowledged")
                         .map_err(database_error)?,
                     row.try_get::<Option<String>, _>("theme")
                         .map_err(database_error)?,
@@ -2395,18 +2402,20 @@ impl PgStore {
         let next = BrowserPreferencesRecord {
             revision: revision + 1,
             onboarding_dismissed: onboarding_dismissed.unwrap_or(current_dismissed),
+            workflow_acknowledged: workflow_acknowledged.unwrap_or(current_workflow_acknowledged),
             theme: theme
                 .map(|theme| theme.map(str::to_owned))
                 .unwrap_or(current_theme),
         };
         sqlx::query(
             "INSERT INTO browser_preference_revisions \
-             (user_id, revision, onboarding_dismissed, theme, actor) \
-             VALUES ($1, $2, $3, $4, $5)",
+             (user_id, revision, onboarding_dismissed, workflow_acknowledged, theme, actor) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(user_id.as_str())
         .bind(next.revision)
         .bind(next.onboarding_dismissed)
+        .bind(next.workflow_acknowledged)
         .bind(&next.theme)
         .bind(actor)
         .execute(&mut *transaction)
@@ -2603,6 +2612,14 @@ impl PgStore {
         };
         if record.owner_user_id.as_deref() != Some(owner_user_id) {
             return Ok(None);
+        }
+        if matches!(
+            record.phase,
+            steward_types::TaskPhase::Succeeded
+                | steward_types::TaskPhase::Failed
+                | steward_types::TaskPhase::Cancelled
+        ) {
+            return Err(StoreError::InvalidTaskTransition);
         }
         self.request_task_finalization(task_uid, &record.submitter_service, owner_user_id)
             .await?;
@@ -8563,6 +8580,7 @@ pub struct EnvelopeUsageRecord {
 pub struct BrowserPreferencesRecord {
     pub revision: i64,
     pub onboarding_dismissed: bool,
+    pub workflow_acknowledged: bool,
     pub theme: Option<String>,
 }
 

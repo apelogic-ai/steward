@@ -411,6 +411,7 @@ pub struct GrantRevocationRequest {
         browser_admin::BrowserFederatedSubjectAuditResponse,
         browser_admin::AssociateFederatedSubjectBody,
         browser_admin::DisableFederatedSubjectBody,
+        browser_admin::AdminRequestStateFilter,
         AgentRunAvailability,
         AgentRunDataStatus,
         AgentRunSpendView,
@@ -4442,15 +4443,15 @@ mod tests {
             ("/paths/~1admin~1api~1v1~1envelope-templates/get", "200"),
             ("/paths/~1admin~1api~1v1~1capabilities/get", "200"),
             (
-                "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/get",
+                "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/get",
                 "200",
             ),
             (
-                "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/post",
+                "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/post",
                 "201",
             ),
             (
-                "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/put",
+                "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/put",
                 "201",
             ),
             ("/paths/~1admin~1api~1v1~1approvals/get", "200"),
@@ -4550,8 +4551,8 @@ mod tests {
             "/paths/~1app~1api~1v1~1preferences/put",
             "/paths/~1admin~1api~1v1~1connections~1github~1start/post",
             "/paths/~1admin~1api~1v1~1connections~1github~1disconnect/post",
-            "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/post",
-            "/paths/~1admin~1api~1v1~1envelope-templates~1{member_role}/put",
+            "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/post",
+            "/paths/~1admin~1api~1v1~1envelope-templates~1{template_id}/put",
             "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1approve/post",
             "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1reject/post",
             "/paths/~1admin~1api~1v1~1envelope-requests~1{request_id}~1file/post",
@@ -4920,6 +4921,24 @@ mod tests {
             request_detail.pointer("/request/history/0/state"),
             Some(&serde_json::json!("requested"))
         );
+
+        let missing_rationale = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build rationale-free envelope approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute rationale-free envelope approval: {error}"))?;
+        assert_eq!(missing_rationale.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         let request_summary = admin_app
             .clone()

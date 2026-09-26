@@ -25,7 +25,7 @@ import { classifyMutationFailure, type MutationFailureState } from "@/data/mutat
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 import { listPublishedWorkflows, renderWorkflowForEnvelope, type PublishedWorkflowListResponse } from "@/workflows/api";
-import { ONBOARDING_WORKFLOW_REFERENCE_KEY, workflowReference } from "@/workflows/contracts";
+import { workflowReference } from "@/workflows/contracts";
 
 function dateTime(value: string): string {
   const parsed = new Date(value);
@@ -258,7 +258,6 @@ function WorkflowGenerator({ requestId }: Readonly<{ requestId: string }>) {
     const result = await renderWorkflowForEnvelope(session.value.csrf, requestId, selected);
     if (result.data && result.response?.ok) {
       setWorkflow(result.data);
-      localStorage.setItem(ONBOARDING_WORKFLOW_REFERENCE_KEY, workflowReference(selected));
       setStatus("idle");
     } else setStatus(classifyMutationFailure(result.response?.status));
   }

@@ -1,13 +1,13 @@
 import { expect, test } from "bun:test";
 
-import { workflowSetupDone } from "./onboarding-view";
+import { sampleRunDone } from "./onboarding-view";
 
-test("workflow setup can be acknowledged before the first detected run", () => {
-  const workflow = "dependency-audit@1";
-  expect(workflowSetupDone([], false, workflow)).toBe(false);
-  expect(workflowSetupDone([], true, workflow)).toBe(true);
-  expect(workflowSetupDone([{ workflowName: "dependency-audit", workflowVersion: 1 }], false, workflow)).toBe(false);
-  expect(workflowSetupDone([{ trigger: { provider: "github" }, workflowName: "repository-review", workflowVersion: 1 }], false, workflow)).toBe(false);
-  expect(workflowSetupDone([{ trigger: { provider: "github" }, workflowName: "dependency-audit", workflowVersion: 1 }], false, workflow)).toBe(true);
-  expect(workflowSetupDone([{ trigger: { provider: "github" }, workflowName: "dependency-audit", workflowVersion: 2 }], false, workflow)).toBe(false);
+test("onboarding completion requires the sample workflow and provisioned envelope", () => {
+  const workflow = "repo-summary@1";
+  const envelopes = new Set(["sample-envelope"]);
+  expect(sampleRunDone([], workflow, envelopes)).toBe(false);
+  expect(sampleRunDone([{ workflowName: "repo-summary", workflowVersion: 1 }], workflow, envelopes)).toBe(false);
+  expect(sampleRunDone([{ trigger: { provider: "github" }, workflowName: "repository-review", workflowVersion: 1, userEnvelopeInstanceId: "sample-envelope" }], workflow, envelopes)).toBe(false);
+  expect(sampleRunDone([{ trigger: { provider: "github" }, workflowName: "repo-summary", workflowVersion: 1, userEnvelopeInstanceId: "other-envelope" }], workflow, envelopes)).toBe(false);
+  expect(sampleRunDone([{ trigger: { provider: "github" }, workflowName: "repo-summary", workflowVersion: 1, userEnvelopeInstanceId: "sample-envelope" }], workflow, envelopes)).toBe(true);
 });

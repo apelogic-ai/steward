@@ -2,6 +2,8 @@
 
 Status: active browser and API boundary.
 
+Applies to Steward 0.2.6.
+
 ## Presentation ownership
 
 The Next.js application under `web/` is Steward's only browser presentation
@@ -70,8 +72,9 @@ canonical administrator actor. Filing an external decision first acquires a
 short-lived per-request lease, so concurrent browser retries cannot create two
 external decisions. The completed reference and status history are append-only.
 The approval route continues to accept the legacy empty object only for an
-unfiled request with no new decision metadata. A rationale is mandatory whenever
-evidence or expiry metadata is supplied or an external decision has been filed.
+unfiled within-ceiling request with no new decision metadata. A rationale is
+mandatory for every ceiling-exceeded approval, whenever evidence or expiry
+metadata is supplied, and whenever an external decision has been filed.
 
 ### Envelopes
 
@@ -112,14 +115,20 @@ remains the authority for exact deltas and Envelope revisions.
 provider catalog. GitHub is enabled; unavailable providers remain explicit and
 disabled. Provider `start` and `disconnect` mutations are browser-session and
 CSRF scoped. The onboarding aggregate composes connection, Envelope, workflow,
-and run evidence; dismissal is a server-side preference. The checklist guides
-the user to choose any published Workflow, render its GitHub Actions file, and
-commit and run it themselves. Steward does not seed or publish a Workflow for
-the user, reserve Workflow names, or infer semantics from a Workflow name. The
-renderer returns a deterministic suggested path, but callers may use any valid
-GitHub workflow filename. The workflow step is complete when a run's
-immutable Workflow name and version match the rendered Workflow reference, or
-when the user explicitly acknowledges that the rendered file was added.
+and run evidence; dismissal and the explicit "I added the workflow"
+acknowledgement are server-side preferences. When browser surfaces are enabled
+and at least one execution binding is advertised, Steward publishes the
+reserved immutable `repo-summary@1` sample once against the first binding in
+lexical order. An existing revision under that name must match the complete
+system-authored identity and digest or startup fails closed. Administrator
+publication cannot use the reserved name, and removing its pinned execution
+binding also fails browser startup rather than advertising an unexecutable
+sample. The renderer
+returns a deterministic suggested path, but callers may use any valid GitHub
+workflow filename. Steps four and five follow all result pages and complete only
+after a GitHub-triggered run pins that sample revision and one of the user's
+provisioned Envelope instances. Steward does not dispatch the run; it is
+launched from GitHub with `gh workflow run` or the Actions UI.
 
 ### Fleet and runs
 
@@ -131,8 +140,14 @@ phase facets computed from the current filter with the phase predicate removed.
 Run detail exposes validated GitHub source provenance when it was captured at
 submission, four bounded stages (admission, runtime provisioning, agent
 execution, and finalization), and one execution step with stdout/stderr streams.
+Stage IDs and timeline stage-event payloads are closed enums; admitted events
+carry the pinned Envelope revision/digest, runtime-bound events carry the
+runtime UID/ownership, and execution-ended events carry a typed terminal exit
+category.
 The separate log endpoint supports bounded byte-offset reads while a Task is
-running and marks whether the stream is complete. Cancel is owner scoped.
+running and marks whether the stream is complete. Cancel is owner scoped and
+returns `409` after a run is terminal. Administrator run detail is read-only and
+does not render cancel or re-run controls.
 Re-run creates a fresh Task for a versioned Steward workflow. For a direct
 GitHub Task, Steward invokes only the governed MCP-GW
 `actions_run_trigger.rerun_workflow_run` operation through the caller's GitHub
