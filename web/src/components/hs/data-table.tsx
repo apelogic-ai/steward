@@ -23,13 +23,13 @@ export function DataTable<T>({ ariaLabel, columns, gridTemplateColumns, minWidth
   return (
     <div aria-label={ariaLabel} className="overflow-x-auto rounded-panel border bg-panel" role="table">
       <div style={{ minWidth }}>
-        <div className="grid items-center gap-4 border-b bg-canvas px-4 py-2.5 text-xs font-semibold text-muted-ink" role="row" style={gridStyle}>
+        <div className="grid items-center gap-4 border-b bg-subtle px-5 py-2.5 text-xs font-semibold text-muted-ink" role="row" style={gridStyle}>
           {columns.map((column) => <span className={column.className} key={column.key} role="columnheader">{column.label}</span>)}
         </div>
         <div role="rowgroup">
           {rows.map((row) => (
             <Link
-              className="grid min-h-16 items-center gap-4 border-b px-4 py-3 text-sm transition-colors last:border-b-0 hover:bg-canvas focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-brand"
+              className="grid min-h-16 items-center gap-4 border-b px-5 py-3.5 text-sm transition-colors last:border-b-0 hover:bg-subtle focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-brand"
               href={rowHref(row)}
               key={rowKey(row)}
               style={gridStyle}

@@ -35,10 +35,10 @@ describe("run table", () => {
     expect(html).toContain('href="/runs/task-newer"');
     expect(html).toContain('data-tone="ok"');
     expect(html).toContain('data-tone="err"');
-    expect(html).not.toContain(">task-newer</p>");
-    expect(html).not.toContain(">task-older</p>");
-    expect(html).not.toContain("newruntime-0000");
-    expect(html).not.toContain("oldruntime-0000");
+    expect(html).toContain("task-newer");
+    expect(html).toContain("task-older");
+    expect(html).toContain("newruntime-0000-0000-0000-000000000000");
+    expect(html).toContain("oldruntime-0000-0000-0000-000000000000");
     expect(html).not.toContain("uppercase");
   });
 });

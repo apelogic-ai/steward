@@ -13,14 +13,13 @@ import {
   type AvailableEnvelopeTemplate,
   type BrowserEnvelope,
   type EnvelopeRequestResponse,
-  type EnvelopeRequestsResponse,
   type EnvelopeTemplatesResponse,
   type GithubActionsWorkflowResponse,
   type MyRunsResponse,
   type UserEnvelopeRequest,
 } from "@/api-client";
 import { RunCards } from "@/components/run-views";
-import { CodeBlock, DataTable, FilterTabs, FormSection, GrantChipList, Meter, SectionCard, StatStrip, TagSelect, grantKindForAction } from "@/components/hs";
+import { CodeBlock, DataTable, FilterTabs, GrantChipList, Meter, SectionCard, StatStrip, TagSelect, grantKindForAction } from "@/components/hs";
 import { EmptyState, PageHeader, PrimaryLink, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -35,48 +34,60 @@ function dateTime(value: string): string {
 
 export function EnvelopesView() {
   const [status, setStatus] = useState("all");
-  const load = useCallback(() => listRequests({ cache: "no-store", credentials: "same-origin" }), []);
-  const state = useApiResource<EnvelopeRequestsResponse>(load);
+  const load = useCallback(async () => {
+    const [requests, templates] = await Promise.all([
+      listRequests({ cache: "no-store", credentials: "same-origin" }),
+      listTemplates({ cache: "no-store", credentials: "same-origin" }),
+    ]);
+    return {
+      data: requests.data && templates.data ? { requests: requests.data.requests, templates: templates.data.templates } : undefined,
+      response: !requests.response?.ok ? requests.response : templates.response,
+    };
+  }, []);
+  const state = useApiResource<{ requests: Array<UserEnvelopeRequest>; templates: Array<AvailableEnvelopeTemplate> }>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader actions={<PrimaryLink href="/envelopes/new">Request envelope</PrimaryLink>} description="Request and inspect governed runtime authority." title="Envelopes" />
-      <ResourceBoundary state={state}>{({ requests }) => {
+      <PageHeader actions={<PrimaryLink href="/envelopes/new">Request envelope</PrimaryLink>} description="Budget, models and tools your agents are allowed to use." title="Envelopes" />
+      <ResourceBoundary state={state}>{({ requests, templates }) => {
         if (requests.length === 0) return <EmptyState title="No data" />;
-        const counts = new Map<string, number>();
-        for (const request of requests) counts.set(request.status, (counts.get(request.status) ?? 0) + 1);
-        const filtered = status === "all" ? requests : requests.filter((request) => request.status === status);
+        const count = (value: string) => requests.filter((request) => value === "pending" ? request.status !== "provisioned" && request.status !== "rejected" : request.status === value).length;
+        const filtered = status === "all" ? requests : requests.filter((request) => status === "pending" ? request.status !== "provisioned" && request.status !== "rejected" : request.status === status);
+        const names = new Map(templates.map((template) => [template.id, template.displayName]));
         return <div className="space-y-5">
           <FilterTabs active={status} items={[
             { count: requests.length, label: "All", value: "all" },
-            ...Array.from(counts).map(([value, count]) => ({ count, label: value.charAt(0).toUpperCase() + value.slice(1), value })),
+            { count: count("provisioned"), label: "Provisioned", value: "provisioned" },
+            { count: count("pending"), label: "Pending", value: "pending" },
+            { count: count("rejected"), label: "Rejected", value: "rejected" },
           ]} onChange={setStatus} />
-          <EnvelopeTable requests={filtered} />
+          <EnvelopeTable names={names} requests={filtered} />
         </div>;
       }}</ResourceBoundary>
     </section>
   );
 }
 
-function EnvelopeTable({ requests }: Readonly<{ requests: Array<UserEnvelopeRequest> }>) {
+function EnvelopeTable({ names, requests }: Readonly<{ names: ReadonlyMap<string, string>; requests: Array<UserEnvelopeRequest> }>) {
   if (requests.length === 0) return <EmptyState title="No matching envelopes" />;
   return <DataTable
     ariaLabel="Envelopes"
     columns={[
-      { key: "name", label: "Envelope", className: "font-semibold", render: (request) => <span><span className="block truncate">{request.templateId ?? "Custom envelope"}</span><span className="mt-0.5 block truncate font-mono text-xs font-normal text-muted-ink">{request.id}</span></span> },
+      { key: "name", label: "Template", className: "font-semibold", render: (request) => <span><span className="block truncate">{request.templateId ? names.get(request.templateId) ?? request.templateId : "Custom envelope"}</span><span className="mt-0.5 block truncate font-mono text-xs font-normal text-muted-ink">{request.id}</span></span> },
       { key: "status", label: "Status", render: (request) => <StatusBadge value={request.status} /> },
-      { key: "revision", label: "Revision", className: "tabular-nums text-muted-ink", render: (request) => request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision },
-      { key: "usage", label: "Monthly spend", render: (request) => {
+      { key: "usage", label: "Spend this month", render: (request) => {
         const spend = request.usage?.spend;
-        if (!spend) {
-          const envelope = request.approvedEnvelope ?? request.requestedEnvelope;
-          return <span className="text-muted-ink">{request.usage?.availability.reason ?? "Not reported"} · limit <strong className="font-medium text-ink">{envelope.spec.budget.monthlyLimit} {envelope.spec.budget.currency}</strong></span>;
-        }
-        return <Meter label={spend.currency} limit={Number(spend.limit)} limitLabel={spend.limit} used={Number(spend.observed)} usedLabel={spend.observed} />;
+        return spend ? <Meter limit={Number(spend.limit)} limitLabel={spend.limit} unit={spend.currency} used={Number(spend.observed)} usedLabel={spend.observed} /> : <span className="text-faint-ink">—</span>;
       } },
-      { key: "updated", label: "Updated", className: "text-muted-ink", render: (request) => dateTime(request.statusAt) },
+      { key: "per-run", label: "Per run", className: "tabular-nums", render: (request) => {
+        const spec = (request.approvedEnvelope ?? request.requestedEnvelope).spec;
+        return spec.budget.singleRunLimit ? `${spec.budget.singleRunLimit} ${spec.budget.currency}` : "—";
+      } },
+      { key: "ttl", label: "TTL", className: "font-mono text-muted-ink", render: (request) => (request.approvedEnvelope ?? request.requestedEnvelope).spec.ttl },
+      { key: "tools", label: "Tools", className: "tabular-nums text-muted-ink", render: (request) => (request.approvedEnvelope ?? request.requestedEnvelope).spec.tools.length },
+      { key: "open", label: "", className: "text-right text-lg text-faint-ink", render: () => "›" },
     ]}
-    gridTemplateColumns="minmax(220px,1.5fr) 130px 90px minmax(190px,1fr) 180px"
-    minWidth="850px"
+    gridTemplateColumns="minmax(220px,1.5fr) 120px minmax(190px,1fr) 110px 80px 70px 24px"
+    minWidth="900px"
     rowHref={(request) => `/envelopes/${request.id}`}
     rowKey={(request) => request.id}
     rows={requests}
@@ -176,14 +187,18 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, templates }: Readonly
 
   const modelOptions = template.ceiling.spec.llms.map((item) => ({ key: `${item.provider}\u0000${item.model}`, kind: "model" as const, label: `${item.provider}/${item.model}` }));
   const toolOptions = template.ceiling.spec.tools.map((item) => ({ key: `${item.provider}\u0000${item.resource}\u0000${item.action}`, kind: grantKindForAction(item.action), label: `${item.provider}:${item.resource}:${item.action}` }));
+  const stepTitle = (number: string, title: string) => <span className="flex items-center gap-3"><span className="font-mono text-xs font-normal text-faint-ink">{number}</span>{title}</span>;
   return (
     <form className="flex flex-wrap items-start gap-5" onSubmit={submit}>
-      <SectionCard className="min-w-0 flex-[1_1_520px]">
-        <FormSection number="01" title="Template"><label className="grid gap-2 text-sm font-semibold">Template<select className="min-h-11 rounded-control border bg-panel px-3 font-normal" disabled={submission === "submitting"} onChange={(event) => selectTemplate(event.target.value)} value={template.id}>{templates.map((item) => <option key={item.id} value={item.id}>{item.displayName} · revision {item.revision}</option>)}</select></label></FormSection>
-        <FormSection number="02" title="Budget and lifetime"><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})<input className="min-h-11 rounded-control border px-3 font-normal" disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => setBudget(event.target.value)} required value={budget} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.budget.monthlyLimit}</span></label><label className="grid gap-2 text-sm font-semibold">Time to live<input className="min-h-11 rounded-control border px-3 font-normal" disabled={submission === "submitting"} onChange={(event) => setTtl(event.target.value)} required value={ttl} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.ttl}</span></label>{template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month<input className="min-h-11 rounded-control border px-3 font-normal" disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => setRuntimeMinutes(event.target.value)} required value={runtimeMinutes} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.runtimeMinutesLimit}</span></label> : null}</div></FormSection>
-        <FormSection number="03" title="Models"><TagSelect disabled={submission === "submitting"} label="Models" onChange={(next) => setModels(new Set(next))} options={modelOptions} value={[...models]} /></FormSection>
-        <FormSection description="Remove anything this envelope doesn’t need. Only tools in the template ceiling are offered." number="04" title="Tools"><TagSelect disabled={submission === "submitting"} label="Tools" onChange={(next) => setTools(new Set(next))} options={toolOptions} value={[...tools]} /></FormSection>
-      </SectionCard>
+      <div className="min-w-0 flex-[1_1_520px] space-y-4">
+        <SectionCard title={stepTitle("01", "Template")}>
+          <label className="sr-only">Template<select disabled={submission === "submitting"} onChange={(event) => selectTemplate(event.target.value)} value={template.id}>{templates.map((item) => <option key={item.id} value={item.id}>{item.displayName} · revision {item.revision}</option>)}</select></label>
+          <div className="grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">{templates.map((item) => <button aria-pressed={item.id === template.id} className={`rounded-tile border p-4 text-left ${item.id === template.id ? "border-brand bg-brand-soft" : "hover:bg-subtle"}`} disabled={submission === "submitting"} key={item.id} onClick={() => selectTemplate(item.id)} type="button"><span className="flex items-center justify-between gap-3"><strong className="text-[15px]">{item.displayName}</strong><span className="font-mono text-xs text-muted-ink">rev {item.revision}</span></span><span className="mt-2 block text-xs text-muted-ink">Up to {item.ceiling.spec.budget.monthlyLimit} {item.ceiling.spec.budget.currency}/mo · {item.ceiling.spec.ttl} · {item.ceiling.spec.tools.length} tools</span></button>)}</div>
+        </SectionCard>
+        <SectionCard title={stepTitle("02", "Budget and lifetime")}><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})<input className="min-h-11 rounded-control border px-3 font-normal" disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => setBudget(event.target.value)} required value={budget} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.budget.monthlyLimit} {template.ceiling.spec.budget.currency}</span></label><label className="grid gap-2 text-sm font-semibold">Time to live<input className="min-h-11 rounded-control border px-3 font-mono font-normal" disabled={submission === "submitting"} onChange={(event) => setTtl(event.target.value)} required value={ttl} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.ttl}</span></label>{template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month<input className="min-h-11 rounded-control border px-3 font-normal" disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => setRuntimeMinutes(event.target.value)} required value={runtimeMinutes} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.runtimeMinutesLimit}</span></label> : null}</div></SectionCard>
+        <SectionCard title={stepTitle("03", "Models")}><TagSelect disabled={submission === "submitting"} label="Models" onChange={(next) => setModels(new Set(next))} options={modelOptions} value={[...models]} /></SectionCard>
+        <SectionCard title={stepTitle("04", "Tools")}><TagSelect disabled={submission === "submitting"} label="Tools" onChange={(next) => setTools(new Set(next))} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools in the template ceiling are offered.</p></SectionCard>
+      </div>
       <SectionCard className="sticky top-7 flex-[1_1_280px] lg:max-w-[380px]" title="Summary">
         <dl className="space-y-3 text-sm">{[["Template", template.displayName], ["Monthly limit", `${budget} ${template.ceiling.spec.budget.currency}`], ["Per run", template.ceiling.spec.budget.singleRunLimit ?? "Not set"], ["TTL", ttl], ["Models", String(models.size)], ["Tools", String(tools.size)]].map(([label, value]) => <div className="flex justify-between gap-4" key={label}><dt className="text-muted-ink">{label}</dt><dd className="text-right font-medium">{value}</dd></div>)}</dl>
         {submission !== "idle" && submission !== "submitting" ? <p className="mt-4 text-sm text-err" role="alert">{{ conflict: "The template revision changed. Reload before retrying.", rejected: "Rust admission rejected the requested authority as outside the template ceiling.", forbidden: "The Rust authorization boundary rejected the request.", unavailable: "The authoritative request service is unavailable.", error: "The request could not be accepted." }[submission]}</p> : null}

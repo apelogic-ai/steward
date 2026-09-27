@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useState, type FormEvent } from "react";
 
 import {
@@ -8,6 +9,7 @@ import {
   denyAdminEscalation,
   fileAdminApprovalDecision,
   fileAdminEnvelopeRequest,
+  getAdminRequest,
   listAdminRequests,
   topUpAdminEscalation,
   rejectAdminEnvelopeRequest,
@@ -17,9 +19,10 @@ import {
   type BrowserEnvelopeRequestDecisionResponse,
   type BrowserEnvelopeRequestView,
   type AdminRequestView,
+  type AdminRequestResponse,
   type AdminRequestsResponse,
 } from "@/api-client";
-import { FilterTabs, SectionCard } from "@/components/hs";
+import { DataTable, FilterTabs, SectionCard } from "@/components/hs";
 import { DefinitionList, EmptyState, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -60,16 +63,30 @@ function envelopeAuthorityItems(spec: BrowserEnvelopeSpec): [string, string][] {
 }
 
 export function AdminApprovalsView() {
-  const load = useCallback(() => listAdminRequests({ cache: "no-store", credentials: "same-origin", query: { state: "needs_action", limit: 100 } }), []);
+  const [filter, setFilter] = useState("needs_action");
+  const load = useCallback(() => listAdminRequests({ cache: "no-store", credentials: "same-origin", query: { state: "all", limit: 100 } }), []);
   const state = useApiResource<AdminRequestsResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Review one authoritative queue of envelope requests, runtime exceptions, and cumulative-limit escalations." title="Requests" />
-      <ResourceBoundary state={state}>{({ requests }) => requests.length === 0 ? (
-        <EmptyState title="No data" />
-      ) : (
-        <RequestWorkspace requests={requests} />
-      )}</ResourceBoundary>
+      <PageHeader description="Envelope requests within a template ceiling are approved and provisioned automatically. Requests above a ceiling, and runtimes that exhaust a cumulative limit, wait here for a decision." title="Requests" />
+      <ResourceBoundary state={state}>{({ requests }) => {
+        if (requests.length === 0) return <EmptyState title="No data" />;
+        const counts = {
+          needs_action: requests.filter((request) => request.state === "requested" || request.state === "escalated").length,
+          all: requests.length,
+          auto_approved: requests.filter((request) => request.state === "auto_approved").length,
+          rejected: requests.filter((request) => request.state === "rejected").length,
+        };
+        const visible = filter === "all" ? requests : filter === "needs_action"
+          ? requests.filter((request) => request.state === "requested" || request.state === "escalated")
+          : requests.filter((request) => request.state === filter);
+        return <div className="space-y-5"><FilterTabs active={filter} items={[
+          { count: counts.needs_action, label: "Needs action", value: "needs_action" },
+          { count: counts.all, label: "All", value: "all" },
+          { count: counts.auto_approved, label: "Auto-approved", value: "auto_approved" },
+          { count: counts.rejected, label: "Rejected", value: "rejected" },
+        ]} onChange={setFilter} />{visible.length ? <RequestTable requests={visible} /> : <EmptyState title="Nothing needs action" />}</div>;
+      }}</ResourceBoundary>
     </section>
   );
 }
@@ -82,36 +99,46 @@ function requestSourceLabel(source: AdminRequestView["source"]): string {
   }[source];
 }
 
-function RequestWorkspace({ requests }: Readonly<{ requests: Array<AdminRequestView> }>) {
-  const [source, setSource] = useState("all");
-  const [selectedId, setSelectedId] = useState(requests[0]?.id ?? "");
-  const visible = source === "all" ? requests : requests.filter((request) => request.source === source);
-  const selected = visible.find((request) => request.id === selectedId) ?? visible[0];
-  const counts = new Map<AdminRequestView["source"], number>();
-  for (const request of requests) counts.set(request.source, (counts.get(request.source) ?? 0) + 1);
+function requestReason(request: AdminRequestView): string {
+  return request.kind === "ceiling_exceeded" ? "above ceiling"
+    : request.kind === "cumulative_exhausted" ? "cumulative limit"
+      : request.kind === "within_ceiling" ? "within ceiling" : "custom";
+}
 
-  return (
-    <div className="space-y-5">
-      <FilterTabs active={source} items={[
-        { count: requests.length, label: "All", value: "all" },
-        { count: counts.get("envelope_request") ?? 0, label: "Envelopes", value: "envelope_request" },
-        { count: counts.get("runtime_exception") ?? 0, label: "Exceptions", value: "runtime_exception" },
-        { count: counts.get("escalation") ?? 0, label: "Limits", value: "escalation" },
-      ]} onChange={setSource} />
-      <div className="grid min-h-[620px] overflow-hidden rounded-panel border bg-panel shadow-sm lg:grid-cols-[minmax(280px,0.72fr)_minmax(0,1.45fr)]">
-        <section aria-label="Request queue" className="border-b border-line lg:border-b-0 lg:border-r">
-          <div className="flex items-center justify-between border-b border-line px-5 py-4"><h2 className="text-sm font-semibold">Needs review</h2><span className="font-mono text-xs text-muted-ink">{visible.length}</span></div>
-          {visible.length ? <ul className="divide-y divide-line-soft">{visible.map((request) => {
-            const active = request.id === selected?.id;
-            return <li key={request.id}><button aria-current={active ? "true" : undefined} className={`grid w-full gap-3 px-5 py-4 text-left transition-colors hover:bg-subtle ${active ? "bg-brand-soft" : ""}`} onClick={() => setSelectedId(request.id)} type="button"><span className="flex items-center justify-between gap-3"><span className="text-xs font-semibold uppercase tracking-wide text-muted-ink">{requestSourceLabel(request.source)}</span><StatusBadge value={request.state} /></span><span><span className="block font-semibold">{request.template.displayName ?? "Custom envelope"}</span><span className="mt-1 block truncate text-sm text-muted-ink">{request.requester.displayEmail}</span></span><span className="text-xs text-faint-ink">{new Date(request.createdAt).toLocaleString()}</span></button></li>;
-          })}</ul> : <div className="p-5"><EmptyState title="No matching requests" /></div>}
-        </section>
-        <section aria-label="Request detail" className="min-w-0 bg-subtle p-4 sm:p-6">
-          {selected ? <ul><UnifiedRequestCard key={selected.id} request={selected} /></ul> : <EmptyState title="Select a request" />}
-        </section>
-      </div>
-    </div>
-  );
+function triggerLabel(request: AdminRequestView): [string, string] {
+  if (request.kind === "ceiling_exceeded") return ["Above ceiling", request.deltas.map((delta) => `${delta.dimension} ${deltaValue(delta.requested)} > ${deltaValue(delta.ceiling)}`).join(" · ")];
+  if (request.kind === "cumulative_exhausted") {
+    const meter = request.escalation?.meters[0];
+    return ["Cumulative limit reached", meter ? `${meter.used} / ${meter.limit} ${meter.unit}` : "Limit exhausted"];
+  }
+  if (request.kind === "within_ceiling") return ["Within ceiling", "Fits the template ceiling"];
+  return ["Custom request", "No governing template"];
+}
+
+function requestAge(createdAt: string): string {
+  const seconds = Math.max(0, Math.round((Date.now() - new Date(createdAt).valueOf()) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  return hours < 24 ? `${hours}h` : `${Math.round(hours / 24)}d`;
+}
+
+function RequestTable({ requests }: Readonly<{ requests: Array<AdminRequestView> }>) {
+  return <DataTable ariaLabel="Requests" columns={[
+    { key: "request", label: "Request", className: "font-semibold", render: (request) => <span><span className="block truncate">{request.template.displayName ?? "Custom envelope"} · {requestReason(request)}</span><span className="mt-0.5 block truncate font-mono text-xs font-normal text-muted-ink">{request.id}</span></span> },
+    { key: "requester", label: "Requester", className: "truncate", render: (request) => request.requester.displayEmail },
+    { key: "trigger", label: "Trigger", render: (request) => { const [label, detail] = triggerLabel(request); return <span><span className={`block font-medium ${request.kind === "ceiling_exceeded" ? "text-warn" : request.kind === "cumulative_exhausted" ? "text-err" : "text-muted-ink"}`}>{label}</span><span className="mt-0.5 block truncate font-mono text-xs text-muted-ink">{detail}</span></span>; } },
+    { key: "status", label: "Status", render: (request) => <StatusBadge value={request.state} /> },
+    { key: "age", label: "Age", className: "text-right font-mono text-muted-ink", render: (request) => requestAge(request.createdAt) },
+    { key: "open", label: "", className: "text-right text-lg text-faint-ink", render: () => "›" },
+  ]} gridTemplateColumns="minmax(230px,1.2fr) minmax(180px,.85fr) minmax(220px,1fr) 120px 70px 24px" minWidth="980px" rowHref={(request) => `/admin/approvals/${encodeURIComponent(request.id)}`} rowKey={(request) => request.id} rows={requests} />;
+}
+
+export function AdminRequestDetailView({ requestId }: Readonly<{ requestId: string }>) {
+  const load = useCallback(() => getAdminRequest({ cache: "no-store", credentials: "same-origin", path: { request_id: requestId } }), [requestId]);
+  const state = useApiResource<AdminRequestResponse>(load);
+  return <ResourceBoundary state={state}>{({ request }) => <section aria-labelledby="page-title" className="mx-auto max-w-[980px] space-y-5"><PageHeader description={`${request.requester.displayEmail} · requested ${new Date(request.createdAt).toLocaleString()}`} title={<span className="inline-flex flex-wrap items-center gap-3">{request.template.displayName ?? "Custom envelope"} · {requestReason(request)} <StatusBadge value={request.state} /></span>} />{request.kind === "ceiling_exceeded" ? <div className="rounded-[10px] bg-warn-soft px-[18px] py-3.5"><strong className="block text-[13px] font-semibold text-warn">Requested above the template ceiling</strong><p className="mt-1 font-mono text-sm">{triggerLabel(request)[1]}</p></div> : request.kind === "cumulative_exhausted" ? <div className="rounded-[10px] bg-err-soft px-[18px] py-3.5"><strong className="block text-[13px] font-semibold text-err">Escalated: a cumulative limit was reached and the run is parked</strong><p className="mt-1 font-mono text-sm">{triggerLabel(request)[1]}</p></div> : null}<ul><UnifiedRequestCard request={request} /></ul><Link className="inline-flex text-sm font-semibold" href="/admin/approvals">← Back to requests</Link></section>}</ResourceBoundary>;
 }
 
 function deltaValue(value: unknown): string {

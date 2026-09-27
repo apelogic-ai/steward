@@ -273,7 +273,7 @@ function AuthenticatedTemplateList() {
           <Link className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas" href="/admin/envelopes/provision">Provision envelope</Link>
           <Link className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-brand-strong" href="/admin/envelopes/templates/new">Create template</Link>
         </div>}
-        description="Review the current immutable envelope templates available in Steward."
+        description="The most a member role can request. Each save creates a new immutable revision."
         title="Envelope templates"
       />
       <ResourceBoundary state={acceptedState}>{({ templates }) => templates.length === 0 ? (
@@ -282,16 +282,16 @@ function AuthenticatedTemplateList() {
         <DataTable
           ariaLabel="Envelope templates"
           columns={[
-            { key: "template", label: "Template", className: "font-semibold", render: (template) => <span><span className="block truncate">{template.displayName}</span><span className="mt-0.5 block truncate font-mono text-xs font-normal text-muted-ink">{template.id}</span></span> },
-            { key: "roles", label: "Roles", className: "text-muted-ink", render: (template) => template.memberRoles.map(displayName).join(", ") },
-            { key: "authority", label: "Authority", render: (template) => <GrantChipList grants={[
-              ...template.envelope.spec.llms.map((model) => ({ kind: "model" as const, name: modelValue(model) })),
-              ...template.envelope.spec.tools.map((tool) => ({ kind: grantKindForAction(tool.action), name: toolValue(tool) })),
-            ]} limit={2} /> },
-            { key: "revision", label: "Revision", className: "tabular-nums text-muted-ink", render: (template) => template.envelope.revision },
+            { key: "template", label: "Member role", className: "font-semibold", render: (template) => <span><span className="block truncate">{template.displayName}</span><span className="mt-0.5 block truncate font-mono text-xs font-normal text-muted-ink">{template.id}</span></span> },
+            { key: "revision", label: "Revision", className: "font-mono text-muted-ink", render: (template) => `rev ${template.envelope.revision}` },
+            { key: "monthly", label: "Monthly", className: "tabular-nums", render: (template) => `${template.envelope.spec.budget.monthlyLimit} ${template.envelope.spec.budget.currency}` },
+            { key: "per-run", label: "Per run", className: "tabular-nums", render: (template) => template.envelope.spec.budget.singleRunLimit ? `${template.envelope.spec.budget.singleRunLimit} ${template.envelope.spec.budget.currency}` : "—" },
+            { key: "ttl", label: "TTL", className: "font-mono text-muted-ink", render: (template) => template.envelope.spec.ttl },
+            { key: "tools", label: "Tools", render: (template) => <GrantChipList grants={template.envelope.spec.tools.map((tool) => ({ kind: grantKindForAction(tool.action), name: toolValue(tool) }))} limit={2} /> },
+            { key: "open", label: "", className: "text-right text-lg text-faint-ink", render: () => "›" },
           ]}
-          gridTemplateColumns="minmax(220px,1.2fr) minmax(160px,.8fr) minmax(300px,1.5fr) 90px"
-          minWidth="860px"
+          gridTemplateColumns="minmax(200px,1.2fr) 90px 120px 120px 80px minmax(210px,1fr) 24px"
+          minWidth="980px"
           rowHref={(template) => `/admin/envelopes/templates/${encodeURIComponent(template.id)}`}
           rowKey={(template) => template.id}
           rows={templates}
@@ -383,7 +383,7 @@ function AuthenticatedNewTemplate({ csrf }: Readonly<{ csrf: string }>) {
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader
         actions={<Link className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas" href="/admin/envelopes/templates">All templates</Link>}
-        description="Author the first immutable revision for a member role. All suggested values remain editable before saving."
+        description="Sets the ceiling for one member role. This becomes revision 1."
         title="Create envelope template"
       />
       <ResourceBoundary state={acceptedState}>{(capabilities) => (
@@ -530,6 +530,41 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
   }
 
   const runner = template.spec.runner;
+  if (create) {
+    return (
+      <form className="overflow-hidden rounded-card border bg-panel" onSubmit={submit}>
+        <FormSection description="The template ID. Users with this role can request against it." title="Member role">
+          <div className="grid gap-4 sm:grid-cols-3">
+            <label className="grid gap-2 text-sm font-semibold">Template ID<input className={`${fieldClass} font-mono`} name="newTemplateId" placeholder="developer" required /></label>
+            <label className="grid gap-2 text-sm font-semibold">Display name<input className={fieldClass} name="displayName" onChange={(event) => setName(event.target.value)} required value={name} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Eligible member roles<input className={fieldClass} name="memberRoles" onChange={(event) => setRoles(event.target.value)} placeholder="developer, analyst" required value={roles} /></label>
+          </div>
+        </FormSection>
+        <FormSection description="Inference spend limits in USD and how long an envelope stays valid." title="Budget and lifetime">
+          <div className="grid gap-4 sm:grid-cols-4">
+            <label className="grid gap-2 text-sm font-semibold">Per run (USD)<input className={fieldClass} inputMode="decimal" onChange={(event) => setSingleRunLimit(event.target.value)} required value={singleRunLimit} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Monthly (USD)<input className={fieldClass} inputMode="decimal" onChange={(event) => setMonthlyLimit(event.target.value)} required value={monthlyLimit} /></label>
+            <label className="grid gap-2 text-sm font-semibold">TTL<input className={`${fieldClass} font-mono`} defaultValue={template.spec.ttl} name="ttl" required /></label>
+            <label className="grid gap-2 text-sm font-semibold">Runtime minutes<input className={`${fieldClass} font-mono`} inputMode="decimal" onChange={(event) => setRuntimeMinutesLimit(event.target.value)} placeholder="60" value={runtimeMinutesLimit} /></label>
+          </div>
+        </FormSection>
+        <FormSection description="Only models supported by the inference gateway can be selected." title="Models">
+          <div className="space-y-3"><div className="flex flex-wrap items-end gap-3"><label className="grid min-w-64 flex-1 gap-2 text-sm font-semibold">Model<select className={fieldClass} disabled={modelCatalog.length === 0} onChange={(event) => setModelInput(event.target.value)} value={modelInput}>{modelCatalog.length === 0 ? <option value="">No models available</option> : modelCatalog.map((model) => <option key={modelKey(model)} value={modelKey(model)}>{modelLabel(model, modelCatalog)}</option>)}</select></label><button className="min-h-11 rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!modelInput || models.some((model) => modelKey(model) === modelInput)} onClick={addModel} type="button">Add model</button></div><ul className="flex flex-wrap gap-2" role="list">{models.map((model, index) => <li className="flex items-center gap-2 rounded-full bg-info-soft px-3 py-1.5 font-mono text-xs" key={`${modelKey(model)}:${index}`}>{modelValue(model)}<button aria-label={`Remove model ${model.model} from provider ${model.provider}`} onClick={() => removeModel(index)} type="button"><svg aria-hidden="true" className="size-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 12 12"><path d="M2 2l8 8M10 2l-8 8" /></svg></button></li>)}</ul></div>
+        </FormSection>
+        <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Write and destructive tools are labelled.`} title="Tools">
+          <div className="space-y-3"><div className="grid gap-3 sm:grid-cols-[1fr_2fr_auto] sm:items-end"><label className="grid gap-2 text-sm font-semibold">Tool provider<select className={fieldClass} disabled={toolProviders.length === 0} onChange={(event) => { const provider = event.target.value; setToolProviderInput(provider); const first = toolCatalog.find((tool) => tool.provider === provider); setToolInput(first ? toolKey(first) : ""); }} value={toolProviderInput}>{toolProviders.length === 0 ? <option value="">No tool providers available</option> : toolProviders.map((provider) => <option key={provider} value={provider}>{displayName(provider)}</option>)}</select></label><label className="grid gap-2 text-sm font-semibold">Tool<select className={fieldClass} disabled={toolCatalog.length === 0} onChange={(event) => setToolInput(event.target.value)} value={toolInput}>{toolCatalog.filter((tool) => tool.provider === toolProviderInput).map((tool) => <option key={toolKey(tool)} value={toolKey(tool)}>{toolLabel(tool, toolCatalog)}</option>)}</select></label><button className="min-h-11 rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!toolInput || tools.some((tool) => toolKey(tool) === toolInput)} onClick={addTool} type="button">Add tool</button></div><ul className="flex flex-wrap gap-2" role="list">{tools.map((tool, index) => <li className="flex items-center gap-2 rounded-full bg-ok-soft px-3 py-1.5 font-mono text-xs" key={`${toolKey(tool)}:${index}`}>{toolValue(tool)} <span className="font-sans text-ok">{grantKindForAction(tool.action)}</span><button aria-label={`Remove tool ${toolValue(tool)}`} onClick={() => removeTool(index)} type="button">×</button></li>)}</ul><p className="text-xs text-muted-ink">Type to filter. ↑ ↓ to move, Enter to add, Backspace removes the last tag.</p></div>
+        </FormSection>
+        <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
+          <div className="space-y-4"><label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => setAutoApproveToCeiling(event.target.checked)} type="checkbox" />Auto-approve every request within the ceiling</label>{!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => setThresholdJson(event.target.value)} spellCheck={false} value={thresholdJson} /></label> : null}</div>
+        </FormSection>
+        <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner">
+          <fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" placeholder="2Gi" /></label><label className="grid gap-2 text-sm font-semibold">Compute<input className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" placeholder="1000m" /></label><label className="grid gap-2 text-sm font-semibold">Storage<input className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" placeholder="10Gi" /></label></div></fieldset>
+        </FormSection>
+        {status !== "idle" && status !== "saving" ? <p className={`px-6 py-3 text-sm ${status === "saved" ? "text-ok" : "text-err"}`} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status)}</p> : null}
+        <footer className="sticky bottom-0 flex flex-wrap items-center justify-between gap-4 border-t bg-subtle px-6 py-4"><p className="text-sm text-muted-ink">{models.length} model{models.length === 1 ? "" : "s"} · {tools.length} tool{tools.length === 1 ? "" : "s"} · {singleRunLimit || "—"} USD per run</p><div className="flex gap-3"><Link className="rounded-control border bg-panel px-4 py-2 text-sm font-semibold" href="/admin/envelopes/templates">Cancel</Link><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="create">{status === "saving" ? "Saving…" : "Create template"}</button></div></footer>
+      </form>
+    );
+  }
   return (
     <form className="space-y-6" onSubmit={submit}>
       <SectionCard>

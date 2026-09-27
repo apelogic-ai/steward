@@ -10,7 +10,7 @@ import {
   type ProviderConnectionView,
 } from "@/api-client";
 import { connectionHealth } from "@/components/connection-health";
-import { GrantChipList, SectionCard } from "@/components/hs";
+import { SectionCard } from "@/components/hs";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -68,7 +68,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
 
   const footer = status?.phase === "connected" ? (
     <div className="flex flex-wrap items-center justify-between gap-4">
-      <p className="max-w-2xl text-[13px] text-muted-ink">Disconnecting revokes this connection for all present and future agent runtimes using the same Steward identity.</p>
+      <p className="max-w-2xl text-[13px] text-muted-ink">Disconnecting revokes this connection for every current and future runtime using your identity.</p>
       <div className="flex gap-2">
         <button className="h-9 rounded-control border bg-panel px-3 text-sm font-semibold disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">Reconnect</button>
         <button className="h-9 rounded-control border border-err px-3 text-sm font-semibold text-err hover:bg-err-soft" onClick={() => setDisconnectOpen(true)} type="button">Disconnect…</button>
@@ -80,7 +80,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
   return (
     <SectionCard actions={<StatusBadge value={badge} />} footer={footer} title={<span className="flex items-center gap-3"><span aria-hidden="true" className="flex size-10 items-center justify-center rounded-[10px] bg-ink text-sm font-bold text-canvas">GH</span><span><span className="block text-[17px]">{connection?.displayName ?? "GitHub"}</span><span className="block text-xs font-normal text-muted-ink">{status?.accountEmail ?? "Account not reported"}{status?.renewalCredentialExpiresAt ? ` · expires ${new Date(status.renewalCredentialExpiresAt).toLocaleDateString()}` : ""}</span></span></span>}>
       <div className="space-y-4">
-        <div><p className="mb-2 text-xs font-semibold text-muted-ink">Scopes</p>{status?.scopesGranted.length ? <GrantChipList grants={status.scopesGranted.map((scope) => ({ kind: "read", name: scope }))} /> : <p className="text-sm text-muted-ink">No granted scopes reported.</p>}</div>
+        <div><p className="mb-2 text-xs font-semibold text-muted-ink">Scopes</p>{status?.scopesGranted.length ? <ul className="flex flex-wrap gap-2">{status.scopesGranted.map((scope) => <li className="rounded-full bg-ok-soft px-3 py-1 font-mono text-xs" key={scope}>{scope} <span className="font-sans font-semibold text-ok">✓ granted</span></li>)}</ul> : <p className="text-sm text-muted-ink">No granted scopes reported.</p>}</div>
         {status?.scopesMissing.length ? <p className="text-sm text-err">Missing required scopes: {status.scopesMissing.join(", ")}.</p> : status ? <p className="text-sm text-ok">All required scopes granted.</p> : null}
         <dl className="grid gap-3 text-sm sm:grid-cols-2"><div><dt className="text-xs font-semibold text-muted-ink">Active credential expires</dt><dd className="mt-1">{status?.activeCredentialExpiresAt ?? "Not reported"}</dd></div><div><dt className="text-xs font-semibold text-muted-ink">Renewal credential expires</dt><dd className="mt-1">{status?.renewalCredentialExpiresAt ?? "Not reported"}</dd></div></dl>
         {!status ? <p className="text-sm text-muted-ink">Connection metadata is not currently available. Authorization can still be started safely.</p> : null}

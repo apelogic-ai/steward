@@ -5,8 +5,8 @@ const source = readFileSync(new URL("./connections-view.tsx", import.meta.url), 
 
 describe("governed provider connection controls", () => {
   test("warns that disconnect affects every present and future runtime", () => {
-    expect(source).toContain("all present and future agent runtimes");
-    expect(source).toContain("same Steward identity");
+    expect(source).toContain("every current and future runtime");
+    expect(source).toContain("using your identity");
   });
 
   test("distinguishes an outstanding OAuth flow from an ordinary conflict", () => {

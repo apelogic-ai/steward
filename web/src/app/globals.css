@@ -215,14 +215,6 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-a {
-  color: var(--color-link);
-}
-
-a:hover {
-  color: var(--color-link-hover);
-}
-
 input,
 select,
 textarea {
@@ -280,5 +272,11 @@ input[type="radio"] {
   }
   html {
     @apply font-sans;
+  }
+  a {
+    color: var(--color-link);
+  }
+  a:hover {
+    color: var(--color-link-hover);
   }
 }

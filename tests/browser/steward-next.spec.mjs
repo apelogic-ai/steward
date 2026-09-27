@@ -222,7 +222,7 @@ const presentationRoutes = [
   { path: `/envelopes/${envelopeId}`, heading: "developer", activeNavigation: "Envelopes" },
   { path: `/envelopes/${envelopeId}/runs`, heading: "Recent runs", activeNavigation: "Envelopes" },
   { path: "/runs", heading: "Runs", activeNavigation: "Runs" },
-  { path: `/runs/${taskUid}`, heading: "Run detail", activeNavigation: "Runs" },
+  { path: `/runs/${taskUid}`, heading: "repository-review@1", activeNavigation: "Runs" },
   { path: "/connections", heading: "Connections", activeNavigation: "Connections" },
   { path: "/settings", heading: "Settings", activeNavigation: "Settings" },
   { path: "/admin/envelopes/templates", heading: "Envelope templates", activeNavigation: "Templates" },
@@ -233,8 +233,9 @@ const presentationRoutes = [
   { path: "/admin/workflows/repository-review/versions/1", heading: "Workflow", activeNavigation: "Workflows" },
   { path: "/admin/workflows/repository-review/new-version", heading: "New repository-review version", activeNavigation: "Workflows" },
   { path: "/admin/runs", heading: "All runs", activeNavigation: "Runs" },
-  { path: `/admin/runs/${taskUid}`, heading: "Run detail", activeNavigation: "Runs" },
+  { path: `/admin/runs/${taskUid}`, heading: "repository-review@1", activeNavigation: "Runs" },
   { path: "/admin/approvals", heading: "Requests", activeNavigation: "Approvals" },
+  { path: `/admin/approvals/${unifiedEnvelopeRequest.id}`, heading: /Developer · above ceiling/i, activeNavigation: "Approvals" },
   { path: "/admin/settings", heading: "Settings", activeNavigation: "Settings" },
 ];
 
@@ -756,6 +757,14 @@ async function guardedPage(browser, {
     requests: emptyCollections ? [] : [unifiedEnvelopeRequest, unifiedRuntimeApproval],
     nextCursor: null,
   }));
+  await context.route(`${origin}/admin/api/v1/requests/${unifiedEnvelopeRequest.id}`, (route) => json(route, {
+    apiVersion: "steward.browser-admin/v1",
+    request: unifiedEnvelopeRequest,
+  }));
+  await context.route(`${origin}/admin/api/v1/requests/${unifiedRuntimeApproval.id}`, (route) => json(route, {
+    apiVersion: "steward.browser-admin/v1",
+    request: unifiedRuntimeApproval,
+  }));
   await context.route(`${origin}/admin/api/v1/requests/summary`, (route) => json(route, {
     apiVersion: "steward.browser-admin/v1",
     needsAction: emptyCollections ? 0 : 2,
@@ -919,8 +928,55 @@ test("the shell carries the HyperShell visual system", async ({ browser }) => {
       sidebarBorder: "rgb(47, 52, 55)",
       primary: "rgb(251, 81, 8)",
     });
+    await expect(session.page.getByRole("link", { name: "HyperShell home" })).toHaveCSS("color", "rgb(236, 238, 239)");
+    await expect(session.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Runs", exact: true })).toHaveCSS("color", "rgb(162, 168, 171)");
   } finally {
     await closeGuardedPage(session);
+  }
+});
+
+test("the HyperShell handoff structure is preserved on primary workspaces", async ({ browser }) => {
+  const developer = await guardedPage(browser, { colorScheme: "light", includeSampleWorkflow: true });
+  try {
+    await developer.page.goto(`${origin}/envelopes`);
+    await expect(developer.page.getByText("Budget, models and tools your agents are allowed to use.")).toBeVisible();
+    for (const label of ["All", "Provisioned", "Pending", "Rejected"]) {
+      await expect(developer.page.getByRole("tab", { name: new RegExp(`^${label}\\s+\\d+$`) })).toBeVisible();
+    }
+    for (const label of ["Template", "Status", "Spend this month", "Per run", "TTL", "Tools"]) {
+      await expect(developer.page.getByRole("columnheader", { name: label })).toBeVisible();
+    }
+
+    await developer.page.goto(`${origin}/runs`);
+    await expect(developer.page.getByText("Agent runs executed under your envelopes.")).toBeVisible();
+    for (const label of ["All", "Running", "Queued", "Parked", "Succeeded", "Failed"]) {
+      await expect(developer.page.getByRole("tab", { name: new RegExp(`^${label}\\s+\\d+$`) })).toBeVisible();
+    }
+
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByRole("heading", { name: "repository-review@1", exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("navigation", { name: "Run jobs" })).toBeVisible();
+    await expect(developer.page.getByText("Sensitivity notice", { exact: true })).toBeVisible();
+
+    await developer.page.goto(`${origin}/get-started`);
+    await expect(developer.page.getByText("Five steps to your first governed agent run. An envelope is the budget, models and tools an agent may use; the workflow runs your agent inside it.")).toBeVisible();
+    for (const title of ["Connect GitHub", "Get your first envelope", "Add the workflow to your repository", "Trigger a test run", "See the result"]) {
+      await expect(developer.page.getByRole("button", { name: new RegExp(title) })).toBeVisible();
+    }
+  } finally {
+    await closeGuardedPage(developer);
+  }
+
+  const administrator = await guardedPage(browser, { colorScheme: "light", session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/approvals`);
+    await expect(administrator.page.getByText(/Envelope requests within a template ceiling are approved and provisioned automatically/)).toBeVisible();
+    await expect(administrator.page.getByRole("table", { name: "Requests" })).toBeVisible();
+    await administrator.page.getByRole("link", { name: /Developer/ }).click();
+    await expect(administrator.page).toHaveURL(`${origin}/admin/approvals/${unifiedEnvelopeRequest.id}`);
+    await expect(administrator.page.getByRole("heading", { name: /Developer · above ceiling/i })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
   }
 });
 
@@ -1142,8 +1198,8 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
   const developer = await guardedPage(browser);
   try {
     await developer.page.goto(`${origin}/envelopes`);
-    await expect(developer.page.getByRole("link", { name: /developer/ })).toBeVisible();
-    await expect(developer.page.getByText("25.00 USD")).toBeVisible();
+    await expect(developer.page.getByRole("link", { name: /Developer/ })).toBeVisible();
+    await expect(developer.page.getByText("5.00 USD")).toBeVisible();
 
     await developer.page.goto(`${origin}/envelopes/new`);
     const template = developer.page.locator("label").filter({ hasText: /^Template/ }).locator("select");
@@ -1288,13 +1344,13 @@ test("onboarding persists workflow acknowledgement and ignores unrelated runs", 
   const developer = await guardedPage(browser, { includeSampleWorkflow: true });
   try {
     await developer.page.goto(`${origin}/get-started`);
-    const workflowStep = developer.page.getByRole("listitem").filter({ hasText: "3. Add the generated workflow" });
-    const runStep = developer.page.getByRole("listitem").filter({ hasText: "4. Run the test workflow" });
-    await expect(workflowStep.getByText("pending", { exact: true })).toBeVisible();
-    await expect(runStep.getByText("pending", { exact: true })).toBeVisible();
+    const workflowStep = developer.page.getByRole("listitem").filter({ hasText: "Add the workflow to your repository" });
+    const runStep = developer.page.getByRole("listitem").filter({ hasText: "Trigger a test run" });
+    await expect(workflowStep.getByText("Copy a read-only sample workflow into a repository", { exact: true })).toBeVisible();
+    await expect(runStep.getByText("Run the sample from GitHub", { exact: true })).toBeVisible();
 
-    await developer.page.getByRole("button", { name: "I added the sample workflow" }).click();
-    await expect(workflowStep.getByText("done", { exact: true })).toBeVisible();
+    await developer.page.getByRole("button", { name: "I've committed it" }).click();
+    await expect(workflowStep.getByText("Done", { exact: true })).toBeVisible();
     const acknowledgement = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/preferences");
     expect(acknowledgement, "expected the durable preference mutation").toBeTruthy();
     expect(acknowledgement.headers["x-steward-csrf"]).toBe("test-csrf");
@@ -1303,17 +1359,17 @@ test("onboarding persists workflow acknowledgement and ignores unrelated runs", 
     expect(acknowledgement.body).toEqual({ workflowAcknowledged: true });
 
     await developer.page.reload();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "3. Add the generated workflow" }).getByText("done", { exact: true })).toBeVisible();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "4. Run the test workflow" }).getByText("pending", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Add the workflow to your repository" }).getByText("Done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Trigger a test run" }).getByText("Run the sample from GitHub", { exact: true })).toBeVisible();
 
-    await developer.page.getByRole("button", { name: "Dismiss checklist" }).click();
-    await expect(developer.page.getByRole("heading", { name: "Checklist dismissed" })).toBeVisible();
+    await developer.page.getByRole("button", { name: /Hide this guide/ }).click();
+    await expect(developer.page.getByText("The onboarding guide is hidden. Your progress is preserved.")).toBeVisible();
     await expect(developer.page.getByRole("link", { name: "Get started" })).toHaveCount(0);
     const dismissal = developer.mutations.findLast((mutation) => mutation.path === "/app/api/v1/preferences");
     expect(dismissal.body).toEqual({ onboardingDismissed: true });
 
-    await developer.page.getByRole("button", { name: "Show checklist again" }).click();
-    await expect(developer.page.getByRole("heading", { name: "Setup checklist" })).toBeVisible();
+    await developer.page.getByRole("button", { name: "Show guide again" }).click();
+    await expect(developer.page.getByRole("heading", { name: "Get started" })).toBeVisible();
     await expect(developer.page.getByRole("link", { name: "Get started" })).toBeVisible();
     const restored = developer.mutations.findLast((mutation) => mutation.path === "/app/api/v1/preferences");
     expect(restored.body).toEqual({ onboardingDismissed: false });
@@ -1327,7 +1383,7 @@ test("onboarding cannot acknowledge an absent sample", async ({ browser }) => {
   try {
     await developer.page.goto(`${origin}/get-started`);
     await expect(developer.page.getByText("The deployment has no executable onboarding sample.")).toBeVisible();
-    await expect(developer.page.getByRole("button", { name: "I added the sample workflow" })).toHaveCount(0);
+    await expect(developer.page.getByRole("button", { name: "I've committed it" })).toBeDisabled();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -1340,9 +1396,9 @@ test("onboarding follows paginated envelope and run evidence", async ({ browser 
   });
   try {
     await developer.page.goto(`${origin}/get-started`);
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "2. Provision an envelope" }).getByText("done", { exact: true })).toBeVisible();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "4. Run the test workflow" }).getByText("done", { exact: true })).toBeVisible();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "5. Inspect the governed run" }).getByText("done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Get your first envelope" }).getByText("Done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Trigger a test run" }).getByText("Done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "See the result" }).getByText("Done", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -1579,6 +1635,8 @@ test("administrator templates and approvals use typed browser authority", async 
 
     await administrator.page.goto(`${origin}/admin/approvals`);
     await expect(administrator.page.getByRole("heading", { name: "Requests" })).toBeVisible();
+    await administrator.page.getByRole("link").filter({ hasText: pendingEnvelopeRequest.requestId }).click();
+    await expect(administrator.page).toHaveURL(`${origin}/admin/approvals/${pendingEnvelopeRequest.requestId}`);
     const envelopeRequestCard = administrator.page.getByRole("listitem").filter({
       has: administrator.page.getByText(pendingEnvelopeRequest.requestId, { exact: true }),
     });
@@ -1593,7 +1651,8 @@ test("administrator templates and approvals use typed browser authority", async 
     const envelopeApprovalMutation = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/approve`);
     expectMutationProof(envelopeApprovalMutation);
     expect(envelopeApprovalMutation.body.rationale).toBe("Approved for the requested bounded envelope.");
-    await administrator.page.getByLabel("Request queue").getByRole("button", { name: /Exception/ }).click();
+    await administrator.page.getByRole("link", { name: "Back to requests" }).click();
+    await administrator.page.getByRole("link").filter({ hasText: approvalId }).click();
     const runtimeApprovalCard = administrator.page.getByRole("listitem").filter({
       has: administrator.page.getByText(approvalId, { exact: true }),
     });
@@ -1855,6 +1914,7 @@ test("administrator can reject a pending envelope request with an optional reaso
   const administrator = await guardedPage(browser, { session: administratorSession });
   try {
     await administrator.page.goto(`${origin}/admin/approvals`);
+    await administrator.page.getByRole("link").filter({ hasText: pendingEnvelopeRequest.requestId }).click();
     const envelopeRequestCard = administrator.page.getByRole("listitem").filter({
       has: administrator.page.getByText(pendingEnvelopeRequest.requestId, { exact: true }),
     });

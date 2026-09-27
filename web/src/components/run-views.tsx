@@ -18,11 +18,11 @@ import {
   type BrowserRunView,
   type MyRunsResponse,
 } from "@/api-client";
-import { DataTable, FilterTabs, SectionCard } from "@/components/hs";
+import { DataTable, FilterTabs } from "@/components/hs";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
-import { DefinitionList, EmptyState, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
+import { EmptyState, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 
 function dateTime(value: string): string {
   const parsed = new Date(value);
@@ -35,8 +35,20 @@ function runUpdatedAt(value: BrowserRunView): number {
 }
 
 function runtimeLabel(value: string | null | undefined): string {
-  if (!value) return "Not assigned";
-  return value.split("-", 1)[0] || value;
+  return value || "unassigned";
+}
+
+function relativeTime(value: string): string {
+  const milliseconds = new Date(value).valueOf();
+  if (!Number.isFinite(milliseconds)) return value;
+  const seconds = Math.max(0, Math.round((Date.now() - milliseconds) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} h ago`;
+  const days = Math.round(hours / 24);
+  return days === 1 ? "Yesterday" : `${days} days ago`;
 }
 
 function durationLabel(createdAt: string, updatedAt: string): string {
@@ -105,12 +117,12 @@ export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; ru
   if (runs.length === 0) return <EmptyState title="No data" />;
   const newestRuns = [...runs].sort((left, right) => runUpdatedAt(right) - runUpdatedAt(left));
   const columns = [
-    { key: "workflow", label: "Workflow", className: "font-semibold", render: (run: BrowserRunView) => <span className="block truncate">{run.workflow}</span> },
+    { key: "workflow", label: "Workflow", className: "font-semibold", render: (run: BrowserRunView) => <span><span className="block truncate">{run.workflow}</span><span className="mt-0.5 block truncate font-mono text-xs font-normal text-muted-ink">{run.taskUid}</span></span> },
     ...(admin ? [{ key: "owner", label: "Owner", render: (run: BrowserRunView) => <span className="block truncate text-muted-ink">{"ownerDisplayEmail" in run ? String(run.ownerDisplayEmail ?? "Not reported") : "Not reported"}</span> }] : []),
     { key: "status", label: "Status", render: (run: BrowserRunView) => <StatusBadge value={run.phase} /> },
-    { key: "runtime", label: "Runtime", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => runtimeLabel(run.runtimeUid) },
-    { key: "spend", label: "Spend", className: "tabular-nums", render: (run: BrowserRunView) => run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "—" },
-    { key: "updated", label: "Updated", className: "text-muted-ink", render: (run: BrowserRunView) => dateTime(run.updatedAt) },
+    { key: "runtime", label: "Runtime", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => <span className={run.runtimeUid ? "text-ink" : "text-faint-ink"}>{runtimeLabel(run.runtimeUid)}</span> },
+    { key: "spend", label: "Spend", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "—" },
+    { key: "updated", label: "Updated", className: "text-right text-muted-ink", render: (run: BrowserRunView) => relativeTime(run.updatedAt) },
   ];
   return <DataTable
     ariaLabel={admin ? "All runs" : "Runs"}
@@ -132,7 +144,7 @@ export function RunsView({ admin = false }: Readonly<{ admin?: boolean }>) {
   return (
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader
-        description={admin ? "Inspect the administrator-authorized run view." : "Track governed execution using the authoritative run record."}
+        description={admin ? "Every governed run across all users." : "Agent runs executed under your envelopes."}
         title={admin ? "All runs" : "Runs"}
       />
       <ResourceBoundary state={state}>{(data) => (
@@ -141,7 +153,7 @@ export function RunsView({ admin = false }: Readonly<{ admin?: boolean }>) {
             active={phase}
             items={[
               { count: data.runs.length, label: "All", value: "all" },
-              ...Object.entries(data.facets.phase).filter(([, count]) => count > 0).map(([value, count]) => ({ count, label: value.charAt(0).toUpperCase() + value.slice(1), value })),
+              ...(["running", "queued", "parked", "succeeded", "failed"] as const).map((value) => ({ count: data.facets.phase[value] ?? 0, label: value.charAt(0).toUpperCase() + value.slice(1), value })),
             ]}
             onChange={setPhase}
           />
@@ -157,6 +169,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
   const session = useSession();
   const [cancelState, setCancelState] = useState<"idle" | "working" | "cancelled" | MutationFailureState>("idle");
   const [rerunState, setRerunState] = useState<"idle" | "working" | MutationFailureState>("idle");
+  const [selectedStageId, setSelectedStageId] = useState<string | null>(null);
   const loadRun = useCallback(() => admin
     ? allRun({ cache: "no-store", credentials: "same-origin", path: { task_uid: taskUid } })
     : myRun({ cache: "no-store", credentials: "same-origin", path: { task_uid: taskUid } }), [admin, taskUid]);
@@ -167,59 +180,55 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
   const timelineState = useApiResource<BrowserRunTimelineResponse>(loadTimeline);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Inspect status, bounded spend, and the append-only timeline." title="Run detail" />
       <ResourceBoundary state={runState}>{({ run }) => {
         const pinnedWorkflow = run.workflowName && run.workflowVersion
           ? `${run.workflowName}@${run.workflowVersion}`
           : run.workflow;
-        const detailItems: Array<[string, string | number]> = [
-          ["Workflow version", pinnedWorkflow],
-          ["Coding agent", run.codingAgentRuntime],
-          ["Runtime UID", run.runtimeUid ?? "Not assigned"],
-          ["Ownership", run.runtimeOwnership],
-          ["User envelope instance", run.userEnvelopeInstanceId ?? "Not reported"],
-          ["User envelope revision", run.userEnvelopeRevision ?? "Not reported"],
-          ["User envelope digest", run.userEnvelopeDigest ?? "Not reported"],
-          ["Created", dateTime(run.createdAt)],
-          ["Updated", dateTime(run.updatedAt)],
-          ["Observed spend", run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "Not reported"],
-          ["Error category", run.errorCategory ?? "None reported"],
-          ["Finalized", run.finalized ? "Yes" : run.finalizationRequested ? "Requested" : "No"],
-        ];
-        if (admin && "ownerDisplayEmail" in run) detailItems.push(["Owner", String(run.ownerDisplayEmail ?? "Not reported")]);
+        const selectedStage = run.stages.find((stage) => stage.id === selectedStageId) ?? run.stages.find((stage) => stage.state === "running" || stage.state === "failed") ?? run.stages[0];
         return (
           <article className="space-y-6">
-            <header className="rounded-panel border bg-panel p-5 shadow-sm sm:p-6">
-              <div className="flex flex-wrap items-start justify-between gap-4">
-                <div><p className="text-xs font-semibold uppercase tracking-wide text-muted-ink">Workflow run</p><h2 className="mt-1 text-2xl font-semibold tracking-tight">{run.workflow}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{run.taskUid}</p></div>
-                <StatusBadge value={run.phase} />
+            <header className="flex flex-wrap items-start justify-between gap-5">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-3"><h1 className="text-[28px] font-semibold tracking-tight" id="page-title">{pinnedWorkflow}</h1><StatusBadge value={run.phase} /></div>
+                <p className="mt-1 break-all font-mono text-xs text-muted-ink">{run.taskUid}</p>
+                {run.trigger ? <div className="mt-2 text-sm text-muted-ink">Triggered by <strong className="font-medium text-ink">{run.trigger.actor}</strong> via {run.trigger.event} · <a href={run.trigger.runUrl} rel="noreferrer" target="_blank">{run.trigger.repository}@{run.trigger.ref} ({run.trigger.sha.slice(0, 7)})</a> · {durationLabel(run.createdAt, run.updatedAt)}</div> : <div className="mt-2 text-sm text-muted-ink">Started {dateTime(run.createdAt)} · {durationLabel(run.createdAt, run.updatedAt)}</div>}
               </div>
-              <div className="mt-5 flex flex-wrap items-center gap-x-5 gap-y-2 border-t border-line-soft pt-4 text-sm text-muted-ink"><span>Started {dateTime(run.createdAt)}</span><span>Duration {durationLabel(run.createdAt, run.updatedAt)}</span></div>
-              {!admin ? <div className="mt-5 flex flex-wrap gap-3"><button className="min-h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={rerunState === "working"} onClick={async () => {
+              {!admin ? <div className="flex flex-wrap gap-2"><button className="min-h-10 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={rerunState === "working"} onClick={async () => {
                 if (session.status !== "authenticated") return;
                 setRerunState("working");
                 const idempotencyKey = crypto.randomUUID();
                 const outcome = await pollRerun(() => rerunMyRun({ body: { idempotencyKey }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { task_uid: taskUid } }));
                 if ("taskUid" in outcome) router.push(`/runs/${outcome.taskUid}`);
                 else setRerunState(outcome.failure);
-              }} type="button">{rerunState === "working" ? "Starting…" : "Re-run"}</button>{!isTerminalPhase(run.phase) ? <button className="min-h-10 rounded-control border border-danger-line px-4 py-2 text-sm font-semibold text-err disabled:opacity-50" disabled={cancelState === "working" || cancelState === "cancelled"} onClick={async () => {
+              }} type="button">{rerunState === "working" ? "Starting…" : "Re-run"}</button>{!isTerminalPhase(run.phase) ? <button aria-label="Cancel run" className="min-h-10 rounded-control border border-danger-line px-4 py-2 text-sm font-semibold text-err disabled:opacity-50" disabled={cancelState === "working" || cancelState === "cancelled"} onClick={async () => {
                 if (session.status !== "authenticated") return;
                 setCancelState("working");
                 const result = await cancelMyRun({ cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { task_uid: taskUid } });
                 setCancelState(result.data && result.response?.ok ? "cancelled" : classifyMutationFailure(result.response?.status));
-              }} type="button">{cancelState === "working" ? "Cancelling…" : cancelState === "cancelled" ? "Cancellation requested" : "Cancel run"}</button> : null}</div> : null}
-              {rerunState !== "idle" && rerunState !== "working" ? <p className="mt-3 text-sm text-err" role="alert">The run could not be re-run ({rerunState}).</p> : null}
-              {cancelState !== "idle" && cancelState !== "working" && cancelState !== "cancelled" ? <p className="mt-3 text-sm text-err" role="alert">The run could not be cancelled ({cancelState}).</p> : null}
+              }} type="button">{cancelState === "working" ? "Cancelling…" : cancelState === "cancelled" ? "Cancellation requested" : "···"}</button> : null}</div> : null}
             </header>
-            <div className="grid items-start gap-6 xl:grid-cols-[minmax(0,1.45fr)_minmax(300px,0.72fr)]">
-              <section aria-labelledby="stages-title" className="overflow-hidden rounded-panel border bg-panel shadow-sm">
-                <div className="border-b border-line px-5 py-4"><h3 className="font-semibold" id="stages-title">Jobs</h3><p className="mt-1 text-sm text-muted-ink">Governed execution stages and captured output.</p></div>
-                {run.stages.length ? <ol className="divide-y divide-line-soft">{run.stages.map((stage, index) => <li key={stage.id}><details className="group" open><summary className="flex cursor-pointer list-none items-center gap-3 px-5 py-4"><span aria-hidden="true" className={`grid size-6 shrink-0 place-items-center rounded-full text-xs font-bold ${stage.state === "succeeded" ? "bg-ok-soft text-ok" : stage.state === "failed" ? "bg-err-soft text-err" : "bg-info-soft text-info"}`}>{stage.state === "succeeded" ? "✓" : stage.state === "failed" ? "×" : index + 1}</span><span className="min-w-0 flex-1 font-semibold">{stage.displayName}</span><StatusBadge value={stage.state} /><span aria-hidden="true" className="text-muted-ink transition-transform group-open:rotate-90">›</span></summary>{stage.steps.length ? <div className="border-t border-line-soft bg-subtle px-5 py-3 ps-14">{stage.steps.map((step) => <div className="flex flex-wrap items-center justify-between gap-3 py-2" key={step.id}><span className="text-sm">{step.displayName}</span><div className="flex gap-2">{step.logStreams.map((stream) => <a className="rounded-control border bg-panel px-3 py-1.5 font-mono text-xs font-semibold" href={`${admin ? "/admin/runs" : "/runs"}/${encodeURIComponent(taskUid)}/logs/${stream}`} key={stream}>{stream}</a>)}</div></div>)}</div> : null}</details></li>)}</ol> : <div className="p-5"><EmptyState title="No stages reported" /></div>}
-              </section>
-              <aside className="space-y-5">
-                <SectionCard title="Summary"><DefinitionList items={detailItems} /></SectionCard>
-                {run.trigger ? <SectionCard title="Triggered by GitHub"><DefinitionList items={[["Repository", run.trigger.repository], ["Event", run.trigger.event], ["Actor", run.trigger.actor], ["Ref", run.trigger.ref], ["Commit", run.trigger.sha], ["Workflow", run.trigger.callerWorkflow]]} /><a className="mt-4 inline-flex text-sm font-semibold text-link hover:text-link-hover" href={run.trigger.runUrl} rel="noreferrer" target="_blank">Open GitHub run ↗</a></SectionCard> : null}
-              </aside>
+            {rerunState !== "idle" && rerunState !== "working" ? <p className="text-sm text-err" role="alert">The run could not be re-run ({rerunState}).</p> : null}
+            {cancelState !== "idle" && cancelState !== "working" && cancelState !== "cancelled" ? <p className="text-sm text-err" role="alert">The run could not be cancelled ({cancelState}).</p> : null}
+            <div className="grid min-h-[540px] overflow-hidden rounded-panel border bg-panel lg:grid-cols-[260px_minmax(0,1fr)]">
+              <nav aria-label="Run jobs" className="border-b border-line lg:border-b-0 lg:border-r">
+                <div className="border-b border-line-soft px-5 py-4 text-sm font-semibold">Jobs</div>
+                {run.stages.length ? <ol className="p-2">{run.stages.map((stage) => <li key={stage.id}><button aria-current={stage.id === selectedStage?.id ? "true" : undefined} className={`flex w-full items-center gap-3 rounded-control px-3 py-3 text-left text-sm ${stage.id === selectedStage?.id ? "bg-brand-soft" : "hover:bg-subtle"}`} onClick={() => setSelectedStageId(stage.id)} type="button"><span aria-hidden="true" className={`size-2.5 shrink-0 rounded-full ${stage.state === "succeeded" ? "bg-ok" : stage.state === "failed" ? "bg-err" : stage.state === "running" ? "bg-info" : "bg-line"}`} /><span className="min-w-0 flex-1 font-medium">{stage.displayName}</span><span className="font-mono text-xs text-faint-ink">—</span></button></li>)}</ol> : <div className="p-5"><EmptyState title="No stages reported" /></div>}
+                <div className="mx-5 border-t border-line-soft py-4 text-xs text-muted-ink"><p className="font-mono">{taskUid}</p><p className="mt-2">Created {dateTime(run.createdAt)}</p></div>
+              </nav>
+              <main className="min-w-0">
+                <div className="grid border-b border-line-soft bg-subtle sm:grid-cols-2 xl:grid-cols-5">{[
+                  ["Workflow version", pinnedWorkflow],
+                  ["User envelope revision", run.userEnvelopeRevision ?? "—"],
+                  ["Runtime", run.runtimeUid ?? "unassigned"],
+                  ["Spend", run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "—"],
+                  ["Agent", run.codingAgentRuntime],
+                ].map(([label, value]) => <div className="min-w-0 border-b border-line-soft px-4 py-3 last:border-b-0 sm:border-r xl:border-b-0" key={label}><p className="text-xs text-muted-ink">{label}</p><p className="mt-1 truncate font-mono text-sm font-medium">{value}</p></div>)}</div>
+                <section aria-labelledby="selected-stage" className="p-5">
+                  <div className="flex items-center justify-between gap-4"><h2 className="text-lg font-semibold" id="selected-stage">{selectedStage?.displayName ?? "Run stages"}</h2>{selectedStage ? <StatusBadge value={selectedStage.state} /> : null}</div>
+                  <p className="mt-5 rounded-control border border-warn/30 bg-warn-soft px-4 py-3 text-sm text-warn"><strong className="block font-semibold text-warn" id="sensitivity-notice">Sensitivity notice</strong>Execution logs may reproduce arbitrary user, tool, or agent output.</p>
+                  {selectedStage?.steps.length ? <ol className="mt-5 divide-y divide-line-soft rounded-card border">{selectedStage.steps.map((step) => <li key={step.id}><details className="group"><summary className="flex cursor-pointer list-none items-center gap-3 px-4 py-3.5"><span aria-hidden="true" className={`grid size-5 place-items-center rounded-full text-xs ${step.state === "succeeded" ? "bg-ok-soft text-ok" : step.state === "failed" ? "bg-err-soft text-err" : "bg-info-soft text-info"}`}>{step.state === "succeeded" ? "✓" : step.state === "failed" ? "×" : "•"}</span><span className="min-w-0 flex-1 text-sm font-medium">{step.displayName}</span><span className="font-mono text-xs text-faint-ink">—</span><span aria-hidden="true" className="transition-transform group-open:rotate-90">›</span></summary>{step.logStreams.length ? <div className="border-t border-line-soft bg-subtle px-4 py-4"><div className="flex flex-wrap gap-2">{step.logStreams.map((stream) => <a className="rounded-control border bg-panel px-3 py-2 font-mono text-xs font-semibold" href={`${admin ? "/admin/runs" : "/runs"}/${encodeURIComponent(taskUid)}/logs/${stream}`} key={stream}>View {stream}</a>)}</div></div> : null}</details></li>)}</ol> : <div className="mt-5"><EmptyState title="No steps reported" /></div>}
+                </section>
+              </main>
             </div>
           </article>
         );
