@@ -873,13 +873,16 @@ test("Next pages carry one strict nonce and nested developer navigation", async 
     expect(scriptNonces.length).toBeGreaterThan(0);
     expect(scriptNonces.every((value) => value === nonce)).toBe(true);
 
-    await session.page.getByRole("button", { name: "Account menu" }).click();
-    await expect(session.page.getByRole("menu", { name: "Account" }).getByText("Alice Example", { exact: true })).toBeVisible();
-    await session.page.getByRole("button", { name: "Account menu" }).click();
-    await expect(session.page.getByRole("link", { name: "Envelopes", exact: true })).toHaveAttribute("aria-current", "page");
-    await session.page.getByRole("link", { name: "Runs", exact: true }).click();
+    const accountMenu = session.page.getByRole("button", { name: "Account menu" });
+    await expect(accountMenu.getByText("Alice Example", { exact: true })).toBeVisible();
+    await accountMenu.click();
+    await expect(session.page.getByRole("menu", { name: "Account" }).getByText("Mode", { exact: true })).toBeVisible();
+    await accountMenu.click();
+    const navigation = session.page.getByRole("navigation", { name: "Primary navigation" });
+    await expect(navigation.getByRole("link", { name: "Envelopes", exact: true })).toHaveAttribute("aria-current", "page");
+    await navigation.getByRole("link", { name: "Runs", exact: true }).click();
     await expect(session.page).toHaveURL(`${origin}/runs`);
-    await expect(session.page.getByRole("link", { name: "Runs", exact: true })).toHaveAttribute("aria-current", "page");
+    await expect(navigation.getByRole("link", { name: "Runs", exact: true })).toHaveAttribute("aria-current", "page");
   } finally {
     await closeGuardedPage(session);
   }
@@ -898,13 +901,13 @@ test("the shell carries the HyperShell visual system", async ({ browser }) => {
 
     const brand = await session.page.evaluate(() => {
       const body = getComputedStyle(document.body);
-      const header = getComputedStyle(document.querySelector("body > div > header"));
+      const sidebar = getComputedStyle(document.querySelector("aside"));
       const primary = getComputedStyle(document.querySelector("a[href='/envelopes/new']"));
       return {
         background: body.backgroundColor,
         foreground: body.color,
         font: body.fontFamily,
-        headerBorder: header.borderBottomColor,
+        sidebarBorder: sidebar.borderRightColor,
         primary: primary.backgroundColor,
       };
     });
@@ -912,7 +915,7 @@ test("the shell carries the HyperShell visual system", async ({ browser }) => {
       background: "rgb(21, 23, 24)",
       foreground: "rgb(236, 238, 239)",
       font: expect.stringContaining("Space Grotesk"),
-      headerBorder: "rgb(47, 52, 55)",
+      sidebarBorder: "rgb(47, 52, 55)",
       primary: "rgb(251, 81, 8)",
     });
   } finally {
@@ -982,24 +985,19 @@ test("the account menu identifies the user and exposes only server-authorized wo
   try {
     await developer.page.goto(`${origin}/envelopes`);
     const accountButton = developer.page.getByRole("button", { name: "Account menu" });
-    await expect(accountButton).toHaveText("A");
-    const accountButtonBox = await accountButton.boundingBox();
-    expect(accountButtonBox?.width).toBe(accountButtonBox?.height);
-    expect(accountButtonBox?.width ?? 0).toBeGreaterThanOrEqual(40);
+    await expect(accountButton.getByText("Alice Example", { exact: true })).toBeVisible();
+    await expect(accountButton.getByText("alice@example.com", { exact: true })).toBeVisible();
     await accountButton.click();
     const account = developer.page.getByRole("menu", { name: "Account" });
-    await expect(account.getByText("Alice Example", { exact: true })).toBeVisible();
-    await expect(account.getByText("alice@example.com", { exact: true })).toBeVisible();
     await expect(account.getByLabel("Workspace view")).toHaveCount(0);
     await expect(account.getByText("Mode", { exact: true })).toBeVisible();
     await expect(account.getByText("APPEARANCE", { exact: true })).toHaveCount(0);
-    await account.getByRole("button", { name: "Switch to dark mode" }).click();
+    await account.getByRole("button", { name: "dark", exact: true }).click();
     await expect(developer.page.locator("html")).toHaveAttribute("data-theme", "dark");
-    await expect(account.getByRole("button", { name: "Switch to light mode" })).toBeVisible();
+    await expect(account.getByRole("button", { name: "light", exact: true })).toBeVisible();
 
     const logoutButton = account.getByRole("button", { name: "Log out" });
-    await expect(logoutButton).toHaveCSS("background-color", "rgb(251, 81, 8)");
-    await expect(logoutButton.locator("xpath=..")).toHaveCSS("border-top-style", "solid");
+    await expect(logoutButton).toHaveCSS("color", "rgb(255, 139, 125)");
     await logoutButton.click();
     await expect(developer.page).toHaveURL(`${origin}/admin/sign-in`);
     await expect(developer.page.getByRole("heading", { name: "Signed out" })).toBeVisible();
@@ -1013,23 +1011,15 @@ test("the account menu identifies the user and exposes only server-authorized wo
   const dualRole = await guardedPage(browser, { session: administratorSession });
   try {
     await dualRole.page.goto(`${origin}/envelopes`);
-    await dualRole.page.getByRole("button", { name: "Account menu" }).click();
-    const account = dualRole.page.getByRole("menu", { name: "Account" });
-    const workspace = account.getByLabel("Workspace view");
-    await expect(workspace).toHaveValue("user");
-    await expect(workspace.locator("option")).toHaveText(["User", "Admin"]);
-    await expect(workspace.locator("xpath=..")).toHaveCSS("border-top-style", "solid");
-    await workspace.selectOption("admin");
+    const workspace = dualRole.page.getByRole("group", { name: "Workspace view" });
+    await expect(workspace.getByRole("button", { name: "user", exact: true })).toHaveAttribute("aria-pressed", "true");
+    await workspace.getByRole("button", { name: "admin", exact: true }).click();
     await expect(dualRole.page).toHaveURL(`${origin}/admin/envelopes/templates`);
-    await dualRole.page.getByRole("button", { name: "Account menu" }).click();
-    await expect(dualRole.page.getByRole("menu", { name: "Account" }).getByLabel("Workspace view")).toHaveValue("admin");
-    await expect(dualRole.page.getByRole("link", { name: "Templates", exact: true })).toHaveAttribute("aria-current", "page");
-    await dualRole.page.getByRole("button", { name: "Account menu" }).click();
+    await expect(dualRole.page.getByRole("group", { name: "Workspace view" }).getByRole("button", { name: "admin", exact: true })).toHaveAttribute("aria-pressed", "true");
+    await expect(dualRole.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Templates", exact: true })).toHaveAttribute("aria-current", "page");
     await dualRole.page.goBack();
     await expect(dualRole.page).toHaveURL(`${origin}/envelopes`);
-    await dualRole.page.getByRole("button", { name: "Account menu" }).click();
-    await expect(dualRole.page.getByRole("menu", { name: "Account" }).getByLabel("Workspace view")).toHaveValue("user");
-    await dualRole.page.getByRole("button", { name: "Account menu" }).click();
+    await expect(dualRole.page.getByRole("group", { name: "Workspace view" }).getByRole("button", { name: "user", exact: true })).toHaveAttribute("aria-pressed", "true");
     await dualRole.page.goForward();
     await expect(dualRole.page).toHaveURL(`${origin}/admin/envelopes/templates`);
   } finally {
@@ -1075,8 +1065,7 @@ test("a rolling local session contract falls back to the authenticated email wit
   const session = await guardedPage(browser, { session: previousSessionContract });
   try {
     await session.page.goto(`${origin}/envelopes`);
-    await session.page.getByRole("button", { name: "Account menu" }).click();
-    const email = session.page.getByRole("menu", { name: "Account" }).getByText("alice@example.com", { exact: true });
+    const email = session.page.getByRole("button", { name: "Account menu" }).locator(".text-muted-ink");
     await expect(email).toBeVisible();
     await expect(email).toHaveCSS("font-weight", "400");
   } finally {
@@ -1091,9 +1080,9 @@ test("every presentation route remains navigable at a narrow viewport", async ({
       await test.step(route.path, async () => {
         await session.page.goto(`${origin}${route.path}`);
         await expect(session.page.getByRole("heading", { name: route.heading, exact: true }).first()).toBeVisible();
-        const activeLink = route.activeNavigation === "Approvals"
-          ? session.page.getByRole("link", { name: /^Approvals/ })
-          : session.page.getByRole("link", { name: route.activeNavigation, exact: true });
+        const navigation = session.page.getByRole("navigation", { name: "Primary navigation" });
+        const activeLabel = route.activeNavigation === "Approvals" ? "Requests" : route.activeNavigation === "Provision" ? "Templates" : route.activeNavigation;
+        const activeLink = navigation.getByRole("link", { name: activeLabel, exact: true });
         await expect(activeLink).toHaveAttribute("aria-current", "page");
         const dimensions = await session.page.evaluate(() => ({
           clientWidth: document.documentElement.clientWidth,

@@ -10,10 +10,12 @@ import {
   updateBrowserPreferences,
   type BrowserTheme,
 } from "@/api-client";
+import { Breadcrumbs, type BreadcrumbItem } from "@/components/hs/breadcrumbs";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { authStartPath } from "@/session/auth-redirect";
 import { useSession, type SessionState } from "@/session/session-context";
 
-const developerNavigation = [
+const userNavigation = [
   { href: "/get-started", label: "Get started" },
   { href: "/envelopes", label: "Envelopes" },
   { href: "/runs", label: "Runs" },
@@ -22,25 +24,79 @@ const developerNavigation = [
 ] as const;
 
 const adminNavigation = [
-  { href: "/admin/workflows", label: "Workflows" },
   { href: "/admin/envelopes/templates", label: "Templates" },
-  { href: "/admin/envelopes/provision", label: "Provision" },
+  { href: "/admin/approvals", label: "Requests" },
   { href: "/admin/runs", label: "Runs" },
-  { href: "/admin/approvals", label: "Approvals" },
+  { href: "/admin/workflows", label: "Workflows" },
   { href: "/admin/settings", label: "Settings" },
 ] as const;
 
 export function isActive(pathname: string, href: string): boolean {
+  if (href === "/admin/envelopes/templates" && pathname === "/admin/envelopes/provision") return true;
   return pathname === href || pathname.startsWith(`${href}/`);
 }
 
 export function hasDualRole(session: SessionState): boolean {
-  return session.status === "authenticated"
-    && session.value.role === "admin";
+  return session.status === "authenticated" && session.value.role === "admin";
 }
 
 export function workspaceLandingPath(workspace: "admin" | "user"): string {
   return workspace === "admin" ? "/admin/envelopes/templates" : "/envelopes";
+}
+
+function shortId(value: string): string {
+  return value.length > 16 ? `${value.slice(0, 12)}…` : value;
+}
+
+export function breadcrumbsForPath(pathname: string): BreadcrumbItem[] {
+  const parts = pathname.split("/").filter(Boolean);
+  const admin = parts[0] === "admin";
+  const root: BreadcrumbItem = { label: admin ? "Admin" : "User" };
+  const rest = admin ? parts.slice(1) : parts;
+  if (rest.length === 0) return [root];
+
+  if (admin && rest[0] === "envelopes" && rest[1] === "templates") {
+    if (!rest[2]) return [root, { label: "Templates" }];
+    if (rest[2] === "new") return [root, { href: "/admin/envelopes/templates", label: "Templates" }, { label: "New template" }];
+    return [root, { href: "/admin/envelopes/templates", label: "Templates" }, { label: shortId(rest[2]), mono: true }];
+  }
+  if (admin && rest[0] === "envelopes" && rest[1] === "provision") {
+    return [root, { href: "/admin/envelopes/templates", label: "Templates" }, { label: "Provision envelope" }];
+  }
+  if (rest[0] === "envelopes") {
+    if (!rest[1]) return [root, { label: "Envelopes" }];
+    if (rest[1] === "new") return [root, { href: "/envelopes", label: "Envelopes" }, { label: "New request" }];
+    const items: BreadcrumbItem[] = [root, { href: "/envelopes", label: "Envelopes" }, { label: shortId(rest[1]), mono: true }];
+    if (rest[2] === "runs") {
+      items[items.length - 1] = { href: `/envelopes/${rest[1]}`, label: shortId(rest[1]), mono: true };
+      items.push({ label: "Runs" });
+    }
+    return items;
+  }
+  if (rest[0] === "runs") {
+    return rest[1]
+      ? [root, { href: admin ? "/admin/runs" : "/runs", label: "Runs" }, { label: shortId(rest[1]), mono: true }]
+      : [root, { label: "Runs" }];
+  }
+  if (admin && rest[0] === "approvals") {
+    return rest[1]
+      ? [root, { href: "/admin/approvals", label: "Requests" }, { label: shortId(rest[1]), mono: true }]
+      : [root, { label: "Requests" }];
+  }
+  if (admin && rest[0] === "workflows") {
+    const items: BreadcrumbItem[] = [root, { label: "Workflows" }];
+    if (rest[1]) {
+      items[1] = { href: "/admin/workflows", label: "Workflows" };
+      items.push({ label: rest[1], mono: true });
+    }
+    return items;
+  }
+  const labels: Record<string, string> = {
+    "get-started": "Get started",
+    connections: "Connections",
+    settings: "Settings",
+  };
+  return [root, { label: labels[rest[0]] ?? rest[0].replaceAll("-", " ") }];
 }
 
 type ResolvedTheme = "dark" | "light";
@@ -59,90 +115,91 @@ function subscribeToPreferredTheme(onChange: () => void): () => void {
   return () => preference.removeEventListener("change", onChange);
 }
 
-function signedOutPath(): string {
-  return "/admin/sign-in";
-}
-
 function applyThemePreference(preference: BrowserTheme): void {
-  if (preference === "system") {
-    delete document.documentElement.dataset.theme;
-  } else {
-    document.documentElement.dataset.theme = preference;
-  }
+  if (preference === "system") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = preference;
   document.cookie = `hypershell-theme=${preference}; Path=/; Max-Age=31536000; SameSite=Lax`;
 }
 
 function StatePanel({ children, title }: Readonly<{ children: ReactNode; title: string }>) {
   return (
-    <section aria-labelledby="session-state-title" className="mx-auto mt-12 max-w-xl rounded-panel border bg-panel p-6 shadow-sm">
+    <section aria-labelledby="session-state-title" className="mx-auto mt-12 max-w-xl rounded-card border bg-panel p-6">
       <h1 className="text-xl font-semibold" id="session-state-title">{title}</h1>
       <div className="mt-3 text-sm leading-6 text-muted-ink">{children}</div>
     </section>
   );
 }
 
-function ThemeIcon({ theme }: Readonly<{ theme: ResolvedTheme }>) {
-  return theme === "light" ? (
-    <svg aria-hidden="true" fill="none" height="20" viewBox="0 0 24 24" width="20">
-      <circle cx="12" cy="12" r="4" stroke="currentColor" strokeWidth="2" />
-      <path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41" stroke="currentColor" strokeLinecap="round" strokeWidth="2" />
-    </svg>
-  ) : (
-    <svg aria-hidden="true" fill="none" height="20" viewBox="0 0 24 24" width="20">
-      <path d="M20.2 15.3A8.5 8.5 0 0 1 8.7 3.8 8.5 8.5 0 1 0 20.2 15.3Z" stroke="currentColor" strokeLinejoin="round" strokeWidth="2" />
-    </svg>
+function WorkspaceSwitch({ adminMode }: Readonly<{ adminMode: boolean }>) {
+  const router = useRouter();
+  return (
+    <div aria-label="Workspace view" className="grid grid-cols-2 rounded-control bg-line-soft p-[3px]" role="group">
+      {(["user", "admin"] as const).map((workspace) => {
+        const active = workspace === (adminMode ? "admin" : "user");
+        return (
+          <button
+            aria-pressed={active}
+            className={`h-8 rounded-[6px] text-[13px] font-semibold capitalize ${active ? "bg-panel text-ink shadow-control" : "text-muted-ink hover:text-ink"}`}
+            key={workspace}
+            onClick={() => router.push(workspaceLandingPath(workspace))}
+            type="button"
+          >
+            {workspace}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
-function AccountMenu({ adminMode, session }: Readonly<{
+function ProfileMenu({ adminMode, session }: Readonly<{
   adminMode: boolean;
   session: Extract<SessionState, { status: "authenticated" }>;
 }>) {
-  const router = useRouter();
   const [open, setOpen] = useState(false);
   const [selectedTheme, setSelectedTheme] = useState<BrowserTheme>("system");
   const [logoutFailed, setLogoutFailed] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
-  const containerRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const displayEmail = session.value.principal.displayEmail;
   const verifiedDisplayName = session.value.principal.displayName?.trim();
   const displayName = verifiedDisplayName || displayEmail;
   const initial = displayName.trim().charAt(0).toUpperCase() || "?";
-  const dualRole = hasDualRole(session);
   const systemTheme = useSyncExternalStore(subscribeToPreferredTheme, preferredTheme, serverTheme);
-  const theme = selectedTheme === "system" ? systemTheme : selectedTheme;
+  const resolvedTheme = selectedTheme === "system" ? systemTheme : selectedTheme;
 
   useEffect(() => {
     let active = true;
     void getBrowserPreferences({ cache: "no-store", credentials: "same-origin" }).then((result) => {
-      const preference = result.data?.theme ?? "system";
-      if (!active || !result.response?.ok) return;
-      setSelectedTheme(preference);
-      applyThemePreference(preference);
+      if (!active || !result.data || !result.response?.ok) return;
+      const theme = result.data.theme ?? "system";
+      setSelectedTheme(theme);
+      applyThemePreference(theme);
     });
     return () => { active = false; };
   }, []);
 
   useEffect(() => {
     if (!open) return;
-
-    const closeOnOutsidePointer = (event: PointerEvent) => {
-      if (!containerRef.current?.contains(event.target as Node)) setOpen(false);
-    };
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       setOpen(false);
       buttonRef.current?.focus();
     };
-
-    document.addEventListener("pointerdown", closeOnOutsidePointer);
     document.addEventListener("keydown", closeOnEscape);
-    return () => {
-      document.removeEventListener("pointerdown", closeOnOutsidePointer);
-      document.removeEventListener("keydown", closeOnEscape);
-    };
+    return () => document.removeEventListener("keydown", closeOnEscape);
   }, [open]);
+
+  const chooseTheme = (theme: BrowserTheme) => {
+    setSelectedTheme(theme);
+    applyThemePreference(theme);
+    void updateBrowserPreferences({
+      body: { theme },
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "X-Steward-CSRF": session.value.csrf },
+    });
+  };
 
   const logout = async () => {
     setLoggingOut(true);
@@ -152,120 +209,113 @@ function AccountMenu({ adminMode, session }: Readonly<{
         body: "{}",
         cache: "no-store",
         credentials: "same-origin",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Steward-CSRF": session.value.csrf,
-        },
+        headers: { "Content-Type": "application/json", "X-Steward-CSRF": session.value.csrf },
         method: "POST",
       });
-      if (response.status === 204) {
-        window.location.replace(signedOutPath());
-        return;
-      }
-      if (response.status === 401) {
-        window.location.replace(signedOutPath());
+      if (response.status === 204 || response.status === 401) {
+        window.location.replace("/admin/sign-in");
         return;
       }
     } catch {
-      // The fixed failure message below keeps transport details out of the account surface.
+      // Fixed copy below deliberately avoids surfacing transport details.
     }
     setLoggingOut(false);
     setLogoutFailed(true);
   };
 
   return (
-    <div className="account-menu-anchor relative" ref={containerRef}>
+    <div className="overflow-hidden rounded-tile border border-line bg-panel">
+      {open ? (
+        <div aria-label="Account" className="space-y-3 border-b border-line-soft p-3" role="menu">
+          <div>
+            <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-[0.06em] text-faint-ink">Mode</p>
+            <div className="grid grid-cols-3 rounded-control bg-line-soft p-[3px]">
+              {(["system", "light", "dark"] as const).map((theme) => (
+                <button
+                  aria-pressed={selectedTheme === theme}
+                  className={`h-8 rounded-[6px] text-xs font-semibold capitalize ${selectedTheme === theme ? "bg-panel text-ink shadow-control" : "text-muted-ink hover:text-ink"}`}
+                  key={theme}
+                  onClick={() => chooseTheme(theme)}
+                  type="button"
+                >
+                  {theme}{theme === "system" ? ` (${resolvedTheme})` : ""}
+                </button>
+              ))}
+            </div>
+          </div>
+          <Link className="block rounded-control px-2 py-1.5 text-[13px] font-medium text-ink hover:bg-line-soft" href={adminMode ? "/admin/settings" : "/settings"} onClick={() => setOpen(false)}>Account settings</Link>
+          <button className="w-full rounded-control px-2 py-1.5 text-left text-[13px] font-semibold text-err hover:bg-err-soft disabled:cursor-wait disabled:opacity-60" disabled={loggingOut} onClick={() => void logout()} type="button">
+            {loggingOut ? "Logging out…" : "Log out"}
+          </button>
+          {logoutFailed ? <p className="text-xs text-err" role="status">Could not log out.</p> : null}
+        </div>
+      ) : null}
       <button
         aria-expanded={open}
         aria-haspopup="menu"
         aria-label="Account menu"
-        className="account-avatar flex shrink-0 items-center justify-center border border-brand/50 bg-brand text-sm font-bold text-white shadow-sm transition hover:bg-brand-strong focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand"
+        className="flex w-full items-center gap-2.5 p-2.5 text-left hover:bg-subtle"
         onClick={() => setOpen((value) => !value)}
         ref={buttonRef}
-        title={displayName}
         type="button"
       >
-        {initial}
+        <span aria-hidden="true" className="flex size-8 shrink-0 items-center justify-center rounded-full bg-brand text-[13px] font-bold text-on-brand">{initial}</span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-[13px] font-semibold text-ink">{displayName}</span>
+          <span className="block truncate text-xs text-muted-ink">{displayEmail}</span>
+        </span>
+        <span aria-hidden="true" className={`me-1 size-2 border-e border-b border-muted-ink transition-transform ${open ? "-rotate-[135deg] translate-y-0.5" : "rotate-45 -translate-y-0.5"}`} />
       </button>
-      {open ? (
-        <div
-          aria-label="Account"
-          className="absolute end-0 top-12 z-40 w-72 overflow-hidden rounded-panel border bg-panel shadow-xl"
-          role="menu"
-        >
-          <div className="flex items-center gap-3 px-4 py-4">
-            <span aria-hidden="true" className="account-avatar account-avatar-large flex shrink-0 items-center justify-center bg-brand text-base font-bold text-white">
-              {initial}
-            </span>
-            <div className="min-w-0">
-              {verifiedDisplayName ? <p className="truncate text-sm font-semibold text-ink" title={verifiedDisplayName}>{verifiedDisplayName}</p> : null}
-              <p className={`${verifiedDisplayName ? "mt-0.5 " : ""}truncate text-sm font-normal text-muted-ink`} title={displayEmail}>{displayEmail}</p>
-            </div>
-          </div>
-          {dualRole ? (
-            <div className="flex items-center justify-between gap-4 border-t px-4 py-3">
-              <label className="text-sm font-medium text-ink" htmlFor="account-workspace">Workspace</label>
-              <select
-                aria-label="Workspace view"
-                className="min-w-28 rounded-md border bg-canvas px-3 py-2 text-sm text-ink"
-                id="account-workspace"
-                onChange={(event) => {
-                  setOpen(false);
-                  router.push(workspaceLandingPath(event.target.value === "admin" ? "admin" : "user"));
-                }}
-                value={adminMode ? "admin" : "user"}
-              >
-                <option value="user">User</option>
-                <option value="admin">Admin</option>
-              </select>
-            </div>
-          ) : null}
-          <div className="flex items-center justify-between border-t px-4 py-3">
-            <span className="text-sm font-medium text-ink">Mode</span>
-            <button
-              aria-label={`Switch to ${theme === "light" ? "dark" : "light"} mode`}
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border bg-canvas text-muted-ink transition hover:border-brand hover:text-brand"
-              onClick={() => {
-                const preference = theme === "light" ? "dark" : "light";
-                setSelectedTheme(preference);
-                applyThemePreference(preference);
-                void updateBrowserPreferences({
-                  body: { theme: preference },
-                  cache: "no-store",
-                  credentials: "same-origin",
-                  headers: { "X-Steward-CSRF": session.value.csrf },
-                });
-              }}
-              title={`${theme === "light" ? "Light" : "Dark"} mode`}
-              type="button"
-            >
-              <ThemeIcon theme={theme} />
-            </button>
-          </div>
-          <div className="border-t p-2">
-            <button
-              className="flex w-full justify-center rounded-md bg-brand px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-brand-strong disabled:cursor-wait disabled:opacity-60"
-              disabled={loggingOut}
-              onClick={() => void logout()}
-              type="button"
-            >
-              {loggingOut ? "Logging out…" : "Log out"}
-            </button>
-            {logoutFailed ? <p className="px-2 pt-2 text-center text-xs text-muted-ink" role="status">Could not log out.</p> : null}
-          </div>
-        </div>
-      ) : null}
     </div>
+  );
+}
+
+function AppSidebar({ adminMode, needsAction, session }: Readonly<{
+  adminMode: boolean;
+  needsAction: number | null;
+  session: Extract<SessionState, { status: "authenticated" }>;
+}>) {
+  const pathname = usePathname();
+  const navigation = adminMode ? adminNavigation : userNavigation;
+  return (
+    <aside className="flex min-h-full flex-col border-b border-line bg-panel px-3 pt-[18px] pb-3 md:sticky md:top-0 md:h-screen md:border-e md:border-b-0">
+      <Link aria-label="HyperShell home" className="flex items-center gap-2.5 px-2 pb-[22px] text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"}>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img alt="HyperShell" className="size-8 rounded-control bg-white object-cover" height="32" src="/brand/logo" width="32" />
+        <span className="text-[17px] font-semibold tracking-[-0.02em]">HyperShell</span>
+      </Link>
+      <p className="px-3 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.06em] text-faint-ink">{adminMode ? "Admin workspace" : "User workspace"}</p>
+      <nav aria-label="Primary navigation" className="space-y-0.5">
+        {navigation.map(({ href, label }) => {
+          const active = isActive(pathname, href);
+          const count = href === "/admin/approvals" ? needsAction : null;
+          return (
+            <Link
+              aria-current={active ? "page" : undefined}
+              className="flex min-h-9 items-center gap-2.5 rounded-control px-3 py-2 text-sm font-medium text-muted-ink hover:bg-line-soft hover:text-ink aria-[current=page]:bg-brand-soft aria-[current=page]:text-ink"
+              href={href}
+              key={href}
+            >
+              <span aria-hidden="true" className={`size-1.5 rounded-[2px] ${active ? "bg-brand" : "bg-field"}`} />
+              <span>{label}</span>
+              {count ? <span aria-hidden="true" className="ms-auto min-w-5 rounded-full bg-brand px-1.5 py-0.5 text-center text-[11px] font-bold text-on-brand">{count}</span> : null}
+            </Link>
+          );
+        })}
+      </nav>
+      <div className="mt-4 space-y-2.5 md:mt-auto">
+        {hasDualRole(session) ? <WorkspaceSwitch adminMode={adminMode} /> : null}
+        <ProfileMenu adminMode={adminMode} session={session} />
+      </div>
+    </aside>
   );
 }
 
 export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
   const pathname = usePathname();
   const session = useSession();
-  const adminMode = pathname.startsWith("/admin/");
-  const navigation = adminMode ? adminNavigation : developerNavigation;
-  const workspaceAuthorized = session.status === "authenticated"
-    && (!adminMode || session.value.role === "admin");
+  const adminMode = pathname === "/admin" || pathname.startsWith("/admin/");
+  const workspaceAuthorized = session.status === "authenticated" && (!adminMode || session.value.role === "admin");
   const [needsAction, setNeedsAction] = useState<number | null>(null);
 
   useEffect(() => {
@@ -278,65 +328,31 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
   }, [adminMode, workspaceAuthorized]);
 
   return (
-    <div className="min-h-screen">
-      <a className="sr-only focus:not-sr-only focus:fixed focus:start-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-panel focus:px-4 focus:py-3" href="#workspace">
-        Skip to workspace
-      </a>
-      <header className="border-b bg-panel">
-        <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-7 gap-y-3 px-4 py-4 sm:px-6 lg:px-8">
-          <Link
-            aria-label="HyperShell home"
-            className="me-auto flex items-center gap-2.5 text-lg font-semibold tracking-tight text-ink"
-            href={adminMode && workspaceAuthorized ? "/admin/runs" : "/envelopes"}
-          >
-            {/* The same-origin image keeps the mark visible under HyperShell's strict style CSP. */}
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img alt="HyperShell" className="size-8 shrink-0 rounded-control bg-white object-cover" height="32" src="/brand/logo" width="32" />
-            <span>HyperShell</span>
-          </Link>
-          {workspaceAuthorized ? (
-            <nav aria-label="Primary navigation" className="order-3 flex w-full gap-1 overflow-x-auto sm:order-none sm:w-auto">
-              {navigation.map(({ href, label }) => (
-                <Link
-                  aria-current={isActive(pathname, href) ? "page" : undefined}
-                  className="rounded-md px-3 py-2 text-sm font-medium text-muted-ink hover:bg-canvas hover:text-ink aria-[current=page]:bg-canvas aria-[current=page]:text-brand-strong"
-                  href={href}
-                  key={href}
-                >
-                  {label}{href === "/admin/approvals" && needsAction ? <span className="ms-2 rounded-full bg-brand px-2 py-0.5 text-xs text-white">{needsAction}</span> : null}
-                </Link>
-              ))}
-            </nav>
-          ) : null}
-          {session.status === "authenticated" ? <AccountMenu adminMode={adminMode} session={session} /> : null}
-        </div>
-      </header>
-      <main className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8" id="workspace">
-        {session.status === "loading" ? (
-          <StatePanel title="Loading Steward"><p>Checking the server-owned session…</p></StatePanel>
-        ) : null}
-        {session.status === "unauthorized" ? (
-          <StatePanel title="Sign in required">
-            <p>Your browser does not have a valid Steward session.</p>
-            <a
-              className="mt-5 inline-flex rounded-md bg-brand px-4 py-2 font-semibold text-white hover:bg-brand-strong"
-              href={authStartPath(pathname)}
-            >
-              Continue with Google
-            </a>
-          </StatePanel>
-        ) : null}
-        {session.status === "unavailable" ? (
-          <StatePanel title="Session unavailable"><p>Steward could not reach the authoritative session service. Try again shortly.</p></StatePanel>
-        ) : null}
-        {session.status === "error" ? (
-          <StatePanel title="Session error"><p>The session response was not accepted. No workspace data has been loaded.</p></StatePanel>
-        ) : null}
-        {session.status === "authenticated" && adminMode && session.value.role !== "admin" ? (
-          <StatePanel title="Forbidden"><p>Your server-owned session does not grant administrator access.</p></StatePanel>
-        ) : null}
-        {session.status === "authenticated" && (!adminMode || session.value.role === "admin") ? children : null}
-      </main>
-    </div>
+    <TooltipProvider>
+      <div className="min-h-screen md:grid md:grid-cols-[216px_minmax(0,1fr)]">
+        <a className="sr-only focus:not-sr-only focus:fixed focus:start-4 focus:top-4 focus:z-50 focus:rounded-control focus:bg-panel focus:px-4 focus:py-3" href="#workspace">Skip to workspace</a>
+        {session.status === "authenticated" && workspaceAuthorized ? <AppSidebar adminMode={adminMode} needsAction={needsAction} session={session} /> : <div className="hidden md:block" />}
+        <main className="min-w-0 px-4 pt-[18px] pb-16 sm:px-7" id="workspace">
+          <div className="mx-auto max-w-[1180px]">
+            {session.status === "loading" ? <StatePanel title="Loading HyperShell"><p>Checking the server-owned session…</p></StatePanel> : null}
+            {session.status === "unauthorized" ? (
+              <StatePanel title="Sign in required">
+                <p>Your browser does not have a valid HyperShell session.</p>
+                <a className="mt-5 inline-flex h-10 items-center rounded-control bg-brand px-4 text-sm font-semibold text-on-brand hover:bg-brand-hover" href={authStartPath(pathname)}>Continue with Google</a>
+              </StatePanel>
+            ) : null}
+            {session.status === "unavailable" ? <StatePanel title="Session unavailable"><p>HyperShell could not reach the authoritative session service. Try again shortly.</p></StatePanel> : null}
+            {session.status === "error" ? <StatePanel title="Session error"><p>The session response was not accepted. No workspace data has been loaded.</p></StatePanel> : null}
+            {session.status === "authenticated" && adminMode && session.value.role !== "admin" ? <StatePanel title="Forbidden"><p>Your server-owned session does not grant administrator access.</p></StatePanel> : null}
+            {session.status === "authenticated" && workspaceAuthorized ? (
+              <>
+                <Breadcrumbs items={breadcrumbsForPath(pathname)} />
+                {children}
+              </>
+            ) : null}
+          </div>
+        </main>
+      </div>
+    </TooltipProvider>
   );
 }

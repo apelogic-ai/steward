@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { hasDualRole, isActive, workspaceLandingPath } from "./app-shell";
+import { breadcrumbsForPath, hasDualRole, isActive, workspaceLandingPath } from "./app-shell";
 
 describe("primary navigation", () => {
   test("selects Envelopes for list, new, detail, and nested run routes", () => {
@@ -39,5 +39,22 @@ describe("workspace mode availability", () => {
   test("lands administrators on template authoring and members on envelopes", () => {
     expect(workspaceLandingPath("admin")).toBe("/admin/envelopes/templates");
     expect(workspaceLandingPath("user")).toBe("/envelopes");
+  });
+});
+
+describe("breadcrumbs", () => {
+  test("marks a dynamic run identifier as the current mono crumb", () => {
+    expect(breadcrumbsForPath("/runs/task-3c9e1b27-long-value")).toEqual([
+      { label: "User" },
+      { href: "/runs", label: "Runs" },
+      { label: "task-3c9e1b2…", mono: true },
+    ]);
+  });
+
+  test("uses Requests as the administrator-facing approval label", () => {
+    expect(breadcrumbsForPath("/admin/approvals")).toEqual([
+      { label: "Admin" },
+      { label: "Requests" },
+    ]);
   });
 });

@@ -11,9 +11,9 @@ export function PageHeader({ actions, description, title }: Readonly<{
 }>) {
   return (
     <header className="flex flex-wrap items-end justify-between gap-4">
-      <div className="max-w-3xl space-y-2">
-        <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl" id="page-title">{title}</h1>
-        <p className="text-base leading-7 text-muted-ink">{description}</p>
+      <div className="max-w-3xl">
+        <h1 className="text-[28px] font-semibold leading-[34px] tracking-[-0.02em]" id="page-title">{title}</h1>
+        <p className="mt-1.5 text-sm leading-5 text-muted-ink">{description}</p>
       </div>
       {actions}
     </header>
@@ -21,7 +21,7 @@ export function PageHeader({ actions, description, title }: Readonly<{
 }
 
 export function PrimaryLink({ children, href }: Readonly<{ children: ReactNode; href: string }>) {
-  return <Link className="inline-flex min-h-11 items-center rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white hover:bg-brand-strong" href={href}>{children}</Link>;
+  return <Link className="inline-flex h-10 items-center rounded-control bg-brand px-4 text-sm font-semibold text-on-brand hover:bg-brand-hover" href={href}>{children}</Link>;
 }
 
 export function StatusBadge({ value }: Readonly<{ value: string }>) {
