@@ -262,6 +262,7 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
             "externalConfigMaps",
             "execution",
             "browserAuth",
+            "stewardRunRelease",
             "apiTlsSecretName",
             "webhookTlsSecretName",
             "capabilityCatalog",
@@ -559,6 +560,9 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
         requires_inference="inferenceProfile" in binding,
         requires_tools="toolsProfile" in binding,
     )
+    validate_steward_run_release(
+        require_object(data, "stewardRunRelease", "input")
+    )
 
     config_maps = require_object(data, "externalConfigMaps", "input")
     workload_trust = require_object(config_maps, "workloadExchangeTrust", "externalConfigMaps")
@@ -652,6 +656,7 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
             "taskOrchestrationMode": "active",
             "apiserver": {
                 "capabilityCatalog": data["capabilityCatalog"],
+                "stewardRunRelease": data["stewardRunRelease"],
                 "inferenceEndpoint": endpoints["inference"],
                 "mcpGatewayEndpoint": endpoints["mcpGateway"],
                 "executionBindingsMode": "active",
@@ -829,6 +834,50 @@ def validate_browser(data: dict[str, Any]) -> None:
         raise ValidationError("gateway.issuerRef.kind must be Issuer or ClusterIssuer")
     validate_name(require_string(data, "apiTlsSecretName", "input"), "apiTlsSecretName")
     validate_name(require_string(data, "webhookTlsSecretName", "input"), "webhookTlsSecretName")
+
+
+def validate_steward_run_release(release: dict[str, Any]) -> None:
+    path = "stewardRunRelease"
+    require_exact_keys(
+        release,
+        {
+            "manifestSchemaVersion",
+            "version",
+            "workflowRepository",
+            "workflowCommit",
+            "actionCommit",
+            "governedJobContainerImage",
+        },
+        path,
+    )
+    if release.get("manifestSchemaVersion") != 3:
+        raise ValidationError("stewardRunRelease.manifestSchemaVersion must equal 3")
+    version = require_string(release, "version", path)
+    if not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version):
+        raise ValidationError("stewardRunRelease.version must be semantic MAJOR.MINOR.PATCH")
+    if tuple(int(part) for part in version.split(".")) < (0, 7, 0):
+        raise ValidationError("stewardRunRelease.version must be 0.7.0 or later")
+    repository = require_string(release, "workflowRepository", path)
+    repository_parts = repository.split("/")
+    if (
+        len(repository) > 200
+        or len(repository_parts) != 2
+        or any(
+            part in {".", ".."}
+            or len(part) > 100
+            or not re.fullmatch(r"[A-Za-z0-9._-]+", part)
+            for part in repository_parts
+        )
+    ):
+        raise ValidationError("stewardRunRelease.workflowRepository must be owner/repository")
+    for key in ("workflowCommit", "actionCommit"):
+        if not re.fullmatch(r"[0-9a-f]{40}", require_string(release, key, path)):
+            raise ValidationError(f"stewardRunRelease.{key} must be a full lowercase commit")
+    image = require_string(release, "governedJobContainerImage", path)
+    if not re.fullmatch(r"[^@\s:]+(?:/[^@\s:]+)+@sha256:[0-9a-f]{64}", image):
+        raise ValidationError(
+            "stewardRunRelease.governedJobContainerImage must be an immutable sha256 image"
+        )
 
 
 def run_helm(chart: pathlib.Path, namespace: str, values_path: pathlib.Path) -> None:

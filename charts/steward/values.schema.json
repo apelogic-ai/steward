@@ -631,7 +631,9 @@
                 "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
                 "workflowRepository": {
                   "type": "string",
-                  "pattern": "^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"
+                  "maxLength": 200,
+                  "pattern": "^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$",
+                  "not": {"pattern": "^\\.{1,2}/|/\\.{1,2}$"}
                 },
                 "workflowCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
                 "actionCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},

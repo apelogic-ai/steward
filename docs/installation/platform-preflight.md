@@ -11,6 +11,7 @@ human summary.
 The input names every namespace, immutable image digest, public hostname,
 Gateway parent, certificate DNS name, database CA reference, provider profile,
 ARC controller service account, external Secret, template capability catalog,
+the verified steward-run release projection selected by the installation BOM,
 and NetworkPolicy API/PostgreSQL destinations. Secret bodies are neither
 accepted nor emitted. Existing infrastructure remains operator-owned.
 
@@ -45,7 +46,8 @@ the explicitly supplied endpoints.
 is the copy-ready governed input. It includes a non-empty capability catalog,
 one immutable execution binding, exact Codex Responses endpoint, named MCP-GW
 authority contract, backend-TLS CA ConfigMap, all required namespaces,
-browser-auth egress, Kubernetes API and PostgreSQL CIDRs, and every immutable
+browser-auth egress, Kubernetes API and PostgreSQL CIDRs, the schema-3
+steward-run workflow/action/image projection, and every immutable
 component/runtime coordinate. The
 compact and separated examples exercise the same contract with different
 namespace layouts.

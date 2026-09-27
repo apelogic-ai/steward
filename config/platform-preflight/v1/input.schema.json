@@ -16,6 +16,7 @@
     "externalConfigMaps",
     "execution",
     "browserAuth",
+    "stewardRunRelease",
     "apiTlsSecretName",
     "webhookTlsSecretName",
     "capabilityCatalog",
@@ -113,6 +114,24 @@
     "externalConfigMaps": {"type": "object"},
     "execution": {"type": "object"},
     "browserAuth": {"type": "object"},
+    "stewardRunRelease": {
+      "type": "object",
+      "required": ["manifestSchemaVersion", "version", "workflowRepository", "workflowCommit", "actionCommit", "governedJobContainerImage"],
+      "additionalProperties": false,
+      "properties": {
+        "manifestSchemaVersion": {"const": 3},
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+        "workflowRepository": {
+          "type": "string",
+          "maxLength": 200,
+          "pattern": "^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$",
+          "not": {"pattern": "^\\.{1,2}/|/\\.{1,2}$"}
+        },
+        "workflowCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "actionCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "governedJobContainerImage": {"type": "string", "pattern": "^[^@\\s:]+(?:/[^@\\s:]+)+@sha256:[0-9a-f]{64}$"}
+      }
+    },
     "capabilityCatalog": {
       "type": "object",
       "required": ["schemaVersion", "models", "tools", "catalogs"],

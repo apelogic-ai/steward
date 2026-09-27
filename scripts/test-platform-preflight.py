@@ -190,6 +190,30 @@ class PlatformPreflightTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("input contains unsupported fields", result.stderr)
 
+    def test_rejects_steward_run_without_envelope_digest_capability(self) -> None:
+        self.input["stewardRunRelease"]["version"] = "0.6.0"
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stewardRunRelease.version must be 0.7.0 or later", result.stderr)
+
+    def test_rejects_incompatible_steward_run_handoff_schema(self) -> None:
+        self.input["stewardRunRelease"]["manifestSchemaVersion"] = 2
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stewardRunRelease.manifestSchemaVersion must equal 3", result.stderr)
+
+    def test_rejects_steward_run_repository_components_rejected_by_runtime(self) -> None:
+        for repository in ("./steward-run", "example-org/.."):
+            with self.subTest(repository=repository):
+                invalid = copy.deepcopy(self.input)
+                invalid["stewardRunRelease"]["workflowRepository"] = repository
+                result = self.run_validate(invalid)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "stewardRunRelease.workflowRepository must be owner/repository",
+                    result.stderr,
+                )
+
     def test_rejects_placeholder_digest(self) -> None:
         self.input["deploymentLock"]["artifacts"]["images.apiserver"]["target"]["digest"] = "sha256:" + "0" * 64
         result = self.run_validate(self.input)
@@ -311,6 +335,10 @@ class PlatformPreflightTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             values = json.loads((output / "steward-values.json").read_text(encoding="utf-8"))
             self.assertEqual(values["config"]["apiserver"]["capabilityCatalog"], complete["capabilityCatalog"])
+            self.assertEqual(
+                values["config"]["apiserver"]["stewardRunRelease"],
+                complete["stewardRunRelease"],
+            )
             self.assertEqual(values["networkPolicy"]["kubeApiCidrs"], complete["networkPolicy"]["kubeApiCidrs"])
             self.assertEqual(values["networkPolicy"]["postgresCidrs"], complete["networkPolicy"]["postgresCidrs"])
             self.assertEqual(values["config"]["apiserver"]["inferenceEndpoint"], "https://inference.example.test/v1/responses")
