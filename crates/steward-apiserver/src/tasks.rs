@@ -1313,17 +1313,8 @@ impl TaskSubmissionLedger for PgStore {
                 .as_str()
                 .strip_prefix("steward:")
                 .ok_or(StoreError::InvalidEnvelopeRequest)?;
-            PgStore::envelope_requests(self, owner_user_id)
+            PgStore::active_provisioned_user_envelopes_by_digest(self, owner_user_id, store_digest)
                 .await
-                .map(|records| {
-                    records
-                        .into_iter()
-                        .filter(|record| {
-                            record.status == steward_store::EnvelopeRequestStatus::Provisioned
-                                && record.envelope_digest.as_deref() == Some(store_digest)
-                        })
-                        .collect()
-                })
         })
     }
 
@@ -1339,18 +1330,9 @@ impl TaskSubmissionLedger for PgStore {
         &'a self,
         owner_user_id: &'a CanonicalUserId,
     ) -> BoxFuture<'a, Result<Vec<EnvelopeRequestRecord>, StoreError>> {
-        Box::pin(async move {
-            PgStore::envelope_requests(self, owner_user_id)
-                .await
-                .map(|records| {
-                    records
-                        .into_iter()
-                        .filter(|record| {
-                            record.status == steward_store::EnvelopeRequestStatus::Provisioned
-                        })
-                        .collect()
-                })
-        })
+        Box::pin(
+            async move { PgStore::active_provisioned_user_envelopes(self, owner_user_id).await },
+        )
     }
 
     fn task_by_idempotency<'a>(

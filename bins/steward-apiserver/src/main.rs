@@ -1256,25 +1256,42 @@ async fn rbac_effective_access(
     if options.json {
         println!("{}", serde_json::to_string(&response)?);
     } else {
-        println!("user id: {}", response.user.user_id);
-        println!("display email: {}", response.user.display_email);
-        println!("administrator: {}", response.administrator);
-        println!("member roles: {}", response.member_roles.join(", "));
-        println!("eligible templates: {}", response.eligible_templates.len());
-        println!("active Envelopes: {}", response.active_envelopes.len());
-        for envelope in response.active_envelopes {
-            println!(
-                "  {}\t{}\t{}@{}",
-                envelope.envelope_instance_id,
-                envelope.envelope_digest,
-                envelope.template_id.as_deref().unwrap_or("custom"),
-                envelope
-                    .template_revision
-                    .map_or_else(|| "-".to_owned(), |revision| revision.to_string())
-            );
-        }
+        print!("{}", format_effective_access_human(&response));
     }
     Ok(())
+}
+
+fn format_effective_access_human(response: &OperatorEffectiveAccessResponse) -> String {
+    let mut output = format!(
+        "user id: {}\ndisplay email: {}\nadministrator: {}\nmember roles: {}\neligible templates: {}\n",
+        response.user.user_id,
+        response.user.display_email,
+        response.administrator,
+        response.member_roles.join(", "),
+        response.eligible_templates.len(),
+    );
+    for template in &response.eligible_templates {
+        output.push_str(&format!(
+            "  {}@{}\n",
+            template.template_id, template.revision
+        ));
+    }
+    output.push_str(&format!(
+        "active Envelopes: {}\n",
+        response.active_envelopes.len()
+    ));
+    for envelope in &response.active_envelopes {
+        output.push_str(&format!(
+            "  {}\t{}\t{}@{}\n",
+            envelope.envelope_instance_id,
+            envelope.envelope_digest,
+            envelope.template_id.as_deref().unwrap_or("custom"),
+            envelope
+                .template_revision
+                .map_or_else(|| "-".to_owned(), |revision| revision.to_string())
+        ));
+    }
+    output
 }
 
 fn rbac_usage() -> &'static str {
@@ -1696,12 +1713,38 @@ mod tests {
         CodexTaskExecutionAdapter, KubernetesTokenReviewAudience, OPERATOR_EXIT_CONFLICT,
         OPERATOR_EXIT_FORBIDDEN, OPERATOR_EXIT_NOT_FOUND, OPERATOR_EXIT_UNAVAILABLE,
         OPERATOR_EXIT_USAGE, OperatorCommandError, TaskApiConfig, TlsListener,
-        bootstrap_rbac_arguments, decode_tls_material, github_source_adapter_from_values,
-        install_rustls_crypto_provider, kubernetes_token_review_audience, operator_exit_code,
-        parse_custom_envelope_safety_ceiling, parse_execution_bindings_mode,
-        parse_template_document, stable_bridge_configuration_from_values,
-        validate_execution_bindings, with_claude_code_execution_adapter,
+        bootstrap_rbac_arguments, decode_tls_material, format_effective_access_human,
+        github_source_adapter_from_values, install_rustls_crypto_provider,
+        kubernetes_token_review_audience, operator_exit_code, parse_custom_envelope_safety_ceiling,
+        parse_execution_bindings_mode, parse_template_document,
+        stable_bridge_configuration_from_values, validate_execution_bindings,
+        with_claude_code_execution_adapter,
     };
+
+    #[test]
+    fn effective_access_human_output_names_eligible_templates() {
+        let output = format_effective_access_human(
+            &steward_apiserver::operator_admin::OperatorEffectiveAccessResponse {
+                user: steward_apiserver::operator_admin::OperatorUserView {
+                    user_id: "usr_0123456789abcdef0123456789abcdef".to_owned(),
+                    display_email: "alice@example.com".to_owned(),
+                    organization_id: "example-org".to_owned(),
+                    state: "active".to_owned(),
+                },
+                administrator: false,
+                member_roles: vec!["engineer".to_owned()],
+                eligible_templates: vec![
+                    steward_apiserver::operator_admin::OperatorEligibleTemplateView {
+                        template_id: "default".to_owned(),
+                        revision: 3,
+                    },
+                ],
+                active_envelopes: Vec::new(),
+            },
+        );
+
+        assert!(output.contains("  default@3\n"));
+    }
 
     #[test]
     fn custom_envelope_safety_ceiling_requires_bounded_runtime_minutes() {

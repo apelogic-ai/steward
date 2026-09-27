@@ -25,6 +25,9 @@ use steward_apiserver::connections::{
 use steward_apiserver::governed_connections::{
     ConnectionExecutionBindings, GovernedConnectionsBroker, GovernedConnectionsConfig,
 };
+use steward_apiserver::{
+    AuthenticatedCaller, AuthenticationError, BoxFuture, RequestAuthenticator, operator_admin,
+};
 use steward_controller::{
     TaskControllerError, reconcile_agent_runtime_work_item, reconcile_task_orchestration_work_item,
     webhook_router_for_controller,
@@ -51,11 +54,60 @@ use steward_types::{
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tower::ServiceExt;
 
 const RUNTIME_PATH_PREFIX: &str =
     "/apis/agents.apelogic.ai/v1alpha1/namespaces/steward-test/agentruntimes";
 const SECRET_PATH_PREFIX: &str = "/api/v1/namespaces/steward-test/secrets";
 const CONTROLLER_USERNAME: &str = "system:serviceaccount:steward-system:steward-controller";
+const OPERATOR_USERNAME: &str = "system:serviceaccount:steward-test:operator";
+
+#[derive(Clone)]
+struct OperatorTestAuthenticator;
+
+impl RequestAuthenticator for OperatorTestAuthenticator {
+    fn authenticate<'a>(
+        &'a self,
+        bearer_token: &'a str,
+    ) -> BoxFuture<'a, Result<AuthenticatedCaller, AuthenticationError>> {
+        Box::pin(async move {
+            if bearer_token != "operator-token" {
+                return Err(AuthenticationError::InvalidCredentials);
+            }
+            Ok(AuthenticatedCaller {
+                actor: OPERATOR_USERNAME.to_owned(),
+                member_roles: Vec::new(),
+                canonical_user_id: None,
+                is_admin: true,
+            })
+        })
+    }
+}
+
+async fn operator_api_request(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> Result<Response<Body>, Box<dyn Error>> {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, "Bearer operator-token");
+    let body = match body {
+        Some(body) => {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+            Body::from(body.to_string())
+        }
+        None => Body::empty(),
+    };
+    Ok(app.clone().oneshot(request.body(body)?).await?)
+}
+
+async fn response_json(response: Response<Body>) -> Result<serde_json::Value, Box<dyn Error>> {
+    let body = to_bytes(response.into_body(), 1024 * 1024).await?;
+    Ok(serde_json::from_slice(&body)?)
+}
 
 #[derive(Clone)]
 struct WebhookAdmissionHarness {
@@ -224,6 +276,358 @@ async fn concurrent_provisioning_enforces_active_digest_uniqueness_transactional
         .filter(|request| request.status == EnvelopeRequestStatus::Provisioned)
         .count();
     assert_eq!(active, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn operator_rbac_and_provisioning_preserve_distinct_active_authority()
+-> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool.clone());
+    store.migrate().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let role = format!("engineer-{suffix}");
+    let identity = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("operator-provision-{suffix}"),
+                "example.com",
+                &format!("alice-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let bob_identity = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.org",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("operator-provision-bob-{suffix}"),
+                "example.org",
+                &format!("bob-{suffix}@example.org"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let envelope = |revision, monthly_limit: &str| Envelope {
+        revision,
+        spec: EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "example".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: monthly_limit.to_owned(),
+                single_run_limit: Some("0.50".to_owned()),
+                currency: "USD".to_owned(),
+            },
+            runtime_minutes_limit: Some("10".to_owned()),
+            ttl: Duration("1h".to_owned()),
+            runner: RunnerRequirements::default(),
+        },
+    };
+    let template_a = format!("develop-{suffix}");
+    let template_b = format!("review-{suffix}");
+    let envelope_a1 = envelope(1, "1.00");
+    let envelope_b1 = envelope(1, "2.00");
+    for (template_id, ceiling) in [(&template_a, &envelope_a1), (&template_b, &envelope_b1)] {
+        store
+            .insert_envelope_template_revision(EnvelopeTemplatePublication {
+                template_id,
+                display_name: template_id,
+                member_roles: std::slice::from_ref(&role),
+                ceiling,
+                auto_provision_threshold: Some(ceiling),
+                authored_by: "test-bootstrap",
+            })
+            .await?;
+    }
+    let operator_app = operator_admin::router(store.clone(), OperatorTestAuthenticator);
+    let users =
+        operator_api_request(&operator_app, Method::GET, "/admin/operator/v1/users", None).await?;
+    assert_eq!(users.status(), StatusCode::OK);
+    let users = response_json(users).await?;
+    assert!(users["users"].as_array().is_some_and(|users| {
+        users
+            .iter()
+            .any(|user| user["userId"] == identity.user_id.as_str())
+    }));
+    let roles =
+        operator_api_request(&operator_app, Method::GET, "/admin/operator/v1/roles", None).await?;
+    assert_eq!(roles.status(), StatusCode::OK);
+    assert!(
+        response_json(roles).await?["memberRoles"]
+            .as_array()
+            .is_some_and(|roles| roles.iter().any(|candidate| candidate == &role))
+    );
+
+    let admin_grant = operator_api_request(
+        &operator_app,
+        Method::POST,
+        "/admin/operator/v1/rbac",
+        Some(json!({
+            "userId": identity.user_id.as_str(),
+            "kind": "administrator",
+            "action": "grant",
+        })),
+    )
+    .await?;
+    assert_eq!(admin_grant.status(), StatusCode::OK);
+    let pure_admin = operator_api_request(
+        &operator_app,
+        Method::POST,
+        "/admin/operator/v1/envelopes/provision",
+        Some(json!({
+            "ownerUserId": identity.user_id.as_str(),
+            "templateId": template_a,
+            "templateRevision": 1,
+            "requestedEnvelope": envelope_a1,
+            "idempotencyKey": format!("pure-admin-{suffix}"),
+        })),
+    )
+    .await?;
+    assert_eq!(pure_admin.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    for action in ["grant", "grant", "revoke", "revoke", "grant"] {
+        let response = operator_api_request(
+            &operator_app,
+            Method::POST,
+            "/admin/operator/v1/rbac",
+            Some(json!({
+                "userId": identity.user_id.as_str(),
+                "kind": "member_role",
+                "memberRole": role,
+                "action": action,
+            })),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let bob_role_grant = operator_api_request(
+        &operator_app,
+        Method::POST,
+        "/admin/operator/v1/rbac",
+        Some(json!({
+            "userId": bob_identity.user_id.as_str(),
+            "kind": "member_role",
+            "memberRole": role.as_str(),
+            "action": "grant",
+        })),
+    )
+    .await?;
+    assert_eq!(bob_role_grant.status(), StatusCode::OK);
+    let role_events = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM browser_rbac_assignment_events \
+         WHERE user_id = $1 AND assignment_kind = 'member_role' AND member_role = $2",
+    )
+    .bind(identity.user_id.as_str())
+    .bind(&role)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        role_events, 3,
+        "exact grant and revoke retries must not duplicate audit events"
+    );
+    let effective = operator_api_request(
+        &operator_app,
+        Method::GET,
+        &format!(
+            "/admin/operator/v1/users/{}/effective-access",
+            identity.user_id.as_str()
+        ),
+        None,
+    )
+    .await?;
+    assert_eq!(effective.status(), StatusCode::OK);
+    let effective = response_json(effective).await?;
+    assert_eq!(effective["administrator"], true);
+    assert_eq!(effective["memberRoles"], json!([role.as_str()]));
+    assert_eq!(
+        effective["eligibleTemplates"].as_array().map(Vec::len),
+        Some(2)
+    );
+
+    for (template_id, requested_envelope, idempotency_key) in [
+        (&template_a, &envelope_a1, format!("provision-a1-{suffix}")),
+        (&template_b, &envelope_b1, format!("provision-b1-{suffix}")),
+    ] {
+        let response = operator_api_request(
+            &operator_app,
+            Method::POST,
+            "/admin/operator/v1/envelopes/provision",
+            Some(json!({
+                "ownerUserId": identity.user_id.as_str(),
+                "templateId": template_id,
+                "templateRevision": 1,
+                "requestedEnvelope": requested_envelope,
+                "idempotencyKey": idempotency_key,
+            })),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let initial_requests = store.envelope_requests(&identity.user_id).await?;
+    let a1 = initial_requests
+        .iter()
+        .find(|request| {
+            request.template_id.as_deref() == Some(template_a.as_str())
+                && request.status == EnvelopeRequestStatus::Provisioned
+        })
+        .cloned()
+        .ok_or("operator API did not provision template A")?;
+    let b1 = initial_requests
+        .iter()
+        .find(|request| {
+            request.template_id.as_deref() == Some(template_b.as_str())
+                && request.status == EnvelopeRequestStatus::Provisioned
+        })
+        .cloned()
+        .ok_or("operator API did not provision template B")?;
+    assert_eq!(a1.owner_user_id, identity.user_id);
+    assert_eq!(a1.status_actor, OPERATOR_USERNAME);
+    assert_eq!(b1.status_actor, OPERATOR_USERNAME);
+
+    let envelope_a2 = envelope(2, "3.00");
+    store
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &template_a,
+            display_name: &template_a,
+            member_roles: std::slice::from_ref(&role),
+            ceiling: &envelope_a2,
+            auto_provision_threshold: Some(&envelope_a2),
+            authored_by: OPERATOR_USERNAME,
+        })
+        .await?;
+    let provision_a2 = |idempotency_key: String| {
+        json!({
+            "ownerUserId": identity.user_id.as_str(),
+            "templateId": template_a,
+            "templateRevision": 2,
+            "requestedEnvelope": envelope_a2,
+            "idempotencyKey": idempotency_key,
+        })
+    };
+    let a2_response = operator_api_request(
+        &operator_app,
+        Method::POST,
+        "/admin/operator/v1/envelopes/provision",
+        Some(provision_a2(format!("provision-a2-{suffix}"))),
+    )
+    .await?;
+    assert_eq!(a2_response.status(), StatusCode::OK);
+    let a2_response = response_json(a2_response).await?;
+    let a2_retry = operator_api_request(
+        &operator_app,
+        Method::POST,
+        "/admin/operator/v1/envelopes/provision",
+        Some(provision_a2(format!("provision-a2-retry-{suffix}"))),
+    )
+    .await?;
+    assert_eq!(a2_retry.status(), StatusCode::OK);
+    assert_eq!(response_json(a2_retry).await?, a2_response);
+
+    let bob_a2_response = operator_api_request(
+        &operator_app,
+        Method::POST,
+        "/admin/operator/v1/envelopes/provision",
+        Some(json!({
+            "ownerUserId": bob_identity.user_id.as_str(),
+            "templateId": template_a.as_str(),
+            "templateRevision": 2,
+            "requestedEnvelope": &envelope_a2,
+            "idempotencyKey": format!("provision-bob-a2-{suffix}"),
+        })),
+    )
+    .await?;
+    assert_eq!(bob_a2_response.status(), StatusCode::OK);
+
+    let requests = store.envelope_requests(&identity.user_id).await?;
+    let a2 = requests
+        .iter()
+        .find(|request| {
+            request.template_id.as_deref() == Some(template_a.as_str())
+                && request.template_revision == Some(2)
+                && request.status == EnvelopeRequestStatus::Provisioned
+        })
+        .cloned()
+        .ok_or("operator API did not provision template A revision 2")?;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.status == EnvelopeRequestStatus::Provisioned)
+            .map(|request| request.id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [a2.id, b1.id].into_iter().collect(),
+        "replacing one template must preserve unrelated active authority"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .find(|request| request.id == a1.id)
+            .map(|request| request.status),
+        Some(EnvelopeRequestStatus::Stale)
+    );
+    let active = store
+        .active_provisioned_user_envelopes(&identity.user_id)
+        .await?;
+    assert_eq!(active.len(), 2);
+    let a2_digest = a2
+        .envelope_digest
+        .as_deref()
+        .ok_or("provisioned Envelope omitted its digest")?;
+    let selected = store
+        .active_provisioned_user_envelopes_by_digest(&identity.user_id, a2_digest)
+        .await?;
+    assert_eq!(
+        selected.iter().map(|record| record.id).collect::<Vec<_>>(),
+        [a2.id]
+    );
+    let bob_requests = store.envelope_requests(&bob_identity.user_id).await?;
+    let bob_a2 = bob_requests
+        .iter()
+        .find(|request| request.status == EnvelopeRequestStatus::Provisioned)
+        .ok_or("operator API did not provision Bob's template A revision 2")?;
+    assert_eq!(bob_a2.envelope_digest.as_deref(), Some(a2_digest));
+    let bob_selected = store
+        .active_provisioned_user_envelopes_by_digest(&bob_identity.user_id, a2_digest)
+        .await?;
+    assert_eq!(
+        bob_selected
+            .iter()
+            .map(|record| record.id)
+            .collect::<Vec<_>>(),
+        [bob_a2.id],
+        "the same digest must resolve independently for each owner"
+    );
+    let b1_digest = b1
+        .envelope_digest
+        .as_deref()
+        .ok_or("provisioned template B omitted its digest")?;
+    assert!(
+        store
+            .active_provisioned_user_envelopes_by_digest(&bob_identity.user_id, b1_digest)
+            .await?
+            .is_empty(),
+        "an owner must not select another user's active Envelope by digest"
+    );
     Ok(())
 }
 

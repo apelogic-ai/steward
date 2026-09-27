@@ -3758,6 +3758,7 @@ dependencies = [
  "steward-types",
  "tokio",
  "tokio-rustls",
+ "tower",
 ]
 
 [[package]]

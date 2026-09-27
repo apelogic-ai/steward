@@ -11482,6 +11482,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn versioned_task_digest_selector_is_owner_scoped_and_unambiguous() -> Result<(), String>
+    {
+        let ledger = versioned_task_ledger()?;
+        {
+            let mut envelopes = ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+            let mut selected = envelopes
+                .first()
+                .cloned()
+                .ok_or_else(|| "versioned task fixture requires one User Envelope".to_owned())?;
+            selected.id = Uuid::from_u128(42);
+            selected.template_id = Some("review".to_owned());
+            selected.envelope_instance_id = Some("envelope-instance-2".to_owned());
+            selected.envelope_digest = Some(format!("sha256:{}", "d".repeat(64)));
+            envelopes.push(selected);
+
+            let mut other_user = envelopes
+                .first()
+                .cloned()
+                .ok_or_else(|| "versioned task fixture requires one User Envelope".to_owned())?;
+            other_user.id = Uuid::from_u128(43);
+            other_user.owner_user_id =
+                CanonicalUserId::parse("usr_abcdef0123456789abcdef0123456789")?;
+            other_user.envelope_instance_id = Some("bob-envelope-instance".to_owned());
+            other_user.envelope_digest = Some(format!("sha256:{}", "c".repeat(64)));
+            envelopes.push(other_user);
+        }
+        let app = task_router(ledger.clone(), FakeTaskIdentityResolver, task_api_config()?);
+        let request = |idempotency_key: &str, digest_byte: char| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", idempotency_key)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "workflow": "repository-review@1",
+                        "envelopeDigest": format!("steward:sha256:{}", digest_byte.to_string().repeat(64)),
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build versioned Workflow request: {error}"))
+        };
+
+        let selected = app
+            .clone()
+            .oneshot(request("select-second-envelope", 'd')?)
+            .await
+            .map_err(|error| format!("submit digest-qualified Workflow: {error}"))?;
+        assert_eq!(selected.status(), StatusCode::ACCEPTED);
+        {
+            let tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?;
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(
+                tasks[0].user_envelope_instance_id.as_deref(),
+                Some("envelope-instance-2")
+            );
+            assert_eq!(
+                tasks[0].user_envelope_digest.as_deref(),
+                Some(format!("sha256:{}", "d".repeat(64)).as_str())
+            );
+        }
+
+        let other_user = app
+            .clone()
+            .oneshot(request("reject-other-user-envelope", 'c')?)
+            .await
+            .map_err(|error| format!("submit cross-user Envelope selector: {error}"))?;
+        assert_eq!(other_user.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        {
+            let mut envelopes = ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+            let mut duplicate = envelopes
+                .iter()
+                .find(|envelope| {
+                    envelope.owner_user_id.as_str() == "usr_0123456789abcdef0123456789abcdef"
+                        && envelope.envelope_digest.as_deref()
+                            == Some(format!("sha256:{}", "d".repeat(64)).as_str())
+                })
+                .cloned()
+                .ok_or_else(|| "selected User Envelope fixture is missing".to_owned())?;
+            duplicate.id = Uuid::from_u128(44);
+            duplicate.envelope_instance_id = Some("duplicate-envelope-instance".to_owned());
+            envelopes.push(duplicate);
+        }
+        let duplicate = app
+            .oneshot(request("reject-duplicate-envelope-digest", 'd')?)
+            .await
+            .map_err(|error| format!("submit duplicate Envelope selector: {error}"))?;
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn versioned_task_retry_uses_persisted_plan_across_runtime_contract_changes()
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;

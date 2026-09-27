@@ -3520,6 +3520,49 @@ impl PgStore {
             .collect()
     }
 
+    /// Resolve every active provisioned User Envelope owned by one canonical user.
+    pub async fn active_provisioned_user_envelopes(
+        &self,
+        owner_user_id: &CanonicalUserId,
+    ) -> Result<Vec<EnvelopeRequestRecord>, StoreError> {
+        self.active_provisioned_user_envelopes_query(owner_user_id, None)
+            .await
+    }
+
+    /// Resolve active provisioned User Envelopes by their content digest, scoped to one owner.
+    pub async fn active_provisioned_user_envelopes_by_digest(
+        &self,
+        owner_user_id: &CanonicalUserId,
+        envelope_digest: &str,
+    ) -> Result<Vec<EnvelopeRequestRecord>, StoreError> {
+        self.active_provisioned_user_envelopes_query(owner_user_id, Some(envelope_digest))
+            .await
+    }
+
+    async fn active_provisioned_user_envelopes_query(
+        &self,
+        owner_user_id: &CanonicalUserId,
+        envelope_digest: Option<&str>,
+    ) -> Result<Vec<EnvelopeRequestRecord>, StoreError> {
+        let mut statement = QueryBuilder::<Postgres>::new(ENVELOPE_REQUEST_COLUMNS);
+        statement.push("WHERE requests.owner_user_id = ");
+        statement.push_bind(owner_user_id.as_str());
+        statement.push(" AND status.status = 'provisioned'");
+        if let Some(envelope_digest) = envelope_digest {
+            statement.push(" AND status.envelope_digest = ");
+            statement.push_bind(envelope_digest);
+        }
+        statement.push(" ORDER BY requests.created_at, requests.id");
+        statement
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .map(envelope_request_record)
+            .collect()
+    }
+
     /// List current pending user-envelope requests for the administrator approval queue.
     pub async fn pending_envelope_requests(
         &self,
